@@ -248,13 +248,6 @@ pub(crate) fn demux_init(
                         ret = demux_send(&mut demux_paramter, packet_box, &packet_pool, send_flags, &demux_node, &scheduler_status, independent_readrate);
 
                         if ret < 0 {
-                            set_scheduler_error(
-                                &scheduler_status,
-                                &scheduler_result,
-                                Demuxing(DemuxingOperationError::PacketRefError(
-                                    DemuxingError::from(ret),
-                                )),
-                            );
                             break;
                         }
                     }

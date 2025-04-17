@@ -546,6 +546,26 @@ mod tests {
     use crate::filter::frame_pipeline_builder::FramePipelineBuilder;
 
     #[test]
+    fn test_img_to_video() {
+        let _ = env_logger::builder()
+            .filter_level(log::LevelFilter::Trace)
+            .is_test(true)
+            .try_init();
+
+        let result = FfmpegContext::builder()
+            .input(Input::from("logo.jpg")
+                .set_format_opt("loop", "1")
+                .set_recording_time_us(10 * 1000_000)
+            )
+            .filter_desc("scale=1280:720")
+            .output(Output::from("output.mp4"))
+            .build().unwrap()
+            .start().unwrap()
+            .wait();
+
+        assert!(result.is_ok());
+    }
+    #[test]
     fn test_copy() {
         let _ = env_logger::builder()
             .filter_level(log::LevelFilter::Trace)
