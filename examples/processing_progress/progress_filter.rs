@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use ez_ffmpeg::filter::frame_filter::FrameFilter;
 use ez_ffmpeg::filter::frame_filter_context::FrameFilterContext;
-use ez_ffmpeg::Frame;
 use ez_ffmpeg::AVMediaType;
+use ez_ffmpeg::Frame;
 
 pub struct ProgressCallBacker {
     pub total_duration: i64,
@@ -22,7 +22,9 @@ impl ProgressCallBacker {
         if let Some(pts) = frame.pts() {
             // Check if the time base is valid.
             if self.time_base.den == 0 {
-                println!("Warning: The time base denominator is 0, and the time cannot be calculated.");
+                println!(
+                    "Warning: The time base denominator is 0, and the time cannot be calculated."
+                );
                 return;
             }
 
@@ -64,6 +66,12 @@ impl FrameFilter for ProgressCallBackFilter {
         frame: Frame,
         _ctx: &FrameFilterContext,
     ) -> Result<Option<Frame>, String> {
+        unsafe {
+            // Ensure the frame is valid and not empty
+            if frame.as_ptr().is_null() || frame.is_empty() {
+                return Ok(Some(frame)); // If invalid, simply return the frame as-is
+            }
+        }
         self.progress_callback.print_progress(&frame);
         Ok(Some(frame))
     }
