@@ -58,7 +58,7 @@ impl ProgressCallBackFilter {
 
 impl FrameFilter for ProgressCallBackFilter {
     fn media_type(&self) -> AVMediaType {
-        AVMediaType::AVMEDIA_TYPE_AUDIO // 处理音频帧
+        AVMediaType::AVMEDIA_TYPE_AUDIO // Process audio frames
     }
 
     fn filter_frame(
