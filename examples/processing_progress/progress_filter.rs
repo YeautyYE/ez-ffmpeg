@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use ez_ffmpeg::filter::frame_filter::FrameFilter;
 use ez_ffmpeg::filter::frame_filter_context::FrameFilterContext;
-use ffmpeg_next::Frame;
-use ffmpeg_sys_next::AVMediaType;
+use ez_ffmpeg::Frame;
+use ez_ffmpeg::AVMediaType;
 
 pub struct ProgressCallBacker {
     pub total_duration: i64,
