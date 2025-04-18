@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ez-ffmpeg = { path = "../../../ez-ffmpeg" , features = ["async"]}
+ez-ffmpeg = { path = "../../../ez-ffmpeg" }
 
 
 [[bin]]
