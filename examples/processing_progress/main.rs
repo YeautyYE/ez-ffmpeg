@@ -16,7 +16,7 @@ fn main() {
     progress_callbacker.total_duration = get_duration_us("test.mp4").unwrap();
     println!("Duration: {} us", progress_callbacker.total_duration);
     
-    // 获取音频流信息
+    // Retrieve the audio stream information
     let audio_info = ez_ffmpeg::stream_info::find_audio_stream_info("test.mp4").unwrap();
     if let Some(audio_info) = audio_info {
         match audio_info {

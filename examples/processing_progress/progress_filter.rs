@@ -20,19 +20,19 @@ impl ProgressCallBacker {
 
     pub fn print_progress(&self, frame: &Frame) {
         if let Some(pts) = frame.pts() {
-            // 检查时基是否有效
+            // Check if the time base is valid.
             if self.time_base.den == 0 {
                 println!("Warning: The time base denominator is 0, and the time cannot be calculated.");
                 return;
             }
 
-            // 获取帧的时间戳（以秒为单位）
+            // Get the timestamp of the frame (in seconds).
             let time_in_stream = pts as f64 * self.time_base.num as f64 / self.time_base.den as f64;
 
-            // 总时长（秒）
+            // Total duration (in seconds)
             let total_duration_sec = self.total_duration as f64 / 1_000_000.0;
 
-            // 计算进度百分比
+            // Calculate the progress percentage
             let progress = (time_in_stream / total_duration_sec) * 100.0;
             let clamped_progress = progress.min(100.0).max(0.0);
 
