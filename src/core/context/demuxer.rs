@@ -3,7 +3,7 @@ use crate::core::context::decoder_stream::DecoderStream;
 use crate::core::context::PacketBox;
 use crate::core::hwaccel::HWAccelID;
 use crate::core::scheduler::input_controller::SchNode;
-use crate::error::{DecoderError, OpenInputError};
+use crate::error::OpenInputError;
 use crate::filter::frame_pipeline::FramePipeline;
 use crossbeam_channel::Sender;
 use ffmpeg_sys_next::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE;
@@ -15,12 +15,12 @@ use ffmpeg_sys_next::{
     av_codec_is_decoder, av_codec_iterate, av_get_pix_fmt, av_hwdevice_find_type_by_name,
     av_hwdevice_get_type_name, avcodec_descriptor_get, avcodec_descriptor_get_by_name,
     avcodec_find_decoder, avcodec_find_decoder_by_name,
-    avcodec_get_hw_config, avformat_close_input, AVCodecID, AVCodecParameters, AVFormatContext,
+    avcodec_get_hw_config, AVCodecID, AVCodecParameters, AVFormatContext,
     AVHWDeviceType, AVMediaType, AVPixelFormat, AVERROR, AVERROR_DECODER_NOT_FOUND, EINVAL,
 };
 use log::{debug, error, warn};
 use std::ffi::{CStr, CString};
-use std::ptr::null_mut;
+use std::ptr::{null, null_mut};
 use std::sync::Arc;
 
 pub(crate) struct Demuxer {
@@ -102,7 +102,7 @@ impl Demuxer {
     }
 
     fn init_streams(
-        mut fmt_ctx: *mut AVFormatContext,
+        fmt_ctx: *mut AVFormatContext,
         video_codec: Option<String>,
         audio_codec: Option<String>,
         subtitle_codec: Option<String>,
@@ -143,10 +143,6 @@ impl Demuxer {
                     hwaccel_id,
                     hwaccel_device_type,
                 )?;
-                if decoder.is_none() {
-                    avformat_close_input(&mut fmt_ctx);
-                    return Err(DecoderError::NotFound.into());
-                }
                 let codec_desc = avcodec_descriptor_get(codec_id);
 
                 let stream = DecoderStream::new(
@@ -154,7 +150,10 @@ impl Demuxer {
                     st,
                     codec_parameters,
                     codec_type,
-                    decoder.unwrap().as_ptr(),
+                    match decoder {
+                        Some(decoder) => { decoder.as_ptr() },
+                        None => { null() },
+                    },
                     codec_desc,
                     duration,
                     time_base,

@@ -144,6 +144,36 @@ pub(super) mod muxer;
 pub(super) mod obj_pool;
 pub(super) mod output_filter;
 
+/// The **null_output** module provides a custom null output implementation for FFmpeg
+/// that discards all data while supporting seeking.
+///
+/// It exposes the [`create_null_output`](null_output::create_null_output) function, which returns an
+/// [`Output`](ez_ffmpeg::Output) object configured to:
+/// - Discard all written data, behaving like `/dev/null`.
+/// - Maintain a seekable position state using atomic operations for thread-safe, high-performance access.
+/// - Support scenarios such as testing or processing streaming inputs (e.g., RTMP) where no output file is needed.
+///
+/// # Usage Scenario
+/// This module is useful when processing FFmpeg input streams without generating an output file, such as
+/// when handling RTMP streams that require a seekable output format like MP4, even if the output is discarded.
+///
+/// # Examples
+///
+/// ```rust
+/// use ez_ffmpeg::Output;
+/// let output: Output = create_null_output();
+/// // Pass `output` to an FFmpeg context for processing
+/// ```
+///
+/// # Performance
+/// - Utilizes `AtomicU64` with `Relaxed` ordering for lock-free position tracking, ensuring efficient concurrent access.
+/// - Write and seek operations are optimized to minimize overhead by avoiding locks.
+///
+/// # Notes
+/// - The default output format is "mp4", but this can be modified using `set_format` as needed.
+/// - Write operations assume individual buffers do not exceed `i32::MAX` bytes, which aligns with typical FFmpeg usage.
+pub mod null_output;
+
 pub(crate) struct CodecContext {
     inner: *mut AVCodecContext,
 }
