@@ -40,7 +40,7 @@ use ffmpeg_sys_next::AVMediaType::{
 };
 use ffmpeg_sys_next::AVPixelFormat::AV_PIX_FMT_NONE;
 use ffmpeg_sys_next::AVSampleFormat::AV_SAMPLE_FMT_NONE;
-use ffmpeg_sys_next::{av_add_q, av_codec_get_id, av_codec_get_tag2, av_dict_free, av_freep, av_get_exact_bits_per_sample, av_guess_codec, av_guess_format, av_guess_frame_rate, av_inv_q, av_malloc, av_rescale_q, av_seek_frame, avcodec_alloc_context3, avcodec_descriptor_get_by_name, avcodec_find_encoder, avcodec_find_encoder_by_name, avcodec_get_name, avcodec_parameters_from_context, avcodec_parameters_to_context, avfilter_graph_alloc, avfilter_graph_free, avfilter_inout_free, avfilter_pad_get_name, avfilter_pad_get_type, avformat_alloc_context, avformat_alloc_output_context2, avformat_close_input, avformat_find_stream_info, avformat_flush, avformat_free_context, avformat_open_input, avio_alloc_context, avio_context_free, avio_open, AVCodec, AVCodecID, AVColorRange, AVColorSpace, AVFilterContext, AVFilterInOut, AVFilterPad, AVFormatContext, AVMediaType, AVOutputFormat, AVPixelFormat, AVRational, AVSampleFormat, AVStream, AVERROR_ENCODER_NOT_FOUND, AVFMT_FLAG_CUSTOM_IO, AVFMT_GLOBALHEADER, AVFMT_NOBINSEARCH, AVFMT_NOFILE, AVFMT_NOGENSEARCH, AVFMT_NOSTREAMS, AVIO_FLAG_WRITE, AVSEEK_FLAG_BACKWARD, AV_TIME_BASE};
+use ffmpeg_sys_next::{av_add_q, av_codec_get_id, av_codec_get_tag2, av_dict_free, av_freep, av_get_exact_bits_per_sample, av_guess_codec, av_guess_format, av_guess_frame_rate, av_inv_q, av_malloc, av_rescale_q, av_seek_frame, avcodec_alloc_context3, avcodec_descriptor_get, avcodec_descriptor_get_by_name, avcodec_find_encoder, avcodec_find_encoder_by_name, avcodec_get_name, avcodec_parameters_from_context, avcodec_parameters_to_context, avfilter_graph_alloc, avfilter_graph_free, avfilter_inout_free, avfilter_pad_get_name, avfilter_pad_get_type, avformat_alloc_context, avformat_alloc_output_context2, avformat_close_input, avformat_find_stream_info, avformat_flush, avformat_free_context, avformat_open_input, avio_alloc_context, avio_context_free, avio_open, AVCodec, AVCodecID, AVColorRange, AVColorSpace, AVFilterContext, AVFilterInOut, AVFilterPad, AVFormatContext, AVMediaType, AVOutputFormat, AVPixelFormat, AVRational, AVSampleFormat, AVStream, AVERROR_ENCODER_NOT_FOUND, AVFMT_FLAG_CUSTOM_IO, AVFMT_GLOBALHEADER, AVFMT_NOBINSEARCH, AVFMT_NOFILE, AVFMT_NOGENSEARCH, AVFMT_NOSTREAMS, AVIO_FLAG_WRITE, AVSEEK_FLAG_BACKWARD, AV_CODEC_PROP_BITMAP_SUB, AV_CODEC_PROP_TEXT_SUB, AV_TIME_BASE};
 #[cfg(not(feature = "docs-rs"))]
 use ffmpeg_sys_next::{av_channel_layout_copy, av_packet_side_data_new, avcodec_get_supported_config, avfilter_graph_segment_apply, avfilter_graph_segment_create_filters, avfilter_graph_segment_free, avfilter_graph_segment_parse, AVChannelLayout};
 use log::{debug, error, info, warn};
@@ -779,28 +779,179 @@ fn map_auto_streams(
             filter_graphs,
             auto_disable,
         )?;
-        map_auto_stream(
-            mux_index,
+        map_auto_subtitle(
             mux,
             demuxs,
             oformat,
-            AVMEDIA_TYPE_SUBTITLE,
-            filter_graphs,
             auto_disable,
         )?;
-        map_auto_stream(
-            mux_index,
+        map_auto_data(
             mux,
             demuxs,
             oformat,
-            AVMEDIA_TYPE_DATA,
-            filter_graphs,
             auto_disable,
         )?;
     }
     Ok(())
 }
 
+#[cfg(feature = "docs-rs")]
+unsafe fn map_auto_subtitle(
+    mux: &mut Muxer,
+    demuxs: &mut Vec<Demuxer>,
+    oformat: *const AVOutputFormat,
+    auto_disable: i32,
+) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(feature = "docs-rs"))]
+unsafe fn map_auto_subtitle(
+    mux: &mut Muxer,
+    demuxs: &mut Vec<Demuxer>,
+    oformat: *const AVOutputFormat,
+    auto_disable: i32,
+) -> Result<()> {
+    if auto_disable & (1 << AVMEDIA_TYPE_SUBTITLE as i32) != 0 {
+        return Ok(());
+    }
+
+    let output_codec = avcodec_find_encoder((*oformat).subtitle_codec);
+    if output_codec.is_null() {
+        return Ok(());
+    }
+    let output_descriptor = avcodec_descriptor_get((*output_codec).id);
+
+    for demux in demuxs {
+        let option = demux
+            .get_streams()
+            .iter()
+            .enumerate()
+            .find_map(|(index, input_stream)| {
+                if input_stream.codec_type == AVMEDIA_TYPE_SUBTITLE {
+                    Some(index)
+                } else {
+                    None
+                }
+            });
+
+        if option.is_none() {
+            continue;
+        }
+
+        let stream_index = option.unwrap();
+
+        let input_descriptor = avcodec_descriptor_get((*demux.get_stream(stream_index).codec_parameters).codec_id);
+        let mut input_props = 0;
+        if !input_descriptor.is_null() {
+            input_props = (*input_descriptor).props & (AV_CODEC_PROP_TEXT_SUB | AV_CODEC_PROP_BITMAP_SUB);
+        }
+        let mut output_props = 0;
+        if !output_descriptor.is_null() {
+            output_props = (*output_descriptor).props & (AV_CODEC_PROP_TEXT_SUB | AV_CODEC_PROP_BITMAP_SUB);
+        }
+
+        if input_props & output_props != 0 ||
+            // Map dvb teletext which has neither property to any output subtitle encoder
+            !input_descriptor.is_null() && !output_descriptor.is_null() &&
+                ((*input_descriptor).props == 0 || (*output_descriptor).props == 0) {
+            let option = choose_encoder(mux, AVMEDIA_TYPE_SUBTITLE)?;
+
+            if let Some((_codec_id, enc)) = option {
+                let (frame_sender, output_stream_index) =
+                    mux.add_enc_stream(AVMEDIA_TYPE_SUBTITLE, enc, demux.node.clone())?;
+                demux.get_stream_mut(stream_index).add_dst(frame_sender);
+                demux.connect_stream(stream_index);
+                let input_stream = demux.get_stream(stream_index);
+                unsafe {
+                    rescale_duration(
+                        input_stream.duration,
+                        input_stream.time_base,
+                        *(*mux.out_fmt_ctx).streams.add(output_stream_index),
+                    );
+                }
+            } else {
+                error!("Error selecting an encoder(subtitle)");
+                return Err(OpenOutputError::from(AVERROR_ENCODER_NOT_FOUND).into());
+            }
+        }
+        break;
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "docs-rs")]
+unsafe fn map_auto_data(
+    mux: &mut Muxer,
+    demuxs: &mut Vec<Demuxer>,
+    oformat: *const AVOutputFormat,
+    auto_disable: i32,
+) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(feature = "docs-rs"))]
+unsafe fn map_auto_data(
+    mux: &mut Muxer,
+    demuxs: &mut Vec<Demuxer>,
+    oformat: *const AVOutputFormat,
+    auto_disable: i32,
+) -> Result<()> {
+    if auto_disable & (1 << AVMEDIA_TYPE_DATA as i32) != 0 {
+        return Ok(());
+    }
+
+    /* Data only if codec id match */
+    let codec_id = av_guess_codec(oformat, null(), (*mux.out_fmt_ctx).url, null(), AVMEDIA_TYPE_DATA);
+
+    if codec_id == AV_CODEC_ID_NONE {
+        return Ok(());
+    }
+
+    for demux in demuxs {
+        let option = demux
+            .get_streams()
+            .iter()
+            .enumerate()
+            .find_map(|(index, input_stream)| {
+                if input_stream.codec_type == AVMEDIA_TYPE_DATA && (*input_stream.codec_parameters).codec_id == codec_id {
+                    Some(index)
+                } else {
+                    None
+                }
+            });
+
+        if option.is_none() {
+            continue;
+        }
+
+        let stream_index = option.unwrap();
+        let option = choose_encoder(mux, AVMEDIA_TYPE_DATA)?;
+
+        if let Some((_codec_id, enc)) = option {
+            let (frame_sender, output_stream_index) =
+                mux.add_enc_stream(AVMEDIA_TYPE_DATA, enc, demux.node.clone())?;
+            demux.get_stream_mut(stream_index).add_dst(frame_sender);
+            demux.connect_stream(stream_index);
+            let input_stream = demux.get_stream(stream_index);
+            unsafe {
+                rescale_duration(
+                    input_stream.duration,
+                    input_stream.time_base,
+                    *(*mux.out_fmt_ctx).streams.add(output_stream_index),
+                );
+            }
+        } else {
+            error!("Error selecting an encoder(data)");
+            return Err(OpenOutputError::from(AVERROR_ENCODER_NOT_FOUND).into());
+        }
+
+        break;
+    }
+
+    Ok(())
+}
 
 #[cfg(feature = "docs-rs")]
 unsafe fn map_auto_stream(
