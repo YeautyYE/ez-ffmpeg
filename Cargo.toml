@@ -1,6 +1,6 @@
 [package]
 name = "ez-ffmpeg"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 authors = ["Yeauty <YeautyYE@gmail.com>"]
 description = "A safe and ergonomic Rust interface for FFmpeg integration, designed for ease of use."
