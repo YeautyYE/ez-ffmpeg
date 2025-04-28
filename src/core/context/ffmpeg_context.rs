@@ -1949,7 +1949,7 @@ fn ifilter_bind_ist(
         } else {
             0
         };
-        if (*demux.in_fmt_ctx).start_time != ffmpeg_sys_next::AV_NOPTS_VALUE {
+        if demux.start_time_us.is_some() {
             input_filter.opts.trim_start_us = Some(tsoffset);
         }
         input_filter.opts.trim_end_us = demux.recording_time_us;

@@ -127,11 +127,12 @@ pub(crate) fn enc_init(
         let mut align_mask = 0;
         let mut samples_queued = 0;
         let mut audio_frame_queue: VecDeque<FrameBox> = VecDeque::new();
+        let mut is_finished = false;
 
         loop {
             let sync_frame = receive_frame(&mut opened, &receiver, &frame_pool, enc_ctx_box.as_mut_ptr(), stream_box.inner,
                                                &ready_sender, &bits_per_raw_sample, &mut frame_samples, &mut align_mask, &mut samples_queued, &mut audio_frame_queue,
-                                               &mut samples_sent, &mut frames_sent,
+                                               &mut samples_sent, &mut frames_sent, &mut is_finished,
                                                &scheduler_status, &scheduler_result);
 
             let mut receive_frame_box = match sync_frame {
@@ -243,13 +244,13 @@ fn process_audio_queue(
     align_mask: usize,
     samples_sent: &mut i64,
     frames_sent: &mut i64,
+    is_finished: &mut bool,
     scheduler_status: &Arc<AtomicUsize>,
     scheduler_result: &Arc<Mutex<Option<crate::error::Result<()>>>>
 ) -> Result<Option<FrameBox>, ()> {
     if let Some(peek) = audio_frame_queue.front() {
-        let is_null = frame_is_null(&peek.frame);
-        if frame_samples <= *samples_queued || is_null {
-            let nb_samples = if is_null {
+        if frame_samples <= *samples_queued || *is_finished {
+            let nb_samples = if *is_finished {
                 std::cmp::min(frame_samples, *samples_queued)
             } else {
                 frame_samples
@@ -257,8 +258,8 @@ fn process_audio_queue(
             *samples_sent += nb_samples as i64;
             *frames_sent = *samples_sent / frame_samples as i64;
 
-            if is_null {
-                return Ok(audio_frame_queue.pop_front());
+            return if *is_finished {
+                Ok(audio_frame_queue.pop_front())
             } else {
                 unsafe {
                     if nb_samples != (*peek.frame.as_ptr()).nb_samples
@@ -280,13 +281,13 @@ fn process_audio_queue(
                                         crate::error::EncodingError::from(ret),
                                     )),
                                 );
-                                return Err(());
+                                Err(())
                             }
-                            Ok(frame) => return Ok(Some(frame)),
+                            Ok(frame) => Ok(Some(frame)),
                         }
                     } else {
                         *samples_queued -= (*peek.frame.as_ptr()).nb_samples;
-                        return Ok(audio_frame_queue.pop_front());
+                        Ok(audio_frame_queue.pop_front())
                     }
                 }
             }
@@ -309,6 +310,7 @@ fn receive_frame(
     audio_frame_queue: &mut VecDeque<FrameBox>,
     samples_sent: &mut i64,
     frames_sent: &mut i64,
+    is_finished: &mut bool,
     scheduler_status: &Arc<AtomicUsize>,
     scheduler_result: &Arc<Mutex<Option<crate::error::Result<()>>>>
 ) -> SyncFrame {
@@ -349,6 +351,7 @@ fn receive_frame(
                 *align_mask,
                 samples_sent,
                 frames_sent,
+                is_finished,
                 scheduler_status,
                 scheduler_result,
             ) {
@@ -367,8 +370,8 @@ fn receive_frame(
     };
 
     if *frame_samples > 0 {
-        let is_null = frame_is_null(&frame_box.frame);
-        if !is_null {
+        *is_finished = frame_is_null(&frame_box.frame);
+        if !*is_finished {
             unsafe {
                 (*frame_box.frame.as_mut_ptr()).duration = av_rescale_q(
                     (*frame_box.frame.as_ptr()).nb_samples as i64,
@@ -383,7 +386,7 @@ fn receive_frame(
         }
         audio_frame_queue.push_back(frame_box);
 
-        if *samples_queued < *frame_samples && !is_null {
+        if *samples_queued < *frame_samples && !*is_finished {
             return SyncFrame::Continue;
         }
         match process_audio_queue(
@@ -394,6 +397,7 @@ fn receive_frame(
             *align_mask,
             samples_sent,
             frames_sent,
+            is_finished,
             scheduler_status,
             &scheduler_result,
         ) {

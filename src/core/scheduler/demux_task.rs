@@ -351,11 +351,11 @@ unsafe fn input_packet_process(
 ) -> c_int {
     ts_fixup(demux_paramter, in_fmt_ctx, pkt, copy_ts);
 
-    if let Some(recording_time_us) = demux_paramter.recording_time_us.clone() {
+    if let Some(recording_time_us) = demux_paramter.recording_time_us {
         if recording_time_us != i64::MAX {
             let mut start_time = 0;
             if copy_ts {
-                start_time += demux_paramter.start_time_us.clone().unwrap_or(0);
+                start_time += demux_paramter.start_time_us.unwrap_or(0);
             }
             let ds = demux_paramter
                 .demux_streams
