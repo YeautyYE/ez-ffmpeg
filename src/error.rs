@@ -446,6 +446,12 @@ pub enum FindStreamError {
     #[error("Operation not permitted to access the file or stream")]
     OperationNotPermitted,
 
+    #[error("No Stream found")]
+    NoStreamFound,
+
+    #[error("No codec parameters found")]
+    NoCodecparFound,
+
     #[error("An unknown error occurred. ret:{0}")]
     UnknownError(i32),
 }
