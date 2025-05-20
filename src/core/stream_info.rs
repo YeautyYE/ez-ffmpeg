@@ -239,6 +239,9 @@ pub fn find_video_stream_info(url: impl Into<String>) -> Result<Option<StreamInf
         }
         let streams = (*in_fmt_ctx_box.fmt_ctx).streams;
         let video_stream = *streams.offset(video_index as isize);
+        if video_stream.is_null() {
+            return Err(FindStreamError::NoStreamFound.into());
+        }
 
         let index = (*video_stream).index;
         let time_base = (*video_stream).time_base;
@@ -248,13 +251,15 @@ pub fn find_video_stream_info(url: impl Into<String>) -> Result<Option<StreamInf
         let r_frame_rate = (*video_stream).r_frame_rate;
         let sample_aspect_ratio = (*video_stream).sample_aspect_ratio;
         let metadata = (*video_stream).metadata;
-        let metadata = av_dict_to_hashmap(metadata);
+        let metadata = dict_to_hashmap(metadata);
         let avg_frame_rate = (*video_stream).avg_frame_rate;
 
         let codec_parameters = (*video_stream).codecpar;
+        if codec_parameters.is_null() {
+            return Err(FindStreamError::NoCodecparFound.into());
+        }
         let codec_id = (*codec_parameters).codec_id;
-        let codec_name = CStr::from_ptr(avcodec_get_name(codec_id));
-        let codec_name = codec_name.to_str().unwrap_or("Unknown codec");
+        let codec_name = codec_name(codec_id);
         let width = (*codec_parameters).width;
         let height = (*codec_parameters).height;
         let bit_rate = (*codec_parameters).bit_rate;
@@ -283,7 +288,7 @@ pub fn find_video_stream_info(url: impl Into<String>) -> Result<Option<StreamInf
             metadata,
             avg_frame_rate,
             codec_id,
-            codec_name: codec_name.to_string(),
+            codec_name,
             width,
             height,
             bit_rate,
@@ -322,6 +327,9 @@ pub fn find_audio_stream_info(url: impl Into<String>) -> Result<Option<StreamInf
         }
         let streams = (*in_fmt_ctx_box.fmt_ctx).streams;
         let audio_stream = *streams.offset(audio_index as isize);
+        if audio_stream.is_null() {
+            return Err(FindStreamError::NoStreamFound.into());
+        }
 
         let index = (*audio_stream).index;
         let time_base = (*audio_stream).time_base;
@@ -329,13 +337,15 @@ pub fn find_audio_stream_info(url: impl Into<String>) -> Result<Option<StreamInf
         let duration = (*audio_stream).duration;
         let nb_frames = (*audio_stream).nb_frames;
         let metadata = (*audio_stream).metadata;
-        let metadata = av_dict_to_hashmap(metadata);
+        let metadata = dict_to_hashmap(metadata);
         let avg_frame_rate = (*audio_stream).avg_frame_rate;
 
         let codec_parameters = (*audio_stream).codecpar;
+        if codec_parameters.is_null() {
+            return Err(FindStreamError::NoCodecparFound.into());
+        }
         let codec_id = (*codec_parameters).codec_id;
-        let codec_name = CStr::from_ptr(avcodec_get_name(codec_id));
-        let codec_name = codec_name.to_str().unwrap_or("Unknown codec");
+        let codec_name = codec_name(codec_id);
         let sample_rate = (*codec_parameters).sample_rate;
         #[cfg(not(feature = "docs-rs"))]
         let ch_layout = (*codec_parameters).ch_layout;
@@ -352,7 +362,7 @@ pub fn find_audio_stream_info(url: impl Into<String>) -> Result<Option<StreamInf
             metadata,
             avg_frame_rate,
             codec_id,
-            codec_name: codec_name.to_string(),
+            codec_name,
             sample_rate,
             #[cfg(not(feature = "docs-rs"))]
             order: ch_layout.order,
@@ -396,6 +406,9 @@ pub fn find_subtitle_stream_info(url: impl Into<String>) -> Result<Option<Stream
 
         let streams = (*in_fmt_ctx_box.fmt_ctx).streams;
         let subtitle_stream = *streams.offset(subtitle_index as isize);
+        if subtitle_stream.is_null() {
+            return Err(FindStreamError::NoStreamFound.into());
+        }
 
         let index = (*subtitle_stream).index;
         let time_base = (*subtitle_stream).time_base;
@@ -403,12 +416,14 @@ pub fn find_subtitle_stream_info(url: impl Into<String>) -> Result<Option<Stream
         let duration = (*subtitle_stream).duration;
         let nb_frames = (*subtitle_stream).nb_frames;
         let metadata = (*subtitle_stream).metadata;
-        let metadata = av_dict_to_hashmap(metadata);
+        let metadata = dict_to_hashmap(metadata);
 
         let codec_parameters = (*subtitle_stream).codecpar;
+        if codec_parameters.is_null() {
+            return Err(FindStreamError::NoCodecparFound.into());
+        }
         let codec_id = (*codec_parameters).codec_id;
-        let codec_name = CStr::from_ptr(avcodec_get_name(codec_id));
-        let codec_name = codec_name.to_str().unwrap_or("Unknown codec");
+        let codec_name = codec_name(codec_id);
 
         let subtitle_stream_info = StreamInfo::Subtitle {
             index,
@@ -418,7 +433,7 @@ pub fn find_subtitle_stream_info(url: impl Into<String>) -> Result<Option<Stream
             nb_frames,
             metadata,
             codec_id,
-            codec_name: codec_name.to_string(),
+            codec_name,
         };
 
         Ok(Some(subtitle_stream_info))
@@ -449,12 +464,15 @@ pub fn find_data_stream_info(url: impl Into<String>) -> Result<Option<StreamInfo
 
         let streams = (*in_fmt_ctx_box.fmt_ctx).streams;
         let data_stream = *streams.offset(data_index as isize);
+        if data_stream.is_null() {
+            return Err(FindStreamError::NoStreamFound.into());
+        }
 
         let index = (*data_stream).index;
         let time_base = (*data_stream).time_base;
         let start_time = (*data_stream).start_time;
         let duration = (*data_stream).duration;
-        let metadata = av_dict_to_hashmap((*data_stream).metadata);
+        let metadata = dict_to_hashmap((*data_stream).metadata);
 
         Ok(Some(StreamInfo::Data {
             index,
@@ -492,16 +510,19 @@ pub fn find_attachment_stream_info(url: impl Into<String>) -> Result<Option<Stre
 
         let streams = (*in_fmt_ctx_box.fmt_ctx).streams;
         let attachment_stream = *streams.offset(attachment_index as isize);
+        if attachment_stream.is_null() {
+            return Err(FindStreamError::NoStreamFound.into());
+        }
 
         let index = (*attachment_stream).index;
-        let metadata = av_dict_to_hashmap((*attachment_stream).metadata);
+        let metadata = dict_to_hashmap((*attachment_stream).metadata);
 
         let codec_parameters = (*attachment_stream).codecpar;
+        if codec_parameters.is_null() {
+            return Err(FindStreamError::NoCodecparFound.into());
+        }
         let codec_id = (*codec_parameters).codec_id;
-        let codec_name = CStr::from_ptr(avcodec_get_name(codec_id))
-            .to_str()
-            .unwrap_or("Unknown codec")
-            .to_string();
+        let codec_name = codec_name(codec_id);
 
         Ok(Some(StreamInfo::Attachment {
             index,
@@ -537,9 +558,12 @@ pub fn find_unknown_stream_info(url: impl Into<String>) -> Result<Option<StreamI
 
         let streams = (*in_fmt_ctx_box.fmt_ctx).streams;
         let unknown_stream = *streams.offset(unknown_index as isize);
+        if unknown_stream.is_null() {
+            return Err(FindStreamError::NoStreamFound.into());
+        }
 
         let index = (*unknown_stream).index;
-        let metadata = av_dict_to_hashmap((*unknown_stream).metadata);
+        let metadata = dict_to_hashmap((*unknown_stream).metadata);
 
         Ok(Some(StreamInfo::Unknown { index, metadata }))
     }
@@ -562,34 +586,54 @@ pub fn find_all_stream_infos(url: impl Into<String>) -> Result<Vec<StreamInfo>> 
     let in_fmt_ctx_box = init_format_context(url)?;
 
     unsafe {
-        let mut stream_infos = Vec::new();
+        let fmt_ctx_ptr = in_fmt_ctx_box.fmt_ctx;
+        if fmt_ctx_ptr.is_null() {
+            return Err(OpenInputError::OutOfMemory.into());
+        }
+        let fmt_ctx = &*fmt_ctx_ptr;
+        let nb_streams = fmt_ctx.nb_streams as usize;
 
-        let stream_count = (*in_fmt_ctx_box.fmt_ctx).nb_streams;
+        let mut infos = Vec::with_capacity(nb_streams);
 
-        for i in 0..stream_count {
-            let stream = *(*in_fmt_ctx_box.fmt_ctx).streams.add(i as usize);
-            let codec_parameters = (*stream).codecpar;
-            let codec_id = (*codec_parameters).codec_id;
-            let codec_name = CStr::from_ptr(avcodec_get_name(codec_id))
-                .to_str()
-                .unwrap_or("Unknown codec")
-                .to_string();
+        for i in 0..nb_streams {
+            let raw_stream = *fmt_ctx.streams.add(i);
+            if raw_stream.is_null() {
+                infos.push(StreamInfo::Unknown {
+                    index: i as i32,
+                    metadata: HashMap::new(),
+                });
+                continue;
+            }
+            let stream = &*raw_stream;
 
-            let index = (*stream).index;
-            let time_base = (*stream).time_base;
-            let start_time = (*stream).start_time;
-            let duration = (*stream).duration;
-            let nb_frames = (*stream).nb_frames;
-            let avg_frame_rate = (*stream).avg_frame_rate;
-            let metadata = av_dict_to_hashmap((*stream).metadata);
+            let metadata = dict_to_hashmap(stream.metadata);
 
-            match (*codec_parameters).codec_type {
+            if stream.codecpar.is_null() {
+                infos.push(StreamInfo::Unknown {
+                    index: stream.index,
+                    metadata,
+                });
+                continue;
+            }
+
+            let codecpar = &*stream.codecpar;
+            let codec_id = codecpar.codec_id;
+            let codec_name = codec_name(codec_id);
+
+            let index = stream.index;
+            let time_base = stream.time_base;
+            let start_time = stream.start_time;
+            let duration = stream.duration;
+            let nb_frames = stream.nb_frames;
+            let avg_frame_rate = stream.avg_frame_rate;
+
+            match codecpar.codec_type {
                 AVMEDIA_TYPE_VIDEO => {
-                    let width = (*codec_parameters).width;
-                    let height = (*codec_parameters).height;
-                    let bit_rate = (*codec_parameters).bit_rate;
-                    let pixel_format = (*codec_parameters).format;
-                    let video_delay = (*codec_parameters).video_delay;
+                    let width = codecpar.width;
+                    let height = codecpar.height;
+                    let bit_rate = codecpar.bit_rate;
+                    let pixel_format = codecpar.format;
+                    let video_delay = codecpar.video_delay;
                     let r_frame_rate = (*stream).r_frame_rate;
                     let sample_aspect_ratio = (*stream).sample_aspect_ratio;
                     let fps = if avg_frame_rate.den == 0 {
@@ -604,7 +648,7 @@ pub fn find_all_stream_infos(url: impl Into<String>) -> Result<Vec<StreamInfo>> 
                         .and_then(|rotate| rotate.parse::<i32>().ok())
                         .unwrap_or(0); // Default to 0 if no "rotate" key is found
 
-                    stream_infos.push(StreamInfo::Video {
+                    infos.push(StreamInfo::Video {
                         index,
                         time_base,
                         start_time,
@@ -626,14 +670,14 @@ pub fn find_all_stream_infos(url: impl Into<String>) -> Result<Vec<StreamInfo>> 
                     });
                 }
                 AVMEDIA_TYPE_AUDIO => {
-                    let sample_rate = (*codec_parameters).sample_rate;
+                    let sample_rate = codecpar.sample_rate;
                     #[cfg(not(feature = "docs-rs"))]
-                    let ch_layout = (*codec_parameters).ch_layout;
-                    let sample_format = (*codec_parameters).format;
-                    let frame_size = (*codec_parameters).frame_size;
-                    let bit_rate = (*codec_parameters).bit_rate;
+                    let ch_layout = codecpar.ch_layout;
+                    let sample_format = codecpar.format;
+                    let frame_size = codecpar.frame_size;
+                    let bit_rate = codecpar.bit_rate;
 
-                    stream_infos.push(StreamInfo::Audio {
+                    infos.push(StreamInfo::Audio {
                         index,
                         time_base,
                         start_time,
@@ -656,7 +700,7 @@ pub fn find_all_stream_infos(url: impl Into<String>) -> Result<Vec<StreamInfo>> 
                     });
                 }
                 AVMEDIA_TYPE_SUBTITLE => {
-                    stream_infos.push(StreamInfo::Subtitle {
+                    infos.push(StreamInfo::Subtitle {
                         index,
                         time_base,
                         start_time,
@@ -668,7 +712,7 @@ pub fn find_all_stream_infos(url: impl Into<String>) -> Result<Vec<StreamInfo>> 
                     });
                 }
                 AVMEDIA_TYPE_DATA => {
-                    stream_infos.push(StreamInfo::Data {
+                    infos.push(StreamInfo::Data {
                         index,
                         time_base,
                         start_time,
@@ -677,7 +721,7 @@ pub fn find_all_stream_infos(url: impl Into<String>) -> Result<Vec<StreamInfo>> 
                     });
                 }
                 AVMEDIA_TYPE_ATTACHMENT => {
-                    stream_infos.push(StreamInfo::Attachment {
+                    infos.push(StreamInfo::Attachment {
                         index,
                         metadata,
                         codec_id,
@@ -685,17 +729,35 @@ pub fn find_all_stream_infos(url: impl Into<String>) -> Result<Vec<StreamInfo>> 
                     });
                 }
                 AVMEDIA_TYPE_UNKNOWN => {
-                    stream_infos.push(StreamInfo::Unknown { index, metadata });
+                    infos.push(StreamInfo::Unknown { index, metadata });
                 }
                 _ => {}
             }
         }
 
-        Ok(stream_infos)
+        if infos.iter().all(|i| matches!(i, StreamInfo::Unknown { .. })) {
+            return Err(FindStreamError::NoStreamFound.into());
+        }
+
+        Ok(infos)
+    }
+}
+
+#[inline]
+fn codec_name(id: AVCodecID) -> String {
+    unsafe {
+        let ptr = avcodec_get_name(id);
+        if ptr.is_null() {
+            "Unknown codec".into()
+        } else {
+            CStr::from_ptr(ptr).to_string_lossy().into_owned()
+        }
     }
 }
 
 fn init_format_context(url: impl Into<String>) -> Result<AVFormatContextBox> {
+    crate::core::initialize_ffmpeg();
+
     unsafe {
         let mut in_fmt_ctx = avformat_alloc_context();
         if in_fmt_ctx.is_null() {
@@ -744,22 +806,22 @@ fn init_format_context(url: impl Into<String>) -> Result<AVFormatContextBox> {
     }
 }
 
-unsafe fn av_dict_to_hashmap(dict: *mut AVDictionary) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    let mut entry: *mut AVDictionaryEntry = null_mut();
-
-    while {
-        entry = av_dict_get(dict, null(), entry, AV_DICT_IGNORE_SUFFIX);
-        !entry.is_null()
-    } {
-        let key = CStr::from_ptr((*entry).key).to_string_lossy().into_owned();
-        let value = CStr::from_ptr((*entry).value)
-            .to_string_lossy()
-            .into_owned();
-
-        map.insert(key, value);
+fn dict_to_hashmap(dict: *mut AVDictionary) -> HashMap<String, String> {
+    if dict.is_null() {
+        return HashMap::new();
     }
-
+    let mut map = HashMap::new();
+    unsafe {
+        let mut e: *mut AVDictionaryEntry = null_mut();
+        while {
+            e = av_dict_get(dict, null(), e, AV_DICT_IGNORE_SUFFIX);
+            !e.is_null()
+        } {
+            let k = CStr::from_ptr((*e).key).to_string_lossy().into_owned();
+            let v = CStr::from_ptr((*e).value).to_string_lossy().into_owned();
+            map.insert(k, v);
+        }
+    }
     map
 }
 
