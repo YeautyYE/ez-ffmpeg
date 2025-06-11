@@ -86,22 +86,40 @@ unsafe impl Send for HWDevice {}
 unsafe impl Sync for HWDevice {}
 
 pub(crate) unsafe fn hw_device_free_all() {
-    if let Some(dev) = FILTER_HW_DEVICE.get() {
-        let mut dev_option = dev.lock().unwrap();
-        if let Some(dev) = dev_option.as_mut() {
-            if !dev.device_ref.is_null() {
-                av_buffer_unref(&mut dev.device_ref);
+    // Free the global filter hardware device
+    if let Some(filter_device) = FILTER_HW_DEVICE.get() {
+        match filter_device.lock() {
+            Ok(mut device_guard) => {
+                if let Some(device) = device_guard.as_mut() {
+                    // Check if device reference is valid to avoid double free
+                    if !device.device_ref.is_null() {
+                        av_buffer_unref(&mut device.device_ref);
+                        // Note: av_buffer_unref will set the pointer to null
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to lock global filter hardware device: {}", e);
             }
         }
     }
 
-    if let Some(devices) = HW_DEVICES.get() {
-        let mut devices = devices.lock().unwrap();
-        if !devices.is_empty() {
-            for dev in devices.iter_mut() {
-                if !dev.device_ref.is_null() {
-                    av_buffer_unref(&mut dev.device_ref);
+    // Free all devices in the hardware device list
+    if let Some(hw_devices) = HW_DEVICES.get() {
+        match hw_devices.lock() {
+            Ok(mut devices_guard) => {
+                // Iterate through and free each device reference
+                for device in devices_guard.iter_mut() {
+                    if !device.device_ref.is_null() {
+                        av_buffer_unref(&mut device.device_ref);
+                        // av_buffer_unref automatically sets pointer to null to prevent dangling pointers
+                    }
                 }
+                // Optional: Clear the device list to free Vec memory
+                devices_guard.clear();
+            }
+            Err(e) => {
+                error!("Failed to lock hardware device list: {}", e);
             }
         }
     }
