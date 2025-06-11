@@ -56,9 +56,11 @@ pub(crate) fn dec_init(
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
 ) -> crate::error::Result<()> {
     let receiver = dec_stream.take_src();
+    let decoder_name = unsafe {std::str::from_utf8_unchecked(CStr::from_ptr((*dec_stream.codec.as_ptr()).name).to_bytes())};
+
     if receiver.is_none() {
         debug!(
-            "Demuxer stream:[{}] not be used. skip.",
+            "Demuxer:{demux_idx}:{decoder_name} stream:[{}] not be used. skip.",
             dec_stream.stream_index
         );
         return Ok(());
@@ -72,7 +74,6 @@ pub(crate) fn dec_init(
     let senders = dec_stream.take_dsts();
     let exit_on_error = exit_on_error.unwrap_or(false);
 
-    let decoder_name = unsafe {std::str::from_utf8_unchecked(CStr::from_ptr((*dec_stream.codec.as_ptr()).name).to_bytes())};
 
     let dp_arc = dp_arc.clone();
     let result = std::thread::Builder::new()
