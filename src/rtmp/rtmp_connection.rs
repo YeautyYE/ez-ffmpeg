@@ -1,4 +1,4 @@
-use log::debug;
+use log::{debug, warn};
 use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
 use std::io;
 use std::io::{Read, Write};
@@ -40,7 +40,7 @@ pub(super) struct RtmpConnection {
 impl RtmpConnection {
     pub(super) fn new(connection_id: usize, socket: TcpStream) -> io::Result<Self> {
 
-        let (byte_sender, byte_receiver) = crossbeam_channel::unbounded();
+        let (byte_sender, byte_receiver) = crossbeam_channel::bounded(1024);
         let (result_sender, result_receiver) = crossbeam_channel::unbounded();
 
         start_byte_writer(byte_receiver, &socket)?;
@@ -56,8 +56,14 @@ impl RtmpConnection {
     }
 
     pub(super) fn write(&self, bytes: Vec<u8>) {
-        if let Err(err) = self.writer.send(bytes) {
-            debug!("Rtmp client send error: {:?}", err);
+        if let Err(e) = self.writer.try_send(bytes) {
+            if e.is_full() {
+                warn!("Connection {} client buffer full, dropping packet.", self.connection_id);
+                return
+            }
+            if e.is_disconnected() {
+                debug!("Connection {} receiver disconnected.", self.connection_id);
+            }
         }
     }
 
