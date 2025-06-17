@@ -134,7 +134,7 @@ impl EmbedRtmpServer<Initialization> {
         self.status.store(STATUS_RUN, Ordering::Release);
 
         let (stream_sender, stream_receiver) = crossbeam_channel::unbounded();
-        let (publisher_sender, publisher_receiver) = crossbeam_channel::unbounded();
+        let (publisher_sender, publisher_receiver) = crossbeam_channel::bounded(1024);
         self.publisher_sender = Some(publisher_sender);
         let stream_keys = self.stream_keys.clone();
         let status = self.status.clone();
@@ -189,18 +189,18 @@ impl EmbedRtmpServer<Initialization> {
 }
 
 impl EmbedRtmpServer<Running> {
-    /// Creates an RTMP “input” endpoint for this server (from the server’s perspective),
+    /// Creates an RTMP "input" endpoint for this server (from the server's perspective),
     /// returning an [`Output`] that can be used by FFmpeg to push media data.
     ///
     /// From the FFmpeg standpoint, the returned [`Output`] is where media content is
-    /// sent (i.e., FFmpeg “outputs” to this RTMP server). After obtaining this [`Output`],
+    /// sent (i.e., FFmpeg "outputs" to this RTMP server). After obtaining this [`Output`],
     /// you can pass it to your FFmpeg job or scheduler to start streaming data into the server.
     ///
     /// # Parameters
     ///
     /// * `app_name` - The RTMP application name, typically corresponding to the `app` part
     ///   of an RTMP URL (e.g., `rtmp://host:port/app/stream_key`).
-    /// * `stream_key` - The stream key (or “stream name”). If a stream with the same key
+    /// * `stream_key` - The stream key (or "stream name"). If a stream with the same key
     ///   already exists, an error will be returned.
     ///
     /// # Returns
@@ -219,7 +219,7 @@ impl EmbedRtmpServer<Running> {
     /// let mut rtmp_server = EmbedRtmpServer::new("localhost:1935");
     /// rtmp_server.start().expect("Failed to start RTMP server");
     ///
-    /// // 2. Create an RTMP “input” with app_name="my-app" and stream_key="my-stream"
+    /// // 2. Create an RTMP "input" with app_name="my-app" and stream_key="my-stream"
     /// let output = rtmp_server
     ///     .create_rtmp_input("my-app", "my-stream")
     ///     .expect("Failed to create RTMP input");
@@ -278,13 +278,13 @@ impl EmbedRtmpServer<Running> {
     /// # Returns
     ///
     /// * `crossbeam_channel::Sender<Vec<u8>>` - A sender that allows you to send raw RTMP bytes
-    ///   into the server’s handling pipeline.
+    ///   into the server's handling pipeline.
     /// * [`crate::error::Error`] - If a stream with the same key already exists or other
     ///   internal issues occur, an error is returned.
     ///
     /// # Notes
     ///
-    /// * This function sets up the initial RTMP “connect” and “publish” commands automatically.
+    /// * This function sets up the initial RTMP "connect" and "publish" commands automatically.
     /// * If you manually send bytes to the resulting channel, they should already be properly
     ///   packaged as RTMP chunks. Otherwise, the server might fail to parse them.
     pub fn create_stream_sender(
