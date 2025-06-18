@@ -2409,18 +2409,17 @@ unsafe fn open_input_file(
 
             let url_cstr = CString::new(url.as_str())?;
 
-            let format_opts = convert_options(input.format_opts.clone())?;
-            let mut format_opts = hashmap_to_avdictionary(&format_opts);
+            let input_opts = convert_options(input.input_opts.clone())?;
+            let mut input_opts = hashmap_to_avdictionary(&input_opts);
             let scan_all_pmts_key = CString::new("scan_all_pmts")?;
-            if ffmpeg_sys_next::av_dict_get(format_opts, scan_all_pmts_key.as_ptr(), null(), ffmpeg_sys_next::AV_DICT_MATCH_CASE).is_null() {
+            if ffmpeg_sys_next::av_dict_get(input_opts, scan_all_pmts_key.as_ptr(), null(), ffmpeg_sys_next::AV_DICT_MATCH_CASE).is_null() {
                 let scan_all_pmts_value = CString::new("1")?;
-                ffmpeg_sys_next::av_dict_set(&mut format_opts, scan_all_pmts_key.as_ptr(), scan_all_pmts_value.as_ptr(), ffmpeg_sys_next::AV_DICT_DONT_OVERWRITE);
+                ffmpeg_sys_next::av_dict_set(&mut input_opts, scan_all_pmts_key.as_ptr(), scan_all_pmts_value.as_ptr(), ffmpeg_sys_next::AV_DICT_DONT_OVERWRITE);
             };
             (*in_fmt_ctx).flags |= ffmpeg_sys_next::AVFMT_FLAG_NONBLOCK;
 
-            let mut ret =
-                avformat_open_input(&mut in_fmt_ctx, url_cstr.as_ptr(), file_iformat, &mut format_opts);
-            av_dict_free(&mut format_opts);
+            let mut ret = avformat_open_input(&mut in_fmt_ctx, url_cstr.as_ptr(), file_iformat, &mut input_opts);
+            av_dict_free(&mut input_opts);
             if ret < 0 {
                 avformat_close_input(&mut in_fmt_ctx);
                 return Err(OpenInputError::from(ret).into());

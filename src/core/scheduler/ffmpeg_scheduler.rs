@@ -554,7 +554,7 @@ mod tests {
 
         let result = FfmpegContext::builder()
             .input(Input::from("logo.jpg")
-                .set_format_opt("loop", "1")
+                .set_input_opt("loop", "1")
                 .set_recording_time_us(10 * 1000_000)
             )
             .filter_desc("scale=1280:720")
