@@ -207,18 +207,33 @@ pub struct Input {
     /// select output format used with HW accelerated decoding
     pub(crate) hwaccel_output_format: Option<String>,
 
-    /// The input format options for the demuxer.
+    /// Input options for avformat_open_input.
     ///
-    /// This field stores additional format-specific options that are passed to the FFmpeg demuxer.
-    /// It is a collection of key-value pairs that can modify the behavior of the input format.
+    /// This field stores options that are passed to FFmpeg's `avformat_open_input()` function.
+    /// These options can affect different layers of the input processing pipeline:
     ///
-    /// **Common examples** might include:
-    /// - `framerate=30` (for device inputs like `avfoundation`).
-    /// - `probesize` or `analyzeduration` (for adjusting how FFmpeg probes input data).
+    /// **Format/Demuxer options:**
+    /// - `probesize` - Maximum data to probe for format detection
+    /// - `analyzeduration` - Duration to analyze for stream info
+    /// - `fflags` - Format flags (e.g., "+genpts")
     ///
-    /// These options are used when initializing the FFmpeg input format, allowing you to
-    /// fine-tune or override default demuxer behavior.
-    pub(crate) format_opts: Option<HashMap<String, String>>,
+    /// **Protocol options:**
+    /// - `user_agent` - HTTP User-Agent header
+    /// - `timeout` - Network timeout in microseconds
+    /// - `headers` - Custom HTTP headers
+    ///
+    /// **Device options:**
+    /// - `framerate` - Input framerate (for avfoundation, dshow, etc.)
+    /// - `video_size` - Input video resolution
+    /// - `pixel_format` - Input pixel format
+    ///
+    /// **General input options:**
+    /// - `thread_queue_size` - Input thread queue size
+    /// - `re` - Read input at native frame rate
+    ///
+    /// These options allow fine-tuning of input behavior across different components
+    /// of the FFmpeg input pipeline.
+    pub(crate) input_opts: Option<HashMap<String, String>>,
 }
 
 impl Input {
@@ -758,65 +773,68 @@ impl Input {
         self
     }
 
-    /// Sets a single input format-specific option.
+    /// Sets a single input option for avformat_open_input.
     ///
-    /// This method allows you to configure a single key-value pair that will be passed
-    /// to the FFmpeg demuxer. If the same key already exists, it will be overwritten.
+    /// This method configures options that will be passed to FFmpeg's `avformat_open_input()`
+    /// function. The options can control behavior at different levels including format detection,
+    /// protocol handling, device configuration, and general input processing.
     ///
     /// **Example Usage:**
     /// ```rust
     /// let input = Input::new("avfoundation:0")
-    ///     .set_format_opt("framerate", "30");
+    ///     .set_input_opt("framerate", "30")
+    ///     .set_input_opt("probesize", "5000000");
     /// ```
     ///
     /// ### Parameters:
-    /// - `key`: The format option name (e.g., `"framerate"`, `"probesize"`).
-    /// - `value`: The value to set (e.g., `"30"`, `"5000000"`).
+    /// - `key`: The option name (e.g., `"framerate"`, `"probesize"`, `"timeout"`).
+    /// - `value`: The option value (e.g., `"30"`, `"5000000"`, `"10000000"`).
     ///
     /// ### Return Value:
-    /// - Returns the modified `Input` instance for chaining.
-    pub fn set_format_opt(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        if let Some(ref mut opts) = self.format_opts {
+    /// - Returns the modified `Input` instance for method chaining.
+    pub fn set_input_opt(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        if let Some(ref mut opts) = self.input_opts {
             opts.insert(key.into(), value.into());
         } else {
             let mut opts = HashMap::new();
             opts.insert(key.into(), value.into());
-            self.format_opts = Some(opts);
+            self.input_opts = Some(opts);
         }
         self
     }
 
-    /// Sets multiple input format-specific options at once.
+    /// Sets multiple input options at once for avformat_open_input.
     ///
-    /// This method allows setting multiple key-value pairs in a single call.
-    /// Each provided key-value pair will be inserted into the `format_opts` map,
-    /// overwriting any existing keys with the same name.
+    /// This method allows setting multiple options in a single call, which will all be
+    /// passed to FFmpeg's `avformat_open_input()` function. Each key-value pair will be
+    /// inserted into the options map, overwriting any existing keys with the same name.
     ///
     /// **Example Usage:**
     /// ```rust
-    /// let input = Input::new("avfoundation:0")
-    ///     .set_format_opts(vec![
-    ///         ("framerate", "30"),
-    ///         ("video_size", "1280x720"),
+    /// let input = Input::new("http://example.com/stream.m3u8")
+    ///     .set_input_opts(vec![
+    ///         ("user_agent", "MyApp/1.0"),
+    ///         ("timeout", "10000000"),
+    ///         ("probesize", "5000000"),
     ///     ]);
     /// ```
     ///
     /// ### Parameters:
-    /// - `opts`: A vector of key-value pairs representing demuxer options.
+    /// - `opts`: A vector of key-value pairs representing input options.
     ///
     /// ### Return Value:
-    /// - Returns the modified `Input` instance for chaining.
-    pub fn set_format_opts(mut self, opts: Vec<(impl Into<String>, impl Into<String>)>) -> Self {
-        if let Some(ref mut format_opts) = self.format_opts {
+    /// - Returns the modified `Input` instance for method chaining.
+    pub fn set_input_opts(mut self, opts: Vec<(impl Into<String>, impl Into<String>)>) -> Self {
+        if let Some(ref mut input_opts) = self.input_opts {
             for (key, value) in opts {
-                format_opts.insert(key.into(), value.into());
+                input_opts.insert(key.into(), value.into());
             }
         } else {
-            let mut format_opts = HashMap::new();
+            let mut input_opts = HashMap::new();
             for (key, value) in opts {
-                format_opts.insert(key.into(), value.into());
+                input_opts.insert(key.into(), value.into());
             }
-            self.format_opts = Some(format_opts);
+            self.input_opts = Some(input_opts);
         }
         self
     }
@@ -843,7 +861,7 @@ impl From<Box<dyn FnMut(&mut [u8]) -> i32>> for Input {
             hwaccel: None,
             hwaccel_device: None,
             hwaccel_output_format: None,
-            format_opts: None,
+            input_opts: None,
         }
     }
 }
@@ -868,7 +886,7 @@ impl From<String> for Input {
             hwaccel: None,
             hwaccel_device: None,
             hwaccel_output_format: None,
-            format_opts: None,
+            input_opts: None,
         }
     }
 }
