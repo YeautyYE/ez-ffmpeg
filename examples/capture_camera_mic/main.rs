@@ -23,13 +23,13 @@ fn main() {
         // Using device index
         let input = Input::from("0:0") // video device 0 and audio device 0
             .set_format("avfoundation")
-            .set_format_opt("framerate", "30")
-            .set_format_opt("video_size", "1280x720");
+            .set_input_opt("framerate", "30")
+            .set_input_opt("video_size", "1280x720");
         // Using device name (commented out as an alternative)
         // let input = Input::from("FaceTime HD Camera:Built-in Microphone")
         //     .set_format("avfoundation")
-        //     .set_format_opt("framerate", "30")
-        //     .set_format_opt("video_size", "1280x720");
+        //     .set_input_opt("framerate", "30")
+        //     .set_input_opt("video_size", "1280x720");
 
         let scheduler = FfmpegContext::builder()
             .input(input)
@@ -47,8 +47,8 @@ fn main() {
         // Windows: dshow uses device names, e.g., "video=Integrated Webcam:audio=Microphone"
         let input = Input::from("video=Integrated Webcam:audio=Microphone")
             .set_format("dshow")
-            .set_format_opt("framerate", "30")
-            .set_format_opt("video_size", "1280x720");
+            .set_input_opt("framerate", "30")
+            .set_input_opt("video_size", "1280x720");
 
         let scheduler = FfmpegContext::builder()
             .input(input)
@@ -66,8 +66,8 @@ fn main() {
         // Linux: separate inputs for video (v4l2) and audio (alsa)
         let video_input = Input::from("/dev/video0")
             .set_format("v4l2")
-            .set_format_opt("framerate", "30")
-            .set_format_opt("video_size", "1280x720");
+            .set_input_opt("framerate", "30")
+            .set_input_opt("video_size", "1280x720");
         let audio_input = Input::from("hw:0")
             .set_format("alsa");
 
