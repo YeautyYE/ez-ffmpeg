@@ -8,7 +8,7 @@ fn main() {
         .input(
             Input::from("logo.jpg")
                 // Set the "loop" format option to 1 to repeat the image
-                .set_format_opt("loop", "1")
+                .set_input_opt("loop", "1")
         )
         // Optionally scale the image to the desired output resolution
         .filter_desc("scale=1280:720")
