@@ -905,14 +905,14 @@ mod tests {
     #[test]
     fn test_new_by_read_callback() {
         let data_source = b"example custom data source".to_vec();
-        let input = Input::new_by_read_callback(move |buf| {
+        let _input = Input::new_by_read_callback(move |buf| {
             let len = data_source.len().min(buf.len());
             buf[..len].copy_from_slice(&data_source[..len]);
             len as i32 // Return the number of bytes written
         });
 
         let data_source2 = b"example custom data source2".to_vec();
-        let input = Input::new_by_read_callback(move |buf2| {
+        let _input = Input::new_by_read_callback(move |buf2| {
             let len = data_source2.len().min(buf2.len());
             buf2[..len].copy_from_slice(&data_source2[..len]);
             len as i32 // Return the number of bytes written
