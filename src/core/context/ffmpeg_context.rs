@@ -2700,12 +2700,12 @@ mod tests {
             vec![Output::from("output.mp4").add_stream_map("my-out")],
         )
         .unwrap();
-        let _ffmpeg_context = FfmpegContext::new(
+        let result = FfmpegContext::new(
             vec!["test.mp4".into()],
             vec!["hue=s=0".into()],
-            vec![Output::from("output.mp4").add_stream_map_with_copy("0:v?")],
-        )
-        .unwrap();
+            vec![Output::from("output.mp4").add_stream_map("0:v?")],
+        );
+        assert!(result.is_err());
         let result = FfmpegContext::new(
             vec!["test.mp4".into()],
             vec!["hue=s=0".into()],
@@ -2743,14 +2743,14 @@ mod tests {
             .is_test(true)
             .try_init();
 
-        let context1 = FfmpegContext::builder()
+        let _context1 = FfmpegContext::builder()
             .input("test.mp4")
             .filter_desc("hue=s=0")
             .output("output.mp4")
             .build()
             .unwrap();
 
-        let context2 = FfmpegContext::builder()
+        let _context2 = FfmpegContext::builder()
             .inputs(vec!["test.mp4"])
             .filter_descs(vec!["hue=s=0"])
             .outputs(vec!["output.mp4"])

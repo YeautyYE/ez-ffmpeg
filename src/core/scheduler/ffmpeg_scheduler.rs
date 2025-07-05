@@ -681,7 +681,7 @@ mod tests {
                 match input.read(buf) {
                     Ok(0) => ffmpeg_sys_next::AVERROR_EOF,
                     Ok(bytes_read) => bytes_read as i32,
-                    Err(e) => ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO),
+                    Err(_) => ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO),
                 }
             })
         };
@@ -710,7 +710,7 @@ mod tests {
 
                 match seek_result {
                     Ok(new_pos) => new_pos as i64,
-                    Err(e) => ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO) as i64,
+                    Err(_) => ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO) as i64,
                 }
             })
         };
@@ -726,7 +726,7 @@ mod tests {
                 let mut output_file = output_file.lock().unwrap();
                 match output_file.write_all(buf) {
                     Ok(_) => buf.len() as i32,
-                    Err(e) => ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO),
+                    Err(_) => ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO),
                 }
             })
         };
@@ -798,7 +798,7 @@ mod tests {
             .is_test(true)
             .try_init();
 
-        let mut output: Output = "output.mp4".into();
+        let output: Output = "output.mp4".into();
         let frame_pipeline_builder: FramePipelineBuilder = AVMediaType::AVMEDIA_TYPE_VIDEO.into();
         let frame_pipeline_builder = frame_pipeline_builder.filter("test", Box::new(NoopFilter::new(AVMediaType::AVMEDIA_TYPE_VIDEO)));
         let output = output.add_frame_pipeline(frame_pipeline_builder);
@@ -844,8 +844,8 @@ mod tests {
             .is_test(true)
             .try_init();
 
-        let mut input: Input = "test.mp4".into();
-        let mut output: Output = "output.mp4".into();
+        let input: Input = "test.mp4".into();
+        let output: Output = "output.mp4".into();
 
         let result = FfmpegContext::builder()
             .input(input.set_hwaccel("videotoolbox"))
