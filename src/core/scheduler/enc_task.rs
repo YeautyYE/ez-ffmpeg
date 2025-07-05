@@ -258,7 +258,7 @@ fn process_audio_queue(
             *samples_sent += nb_samples as i64;
             *frames_sent = *samples_sent / frame_samples as i64;
 
-            return if *is_finished {
+            return if *is_finished && frame_is_null(&peek.frame) {
                 Ok(audio_frame_queue.pop_front())
             } else {
                 unsafe {
