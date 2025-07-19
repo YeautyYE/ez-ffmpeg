@@ -540,6 +540,7 @@ unsafe fn mux_fixup_ts(
             if (*pkt).pts >= (*pkt).dts {
                 (*pkt).pts = std::cmp::max((*pkt).pts, max);
             }
+            (*pkt).dts = max;
         }
     }
     *last_mux_dts = (*pkt).dts;
