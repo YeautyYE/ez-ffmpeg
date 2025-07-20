@@ -488,7 +488,7 @@ unsafe fn mux_fixup_ts(
     }
     let last_mux_dts = st_last_dts_map.get_mut(&stream_index).unwrap();
 
-    if oformat_flags & AVFMT_NOTIMESTAMPS == 0 {
+    if (oformat_flags & AVFMT_NOTIMESTAMPS) == 0 {
         if (*pkt).dts != AV_NOPTS_VALUE && (*pkt).pts != AV_NOPTS_VALUE && (*pkt).dts > (*pkt).pts {
             warn!(
                 "Invalid DTS: {} PTS: {}, replacing by guess",
@@ -500,47 +500,47 @@ unsafe fn mux_fixup_ts(
                 - max3((*pkt).pts, (*pkt).dts, *last_mux_dts + 1);
             (*pkt).dts = (*pkt).pts;
         }
-    }
 
-    if (packet_data.codec_type == AVMEDIA_TYPE_AUDIO
-        || packet_data.codec_type == AVMEDIA_TYPE_VIDEO
-        || packet_data.codec_type == AVMEDIA_TYPE_SUBTITLE)
-        && (*pkt).dts != AV_NOPTS_VALUE
-        && *last_mux_dts != AV_NOPTS_VALUE
-    {
-        let max = *last_mux_dts + (oformat_flags & AVFMT_TS_NONSTRICT == 0) as i64;
-        if (*pkt).dts < max {
-            let loglevel = if max - (*pkt).dts > 2 || packet_data.codec_type == AVMEDIA_TYPE_VIDEO {
-                AV_LOG_WARNING
-            } else {
-                AV_LOG_DEBUG
-            };
-            if loglevel == AV_LOG_WARNING {
-                warn!(
-                    "Non-monotonic DTS; previous: {}, current: {}; ",
-                    *last_mux_dts,
-                    (*pkt).dts
-                );
-                warn!(
-                    "changing to {}. This may result in incorrect timestamps in the output file.",
-                    max
-                );
-            } else {
-                debug!(
-                    "Non-monotonic DTS; previous: {}, current: {}; ",
-                    *last_mux_dts,
-                    (*pkt).dts
-                );
-                debug!(
-                    "changing to {}. This may result in incorrect timestamps in the output file.",
-                    max
-                );
-            }
+        if (packet_data.codec_type == AVMEDIA_TYPE_AUDIO
+            || packet_data.codec_type == AVMEDIA_TYPE_VIDEO
+            || packet_data.codec_type == AVMEDIA_TYPE_SUBTITLE)
+            && (*pkt).dts != AV_NOPTS_VALUE
+            && *last_mux_dts != AV_NOPTS_VALUE
+        {
+            let max = *last_mux_dts + ((oformat_flags & AVFMT_TS_NONSTRICT) == 0) as i64;
+            if (*pkt).dts < max {
+                let loglevel = if max - (*pkt).dts > 2 || packet_data.codec_type == AVMEDIA_TYPE_VIDEO {
+                    AV_LOG_WARNING
+                } else {
+                    AV_LOG_DEBUG
+                };
+                if loglevel == AV_LOG_WARNING {
+                    warn!(
+                        "Non-monotonic DTS; previous: {}, current: {}; ",
+                        *last_mux_dts,
+                        (*pkt).dts
+                    );
+                    warn!(
+                        "changing to {}. This may result in incorrect timestamps in the output file.",
+                        max
+                    );
+                } else {
+                    debug!(
+                        "Non-monotonic DTS; previous: {}, current: {}; ",
+                        *last_mux_dts,
+                        (*pkt).dts
+                    );
+                    debug!(
+                        "changing to {}. This may result in incorrect timestamps in the output file.",
+                        max
+                    );
+                }
 
-            if (*pkt).pts >= (*pkt).dts {
-                (*pkt).pts = std::cmp::max((*pkt).pts, max);
+                if (*pkt).pts >= (*pkt).dts {
+                    (*pkt).pts = std::cmp::max((*pkt).pts, max);
+                }
+                (*pkt).dts = max;
             }
-            (*pkt).dts = max;
         }
     }
     *last_mux_dts = (*pkt).dts;
