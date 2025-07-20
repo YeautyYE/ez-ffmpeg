@@ -2326,6 +2326,22 @@ unsafe fn open_input_file(
         }
     };
 
+    let file_iformat = if let Some(format) = &input.format {
+        let format_cstr = CString::new(format.clone())?;
+
+        let file_iformat = ffmpeg_sys_next::av_find_input_format(format_cstr.as_ptr());
+        if file_iformat.is_null() {
+            error!("Unknown input format: '{format}'");
+            return Err(OpenInputError::InvalidFormat(format.clone()).into());
+        }
+        file_iformat
+    } else {
+        null()
+    };
+
+    let input_opts = convert_options(input.input_opts.clone())?;
+    let mut input_opts = hashmap_to_avdictionary(&input_opts);
+
     match &input.url {
         None => {
             if input.read_callback.is_none() {
@@ -2369,7 +2385,7 @@ unsafe fn open_input_file(
             (*in_fmt_ctx).pb = avio_ctx;
             (*in_fmt_ctx).flags = AVFMT_FLAG_CUSTOM_IO;
 
-            let ret = avformat_open_input(&mut in_fmt_ctx, null(), null(), null_mut());
+            let ret = avformat_open_input(&mut in_fmt_ctx, null(), file_iformat, &mut input_opts);
             if ret < 0 {
                 av_freep(&mut (*avio_ctx).buffer as *mut _ as *mut c_void);
                 avio_context_free(&mut avio_ctx);
@@ -2394,23 +2410,8 @@ unsafe fn open_input_file(
             }
         }
         Some(url) => {
-            let file_iformat = if let Some(format) = &input.format {
-                let format_cstr = CString::new(format.clone())?;
-
-                let file_iformat = ffmpeg_sys_next::av_find_input_format(format_cstr.as_ptr());
-                if file_iformat.is_null() {
-                    error!("Unknown input format: '{format}'");
-                    return Err(OpenInputError::InvalidFormat(format.clone()).into());
-                }
-                file_iformat
-            } else {
-                null()
-            };
-
             let url_cstr = CString::new(url.as_str())?;
 
-            let input_opts = convert_options(input.input_opts.clone())?;
-            let mut input_opts = hashmap_to_avdictionary(&input_opts);
             let scan_all_pmts_key = CString::new("scan_all_pmts")?;
             if ffmpeg_sys_next::av_dict_get(input_opts, scan_all_pmts_key.as_ptr(), null(), ffmpeg_sys_next::AV_DICT_MATCH_CASE).is_null() {
                 let scan_all_pmts_value = CString::new("1")?;
