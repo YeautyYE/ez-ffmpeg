@@ -378,6 +378,7 @@ unsafe fn ts_fixup(
     demux_paramter: &mut DemuxerParamter,
     in_fmt_ctx: *mut AVFormatContext,
     pkt: *mut AVPacket,
+    copy_ts: bool,
 ) {}
 
 #[cfg(not(feature = "docs-rs"))]

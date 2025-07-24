@@ -1406,8 +1406,8 @@ unsafe fn free_output_av_format_context(muxs: Vec<Muxer>) {
 }
 
 #[cfg(feature = "docs-rs")]
-unsafe fn open_output_file(index: usize, output: &mut Output) -> Result<Muxer> {
-    Err(Bug)
+unsafe fn open_output_file(index: usize, output: &mut Output, copy_ts: bool) -> Result<Muxer> {
+    Err(Error::Bug)
 }
 
 #[cfg(not(feature = "docs-rs"))]
@@ -2094,7 +2094,7 @@ fn init_filter_graph(
     filter_desc: &str,
     hw_device: Option<String>,
 ) -> Result<FilterGraph> {
-    Err(Bug)
+    Err(Error::Bug)
 }
 
 #[cfg(not(feature = "docs-rs"))]
@@ -2298,8 +2298,9 @@ unsafe fn free_input_av_format_context(demuxs: Vec<Demuxer>) {
 unsafe fn open_input_file(
     index: usize,
     input: &mut Input,
+    copy_ts: bool,
 ) -> Result<Demuxer> {
-    Err(Bug)
+    Err(Error::Bug)
 }
 
 #[cfg(not(feature = "docs-rs"))]
