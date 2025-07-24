@@ -228,7 +228,7 @@ pub(crate) fn dec_init(
 unsafe fn transcode_subtitles(
     dp_arc: Arc<Mutex<DecoderParameter>>,
     exit_on_error: bool,
-    mut packet_box: PacketBox,
+    packet_box: PacketBox,
     packet_pool: &ObjPool<Packet>,
     frame_pool: &ObjPool<Frame>,
     senders: &Vec<Sender<FrameBox>>,

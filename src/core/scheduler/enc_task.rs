@@ -451,6 +451,17 @@ fn get_max_frames(codec_type: AVMediaType, max_video_frames: Option<i64>, max_au
     }
 }
 
+#[cfg(feature = "docs-rs")]
+unsafe fn receive_samples(
+    samples_queued: &mut i32,
+    audio_frame_queue: &mut VecDeque<FrameBox>,
+    nb_samples: i32,
+    frame_pool: &ObjPool<Frame>,
+    align_mask: usize,
+) -> Result<FrameBox, i32> {
+    Err(ffmpeg_sys_next::AVERROR_BUG)
+}
+
 #[cfg(not(feature = "docs-rs"))]
 unsafe fn receive_samples(
     samples_queued: &mut i32,
@@ -564,6 +575,17 @@ unsafe fn receive_samples(
         frame: dst,
         frame_data,
     })
+}
+
+#[cfg(feature = "docs-rs")]
+fn enc_open(
+    enc_ctx: *mut AVCodecContext,
+    stream: *mut AVStream,
+    frame_box: &mut FrameBox,
+    ready_sender: Option<Sender<i32>>,
+    bits_per_raw_sample: Option<i32>,
+) -> crate::error::Result<()> {
+    Ok(())
 }
 
 #[cfg(not(feature = "docs-rs"))]
