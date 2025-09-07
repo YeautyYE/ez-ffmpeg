@@ -56,7 +56,22 @@ pub(crate) fn dec_init(
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
 ) -> crate::error::Result<()> {
     let receiver = dec_stream.take_src();
-    let decoder_name = unsafe {std::str::from_utf8_unchecked(CStr::from_ptr((*dec_stream.codec.as_ptr()).name).to_bytes())};
+    
+    let codec_ptr = dec_stream.codec.as_ptr();
+    if codec_ptr.is_null() {
+        error!("Decoder codec pointer is null for stream {}", dec_stream.stream_index);
+        return Err(OpenDecoder(OpenDecoderOperationError::ContextAllocationError(OpenDecoderError::OutOfMemory)));
+    }
+    
+    let codec_name_ptr = unsafe { (*codec_ptr).name };
+    if codec_name_ptr.is_null() {
+        error!("Decoder codec name pointer is null for stream {}", dec_stream.stream_index);
+        return Err(OpenDecoder(OpenDecoderOperationError::ContextAllocationError(OpenDecoderError::OutOfMemory)));
+    }
+    
+    let decoder_name = unsafe {
+        std::str::from_utf8_unchecked(CStr::from_ptr(codec_name_ptr).to_bytes())
+    };
 
     if receiver.is_none() {
         debug!(
