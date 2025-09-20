@@ -249,7 +249,8 @@ fn _mux_init(
 
             let mux_stream_node = unsafe { &mux_stream_nodes[(*pkt).stream_index as usize] };
             unsafe {
-                if packet_is_null(&packet_box.packet) || packet_box.packet.is_empty() {
+                let has_side_data = (*packet_box.packet.as_ptr()).side_data_elems > 0;
+                if packet_is_null(&packet_box.packet) || (packet_box.packet.is_empty() && !has_side_data) {
                     nb_done += 1;
                     packet_pool.release(packet_box.packet);
 
