@@ -12,11 +12,7 @@ use ffmpeg_sys_next::AVPixelFormat::{
     AV_PIX_FMT_CUDA, AV_PIX_FMT_MEDIACODEC, AV_PIX_FMT_NONE, AV_PIX_FMT_QSV,
 };
 use ffmpeg_sys_next::{
-    av_codec_is_decoder, av_codec_iterate, av_get_pix_fmt, av_hwdevice_find_type_by_name,
-    av_hwdevice_get_type_name, avcodec_descriptor_get, avcodec_descriptor_get_by_name,
-    avcodec_find_decoder, avcodec_find_decoder_by_name,
-    avcodec_get_hw_config, AVCodecID, AVCodecParameters, AVFormatContext,
-    AVHWDeviceType, AVMediaType, AVPixelFormat, AVERROR, AVERROR_DECODER_NOT_FOUND, EINVAL,
+    av_channel_layout_default, av_codec_is_decoder, av_codec_iterate, av_get_pix_fmt, av_hwdevice_find_type_by_name, av_hwdevice_get_type_name, avcodec_descriptor_get, avcodec_descriptor_get_by_name, avcodec_find_decoder, avcodec_find_decoder_by_name, avcodec_get_hw_config, AVChannelOrder, AVCodecID, AVCodecParameters, AVFormatContext, AVHWDeviceType, AVMediaType, AVPixelFormat, AVERROR, AVERROR_DECODER_NOT_FOUND, EINVAL
 };
 use log::{debug, error, warn};
 use std::ffi::{CStr, CString};
@@ -132,6 +128,12 @@ impl Demuxer {
                     )?;
 
                 let codec_id = (*codec_parameters).codec_id;
+
+                if codec_type == AVMEDIA_TYPE_AUDIO
+                    && (*codec_parameters).ch_layout.order == AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC
+                        && (*codec_parameters).ch_layout.nb_channels > 0 {
+                        av_channel_layout_default(&mut (*codec_parameters).ch_layout, (*codec_parameters).ch_layout.nb_channels);
+                }
 
                 let codec_name =
                     get_codec_name(codec_type, &video_codec, &audio_codec, &subtitle_codec);
