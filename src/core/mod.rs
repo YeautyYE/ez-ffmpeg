@@ -456,13 +456,13 @@ type VaListType = *mut ffmpeg_sys_next::__va_list_tag;
     not(target_os = "uefi"),
     not(windows),
 ))]
-pub type VaListType = *mut ffmpeg_sys_next::__va_list_tag_aarch64;
+type VaListType = *mut libc::c_void;
 
 #[cfg(all(target_arch = "powerpc", not(target_os = "uefi"), not(windows)))]
-pub type VaListType = *mut ffmpeg_sys_next::__va_list_tag_powerpc;
+type VaListType = *mut ffmpeg_sys_next::__va_list_tag_powerpc;
 
 #[cfg(target_arch = "s390x")]
-pub type VaListType = *mut ffmpeg_sys_next::__va_list_tag_s390x;
+type VaListType = *mut ffmpeg_sys_next::__va_list_tag_s390x;
 
 unsafe extern "C" fn ffmpeg_log_callback(
     ptr: *mut libc::c_void,
