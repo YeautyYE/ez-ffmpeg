@@ -39,7 +39,6 @@ pub(super) struct RtmpConnection {
 
 impl RtmpConnection {
     pub(super) fn new(connection_id: usize, socket: TcpStream) -> io::Result<Self> {
-
         let (byte_sender, byte_receiver) = crossbeam_channel::bounded(1024);
         let (result_sender, result_receiver) = crossbeam_channel::unbounded();
 
@@ -58,8 +57,11 @@ impl RtmpConnection {
     pub(super) fn write(&self, bytes: Vec<u8>) {
         if let Err(e) = self.writer.try_send(bytes) {
             if e.is_full() {
-                warn!("Connection {} client buffer full, dropping packet.", self.connection_id);
-                return
+                warn!(
+                    "Connection {} client buffer full, dropping packet.",
+                    self.connection_id
+                );
+                return;
             }
             if e.is_disconnected() {
                 debug!("Connection {} receiver disconnected.", self.connection_id);
@@ -70,7 +72,9 @@ impl RtmpConnection {
     pub(super) fn read(&mut self) -> Result<ReadResult, ConnectionError> {
         match self.reader.try_recv() {
             Err(crossbeam_channel::TryRecvError::Empty) => Ok(ReadResult::NoBytesReceived),
-            Err(crossbeam_channel::TryRecvError::Disconnected) => Err(ConnectionError::SocketClosed),
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                Err(ConnectionError::SocketClosed)
+            }
             Ok(result) => match self.handshake_completed {
                 true => Ok(result),
                 false => match result {
@@ -125,7 +129,10 @@ impl RtmpConnection {
     }
 }
 
-fn start_byte_writer(byte_receiver: crossbeam_channel::Receiver<Vec<u8>>, socket: &TcpStream) -> io::Result<()>{
+fn start_byte_writer(
+    byte_receiver: crossbeam_channel::Receiver<Vec<u8>>,
+    socket: &TcpStream,
+) -> io::Result<()> {
     let mut socket = socket.try_clone()?;
     thread::spawn(move || {
         while let Ok(bytes) = byte_receiver.recv() {
@@ -141,7 +148,6 @@ fn start_byte_writer(byte_receiver: crossbeam_channel::Receiver<Vec<u8>>, socket
                 }
                 break;
             }
-
         }
         socket
             .shutdown(Shutdown::Write)
@@ -150,7 +156,10 @@ fn start_byte_writer(byte_receiver: crossbeam_channel::Receiver<Vec<u8>>, socket
     Ok(())
 }
 
-fn start_result_reader(sender: crossbeam_channel::Sender<ReadResult>, socket: &TcpStream) -> io::Result<()> {
+fn start_result_reader(
+    sender: crossbeam_channel::Sender<ReadResult>,
+    socket: &TcpStream,
+) -> io::Result<()> {
     let mut socket = socket.try_clone()?;
     thread::spawn(move || {
         loop {

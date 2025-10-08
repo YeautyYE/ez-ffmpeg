@@ -1,9 +1,11 @@
-use crate::core::context::output::VSyncMethod;
 use crate::core::context::FrameBox;
+use crate::core::context::output::VSyncMethod;
 use crossbeam_channel::Sender;
 #[cfg(not(feature = "docs-rs"))]
 use ffmpeg_sys_next::{AVChannelLayout, AVChannelLayout__bindgen_ty_1, AVChannelOrder};
-use ffmpeg_sys_next::{AVCodec, AVColorRange, AVColorSpace, AVMediaType, AVPixelFormat, AVRational, AVSampleFormat};
+use ffmpeg_sys_next::{
+    AVCodec, AVColorRange, AVColorSpace, AVMediaType, AVPixelFormat, AVRational, AVSampleFormat,
+};
 use std::ptr::{null, null_mut};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;

@@ -39,6 +39,6 @@
 //! **Feature Flag**: Only available when the `rtmp` feature is enabled.
 
 pub mod embed_rtmp_server;
-mod rtmp_scheduler;
-mod rtmp_connection;
 mod gop;
+mod rtmp_connection;
+mod rtmp_scheduler;

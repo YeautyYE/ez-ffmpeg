@@ -1,8 +1,8 @@
 use ffmpeg_sys_next::{
-    av_codec_is_decoder, av_codec_is_encoder, av_codec_iterate, avcodec_descriptor_next,
-    AVCodecDescriptor, AVCodecID, AVMediaType,
+    AVCodecDescriptor, AVCodecID, AVMediaType, av_codec_is_decoder, av_codec_is_encoder,
+    av_codec_iterate, avcodec_descriptor_next,
 };
-use std::ffi::{c_void, CStr};
+use std::ffi::{CStr, c_void};
 use std::ptr::{null, null_mut};
 
 #[derive(Clone)]

@@ -4,13 +4,12 @@ use ffmpeg_sys_next::AVMediaType::{
     AVMEDIA_TYPE_VIDEO,
 };
 use ffmpeg_sys_next::{
-    av_freep, avcodec_free_context, avformat_close_input, avformat_free_context, avio_closep,
-    avio_context_free, AVCodecContext, AVCodecParameters, AVFormatContext, AVIOContext,
-    AVMediaType, AVRational, AVStream, AVFMT_NOFILE,
+    AVCodecContext, AVCodecParameters, AVFMT_NOFILE, AVFormatContext, AVIOContext, AVMediaType,
+    AVRational, AVStream, av_freep, avcodec_free_context, avformat_close_input,
+    avformat_free_context, avio_closep, avio_context_free,
 };
 use std::ffi::c_void;
 use std::ptr::null_mut;
-
 
 /// The **ffmpeg_context** module is responsible for assembling FFmpeg’s configuration:
 /// inputs, outputs, codecs, filters, and other parameters needed to construct a
@@ -133,7 +132,6 @@ pub mod output;
 /// // my_filters.set_hw_device("cuda");
 /// ```
 pub mod filter_complex;
-
 
 pub(super) mod decoder_stream;
 pub(super) mod demuxer;
@@ -342,17 +340,19 @@ pub(crate) fn out_fmt_ctx_free(out_fmt_ctx: *mut AVFormatContext, is_set_write_c
 }
 
 unsafe fn free_output_opaque(mut avio_ctx: *mut AVIOContext) {
-    if avio_ctx.is_null() {
-        return;
+    unsafe {
+        if avio_ctx.is_null() {
+            return;
+        }
+        if !(*avio_ctx).buffer.is_null() {
+            av_freep(&mut (*avio_ctx).buffer as *mut _ as *mut c_void);
+        }
+        let opaque_ptr = (*avio_ctx).opaque as *mut Box<dyn FnMut(&[u8]) -> i32>;
+        if !opaque_ptr.is_null() {
+            let _ = Box::from_raw(opaque_ptr);
+        }
+        avio_context_free(&mut avio_ctx);
     }
-    if !(*avio_ctx).buffer.is_null() {
-        av_freep(&mut (*avio_ctx).buffer as *mut _ as *mut c_void);
-    }
-    let opaque_ptr = (*avio_ctx).opaque as *mut Box<dyn FnMut(&[u8]) -> i32>;
-    if !opaque_ptr.is_null() {
-        let _ = Box::from_raw(opaque_ptr);
-    }
-    avio_context_free(&mut avio_ctx);
 }
 
 pub(crate) fn in_fmt_ctx_free(mut in_fmt_ctx: *mut AVFormatContext, is_set_read_callback: bool) {
@@ -370,13 +370,15 @@ pub(crate) fn in_fmt_ctx_free(mut in_fmt_ctx: *mut AVFormatContext, is_set_read_
 }
 
 unsafe fn free_input_opaque(mut avio_ctx: *mut AVIOContext) {
-    if !avio_ctx.is_null() {
-        let opaque_ptr = (*avio_ctx).opaque as *mut Box<dyn FnMut(&mut [u8]) -> i32>;
-        if !opaque_ptr.is_null() {
-            let _ = Box::from_raw(opaque_ptr);
+    unsafe {
+        if !avio_ctx.is_null() {
+            let opaque_ptr = (*avio_ctx).opaque as *mut Box<dyn FnMut(&mut [u8]) -> i32>;
+            if !opaque_ptr.is_null() {
+                let _ = Box::from_raw(opaque_ptr);
+            }
+            av_freep(&mut (*avio_ctx).buffer as *mut _ as *mut c_void);
+            avio_context_free(&mut avio_ctx);
         }
-        av_freep(&mut (*avio_ctx).buffer as *mut _ as *mut c_void);
-        avio_context_free(&mut avio_ctx);
     }
 }
 

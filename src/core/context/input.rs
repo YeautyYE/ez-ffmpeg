@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use crate::filter::frame_pipeline::FramePipeline;
+use std::collections::HashMap;
 
 unsafe impl Send for Input {}
 
@@ -434,7 +434,12 @@ impl Input {
     ///     ]);
     /// ```
     pub fn set_frame_pipelines(mut self, frame_pipelines: Vec<impl Into<FramePipeline>>) -> Self {
-        self.frame_pipelines = Some(frame_pipelines.into_iter().map(|frame_pipeline| frame_pipeline.into()).collect());
+        self.frame_pipelines = Some(
+            frame_pipelines
+                .into_iter()
+                .map(|frame_pipeline| frame_pipeline.into())
+                .collect(),
+        );
         self
     }
 
@@ -838,7 +843,6 @@ impl Input {
         }
         self
     }
-
 }
 
 impl From<Box<dyn FnMut(&mut [u8]) -> i32>> for Input {
@@ -896,7 +900,6 @@ impl From<&str> for Input {
         Self::from(String::from(url))
     }
 }
-
 
 #[cfg(test)]
 mod tests {

@@ -1,16 +1,17 @@
 use crate::core::context::filter_graph::FilterGraph;
-use crate::core::context::input_filter::{InputFilterOptions, IFILTER_FLAG_AUTOROTATE};
+use crate::core::context::input_filter::{IFILTER_FLAG_AUTOROTATE, InputFilterOptions};
 use crate::core::context::obj_pool::ObjPool;
 use crate::core::context::output::VSyncMethod;
 use crate::core::context::output::VSyncMethod::{VsyncCfr, VsyncVscfr};
 use crate::core::context::output_filter::OutputFilterOptions;
-use crate::core::context::{null_frame, FrameBox, FrameData};
+use crate::core::context::{FrameBox, FrameData, null_frame};
 use crate::core::scheduler::ffmpeg_scheduler::{
-    frame_is_null, set_scheduler_error, wait_until_not_paused, STATUS_END,
+    STATUS_END, frame_is_null, set_scheduler_error, wait_until_not_paused,
 };
 use crate::core::scheduler::input_controller::{InputController, SchNode};
 use crate::error::{Error, FilterGraphError, FilterGraphOperationError, FilterGraphParseError};
-use crate::hwaccel::{hw_device_for_filter, init_filter_hw_device, HWDevice};
+use crate::hwaccel::{HWDevice, hw_device_for_filter, init_filter_hw_device};
+use crate::util::ffmpeg_utils::av_err2str;
 use crossbeam_channel::{RecvTimeoutError, Sender};
 use ffmpeg_next::Frame;
 #[cfg(not(feature = "docs-rs"))]
@@ -24,6 +25,11 @@ use ffmpeg_sys_next::AVPixelFormat::AV_PIX_FMT_NONE;
 use ffmpeg_sys_next::AVRounding::{AV_ROUND_NEAR_INF, AV_ROUND_PASS_MINMAX};
 use ffmpeg_sys_next::AVSampleFormat::AV_SAMPLE_FMT_NONE;
 use ffmpeg_sys_next::{
+    AV_BPRINT_SIZE_AUTOMATIC, AV_BUFFERSINK_FLAG_NO_REQUEST, AV_BUFFERSRC_FLAG_PUSH,
+    AV_NOPTS_VALUE, AV_OPT_SEARCH_CHILDREN, AV_PIX_FMT_FLAG_HWACCEL, AV_TIME_BASE_Q, AVBPrint,
+    AVBufferRef, AVColorRange, AVColorSpace, AVERROR, AVERROR_BUG, AVERROR_EOF,
+    AVERROR_OPTION_NOT_FOUND, AVFilterContext, AVFilterGraph, AVFilterInOut, AVFrame,
+    AVIO_FLAG_READ, AVMediaType, AVPixelFormat, AVRational, AVSampleFormat, EAGAIN, EIO, ENOMEM,
     av_bprint_chars, av_bprint_finalize, av_bprint_init, av_bprintf, av_buffer_ref,
     av_buffer_unref, av_buffersink_get_frame_flags, av_buffersink_get_frame_rate,
     av_buffersink_get_h, av_buffersink_get_sample_aspect_ratio, av_buffersink_get_sample_rate,
@@ -37,31 +43,25 @@ use ffmpeg_sys_next::{
     avfilter_graph_alloc, avfilter_graph_config, avfilter_graph_create_filter, avfilter_graph_free,
     avfilter_graph_request_oldest, avfilter_inout_free, avfilter_link, avfilter_pad_get_type,
     avio_close, avio_closep, avio_open, avio_open2, avio_read, avio_read_to_bprint, avio_size,
-    AVBPrint, AVBufferRef, AVColorRange, AVColorSpace, AVFilterContext, AVFilterGraph,
-    AVFilterInOut, AVFrame, AVMediaType, AVPixelFormat, AVRational, AVSampleFormat, AVERROR,
-    AVERROR_BUG, AVERROR_EOF, AVERROR_OPTION_NOT_FOUND, AVIO_FLAG_READ, AV_BPRINT_SIZE_AUTOMATIC,
-    AV_BUFFERSINK_FLAG_NO_REQUEST, AV_BUFFERSRC_FLAG_PUSH, AV_NOPTS_VALUE, AV_OPT_SEARCH_CHILDREN,
-    AV_PIX_FMT_FLAG_HWACCEL, AV_TIME_BASE_Q, EAGAIN, EIO, ENOMEM,
 };
 #[cfg(not(feature = "docs-rs"))]
 use ffmpeg_sys_next::{
-    av_buffer_replace, av_buffersink_get_ch_layout, av_buffersink_get_color_range,
-    av_buffersink_get_colorspace, av_buffersink_get_format, av_channel_layout_check,
-    av_channel_layout_compare, av_channel_layout_copy, av_channel_layout_describe_bprint,
-    av_channel_layout_uninit, av_dict_iterate, avfilter_graph_segment_apply,
-    avfilter_graph_segment_create_filters, avfilter_graph_segment_free,
-    avfilter_graph_segment_parse, AVChannelLayout, AVChannelLayout__bindgen_ty_1, AVChannelOrder,
-    AVFilterGraphSegment, AVFILTER_FLAG_HWDEVICE, AVFILTER_FLAG_METADATA_ONLY, AV_FRAME_FLAG_KEY,
+    AV_FRAME_FLAG_KEY, AVChannelLayout, AVChannelLayout__bindgen_ty_1, AVChannelOrder,
+    AVFILTER_FLAG_HWDEVICE, AVFILTER_FLAG_METADATA_ONLY, AVFilterGraphSegment, av_buffer_replace,
+    av_buffersink_get_ch_layout, av_buffersink_get_color_range, av_buffersink_get_colorspace,
+    av_buffersink_get_format, av_channel_layout_check, av_channel_layout_compare,
+    av_channel_layout_copy, av_channel_layout_describe_bprint, av_channel_layout_uninit,
+    av_dict_iterate, avfilter_graph_segment_apply, avfilter_graph_segment_create_filters,
+    avfilter_graph_segment_free, avfilter_graph_segment_parse,
 };
 use log::{debug, error, info, trace, warn};
 use std::collections::VecDeque;
 use std::f64::consts::PI;
-use std::ffi::{c_char, c_void, CStr, CString};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use crate::util::ffmpeg_utils::av_err2str;
 
 pub(crate) fn filter_graph_init(
     fg_index: usize,
@@ -159,7 +159,7 @@ pub(crate) fn filter_graph_init(
 
                 if input_index < finished_flag_list.len() {
                     if finished_flag_list[input_index].load(Ordering::Acquire) {
-                       continue;
+                        continue;
                     }
                 } else {
                     unreachable!()
@@ -184,7 +184,11 @@ pub(crate) fn filter_graph_init(
                             &frame_pool,
                         ) {
                             match e {
-                                Error::FilterGraph(FilterGraphOperationError::BufferSourceAddFrameError(FilterGraphError::EOF)) => {
+                                Error::FilterGraph(
+                                    FilterGraphOperationError::BufferSourceAddFrameError(
+                                        FilterGraphError::EOF,
+                                    ),
+                                ) => {
                                     debug!("Input {} no longer accepts new data", input_index);
                                     filter_receive_finish(&finished_flag_list, input_index);
                                 }
@@ -208,7 +212,11 @@ pub(crate) fn filter_graph_init(
                             &frame_pool,
                         ) {
                             match e {
-                                Error::FilterGraph(FilterGraphOperationError::BufferSourceAddFrameError(FilterGraphError::EOF)) => {
+                                Error::FilterGraph(
+                                    FilterGraphOperationError::BufferSourceAddFrameError(
+                                        FilterGraphError::EOF,
+                                    ),
+                                ) => {
                                     debug!("Input {} no longer accepts new data", input_index);
                                     filter_receive_finish(&finished_flag_list, input_index);
                                 }
@@ -456,76 +464,81 @@ unsafe fn fg_send_eof(
     input_filter_index: usize,
     frame_pool: &ObjPool<Frame>,
 ) -> crate::error::Result<()> {
-    let ifp = &ifps[input_filter_index];
-    if ifp.eof {
-        frame_pool.release(frame_box.frame);
-        return Ok(());
-    }
-
-    let ifp = &mut ifps[input_filter_index];
-    ifp.eof = true;
-
-    let frame = frame_box.frame.as_mut_ptr();
-    if !ifp.filter.is_null() {
-        let pts = av_rescale_q_rnd(
-            (*frame).pts,
-            (*frame).time_base,
-            ifp.time_base,
-            std::mem::transmute(AV_ROUND_NEAR_INF as u32 | AV_ROUND_PASS_MINMAX as u32),
-        );
-        let ret = av_buffersrc_close(ifp.filter, pts, AV_BUFFERSRC_FLAG_PUSH as u32);
-        frame_pool.release(frame_box.frame);
-        if ret < 0 {
-            return Err(Error::FilterGraph(
-                FilterGraphOperationError::BufferSourceCloseError(FilterGraphError::from(ret)),
-            ));
+    unsafe {
+        let ifp = &ifps[input_filter_index];
+        if ifp.eof {
+            frame_pool.release(frame_box.frame);
+            return Ok(());
         }
-    } else {
-        if ifp.format < 0 {
-            // the filtergraph was never configured, use the fallback parameters
 
-            let ifp = &mut ifps[input_filter_index];
-            ifp.format = (*ifp.opts.fallback.as_ptr()).format;
-            ifp.sample_rate = (*ifp.opts.fallback.as_ptr()).sample_rate;
-            ifp.width = (*ifp.opts.fallback.as_ptr()).width;
-            ifp.height = (*ifp.opts.fallback.as_ptr()).height;
-            ifp.sample_aspect_ratio = (*ifp.opts.fallback.as_ptr()).sample_aspect_ratio;
-            ifp.color_space = (*ifp.opts.fallback.as_ptr()).colorspace;
-            ifp.color_range = (*ifp.opts.fallback.as_ptr()).color_range;
-            ifp.time_base = (*ifp.opts.fallback.as_ptr()).time_base;
+        let ifp = &mut ifps[input_filter_index];
+        ifp.eof = true;
 
-            let ret = av_channel_layout_copy(
-                &mut ifp.ch_layout,
-                &(*ifp.opts.fallback.as_ptr()).ch_layout,
+        let frame = frame_box.frame.as_mut_ptr();
+        if !ifp.filter.is_null() {
+            let pts = av_rescale_q_rnd(
+                (*frame).pts,
+                (*frame).time_base,
+                ifp.time_base,
+                std::mem::transmute(AV_ROUND_NEAR_INF as u32 | AV_ROUND_PASS_MINMAX as u32),
             );
+            let ret = av_buffersrc_close(ifp.filter, pts, AV_BUFFERSRC_FLAG_PUSH as u32);
+            frame_pool.release(frame_box.frame);
             if ret < 0 {
-                frame_pool.release(frame_box.frame);
                 return Err(Error::FilterGraph(
-                    FilterGraphOperationError::ChannelLayoutCopyError(FilterGraphError::from(ret)),
+                    FilterGraphOperationError::BufferSourceCloseError(FilterGraphError::from(ret)),
                 ));
             }
+        } else {
+            if ifp.format < 0 {
+                // the filtergraph was never configured, use the fallback parameters
 
-            if ifilter_has_all_input_formats(ifps) {
-                if let Err(e) = configure_filtergraph(fg_index, graph, fgp, graph_desc, ifps, ofps)
-                {
-                    error!("Error initializing filters! {e}");
+                let ifp = &mut ifps[input_filter_index];
+                ifp.format = (*ifp.opts.fallback.as_ptr()).format;
+                ifp.sample_rate = (*ifp.opts.fallback.as_ptr()).sample_rate;
+                ifp.width = (*ifp.opts.fallback.as_ptr()).width;
+                ifp.height = (*ifp.opts.fallback.as_ptr()).height;
+                ifp.sample_aspect_ratio = (*ifp.opts.fallback.as_ptr()).sample_aspect_ratio;
+                ifp.color_space = (*ifp.opts.fallback.as_ptr()).colorspace;
+                ifp.color_range = (*ifp.opts.fallback.as_ptr()).color_range;
+                ifp.time_base = (*ifp.opts.fallback.as_ptr()).time_base;
+
+                let ret = av_channel_layout_copy(
+                    &mut ifp.ch_layout,
+                    &(*ifp.opts.fallback.as_ptr()).ch_layout,
+                );
+                if ret < 0 {
                     frame_pool.release(frame_box.frame);
-                    return Err(e);
+                    return Err(Error::FilterGraph(
+                        FilterGraphOperationError::ChannelLayoutCopyError(FilterGraphError::from(
+                            ret,
+                        )),
+                    ));
                 }
+
+                if ifilter_has_all_input_formats(ifps) {
+                    if let Err(e) =
+                        configure_filtergraph(fg_index, graph, fgp, graph_desc, ifps, ofps)
+                    {
+                        error!("Error initializing filters! {e}");
+                        frame_pool.release(frame_box.frame);
+                        return Err(e);
+                    }
+                }
+            }
+
+            let ifp = &ifps[input_filter_index];
+            if ifp.format < 0 {
+                error!(
+                    "Cannot determine format of input {} after EOF",
+                    ifp.opts.name
+                );
+                return Err(Error::FilterGraph(FilterGraphOperationError::InvalidData));
             }
         }
 
-        let ifp = &ifps[input_filter_index];
-        if ifp.format < 0 {
-            error!(
-                "Cannot determine format of input {} after EOF",
-                ifp.opts.name
-            );
-            return Err(Error::FilterGraph(FilterGraphOperationError::InvalidData));
-        }
+        Ok(())
     }
-
-    Ok(())
 }
 
 const VIDEO_CHANGED: i32 = 1 << 0;
@@ -559,167 +572,172 @@ unsafe fn fg_send_frame(
     input_filter_index: usize,
     frame_pool: &ObjPool<Frame>,
 ) -> crate::error::Result<()> {
-    let frame = frame_box.frame.as_mut_ptr();
-    let mut need_reinit = 0;
+    unsafe {
+        let frame = frame_box.frame.as_mut_ptr();
+        let mut need_reinit = 0;
 
-    let ifp = &ifps[input_filter_index];
-    let media_type = ifp.media_type;
-    // determine if the parameters for this input changed
-    // Check audio or video parameters
-    match media_type {
-        AVMEDIA_TYPE_AUDIO => {
-            if ifp.format != (*frame).format
-                || ifp.sample_rate != (*frame).sample_rate
-                || unsafe { av_channel_layout_compare(&ifp.ch_layout, &(*frame).ch_layout) } != 0
-            {
-                need_reinit |= AUDIO_CHANGED;
+        let ifp = &ifps[input_filter_index];
+        let media_type = ifp.media_type;
+        // determine if the parameters for this input changed
+        // Check audio or video parameters
+        match media_type {
+            AVMEDIA_TYPE_AUDIO => {
+                if ifp.format != (*frame).format
+                    || ifp.sample_rate != (*frame).sample_rate
+                    || unsafe { av_channel_layout_compare(&ifp.ch_layout, &(*frame).ch_layout) }
+                        != 0
+                {
+                    need_reinit |= AUDIO_CHANGED;
+                }
             }
-        }
-        AVMEDIA_TYPE_VIDEO => {
-            if ifp.format != (*frame).format
-                || ifp.width != (*frame).width
-                || ifp.height != (*frame).height
-                || ifp.color_space != (*frame).colorspace
-                || ifp.color_range != (*frame).color_range
-            {
-                need_reinit |= VIDEO_CHANGED;
+            AVMEDIA_TYPE_VIDEO => {
+                if ifp.format != (*frame).format
+                    || ifp.width != (*frame).width
+                    || ifp.height != (*frame).height
+                    || ifp.color_space != (*frame).colorspace
+                    || ifp.color_range != (*frame).color_range
+                {
+                    need_reinit |= VIDEO_CHANGED;
+                }
             }
+            _ => {}
         }
-        _ => {}
-    }
 
-    // Check display matrix
-    let sd = av_frame_get_side_data(frame, AV_FRAME_DATA_DISPLAYMATRIX);
-    if !sd.is_null() {
-        if !ifp.displaymatrix_present
-            || std::slice::from_raw_parts((*sd).data, size_of_val(&ifp.displaymatrix))
-                != std::slice::from_raw_parts(
-                    ifp.displaymatrix.as_ptr() as *const u8,
-                    size_of_val(&ifp.displaymatrix),
-                )
-        {
+        // Check display matrix
+        let sd = av_frame_get_side_data(frame, AV_FRAME_DATA_DISPLAYMATRIX);
+        if !sd.is_null() {
+            if !ifp.displaymatrix_present
+                || std::slice::from_raw_parts((*sd).data, size_of_val(&ifp.displaymatrix))
+                    != std::slice::from_raw_parts(
+                        ifp.displaymatrix.as_ptr() as *const u8,
+                        size_of_val(&ifp.displaymatrix),
+                    )
+            {
+                need_reinit |= MATRIX_CHANGED;
+            }
+        } else if ifp.displaymatrix_present {
             need_reinit |= MATRIX_CHANGED;
         }
-    } else if ifp.displaymatrix_present {
-        need_reinit |= MATRIX_CHANGED;
-    }
 
-    // Always allow reinit
-    /*if !graph.is_null() && !(ifp.opts.flags & IFILTER_FLAG_REINIT){
-        need_reinit = 0;
-    }*/
+        // Always allow reinit
+        /*if !graph.is_null() && !(ifp.opts.flags & IFILTER_FLAG_REINIT){
+            need_reinit = 0;
+        }*/
 
-    if (ifp.hw_frames_ctx.is_null() != (*frame).hw_frames_ctx.is_null())
-        || (!ifp.hw_frames_ctx.is_null()
-            && (*ifp.hw_frames_ctx).data != (*(*frame).hw_frames_ctx).data)
-    {
-        need_reinit |= HWACCEL_CHANGED;
-    }
-
-    // Reinitialize if needed
-    if need_reinit != 0 || (*graph).is_null() {
-        ifilter_parameters_from_frame(&mut ifps[input_filter_index], frame, media_type)?;
-
-        if !ifilter_has_all_input_formats(ifps) {
-            let _ = &mut ifps[input_filter_index].frame_queue.push_back(frame_box);
-            return Ok(());
+        if (ifp.hw_frames_ctx.is_null() != (*frame).hw_frames_ctx.is_null())
+            || (!ifp.hw_frames_ctx.is_null()
+                && (*ifp.hw_frames_ctx).data != (*(*frame).hw_frames_ctx).data)
+        {
+            need_reinit |= HWACCEL_CHANGED;
         }
 
-        if !(*graph).is_null() {
-            let ret = fg_read_frames(*graph, fgp, ifps, ofps, frame_pool);
-            if ret < 0 {
-                return Err(Error::FilterGraph(
-                    FilterGraphOperationError::ProcessFramesError(FilterGraphError::from(ret)),
-                ));
+        // Reinitialize if needed
+        if need_reinit != 0 || (*graph).is_null() {
+            ifilter_parameters_from_frame(&mut ifps[input_filter_index], frame, media_type)?;
+
+            if !ifilter_has_all_input_formats(ifps) {
+                let _ = &mut ifps[input_filter_index].frame_queue.push_back(frame_box);
+                return Ok(());
             }
 
-            let mut reason: AVBPrint = std::mem::zeroed();
-            av_bprint_init(&mut reason, 0, AV_BPRINT_SIZE_AUTOMATIC as u32);
+            if !(*graph).is_null() {
+                let ret = fg_read_frames(*graph, fgp, ifps, ofps, frame_pool);
+                if ret < 0 {
+                    return Err(Error::FilterGraph(
+                        FilterGraphOperationError::ProcessFramesError(FilterGraphError::from(ret)),
+                    ));
+                }
 
-            if need_reinit & AUDIO_CHANGED != 0 {
-                let fmt_str = CString::new("audio parameters changed to %d Hz, \0").unwrap();
-                let sample_format_name =
-                    av_get_sample_fmt_name(std::mem::transmute((*frame).format));
-                av_bprintf(&mut reason, fmt_str.as_ptr(), (*frame).sample_rate);
-                av_channel_layout_describe_bprint(&(*frame).ch_layout, &mut reason);
-                let comma_str = CString::new(", %s, \0").unwrap();
-                av_bprintf(
-                    &mut reason,
-                    comma_str.as_ptr(),
-                    unknown_if_null(sample_format_name).as_ptr(),
-                );
+                let mut reason: AVBPrint = std::mem::zeroed();
+                av_bprint_init(&mut reason, 0, AV_BPRINT_SIZE_AUTOMATIC as u32);
+
+                if need_reinit & AUDIO_CHANGED != 0 {
+                    let fmt_str = CString::new("audio parameters changed to %d Hz, \0").unwrap();
+                    let sample_format_name =
+                        av_get_sample_fmt_name(std::mem::transmute((*frame).format));
+                    av_bprintf(&mut reason, fmt_str.as_ptr(), (*frame).sample_rate);
+                    av_channel_layout_describe_bprint(&(*frame).ch_layout, &mut reason);
+                    let comma_str = CString::new(", %s, \0").unwrap();
+                    av_bprintf(
+                        &mut reason,
+                        comma_str.as_ptr(),
+                        unknown_if_null(sample_format_name).as_ptr(),
+                    );
+                }
+
+                if need_reinit & VIDEO_CHANGED != 0 {
+                    let pixel_format_name =
+                        av_get_pix_fmt_name(std::mem::transmute((*frame).format));
+                    let color_space_name = av_color_space_name((*frame).colorspace);
+                    let color_range_name = av_color_range_name((*frame).color_range);
+
+                    let fmt_str =
+                        CString::new("video parameters changed to %s(%s, %s), %dx%d, \0").unwrap();
+                    av_bprintf(
+                        &mut reason,
+                        fmt_str.as_ptr(),
+                        unknown_if_null(pixel_format_name).as_ptr(),
+                        unknown_if_null(color_range_name).as_ptr(),
+                        unknown_if_null(color_space_name).as_ptr(),
+                        (*frame).width,
+                        (*frame).height,
+                    );
+                }
+
+                if need_reinit & MATRIX_CHANGED != 0 {
+                    let matrix_changed_str = CString::new("display matrix changed, \0").unwrap();
+                    av_bprintf(&mut reason, matrix_changed_str.as_ptr());
+                }
+
+                if need_reinit & HWACCEL_CHANGED != 0 {
+                    let hwaccel_changed_str = CString::new("hwaccel changed, \0").unwrap();
+                    av_bprintf(&mut reason, hwaccel_changed_str.as_ptr());
+                }
+
+                // Remove the last comma if necessary
+                if reason.len > 1 {
+                    let len = reason.len as usize;
+                    let reason_ptr = reason.str_ as *mut u8;
+                    *reason_ptr.add(len - 2) = 0; // Set the last comma to null terminator
+                }
+
+                let reason_str = CStr::from_ptr(reason.str_)
+                    .to_str()
+                    .unwrap_or("Unknown reason")
+                    .to_string();
+                info!("Reconfiguring filter because graph {}", reason_str);
             }
 
-            if need_reinit & VIDEO_CHANGED != 0 {
-                let pixel_format_name = av_get_pix_fmt_name(std::mem::transmute((*frame).format));
-                let color_space_name = av_color_space_name((*frame).colorspace);
-                let color_range_name = av_color_range_name((*frame).color_range);
-
-                let fmt_str =
-                    CString::new("video parameters changed to %s(%s, %s), %dx%d, \0").unwrap();
-                av_bprintf(
-                    &mut reason,
-                    fmt_str.as_ptr(),
-                    unknown_if_null(pixel_format_name).as_ptr(),
-                    unknown_if_null(color_range_name).as_ptr(),
-                    unknown_if_null(color_space_name).as_ptr(),
-                    (*frame).width,
-                    (*frame).height,
-                );
+            if let Err(e) = configure_filtergraph(fg_index, graph, fgp, graph_desc, ifps, ofps) {
+                error!("Error reinitializing filters! {}", e);
+                frame_pool.release(frame_box.frame);
+                return Err(e);
             }
-
-            if need_reinit & MATRIX_CHANGED != 0 {
-                let matrix_changed_str = CString::new("display matrix changed, \0").unwrap();
-                av_bprintf(&mut reason, matrix_changed_str.as_ptr());
-            }
-
-            if need_reinit & HWACCEL_CHANGED != 0 {
-                let hwaccel_changed_str = CString::new("hwaccel changed, \0").unwrap();
-                av_bprintf(&mut reason, hwaccel_changed_str.as_ptr());
-            }
-
-            // Remove the last comma if necessary
-            if reason.len > 1 {
-                let len = reason.len as usize;
-                let reason_ptr = reason.str_ as *mut u8;
-                *reason_ptr.add(len - 2) = 0; // Set the last comma to null terminator
-            }
-
-            let reason_str = CStr::from_ptr(reason.str_)
-                .to_str()
-                .unwrap_or("Unknown reason")
-                .to_string();
-            info!("Reconfiguring filter because graph {}", reason_str);
         }
 
-        if let Err(e) = configure_filtergraph(fg_index, graph, fgp, graph_desc, ifps, ofps) {
-            error!("Error reinitializing filters! {}", e);
-            frame_pool.release(frame_box.frame);
-            return Err(e);
+        let ifp = &ifps[input_filter_index];
+
+        (*frame).pts = av_rescale_q((*frame).pts, (*frame).time_base, ifp.time_base);
+        (*frame).duration = av_rescale_q((*frame).duration, (*frame).time_base, ifp.time_base);
+        (*frame).time_base = ifp.time_base;
+
+        if ifp.displaymatrix_applied {
+            av_frame_remove_side_data(frame, AV_FRAME_DATA_DISPLAYMATRIX);
         }
-    }
 
-    let ifp = &ifps[input_filter_index];
-
-    (*frame).pts = av_rescale_q((*frame).pts, (*frame).time_base, ifp.time_base);
-    (*frame).duration = av_rescale_q((*frame).duration, (*frame).time_base, ifp.time_base);
-    (*frame).time_base = ifp.time_base;
-
-    if ifp.displaymatrix_applied {
-        av_frame_remove_side_data(frame, AV_FRAME_DATA_DISPLAYMATRIX);
-    }
-
-    let ret = av_buffersrc_add_frame_flags(ifp.filter, frame, AV_BUFFERSRC_FLAG_PUSH as u32 as i32);
-    frame_pool.release(frame_box.frame);
-    if ret < 0 {
-        if ret != AVERROR_EOF {
-            error!("Error while filtering: {}", av_err2str(ret));
+        let ret =
+            av_buffersrc_add_frame_flags(ifp.filter, frame, AV_BUFFERSRC_FLAG_PUSH as u32 as i32);
+        frame_pool.release(frame_box.frame);
+        if ret < 0 {
+            if ret != AVERROR_EOF {
+                error!("Error while filtering: {}", av_err2str(ret));
+            }
+            return Err(Error::FilterGraph(
+                FilterGraphOperationError::BufferSourceAddFrameError(FilterGraphError::from(ret)),
+            ));
         }
-        return Err(Error::FilterGraph(
-            FilterGraphOperationError::BufferSourceAddFrameError(FilterGraphError::from(ret)),
-        ));
+        Ok(())
     }
-    Ok(())
 }
 
 #[cfg(feature = "docs-rs")]
@@ -743,203 +761,207 @@ unsafe fn configure_filtergraph(
     ifps: &mut Vec<InputFilterParameter>,
     ofps: &mut Vec<OutputFilterParameter>,
 ) -> crate::error::Result<()> {
-    cleanup_filtergraph(graph, ifps, ofps);
-    *graph = avfilter_graph_alloc();
-    (**graph).nb_threads = 0;
-
-    let hw_device = hw_device_for_filter();
-
-    let mut inputs = null_mut();
-    let mut outputs = null_mut();
-    let mut ret = graph_parse(*graph, graph_desc, &mut inputs, &mut outputs, hw_device);
-    if ret < 0 {
+    unsafe {
         cleanup_filtergraph(graph, ifps, ofps);
-        return Err(Error::FilterGraph(FilterGraphOperationError::ParseError(
-            FilterGraphParseError::from(ret),
-        )));
-    }
+        *graph = avfilter_graph_alloc();
+        (**graph).nb_threads = 0;
 
-    let mut cur = inputs;
-    let mut i = 0;
-    loop {
-        if cur.is_null() {
-            break;
-        }
+        let hw_device = hw_device_for_filter();
 
-        let ifp = ifps.get_mut(i);
-        if ifp.is_none() {
-            error!("input[{i}] can't find matched InputFilterParameter");
-            break;
-        }
-
-        let ret = configure_input_filter(fg_index, *graph, ifp.unwrap(), cur);
-        if ret < 0 {
-            avfilter_inout_free(&mut inputs);
-            avfilter_inout_free(&mut outputs);
-            cleanup_filtergraph(graph, ifps, ofps);
-            return Err(Error::FilterGraph(FilterGraphOperationError::ParseError(
-                FilterGraphParseError::from(ret),
-            )));
-        }
-
-        cur = (*cur).next;
-        i += 1;
-    }
-    avfilter_inout_free(&mut inputs);
-
-    cur = outputs;
-    i = 0;
-    loop {
-        if cur.is_null() {
-            break;
-        }
-
-        let ofp = ofps.get_mut(i);
-        if ofp.is_none() {
-            error!("output[{i}] can't find matched OutputFilterParameter");
-            break;
-        }
-
-        let ret = configure_output_filter(*graph, ofp.unwrap(), cur);
-        if ret < 0 {
-            avfilter_inout_free(&mut outputs);
-            cleanup_filtergraph(graph, ifps, ofps);
-            return Err(Error::FilterGraph(FilterGraphOperationError::ParseError(
-                FilterGraphParseError::from(ret),
-            )));
-        }
-
-        cur = (*cur).next;
-        i += 1;
-    }
-    avfilter_inout_free(&mut outputs);
-
-    //TODO disable_conversions
-
-    ret = avfilter_graph_config(*graph, null_mut());
-    if ret < 0 {
-        cleanup_filtergraph(graph, ifps, ofps);
-        return Err(Error::FilterGraph(FilterGraphOperationError::ParseError(
-            FilterGraphParseError::from(ret),
-        )));
-    }
-
-    fgp.is_meta = graph_is_meta(*graph);
-
-    /* limit the lists of allowed formats to the ones selected, to
-     * make sure they stay the same if the filtergraph is reconfigured later */
-    for ofp in &mut *ofps {
-        ofp.format = std::mem::transmute(av_buffersink_get_format(ofp.filter));
-        ofp.width = av_buffersink_get_w(ofp.filter);
-        ofp.height = av_buffersink_get_h(ofp.filter);
-        ofp.color_space = av_buffersink_get_colorspace(ofp.filter);
-        ofp.color_range = av_buffersink_get_color_range(ofp.filter);
-
-        ofp.tb_out = av_buffersink_get_time_base(ofp.filter);
-
-        ofp.sample_aspect_ratio = av_buffersink_get_sample_aspect_ratio(ofp.filter);
-
-        ofp.sample_rate = av_buffersink_get_sample_rate(ofp.filter);
-
-        av_channel_layout_uninit(&mut ofp.opts.ch_layout);
-        ret = av_buffersink_get_ch_layout(ofp.filter, &mut ofp.opts.ch_layout);
+        let mut inputs = null_mut();
+        let mut outputs = null_mut();
+        let mut ret = graph_parse(*graph, graph_desc, &mut inputs, &mut outputs, hw_device);
         if ret < 0 {
             cleanup_filtergraph(graph, ifps, ofps);
             return Err(Error::FilterGraph(FilterGraphOperationError::ParseError(
                 FilterGraphParseError::from(ret),
             )));
         }
-    }
 
-    for ifp in &mut *ifps {
+        let mut cur = inputs;
+        let mut i = 0;
         loop {
-            let option = ifp.frame_queue.pop_front();
-            if option.is_none() {
+            if cur.is_null() {
                 break;
             }
-            let tmp_frame_box = option.unwrap();
-            if ifp.media_type == AVMEDIA_TYPE_SUBTITLE {
-                //TODO
-                // sub2video_frame(ifp, tmp_frame_box);
-            } else {
-                let mut tmp_frame = unsafe { av_frame_alloc() };
-                if tmp_frame.is_null() {
-                    return Err(Error::FilterGraph(
-                        FilterGraphOperationError::BufferSourceAddFrameError(
-                            FilterGraphError::OutOfMemory,
-                        ),
-                    ));
+
+            let ifp = ifps.get_mut(i);
+            if ifp.is_none() {
+                error!("input[{i}] can't find matched InputFilterParameter");
+                break;
+            }
+
+            let ret = configure_input_filter(fg_index, *graph, ifp.unwrap(), cur);
+            if ret < 0 {
+                avfilter_inout_free(&mut inputs);
+                avfilter_inout_free(&mut outputs);
+                cleanup_filtergraph(graph, ifps, ofps);
+                return Err(Error::FilterGraph(FilterGraphOperationError::ParseError(
+                    FilterGraphParseError::from(ret),
+                )));
+            }
+
+            cur = (*cur).next;
+            i += 1;
+        }
+        avfilter_inout_free(&mut inputs);
+
+        cur = outputs;
+        i = 0;
+        loop {
+            if cur.is_null() {
+                break;
+            }
+
+            let ofp = ofps.get_mut(i);
+            if ofp.is_none() {
+                error!("output[{i}] can't find matched OutputFilterParameter");
+                break;
+            }
+
+            let ret = configure_output_filter(*graph, ofp.unwrap(), cur);
+            if ret < 0 {
+                avfilter_inout_free(&mut outputs);
+                cleanup_filtergraph(graph, ifps, ofps);
+                return Err(Error::FilterGraph(FilterGraphOperationError::ParseError(
+                    FilterGraphParseError::from(ret),
+                )));
+            }
+
+            cur = (*cur).next;
+            i += 1;
+        }
+        avfilter_inout_free(&mut outputs);
+
+        //TODO disable_conversions
+
+        ret = avfilter_graph_config(*graph, null_mut());
+        if ret < 0 {
+            cleanup_filtergraph(graph, ifps, ofps);
+            return Err(Error::FilterGraph(FilterGraphOperationError::ParseError(
+                FilterGraphParseError::from(ret),
+            )));
+        }
+
+        fgp.is_meta = graph_is_meta(*graph);
+
+        /* limit the lists of allowed formats to the ones selected, to
+         * make sure they stay the same if the filtergraph is reconfigured later */
+        for ofp in &mut *ofps {
+            ofp.format = std::mem::transmute(av_buffersink_get_format(ofp.filter));
+            ofp.width = av_buffersink_get_w(ofp.filter);
+            ofp.height = av_buffersink_get_h(ofp.filter);
+            ofp.color_space = av_buffersink_get_colorspace(ofp.filter);
+            ofp.color_range = av_buffersink_get_color_range(ofp.filter);
+
+            ofp.tb_out = av_buffersink_get_time_base(ofp.filter);
+
+            ofp.sample_aspect_ratio = av_buffersink_get_sample_aspect_ratio(ofp.filter);
+
+            ofp.sample_rate = av_buffersink_get_sample_rate(ofp.filter);
+
+            av_channel_layout_uninit(&mut ofp.opts.ch_layout);
+            ret = av_buffersink_get_ch_layout(ofp.filter, &mut ofp.opts.ch_layout);
+            if ret < 0 {
+                cleanup_filtergraph(graph, ifps, ofps);
+                return Err(Error::FilterGraph(FilterGraphOperationError::ParseError(
+                    FilterGraphParseError::from(ret),
+                )));
+            }
+        }
+
+        for ifp in &mut *ifps {
+            loop {
+                let option = ifp.frame_queue.pop_front();
+                if option.is_none() {
+                    break;
                 }
-                ret = av_frame_ref(tmp_frame, tmp_frame_box.frame.as_ptr());
+                let tmp_frame_box = option.unwrap();
+                if ifp.media_type == AVMEDIA_TYPE_SUBTITLE {
+                    //TODO
+                    // sub2video_frame(ifp, tmp_frame_box);
+                } else {
+                    let mut tmp_frame = unsafe { av_frame_alloc() };
+                    if tmp_frame.is_null() {
+                        return Err(Error::FilterGraph(
+                            FilterGraphOperationError::BufferSourceAddFrameError(
+                                FilterGraphError::OutOfMemory,
+                            ),
+                        ));
+                    }
+                    ret = av_frame_ref(tmp_frame, tmp_frame_box.frame.as_ptr());
+                    if ret < 0 {
+                        return Err(Error::FilterGraph(
+                            FilterGraphOperationError::BufferSourceAddFrameError(
+                                FilterGraphError::from(ret),
+                            ),
+                        ));
+                    }
+                    ret = av_buffersrc_add_frame(ifp.filter, tmp_frame);
+                    if ret < 0 {
+                        av_frame_free(&mut tmp_frame);
+                    }
+                }
+            }
+        }
+
+        if ret < 0 {
+            cleanup_filtergraph(graph, ifps, ofps);
+            return Err(Error::FilterGraph(
+                FilterGraphOperationError::BufferSourceAddFrameError(FilterGraphError::from(ret)),
+            ));
+        }
+
+        let mut have_input_eof = false;
+        /* send the EOFs for the finished inputs */
+        for ifp in &mut *ifps {
+            if ifp.eof {
+                ret = av_buffersrc_add_frame(ifp.filter, null_mut());
                 if ret < 0 {
+                    cleanup_filtergraph(graph, ifps, ofps);
                     return Err(Error::FilterGraph(
                         FilterGraphOperationError::BufferSourceAddFrameError(
                             FilterGraphError::from(ret),
                         ),
                     ));
                 }
-                ret = av_buffersrc_add_frame(ifp.filter, tmp_frame);
-                if ret < 0 {
-                    av_frame_free(&mut tmp_frame);
-                }
+                have_input_eof = true;
             }
         }
-    }
 
-    if ret < 0 {
-        cleanup_filtergraph(graph, ifps, ofps);
-        return Err(Error::FilterGraph(
-            FilterGraphOperationError::BufferSourceAddFrameError(FilterGraphError::from(ret)),
-        ));
-    }
-
-    let mut have_input_eof = false;
-    /* send the EOFs for the finished inputs */
-    for ifp in &mut *ifps {
-        if ifp.eof {
-            ret = av_buffersrc_add_frame(ifp.filter, null_mut());
-            if ret < 0 {
+        if have_input_eof {
+            // make sure the EOF propagates to the end of the graph
+            ret = avfilter_graph_request_oldest(*graph);
+            if ret < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR_EOF {
                 cleanup_filtergraph(graph, ifps, ofps);
                 return Err(Error::FilterGraph(
-                    FilterGraphOperationError::BufferSourceAddFrameError(FilterGraphError::from(
-                        ret,
-                    )),
+                    FilterGraphOperationError::RequestOldestError(FilterGraphError::from(ret)),
                 ));
             }
-            have_input_eof = true;
         }
-    }
 
-    if have_input_eof {
-        // make sure the EOF propagates to the end of the graph
-        ret = avfilter_graph_request_oldest(*graph);
-        if ret < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR_EOF {
-            cleanup_filtergraph(graph, ifps, ofps);
-            return Err(Error::FilterGraph(
-                FilterGraphOperationError::RequestOldestError(FilterGraphError::from(ret)),
-            ));
-        }
+        Ok(())
     }
-
-    Ok(())
 }
 
 #[cfg(not(feature = "docs-rs"))]
 unsafe fn graph_is_meta(graph: *mut AVFilterGraph) -> bool {
-    for i in 0..(*graph).nb_filters {
-        unsafe {
-            let filter_context = *(*graph).filters.add(i as usize);
-            let filter = (*filter_context).filter;
+    unsafe {
+        for i in 0..(*graph).nb_filters {
+            unsafe {
+                let filter_context = *(*graph).filters.add(i as usize);
+                let filter = (*filter_context).filter;
 
-            if !((*filter).flags & AVFILTER_FLAG_METADATA_ONLY != 0
-                || (*filter_context).nb_outputs == 0
-                || filter_is_buffersrc(filter_context))
-            {
-                return false;
+                if !((*filter).flags & AVFILTER_FLAG_METADATA_ONLY != 0
+                    || (*filter_context).nb_outputs == 0
+                    || filter_is_buffersrc(filter_context))
+                {
+                    return false;
+                }
             }
         }
+        true
     }
-    true
 }
 
 fn filter_is_buffersrc(f: *mut AVFilterContext) -> bool {
@@ -957,12 +979,14 @@ unsafe fn configure_output_filter(
     ofp: &mut OutputFilterParameter,
     output: *mut AVFilterInOut,
 ) -> i32 {
-    match ofp.media_type {
-        AVMEDIA_TYPE_VIDEO => configure_output_video_filter(graph, ofp, output),
-        AVMEDIA_TYPE_AUDIO => configure_output_audio_filter(graph, ofp, output),
-        _ => {
-            error!("Unexpected media type {:?}", ofp.media_type);
-            0
+    unsafe {
+        match ofp.media_type {
+            AVMEDIA_TYPE_VIDEO => configure_output_video_filter(graph, ofp, output),
+            AVMEDIA_TYPE_AUDIO => configure_output_audio_filter(graph, ofp, output),
+            _ => {
+                error!("Unexpected media type {:?}", ofp.media_type);
+                0
+            }
         }
     }
 }
@@ -982,124 +1006,126 @@ unsafe fn configure_output_audio_filter(
     ofp: &mut OutputFilterParameter,
     output: *mut AVFilterInOut,
 ) -> i32 {
-    let mut pad_idx = (*output).pad_idx;
-    let mut last_filter = (*output).filter_ctx;
+    unsafe {
+        let mut pad_idx = (*output).pad_idx;
+        let mut last_filter = (*output).filter_ctx;
 
-    let result = CString::new(format!("out_{}", ofp.opts.name));
-    if let Err(_) = result {
-        return AVERROR(ENOMEM);
-    }
-    let name = result.unwrap();
-
-    let abuffer_str = std::ffi::CString::new("abuffersink").unwrap();
-    let abuffer_filter = avfilter_get_by_name(abuffer_str.as_ptr());
-
-    let ret = avfilter_graph_create_filter(
-        &mut ofp.filter,
-        abuffer_filter,
-        name.as_ptr(),
-        null(),
-        null_mut(),
-        graph,
-    );
-    if ret < 0 {
-        return ret;
-    }
-
-    let all_channel_counts_str = std::ffi::CString::new("all_channel_counts").unwrap();
-    let mut ret = av_opt_set_int(
-        ofp.filter as *mut _,
-        all_channel_counts_str.as_ptr(),
-        1,
-        AV_OPT_SEARCH_CHILDREN,
-    );
-    if ret < 0 {
-        return ret;
-    }
-
-    let mut bprint = AVBPrint {
-        str_: null_mut(),
-        len: 0,
-        size: 0,
-        size_max: 0,
-        reserved_internal_buffer: [0; 1],
-        reserved_padding: [0; 1000],
-    };
-    av_bprint_init(&mut bprint, 0, u32::MAX);
-
-    choose_sample_fmts(
-        &mut bprint,
-        ofp.opts.audio_format,
-        ofp.opts.audio_formats.clone(),
-    );
-    choose_sample_rates(
-        &mut bprint,
-        ofp.opts.sample_rate,
-        ofp.opts.sample_rates.clone(),
-    );
-    choose_channel_layouts(&mut bprint, ofp.opts.ch_layout, ofp.opts.ch_layouts.clone());
-
-    if bprint.len >= bprint.size {
-        av_bprint_finalize(&mut bprint, null_mut());
-        return AVERROR(ENOMEM);
-    }
-
-    if bprint.len > 0 {
-        let mut filter = null_mut();
-
-        let result = CString::new(format!("format_out_{}", ofp.name));
+        let result = CString::new(format!("out_{}", ofp.opts.name));
         if let Err(_) = result {
-            av_bprint_finalize(&mut bprint, null_mut());
             return AVERROR(ENOMEM);
         }
         let name = result.unwrap();
 
-        let format_out_str = CString::new("aformat").unwrap();
-        let format_out_filter = avfilter_get_by_name(format_out_str.as_ptr());
-        let mut ret = avfilter_graph_create_filter(
-            &mut filter,
-            format_out_filter,
+        let abuffer_str = std::ffi::CString::new("abuffersink").unwrap();
+        let abuffer_filter = avfilter_get_by_name(abuffer_str.as_ptr());
+
+        let ret = avfilter_graph_create_filter(
+            &mut ofp.filter,
+            abuffer_filter,
             name.as_ptr(),
-            bprint.str_,
+            null(),
             null_mut(),
             graph,
         );
         if ret < 0 {
-            av_bprint_finalize(&mut bprint, null_mut());
             return ret;
         }
 
-        ret = avfilter_link(last_filter, pad_idx as u32, filter, 0);
+        let all_channel_counts_str = std::ffi::CString::new("all_channel_counts").unwrap();
+        let mut ret = av_opt_set_int(
+            ofp.filter as *mut _,
+            all_channel_counts_str.as_ptr(),
+            1,
+            AV_OPT_SEARCH_CHILDREN,
+        );
+        if ret < 0 {
+            return ret;
+        }
+
+        let mut bprint = AVBPrint {
+            str_: null_mut(),
+            len: 0,
+            size: 0,
+            size_max: 0,
+            reserved_internal_buffer: [0; 1],
+            reserved_padding: [0; 1000],
+        };
+        av_bprint_init(&mut bprint, 0, u32::MAX);
+
+        choose_sample_fmts(
+            &mut bprint,
+            ofp.opts.audio_format,
+            ofp.opts.audio_formats.clone(),
+        );
+        choose_sample_rates(
+            &mut bprint,
+            ofp.opts.sample_rate,
+            ofp.opts.sample_rates.clone(),
+        );
+        choose_channel_layouts(&mut bprint, ofp.opts.ch_layout, ofp.opts.ch_layouts.clone());
+
+        if bprint.len >= bprint.size {
+            av_bprint_finalize(&mut bprint, null_mut());
+            return AVERROR(ENOMEM);
+        }
+
+        if bprint.len > 0 {
+            let mut filter = null_mut();
+
+            let result = CString::new(format!("format_out_{}", ofp.name));
+            if let Err(_) = result {
+                av_bprint_finalize(&mut bprint, null_mut());
+                return AVERROR(ENOMEM);
+            }
+            let name = result.unwrap();
+
+            let format_out_str = CString::new("aformat").unwrap();
+            let format_out_filter = avfilter_get_by_name(format_out_str.as_ptr());
+            let mut ret = avfilter_graph_create_filter(
+                &mut filter,
+                format_out_filter,
+                name.as_ptr(),
+                bprint.str_,
+                null_mut(),
+                graph,
+            );
+            if ret < 0 {
+                av_bprint_finalize(&mut bprint, null_mut());
+                return ret;
+            }
+
+            ret = avfilter_link(last_filter, pad_idx as u32, filter, 0);
+            if ret < 0 {
+                av_bprint_finalize(&mut bprint, null_mut());
+                return ret;
+            }
+
+            last_filter = filter;
+            pad_idx = 0;
+        }
+
+        //TODO auto apad
+
+        let name = format!("trim_out_{}", ofp.name);
+        ret = insert_trim(
+            ofp.opts.trim_start_us,
+            ofp.opts.trim_duration_us,
+            &mut last_filter,
+            &mut pad_idx,
+            &name,
+        );
+        if ret < 0 {
+            return ret;
+        }
+
+        ret = avfilter_link(last_filter, pad_idx as u32, ofp.filter, 0);
         if ret < 0 {
             av_bprint_finalize(&mut bprint, null_mut());
             return ret;
         }
 
-        last_filter = filter;
-        pad_idx = 0;
+        0
     }
-
-    //TODO auto apad
-
-    let name = format!("trim_out_{}", ofp.name);
-    ret = insert_trim(
-        ofp.opts.trim_start_us,
-        ofp.opts.trim_duration_us,
-        &mut last_filter,
-        &mut pad_idx,
-        &name,
-    );
-    if ret < 0 {
-        return ret;
-    }
-
-    ret = avfilter_link(last_filter, pad_idx as u32, ofp.filter, 0);
-    if ret < 0 {
-        av_bprint_finalize(&mut bprint, null_mut());
-        return ret;
-    }
-
-    0
 }
 
 fn insert_trim(
@@ -1209,54 +1235,59 @@ unsafe fn fg_read_frames(
     ofps: &mut Vec<OutputFilterParameter>,
     frame_pool: &ObjPool<Frame>,
 ) -> i32 {
-    // graph not configured, just select the input to request
-    if graph.is_null() {
-        for ifp in ifps {
-            if ifp.format < 0 && !ifp.eof {
-                fgp.next_in = ifp.input_filter_index;
-                return 0;
-            }
-        }
-        return AVERROR_BUG;
-    }
-
-    loop {
-        if fgp.nb_outputs_done >= ofps.len() {
-            break;
-        }
-
-        let ret = avfilter_graph_request_oldest(graph);
-        if ret == AVERROR(EAGAIN) {
-            fgp.next_in = choose_input(ifps);
-            break;
-        } else if ret < 0 {
-            if ret == AVERROR_EOF {
-                trace!("Filtergraph returned EOF, finishing");
-            } else {
-                error!("Error requesting a frame from the filtergraph: {}", av_err2str(ret));
-            }
-            return ret;
-        }
-
-        //TODO rate-control
-
-        for ofp in &mut *ofps {
-            loop {
-                let ret = fg_output_step(fgp, ofp, frame_pool);
-                if ret < 0 {
-                    return ret;
-                }
-                if ret != 0 {
-                    break;
+    unsafe {
+        // graph not configured, just select the input to request
+        if graph.is_null() {
+            for ifp in ifps {
+                if ifp.format < 0 && !ifp.eof {
+                    fgp.next_in = ifp.input_filter_index;
+                    return 0;
                 }
             }
+            return AVERROR_BUG;
         }
-    }
 
-    if fgp.nb_outputs_done == ofps.len() {
-        AVERROR_EOF
-    } else {
-        0
+        loop {
+            if fgp.nb_outputs_done >= ofps.len() {
+                break;
+            }
+
+            let ret = avfilter_graph_request_oldest(graph);
+            if ret == AVERROR(EAGAIN) {
+                fgp.next_in = choose_input(ifps);
+                break;
+            } else if ret < 0 {
+                if ret == AVERROR_EOF {
+                    trace!("Filtergraph returned EOF, finishing");
+                } else {
+                    error!(
+                        "Error requesting a frame from the filtergraph: {}",
+                        av_err2str(ret)
+                    );
+                }
+                return ret;
+            }
+
+            //TODO rate-control
+
+            for ofp in &mut *ofps {
+                loop {
+                    let ret = fg_output_step(fgp, ofp, frame_pool);
+                    if ret < 0 {
+                        return ret;
+                    }
+                    if ret != 0 {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if fgp.nb_outputs_done == ofps.len() {
+            AVERROR_EOF
+        } else {
+            0
+        }
     }
 }
 
@@ -1295,108 +1326,115 @@ unsafe fn fg_output_step(
     ofp: &mut OutputFilterParameter,
     frame_pool: &ObjPool<Frame>,
 ) -> i32 {
-    let Ok(mut frame) = frame_pool.get() else {
-        return AVERROR(ffmpeg_sys_next::ENOMEM);
-    };
-    let mut ret = av_buffersink_get_frame_flags(
-        ofp.filter,
-        frame.as_mut_ptr(),
-        AV_BUFFERSINK_FLAG_NO_REQUEST,
-    );
+    unsafe {
+        let Ok(mut frame) = frame_pool.get() else {
+            return AVERROR(ffmpeg_sys_next::ENOMEM);
+        };
+        let mut ret = av_buffersink_get_frame_flags(
+            ofp.filter,
+            frame.as_mut_ptr(),
+            AV_BUFFERSINK_FLAG_NO_REQUEST,
+        );
 
-    if ret == AVERROR_EOF && !ofp.eof {
-        frame_pool.release(frame);
-        ret = fg_output_frame(fgp, ofp, null_frame(), frame_pool);
-        return if ret < 0 { ret } else { 1 };
-    } else if ret == AVERROR(EAGAIN) || ret == AVERROR_EOF {
-        frame_pool.release(frame);
-        return 1;
-    } else if ret < 0 {
-        frame_pool.release(frame);
-        warn!("Error in retrieving a frame from the filtergraph: {}", av_err2str(ret));
-        return ret;
-    }
+        if ret == AVERROR_EOF && !ofp.eof {
+            frame_pool.release(frame);
+            ret = fg_output_frame(fgp, ofp, null_frame(), frame_pool);
+            return if ret < 0 { ret } else { 1 };
+        } else if ret == AVERROR(EAGAIN) || ret == AVERROR_EOF {
+            frame_pool.release(frame);
+            return 1;
+        } else if ret < 0 {
+            frame_pool.release(frame);
+            warn!(
+                "Error in retrieving a frame from the filtergraph: {}",
+                av_err2str(ret)
+            );
+            return ret;
+        }
 
-    if ofp.eof {
-        frame_pool.release(frame);
-        return 0;
-    }
+        if ofp.eof {
+            frame_pool.release(frame);
+            return 0;
+        }
 
-    // Choose the output timebase the first time we get a frame.
-    choose_out_timebase(ofp, &frame);
-    (*frame.as_mut_ptr()).time_base = av_buffersink_get_time_base(ofp.filter);
+        // Choose the output timebase the first time we get a frame.
+        choose_out_timebase(ofp, &frame);
+        (*frame.as_mut_ptr()).time_base = av_buffersink_get_time_base(ofp.filter);
 
-    /*if !fgp.is_meta {
+        /*if !fgp.is_meta {
 
-    }*/
+        }*/
 
-    if ofp.media_type == AVMEDIA_TYPE_VIDEO {
-        if (*frame.as_ptr()).duration == 0 {
-            let fr = av_buffersink_get_frame_rate(ofp.filter);
-            if fr.num > 0 && fr.den > 0 {
-                (*frame.as_mut_ptr()).duration =
-                    av_rescale_q(1, av_inv_q(fr), (*frame.as_ptr()).time_base);
+        if ofp.media_type == AVMEDIA_TYPE_VIDEO {
+            if (*frame.as_ptr()).duration == 0 {
+                let fr = av_buffersink_get_frame_rate(ofp.filter);
+                if fr.num > 0 && fr.den > 0 {
+                    (*frame.as_mut_ptr()).duration =
+                        av_rescale_q(1, av_inv_q(fr), (*frame.as_ptr()).time_base);
+                }
             }
         }
-    }
 
-    ret = fg_output_frame(fgp, ofp, frame, frame_pool);
-    if ret < 0 {
-        return ret;
-    }
+        ret = fg_output_frame(fgp, ofp, frame, frame_pool);
+        if ret < 0 {
+            return ret;
+        }
 
-    0
+        0
+    }
 }
 
 unsafe fn choose_out_timebase(ofp: &mut OutputFilterParameter, frame: &Frame) {
-    let mut tb = AVRational { num: 0, den: 0 };
-    if ofp.media_type == AVMEDIA_TYPE_AUDIO {
-        tb = AVRational {
-            num: 1,
-            den: (*frame.as_ptr()).sample_rate,
-        };
-        ofp.tb_out = tb;
-        return;
-    }
-
-    let mut fr = ofp.fpsconv_context.framerate;
-    if fr.num == 0 {
-        let fr_sink = av_buffersink_get_frame_rate(ofp.filter);
-        if fr_sink.num > 0 && fr_sink.den > 0 {
-            fr = fr_sink;
+    unsafe {
+        let mut tb = AVRational { num: 0, den: 0 };
+        if ofp.media_type == AVMEDIA_TYPE_AUDIO {
+            tb = AVRational {
+                num: 1,
+                den: (*frame.as_ptr()).sample_rate,
+            };
+            ofp.tb_out = tb;
+            return;
         }
-    }
 
-    if let Some(vsync_method) = ofp.opts.vsync_method {
-        if vsync_method == VsyncCfr || vsync_method == VsyncVscfr {
-            if fr.num == 0 && ofp.fpsconv_context.framerate_max.num == 0 {
-                fr = AVRational { num: 25, den: 1 };
-                warn!(
-                    "No information \
+        let mut fr = ofp.fpsconv_context.framerate;
+        if fr.num == 0 {
+            let fr_sink = av_buffersink_get_frame_rate(ofp.filter);
+            if fr_sink.num > 0 && fr_sink.den > 0 {
+                fr = fr_sink;
+            }
+        }
+
+        if let Some(vsync_method) = ofp.opts.vsync_method {
+            if vsync_method == VsyncCfr || vsync_method == VsyncVscfr {
+                if fr.num == 0 && ofp.fpsconv_context.framerate_max.num == 0 {
+                    fr = AVRational { num: 25, den: 1 };
+                    warn!(
+                        "No information \
                 about the input framerate is available. Falling \
                 back to a default value of 25fps. Use the `framerate` option \
                 if you want a different framerate."
-                );
-            }
+                    );
+                }
 
-            if ofp.fpsconv_context.framerate_max.num != 0
-                && (av_q2d(fr) > av_q2d(ofp.fpsconv_context.framerate_max) || fr.den != 0)
-            {
-                fr = ofp.fpsconv_context.framerate_max;
+                if ofp.fpsconv_context.framerate_max.num != 0
+                    && (av_q2d(fr) > av_q2d(ofp.fpsconv_context.framerate_max) || fr.den != 0)
+                {
+                    fr = ofp.fpsconv_context.framerate_max;
+                }
             }
         }
-    }
 
-    if !(tb.num > 0 && tb.den > 0) {
-        tb = av_inv_q(fr);
-    }
-    if !(tb.num > 0 && tb.den > 0) {
-        tb = (*frame.as_ptr()).time_base;
-    }
+        if !(tb.num > 0 && tb.den > 0) {
+            tb = av_inv_q(fr);
+        }
+        if !(tb.num > 0 && tb.den > 0) {
+            tb = (*frame.as_ptr()).time_base;
+        }
 
-    ofp.fpsconv_context.framerate = fr;
+        ofp.fpsconv_context.framerate = fr;
 
-    ofp.tb_out = tb;
+        ofp.tb_out = tb;
+    }
 }
 
 #[cfg(feature = "docs-rs")]
@@ -1416,138 +1454,142 @@ unsafe fn fg_output_frame(
     mut frame: Frame,
     frame_pool: &ObjPool<Frame>,
 ) -> i32 {
-    if !ofp.finished_flag_list.is_empty() && ofp.fg_input_index < ofp.finished_flag_list.len() {
-        if ofp.finished_flag_list[ofp.fg_input_index].load(Ordering::Acquire) {
-            ofp.eof = true;
-            fgp.nb_outputs_done += 1;
-            return 0;
-        }
-    }
-
-    let mut nb_frames = if !frame_is_null(&frame) { 1 } else { 0 };
-    let mut nb_frames_prev = 0;
-
-    if ofp.media_type == AVMEDIA_TYPE_VIDEO && (!frame_is_null(&frame) || fgp.got_frame) {
-        unsafe { video_sync_process(ofp, frame.as_mut_ptr(), &mut nb_frames, &mut nb_frames_prev) };
-    }
-
-    let frame_prev = &ofp.fpsconv_context.last_frame;
-    for i in 0..nb_frames {
-        let frame_out = if ofp.media_type == AVMEDIA_TYPE_VIDEO {
-            let frame_in = if i < nb_frames_prev && !(*frame_prev.as_ptr()).buf[0].is_null() {
-                frame_prev
-            } else {
-                &frame
-            };
-
-            if frame_is_null(&frame_in) {
-                break;
-            }
-
-            let Ok(mut out) = frame_pool.get() else {
-                return AVERROR(ffmpeg_sys_next::ENOMEM);
-            };
-            let ret = av_frame_ref(out.as_mut_ptr(), frame_in.as_ptr());
-            if ret < 0 {
-                return ret;
-            }
-
-            (*out.as_mut_ptr()).pts = ofp.next_pts;
-
-            if ofp.fpsconv_context.dropped_keyframe {
-                (*out.as_mut_ptr()).flags |= AV_FRAME_FLAG_KEY;
-                ofp.fpsconv_context.dropped_keyframe = false;
-            }
-
-            out
-        } else {
-            // let frame = frame;
-            let Ok(mut out) = frame_pool.get() else {
-                return AVERROR(ffmpeg_sys_next::ENOMEM);
-            };
-            (*frame.as_mut_ptr()).pts = if (*frame.as_ptr()).pts == AV_NOPTS_VALUE {
-                ofp.next_pts
-            } else {
-                av_rescale_q(
-                    (*frame.as_ptr()).pts,
-                    (*frame.as_ptr()).time_base,
-                    ofp.tb_out,
-                ) - av_rescale_q(ofp.opts.ts_offset.unwrap_or(0), AV_TIME_BASE_Q, ofp.tb_out)
-            };
-            (*frame.as_mut_ptr()).time_base = ofp.tb_out;
-            (*frame.as_mut_ptr()).duration = av_rescale_q(
-                (*frame.as_ptr()).nb_samples as i64,
-                AVRational {
-                    num: 1,
-                    den: (*frame.as_ptr()).sample_rate,
-                },
-                ofp.tb_out,
-            );
-
-            ofp.next_pts = (*frame.as_ptr()).pts + (*frame.as_ptr()).duration;
-
-            let ret = av_frame_ref(out.as_mut_ptr(), frame.as_ptr());
-            if ret < 0 {
-                return ret;
-            }
-            out
-        };
-
-        // send the frame to consumers
-        if let Some(dst) = ofp.dst.as_ref() {
-            let framerate = if ofp.opts.framerate.den == 0 {
-                None
-            } else {
-                Some(ofp.opts.framerate)
-            };
-
-            let frame_box = FrameBox {
-                frame: frame_out,
-                frame_data: FrameData {
-                    framerate,
-                    bits_per_raw_sample: 0,
-                    input_stream_width: 0,
-                    input_stream_height: 0,
-                    subtitle_header_size: 0,
-                    subtitle_header: null_mut(),
-                    fg_input_index: ofp.fg_input_index,
-                },
-            };
-
-            if let Err(_) = dst.send(frame_box) {
-                if !ofp.eof {
-                    ofp.eof = true;
-                    fgp.nb_outputs_done += 1;
-                }
+    unsafe {
+        if !ofp.finished_flag_list.is_empty() && ofp.fg_input_index < ofp.finished_flag_list.len() {
+            if ofp.finished_flag_list[ofp.fg_input_index].load(Ordering::Acquire) {
+                ofp.eof = true;
+                fgp.nb_outputs_done += 1;
                 return 0;
             }
         }
 
-        if ofp.media_type == AVMEDIA_TYPE_VIDEO {
-            ofp.fpsconv_context.frame_number += 1;
-            ofp.next_pts += 1;
+        let mut nb_frames = if !frame_is_null(&frame) { 1 } else { 0 };
+        let mut nb_frames_prev = 0;
 
-            if i == nb_frames_prev {
-                if !frame_is_null(&frame) {
-                    (*frame.as_mut_ptr()).flags &= !AV_FRAME_FLAG_KEY;
-                }
-            }
+        if ofp.media_type == AVMEDIA_TYPE_VIDEO && (!frame_is_null(&frame) || fgp.got_frame) {
+            unsafe {
+                video_sync_process(ofp, frame.as_mut_ptr(), &mut nb_frames, &mut nb_frames_prev)
+            };
         }
 
-        fgp.got_frame = true;
-    }
+        let frame_prev = &ofp.fpsconv_context.last_frame;
+        for i in 0..nb_frames {
+            let frame_out = if ofp.media_type == AVMEDIA_TYPE_VIDEO {
+                let frame_in = if i < nb_frames_prev && !(*frame_prev.as_ptr()).buf[0].is_null() {
+                    frame_prev
+                } else {
+                    &frame
+                };
 
-    let frame_is_null = frame_is_null(&frame);
-    if !frame_is_null && ofp.media_type == AVMEDIA_TYPE_VIDEO {
-        let frame_prev = std::mem::replace(&mut ofp.fpsconv_context.last_frame, frame);
-        frame_pool.release(frame_prev);
-    }
+                if frame_is_null(&frame_in) {
+                    break;
+                }
 
-    if frame_is_null {
-        return close_output(ofp, fgp, frame_pool);
-    }
+                let Ok(mut out) = frame_pool.get() else {
+                    return AVERROR(ffmpeg_sys_next::ENOMEM);
+                };
+                let ret = av_frame_ref(out.as_mut_ptr(), frame_in.as_ptr());
+                if ret < 0 {
+                    return ret;
+                }
 
-    0
+                (*out.as_mut_ptr()).pts = ofp.next_pts;
+
+                if ofp.fpsconv_context.dropped_keyframe {
+                    (*out.as_mut_ptr()).flags |= AV_FRAME_FLAG_KEY;
+                    ofp.fpsconv_context.dropped_keyframe = false;
+                }
+
+                out
+            } else {
+                // let frame = frame;
+                let Ok(mut out) = frame_pool.get() else {
+                    return AVERROR(ffmpeg_sys_next::ENOMEM);
+                };
+                (*frame.as_mut_ptr()).pts = if (*frame.as_ptr()).pts == AV_NOPTS_VALUE {
+                    ofp.next_pts
+                } else {
+                    av_rescale_q(
+                        (*frame.as_ptr()).pts,
+                        (*frame.as_ptr()).time_base,
+                        ofp.tb_out,
+                    ) - av_rescale_q(ofp.opts.ts_offset.unwrap_or(0), AV_TIME_BASE_Q, ofp.tb_out)
+                };
+                (*frame.as_mut_ptr()).time_base = ofp.tb_out;
+                (*frame.as_mut_ptr()).duration = av_rescale_q(
+                    (*frame.as_ptr()).nb_samples as i64,
+                    AVRational {
+                        num: 1,
+                        den: (*frame.as_ptr()).sample_rate,
+                    },
+                    ofp.tb_out,
+                );
+
+                ofp.next_pts = (*frame.as_ptr()).pts + (*frame.as_ptr()).duration;
+
+                let ret = av_frame_ref(out.as_mut_ptr(), frame.as_ptr());
+                if ret < 0 {
+                    return ret;
+                }
+                out
+            };
+
+            // send the frame to consumers
+            if let Some(dst) = ofp.dst.as_ref() {
+                let framerate = if ofp.opts.framerate.den == 0 {
+                    None
+                } else {
+                    Some(ofp.opts.framerate)
+                };
+
+                let frame_box = FrameBox {
+                    frame: frame_out,
+                    frame_data: FrameData {
+                        framerate,
+                        bits_per_raw_sample: 0,
+                        input_stream_width: 0,
+                        input_stream_height: 0,
+                        subtitle_header_size: 0,
+                        subtitle_header: null_mut(),
+                        fg_input_index: ofp.fg_input_index,
+                    },
+                };
+
+                if let Err(_) = dst.send(frame_box) {
+                    if !ofp.eof {
+                        ofp.eof = true;
+                        fgp.nb_outputs_done += 1;
+                    }
+                    return 0;
+                }
+            }
+
+            if ofp.media_type == AVMEDIA_TYPE_VIDEO {
+                ofp.fpsconv_context.frame_number += 1;
+                ofp.next_pts += 1;
+
+                if i == nb_frames_prev {
+                    if !frame_is_null(&frame) {
+                        (*frame.as_mut_ptr()).flags &= !AV_FRAME_FLAG_KEY;
+                    }
+                }
+            }
+
+            fgp.got_frame = true;
+        }
+
+        let frame_is_null = frame_is_null(&frame);
+        if !frame_is_null && ofp.media_type == AVMEDIA_TYPE_VIDEO {
+            let frame_prev = std::mem::replace(&mut ofp.fpsconv_context.last_frame, frame);
+            frame_pool.release(frame_prev);
+        }
+
+        if frame_is_null {
+            return close_output(ofp, fgp, frame_pool);
+        }
+
+        0
+    }
 }
 
 #[cfg(feature = "docs-rs")]
@@ -1565,46 +1607,69 @@ unsafe fn close_output(
     fgp: &mut FilterGraphParameter,
     frame_pool: &ObjPool<Frame>,
 ) -> i32 {
-    // we are finished and no frames were ever seen at this output,
-    // at least initialize the encoder with a dummy frame
+    unsafe {
+        // we are finished and no frames were ever seen at this output,
+        // at least initialize the encoder with a dummy frame
 
-    if !fgp.got_frame {
-        let Ok(mut frame) = frame_pool.get() else {
-            return AVERROR(ffmpeg_sys_next::ENOMEM);
-        };
+        if !fgp.got_frame {
+            let Ok(mut frame) = frame_pool.get() else {
+                return AVERROR(ffmpeg_sys_next::ENOMEM);
+            };
 
-        (*frame.as_mut_ptr()).time_base = ofp.tb_out;
-        (*frame.as_mut_ptr()).format = std::mem::transmute(ofp.format);
+            (*frame.as_mut_ptr()).time_base = ofp.tb_out;
+            (*frame.as_mut_ptr()).format = std::mem::transmute(ofp.format);
 
-        (*frame.as_mut_ptr()).width = ofp.width;
-        (*frame.as_mut_ptr()).height = ofp.height;
-        (*frame.as_mut_ptr()).sample_aspect_ratio = ofp.sample_aspect_ratio;
+            (*frame.as_mut_ptr()).width = ofp.width;
+            (*frame.as_mut_ptr()).height = ofp.height;
+            (*frame.as_mut_ptr()).sample_aspect_ratio = ofp.sample_aspect_ratio;
 
-        (*frame.as_mut_ptr()).sample_rate = ofp.sample_rate;
+            (*frame.as_mut_ptr()).sample_rate = ofp.sample_rate;
 
-        if ofp.opts.ch_layout.nb_channels != 0 {
-            let ret = av_channel_layout_copy(
-                &mut (*frame.as_mut_ptr()).ch_layout,
-                &mut (*frame.as_mut_ptr()).ch_layout,
-            );
-            if ret < 0 {
-                return ret;
+            if ofp.opts.ch_layout.nb_channels != 0 {
+                let ret = av_channel_layout_copy(
+                    &mut (*frame.as_mut_ptr()).ch_layout,
+                    &mut (*frame.as_mut_ptr()).ch_layout,
+                );
+                if ret < 0 {
+                    return ret;
+                }
+            }
+
+            warn!("No filtered frames for output stream, trying to initialize anyway.");
+
+            if let Some(dst) = ofp.dst.clone() {
+                let framerate = if ofp.opts.framerate.den == 0 {
+                    None
+                } else {
+                    Some(ofp.opts.framerate)
+                };
+
+                let frame_box = FrameBox {
+                    frame,
+                    frame_data: FrameData {
+                        framerate,
+                        bits_per_raw_sample: 0,
+                        input_stream_width: 0,
+                        input_stream_height: 0,
+                        subtitle_header_size: 0,
+                        subtitle_header: null_mut(),
+                        fg_input_index: ofp.fg_input_index,
+                    },
+                };
+
+                if let Err(_) = dst.send(frame_box) {
+                    return AVERROR(ffmpeg_sys_next::EOF);
+                }
             }
         }
 
-        warn!("No filtered frames for output stream, trying to initialize anyway.");
+        ofp.eof = true;
 
         if let Some(dst) = ofp.dst.clone() {
-            let framerate = if ofp.opts.framerate.den == 0 {
-                None
-            } else {
-                Some(ofp.opts.framerate)
-            };
-
             let frame_box = FrameBox {
-                frame,
+                frame: null_frame(),
                 frame_data: FrameData {
-                    framerate,
+                    framerate: None,
                     bits_per_raw_sample: 0,
                     input_stream_width: 0,
                     input_stream_height: 0,
@@ -1618,30 +1683,9 @@ unsafe fn close_output(
                 return AVERROR(ffmpeg_sys_next::EOF);
             }
         }
+
+        0
     }
-
-    ofp.eof = true;
-
-    if let Some(dst) = ofp.dst.clone() {
-        let frame_box = FrameBox {
-            frame: null_frame(),
-            frame_data: FrameData {
-                framerate: None,
-                bits_per_raw_sample: 0,
-                input_stream_width: 0,
-                input_stream_height: 0,
-                subtitle_header_size: 0,
-                subtitle_header: null_mut(),
-                fg_input_index: ofp.fg_input_index,
-            },
-        };
-
-        if let Err(_) = dst.send(frame_box) {
-            return AVERROR(ffmpeg_sys_next::EOF);
-        }
-    }
-
-    0
 }
 
 #[cfg(feature = "docs-rs")]
@@ -1660,23 +1704,106 @@ unsafe fn video_sync_process(
     nb_frames: &mut i64,
     nb_frames_prev: &mut i64,
 ) {
-    let Some(vsync_method) = ofp.opts.vsync_method else {
-        error!("No vsync method on video sync!!!");
-        return;
-    };
+    unsafe {
+        let Some(vsync_method) = ofp.opts.vsync_method else {
+            error!("No vsync method on video sync!!!");
+            return;
+        };
 
-    let fps = &mut ofp.fpsconv_context;
+        let fps = &mut ofp.fpsconv_context;
 
-    if frame.is_null() {
-        *nb_frames_prev = mid_pred(
-            fps.frames_prev_hist[0],
-            fps.frames_prev_hist[1],
-            fps.frames_prev_hist[2],
-        );
-        *nb_frames = *nb_frames_prev;
+        if frame.is_null() {
+            *nb_frames_prev = mid_pred(
+                fps.frames_prev_hist[0],
+                fps.frames_prev_hist[1],
+                fps.frames_prev_hist[2],
+            );
+            *nb_frames = *nb_frames_prev;
 
-        if *nb_frames == 0 && fps.last_dropped > 0 {
-            fps.last_dropped += 1;
+            if *nb_frames == 0 && fps.last_dropped > 0 {
+                fps.last_dropped += 1;
+            }
+
+            // Handle finish cleanup here
+            fps.frames_prev_hist.copy_within(0..2, 1);
+            fps.frames_prev_hist[0] = *nb_frames_prev;
+
+            if *nb_frames_prev == 0 && fps.last_dropped > 0 {
+                info!(
+                    "Dropping frame {} at ts {}",
+                    fps.frame_number,
+                    (*fps.last_frame.as_ptr()).pts
+                );
+            }
+
+            fps.last_dropped = (nb_frames == nb_frames_prev && !frame.is_null()) as i32;
+
+            if fps.last_dropped != 0 && (*frame).flags & AV_FRAME_FLAG_KEY != 0 {
+                fps.dropped_keyframe = true;
+            }
+
+            return;
+        }
+
+        let mut duration =
+            (*frame).duration as f64 * av_q2d((*frame).time_base) / av_q2d(ofp.tb_out);
+        let mut sync_ipts =
+            adjust_frame_pts_to_encoder_tb(frame, ofp.tb_out, ofp.opts.ts_offset.unwrap_or(0));
+        /* delta0 is the "drift" between the input frame and
+         * where it would fall in the output. */
+        let mut delta0 = sync_ipts - ofp.next_pts as f64;
+        let delta = delta0 + duration;
+
+        // tracks the number of times the PREVIOUS frame should be duplicated,
+        // mostly for variable framerate (VFR)
+        *nb_frames_prev = 0;
+        /* by default, we output a single frame */
+        *nb_frames = 1;
+
+        if delta0 < 0.0 && delta > 0.0 && vsync_method != VSyncMethod::VsyncPassthrough {
+            if delta0 < -0.6 {
+                debug!("Past duration {:.2} too large", -delta0);
+            } else {
+                debug!("Clipping frame in rate conversion by {:.6}", -delta0);
+            }
+            sync_ipts = ofp.next_pts as f64;
+            duration += delta0;
+            delta0 = 0.0;
+        }
+
+        match vsync_method {
+            VSyncMethod::VsyncVscfr => {
+                if fps.frame_number == 0 && delta0 >= 0.5 {
+                    log::debug!("Not duplicating {} initial frames", delta0 as i32);
+                    // delta = duration;
+                    // delta0 = 0.0;
+                    ofp.next_pts = sync_ipts.round() as i64;
+                }
+            }
+            VSyncMethod::VsyncCfr => {
+                if delta < -1.1 {
+                    *nb_frames = 0;
+                } else if delta > 1.1 {
+                    *nb_frames = delta.round() as i64;
+                    if delta0 > 1.1 {
+                        *nb_frames_prev = (delta0 - 0.6).round() as i64;
+                    }
+                }
+                (*frame).duration = 1;
+            }
+            VSyncMethod::VsyncVfr => {
+                if delta <= -0.6 {
+                    *nb_frames = 0;
+                } else if delta > 0.6 {
+                    ofp.next_pts = sync_ipts.round() as i64;
+                }
+                (*frame).duration = duration.round() as i64;
+            }
+            VSyncMethod::VsyncPassthrough => {
+                ofp.next_pts = sync_ipts.round() as i64;
+                (*frame).duration = duration.round() as i64;
+            }
+            _ => {}
         }
 
         // Handle finish cleanup here
@@ -1691,91 +1818,11 @@ unsafe fn video_sync_process(
             );
         }
 
-        fps.last_dropped = (nb_frames == nb_frames_prev && !frame.is_null()) as i32;
+        fps.last_dropped = (nb_frames == nb_frames_prev) as i32;
 
         if fps.last_dropped != 0 && (*frame).flags & AV_FRAME_FLAG_KEY != 0 {
             fps.dropped_keyframe = true;
         }
-
-        return;
-    }
-
-    let mut duration = (*frame).duration as f64 * av_q2d((*frame).time_base) / av_q2d(ofp.tb_out);
-    let mut sync_ipts =
-        adjust_frame_pts_to_encoder_tb(frame, ofp.tb_out, ofp.opts.ts_offset.unwrap_or(0));
-    /* delta0 is the "drift" between the input frame and
-     * where it would fall in the output. */
-    let mut delta0 = sync_ipts - ofp.next_pts as f64;
-    let delta = delta0 + duration;
-
-    // tracks the number of times the PREVIOUS frame should be duplicated,
-    // mostly for variable framerate (VFR)
-    *nb_frames_prev = 0;
-    /* by default, we output a single frame */
-    *nb_frames = 1;
-
-    if delta0 < 0.0 && delta > 0.0 && vsync_method != VSyncMethod::VsyncPassthrough {
-        if delta0 < -0.6 {
-            debug!("Past duration {:.2} too large", -delta0);
-        } else {
-            debug!("Clipping frame in rate conversion by {:.6}", -delta0);
-        }
-        sync_ipts = ofp.next_pts as f64;
-        duration += delta0;
-        delta0 = 0.0;
-    }
-
-    match vsync_method {
-        VSyncMethod::VsyncVscfr => {
-            if fps.frame_number == 0 && delta0 >= 0.5 {
-                log::debug!("Not duplicating {} initial frames", delta0 as i32);
-                // delta = duration;
-                // delta0 = 0.0;
-                ofp.next_pts = sync_ipts.round() as i64;
-            }
-        }
-        VSyncMethod::VsyncCfr => {
-            if delta < -1.1 {
-                *nb_frames = 0;
-            } else if delta > 1.1 {
-                *nb_frames = delta.round() as i64;
-                if delta0 > 1.1 {
-                    *nb_frames_prev = (delta0 - 0.6).round() as i64;
-                }
-            }
-            (*frame).duration = 1;
-        }
-        VSyncMethod::VsyncVfr => {
-            if delta <= -0.6 {
-                *nb_frames = 0;
-            } else if delta > 0.6 {
-                ofp.next_pts = sync_ipts.round() as i64;
-            }
-            (*frame).duration = duration.round() as i64;
-        }
-        VSyncMethod::VsyncPassthrough => {
-            ofp.next_pts = sync_ipts.round() as i64;
-            (*frame).duration = duration.round() as i64;
-        }
-        _ => {}
-    }
-
-    // Handle finish cleanup here
-    fps.frames_prev_hist.copy_within(0..2, 1);
-    fps.frames_prev_hist[0] = *nb_frames_prev;
-
-    if *nb_frames_prev == 0 && fps.last_dropped > 0 {
-        info!(
-            "Dropping frame {} at ts {}",
-            fps.frame_number,
-            (*fps.last_frame.as_ptr()).pts
-        );
-    }
-
-    fps.last_dropped = (nb_frames == nb_frames_prev) as i32;
-
-    if fps.last_dropped != 0 && (*frame).flags & AV_FRAME_FLAG_KEY != 0 {
-        fps.dropped_keyframe = true;
     }
 }
 
@@ -1794,29 +1841,31 @@ unsafe fn adjust_frame_pts_to_encoder_tb(
     tb_dst: AVRational,
     start_time: i64,
 ) -> f64 {
-    let mut float_pts = AV_NOPTS_VALUE as f64;
-    let mut tb = tb_dst;
-    let filter_tb = (*frame).time_base;
-    let extra_bits = av_clip(29 - av_log2(tb.den as u32), 0, 16);
+    unsafe {
+        let mut float_pts = AV_NOPTS_VALUE as f64;
+        let mut tb = tb_dst;
+        let filter_tb = (*frame).time_base;
+        let extra_bits = av_clip(29 - av_log2(tb.den as u32), 0, 16);
 
-    if (*frame).pts == AV_NOPTS_VALUE {
-        return float_pts;
+        if (*frame).pts == AV_NOPTS_VALUE {
+            return float_pts;
+        }
+
+        tb.den <<= extra_bits;
+        float_pts = av_rescale_q((*frame).pts, filter_tb, tb) as f64
+            - av_rescale_q(start_time, AV_TIME_BASE_Q, tb) as f64;
+        float_pts /= (1 << extra_bits) as f64;
+
+        if float_pts != float_pts.round() {
+            float_pts += float_pts.signum() * 1.0 / (1 << 17) as f64;
+        }
+
+        (*frame).pts = av_rescale_q((*frame).pts, filter_tb, tb_dst)
+            - av_rescale_q(start_time, AV_TIME_BASE_Q, tb_dst);
+        (*frame).time_base = tb_dst;
+
+        float_pts
     }
-
-    tb.den <<= extra_bits;
-    float_pts = av_rescale_q((*frame).pts, filter_tb, tb) as f64
-        - av_rescale_q(start_time, AV_TIME_BASE_Q, tb) as f64;
-    float_pts /= (1 << extra_bits) as f64;
-
-    if float_pts != float_pts.round() {
-        float_pts += float_pts.signum() * 1.0 / (1 << 17) as f64;
-    }
-
-    (*frame).pts = av_rescale_q((*frame).pts, filter_tb, tb_dst)
-        - av_rescale_q(start_time, AV_TIME_BASE_Q, tb_dst);
-    (*frame).time_base = tb_dst;
-
-    float_pts
 }
 
 fn av_clip(x: i32, min_val: i32, max_val: i32) -> i32 {
@@ -2085,106 +2134,108 @@ unsafe fn configure_output_video_filter(
     ofp: &mut OutputFilterParameter,
     output: *mut AVFilterInOut,
 ) -> i32 {
-    let mut pad_idx = (*output).pad_idx;
+    unsafe {
+        let mut pad_idx = (*output).pad_idx;
 
-    let mut last_filter = (*output).filter_ctx;
+        let mut last_filter = (*output).filter_ctx;
 
-    let result = CString::new(format!("out_{}", ofp.opts.name));
-    if let Err(_) = result {
-        return AVERROR(ENOMEM);
-    }
-    let name = result.unwrap();
+        let result = CString::new(format!("out_{}", ofp.opts.name));
+        if let Err(_) = result {
+            return AVERROR(ENOMEM);
+        }
+        let name = result.unwrap();
 
-    let buffer_str = std::ffi::CString::new("buffersink").unwrap();
-    let buffer_filter = avfilter_get_by_name(buffer_str.as_ptr());
-
-    let mut ret = avfilter_graph_create_filter(
-        &mut ofp.filter,
-        buffer_filter,
-        name.as_ptr(),
-        null(),
-        null_mut(),
-        graph,
-    );
-    if ret < 0 {
-        return ret;
-    }
-
-    let mut bprint = AVBPrint {
-        str_: null_mut(),
-        len: 0,
-        size: 0,
-        size_max: 0,
-        reserved_internal_buffer: [0; 1],
-        reserved_padding: [0; 1000],
-    };
-    av_bprint_init(&mut bprint, 0, u32::MAX);
-
-    //TODO To support specifying the following parameters
-    choose_pix_fmts(&mut bprint, AV_PIX_FMT_NONE, ofp.opts.formats.clone());
-    choose_color_spaces(
-        &mut bprint,
-        AVCOL_SPC_UNSPECIFIED,
-        ofp.opts.color_spaces.clone().unwrap_or(Vec::new()),
-    );
-    choose_color_ranges(
-        &mut bprint,
-        AVCOL_RANGE_UNSPECIFIED,
-        ofp.opts.color_ranges.clone().unwrap_or(Vec::new()),
-    );
-
-    if bprint.len >= bprint.size {
-        av_bprint_finalize(&mut bprint, null_mut());
-        return AVERROR(ENOMEM);
-    }
-
-    if bprint.len > 0 {
-        let mut filter = null_mut();
-
-        let format_str = CString::new("format").unwrap();
-        let format_filter = avfilter_get_by_name(format_str.as_ptr());
+        let buffer_str = std::ffi::CString::new("buffersink").unwrap();
+        let buffer_filter = avfilter_get_by_name(buffer_str.as_ptr());
 
         let mut ret = avfilter_graph_create_filter(
-            &mut filter,
-            format_filter,
-            format_str.as_ptr(),
-            bprint.str_,
+            &mut ofp.filter,
+            buffer_filter,
+            name.as_ptr(),
+            null(),
             null_mut(),
             graph,
         );
         if ret < 0 {
-            av_bprint_finalize(&mut bprint, null_mut());
             return ret;
         }
 
-        ret = avfilter_link(last_filter, pad_idx as u32, filter, 0);
+        let mut bprint = AVBPrint {
+            str_: null_mut(),
+            len: 0,
+            size: 0,
+            size_max: 0,
+            reserved_internal_buffer: [0; 1],
+            reserved_padding: [0; 1000],
+        };
+        av_bprint_init(&mut bprint, 0, u32::MAX);
+
+        //TODO To support specifying the following parameters
+        choose_pix_fmts(&mut bprint, AV_PIX_FMT_NONE, ofp.opts.formats.clone());
+        choose_color_spaces(
+            &mut bprint,
+            AVCOL_SPC_UNSPECIFIED,
+            ofp.opts.color_spaces.clone().unwrap_or(Vec::new()),
+        );
+        choose_color_ranges(
+            &mut bprint,
+            AVCOL_RANGE_UNSPECIFIED,
+            ofp.opts.color_ranges.clone().unwrap_or(Vec::new()),
+        );
+
+        if bprint.len >= bprint.size {
+            av_bprint_finalize(&mut bprint, null_mut());
+            return AVERROR(ENOMEM);
+        }
+
+        if bprint.len > 0 {
+            let mut filter = null_mut();
+
+            let format_str = CString::new("format").unwrap();
+            let format_filter = avfilter_get_by_name(format_str.as_ptr());
+
+            let mut ret = avfilter_graph_create_filter(
+                &mut filter,
+                format_filter,
+                format_str.as_ptr(),
+                bprint.str_,
+                null_mut(),
+                graph,
+            );
+            if ret < 0 {
+                av_bprint_finalize(&mut bprint, null_mut());
+                return ret;
+            }
+
+            ret = avfilter_link(last_filter, pad_idx as u32, filter, 0);
+            if ret < 0 {
+                av_bprint_finalize(&mut bprint, null_mut());
+                return ret;
+            }
+
+            last_filter = filter;
+            pad_idx = 0;
+        }
+
+        let name = format!("trim_out_{}", ofp.name);
+        ret = insert_trim(
+            ofp.opts.trim_start_us,
+            ofp.opts.trim_duration_us,
+            &mut last_filter,
+            &mut pad_idx,
+            &name,
+        );
+        if ret < 0 {
+            return ret;
+        }
+
+        ret = avfilter_link(last_filter, pad_idx as u32, ofp.filter, 0);
         if ret < 0 {
             av_bprint_finalize(&mut bprint, null_mut());
             return ret;
         }
-
-        last_filter = filter;
-        pad_idx = 0;
+        0
     }
-
-    let name = format!("trim_out_{}", ofp.name);
-    ret = insert_trim(
-        ofp.opts.trim_start_us,
-        ofp.opts.trim_duration_us,
-        &mut last_filter,
-        &mut pad_idx,
-        &name,
-    );
-    if ret < 0 {
-        return ret;
-    }
-
-    ret = avfilter_link(last_filter, pad_idx as u32, ofp.filter, 0);
-    if ret < 0 {
-        av_bprint_finalize(&mut bprint, null_mut());
-        return ret;
-    }
-    0
 }
 
 fn choose_pix_fmts(
@@ -2313,12 +2364,14 @@ unsafe fn configure_input_filter(
     ifp: &mut InputFilterParameter,
     input: *mut AVFilterInOut,
 ) -> i32 {
-    match ifp.media_type {
-        AVMEDIA_TYPE_VIDEO => configure_input_video_filter(fg_index, graph, ifp, input),
-        AVMEDIA_TYPE_AUDIO => configure_input_audio_filter(fg_index, graph, ifp, input),
-        _ => {
-            error!("Unexpected media type {:?}", ifp.media_type);
-            0
+    unsafe {
+        match ifp.media_type {
+            AVMEDIA_TYPE_VIDEO => configure_input_video_filter(fg_index, graph, ifp, input),
+            AVMEDIA_TYPE_AUDIO => configure_input_audio_filter(fg_index, graph, ifp, input),
+            _ => {
+                error!("Unexpected media type {:?}", ifp.media_type);
+                0
+            }
         }
     }
 }
@@ -2340,83 +2393,85 @@ unsafe fn configure_input_audio_filter(
     ifp: &mut InputFilterParameter,
     input: *mut AVFilterInOut,
 ) -> i32 {
-    let mut pad_idx = 0;
-    let abuffer_str = std::ffi::CString::new("abuffer").unwrap();
-    let abuffer_filter = avfilter_get_by_name(abuffer_str.as_ptr());
+    unsafe {
+        let mut pad_idx = 0;
+        let abuffer_str = std::ffi::CString::new("abuffer").unwrap();
+        let abuffer_filter = avfilter_get_by_name(abuffer_str.as_ptr());
 
-    let mut args = AVBPrint {
-        str_: null_mut(),
-        len: 0,
-        size: 0,
-        size_max: 0,
-        reserved_internal_buffer: [0; 1],
-        reserved_padding: [0; 1000],
-    };
+        let mut args = AVBPrint {
+            str_: null_mut(),
+            len: 0,
+            size: 0,
+            size_max: 0,
+            reserved_internal_buffer: [0; 1],
+            reserved_padding: [0; 1000],
+        };
 
-    av_bprint_init(&mut args, 0, AV_BPRINT_SIZE_AUTOMATIC as u32);
-    let sample_fmt_name = av_get_sample_fmt_name(std::mem::transmute((*ifp).format));
+        av_bprint_init(&mut args, 0, AV_BPRINT_SIZE_AUTOMATIC as u32);
+        let sample_fmt_name = av_get_sample_fmt_name(std::mem::transmute((*ifp).format));
 
-    {
-        let fmt_str = CString::new("time_base=%d/%d:sample_rate=%d:sample_fmt=%s").unwrap();
-        av_bprintf(
-            &mut args,
-            fmt_str.as_ptr(),
-            (*ifp).time_base.num,
-            (*ifp).time_base.den,
-            (*ifp).sample_rate,
-            sample_fmt_name,
+        {
+            let fmt_str = CString::new("time_base=%d/%d:sample_rate=%d:sample_fmt=%s").unwrap();
+            av_bprintf(
+                &mut args,
+                fmt_str.as_ptr(),
+                (*ifp).time_base.num,
+                (*ifp).time_base.den,
+                (*ifp).sample_rate,
+                sample_fmt_name,
+            );
+        }
+
+        if av_channel_layout_check(&(*ifp).ch_layout) != 0
+            && (*ifp).ch_layout.order != AV_CHANNEL_ORDER_UNSPEC
+        {
+            let channel_layout_str = CString::new(":channel_layout=").unwrap();
+            av_bprintf(&mut args, channel_layout_str.as_ptr());
+            av_channel_layout_describe_bprint(&(*ifp).ch_layout, &mut args);
+        } else {
+            let channels_fmt = CString::new(":channels=%d").unwrap();
+            av_bprintf(
+                &mut args,
+                channels_fmt.as_ptr(),
+                (*ifp).ch_layout.nb_channels,
+            );
+        }
+
+        let name = format!("graph_{fg_index}_in_{}", ifp.opts.name);
+        let name = CString::new(name.as_str()).expect("CString::new failed");
+
+        let mut ret = avfilter_graph_create_filter(
+            &mut (*ifp).filter,
+            abuffer_filter,
+            name.as_ptr(),
+            args.str_,
+            null_mut(),
+            graph,
         );
-    }
+        if ret < 0 {
+            return ret;
+        }
 
-    if av_channel_layout_check(&(*ifp).ch_layout) != 0
-        && (*ifp).ch_layout.order != AV_CHANNEL_ORDER_UNSPEC
-    {
-        let channel_layout_str = CString::new(":channel_layout=").unwrap();
-        av_bprintf(&mut args, channel_layout_str.as_ptr());
-        av_channel_layout_describe_bprint(&(*ifp).ch_layout, &mut args);
-    } else {
-        let channels_fmt = CString::new(":channels=%d").unwrap();
-        av_bprintf(
-            &mut args,
-            channels_fmt.as_ptr(),
-            (*ifp).ch_layout.nb_channels,
+        let mut last_filter = ifp.filter;
+
+        let name = format!("trim_in_{}", ifp.name);
+        ret = insert_trim(
+            ifp.opts.trim_start_us,
+            ifp.opts.trim_end_us,
+            &mut last_filter,
+            &mut pad_idx,
+            &name,
         );
+        if ret < 0 {
+            return ret;
+        }
+
+        ret = avfilter_link(last_filter, 0, (*input).filter_ctx, (*input).pad_idx as u32);
+        if ret < 0 {
+            return ret;
+        }
+        0
     }
-
-    let name = format!("graph_{fg_index}_in_{}", ifp.opts.name);
-    let name = CString::new(name.as_str()).expect("CString::new failed");
-
-    let mut ret = avfilter_graph_create_filter(
-        &mut (*ifp).filter,
-        abuffer_filter,
-        name.as_ptr(),
-        args.str_,
-        null_mut(),
-        graph,
-    );
-    if ret < 0 {
-        return ret;
-    }
-
-    let mut last_filter = ifp.filter;
-
-    let name = format!("trim_in_{}", ifp.name);
-    ret = insert_trim(
-        ifp.opts.trim_start_us,
-        ifp.opts.trim_end_us,
-        &mut last_filter,
-        &mut pad_idx,
-        &name,
-    );
-    if ret < 0 {
-        return ret;
-    }
-
-    ret = avfilter_link(last_filter, 0, (*input).filter_ctx, (*input).pad_idx as u32);
-    if ret < 0 {
-        return ret;
-    }
-    0
 }
 
 unsafe fn configure_input_video_filter(
@@ -2425,154 +2480,156 @@ unsafe fn configure_input_video_filter(
     ifp: &mut InputFilterParameter,
     input: *mut AVFilterInOut,
 ) -> i32 {
-    let mut pad_idx = 0;
+    unsafe {
+        let mut pad_idx = 0;
 
-    let buffer_str = std::ffi::CString::new("buffer").unwrap();
-    let buffer_filter = avfilter_get_by_name(buffer_str.as_ptr());
+        let buffer_str = std::ffi::CString::new("buffer").unwrap();
+        let buffer_filter = avfilter_get_by_name(buffer_str.as_ptr());
 
-    let mut par = av_buffersrc_parameters_alloc();
-    if par.is_null() {
-        return AVERROR(ENOMEM);
-    }
-
-    //TODO
-    /*if (ifp.type_src == AVMEDIA_TYPE_SUBTITLE){
-    sub2video_prepare(ifp);
-    }*/
-
-    let mut sar = ifp.sample_aspect_ratio;
-    if sar.den == 0 {
-        sar = AVRational { num: 0, den: 1 };
-    }
-
-    let mut args = format!(
-        "video_size={}x{}:pix_fmt={}:time_base={}/{}:pixel_aspect={}/{}:colorspace={}:range={}",
-        ifp.width,
-        ifp.height,
-        ifp.format,
-        ifp.time_base.num,
-        ifp.time_base.den,
-        sar.num,
-        sar.den,
-        ifp.color_space as i32,
-        ifp.color_range as i32,
-    );
-    if ifp.opts.framerate.num != 0 && ifp.opts.framerate.den != 0 {
-        args.push_str(&format!(
-            ":frame_rate={}/{}",
-            ifp.opts.framerate.num, ifp.opts.framerate.den
-        ));
-    }
-
-    let result = CString::new(format!(
-        "graph {fg_index} input from stream {}",
-        ifp.opts.name
-    ));
-    if let Err(_) = result {
-        av_freep(&mut par as *mut _ as *mut c_void);
-        return AVERROR(ENOMEM);
-    }
-    let name = result.unwrap();
-
-    let args_cstr = CString::new(args).unwrap();
-    let mut ret = avfilter_graph_create_filter(
-        &mut ifp.filter,
-        buffer_filter,
-        name.as_ptr(),
-        args_cstr.as_ptr(),
-        null_mut(),
-        graph,
-    );
-    if ret < 0 {
-        av_freep(&mut par as *mut _ as *mut c_void);
-        return ret;
-    }
-
-    (*par).hw_frames_ctx = ifp.hw_frames_ctx;
-    ret = av_buffersrc_parameters_set(ifp.filter, par);
-    av_freep(&mut par as *mut _ as *mut c_void);
-    if ret < 0 {
-        return ret;
-    }
-
-    let mut last_filter = ifp.filter;
-    let desc = av_pix_fmt_desc_get(std::mem::transmute(ifp.format));
-
-    /*if (ifp.opts.flags & IFILTER_FLAG_CROP) {
-        char crop_buf[64];
-        snprintf(crop_buf, sizeof(crop_buf), "w=iw-%u-%u:h=ih-%u-%u:x=%u:y=%u",
-        ifp.opts.crop_left, ifp.opts.crop_right,
-        ifp.opts.crop_top, ifp.opts.crop_bottom,
-        ifp.opts.crop_left, ifp.opts.crop_top);
-        ret = insert_filter(&last_filter, &pad_idx, "crop", crop_buf);
-        if ret < 0
-        return ret;
-    }*/
-
-    ifp.displaymatrix_applied = false;
-    if ifp.opts.flags & IFILTER_FLAG_AUTOROTATE != 0
-        && (*desc).flags & AV_PIX_FMT_FLAG_HWACCEL as u64 == 0
-    {
-        let displaymatrix = ifp.displaymatrix;
-        let theta = get_rotation(&displaymatrix);
-
-        if (theta - 90.0).abs() < 1.0 {
-            let args = if displaymatrix[3] > 0 {
-                "cclock_flip"
-            } else {
-                "clock"
-            };
-            ret = insert_filter(&mut last_filter, &mut pad_idx, "transpose", Some(args));
-        } else if (theta - 180.0).abs() < 1.0 {
-            if displaymatrix[0] < 0 {
-                ret = insert_filter(&mut last_filter, &mut pad_idx, "hflip", None);
-                if ret < 0 {
-                    return ret;
-                }
-            }
-            if displaymatrix[4] < 0 {
-                ret = insert_filter(&mut last_filter, &mut pad_idx, "vflip", None);
-            }
-        } else if (theta - 270.0).abs() < 1.0 {
-            let args = if displaymatrix[3] < 0 {
-                "clock_flip"
-            } else {
-                "cclock"
-            };
-            ret = insert_filter(&mut last_filter, &mut pad_idx, "transpose", Some(args));
-        } else if theta.abs() > 1.0 {
-            let rotate_buf = format!("{:.6}*PI/180", theta);
-            ret = insert_filter(&mut last_filter, &mut pad_idx, "rotate", Some(&rotate_buf));
-        } else if theta.abs() < 1.0 {
-            if displaymatrix[4] < 0 {
-                ret = insert_filter(&mut last_filter, &mut pad_idx, "vflip", None);
-            }
+        let mut par = av_buffersrc_parameters_alloc();
+        if par.is_null() {
+            return AVERROR(ENOMEM);
         }
 
+        //TODO
+        /*if (ifp.type_src == AVMEDIA_TYPE_SUBTITLE){
+        sub2video_prepare(ifp);
+        }*/
+
+        let mut sar = ifp.sample_aspect_ratio;
+        if sar.den == 0 {
+            sar = AVRational { num: 0, den: 1 };
+        }
+
+        let mut args = format!(
+            "video_size={}x{}:pix_fmt={}:time_base={}/{}:pixel_aspect={}/{}:colorspace={}:range={}",
+            ifp.width,
+            ifp.height,
+            ifp.format,
+            ifp.time_base.num,
+            ifp.time_base.den,
+            sar.num,
+            sar.den,
+            ifp.color_space as i32,
+            ifp.color_range as i32,
+        );
+        if ifp.opts.framerate.num != 0 && ifp.opts.framerate.den != 0 {
+            args.push_str(&format!(
+                ":frame_rate={}/{}",
+                ifp.opts.framerate.num, ifp.opts.framerate.den
+            ));
+        }
+
+        let result = CString::new(format!(
+            "graph {fg_index} input from stream {}",
+            ifp.opts.name
+        ));
+        if let Err(_) = result {
+            av_freep(&mut par as *mut _ as *mut c_void);
+            return AVERROR(ENOMEM);
+        }
+        let name = result.unwrap();
+
+        let args_cstr = CString::new(args).unwrap();
+        let mut ret = avfilter_graph_create_filter(
+            &mut ifp.filter,
+            buffer_filter,
+            name.as_ptr(),
+            args_cstr.as_ptr(),
+            null_mut(),
+            graph,
+        );
+        if ret < 0 {
+            av_freep(&mut par as *mut _ as *mut c_void);
+            return ret;
+        }
+
+        (*par).hw_frames_ctx = ifp.hw_frames_ctx;
+        ret = av_buffersrc_parameters_set(ifp.filter, par);
+        av_freep(&mut par as *mut _ as *mut c_void);
         if ret < 0 {
             return ret;
         }
 
-        ifp.displaymatrix_applied = true;
-    }
+        let mut last_filter = ifp.filter;
+        let desc = av_pix_fmt_desc_get(std::mem::transmute(ifp.format));
 
-    let name = format!("trim_in_{}", ifp.name);
-    ret = insert_trim(
-        ifp.opts.trim_start_us,
-        ifp.opts.trim_end_us,
-        &mut last_filter,
-        &mut pad_idx,
-        &name,
-    );
-    if ret < 0 {
-        return ret;
-    }
+        /*if (ifp.opts.flags & IFILTER_FLAG_CROP) {
+            char crop_buf[64];
+            snprintf(crop_buf, sizeof(crop_buf), "w=iw-%u-%u:h=ih-%u-%u:x=%u:y=%u",
+            ifp.opts.crop_left, ifp.opts.crop_right,
+            ifp.opts.crop_top, ifp.opts.crop_bottom,
+            ifp.opts.crop_left, ifp.opts.crop_top);
+            ret = insert_filter(&last_filter, &pad_idx, "crop", crop_buf);
+            if ret < 0
+            return ret;
+        }*/
 
-    ret = avfilter_link(last_filter, 0, (*input).filter_ctx, (*input).pad_idx as u32);
-    if ret < 0 {
-        return ret;
+        ifp.displaymatrix_applied = false;
+        if ifp.opts.flags & IFILTER_FLAG_AUTOROTATE != 0
+            && (*desc).flags & AV_PIX_FMT_FLAG_HWACCEL as u64 == 0
+        {
+            let displaymatrix = ifp.displaymatrix;
+            let theta = get_rotation(&displaymatrix);
+
+            if (theta - 90.0).abs() < 1.0 {
+                let args = if displaymatrix[3] > 0 {
+                    "cclock_flip"
+                } else {
+                    "clock"
+                };
+                ret = insert_filter(&mut last_filter, &mut pad_idx, "transpose", Some(args));
+            } else if (theta - 180.0).abs() < 1.0 {
+                if displaymatrix[0] < 0 {
+                    ret = insert_filter(&mut last_filter, &mut pad_idx, "hflip", None);
+                    if ret < 0 {
+                        return ret;
+                    }
+                }
+                if displaymatrix[4] < 0 {
+                    ret = insert_filter(&mut last_filter, &mut pad_idx, "vflip", None);
+                }
+            } else if (theta - 270.0).abs() < 1.0 {
+                let args = if displaymatrix[3] < 0 {
+                    "clock_flip"
+                } else {
+                    "cclock"
+                };
+                ret = insert_filter(&mut last_filter, &mut pad_idx, "transpose", Some(args));
+            } else if theta.abs() > 1.0 {
+                let rotate_buf = format!("{:.6}*PI/180", theta);
+                ret = insert_filter(&mut last_filter, &mut pad_idx, "rotate", Some(&rotate_buf));
+            } else if theta.abs() < 1.0 {
+                if displaymatrix[4] < 0 {
+                    ret = insert_filter(&mut last_filter, &mut pad_idx, "vflip", None);
+                }
+            }
+
+            if ret < 0 {
+                return ret;
+            }
+
+            ifp.displaymatrix_applied = true;
+        }
+
+        let name = format!("trim_in_{}", ifp.name);
+        ret = insert_trim(
+            ifp.opts.trim_start_us,
+            ifp.opts.trim_end_us,
+            &mut last_filter,
+            &mut pad_idx,
+            &name,
+        );
+        if ret < 0 {
+            return ret;
+        }
+
+        ret = avfilter_link(last_filter, 0, (*input).filter_ctx, (*input).pad_idx as u32);
+        if ret < 0 {
+            return ret;
+        }
+        0
     }
-    0
 }
 
 fn insert_filter(
@@ -2683,233 +2740,243 @@ unsafe fn graph_parse(
     outputs: *mut *mut AVFilterInOut,
     hw_device: Option<HWDevice>,
 ) -> i32 {
-    let desc = CString::new(graph_desc).expect("CString::new failed");
-    let mut seg = null_mut();
-    *inputs = null_mut();
-    *outputs = null_mut();
-    let mut ret = avfilter_graph_segment_parse(graph, desc.as_ptr(), 0, &mut seg);
-    if ret < 0 {
-        return ret;
-    }
+    unsafe {
+        let desc = CString::new(graph_desc).expect("CString::new failed");
+        let mut seg = null_mut();
+        *inputs = null_mut();
+        *outputs = null_mut();
+        let mut ret = avfilter_graph_segment_parse(graph, desc.as_ptr(), 0, &mut seg);
+        if ret < 0 {
+            return ret;
+        }
 
-    ret = avfilter_graph_segment_create_filters(seg, 0);
-    if ret < 0 {
-        avfilter_graph_segment_free(&mut seg);
-        return ret;
-    }
+        ret = avfilter_graph_segment_create_filters(seg, 0);
+        if ret < 0 {
+            avfilter_graph_segment_free(&mut seg);
+            return ret;
+        }
 
-    if let Some(hw_device) = hw_device {
-        for i in 0..(*graph).nb_filters {
-            let f = *(*graph).filters.add(i as usize);
+        if let Some(hw_device) = hw_device {
+            for i in 0..(*graph).nb_filters {
+                let f = *(*graph).filters.add(i as usize);
 
-            if (*(*f).filter).flags & AVFILTER_FLAG_HWDEVICE == 0 {
-                continue;
-            }
-            (*f).hw_device_ctx = av_buffer_ref(hw_device.device_ref);
-            if (*f).hw_device_ctx.is_null() {
-                avfilter_graph_segment_free(&mut seg);
-                return AVERROR(ENOMEM);
+                if (*(*f).filter).flags & AVFILTER_FLAG_HWDEVICE == 0 {
+                    continue;
+                }
+                (*f).hw_device_ctx = av_buffer_ref(hw_device.device_ref);
+                if (*f).hw_device_ctx.is_null() {
+                    avfilter_graph_segment_free(&mut seg);
+                    return AVERROR(ENOMEM);
+                }
             }
         }
-    }
 
-    ret = graph_opts_apply(seg);
-    if ret < 0 {
+        ret = graph_opts_apply(seg);
+        if ret < 0 {
+            avfilter_graph_segment_free(&mut seg);
+            return ret;
+        }
+
+        ret = avfilter_graph_segment_apply(seg, 0, inputs, outputs);
         avfilter_graph_segment_free(&mut seg);
-        return ret;
+
+        ret
     }
-
-    ret = avfilter_graph_segment_apply(seg, 0, inputs, outputs);
-    avfilter_graph_segment_free(&mut seg);
-
-    ret
 }
 
 #[cfg(not(feature = "docs-rs"))]
 pub(crate) unsafe fn graph_opts_apply(seg: *mut AVFilterGraphSegment) -> i32 {
-    for i in 0..(*seg).nb_chains {
-        let ch = *(*seg).chains.add(i);
+    unsafe {
+        for i in 0..(*seg).nb_chains {
+            let ch = *(*seg).chains.add(i);
 
-        for j in 0..(*ch).nb_filters {
-            let p = *(*ch).filters.add(j);
-            let mut e = null();
+            for j in 0..(*ch).nb_filters {
+                let p = *(*ch).filters.add(j);
+                let mut e = null();
 
-            assert!(!(*p).filter.is_null());
+                assert!(!(*p).filter.is_null());
 
-            loop {
-                e = av_dict_iterate((*p).opts, e);
-                if e.is_null() {
-                    break;
+                loop {
+                    e = av_dict_iterate((*p).opts, e);
+                    if e.is_null() {
+                        break;
+                    }
+
+                    let ret = filter_opt_apply((*p).filter, (*e).key, (*e).value);
+                    if ret < 0 {
+                        return ret;
+                    }
                 }
 
-                let ret = filter_opt_apply((*p).filter, (*e).key, (*e).value);
-                if ret < 0 {
-                    return ret;
-                }
+                av_dict_free(&mut (*p).opts);
             }
-
-            av_dict_free(&mut (*p).opts);
         }
-    }
 
-    0
+        0
+    }
 }
 
 unsafe fn filter_opt_apply(f: *mut AVFilterContext, mut key: *mut c_char, val: *mut c_char) -> i32 {
-    let mut ret = av_opt_set(f as *mut libc::c_void, key, val, AV_OPT_SEARCH_CHILDREN);
-    if ret >= 0 {
-        return 0;
-    }
-
-    let o = if ret == AVERROR_OPTION_NOT_FOUND && *key == b'/' as c_char {
-        av_opt_find(
-            f as *mut libc::c_void,
-            key.add(1),
-            null(),
-            0,
-            AV_OPT_SEARCH_CHILDREN,
-        )
-    } else {
-        null()
-    };
-    if o.is_null() {
-        error!(
-            "Error applying option '{}' to filter '{}': {}",
-            CStr::from_ptr(key).to_str().unwrap_or("[unknow key]"),
-            CStr::from_ptr((*(*f).filter).name)
-                .to_str()
-                .unwrap_or("[unknow filter name]"),
-            av_err2str(ret)
-        );
-        return ret;
-    }
-
-    key = key.add(1);
-
-    if (*o).type_ == AV_OPT_TYPE_BINARY {
-        let result = read_binary(val);
-        if let Err(e) = result {
-            error!(
-                "Error loading value for option '{}' from file {}",
-                CStr::from_ptr(key).to_str().unwrap_or("[unknow key]"),
-                CStr::from_ptr(val).to_str().unwrap_or("[unknow val]")
-            );
-            return e;
-        }
-        let (data, len) = result.unwrap();
-
-        ret = av_opt_set_bin(
-            f as *mut libc::c_void,
-            key,
-            data as *mut u8,
-            len as i32,
-            AV_OPT_SEARCH_CHILDREN,
-        );
-        av_freep(data);
-    } else {
-        let data = file_read(val);
-        if data.is_null() {
-            error!(
-                "Error loading value for option '{}' from file {}",
-                CStr::from_ptr(key).to_str().unwrap_or("[unknow key]"),
-                CStr::from_ptr(val).to_str().unwrap_or("[unknow val]")
-            );
-            return AVERROR(EIO);
+    unsafe {
+        let mut ret = av_opt_set(f as *mut libc::c_void, key, val, AV_OPT_SEARCH_CHILDREN);
+        if ret >= 0 {
+            return 0;
         }
 
-        ret = av_opt_set(f as *mut libc::c_void, key, data, AV_OPT_SEARCH_CHILDREN);
-        av_freep(data as *mut libc::c_void);
-    }
-    if ret < 0 {
-        error!(
-            "Error applying option '{}' to filter '{}': {}",
-            CStr::from_ptr(key).to_str().unwrap_or("[unknow key]"),
-            CStr::from_ptr((*(*f).filter).name)
-                .to_str()
-                .unwrap_or("[unknow filter name]"),
-            av_err2str(ret)
-        );
-        return ret;
-    }
+        let o = if ret == AVERROR_OPTION_NOT_FOUND && *key == b'/' as c_char {
+            av_opt_find(
+                f as *mut libc::c_void,
+                key.add(1),
+                null(),
+                0,
+                AV_OPT_SEARCH_CHILDREN,
+            )
+        } else {
+            null()
+        };
+        if o.is_null() {
+            error!(
+                "Error applying option '{}' to filter '{}': {}",
+                CStr::from_ptr(key).to_str().unwrap_or("[unknow key]"),
+                CStr::from_ptr((*(*f).filter).name)
+                    .to_str()
+                    .unwrap_or("[unknow filter name]"),
+                av_err2str(ret)
+            );
+            return ret;
+        }
 
-    0
+        key = key.add(1);
+
+        if (*o).type_ == AV_OPT_TYPE_BINARY {
+            let result = read_binary(val);
+            if let Err(e) = result {
+                error!(
+                    "Error loading value for option '{}' from file {}",
+                    CStr::from_ptr(key).to_str().unwrap_or("[unknow key]"),
+                    CStr::from_ptr(val).to_str().unwrap_or("[unknow val]")
+                );
+                return e;
+            }
+            let (data, len) = result.unwrap();
+
+            ret = av_opt_set_bin(
+                f as *mut libc::c_void,
+                key,
+                data as *mut u8,
+                len as i32,
+                AV_OPT_SEARCH_CHILDREN,
+            );
+            av_freep(data);
+        } else {
+            let data = file_read(val);
+            if data.is_null() {
+                error!(
+                    "Error loading value for option '{}' from file {}",
+                    CStr::from_ptr(key).to_str().unwrap_or("[unknow key]"),
+                    CStr::from_ptr(val).to_str().unwrap_or("[unknow val]")
+                );
+                return AVERROR(EIO);
+            }
+
+            ret = av_opt_set(f as *mut libc::c_void, key, data, AV_OPT_SEARCH_CHILDREN);
+            av_freep(data as *mut libc::c_void);
+        }
+        if ret < 0 {
+            error!(
+                "Error applying option '{}' to filter '{}': {}",
+                CStr::from_ptr(key).to_str().unwrap_or("[unknow key]"),
+                CStr::from_ptr((*(*f).filter).name)
+                    .to_str()
+                    .unwrap_or("[unknow filter name]"),
+                av_err2str(ret)
+            );
+            return ret;
+        }
+
+        0
+    }
 }
 
 unsafe fn file_read(filename: *mut c_char) -> *mut c_char {
-    let mut pb = null_mut();
-    let mut ret = avio_open(&mut pb, filename, AVIO_FLAG_READ);
-    let bprint = null_mut();
-    let mut str = null_mut();
+    unsafe {
+        let mut pb = null_mut();
+        let mut ret = avio_open(&mut pb, filename, AVIO_FLAG_READ);
+        let bprint = null_mut();
+        let mut str = null_mut();
 
-    if ret < 0 {
-        error!(
-            "Error opening file {}.",
-            CStr::from_ptr(filename)
-                .to_str()
-                .unwrap_or("[unknow filename]")
-        );
-        return null_mut();
-    }
+        if ret < 0 {
+            error!(
+                "Error opening file {}.",
+                CStr::from_ptr(filename)
+                    .to_str()
+                    .unwrap_or("[unknow filename]")
+            );
+            return null_mut();
+        }
 
-    av_bprint_init(bprint, 0, u32::MAX);
-    ret = avio_read_to_bprint(pb, bprint, usize::MAX);
-    avio_closep(&mut pb);
-    if ret < 0 {
-        av_bprint_finalize(bprint, null_mut());
-        return null_mut();
+        av_bprint_init(bprint, 0, u32::MAX);
+        ret = avio_read_to_bprint(pb, bprint, usize::MAX);
+        avio_closep(&mut pb);
+        if ret < 0 {
+            av_bprint_finalize(bprint, null_mut());
+            return null_mut();
+        }
+        ret = av_bprint_finalize(bprint, &mut str);
+        if ret < 0 {
+            return null_mut();
+        }
+        str
     }
-    ret = av_bprint_finalize(bprint, &mut str);
-    if ret < 0 {
-        return null_mut();
-    }
-    str
 }
 
 unsafe fn read_binary(path: *mut c_char) -> crate::error::Result<(*mut c_void, i64), i32> {
-    let mut io = null_mut();
+    unsafe {
+        let mut io = null_mut();
 
-    let ret = avio_open2(&mut io, path, AVIO_FLAG_READ, null(), null_mut());
-    if ret < 0 {
-        error!(
-            "Cannot open file '{}': {}",
-            CStr::from_ptr(path).to_str().unwrap_or("[unknow path]"),
-            av_err2str(ret)
-        );
-        return Err(ret);
-    }
+        let ret = avio_open2(&mut io, path, AVIO_FLAG_READ, null(), null_mut());
+        if ret < 0 {
+            error!(
+                "Cannot open file '{}': {}",
+                CStr::from_ptr(path).to_str().unwrap_or("[unknow path]"),
+                av_err2str(ret)
+            );
+            return Err(ret);
+        }
 
-    let fsize = avio_size(io);
-    if fsize < 0 || fsize > i64::MAX {
-        error!(
-            "Cannot obtain size of file '{}'",
-            CStr::from_ptr(path).to_str().unwrap_or("[unknow path]")
-        );
+        let fsize = avio_size(io);
+        if fsize < 0 || fsize > i64::MAX {
+            error!(
+                "Cannot obtain size of file '{}'",
+                CStr::from_ptr(path).to_str().unwrap_or("[unknow path]")
+            );
+            avio_close(io);
+            return Err(AVERROR(EIO));
+        }
+
+        let data = av_malloc(fsize as usize);
+        if data.is_null() {
+            avio_close(io);
+            return Err(AVERROR(ENOMEM));
+        }
+
+        let read_size = avio_read(io, data as *mut libc::c_uchar, fsize as i32);
+        if read_size != fsize as i32 {
+            error!(
+                "Error reading file '{}'. read_size:{read_size}",
+                CStr::from_ptr(path).to_str().unwrap_or("[unknow path]")
+            );
+            av_freep(data);
+            avio_close(io);
+            return Err(if read_size < 0 {
+                read_size
+            } else {
+                AVERROR(EIO)
+            });
+        }
+
         avio_close(io);
-        return Err(AVERROR(EIO));
+
+        Ok((data, fsize))
     }
-
-    let data = av_malloc(fsize as usize);
-    if data.is_null() {
-        avio_close(io);
-        return Err(AVERROR(ENOMEM));
-    }
-
-    let read_size = avio_read(io, data as *mut libc::c_uchar, fsize as i32);
-    if read_size != fsize as i32 {
-        error!(
-            "Error reading file '{}'. read_size:{read_size}",
-            CStr::from_ptr(path).to_str().unwrap_or("[unknow path]")
-        );
-        av_freep(data);
-        avio_close(io);
-        return Err(if read_size < 0 {
-            read_size
-        } else {
-            AVERROR(EIO)
-        });
-    }
-
-    avio_close(io);
-
-    Ok((data, fsize))
 }

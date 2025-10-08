@@ -1,16 +1,19 @@
-use std::collections::HashMap;
 use crate::core::context::encoder_stream::EncoderStream;
-use crate::core::filter::frame_pipeline::FramePipeline;
 use crate::core::context::output::{StreamMap, VSyncMethod};
 use crate::core::context::{FrameBox, PacketBox};
+use crate::core::filter::frame_pipeline::FramePipeline;
+use crate::core::scheduler::input_controller::SchNode;
 use crate::error::OpenOutputError;
 use crossbeam_channel::{Receiver, Sender};
-use ffmpeg_sys_next::{avformat_new_stream, AVCodec, AVFormatContext, AVMediaType, AVRational, AVSampleFormat, AVStream, AVFMT_NOTIMESTAMPS, AVFMT_VARIABLE_FPS};
+use ffmpeg_sys_next::{
+    AVCodec, AVFMT_NOTIMESTAMPS, AVFMT_VARIABLE_FPS, AVFormatContext, AVMediaType, AVRational,
+    AVSampleFormat, AVStream, avformat_new_stream,
+};
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::ptr::null;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use crate::core::scheduler::input_controller::SchNode;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 
 pub(crate) struct Muxer {
     pub(crate) url: String,
@@ -32,7 +35,6 @@ pub(crate) struct Muxer {
     pub(crate) audio_sample_rate: Option<i32>,
     pub(crate) audio_channels: Option<i32>,
     pub(crate) audio_sample_fmt: Option<AVSampleFormat>,
-
 
     pub(crate) video_qscale: Option<i32>,
     pub(crate) audio_qscale: Option<i32>,
@@ -89,7 +91,7 @@ impl Muxer {
         audio_codec_opts: Option<HashMap<CString, CString>>,
         subtitle_codec_opts: Option<HashMap<CString, CString>>,
         format_opts: Option<HashMap<CString, CString>>,
-        copy_ts: bool
+        copy_ts: bool,
     ) -> Self {
         Self {
             url,
@@ -140,7 +142,12 @@ impl Muxer {
 
         let vsync_method = if media_type == AVMediaType::AVMEDIA_TYPE_VIDEO {
             Some(unsafe {
-                determine_vsync_method(self.vsync_method, self.framerate, self.out_fmt_ctx, self.copy_ts)
+                determine_vsync_method(
+                    self.vsync_method,
+                    self.framerate,
+                    self.out_fmt_ctx,
+                    self.copy_ts,
+                )
             })
         } else {
             None
@@ -176,7 +183,7 @@ impl Muxer {
     pub(crate) fn new_stream(
         &mut self,
         src: Arc<SchNode>,
-    ) -> crate::error::Result<(Sender<PacketBox>,*mut AVStream, usize)> {
+    ) -> crate::error::Result<(Sender<PacketBox>, *mut AVStream, usize)> {
         let packet_sender = match &self.queue {
             None => {
                 let (packet_sender, packet_receiver) = crossbeam_channel::bounded(8);
@@ -187,11 +194,14 @@ impl Muxer {
         };
 
         let index = self.nb_streams;
-        self.mux_stream_nodes.insert(index, Arc::new(SchNode::MuxStream {
-            src,
-            last_dts: Arc::new(AtomicI64::new(0)),
-            source_finished: Arc::new(AtomicBool::new(false)),
-        }));
+        self.mux_stream_nodes.insert(
+            index,
+            Arc::new(SchNode::MuxStream {
+                src,
+                last_dts: Arc::new(AtomicI64::new(0)),
+                source_finished: Arc::new(AtomicBool::new(false)),
+            }),
+        );
 
         self.nb_streams += 1;
         unsafe {
@@ -250,40 +260,42 @@ unsafe fn determine_vsync_method(
     out_fmt_ctx: *mut AVFormatContext,
     copy_ts: bool,
 ) -> VSyncMethod {
-    if vsync_method != VSyncMethod::VsyncAuto {
-        return vsync_method;
-    }
+    unsafe {
+        if vsync_method != VSyncMethod::VsyncAuto {
+            return vsync_method;
+        }
 
-    // 1. Check if frame rate is set
-    let mut vsync_method = if framerate.map_or(false, |fr| fr.num != 0) {
-        VSyncMethod::VsyncCfr
-    }
-    // 2. If output format is "avi", set VSYNC_VFR
-    else if match CStr::from_ptr((*(*out_fmt_ctx).oformat).name).to_str() {
-        Ok(s) => s == "avi",
-        Err(_) => false,
-    } {
-        VSyncMethod::VsyncVfr
-    }
-    // 3. Otherwise, check the format flags
-    else {
-        let oformat = (*out_fmt_ctx).oformat;
-        if (*oformat).flags & AVFMT_VARIABLE_FPS != 0 {
-            if (*oformat).flags & AVFMT_NOTIMESTAMPS != 0 {
-                VSyncMethod::VsyncPassthrough
-            } else {
-                VSyncMethod::VsyncVfr
-            }
-        } else {
+        // 1. Check if frame rate is set
+        let mut vsync_method = if framerate.map_or(false, |fr| fr.num != 0) {
             VSyncMethod::VsyncCfr
         }
-    };
+        // 2. If output format is "avi", set VSYNC_VFR
+        else if match CStr::from_ptr((*(*out_fmt_ctx).oformat).name).to_str() {
+            Ok(s) => s == "avi",
+            Err(_) => false,
+        } {
+            VSyncMethod::VsyncVfr
+        }
+        // 3. Otherwise, check the format flags
+        else {
+            let oformat = (*out_fmt_ctx).oformat;
+            if (*oformat).flags & AVFMT_VARIABLE_FPS != 0 {
+                if (*oformat).flags & AVFMT_NOTIMESTAMPS != 0 {
+                    VSyncMethod::VsyncPassthrough
+                } else {
+                    VSyncMethod::VsyncVfr
+                }
+            } else {
+                VSyncMethod::VsyncCfr
+            }
+        };
 
-    // 4. If input stream exists and VSYNC_CFR is selected, check additional conditions
-    if vsync_method == VSyncMethod::VsyncCfr && copy_ts {
-        vsync_method = VSyncMethod::VsyncVscfr;
+        // 4. If input stream exists and VSYNC_CFR is selected, check additional conditions
+        if vsync_method == VSyncMethod::VsyncCfr && copy_ts {
+            vsync_method = VSyncMethod::VsyncVscfr;
+        }
+
+        vsync_method
+        // TODO 5. If VSYNC_CFR and copy_ts is true, change to VSYNC_VSCFR
     }
-
-    vsync_method
-    // TODO 5. If VSYNC_CFR and copy_ts is true, change to VSYNC_VSCFR
 }

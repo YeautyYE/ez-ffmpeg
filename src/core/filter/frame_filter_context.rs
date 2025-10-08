@@ -15,8 +15,14 @@ pub struct FrameFilterContext<'a> {
 
 impl<'a> FrameFilterContext<'a> {
     /// Creates a new context for a specific filter name and attribute map.
-    pub fn new(name: &'a str, attribute_map: &'a mut HashMap<String, Box<dyn Any + std::marker::Send>>) -> Self {
-        Self { name, attribute_map }
+    pub fn new(
+        name: &'a str,
+        attribute_map: &'a mut HashMap<String, Box<dyn Any + std::marker::Send>>,
+    ) -> Self {
+        Self {
+            name,
+            attribute_map,
+        }
     }
 
     /// Returns the filter's name, useful for logging or debugging.

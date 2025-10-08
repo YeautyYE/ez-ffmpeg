@@ -2,8 +2,8 @@ use std::ffi::CStr;
 use std::ptr::null_mut;
 
 pub mod frame_filter;
-pub mod frame_pipeline;
 pub mod frame_filter_context;
+pub mod frame_pipeline;
 pub mod frame_pipeline_builder;
 
 /// Retrieves a list of all filters recognized by FFmpeg.
@@ -38,7 +38,8 @@ pub fn get_filters() -> Vec<FilterInfo> {
 
             // Convert the filter's name and description from C strings to Rust strings.
             let name = std::str::from_utf8_unchecked(CStr::from_ptr((*filter).name).to_bytes());
-            let description = std::str::from_utf8_unchecked(CStr::from_ptr((*filter).description).to_bytes());
+            let description =
+                std::str::from_utf8_unchecked(CStr::from_ptr((*filter).description).to_bytes());
             // Retrieve the filter's flags.
             let flags = ffmpeg_next::filter::Flags::from_bits_truncate((*filter).flags);
 

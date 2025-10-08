@@ -1,6 +1,6 @@
-use std::collections::HashMap;
-use ffmpeg_sys_next::{AVRational, AVSampleFormat};
 use crate::filter::frame_pipeline::FramePipeline;
+use ffmpeg_sys_next::{AVRational, AVSampleFormat};
+use std::collections::HashMap;
 
 unsafe impl Send for Output {}
 
@@ -303,7 +303,6 @@ pub struct Output {
     ///     .set_format_opt("movflags", "faststart");
     /// ```
     pub(crate) format_opts: Option<HashMap<String, String>>,
-
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -553,7 +552,12 @@ impl Output {
     ///     ]);
     /// ```
     pub fn set_frame_pipelines(mut self, frame_pipelines: Vec<impl Into<FramePipeline>>) -> Self {
-        self.frame_pipelines = Some(frame_pipelines.into_iter().map(|frame_pipeline| frame_pipeline.into()).collect());
+        self.frame_pipelines = Some(
+            frame_pipelines
+                .into_iter()
+                .map(|frame_pipeline| frame_pipeline.into())
+                .collect(),
+        );
         self
     }
 
@@ -1046,7 +1050,10 @@ impl Output {
     ///         ("preset", "fast")
     ///     ]);
     /// ```
-    pub fn set_video_codec_opts(mut self, opts: Vec<(impl Into<String>, impl Into<String>)>) -> Self {
+    pub fn set_video_codec_opts(
+        mut self,
+        opts: Vec<(impl Into<String>, impl Into<String>)>,
+    ) -> Self {
         let video_opts = self.video_codec_opts.get_or_insert_with(HashMap::new);
         for (key, value) in opts {
             video_opts.insert(key.into(), value.into());
@@ -1091,7 +1098,10 @@ impl Output {
     ///         ("compression_level", "6")
     ///     ]);
     /// ```
-    pub fn set_audio_codec_opts(mut self, opts: Vec<(impl Into<String>, impl Into<String>)>) -> Self {
+    pub fn set_audio_codec_opts(
+        mut self,
+        opts: Vec<(impl Into<String>, impl Into<String>)>,
+    ) -> Self {
         let audio_opts = self.audio_codec_opts.get_or_insert_with(HashMap::new);
         for (key, value) in opts {
             audio_opts.insert(key.into(), value.into());
@@ -1116,7 +1126,11 @@ impl Output {
     /// let output = Output::from("some_url")
     ///     .set_subtitle_codec_opt("mov_text", "");
     /// ```
-    pub fn set_subtitle_codec_opt(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+    pub fn set_subtitle_codec_opt(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
         if let Some(ref mut opts) = self.subtitle_codec_opts {
             opts.insert(key.into(), value.into());
         } else {
@@ -1137,7 +1151,10 @@ impl Output {
     ///         ("forced_subs", "1")
     ///     ]);
     /// ```
-    pub fn set_subtitle_codec_opts(mut self, opts: Vec<(impl Into<String>, impl Into<String>)>) -> Self {
+    pub fn set_subtitle_codec_opts(
+        mut self,
+        opts: Vec<(impl Into<String>, impl Into<String>)>,
+    ) -> Self {
         let subtitle_opts = self.subtitle_codec_opts.get_or_insert_with(HashMap::new);
         for (key, value) in opts {
             subtitle_opts.insert(key.into(), value.into());

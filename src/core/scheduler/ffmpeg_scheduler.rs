@@ -91,7 +91,6 @@ impl<S: 'static> FfmpegScheduler<S> {
 }
 
 impl FfmpegScheduler<Initialization> {
-
     /// Creates a new [`FfmpegScheduler`] in the **initialization** state from the given [`FfmpegContext`].
     /// This is the first step to orchestrating an FFmpeg job: you prepare your
     /// inputs, outputs, and filters using [`FfmpegContext`], then pass it here.
@@ -141,8 +140,19 @@ impl FfmpegScheduler<Initialization> {
         let thread_sync = self.thread_sync.clone();
         let scheduler_result = self.result.clone();
 
-        let demux_nodes = self.ffmpeg_context.demuxs.iter().map(|demux| demux.node.clone()).collect::<Vec<_>>();
-        let mux_stream_nodes = self.ffmpeg_context.muxs.iter().flat_map(|mux| mux.mux_stream_nodes.clone()).map(|mux_stream| mux_stream.clone()).collect::<Vec<_>>();
+        let demux_nodes = self
+            .ffmpeg_context
+            .demuxs
+            .iter()
+            .map(|demux| demux.node.clone())
+            .collect::<Vec<_>>();
+        let mux_stream_nodes = self
+            .ffmpeg_context
+            .muxs
+            .iter()
+            .flat_map(|mux| mux.mux_stream_nodes.clone())
+            .map(|mux_stream| mux_stream.clone())
+            .collect::<Vec<_>>();
         let input_controller = InputController::new(demux_nodes, mux_stream_nodes);
         let input_controller = Arc::new(input_controller);
 
@@ -314,7 +324,6 @@ impl FfmpegScheduler<Initialization> {
 }
 
 impl FfmpegScheduler<Running> {
-
     /// Pauses a running FFmpeg job, transitioning from `Running` to `Paused`.
     ///
     /// Internally sets the FFmpeg pipeline threads to a paused state. Depending
@@ -430,7 +439,6 @@ impl std::future::Future for FfmpegScheduler<Running> {
 }
 
 impl FfmpegScheduler<Paused> {
-
     /// Resumes a paused FFmpeg job, transitioning from `Paused` back to `Running`.
     ///
     /// If the scheduler is in an ended state, this has no effect. Otherwise,
@@ -458,8 +466,6 @@ impl FfmpegScheduler<Paused> {
         self._abort()
     }
 }
-
-
 
 fn new_frame() -> crate::error::Result<Frame> {
     let frame = unsafe { av_frame_alloc() };
@@ -537,13 +543,13 @@ mod tests {
     use crate::core::scheduler::ffmpeg_scheduler::{
         FfmpegScheduler, Initialization, Paused, Running, STATUS_INIT, STATUS_PAUSE, STATUS_RUN,
     };
+    use crate::filter::frame_pipeline_builder::FramePipelineBuilder;
     use ffmpeg_sys_next::AVMediaType;
     use log::{info, warn};
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
     use std::thread::sleep;
     use std::time::Duration;
-    use crate::filter::frame_pipeline_builder::FramePipelineBuilder;
 
     #[test]
     fn test_img_to_video() {
@@ -553,14 +559,17 @@ mod tests {
             .try_init();
 
         let result = FfmpegContext::builder()
-            .input(Input::from("logo.jpg")
-                .set_input_opt("loop", "1")
-                .set_recording_time_us(10 * 1000_000)
+            .input(
+                Input::from("logo.jpg")
+                    .set_input_opt("loop", "1")
+                    .set_recording_time_us(10 * 1000_000),
             )
             .filter_desc("scale=1280:720")
             .output(Output::from("output.mp4"))
-            .build().unwrap()
-            .start().unwrap()
+            .build()
+            .unwrap()
+            .start()
+            .unwrap()
             .wait();
 
         assert!(result.is_ok());
@@ -574,9 +583,10 @@ mod tests {
 
         let result = FfmpegContext::builder()
             .input("test.mp4")
-            .output( Output::from("output.mp4")
-                .add_stream_map_with_copy("0:v")
-                .add_stream_map_with_copy("0:a")
+            .output(
+                Output::from("output.mp4")
+                    .add_stream_map_with_copy("0:v")
+                    .add_stream_map_with_copy("0:a"),
             )
             .build()
             .unwrap()
@@ -800,7 +810,10 @@ mod tests {
 
         let output: Output = "output.mp4".into();
         let frame_pipeline_builder: FramePipelineBuilder = AVMediaType::AVMEDIA_TYPE_VIDEO.into();
-        let frame_pipeline_builder = frame_pipeline_builder.filter("test", Box::new(NoopFilter::new(AVMediaType::AVMEDIA_TYPE_VIDEO)));
+        let frame_pipeline_builder = frame_pipeline_builder.filter(
+            "test",
+            Box::new(NoopFilter::new(AVMediaType::AVMEDIA_TYPE_VIDEO)),
+        );
         let output = output.add_frame_pipeline(frame_pipeline_builder);
 
         let context = FfmpegContext::builder()
@@ -941,10 +954,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let result = FfmpegScheduler::new(context)
-            .start()
-            .unwrap()
-            .wait();
+        let result = FfmpegScheduler::new(context).start().unwrap().wait();
         assert!(result.is_ok());
     }
 

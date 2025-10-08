@@ -1,8 +1,8 @@
 use ffmpeg_sys_next::{
-    av_buffer_unref, av_dict_parse_string, av_hwdevice_ctx_create, av_hwdevice_ctx_create_derived,
-    av_hwdevice_find_type_by_name, av_hwdevice_get_type_name, av_hwdevice_iterate_types,
-    avcodec_get_hw_config, AVBufferRef, AVCodec, AVHWDeviceType, AVERROR,
-    AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX, EINVAL, ENOMEM,
+    AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX, AVBufferRef, AVCodec, AVERROR, AVHWDeviceType, EINVAL,
+    ENOMEM, av_buffer_unref, av_dict_parse_string, av_hwdevice_ctx_create,
+    av_hwdevice_ctx_create_derived, av_hwdevice_find_type_by_name, av_hwdevice_get_type_name,
+    av_hwdevice_iterate_types, avcodec_get_hw_config,
 };
 use log::{error, warn};
 use std::ffi::{CStr, CString};
@@ -86,40 +86,42 @@ unsafe impl Send for HWDevice {}
 unsafe impl Sync for HWDevice {}
 
 pub(crate) unsafe fn hw_device_free_all() {
-    // Free the global filter hardware device
-    if let Some(filter_device) = FILTER_HW_DEVICE.get() {
-        match filter_device.lock() {
-            Ok(mut device_guard) => {
-                if let Some(device) = device_guard.as_mut() {
-                    // Check if device reference is valid to avoid double free
-                    if !device.device_ref.is_null() {
-                        av_buffer_unref(&mut device.device_ref);
-                        // Note: av_buffer_unref will set the pointer to null
+    unsafe {
+        // Free the global filter hardware device
+        if let Some(filter_device) = FILTER_HW_DEVICE.get() {
+            match filter_device.lock() {
+                Ok(mut device_guard) => {
+                    if let Some(device) = device_guard.as_mut() {
+                        // Check if device reference is valid to avoid double free
+                        if !device.device_ref.is_null() {
+                            av_buffer_unref(&mut device.device_ref);
+                            // Note: av_buffer_unref will set the pointer to null
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                error!("Failed to lock global filter hardware device: {}", e);
+                Err(e) => {
+                    error!("Failed to lock global filter hardware device: {}", e);
+                }
             }
         }
-    }
 
-    // Free all devices in the hardware device list
-    if let Some(hw_devices) = HW_DEVICES.get() {
-        match hw_devices.lock() {
-            Ok(mut devices_guard) => {
-                // Iterate through and free each device reference
-                for device in devices_guard.iter_mut() {
-                    if !device.device_ref.is_null() {
-                        av_buffer_unref(&mut device.device_ref);
-                        // av_buffer_unref automatically sets pointer to null to prevent dangling pointers
+        // Free all devices in the hardware device list
+        if let Some(hw_devices) = HW_DEVICES.get() {
+            match hw_devices.lock() {
+                Ok(mut devices_guard) => {
+                    // Iterate through and free each device reference
+                    for device in devices_guard.iter_mut() {
+                        if !device.device_ref.is_null() {
+                            av_buffer_unref(&mut device.device_ref);
+                            // av_buffer_unref automatically sets pointer to null to prevent dangling pointers
+                        }
                     }
+                    // Optional: Clear the device list to free Vec memory
+                    devices_guard.clear();
                 }
-                // Optional: Clear the device list to free Vec memory
-                devices_guard.clear();
-            }
-            Err(e) => {
-                error!("Failed to lock hardware device list: {}", e);
+                Err(e) => {
+                    error!("Failed to lock hardware device list: {}", e);
+                }
             }
         }
     }
@@ -146,9 +148,12 @@ pub(crate) fn hw_device_for_filter() -> Option<HWDevice> {
                         let type_name = av_hwdevice_get_type_name(dev.device_type);
                         let type_name = CStr::from_ptr(type_name).to_str();
                         if let Ok(type_name) = type_name {
-                            warn!("There are {} hardware devices. device {} of type {type_name} is picked for filters by default. Set hardware device explicitly with the filter_hw_device option if device {} is not usable for filters.",
-                            devices.len(),dev.name,
-                            dev.name,);
+                            warn!(
+                                "There are {} hardware devices. device {} of type {type_name} is picked for filters by default. Set hardware device explicitly with the filter_hw_device option if device {} is not usable for filters.",
+                                devices.len(),
+                                dev.name,
+                                dev.name,
+                            );
                         }
                     }
                 }
@@ -290,7 +295,9 @@ pub(crate) fn hw_device_init_from_string(arg: &str) -> (i32, Option<HWDevice>) {
                 None => av_hwdevice_ctx_create(&mut device_ref, device_type, null(), options, 0),
                 Some(device_name) => {
                     let Ok(device_name_cstr) = CString::new(device_name.clone()) else {
-                        error!("Device creation failed: device_name:{device_name} can't convert to CString");
+                        error!(
+                            "Device creation failed: device_name:{device_name} can't convert to CString"
+                        );
                         av_buffer_unref(&mut device_ref);
                         return (AVERROR(EINVAL), None);
                     };

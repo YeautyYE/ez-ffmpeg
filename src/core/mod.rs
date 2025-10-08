@@ -470,34 +470,36 @@ unsafe extern "C" fn ffmpeg_log_callback(
     fmt: *const libc::c_char,
     args: VaListType,
 ) {
-    // Create a fixed-size buffer to hold the formatted log message.
-    let mut buffer = [0u8; 1024];
-    // 'print_prefix' is used internally by av_log_format_line to decide whether to print a prefix.
-    let mut print_prefix = 1;
+    unsafe {
+        // Create a fixed-size buffer to hold the formatted log message.
+        let mut buffer = [0u8; 1024];
+        // 'print_prefix' is used internally by av_log_format_line to decide whether to print a prefix.
+        let mut print_prefix = 1;
 
-    // Call FFmpeg's av_log_format_line to format the variable arguments into the buffer.
-    ffmpeg_sys_next::av_log_format_line(
-        ptr,
-        level,
-        fmt,
-        args,
-        buffer.as_mut_ptr() as *mut libc::c_char,
-        buffer.len() as libc::c_int,
-        &mut print_prefix,
-    );
+        // Call FFmpeg's av_log_format_line to format the variable arguments into the buffer.
+        ffmpeg_sys_next::av_log_format_line(
+            ptr,
+            level,
+            fmt,
+            args,
+            buffer.as_mut_ptr() as *mut libc::c_char,
+            buffer.len() as libc::c_int,
+            &mut print_prefix,
+        );
 
-    // Convert the C string in the buffer to a Rust &str.
-    if let Ok(msg) = std::ffi::CStr::from_ptr(buffer.as_ptr() as *const libc::c_char).to_str() {
-        // Trim any trailing newline characters (\n or \r).
-        let trimmed_msg = msg.trim_end_matches(|c| c == '\n' || c == '\r');
+        // Convert the C string in the buffer to a Rust &str.
+        if let Ok(msg) = std::ffi::CStr::from_ptr(buffer.as_ptr() as *const libc::c_char).to_str() {
+            // Trim any trailing newline characters (\n or \r).
+            let trimmed_msg = msg.trim_end_matches(|c| c == '\n' || c == '\r');
 
-        // Map FFmpeg log levels to the corresponding Rust log levels.
-        if level <= ffmpeg_sys_next::AV_LOG_ERROR {
-            log::error!("FFmpeg: {}", trimmed_msg);
-        } else if level <= ffmpeg_sys_next::AV_LOG_WARNING {
-            log::warn!("FFmpeg: {}", trimmed_msg);
-        } else if level <= ffmpeg_sys_next::AV_LOG_INFO {
-            log::info!("FFmpeg: {}", trimmed_msg);
+            // Map FFmpeg log levels to the corresponding Rust log levels.
+            if level <= ffmpeg_sys_next::AV_LOG_ERROR {
+                log::error!("FFmpeg: {}", trimmed_msg);
+            } else if level <= ffmpeg_sys_next::AV_LOG_WARNING {
+                log::warn!("FFmpeg: {}", trimmed_msg);
+            } else if level <= ffmpeg_sys_next::AV_LOG_INFO {
+                log::info!("FFmpeg: {}", trimmed_msg);
+            }
         }
     }
 }

@@ -1,6 +1,6 @@
 use crate::core::codec::Codec;
-use crate::core::context::decoder_stream::DecoderStream;
 use crate::core::context::PacketBox;
+use crate::core::context::decoder_stream::DecoderStream;
 use crate::core::hwaccel::HWAccelID;
 use crate::core::scheduler::input_controller::SchNode;
 use crate::error::OpenInputError;
@@ -12,7 +12,11 @@ use ffmpeg_sys_next::AVPixelFormat::{
     AV_PIX_FMT_CUDA, AV_PIX_FMT_MEDIACODEC, AV_PIX_FMT_NONE, AV_PIX_FMT_QSV,
 };
 use ffmpeg_sys_next::{
-    av_channel_layout_default, av_codec_is_decoder, av_codec_iterate, av_get_pix_fmt, av_hwdevice_find_type_by_name, av_hwdevice_get_type_name, avcodec_descriptor_get, avcodec_descriptor_get_by_name, avcodec_find_decoder, avcodec_find_decoder_by_name, avcodec_get_hw_config, AVChannelOrder, AVCodecID, AVCodecParameters, AVFormatContext, AVHWDeviceType, AVMediaType, AVPixelFormat, AVERROR, AVERROR_DECODER_NOT_FOUND, EINVAL
+    AVChannelOrder, AVCodecID, AVCodecParameters, AVERROR, AVERROR_DECODER_NOT_FOUND,
+    AVFormatContext, AVHWDeviceType, AVMediaType, AVPixelFormat, EINVAL, av_channel_layout_default,
+    av_codec_is_decoder, av_codec_iterate, av_get_pix_fmt, av_hwdevice_find_type_by_name,
+    av_hwdevice_get_type_name, avcodec_descriptor_get, avcodec_descriptor_get_by_name,
+    avcodec_find_decoder, avcodec_find_decoder_by_name, avcodec_get_hw_config,
 };
 use log::{debug, error, warn};
 use std::ffi::{CStr, CString};
@@ -90,7 +94,10 @@ impl Demuxer {
             copy_ts,
             #[cfg(windows)]
             hwaccel,
-            node: Arc::new(SchNode::Demux { waiter: Arc::new(Default::default()), task_exited: Arc::new(Default::default()) }),
+            node: Arc::new(SchNode::Demux {
+                waiter: Arc::new(Default::default()),
+                task_exited: Arc::new(Default::default()),
+            }),
             streams,
             dsts: vec![],
             start_time_effective: 0,
@@ -130,9 +137,14 @@ impl Demuxer {
                 let codec_id = (*codec_parameters).codec_id;
 
                 if codec_type == AVMEDIA_TYPE_AUDIO
-                    && (*codec_parameters).ch_layout.order == AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC
-                        && (*codec_parameters).ch_layout.nb_channels > 0 {
-                        av_channel_layout_default(&mut (*codec_parameters).ch_layout, (*codec_parameters).ch_layout.nb_channels);
+                    && (*codec_parameters).ch_layout.order
+                        == AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC
+                    && (*codec_parameters).ch_layout.nb_channels > 0
+                {
+                    av_channel_layout_default(
+                        &mut (*codec_parameters).ch_layout,
+                        (*codec_parameters).ch_layout.nb_channels,
+                    );
                 }
 
                 let codec_name =
@@ -153,8 +165,8 @@ impl Demuxer {
                     codec_parameters,
                     codec_type,
                     match decoder {
-                        Some(decoder) => { decoder.as_ptr() },
-                        None => { null() },
+                        Some(decoder) => decoder.as_ptr(),
+                        None => null(),
                     },
                     codec_desc,
                     duration,
@@ -309,7 +321,9 @@ fn choose_decoder(
                                 let type_name = av_hwdevice_get_type_name(hwaccel_device_type);
                                 let type_name = CStr::from_ptr(type_name).to_str();
                                 if let (Ok(name), Ok(type_name)) = (name, type_name) {
-                                    debug!("Selecting decoder '{name}' because of requested hwaccel method {type_name}");
+                                    debug!(
+                                        "Selecting decoder '{name}' because of requested hwaccel method {type_name}"
+                                    );
                                 }
 
                                 return Ok(Some(Codec::new(c)));
@@ -348,11 +362,15 @@ fn find_hwaccel(
 
     match (&hwaccel, hwaccel_output_format) {
         (Some(hwaccel), None) if hwaccel == "cuvid" => {
-            warn!("WARNING: Defaulting hwaccel_output_format to cuda for compatibility with older.This behavior is DEPRECATED and will be removed in the future.Please explicitly set \"hwaccel_output_format\" to \"cuda\" using the appropriate API method.");
+            warn!(
+                "WARNING: Defaulting hwaccel_output_format to cuda for compatibility with older.This behavior is DEPRECATED and will be removed in the future.Please explicitly set \"hwaccel_output_format\" to \"cuda\" using the appropriate API method."
+            );
             out_hwaccel_output_format = AV_PIX_FMT_CUDA;
         }
         (Some(hwaccel), None) if hwaccel == "qsv" => {
-            warn!("WARNING: Defaulting hwaccel_output_format to qsv for compatibility with older.This behavior is DEPRECATED and will be removed in the future.Please explicitly set \"hwaccel_output_format\" to \"qsv\" using the appropriate API method.");
+            warn!(
+                "WARNING: Defaulting hwaccel_output_format to qsv for compatibility with older.This behavior is DEPRECATED and will be removed in the future.Please explicitly set \"hwaccel_output_format\" to \"qsv\" using the appropriate API method."
+            );
             out_hwaccel_output_format = AV_PIX_FMT_QSV;
         }
         (Some(hwaccel), None) if hwaccel == "mediacodec" => {

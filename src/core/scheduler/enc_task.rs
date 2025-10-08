@@ -1,10 +1,13 @@
 use crate::core::context::encoder_stream::EncoderStream;
 use crate::core::context::obj_pool::ObjPool;
 use crate::core::context::{CodecContext, FrameBox, PacketBox, PacketData};
-use crate::error::Error::{Encoding, OpenEncoder};
-use crate::error::{AllocPacketError, EncodeSubtitleError, EncodingError, EncodingOperationError, OpenEncoderError, OpenEncoderOperationError, OpenOutputError};
 use crate::core::scheduler::ffmpeg_scheduler::{
-    frame_is_null, packet_is_null, set_scheduler_error, wait_until_not_paused, STATUS_END,
+    STATUS_END, frame_is_null, packet_is_null, set_scheduler_error, wait_until_not_paused,
+};
+use crate::error::Error::{Encoding, OpenEncoder};
+use crate::error::{
+    AllocPacketError, EncodeSubtitleError, EncodingError, EncodingOperationError, OpenEncoderError,
+    OpenEncoderOperationError, OpenOutputError,
 };
 use crate::hwaccel::hw_device_get_by_type;
 use crate::util::ffmpeg_utils::{av_err2str, hashmap_to_avdictionary};
@@ -23,9 +26,25 @@ use ffmpeg_sys_next::AVPixelFormat::AV_PIX_FMT_NONE;
 use ffmpeg_sys_next::AVSampleFormat::AV_SAMPLE_FMT_NONE;
 #[cfg(not(feature = "docs-rs"))]
 use ffmpeg_sys_next::AVSideDataProps::AV_SIDE_DATA_PROP_GLOBAL;
+use ffmpeg_sys_next::{
+    AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE, AV_CODEC_CAP_PARAM_CHANGE, AV_CODEC_FLAG_INTERLACED_DCT,
+    AV_CODEC_FLAG_INTERLACED_ME, AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX,
+    AV_CODEC_HW_CONFIG_METHOD_HW_FRAMES_CTX, AV_NOPTS_VALUE, AV_OPT_SEARCH_CHILDREN,
+    AV_PKT_FLAG_TRUSTED, AV_TIME_BASE_Q, AVBufferRef, AVCodecContext, AVERROR, AVERROR_EOF,
+    AVERROR_EXPERIMENTAL, AVFrame, AVHWFramesContext, AVMediaType, AVRational, AVStream,
+    AVSubtitle, EAGAIN, av_add_q, av_buffer_ref, av_compare_ts, av_cpu_max_align,
+    av_frame_copy_props, av_frame_get_buffer, av_frame_ref, av_get_bytes_per_sample,
+    av_get_pix_fmt_name, av_opt_set_dict2, av_pix_fmt_desc_get, av_rescale_q,
+    av_sample_fmt_is_planar, av_samples_copy, av_shrink_packet, avcodec_alloc_context3,
+    avcodec_encode_subtitle, avcodec_get_hw_config, avcodec_open2, avcodec_parameters_from_context,
+    avcodec_receive_packet, avcodec_send_frame,
+};
 #[cfg(not(feature = "docs-rs"))]
-use ffmpeg_sys_next::{av_channel_layout_copy, av_frame_side_data_clone, av_frame_side_data_desc, AV_CODEC_FLAG_COPY_OPAQUE, AV_CODEC_FLAG_FRAME_DURATION, AV_FRAME_FLAG_INTERLACED, AV_FRAME_FLAG_TOP_FIELD_FIRST, AV_FRAME_SIDE_DATA_FLAG_UNIQUE};
-use ffmpeg_sys_next::{av_add_q, av_buffer_ref, av_compare_ts, av_cpu_max_align, av_frame_copy_props, av_frame_get_buffer, av_frame_ref, av_get_bytes_per_sample, av_get_pix_fmt_name, av_opt_set_dict2, av_pix_fmt_desc_get, av_rescale_q, av_sample_fmt_is_planar, av_samples_copy, av_shrink_packet, avcodec_alloc_context3, avcodec_encode_subtitle, avcodec_get_hw_config, avcodec_open2, avcodec_parameters_from_context, avcodec_receive_packet, avcodec_send_frame, AVBufferRef, AVCodecContext, AVFrame, AVHWFramesContext, AVMediaType, AVRational, AVStream, AVSubtitle, AVERROR, AVERROR_EOF, AVERROR_EXPERIMENTAL, AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE, AV_CODEC_CAP_PARAM_CHANGE, AV_CODEC_FLAG_INTERLACED_DCT, AV_CODEC_FLAG_INTERLACED_ME, AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX, AV_CODEC_HW_CONFIG_METHOD_HW_FRAMES_CTX, AV_NOPTS_VALUE, AV_OPT_SEARCH_CHILDREN, AV_PKT_FLAG_TRUSTED, AV_TIME_BASE_Q, EAGAIN};
+use ffmpeg_sys_next::{
+    AV_CODEC_FLAG_COPY_OPAQUE, AV_CODEC_FLAG_FRAME_DURATION, AV_FRAME_FLAG_INTERLACED,
+    AV_FRAME_FLAG_TOP_FIELD_FIRST, AV_FRAME_SIDE_DATA_FLAG_UNIQUE, av_channel_layout_copy,
+    av_frame_side_data_clone, av_frame_side_data_desc,
+};
 use log::{debug, error, info, trace, warn};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString};
@@ -95,13 +114,26 @@ pub(crate) fn enc_init(
     }
 
     if oformat_flags & ffmpeg_sys_next::AVFMT_GLOBALHEADER != 0 {
-       unsafe { (*enc_ctx).flags |= ffmpeg_sys_next::AV_CODEC_FLAG_GLOBAL_HEADER as i32; }
+        unsafe {
+            (*enc_ctx).flags |= ffmpeg_sys_next::AV_CODEC_FLAG_GLOBAL_HEADER as i32;
+        }
     }
     let enc_ctx_box = CodecContext::new(enc_ctx);
 
-    let max_frames = get_max_frames(enc_stream.codec_type, max_video_frames, max_audio_frames, max_subtitle_frames);
+    let max_frames = get_max_frames(
+        enc_stream.codec_type,
+        max_video_frames,
+        max_audio_frames,
+        max_subtitle_frames,
+    );
 
-    set_encoder_opts(&enc_stream, video_codec_opts, audio_codec_opts, subtitle_codec_opts, &enc_ctx_box)?;
+    set_encoder_opts(
+        &enc_stream,
+        video_codec_opts,
+        audio_codec_opts,
+        subtitle_codec_opts,
+        &enc_ctx_box,
+    )?;
 
     let receiver = enc_stream.take_src();
     let pkt_sender = enc_stream.take_dst();
@@ -111,100 +143,123 @@ pub(crate) fn enc_init(
     let stream_box = enc_stream.stream;
     let stream_index = enc_stream.stream_index;
 
-    let encoder_name = unsafe {std::str::from_utf8_unchecked(CStr::from_ptr((*enc_stream.encoder).name).to_bytes())};
+    let encoder_name = unsafe {
+        std::str::from_utf8_unchecked(CStr::from_ptr((*enc_stream.encoder).name).to_bytes())
+    };
 
-    let result = std::thread::Builder::new().name(format!("encoder{stream_index}:{mux_idx}:{encoder_name}")).spawn(move || unsafe {
-        let enc_ctx_box = enc_ctx_box;
-        let stream_box = stream_box;
+    let result = std::thread::Builder::new()
+        .name(format!("encoder{stream_index}:{mux_idx}:{encoder_name}"))
+        .spawn(move || unsafe {
+            let enc_ctx_box = enc_ctx_box;
+            let stream_box = stream_box;
 
-        let mut opened = false;
-        let mut finished = false;
-        let mut frames_sent = 0;
-        let mut samples_sent = 0;
+            let mut opened = false;
+            let mut finished = false;
+            let mut frames_sent = 0;
+            let mut samples_sent = 0;
 
-        // audio
-        let mut frame_samples = 0;
-        let mut align_mask = 0;
-        let mut samples_queued = 0;
-        let mut audio_frame_queue: VecDeque<FrameBox> = VecDeque::new();
-        let mut is_finished = false;
+            // audio
+            let mut frame_samples = 0;
+            let mut align_mask = 0;
+            let mut samples_queued = 0;
+            let mut audio_frame_queue: VecDeque<FrameBox> = VecDeque::new();
+            let mut is_finished = false;
 
-        loop {
-            let sync_frame = receive_frame(&mut opened, &receiver, &frame_pool, enc_ctx_box.as_mut_ptr(), stream_box.inner,
-                                               &ready_sender, &bits_per_raw_sample, &mut frame_samples, &mut align_mask, &mut samples_queued, &mut audio_frame_queue,
-                                               &mut samples_sent, &mut frames_sent, &mut is_finished,
-                                               &scheduler_status, &scheduler_result);
+            loop {
+                let sync_frame = receive_frame(
+                    &mut opened,
+                    &receiver,
+                    &frame_pool,
+                    enc_ctx_box.as_mut_ptr(),
+                    stream_box.inner,
+                    &ready_sender,
+                    &bits_per_raw_sample,
+                    &mut frame_samples,
+                    &mut align_mask,
+                    &mut samples_queued,
+                    &mut audio_frame_queue,
+                    &mut samples_sent,
+                    &mut frames_sent,
+                    &mut is_finished,
+                    &scheduler_status,
+                    &scheduler_result,
+                );
 
-            let mut receive_frame_box = match sync_frame {
-                SyncFrame::FrameBox(frame_box) => frame_box,
-                SyncFrame::Continue => continue,
-                SyncFrame::Break => break
-            };
+                let mut receive_frame_box = match sync_frame {
+                    SyncFrame::FrameBox(frame_box) => frame_box,
+                    SyncFrame::Continue => continue,
+                    SyncFrame::Break => break,
+                };
 
-            let result = frame_encode(
-                enc_ctx_box.as_mut_ptr(),
-                receive_frame_box.frame.as_mut_ptr(),
-                start_time_us,
-                recording_time_us,
-                &pkt_sender,
-                &pre_pkt_sender,
-                &mux_started,
-                stream_box.inner,
-                &packet_pool,
-            );
-            frame_pool.release(receive_frame_box.frame);
-            if let Err(e) = result {
-                error!("Error encoding a frame: {}", e);
-                set_scheduler_error(&scheduler_status, &scheduler_result, e);
-                break;
-            }
+                let result = frame_encode(
+                    enc_ctx_box.as_mut_ptr(),
+                    receive_frame_box.frame.as_mut_ptr(),
+                    start_time_us,
+                    recording_time_us,
+                    &pkt_sender,
+                    &pre_pkt_sender,
+                    &mux_started,
+                    stream_box.inner,
+                    &packet_pool,
+                );
+                frame_pool.release(receive_frame_box.frame);
+                if let Err(e) = result {
+                    error!("Error encoding a frame: {}", e);
+                    set_scheduler_error(&scheduler_status, &scheduler_result, e);
+                    break;
+                }
 
-            if let Some(max_frames) = max_frames.as_ref() {
-                if frames_sent >= *max_frames {
-                    debug!("sq: {stream_index} frames_max {max_frames} reached");
-                    finished = true;
+                if let Some(max_frames) = max_frames.as_ref() {
+                    if frames_sent >= *max_frames {
+                        debug!("sq: {stream_index} frames_max {max_frames} reached");
+                        finished = true;
+                        break;
+                    }
+                }
+
+                finished = result.unwrap();
+                if finished {
+                    trace!("Encoder returned EOF, finishing");
                     break;
                 }
             }
 
-            finished = result.unwrap();
+            // flush the encoder
             if finished {
-                trace!("Encoder returned EOF, finishing");
-                break;
+                let enc_ctx = enc_ctx_box.as_mut_ptr();
+                let stream = stream_box.inner;
+
+                let mut packet = Packet::empty();
+                (*packet.as_mut_ptr()).stream_index = stream_index as i32;
+                if let Err(e) = send_to_mux(
+                    PacketBox {
+                        packet,
+                        packet_data: PacketData {
+                            dts_est: 0,
+                            codec_type: (*enc_ctx).codec_type,
+                            output_stream_index: (*stream).index,
+                            is_copy: false,
+                            codecpar: (*stream).codecpar,
+                        },
+                    },
+                    &pkt_sender,
+                    &pre_pkt_sender,
+                    &mux_started,
+                ) {
+                    error!("Error flushing encoder: {}", e);
+                    set_scheduler_error(
+                        &scheduler_status,
+                        &scheduler_result,
+                        Encoding(EncodingOperationError::MuxerFinished),
+                    );
+                }
             }
-        }
 
-        // flush the encoder
-        if finished {
-            let enc_ctx = enc_ctx_box.as_mut_ptr();
-            let stream = stream_box.inner;
-
-            let mut packet = Packet::empty();
-            (*packet.as_mut_ptr()).stream_index = stream_index as i32;
-            if let Err(e) = send_to_mux(PacketBox {
-                packet,
-                packet_data: PacketData {
-                    dts_est: 0,
-                    codec_type: (*enc_ctx).codec_type,
-                    output_stream_index: (*stream).index,
-                    is_copy: false,
-                    codecpar: (*stream).codecpar,
-                },
-            }, &pkt_sender, &pre_pkt_sender, &mux_started) {
-                error!("Error flushing encoder: {}", e);
-                set_scheduler_error(
-                    &scheduler_status,
-                    &scheduler_result,
-                    Encoding(EncodingOperationError::MuxerFinished),
-                );
-            }
-        }
-
-        debug!("Encoder finished.");
-    });
+            debug!("Encoder finished.");
+        });
     if let Err(e) = result {
         error!("Encoder thread exited with error: {e}");
-        return Err(OpenEncoderOperationError::ThreadExited.into())
+        return Err(OpenEncoderOperationError::ThreadExited.into());
     }
 
     Ok(())
@@ -227,7 +282,7 @@ fn receive_from(
                 return Err(SyncFrame::Break);
             }
             Ok(frame_box)
-        },
+        }
         Err(e) if e == RecvTimeoutError::Disconnected => {
             debug!("Source[decoder/filtergraph/pipeline] thread exit.");
             Err(SyncFrame::Break)
@@ -246,7 +301,7 @@ fn process_audio_queue(
     frames_sent: &mut i64,
     is_finished: &mut bool,
     scheduler_status: &Arc<AtomicUsize>,
-    scheduler_result: &Arc<Mutex<Option<crate::error::Result<()>>>>
+    scheduler_result: &Arc<Mutex<Option<crate::error::Result<()>>>>,
 ) -> Result<Option<FrameBox>, ()> {
     if let Some(peek) = audio_frame_queue.front() {
         if frame_samples <= *samples_queued || *is_finished {
@@ -290,7 +345,7 @@ fn process_audio_queue(
                         Ok(audio_frame_queue.pop_front())
                     }
                 }
-            }
+            };
         }
     }
     Ok(None)
@@ -312,7 +367,7 @@ fn receive_frame(
     frames_sent: &mut i64,
     is_finished: &mut bool,
     scheduler_status: &Arc<AtomicUsize>,
-    scheduler_result: &Arc<Mutex<Option<crate::error::Result<()>>>>
+    scheduler_result: &Arc<Mutex<Option<crate::error::Result<()>>>>,
 ) -> SyncFrame {
     let mut frame_box = if !*opened {
         let mut frame_box = match receive_from(receiver, scheduler_status) {
@@ -326,7 +381,13 @@ fn receive_frame(
             return SyncFrame::Break;
         }
 
-        if let Err(e) = enc_open(enc_ctx, stream, &mut frame_box, ready_sender.clone(), bits_per_raw_sample.clone()) {
+        if let Err(e) = enc_open(
+            enc_ctx,
+            stream,
+            &mut frame_box,
+            ready_sender.clone(),
+            bits_per_raw_sample.clone(),
+        ) {
             frame_pool.release(frame_box.frame);
             error!("Open encoder error: {e}");
             set_scheduler_error(scheduler_status, scheduler_result, e);
@@ -411,7 +472,13 @@ fn receive_frame(
     }
 }
 
-fn set_encoder_opts(enc_stream: &EncoderStream, video_codec_opts: &Option<HashMap<CString, CString>>, audio_codec_opts: &Option<HashMap<CString, CString>>, subtitle_codec_opts: &Option<HashMap<CString, CString>>, enc_ctx_box: &CodecContext) -> crate::error::Result<()> {
+fn set_encoder_opts(
+    enc_stream: &EncoderStream,
+    video_codec_opts: &Option<HashMap<CString, CString>>,
+    audio_codec_opts: &Option<HashMap<CString, CString>>,
+    subtitle_codec_opts: &Option<HashMap<CString, CString>>,
+    enc_ctx_box: &CodecContext,
+) -> crate::error::Result<()> {
     let mut encoder_opts = if enc_stream.codec_type == AVMEDIA_TYPE_VIDEO {
         hashmap_to_avdictionary(video_codec_opts)
     } else if enc_stream.codec_type == AVMEDIA_TYPE_AUDIO {
@@ -439,7 +506,12 @@ fn set_encoder_opts(enc_stream: &EncoderStream, video_codec_opts: &Option<HashMa
     Ok(())
 }
 
-fn get_max_frames(codec_type: AVMediaType, max_video_frames: Option<i64>, max_audio_frames: Option<i64>, max_subtitle_frames: Option<i64>) -> Option<i64> {
+fn get_max_frames(
+    codec_type: AVMediaType,
+    max_video_frames: Option<i64>,
+    max_audio_frames: Option<i64>,
+    max_subtitle_frames: Option<i64>,
+) -> Option<i64> {
     if codec_type == AVMEDIA_TYPE_VIDEO {
         max_video_frames
     } else if codec_type == AVMEDIA_TYPE_AUDIO {
@@ -470,25 +542,98 @@ unsafe fn receive_samples(
     frame_pool: &ObjPool<Frame>,
     align_mask: usize,
 ) -> Result<FrameBox, i32> {
-    assert!(*samples_queued >= nb_samples);
+    unsafe {
+        assert!(*samples_queued >= nb_samples);
 
-    let Ok(mut dst) = frame_pool.get() else {
-        return Err(AVERROR(ffmpeg_sys_next::ENOMEM));
-    };
+        let Ok(mut dst) = frame_pool.get() else {
+            return Err(AVERROR(ffmpeg_sys_next::ENOMEM));
+        };
 
-    let mut src_box = audio_frame_queue.front_mut().unwrap();
-    let src = &mut src_box.frame;
+        let mut src_box = audio_frame_queue.front_mut().unwrap();
+        let src = &mut src_box.frame;
 
-    if (*src.as_ptr()).nb_samples > nb_samples && frame_is_aligned(align_mask, src.as_ptr()) {
-        let ret = av_frame_ref(dst.as_mut_ptr(), src.as_ptr());
+        if (*src.as_ptr()).nb_samples > nb_samples && frame_is_aligned(align_mask, src.as_ptr()) {
+            let ret = av_frame_ref(dst.as_mut_ptr(), src.as_ptr());
+            if ret < 0 {
+                frame_pool.release(dst);
+                return Err(ret);
+            }
+
+            (*dst.as_mut_ptr()).nb_samples = nb_samples;
+            offset_audio(src.as_mut_ptr(), nb_samples);
+            *samples_queued -= nb_samples;
+
+            (*dst.as_mut_ptr()).duration = av_rescale_q(
+                nb_samples as i64,
+                AVRational {
+                    num: 1,
+                    den: (*dst.as_ptr()).sample_rate,
+                },
+                (*dst.as_ptr()).time_base,
+            );
+
+            let frame_data = src_box.frame_data.clone();
+            return Ok(FrameBox {
+                frame: dst,
+                frame_data,
+            });
+        }
+
+        // otherwise allocate a new frame and copy the data
+        let mut ret = av_channel_layout_copy(
+            &mut (*dst.as_mut_ptr()).ch_layout,
+            &(*src.as_ptr()).ch_layout,
+        );
+        if ret < 0 {
+            frame_pool.release(dst);
+            return Err(ret);
+        }
+        (*dst.as_mut_ptr()).format = (*src.as_ptr()).format;
+        (*dst.as_mut_ptr()).nb_samples = nb_samples;
+
+        ret = av_frame_get_buffer(dst.as_mut_ptr(), 0);
         if ret < 0 {
             frame_pool.release(dst);
             return Err(ret);
         }
 
-        (*dst.as_mut_ptr()).nb_samples = nb_samples;
-        offset_audio(src.as_mut_ptr(), nb_samples);
-        *samples_queued -= nb_samples;
+        ret = av_frame_copy_props(dst.as_mut_ptr(), src.as_ptr());
+        if ret < 0 {
+            frame_pool.release(dst);
+            return Err(ret);
+        }
+
+        let frame_data = src_box.frame_data.clone();
+
+        (*dst.as_mut_ptr()).nb_samples = 0;
+        while (*dst.as_ptr()).nb_samples < nb_samples {
+            src_box = audio_frame_queue.front_mut().unwrap();
+            let src = &mut src_box.frame;
+
+            let to_copy = std::cmp::min(
+                nb_samples - (*dst.as_ptr()).nb_samples,
+                (*src.as_ptr()).nb_samples,
+            );
+
+            av_samples_copy(
+                (*dst.as_ptr()).extended_data,
+                (*src.as_ptr()).extended_data,
+                (*dst.as_ptr()).nb_samples,
+                0,
+                to_copy,
+                (*dst.as_ptr()).ch_layout.nb_channels,
+                std::mem::transmute((*dst.as_ptr()).format),
+            );
+
+            if to_copy < (*src.as_ptr()).nb_samples {
+                offset_audio(src.as_mut_ptr(), to_copy);
+            } else {
+                audio_frame_queue.pop_front();
+            }
+
+            *samples_queued -= to_copy;
+            (*dst.as_mut_ptr()).nb_samples += to_copy;
+        }
 
         (*dst.as_mut_ptr()).duration = av_rescale_q(
             nb_samples as i64,
@@ -499,82 +644,11 @@ unsafe fn receive_samples(
             (*dst.as_ptr()).time_base,
         );
 
-        let frame_data = src_box.frame_data.clone();
-        return Ok(FrameBox {
+        Ok(FrameBox {
             frame: dst,
             frame_data,
-        });
+        })
     }
-
-    // otherwise allocate a new frame and copy the data
-    let mut ret = av_channel_layout_copy(
-        &mut (*dst.as_mut_ptr()).ch_layout,
-        &(*src.as_ptr()).ch_layout,
-    );
-    if ret < 0 {
-        frame_pool.release(dst);
-        return Err(ret);
-    }
-    (*dst.as_mut_ptr()).format = (*src.as_ptr()).format;
-    (*dst.as_mut_ptr()).nb_samples = nb_samples;
-
-    ret = av_frame_get_buffer(dst.as_mut_ptr(), 0);
-    if ret < 0 {
-        frame_pool.release(dst);
-        return Err(ret);
-    }
-
-    ret = av_frame_copy_props(dst.as_mut_ptr(), src.as_ptr());
-    if ret < 0 {
-        frame_pool.release(dst);
-        return Err(ret);
-    }
-
-    let frame_data = src_box.frame_data.clone();
-
-    (*dst.as_mut_ptr()).nb_samples = 0;
-    while (*dst.as_ptr()).nb_samples < nb_samples {
-        src_box = audio_frame_queue.front_mut().unwrap();
-        let src = &mut src_box.frame;
-
-        let to_copy = std::cmp::min(
-            nb_samples - (*dst.as_ptr()).nb_samples,
-            (*src.as_ptr()).nb_samples,
-        );
-
-        av_samples_copy(
-            (*dst.as_ptr()).extended_data,
-            (*src.as_ptr()).extended_data,
-            (*dst.as_ptr()).nb_samples,
-            0,
-            to_copy,
-            (*dst.as_ptr()).ch_layout.nb_channels,
-            std::mem::transmute((*dst.as_ptr()).format),
-        );
-
-        if to_copy < (*src.as_ptr()).nb_samples {
-            offset_audio(src.as_mut_ptr(), to_copy);
-        } else {
-            audio_frame_queue.pop_front();
-        }
-
-        *samples_queued -= to_copy;
-        (*dst.as_mut_ptr()).nb_samples += to_copy;
-    }
-
-    (*dst.as_mut_ptr()).duration = av_rescale_q(
-        nb_samples as i64,
-        AVRational {
-            num: 1,
-            den: (*dst.as_ptr()).sample_rate,
-        },
-        (*dst.as_ptr()).time_base,
-    );
-
-    Ok(FrameBox {
-        frame: dst,
-        frame_data,
-    })
 }
 
 #[cfg(feature = "docs-rs")]
@@ -777,7 +851,9 @@ fn enc_open(
         let ret = avcodec_open2(enc_ctx, enc, null_mut());
         if ret < 0 {
             if ret != AVERROR_EXPERIMENTAL {
-                error!("Error while opening encoder - maybe incorrect parameters such as bit_rate, rate, width or height.");
+                error!(
+                    "Error while opening encoder - maybe incorrect parameters such as bit_rate, rate, width or height."
+                );
             }
             return Err(OpenEncoder(OpenEncoderOperationError::CodecOpenError(
                 OpenEncoderError::OutOfMemory,
@@ -817,132 +893,139 @@ unsafe fn hw_device_setup_for_encode(
     enc_ctx: *mut AVCodecContext,
     mut frames_ref: *mut AVBufferRef,
 ) -> i32 {
-    let mut dev = None;
-
-    if !frames_ref.is_null()
-        && (*((*frames_ref).data as *mut AVHWFramesContext)).format == (*enc_ctx).pix_fmt
-    {
-        // Matching format, will try to use hw_frames_ctx.
-    } else {
-        frames_ref = null_mut();
-    }
-
-    let mut i = 0;
-    loop {
-        let config = avcodec_get_hw_config((*enc_ctx).codec, i);
-        if config.is_null() {
-            break;
-        }
+    unsafe {
+        let mut dev = None;
 
         if !frames_ref.is_null()
-            && (*config).methods & AV_CODEC_HW_CONFIG_METHOD_HW_FRAMES_CTX as i32 != 0
-            && ((*config).pix_fmt == AV_PIX_FMT_NONE || (*config).pix_fmt == (*enc_ctx).pix_fmt)
+            && (*((*frames_ref).data as *mut AVHWFramesContext)).format == (*enc_ctx).pix_fmt
         {
+            // Matching format, will try to use hw_frames_ctx.
+        } else {
+            frames_ref = null_mut();
+        }
+
+        let mut i = 0;
+        loop {
+            let config = avcodec_get_hw_config((*enc_ctx).codec, i);
+            if config.is_null() {
+                break;
+            }
+
+            if !frames_ref.is_null()
+                && (*config).methods & AV_CODEC_HW_CONFIG_METHOD_HW_FRAMES_CTX as i32 != 0
+                && ((*config).pix_fmt == AV_PIX_FMT_NONE || (*config).pix_fmt == (*enc_ctx).pix_fmt)
+            {
+                trace!(
+                    "Using input frames context (format {}) with {} encoder.",
+                    CStr::from_ptr(av_get_pix_fmt_name((*enc_ctx).pix_fmt))
+                        .to_str()
+                        .unwrap_or("[unknow / Invalid UTF-8]"),
+                    CStr::from_ptr((*(*enc_ctx).codec).name)
+                        .to_str()
+                        .unwrap_or("[unknow codec / Invalid UTF-8]")
+                );
+                (*enc_ctx).hw_frames_ctx = av_buffer_ref(frames_ref);
+                if (*enc_ctx).hw_frames_ctx.is_null() {
+                    return AVERROR(ffmpeg_sys_next::ENOMEM);
+                }
+                return 0;
+            }
+
+            if dev.is_none()
+                && (*config).methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as i32 != 0
+            {
+                dev = hw_device_get_by_type((*config).device_type);
+            }
+
+            i += 1;
+        }
+
+        if let Some(dev) = dev {
             trace!(
-                "Using input frames context (format {}) with {} encoder.",
-                CStr::from_ptr(av_get_pix_fmt_name((*enc_ctx).pix_fmt))
-                    .to_str()
-                    .unwrap_or("[unknow / Invalid UTF-8]"),
+                "Using device %s (type {}) with {} encoder.",
+                dev.name,
                 CStr::from_ptr((*(*enc_ctx).codec).name)
                     .to_str()
                     .unwrap_or("[unknow codec / Invalid UTF-8]")
             );
-            (*enc_ctx).hw_frames_ctx = av_buffer_ref(frames_ref);
-            if (*enc_ctx).hw_frames_ctx.is_null() {
+            (*enc_ctx).hw_device_ctx = av_buffer_ref(dev.device_ref);
+            if (*enc_ctx).hw_device_ctx.is_null() {
                 return AVERROR(ffmpeg_sys_next::ENOMEM);
             }
-            return 0;
         }
 
-        if dev.is_none() && (*config).methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as i32 != 0
-        {
-            dev = hw_device_get_by_type((*config).device_type);
-        }
-
-        i += 1;
+        0
     }
-
-    if let Some(dev) = dev {
-        trace!(
-            "Using device %s (type {}) with {} encoder.",
-            dev.name,
-            CStr::from_ptr((*(*enc_ctx).codec).name)
-                .to_str()
-                .unwrap_or("[unknow codec / Invalid UTF-8]")
-        );
-        (*enc_ctx).hw_device_ctx = av_buffer_ref(dev.device_ref);
-        if (*enc_ctx).hw_device_ctx.is_null() {
-            return AVERROR(ffmpeg_sys_next::ENOMEM);
-        }
-    }
-
-    0
 }
 
 #[cfg(not(feature = "docs-rs"))]
 unsafe fn offset_audio(f: *mut AVFrame, nb_samples: i32) {
-    let planar = av_sample_fmt_is_planar(std::mem::transmute((*f).format));
-    let planes = if planar != 0 {
-        (*f).ch_layout.nb_channels
-    } else {
-        1
-    };
-    let bps = av_get_bytes_per_sample(std::mem::transmute((*f).format));
-    let offset = (nb_samples
-        * bps
-        * if planar != 0 {
-            1
-        } else {
+    unsafe {
+        let planar = av_sample_fmt_is_planar(std::mem::transmute((*f).format));
+        let planes = if planar != 0 {
             (*f).ch_layout.nb_channels
-        }) as usize;
+        } else {
+            1
+        };
+        let bps = av_get_bytes_per_sample(std::mem::transmute((*f).format));
+        let offset = (nb_samples
+            * bps
+            * if planar != 0 {
+                1
+            } else {
+                (*f).ch_layout.nb_channels
+            }) as usize;
 
-    assert!(bps > 0);
-    assert!(nb_samples < (*f).nb_samples);
+        assert!(bps > 0);
+        assert!(nb_samples < (*f).nb_samples);
 
-    for i in 0..planes as usize {
-        std::ptr::write(
-            (*f).extended_data.add(i),
-            (*(*f).extended_data.add(i)).add(offset),
-        );
-        if i < (*f).data.len() {
-            *(*f).data.get_unchecked_mut(i) = *(*f).extended_data.add(i);
+        for i in 0..planes as usize {
+            std::ptr::write(
+                (*f).extended_data.add(i),
+                (*(*f).extended_data.add(i)).add(offset),
+            );
+            if i < (*f).data.len() {
+                *(*f).data.get_unchecked_mut(i) = *(*f).extended_data.add(i);
+            }
         }
+
+        (*f).linesize[0] -= offset as i32;
+        (*f).nb_samples -= nb_samples;
+
+        (*f).duration = av_rescale_q(
+            (*f).nb_samples as i64,
+            AVRational {
+                num: 1,
+                den: (*f).sample_rate,
+            },
+            (*f).time_base,
+        );
+
+        (*f).pts += av_rescale_q(
+            nb_samples as i64,
+            AVRational {
+                num: 1,
+                den: (*f).sample_rate,
+            },
+            (*f).time_base,
+        );
     }
-
-    (*f).linesize[0] -= offset as i32;
-    (*f).nb_samples -= nb_samples;
-
-    (*f).duration = av_rescale_q(
-        (*f).nb_samples as i64,
-        AVRational {
-            num: 1,
-            den: (*f).sample_rate,
-        },
-        (*f).time_base,
-    );
-
-    (*f).pts += av_rescale_q(
-        nb_samples as i64,
-        AVRational {
-            num: 1,
-            den: (*f).sample_rate,
-        },
-        (*f).time_base,
-    );
 }
 
 unsafe fn frame_is_aligned(align_mask: usize, frame: *const AVFrame) -> bool {
-    assert!((*frame).nb_samples > 0);
-    assert!(align_mask > 0);
+    unsafe {
+        assert!((*frame).nb_samples > 0);
+        assert!(align_mask > 0);
 
-    let data_ptr = (*frame).data[0] as usize;
-    let linesize = (*frame).linesize[0] as usize;
+        let data_ptr = (*frame).data[0] as usize;
+        let linesize = (*frame).linesize[0] as usize;
 
-    if (data_ptr & align_mask) == 0 && (linesize & align_mask) == 0 && linesize > align_mask {
-        return true;
+        if (data_ptr & align_mask) == 0 && (linesize & align_mask) == 0 && linesize > align_mask {
+            return true;
+        }
+
+        false
     }
-
-    false
 }
 
 #[cfg(not(feature = "docs-rs"))]
@@ -990,7 +1073,10 @@ fn frame_encode(
                     AV_TIME_BASE_Q,
                 ) >= 0
                 {
-                    debug!("Reached the target time: {recording_time_us} us, frame time: {} us. Ending the recording.", (*frame).pts);
+                    debug!(
+                        "Reached the target time: {recording_time_us} us, frame time: {} us. Ending the recording.",
+                        (*frame).pts
+                    );
                     return Ok(true);
                 }
             }
@@ -1002,12 +1088,22 @@ fn frame_encode(
                 if (*(*enc_ctx).codec).capabilities & AV_CODEC_CAP_PARAM_CHANGE as i32 == 0
                     && (*enc_ctx).ch_layout.nb_channels != (*frame).ch_layout.nb_channels
                 {
-                    error!("Audio channel count changed and encoder does not support parameter changes");
+                    error!(
+                        "Audio channel count changed and encoder does not support parameter changes"
+                    );
                     return Ok(false);
                 }
             }
         }
-        encode_frame(enc_ctx, frame, pkt_sender,  pre_pkt_sender, mux_started, stream, packet_pool)
+        encode_frame(
+            enc_ctx,
+            frame,
+            pkt_sender,
+            pre_pkt_sender,
+            mux_started,
+            stream,
+            packet_pool,
+        )
     }
 }
 
@@ -1022,114 +1118,121 @@ unsafe fn do_subtitle_out(
     mux_started: &Arc<AtomicBool>,
     stream: *mut AVStream,
 ) -> crate::error::Result<bool> {
-    let subtitle_out_max_size = 1024 * 1024;
-    if (*sub).pts == AV_NOPTS_VALUE {
-        return Err(Encoding(EncodingOperationError::SubtitleNotPts));
-    }
-    if let Some(start_time_us) = start_time_us {
-        if (*sub).pts < start_time_us {
-            return Ok(false);
+    unsafe {
+        let subtitle_out_max_size = 1024 * 1024;
+        if (*sub).pts == AV_NOPTS_VALUE {
+            return Err(Encoding(EncodingOperationError::SubtitleNotPts));
         }
-    }
-
-    let nb = if (*enc_ctx).codec_id == AV_CODEC_ID_DVB_SUBTITLE {
-        2
-    } else if (*enc_ctx).codec_id == AV_CODEC_ID_ASS {
-        std::cmp::max((*sub).num_rects, 1)
-    } else {
-        1
-    };
-
-    let mut pts = (*sub).pts;
-    if let Some(start_time_us) = start_time_us {
-        pts -= start_time_us;
-    }
-    for i in 0..nb {
-        let mut local_sub = *sub;
-        if let Some(recording_time_us) = recording_time_us {
-            if av_compare_ts(pts, AV_TIME_BASE_Q, recording_time_us, AV_TIME_BASE_Q) >= 0 {
-                return Ok(true);
+        if let Some(start_time_us) = start_time_us {
+            if (*sub).pts < start_time_us {
+                return Ok(false);
             }
         }
 
-        let mut packet = Packet::new(subtitle_out_max_size);
-        if packet_is_null(&packet) {
-            return Err(Encoding(EncodingOperationError::AllocPacket(
-                AllocPacketError::OutOfMemory,
-            )));
+        let nb = if (*enc_ctx).codec_id == AV_CODEC_ID_DVB_SUBTITLE {
+            2
+        } else if (*enc_ctx).codec_id == AV_CODEC_ID_ASS {
+            std::cmp::max((*sub).num_rects, 1)
+        } else {
+            1
+        };
+
+        let mut pts = (*sub).pts;
+        if let Some(start_time_us) = start_time_us {
+            pts -= start_time_us;
         }
-        let pkt = packet.as_mut_ptr();
+        for i in 0..nb {
+            let mut local_sub = *sub;
+            if let Some(recording_time_us) = recording_time_us {
+                if av_compare_ts(pts, AV_TIME_BASE_Q, recording_time_us, AV_TIME_BASE_Q) >= 0 {
+                    return Ok(true);
+                }
+            }
 
-        local_sub.pts = pts;
-        // start_display_time is required to be 0
-        local_sub.pts += av_rescale_q(
-            (*sub).start_display_time as i64,
-            AVRational { num: 1, den: 1000 },
-            AV_TIME_BASE_Q,
-        );
-        local_sub.end_display_time -= (*sub).start_display_time;
-        local_sub.start_display_time = 0;
+            let mut packet = Packet::new(subtitle_out_max_size);
+            if packet_is_null(&packet) {
+                return Err(Encoding(EncodingOperationError::AllocPacket(
+                    AllocPacketError::OutOfMemory,
+                )));
+            }
+            let pkt = packet.as_mut_ptr();
 
-        if (*enc_ctx).codec_id == AV_CODEC_ID_DVB_SUBTITLE && i == 1 {
-            local_sub.num_rects = 0;
-        } else if (*enc_ctx).codec_id == AV_CODEC_ID_ASS && (*sub).num_rects > 0 {
-            local_sub.num_rects = 1;
-            local_sub.rects = local_sub.rects.add(i as usize);
-        }
+            local_sub.pts = pts;
+            // start_display_time is required to be 0
+            local_sub.pts += av_rescale_q(
+                (*sub).start_display_time as i64,
+                AVRational { num: 1, den: 1000 },
+                AV_TIME_BASE_Q,
+            );
+            local_sub.end_display_time -= (*sub).start_display_time;
+            local_sub.start_display_time = 0;
 
-        let subtitle_out_size =
-            avcodec_encode_subtitle(enc_ctx, (*pkt).data, (*pkt).size, &local_sub);
-        if subtitle_out_size < 0 {
-            error!("Subtitle encoding failed");
-            return Err(Encoding(EncodingOperationError::EncodeSubtitle(
-                EncodeSubtitleError::from(subtitle_out_size),
-            )));
-        }
+            if (*enc_ctx).codec_id == AV_CODEC_ID_DVB_SUBTITLE && i == 1 {
+                local_sub.num_rects = 0;
+            } else if (*enc_ctx).codec_id == AV_CODEC_ID_ASS && (*sub).num_rects > 0 {
+                local_sub.num_rects = 1;
+                local_sub.rects = local_sub.rects.add(i as usize);
+            }
 
-        av_shrink_packet(pkt, subtitle_out_size);
+            let subtitle_out_size =
+                avcodec_encode_subtitle(enc_ctx, (*pkt).data, (*pkt).size, &local_sub);
+            if subtitle_out_size < 0 {
+                error!("Subtitle encoding failed");
+                return Err(Encoding(EncodingOperationError::EncodeSubtitle(
+                    EncodeSubtitleError::from(subtitle_out_size),
+                )));
+            }
 
-        (*pkt).time_base = AV_TIME_BASE_Q;
-        (*pkt).pts = (*sub).pts;
-        (*pkt).duration = av_rescale_q(
-            (*sub).end_display_time as i64,
-            AVRational { num: 1, den: 1000 },
-            (*pkt).time_base,
-        );
-        if (*enc_ctx).codec_id == AV_CODEC_ID_DVB_SUBTITLE {
-            /* XXX: the pts correction is handled here. Maybe handling
-            it in the codec would be better */
-            if i == 0 {
-                (*pkt).pts += av_rescale_q(
-                    (*sub).start_display_time as i64,
-                    AVRational { num: 1, den: 1000 },
-                    (*pkt).time_base,
-                );
-            } else {
-                (*pkt).pts += av_rescale_q(
-                    (*sub).end_display_time as i64,
-                    AVRational { num: 1, den: 1000 },
-                    (*pkt).time_base,
-                );
+            av_shrink_packet(pkt, subtitle_out_size);
+
+            (*pkt).time_base = AV_TIME_BASE_Q;
+            (*pkt).pts = (*sub).pts;
+            (*pkt).duration = av_rescale_q(
+                (*sub).end_display_time as i64,
+                AVRational { num: 1, den: 1000 },
+                (*pkt).time_base,
+            );
+            if (*enc_ctx).codec_id == AV_CODEC_ID_DVB_SUBTITLE {
+                /* XXX: the pts correction is handled here. Maybe handling
+                it in the codec would be better */
+                if i == 0 {
+                    (*pkt).pts += av_rescale_q(
+                        (*sub).start_display_time as i64,
+                        AVRational { num: 1, den: 1000 },
+                        (*pkt).time_base,
+                    );
+                } else {
+                    (*pkt).pts += av_rescale_q(
+                        (*sub).end_display_time as i64,
+                        AVRational { num: 1, den: 1000 },
+                        (*pkt).time_base,
+                    );
+                }
+            }
+            (*pkt).dts = (*pkt).pts;
+
+            if let Err(_) = send_to_mux(
+                PacketBox {
+                    packet,
+                    packet_data: PacketData {
+                        dts_est: 0,
+                        codec_type: (*enc_ctx).codec_type,
+                        output_stream_index: (*stream).index,
+                        is_copy: false,
+                        codecpar: (*stream).codecpar,
+                    },
+                },
+                pkt_sender,
+                pre_pkt_sender,
+                mux_started,
+            ) {
+                error!("send subtitle packet failed, mux already finished");
+                return Err(Encoding(EncodingOperationError::MuxerFinished));
             }
         }
-        (*pkt).dts = (*pkt).pts;
 
-        if let Err(_) = send_to_mux(PacketBox {
-            packet,
-            packet_data: PacketData {
-                dts_est: 0,
-                codec_type: (*enc_ctx).codec_type,
-                output_stream_index: (*stream).index,
-                is_copy: false,
-                codecpar: (*stream).codecpar,
-            },
-        }, pkt_sender, pre_pkt_sender, mux_started) {
-            error!("send subtitle packet failed, mux already finished");
-            return Err(Encoding(EncodingOperationError::MuxerFinished));
-        }
+        Ok(false)
     }
-
-    Ok(false)
 }
 
 #[cfg(not(feature = "docs-rs"))]
@@ -1142,68 +1245,79 @@ unsafe fn encode_frame(
     stream: *mut AVStream,
     packet_pool: &ObjPool<Packet>,
 ) -> crate::error::Result<bool> {
-    if !frame.is_null() {
-        if (*frame).sample_aspect_ratio.num != 0 {
-            (*enc_ctx).sample_aspect_ratio = (*frame).sample_aspect_ratio;
-        }
-    }
-
-    let ret = avcodec_send_frame(enc_ctx, frame);
-    if ret < 0 && !(ret == AVERROR_EOF && frame.is_null()) {
-        if ret == AVERROR_EOF && frame.is_null(){
-            trace!("EOF reached, no more frames to encode.");
-        } else {
-            error!(
-            "Error submitting {:?} frame to the encoder",
-            (*enc_ctx).codec_type
-        );
-            return Err(Encoding(EncodingOperationError::SendFrameError(
-                EncodingError::from(ret),
-            )));
-        }
-    }
-
-    loop {
-        let mut packet = packet_pool.get()?;
-        let pkt = packet.as_mut_ptr();
-
-        let ret = avcodec_receive_packet(enc_ctx, pkt);
-
-        (*pkt).time_base = (*enc_ctx).time_base;
-
-        if ret == AVERROR(EAGAIN) {
-            return Ok(false);
-        } else if ret < 0 {
-            if ret == AVERROR_EOF {
-                trace!("EOF reached. No more packets to receive.");
-                return Ok(true);
+    unsafe {
+        if !frame.is_null() {
+            if (*frame).sample_aspect_ratio.num != 0 {
+                (*enc_ctx).sample_aspect_ratio = (*frame).sample_aspect_ratio;
             }
-            error!("{:?} encoding failed", (*enc_ctx).codec_type);
-            return Err(Encoding(EncodingOperationError::ReceivePacketError(
-                EncodingError::from(ret),
-            )));
         }
 
-        (*pkt).flags |= AV_PKT_FLAG_TRUSTED;
+        let ret = avcodec_send_frame(enc_ctx, frame);
+        if ret < 0 && !(ret == AVERROR_EOF && frame.is_null()) {
+            if ret == AVERROR_EOF && frame.is_null() {
+                trace!("EOF reached, no more frames to encode.");
+            } else {
+                error!(
+                    "Error submitting {:?} frame to the encoder",
+                    (*enc_ctx).codec_type
+                );
+                return Err(Encoding(EncodingOperationError::SendFrameError(
+                    EncodingError::from(ret),
+                )));
+            }
+        }
 
-        if let Err(_) = send_to_mux(PacketBox {
-            packet,
-            packet_data: PacketData {
-                dts_est: 0,
-                codec_type: (*enc_ctx).codec_type,
-                output_stream_index: (*stream).index,
-                is_copy: false,
-                codecpar: (*stream).codecpar,
-            },
-        }, pkt_sender, pre_pkt_sender, mux_started) {
-            error!("send packet failed, mux already finished");
-            return Err(Encoding(EncodingOperationError::MuxerFinished));
+        loop {
+            let mut packet = packet_pool.get()?;
+            let pkt = packet.as_mut_ptr();
+
+            let ret = avcodec_receive_packet(enc_ctx, pkt);
+
+            (*pkt).time_base = (*enc_ctx).time_base;
+
+            if ret == AVERROR(EAGAIN) {
+                return Ok(false);
+            } else if ret < 0 {
+                if ret == AVERROR_EOF {
+                    trace!("EOF reached. No more packets to receive.");
+                    return Ok(true);
+                }
+                error!("{:?} encoding failed", (*enc_ctx).codec_type);
+                return Err(Encoding(EncodingOperationError::ReceivePacketError(
+                    EncodingError::from(ret),
+                )));
+            }
+
+            (*pkt).flags |= AV_PKT_FLAG_TRUSTED;
+
+            if let Err(_) = send_to_mux(
+                PacketBox {
+                    packet,
+                    packet_data: PacketData {
+                        dts_est: 0,
+                        codec_type: (*enc_ctx).codec_type,
+                        output_stream_index: (*stream).index,
+                        is_copy: false,
+                        codecpar: (*stream).codecpar,
+                    },
+                },
+                pkt_sender,
+                pre_pkt_sender,
+                mux_started,
+            ) {
+                error!("send packet failed, mux already finished");
+                return Err(Encoding(EncodingOperationError::MuxerFinished));
+            }
         }
     }
 }
 
-
-fn send_to_mux(packet_box: PacketBox, pkt_sender: &Sender<PacketBox>, pre_pkt_sender: &Sender<PacketBox>, mux_started:&Arc<AtomicBool>) -> Result<(), SendError<PacketBox>> {
+fn send_to_mux(
+    packet_box: PacketBox,
+    pkt_sender: &Sender<PacketBox>,
+    pre_pkt_sender: &Sender<PacketBox>,
+    mux_started: &Arc<AtomicBool>,
+) -> Result<(), SendError<PacketBox>> {
     if mux_started.load(Ordering::Acquire) {
         pkt_sender.send(packet_box)
     } else {
