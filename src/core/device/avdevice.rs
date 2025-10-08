@@ -65,7 +65,7 @@ fn find_input_device_list(media_type: AVMediaType) -> crate::error::Result<Vec<S
                 }
 
                 let result = CStr::from_ptr((*device).device_description).to_str();
-                if let Err(e) = result {
+                if let Err(_) = result {
                     return Err(FindDevicesError::UTF8Error.into());
                 }
                 let device_description = result.unwrap();

@@ -885,13 +885,11 @@ unsafe fn map_auto_subtitle(
                     demux.get_stream_mut(stream_index).add_dst(frame_sender);
                     demux.connect_stream(stream_index);
                     let input_stream = demux.get_stream(stream_index);
-                    unsafe {
-                        rescale_duration(
-                            input_stream.duration,
-                            input_stream.time_base,
-                            *(*mux.out_fmt_ctx).streams.add(output_stream_index),
-                        );
-                    }
+                    rescale_duration(
+                        input_stream.duration,
+                        input_stream.time_base,
+                        *(*mux.out_fmt_ctx).streams.add(output_stream_index),
+                    );
                 } else {
                     error!("Error selecting an encoder(subtitle)");
                     return Err(OpenOutputError::from(AVERROR_ENCODER_NOT_FOUND).into());
@@ -968,13 +966,11 @@ unsafe fn map_auto_data(
                 demux.get_stream_mut(stream_index).add_dst(frame_sender);
                 demux.connect_stream(stream_index);
                 let input_stream = demux.get_stream(stream_index);
-                unsafe {
-                    rescale_duration(
-                        input_stream.duration,
-                        input_stream.time_base,
-                        *(*mux.out_fmt_ctx).streams.add(output_stream_index),
-                    );
-                }
+                rescale_duration(
+                    input_stream.duration,
+                    input_stream.time_base,
+                    *(*mux.out_fmt_ctx).streams.add(output_stream_index),
+                );
             } else {
                 error!("Error selecting an encoder(data)");
                 return Err(OpenOutputError::from(AVERROR_ENCODER_NOT_FOUND).into());
@@ -1063,13 +1059,11 @@ unsafe fn map_auto_stream(
                     demux.get_stream_mut(stream_index).add_dst(frame_sender);
                     demux.connect_stream(stream_index);
                     let input_stream = demux.get_stream(stream_index);
-                    unsafe {
-                        rescale_duration(
-                            input_stream.duration,
-                            input_stream.time_base,
-                            *(*mux.out_fmt_ctx).streams.add(output_stream_index),
-                        );
-                    }
+                    rescale_duration(
+                        input_stream.duration,
+                        input_stream.time_base,
+                        *(*mux.out_fmt_ctx).streams.add(output_stream_index),
+                    );
                 }
 
                 return Ok(());
@@ -1083,19 +1077,17 @@ unsafe fn map_auto_stream(
             let (packet_sender, _st, output_stream_index) = mux.new_stream(demux.node.clone())?;
             demux.add_packet_dst(packet_sender, stream_index, output_stream_index);
 
-            unsafe {
-                streamcopy_init(
-                    mux,
-                    *(*demux.in_fmt_ctx).streams.add(stream_index),
-                    *(*mux.out_fmt_ctx).streams.add(output_stream_index),
-                )?;
-                rescale_duration(
-                    input_stream_duration,
-                    input_stream_time_base,
-                    *(*mux.out_fmt_ctx).streams.add(output_stream_index),
-                );
-                mux.stream_ready()
-            }
+            streamcopy_init(
+                mux,
+                *(*demux.in_fmt_ctx).streams.add(stream_index),
+                *(*mux.out_fmt_ctx).streams.add(output_stream_index),
+            )?;
+            rescale_duration(
+                input_stream_duration,
+                input_stream_time_base,
+                *(*mux.out_fmt_ctx).streams.add(output_stream_index),
+            );
+            mux.stream_ready()
         }
 
         Ok(())
@@ -1131,7 +1123,7 @@ fn init_simple_filtergraph(
     Ok(())
 }
 
-unsafe fn rescale_duration(src_duration: i64, src_time_base: AVRational, stream: *mut AVStream) {
+fn rescale_duration(src_duration: i64, src_time_base: AVRational, stream: *mut AVStream) {
     unsafe {
         (*stream).duration = av_rescale_q(src_duration, src_time_base, (*stream).time_base);
     }

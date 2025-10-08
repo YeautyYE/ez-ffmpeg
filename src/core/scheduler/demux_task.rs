@@ -308,16 +308,14 @@ fn demux_done(
                 },
             };
 
-            let _ret = unsafe {
-                demux_stream_send_to_dst(
-                    packet_box,
-                    packet_dst,
-                    output_stream_index,
-                    dst_finished,
-                    0,
-                    scheduler_status,
-                )
-            };
+            let _ret = demux_stream_send_to_dst(
+                packet_box,
+                packet_dst,
+                output_stream_index,
+                dst_finished,
+                0,
+                scheduler_status,
+            );
         }
     }
 }
@@ -1071,7 +1069,7 @@ unsafe fn demux_send_for_stream(
 
 const DEMUX_SEND_STREAMCOPY_EOF: usize = 1 << 0;
 
-unsafe fn demux_stream_send_to_dst(
+fn demux_stream_send_to_dst(
     mut packet_box: PacketBox,
     packet_dst: &Sender<PacketBox>,
     output_stream_index: &Option<usize>,
@@ -1079,48 +1077,48 @@ unsafe fn demux_stream_send_to_dst(
     flags: usize,
     scheduler_status: &Arc<AtomicUsize>,
 ) -> i32 {
-    unsafe {
-        if *dst_finished {
-            return AVERROR_EOF;
-        }
+    if *dst_finished {
+        return AVERROR_EOF;
+    }
 
-        if !packet_is_null(&packet_box.packet)
-            && output_stream_index.is_some()
-            && (flags & DEMUX_SEND_STREAMCOPY_EOF) != 0
-        {
-            unsafe {
-                (*packet_box.packet.as_mut_ptr()).stream_index = -1;
-            }
-            *dst_finished = true;
+    if !packet_is_null(&packet_box.packet)
+        && output_stream_index.is_some()
+        && (flags & DEMUX_SEND_STREAMCOPY_EOF) != 0
+    {
+        unsafe {
+            (*packet_box.packet.as_mut_ptr()).stream_index = -1;
         }
+        *dst_finished = true;
+    }
 
-        if let Some(output_stream_index) = output_stream_index {
+    if let Some(output_stream_index) = output_stream_index {
+        unsafe {
             (*packet_box.packet.as_mut_ptr()).stream_index = *output_stream_index as i32;
-            packet_box.packet_data.output_stream_index = *output_stream_index as i32;
-            packet_box.packet_data.is_copy = true;
         }
+        packet_box.packet_data.output_stream_index = *output_stream_index as i32;
+        packet_box.packet_data.is_copy = true;
+    }
 
-        if *dst_finished {
-            if let Err(_) = packet_dst.send(packet_box) {
-                if !wait_until_not_paused(scheduler_status) == STATUS_END {
-                    error!("Demuxer send packet failed, destination already finished");
-                }
-            }
-
-            return AVERROR_EOF;
-        }
-
+    if *dst_finished {
         if let Err(_) = packet_dst.send(packet_box) {
             if !wait_until_not_paused(scheduler_status) == STATUS_END {
                 error!("Demuxer send packet failed, destination already finished");
             }
-
-            *dst_finished = true;
-            return AVERROR_EOF;
         }
 
-        0
+        return AVERROR_EOF;
     }
+
+    if let Err(_) = packet_dst.send(packet_box) {
+        if !wait_until_not_paused(scheduler_status) == STATUS_END {
+            error!("Demuxer send packet failed, destination already finished");
+        }
+
+        *dst_finished = true;
+        return AVERROR_EOF;
+    }
+
+    0
 }
 
 unsafe fn demux_flush(

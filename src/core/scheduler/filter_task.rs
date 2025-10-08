@@ -256,7 +256,7 @@ pub(crate) fn filter_graph_init(
             }
 
             for ofp in &mut ofps {
-                let ret = unsafe { fg_output_frame(&mut fgp, ofp, null_frame(), &frame_pool) };
+                let ret = fg_output_frame(&mut fgp, ofp, null_frame(), &frame_pool);
                 if ret < 0 {
                     set_scheduler_error(
                         &scheduler_status,
@@ -584,8 +584,7 @@ unsafe fn fg_send_frame(
             AVMEDIA_TYPE_AUDIO => {
                 if ifp.format != (*frame).format
                     || ifp.sample_rate != (*frame).sample_rate
-                    || unsafe { av_channel_layout_compare(&ifp.ch_layout, &(*frame).ch_layout) }
-                        != 0
+                    || av_channel_layout_compare(&ifp.ch_layout, &(*frame).ch_layout) != 0
                 {
                     need_reinit |= AUDIO_CHANGED;
                 }
@@ -881,7 +880,7 @@ unsafe fn configure_filtergraph(
                     //TODO
                     // sub2video_frame(ifp, tmp_frame_box);
                 } else {
-                    let mut tmp_frame = unsafe { av_frame_alloc() };
+                    let mut tmp_frame = av_frame_alloc();
                     if tmp_frame.is_null() {
                         return Err(Error::FilterGraph(
                             FilterGraphOperationError::BufferSourceAddFrameError(
@@ -948,16 +947,14 @@ unsafe fn configure_filtergraph(
 unsafe fn graph_is_meta(graph: *mut AVFilterGraph) -> bool {
     unsafe {
         for i in 0..(*graph).nb_filters {
-            unsafe {
-                let filter_context = *(*graph).filters.add(i as usize);
-                let filter = (*filter_context).filter;
+            let filter_context = *(*graph).filters.add(i as usize);
+            let filter = (*filter_context).filter;
 
-                if !((*filter).flags & AVFILTER_FLAG_METADATA_ONLY != 0
-                    || (*filter_context).nb_outputs == 0
-                    || filter_is_buffersrc(filter_context))
-                {
-                    return false;
-                }
+            if !((*filter).flags & AVFILTER_FLAG_METADATA_ONLY != 0
+                || (*filter_context).nb_outputs == 0
+                || filter_is_buffersrc(filter_context))
+            {
+                return false;
             }
         }
         true
@@ -1448,7 +1445,7 @@ unsafe fn fg_output_frame(
 }
 
 #[cfg(not(feature = "docs-rs"))]
-unsafe fn fg_output_frame(
+fn fg_output_frame(
     fgp: &mut FilterGraphParameter,
     ofp: &mut OutputFilterParameter,
     mut frame: Frame,
@@ -1467,9 +1464,7 @@ unsafe fn fg_output_frame(
         let mut nb_frames_prev = 0;
 
         if ofp.media_type == AVMEDIA_TYPE_VIDEO && (!frame_is_null(&frame) || fgp.got_frame) {
-            unsafe {
-                video_sync_process(ofp, frame.as_mut_ptr(), &mut nb_frames, &mut nb_frames_prev)
-            };
+            video_sync_process(ofp, frame.as_mut_ptr(), &mut nb_frames, &mut nb_frames_prev);
         }
 
         let frame_prev = &ofp.fpsconv_context.last_frame;
