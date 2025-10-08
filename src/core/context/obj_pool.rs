@@ -27,10 +27,9 @@ impl<T> ObjPool<T> {
     }
 
     pub(crate) fn get(&self) -> crate::error::Result<T> {
-        if let Some(obj) = self.queue.pop() {
-            Ok(obj)
-        } else {
-            (self.create_fn)()
+        match self.queue.pop() {
+            Some(obj) => Ok(obj),
+            _ => (self.create_fn)(),
         }
     }
 
