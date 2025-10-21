@@ -247,7 +247,13 @@ fn _mux_init(
             let pkt = packet_box.packet.as_ptr();
             let packet_data = &packet_box.packet_data;
 
-            let mux_stream_node = unsafe { &mux_stream_nodes[(*pkt).stream_index as usize] };
+            let stream_index = unsafe { (*pkt).stream_index as usize };
+            if stream_index >= mux_stream_nodes.len() {
+                error!("Invalid stream_index: {} >= {}", stream_index, mux_stream_nodes.len());
+                packet_pool.release(packet_box.packet);
+                continue;
+            }
+            let mux_stream_node = &mux_stream_nodes[stream_index];
             unsafe {
                 let has_side_data = (*packet_box.packet.as_ptr()).side_data_elems > 0;
                 if packet_is_null(&packet_box.packet) || (packet_box.packet.is_empty() && !has_side_data) {
