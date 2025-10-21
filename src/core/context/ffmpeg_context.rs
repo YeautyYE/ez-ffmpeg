@@ -40,7 +40,7 @@ use ffmpeg_sys_next::AVMediaType::{
 };
 use ffmpeg_sys_next::AVPixelFormat::AV_PIX_FMT_NONE;
 use ffmpeg_sys_next::AVSampleFormat::AV_SAMPLE_FMT_NONE;
-use ffmpeg_sys_next::{av_add_q, av_codec_get_id, av_codec_get_tag2, av_dict_free, av_freep, av_get_exact_bits_per_sample, av_guess_codec, av_guess_format, av_guess_frame_rate, av_inv_q, av_malloc, av_rescale_q, av_seek_frame, avcodec_alloc_context3, avcodec_descriptor_get, avcodec_descriptor_get_by_name, avcodec_find_encoder, avcodec_find_encoder_by_name, avcodec_get_name, avcodec_parameters_from_context, avcodec_parameters_to_context, avfilter_graph_alloc, avfilter_graph_free, avfilter_inout_free, avfilter_pad_get_name, avfilter_pad_get_type, avformat_alloc_context, avformat_alloc_output_context2, avformat_close_input, avformat_find_stream_info, avformat_flush, avformat_free_context, avformat_open_input, avio_alloc_context, avio_context_free, avio_open, AVCodec, AVCodecID, AVColorRange, AVColorSpace, AVFilterContext, AVFilterInOut, AVFilterPad, AVFormatContext, AVMediaType, AVOutputFormat, AVPixelFormat, AVRational, AVSampleFormat, AVStream, AVERROR_ENCODER_NOT_FOUND, AVFMT_FLAG_CUSTOM_IO, AVFMT_GLOBALHEADER, AVFMT_NOBINSEARCH, AVFMT_NOFILE, AVFMT_NOGENSEARCH, AVFMT_NOSTREAMS, AVIO_FLAG_WRITE, AVSEEK_FLAG_BACKWARD, AV_CODEC_PROP_BITMAP_SUB, AV_CODEC_PROP_TEXT_SUB, AV_TIME_BASE};
+use ffmpeg_sys_next::{av_add_q, av_channel_layout_default, av_codec_get_id, av_codec_get_tag2, av_dict_free, av_freep, av_get_exact_bits_per_sample, av_guess_codec, av_guess_format, av_guess_frame_rate, av_inv_q, av_malloc, av_rescale_q, av_seek_frame, avcodec_alloc_context3, avcodec_descriptor_get, avcodec_descriptor_get_by_name, avcodec_find_encoder, avcodec_find_encoder_by_name, avcodec_get_name, avcodec_parameters_from_context, avcodec_parameters_to_context, avfilter_graph_alloc, avfilter_graph_free, avfilter_inout_free, avfilter_pad_get_name, avfilter_pad_get_type, avformat_alloc_context, avformat_alloc_output_context2, avformat_close_input, avformat_find_stream_info, avformat_flush, avformat_free_context, avformat_open_input, avio_alloc_context, avio_context_free, avio_open, AVCodec, AVCodecID, AVColorRange, AVColorSpace, AVFilterContext, AVFilterInOut, AVFilterPad, AVFormatContext, AVMediaType, AVOutputFormat, AVPixelFormat, AVRational, AVSampleFormat, AVStream, AVERROR_ENCODER_NOT_FOUND, AVFMT_FLAG_CUSTOM_IO, AVFMT_GLOBALHEADER, AVFMT_NOBINSEARCH, AVFMT_NOFILE, AVFMT_NOGENSEARCH, AVFMT_NOSTREAMS, AVIO_FLAG_WRITE, AVSEEK_FLAG_BACKWARD, AV_CODEC_PROP_BITMAP_SUB, AV_CODEC_PROP_TEXT_SUB, AV_TIME_BASE};
 #[cfg(not(feature = "docs-rs"))]
 use ffmpeg_sys_next::{av_channel_layout_copy, av_packet_side_data_new, avcodec_get_supported_config, avfilter_graph_segment_apply, avfilter_graph_segment_create_filters, avfilter_graph_segment_free, avfilter_graph_segment_parse, AVChannelLayout};
 use log::{debug, error, info, warn};
@@ -491,6 +491,48 @@ fn map_manual(
     Ok(())
 }
 
+#[cfg(not(feature = "docs-rs"))]
+fn set_channel_layout(
+    ch_layout: &mut AVChannelLayout,
+    ch_layouts: &Option<Vec<AVChannelLayout>>,
+    layout_requested: &AVChannelLayout,
+) -> Result<()> {
+    unsafe {
+        // Scenario 1: If the requested layout has a specified order (not UNSPEC), copy it directly
+        if layout_requested.order != AV_CHANNEL_ORDER_UNSPEC {
+            let ret = av_channel_layout_copy(ch_layout, layout_requested);
+            if ret < 0 {
+                return Err(OpenOutputError::from(ret).into());
+            }
+            return Ok(());
+        }
+
+        // Scenario 2: Requested layout is UNSPEC and no encoder-supported layouts available
+        // Use default layout based on channel count
+        if ch_layouts.is_none() {
+            av_channel_layout_default(ch_layout, layout_requested.nb_channels);
+            return Ok(());
+        }
+
+        // Scenario 3: Try to match channel count from encoder's supported layouts
+        if let Some(layouts) = ch_layouts {
+            for layout in layouts {
+                if layout.nb_channels == layout_requested.nb_channels {
+                    let ret = av_channel_layout_copy(ch_layout, layout);
+                    if ret < 0 {
+                        return Err(OpenOutputError::from(ret).into());
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
+        // Scenario 4: No matching channel count found, use default layout
+        av_channel_layout_default(ch_layout, layout_requested.nb_channels);
+        Ok(())
+    }
+}
+
 #[cfg(feature = "docs-rs")]
 fn configure_output_filter_opts(
     index: usize,
@@ -702,6 +744,17 @@ fn configure_output_filter_opts(
                 current = current.add(1);
             }
             output_filter.opts.ch_layouts = Some(layout_list);
+
+            // Call set_channel_layout to resolve UNSPEC layouts to proper defaults
+            // Corresponds to FFmpeg ffmpeg_filter.c:879-882
+            if output_filter.opts.ch_layout.nb_channels > 0 {
+                let layout_requested = output_filter.opts.ch_layout.clone();
+                set_channel_layout(
+                    &mut output_filter.opts.ch_layout,
+                    &output_filter.opts.ch_layouts,
+                    &layout_requested,
+                )?;
+            }
         }
     };
     Ok(())
