@@ -594,9 +594,15 @@ fn configure_output_filter_opts(
 
             let mut current = formats;
             let mut format_list = Vec::new();
-            while !current.is_null() && *current != AV_PIX_FMT_NONE {
+            let mut count = 0;
+            const MAX_FORMATS: usize = 512;
+            while !current.is_null() && *current != AV_PIX_FMT_NONE && count < MAX_FORMATS {
                 format_list.push(*current);
                 current = current.add(1);
+                count += 1;
+            }
+            if count >= MAX_FORMATS {
+                warn!("Reached maximum format limit");
             }
             output_filter.opts.formats = Some(format_list);
 
@@ -615,9 +621,15 @@ fn configure_output_filter_opts(
             }
             let mut framerate_list = Vec::new();
             let mut current = framerates;
-            while !current.is_null() && (*current).num != 0 && (*current).den != 0 {
+            let mut count = 0;
+            const MAX_FRAMERATES: usize = 64;
+            while !current.is_null() && (*current).num != 0 && (*current).den != 0 && count < MAX_FRAMERATES {
                 framerate_list.push(*current);
                 current = current.add(1);
+                count += 1;
+            }
+            if count >= MAX_FRAMERATES {
+                warn!("Reached maximum framerate limit");
             }
             output_filter.opts.framerates = Some(framerate_list);
 
@@ -640,9 +652,15 @@ fn configure_output_filter_opts(
             }
             let mut color_space_list = Vec::new();
             let mut current = color_spaces;
-            while !current.is_null() && *current != AVCOL_SPC_UNSPECIFIED {
+            let mut count = 0;
+            const MAX_COLOR_SPACES: usize = 128;
+            while !current.is_null() && *current != AVCOL_SPC_UNSPECIFIED && count < MAX_COLOR_SPACES {
                 color_space_list.push(*current);
                 current = current.add(1);
+                count += 1;
+            }
+            if count >= MAX_COLOR_SPACES {
+                warn!("Reached maximum color space limit");
             }
             output_filter.opts.color_spaces = Some(color_space_list);
 
@@ -661,9 +679,15 @@ fn configure_output_filter_opts(
             }
             let mut color_range_list = Vec::new();
             let mut current = color_ranges;
-            while !current.is_null() && *current != AVCOL_RANGE_UNSPECIFIED {
+            let mut count = 0;
+            const MAX_COLOR_RANGES: usize = 64;
+            while !current.is_null() && *current != AVCOL_RANGE_UNSPECIFIED && count < MAX_COLOR_RANGES {
                 color_range_list.push(*current);
                 current = current.add(1);
+                count += 1;
+            }
+            if count >= MAX_COLOR_RANGES {
+                warn!("Reached maximum color range limit");
             }
             output_filter.opts.color_ranges = Some(color_range_list);
 
@@ -689,9 +713,15 @@ fn configure_output_filter_opts(
 
             let mut current = audio_formats;
             let mut audio_format_list = Vec::new();
-            while !current.is_null() && *current != AV_SAMPLE_FMT_NONE {
+            let mut count = 0;
+            const MAX_AUDIO_FORMATS: usize = 32;
+            while !current.is_null() && *current != AV_SAMPLE_FMT_NONE && count < MAX_AUDIO_FORMATS {
                 audio_format_list.push(*current);
                 current = current.add(1);
+                count += 1;
+            }
+            if count >= MAX_AUDIO_FORMATS {
+                warn!("Reached maximum audio format limit");
             }
             output_filter.opts.audio_formats = Some(audio_format_list);
 
@@ -714,9 +744,15 @@ fn configure_output_filter_opts(
             }
             let mut rate_list = Vec::new();
             let mut current = rates;
-            while !current.is_null() && *current != 0 {
+            let mut count = 0;
+            const MAX_SAMPLE_RATES: usize = 64;
+            while !current.is_null() && *current != 0 && count < MAX_SAMPLE_RATES {
                 rate_list.push(*current);
                 current = current.add(1);
+                count += 1;
+            }
+            if count >= MAX_SAMPLE_RATES {
+                warn!("Reached maximum sample rate limit");
             }
             output_filter.opts.sample_rates = Some(rate_list);
 
@@ -739,9 +775,15 @@ fn configure_output_filter_opts(
             }
             let mut layout_list = Vec::new();
             let mut current = layouts;
-            while !current.is_null() && (*current).order != AV_CHANNEL_ORDER_UNSPEC {
+            let mut count = 0;
+            const MAX_CHANNEL_LAYOUTS: usize = 128;
+            while !current.is_null() && (*current).order != AV_CHANNEL_ORDER_UNSPEC && count < MAX_CHANNEL_LAYOUTS {
                 layout_list.push(*current);
                 current = current.add(1);
+                count += 1;
+            }
+            if count >= MAX_CHANNEL_LAYOUTS {
+                warn!("Reached maximum channel layout limit");
             }
             output_filter.opts.ch_layouts = Some(layout_list);
 

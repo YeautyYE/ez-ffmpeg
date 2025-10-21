@@ -376,7 +376,12 @@ unsafe fn process_subtitle(
     frame_pool: &ObjPool<Frame>,
     senders: &Vec<(Sender<FrameBox>, usize, Arc<[AtomicBool]>)>,
 ) -> crate::error::Result<()> {
-    let subtitle = (*(*frame.as_ptr()).buf[0]).data as *mut AVSubtitle;
+    let frame_ptr = frame.as_ptr();
+    if (*frame_ptr).buf[0].is_null() {
+        return Ok(());
+    }
+
+    let subtitle = (*(*frame_ptr).buf[0]).data as *mut AVSubtitle;
 
     //TODO
     // if (dp->flags & DECODER_FLAG_FIX_SUB_DURATION)
