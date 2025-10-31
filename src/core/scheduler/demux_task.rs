@@ -8,6 +8,7 @@ use crate::core::scheduler::ffmpeg_scheduler::{
 };
 use crate::error::Error::Demuxing;
 use crate::error::{DemuxingError, DemuxingOperationError};
+use crate::util::ffmpeg_utils::av_rescale_q_rnd;
 use crossbeam_channel::Sender;
 use ffmpeg_next::packet::{Mut, Ref};
 use ffmpeg_next::Packet;
@@ -17,7 +18,7 @@ use ffmpeg_sys_next::AVRounding::AV_ROUND_NEAR_INF;
 use ffmpeg_sys_next::AV_CODEC_PROP_FIELDS;
 use ffmpeg_sys_next::{
     av_compare_ts, av_gettime_relative, av_inv_q, av_mul_q, av_packet_ref, av_q2d, av_read_frame,
-    av_rescale, av_rescale_q, av_rescale_q_rnd, av_stream_get_parser, av_usleep,
+    av_rescale, av_rescale_q, av_stream_get_parser, av_usleep,
     avformat_seek_file, AVCodecDescriptor, AVCodecParameters, AVFormatContext, AVMediaType,
     AVPacket, AVRational, AVStream, AVERROR, AVERROR_EOF, AVFMT_TS_DISCONT,
     AV_NOPTS_VALUE, AV_PKT_FLAG_CORRUPT, AV_TIME_BASE, AV_TIME_BASE_Q,
@@ -647,7 +648,7 @@ unsafe fn ts_discontinuity_detect(
         (*pkt).dts,
         (*pkt).time_base,
         AV_TIME_BASE_Q,
-        AV_ROUND_NEAR_INF,
+        AV_ROUND_NEAR_INF as u32,
     );
 
     if copy_ts && ds.next_dts != AV_NOPTS_VALUE && fmt_is_discont != 0 && (*ist).pts_wrap_bits < 60
@@ -656,7 +657,7 @@ unsafe fn ts_discontinuity_detect(
             (*pkt).dts + (1i64 << (*ist).pts_wrap_bits),
             (*pkt).time_base,
             AV_TIME_BASE_Q,
-            AV_ROUND_NEAR_INF,
+            AV_ROUND_NEAR_INF as u32,
         );
         if (wrap_dts - ds.next_dts).abs() < (pkt_dts - ds.next_dts).abs() / 10 {
             disable_discontinuity_correction = false;
