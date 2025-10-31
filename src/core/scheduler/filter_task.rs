@@ -11,6 +11,7 @@ use crate::core::scheduler::ffmpeg_scheduler::{
 use crate::core::scheduler::input_controller::{InputController, SchNode};
 use crate::error::{Error, FilterGraphError, FilterGraphOperationError, FilterGraphParseError};
 use crate::hwaccel::{hw_device_for_filter, init_filter_hw_device, HWDevice};
+use crate::util::ffmpeg_utils::av_rescale_q_rnd;
 use crossbeam_channel::{RecvTimeoutError, Sender};
 use ffmpeg_next::Frame;
 #[cfg(not(feature = "docs-rs"))]
@@ -33,7 +34,7 @@ use ffmpeg_sys_next::{
     av_color_space_name, av_dict_free, av_frame_alloc, av_frame_free, av_frame_get_side_data,
     av_frame_ref, av_frame_remove_side_data, av_freep, av_get_pix_fmt_name, av_get_sample_fmt_name,
     av_inv_q, av_log2, av_malloc, av_opt_find, av_opt_set, av_opt_set_bin, av_opt_set_int,
-    av_pix_fmt_desc_get, av_q2d, av_rescale_q, av_rescale_q_rnd, avfilter_get_by_name,
+    av_pix_fmt_desc_get, av_q2d, av_rescale_q, avfilter_get_by_name,
     avfilter_graph_alloc, avfilter_graph_config, avfilter_graph_create_filter, avfilter_graph_free,
     avfilter_graph_request_oldest, avfilter_inout_free, avfilter_link, avfilter_pad_get_type,
     avio_close, avio_closep, avio_open, avio_open2, avio_read, avio_read_to_bprint, avio_size,
@@ -471,7 +472,7 @@ unsafe fn fg_send_eof(
             (*frame).pts,
             (*frame).time_base,
             ifp.time_base,
-            std::mem::transmute(AV_ROUND_NEAR_INF as u32 | AV_ROUND_PASS_MINMAX as u32),
+            AV_ROUND_NEAR_INF as u32 | AV_ROUND_PASS_MINMAX as u32,
         );
         let ret = av_buffersrc_close(ifp.filter, pts, AV_BUFFERSRC_FLAG_PUSH as u32);
         frame_pool.release(frame_box.frame);
