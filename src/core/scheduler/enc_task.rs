@@ -4,7 +4,7 @@ use crate::core::context::{CodecContext, FrameBox, PacketBox, PacketData};
 use crate::error::Error::{Encoding, OpenEncoder};
 use crate::error::{AllocPacketError, EncodeSubtitleError, EncodingError, EncodingOperationError, OpenEncoderError, OpenEncoderOperationError, OpenOutputError};
 use crate::core::scheduler::ffmpeg_scheduler::{
-    frame_is_null, packet_is_null, set_scheduler_error, wait_until_not_paused, STATUS_END,
+    frame_is_null, is_stopping, packet_is_null, set_scheduler_error, wait_until_not_paused, STATUS_ABORT,
 };
 use crate::hwaccel::hw_device_get_by_type;
 use crate::util::ffmpeg_utils::{av_err2str, hashmap_to_avdictionary};
@@ -174,8 +174,94 @@ pub(crate) fn enc_init(
             }
         }
 
-        // flush the encoder
-        if finished {
+        // Encoder flush logic - handles two different exit scenarios:
+        //
+        // SCENARIO 1: finished=true (normal completion)
+        //   - Encoder received NULL frame from upstream (frame_encode() processed it)
+        //   - encode_frame() already called avcodec_send_frame(NULL)
+        //   - All buffered packets (B-frames, etc.) have been drained via receive_packet() loop
+        //   - Encoder is completely flushed, no additional flush needed
+        //
+        // SCENARIO 2: finished=false (early exit: abort or disconnect)
+        //   - Encoder did NOT receive NULL frame (thread exited early via abort() or Disconnected)
+        //   - Encoder buffer may still contain unencoded frames (B-frames waiting for future frames)
+        //   - If NOT abort: actively flush encoder to drain buffered frames
+        //   - If abort: skip flush (user doesn't care about incomplete output)
+        //
+        if !finished {
+            let status = scheduler_status.load(Ordering::Acquire);
+
+            if status != STATUS_ABORT {
+                // Actively flush encoder: send NULL frame and drain all buffered packets
+                let enc_ctx = enc_ctx_box.as_mut_ptr();
+                let stream = stream_box.inner;
+
+                // Send NULL frame to signal EOF
+                let ret = avcodec_send_frame(enc_ctx, null_mut());
+                if ret < 0 && ret != AVERROR_EOF {
+                    error!("Error flushing encoder: {}", av_err2str(ret));
+                } else {
+                    // Drain all buffered packets (B-frames, delayed frames, etc.)
+                    // Note: These are real packets with data, NOT empty marker packets
+                    loop {
+                        let packet_result = packet_pool.get();
+                        if packet_result.is_err() {
+                            error!("Failed to allocate packet for flushing");
+                            break;
+                        }
+                        let mut packet = packet_result.unwrap();
+                        let pkt = packet.as_mut_ptr();
+
+                        let ret = avcodec_receive_packet(enc_ctx, pkt);
+                        if ret == AVERROR_EOF {
+                            trace!("Encoder flushing completed");
+                            packet_pool.release(packet);
+                            break;
+                        }
+                        if ret == AVERROR(EAGAIN) {
+                            packet_pool.release(packet);
+                            break;
+                        }
+                        if ret < 0 {
+                            error!("Error receiving flushed packet: {}", av_err2str(ret));
+                            packet_pool.release(packet);
+                            break;
+                        }
+
+                        (*pkt).time_base = (*enc_ctx).time_base;
+                        (*pkt).flags |= AV_PKT_FLAG_TRUSTED;
+
+                        // Send flushed packet to mux (real data packet, not empty marker)
+                        if let Err(_) = send_to_mux(PacketBox {
+                            packet,
+                            packet_data: PacketData {
+                                dts_est: 0,
+                                codec_type: (*enc_ctx).codec_type,
+                                output_stream_index: (*stream).index,
+                                is_copy: false,
+                                codecpar: (*stream).codecpar,
+                            },
+                        }, &pkt_sender, &pre_pkt_sender, &mux_started) {
+                            error!("send flushed packet failed, mux already finished");
+                            break;
+                        }
+                    }
+                }
+            } else {
+                debug!("Encoder detected abort, skipping flush for stream {}", stream_index);
+            }
+        }
+
+        // Send empty packet marker to signal stream end to muxer
+        //
+        // IMPORTANT: This empty packet is REQUIRED in ALL scenarios:
+        // - SCENARIO 1 (finished=true): After normal encoding completion
+        // - SCENARIO 2 (finished=false, no abort): After flushing buffered frames
+        //
+        // Why needed after flush? Because flushed packets contain REAL DATA (B-frames, etc.),
+        // not empty markers. Muxer uses `packet.is_empty()` to detect stream completion,
+        // so we must send an explicit empty packet to signal "no more data from this encoder".
+        {
             let enc_ctx = enc_ctx_box.as_mut_ptr();
             let stream = stream_box.inner;
 
@@ -191,7 +277,7 @@ pub(crate) fn enc_init(
                     codecpar: (*stream).codecpar,
                 },
             }, &pkt_sender, &pre_pkt_sender, &mux_started) {
-                error!("Error flushing encoder: {}", e);
+                error!("Error sending end packet: {}", e);
                 set_scheduler_error(
                     &scheduler_status,
                     &scheduler_result,
@@ -222,7 +308,7 @@ fn receive_from(
 ) -> Result<FrameBox, SyncFrame> {
     match receiver.recv_timeout(Duration::from_millis(100)) {
         Ok(frame_box) => {
-            if wait_until_not_paused(scheduler_status) == STATUS_END {
+            if is_stopping(wait_until_not_paused(scheduler_status)) {
                 info!("Encoder receiver end command, finishing.");
                 return Err(SyncFrame::Break);
             }

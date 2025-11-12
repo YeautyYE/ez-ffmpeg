@@ -4,7 +4,7 @@ use crate::core::context::demuxer::Demuxer;
 use crate::core::context::obj_pool::ObjPool;
 use crate::core::context::{AVFormatContextBox, PacketBox, PacketData};
 use crate::core::scheduler::ffmpeg_scheduler::{
-    packet_is_null, set_scheduler_error, wait_until_not_paused, STATUS_END,
+    is_stopping, packet_is_null, set_scheduler_error, wait_until_not_paused,
 };
 use crate::error::Error::Demuxing;
 use crate::error::{DemuxingError, DemuxingOperationError};
@@ -95,7 +95,7 @@ pub(crate) fn demux_init(
                 unsafe {
                     let mut ret = av_read_frame(in_fmt_ctx_box.fmt_ctx, packet.as_mut_ptr());
                     if ret == AVERROR(EAGAIN) {
-                        if wait_until_not_paused(&scheduler_status) == STATUS_END {
+                        if is_stopping(wait_until_not_paused(&scheduler_status)) {
                             info!("Demuxer receiver end command, finishing.");
                             break;
                         }
@@ -104,7 +104,7 @@ pub(crate) fn demux_init(
                         continue;
                     }
 
-                    if wait_until_not_paused(&scheduler_status) == STATUS_END {
+                    if is_stopping(wait_until_not_paused(&scheduler_status)) {
                         info!("Demuxer receiver end command, finishing.");
                         break;
                     }
@@ -929,7 +929,7 @@ unsafe fn demux_send(
         waiter, ..
     } = node else { unreachable!() };
     let wait_time = waiter.wait_with_scheduler_status(scheduler_status, independent_readrate);
-    if wait_until_not_paused(scheduler_status) == STATUS_END {
+    if is_stopping(wait_until_not_paused(scheduler_status)) {
         return ffmpeg_sys_next::AVERROR_EXIT;
     }
     if independent_readrate && wait_time != 0 {
@@ -1064,7 +1064,7 @@ unsafe fn demux_stream_send_to_dst(
 
     if *dst_finished {
         if let Err(_) = packet_dst.send(packet_box) {
-            if !wait_until_not_paused(scheduler_status) == STATUS_END {
+            if !is_stopping(wait_until_not_paused(scheduler_status)) {
                 error!("Demuxer send packet failed, destination already finished");
             }
         }
@@ -1073,7 +1073,7 @@ unsafe fn demux_stream_send_to_dst(
     }
 
     if let Err(_) = packet_dst.send(packet_box) {
-        if !wait_until_not_paused(scheduler_status) == STATUS_END {
+        if !is_stopping(wait_until_not_paused(scheduler_status)) {
             error!("Demuxer send packet failed, destination already finished");
         }
 
