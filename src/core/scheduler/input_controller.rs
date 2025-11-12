@@ -1,4 +1,4 @@
-use crate::core::scheduler::ffmpeg_scheduler::STATUS_END;
+use crate::core::scheduler::ffmpeg_scheduler::is_stopping;
 use crate::util::sch_waiter::SchWaiter;
 use ffmpeg_sys_next::AV_NOPTS_VALUE;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
@@ -53,7 +53,7 @@ impl InputController {
 
     pub(crate) fn update_locked(&self, scheduler_status: &Arc<AtomicUsize>) {
         let _guard = self.lock.lock().unwrap();
-        if scheduler_status.load(Ordering::Acquire) == STATUS_END {
+        if is_stopping(scheduler_status.load(Ordering::Acquire)) {
             return;
         }
 

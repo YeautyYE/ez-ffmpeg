@@ -6,7 +6,7 @@ use crate::core::context::output::VSyncMethod::{VsyncCfr, VsyncVscfr};
 use crate::core::context::output_filter::OutputFilterOptions;
 use crate::core::context::{null_frame, FrameBox, FrameData};
 use crate::core::scheduler::ffmpeg_scheduler::{
-    frame_is_null, set_scheduler_error, wait_until_not_paused, STATUS_END,
+    frame_is_null, is_stopping, set_scheduler_error, wait_until_not_paused,
 };
 use crate::core::scheduler::input_controller::{InputController, SchNode};
 use crate::error::{Error, FilterGraphError, FilterGraphOperationError, FilterGraphParseError};
@@ -142,7 +142,7 @@ pub(crate) fn filter_graph_init(
 
                 let result = src.recv_timeout(Duration::from_millis(100));
 
-                if wait_until_not_paused(&scheduler_status) == STATUS_END {
+                if is_stopping(wait_until_not_paused(&scheduler_status)) {
                     info!("Filtergraph receiver end command, finishing.");
                     break;
                 }
@@ -223,7 +223,7 @@ pub(crate) fn filter_graph_init(
                     }
                 }
 
-                if wait_until_not_paused(&scheduler_status) == STATUS_END {
+                if is_stopping(wait_until_not_paused(&scheduler_status)) {
                     info!("Filtergraph receiver end command, finishing.");
                     break;
                 }

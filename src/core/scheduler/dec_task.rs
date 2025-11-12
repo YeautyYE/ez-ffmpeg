@@ -2,7 +2,7 @@ use crate::core::context::decoder_stream::DecoderStream;
 use crate::core::context::obj_pool::ObjPool;
 use crate::core::context::{null_frame, CodecContext, FrameBox, FrameData, PacketBox};
 use crate::core::scheduler::ffmpeg_scheduler::{
-    packet_is_null, set_scheduler_error, wait_until_not_paused, STATUS_END,
+    is_stopping, packet_is_null, set_scheduler_error, wait_until_not_paused,
 };
 use crate::error::DecodingOperationError::DecodeSubtitleError;
 use crate::error::Error::{Bug, Decoding, OpenDecoder};
@@ -110,7 +110,7 @@ pub(crate) fn dec_init(
 
                 let result = receiver.recv_timeout(Duration::from_millis(100));
 
-                if wait_until_not_paused(&scheduler_status) == STATUS_END {
+                if is_stopping(wait_until_not_paused(&scheduler_status)) {
                     info!("Decoder receiver end command, finishing.");
                     break;
                 }

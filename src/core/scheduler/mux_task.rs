@@ -1,7 +1,7 @@
 use crate::core::context::muxer::Muxer;
 use crate::core::context::obj_pool::ObjPool;
 use crate::core::context::{AVFormatContextBox, PacketBox, PacketData};
-use crate::core::scheduler::ffmpeg_scheduler::{packet_is_null, set_scheduler_error, wait_until_not_paused, STATUS_END};
+use crate::core::scheduler::ffmpeg_scheduler::{is_stopping, packet_is_null, set_scheduler_error, wait_until_not_paused, STATUS_ABORT, STATUS_END};
 use crate::core::scheduler::input_controller::{InputController, SchNode};
 use crate::error::Error::Muxing;
 use crate::error::{MuxingError, MuxingOperationError, WriteHeaderError};
@@ -86,7 +86,7 @@ pub(crate) fn ready_to_init_mux(
             loop {
                 let result = receiver.recv_timeout(Duration::from_millis(100));
 
-                if wait_until_not_paused(&scheduler_status) == STATUS_END {
+                if is_stopping(wait_until_not_paused(&scheduler_status)) {
                     thread_sync.thread_done();
                     info!("Init muxer receiver end command, finishing.");
                     break;
@@ -230,7 +230,7 @@ fn _mux_init(
         loop {
             let result = pkt_receiver.recv_timeout(Duration::from_millis(100));
 
-            if wait_until_not_paused(&scheduler_status) == STATUS_END {
+            if is_stopping(wait_until_not_paused(&scheduler_status)) {
                 info!("Muxer receiver end command, finishing.");
                 break;
             }
@@ -257,6 +257,13 @@ fn _mux_init(
             unsafe {
                 let has_side_data = (*packet_box.packet.as_ptr()).side_data_elems > 0;
                 if packet_is_null(&packet_box.packet) || (packet_box.packet.is_empty() && !has_side_data) {
+                    let current_status = scheduler_status.load(Ordering::Acquire);
+                    if current_status == STATUS_ABORT {
+                        debug!("Muxer detected abort from stream {}, exiting without trailer", stream_index);
+                        packet_pool.release(packet_box.packet);
+                        break;
+                    }
+
                     nb_done += 1;
                     packet_pool.release(packet_box.packet);
 
@@ -324,18 +331,23 @@ fn _mux_init(
         }
 
         // write_trailer
-        unsafe {
-            let ret = av_write_trailer(out_fmt_ctx_box.fmt_ctx);
-            if ret < 0 {
-                error!("Error writing trailer: {}", av_err2str(ret));
-                set_scheduler_error(
-                    &scheduler_status,
-                    &scheduler_result,
-                    Muxing(MuxingOperationError::TrailerWriteError(MuxingError::from(
-                        ret,
-                    ))),
-                );
+        let final_status = scheduler_status.load(Ordering::Acquire);
+        if final_status != STATUS_ABORT {
+            unsafe {
+                let ret = av_write_trailer(out_fmt_ctx_box.fmt_ctx);
+                if ret < 0 {
+                    error!("Error writing trailer: {}", av_err2str(ret));
+                    set_scheduler_error(
+                        &scheduler_status,
+                        &scheduler_result,
+                        Muxing(MuxingOperationError::TrailerWriteError(MuxingError::from(
+                            ret,
+                        ))),
+                    );
+                }
             }
+        } else {
+            debug!("Muxer skipping trailer due to abort");
         }
 
         debug!("Muxer finished.");

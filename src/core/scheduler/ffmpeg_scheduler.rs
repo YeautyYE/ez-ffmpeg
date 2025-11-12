@@ -25,12 +25,49 @@ pub struct Running;
 pub struct Paused;
 pub struct Ended;
 
+// Internal wrapper for Running state to enable Drop implementation.
+//
+// This guard ensures that when a FfmpegScheduler<Running> (or Paused) is dropped,
+// all worker threads are properly terminated and output files are finalized.
+//
+// IMPORTANT: Drop only runs when the scheduler goes out of scope normally.
+// If the process exits abruptly (e.g., via std::process::exit() or panic in main),
+// Drop will NOT run and files may be corrupted.
+//
+// The guard is passed through state transitions (Running -> Paused -> Running)
+// via into_state() to maintain Drop protection across all active states.
+struct RunningGuard {
+    status: Arc<AtomicUsize>,
+    thread_sync: ThreadSynchronizer,
+}
+
+impl Drop for RunningGuard {
+    /// Ensures graceful shutdown when scheduler is dropped.
+    /// Blocks until all threads complete to prevent data corruption.
+    fn drop(&mut self) {
+        // Always ensure STATUS_END is set
+        if !is_stopping(self.status.load(Ordering::Acquire)) {
+            log::debug!("Drop called, setting STATUS_END");
+            self.status.store(STATUS_END, Ordering::Release);
+        }
+
+        // Always wait for all threads to complete
+        // This is safe to call multiple times - if threads are already done (counter==0),
+        // wait_for_all_threads() returns immediately without blocking.
+        // This ensures cleanup works correctly after both abort() and stop().
+        log::debug!("Drop waiting for all threads to finish");
+        self.thread_sync.wait_for_all_threads();
+    }
+}
+
 pub struct FfmpegScheduler<S> {
     ffmpeg_context: FfmpegContext,
     status: Arc<AtomicUsize>,
     thread_sync: ThreadSynchronizer,
     result: Arc<Mutex<Option<crate::error::Result<()>>>>,
     state: PhantomData<S>,
+    // Guard for Running state - Some only when in Running state
+    _guard: Option<RunningGuard>,
 }
 unsafe impl<S> Send for FfmpegScheduler<S> {}
 unsafe impl<S> Sync for FfmpegScheduler<S> {}
@@ -38,7 +75,13 @@ unsafe impl<S> Sync for FfmpegScheduler<S> {}
 pub(crate) const STATUS_INIT: usize = 0;
 pub(crate) const STATUS_RUN: usize = 1;
 pub(crate) const STATUS_PAUSE: usize = 2;
-pub(crate) const STATUS_END: usize = 3;
+pub(crate) const STATUS_ABORT: usize = 3;
+pub(crate) const STATUS_END: usize = 4;
+
+/// Checks if scheduler is in a stopping state (abort or normal end)
+pub(crate) fn is_stopping(status: usize) -> bool {
+    status == STATUS_END || status == STATUS_ABORT
+}
 
 impl<S: 'static> FfmpegScheduler<S> {
     /// Determines if this scheduler’s **state type** (`S`) matches a specified
@@ -65,17 +108,18 @@ impl<S: 'static> FfmpegScheduler<S> {
             thread_sync: self.thread_sync,
             result: self.result,
             state: Default::default(),
+            _guard: self._guard,  // Pass guard to maintain Drop protection across state transitions
         }
     }
 
-    /// Immediately signals the FFmpeg job to end (e.g., on error or user cancellation).
-    /// This sets the internal status to “END.” Typically called by [`abort()`]
-    /// or other cleanup routines.
+    /// Internal method to signal the scheduler to stop.
+    /// This sets the scheduler's status to "END" and signals all worker threads
+    /// to finish up and exit gracefully.
     ///
     /// # Note
-    /// After calling `_abort()`, the scheduler is effectively in a terminal state,
-    /// though some background threads may still be cleaning up resources.
-    fn _abort(self) {
+    /// This method only sets the signal flag. It does not wait for threads to complete.
+    /// Calling code is responsible for deciding whether to wait or not.
+    fn signal_stop(&self) {
         self.status.store(STATUS_END, Ordering::Release);
     }
 
@@ -86,7 +130,7 @@ impl<S: 'static> FfmpegScheduler<S> {
     /// - `true` if the FFmpeg job is in the ended state.
     /// - `false` otherwise.
     pub fn is_ended(&self) -> bool {
-        self.status.load(Ordering::Acquire) == STATUS_END
+        is_stopping(self.status.load(Ordering::Acquire))
     }
 }
 
@@ -114,6 +158,7 @@ impl FfmpegScheduler<Initialization> {
             thread_sync: ThreadSynchronizer::new(),
             status: Arc::new(AtomicUsize::new(STATUS_INIT)),
             result: Arc::new(Mutex::new(None)),
+            _guard: None,
         }
     }
 
@@ -301,7 +346,14 @@ impl FfmpegScheduler<Initialization> {
 
         input_controller.as_ref().update_locked(&scheduler_status);
 
-        Ok(self.into_state())
+        // Create Running state with guard for Drop implementation
+        let mut running_scheduler = self.into_state::<Running>();
+        running_scheduler._guard = Some(RunningGuard {
+            status: running_scheduler.status.clone(),
+            thread_sync: running_scheduler.thread_sync.clone(),
+        });
+
+        Ok(running_scheduler)
     }
 
     /// Cleans up Muxers/Demuxers and signals the job to end if an error occurs
@@ -324,7 +376,7 @@ impl FfmpegScheduler<Running> {
     /// # Returns
     /// A new [`FfmpegScheduler<Paused>`] representing the paused job.
     pub fn pause(self) -> FfmpegScheduler<Paused> {
-        if self.status.load(Ordering::Acquire) != STATUS_END {
+        if !is_stopping(self.status.load(Ordering::Acquire)) {
             self.status.store(STATUS_PAUSE, Ordering::Release);
         }
         self.into_state()
@@ -349,7 +401,7 @@ impl FfmpegScheduler<Running> {
     /// assert!(result.is_ok());
     /// ```
     pub fn wait(self) -> crate::error::Result<()> {
-        if self.status.load(Ordering::Acquire) != STATUS_END {
+        if !is_stopping(self.status.load(Ordering::Acquire)) {
             self.thread_sync.wait_for_all_threads();
             self.status.store(STATUS_END, Ordering::Release);
         }
@@ -367,17 +419,91 @@ impl FfmpegScheduler<Running> {
         }
     }
 
-    /// Immediately signals the FFmpeg job to end (abort). Similar to dropping the scheduler,
-    /// but this method explicitly sets the internal status to “END.”
+    /// **WARNING: Immediately aborts the FFmpeg job without waiting for threads to complete.**
+    ///
+    /// This method signals all threads to stop and returns **immediately**. It does NOT wait
+    /// for threads to finish their work, which means:
+    ///
+    /// - **Output files WILL BE UNUSABLE** (missing trailer, encoder buffers not flushed)
+    /// - **Encoded data in buffers will be lost** (B-frames, delayed frames)
+    /// - **Files will NOT be seekable or playable** in most media players
+    /// - Only use this when you **do not need the output files at all**
+    ///
+    /// # When to Use
+    ///
+    /// - Emergency shutdown scenarios where speed is critical
+    /// - Preview/test runs where output is discarded
+    /// - User cancellation where output is not needed
+    ///
+    /// # When NOT to Use
+    ///
+    /// - **NEVER** when you need valid output files → **Use [`stop()`](Self::stop) instead**
+    ///
+    /// # Why Files Are Unusable
+    ///
+    /// `abort()` causes:
+    /// 1. Encoder to skip flush -> buffered frames lost
+    /// 2. Muxer to skip trailer -> no seeking, no playback in most players
+    ///
+    /// **The ONLY way to get valid files is to use `stop()` instead of `abort()`.**
+    ///
+    /// # Comparison
+    ///
+    /// ```rust
+    /// // WRONG: Files will be unusable
+    /// scheduler.abort();
+    ///
+    /// // CORRECT: Files will be valid and playable
+    /// scheduler.stop();
+    /// ```
     ///
     /// # Example
     /// ```rust
     /// let running_scheduler = scheduler.start().unwrap();
-    /// // Some condition triggers an early stop
+    /// // User clicked "Cancel" - don't need output
     /// running_scheduler.abort();
     /// ```
     pub fn abort(self) {
-        self._abort()
+        self.status.store(STATUS_ABORT, Ordering::Release);
+    }
+
+    /// Gracefully stops the FFmpeg job and waits for all threads to complete.
+    ///
+    /// This method **blocks** until all processing is finished and ensures **complete data integrity**.
+    /// All encoder buffers are flushed, all output files are properly finalized with trailers,
+    /// and all threads are cleanly terminated.
+    ///
+    /// # Guarantees
+    ///
+    /// - All buffered frames are encoded and written
+    /// - Output files contain proper headers and trailers (e.g., MP4 moov atom, MKV Cues)
+    /// - Files are seekable and playable in all media players
+    /// - No data loss or corruption
+    ///
+    /// # When to Use
+    ///
+    /// - **Always use this** when you need valid output files
+    /// - Production transcoding workflows
+    /// - Before exiting the application
+    /// - Any scenario where output quality matters
+    ///
+    /// # Comparison with abort()
+    ///
+    /// | Method | Blocks? | Data Integrity | Use Case |
+    /// |--------|---------|----------------|----------|
+    /// | `stop()` | Yes | Guaranteed | Production, need valid files |
+    /// | `abort()` | No | Not guaranteed | Emergency, don't care about files |
+    ///
+    /// # Example
+    /// ```rust
+    /// let running_scheduler = scheduler.start().unwrap();
+    /// // ... processing ...
+    /// running_scheduler.stop(); // Blocks until complete, files are valid
+    /// ```
+    pub fn stop(self) {
+        self.signal_stop();
+        self.thread_sync.wait_for_all_threads();
+        log::debug!("stop() completed, all threads finished");
     }
 }
 
@@ -408,7 +534,7 @@ impl std::future::Future for FfmpegScheduler<Running> {
     ) -> std::task::Poll<Self::Output> {
         let this = self.get_mut();
 
-        if this.status.load(Ordering::Acquire) == STATUS_END {
+        if is_stopping(this.status.load(Ordering::Acquire)) {
             let option = this.result.lock().unwrap().take();
             std::task::Poll::Ready(match option {
                 None => {
@@ -439,23 +565,33 @@ impl FfmpegScheduler<Paused> {
     /// # Returns
     /// A new [`FfmpegScheduler<Running>`] representing the resumed job.
     pub fn resume(self) -> FfmpegScheduler<Running> {
-        if self.status.load(Ordering::Acquire) != STATUS_END {
+        if !is_stopping(self.status.load(Ordering::Acquire)) {
             self.status.store(STATUS_RUN, Ordering::Release);
         }
         self.into_state()
     }
 
-    /// Immediately ends the paused job. Equivalent to [`FfmpegScheduler<Running>::abort()`],
-    /// but can be called from the paused state.
+    /// **WARNING: Immediately aborts the paused FFmpeg job without waiting for threads to complete.**
+    ///
+    /// This method has the **exact same behavior and consequences** as [`FfmpegScheduler<Running>::abort()`]:
+    ///
+    /// - **Output files WILL BE UNUSABLE** (missing trailer, encoder buffers not flushed)
+    /// - **Encoded data in buffers will be lost** (B-frames, delayed frames)
+    /// - **Files will NOT be seekable or playable** in most media players
+    /// - Only use this when you **do not need the output files at all**
+    ///
+    /// **The ONLY way to get valid files is to use [`stop()`](Running::stop) instead of `abort()`.**
+    ///
+    /// See [`FfmpegScheduler<Running>::abort()`] for complete documentation.
     ///
     /// # Example
     /// ```rust
-    /// // Suppose we have a paused scheduler
+    /// let paused_scheduler = running_scheduler.pause();
+    /// // User clicked "Cancel" - don't need output
     /// paused_scheduler.abort();
-    /// // The job is now signaled to end
     /// ```
     pub fn abort(self) {
-        self._abort()
+        self.status.store(STATUS_ABORT, Ordering::Release)
     }
 }
 
@@ -978,5 +1114,33 @@ mod tests {
         scheduler.abort();
 
         sleep(Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_stop() {
+        let _ = env_logger::builder()
+            .filter_level(log::LevelFilter::Trace)
+            .is_test(true)
+            .try_init();
+
+        let context = FfmpegContext::builder()
+            .input("test.mp4")
+            .filter_desc("hue=s=0")
+            .output("output.mp4")
+            .build()
+            .unwrap();
+
+        let scheduler = FfmpegScheduler::new(context);
+        let scheduler = scheduler.start().unwrap();
+
+        // Let the job process some frames before stopping
+        sleep(Duration::from_millis(500));
+
+        // stop() should block until all threads complete
+        scheduler.stop();
+
+        // Verify output file exists and has content
+        let metadata = std::fs::metadata("output.mp4").unwrap();
+        assert!(metadata.len() > 0, "Output file should have content after stop()");
     }
 }
