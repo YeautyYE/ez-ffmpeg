@@ -1,8 +1,21 @@
+//! Helper functions that wrap or re-implement FFmpeg's common utility routines. Keeping these
+//! thin veneers in one place makes it easy to compare our Rust code with the original C
+//! implementations from libavutil/libavformat when debugging.
+
+use ffmpeg_sys_next::{
+    av_dict_set, av_strerror, AVDictionary, AVRational, AV_ERROR_MAX_STRING_SIZE,
+};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
-use ffmpeg_sys_next::{av_dict_set, av_strerror, AVDictionary, AVRational, AV_ERROR_MAX_STRING_SIZE};
 
-pub(crate) fn hashmap_to_avdictionary(opts: &Option<HashMap<CString, CString>>) -> *mut AVDictionary {
+/// Convert an optional `HashMap<CString, CString>` into an `AVDictionary` by invoking
+/// `av_dict_set()` for each entry.
+///
+/// FFmpeg reference: `av_dict_set()` in `libavutil/dict.c` uses the same ownership rules; the
+/// caller is still responsible for freeing the resulting dictionary via `av_dict_free()`.
+pub(crate) fn hashmap_to_avdictionary(
+    opts: &Option<HashMap<CString, CString>>,
+) -> *mut AVDictionary {
     let mut av_dict: *mut AVDictionary = std::ptr::null_mut();
 
     if let Some(map) = opts {
@@ -16,6 +29,75 @@ pub(crate) fn hashmap_to_avdictionary(opts: &Option<HashMap<CString, CString>>) 
     av_dict
 }
 
+/// Convert Rust String to C-compatible CString, handling null bytes
+///
+/// This is a utility function for safe String → CString conversion with proper error handling.
+/// FFmpeg's C API requires null-terminated strings, but Rust Strings can contain null bytes.
+///
+/// # Arguments
+/// * `s` - Rust string slice to convert
+///
+/// # Returns
+/// * `Ok(CString)` - Successfully converted string
+/// * `Err(String)` - String contains embedded null bytes (invalid for C strings)
+///
+/// # Note
+/// Currently unused but kept as a utility function for future features that need
+/// safe String → CString conversion with validation. Used internally by
+/// hashmap_to_avdictionary_string().
+#[allow(dead_code)]
+pub(crate) fn string_to_cstring(s: &str) -> Result<CString, String> {
+    CString::new(s).map_err(|e| format!("String contains null byte: {}", e))
+}
+
+/// Convert HashMap<String, String> to FFmpeg's AVDictionary
+///
+/// This function provides a type-safe way to convert Rust HashMap to FFmpeg's C dictionary.
+/// Unlike hashmap_to_avdictionary() which takes CString values, this accepts String values
+/// and performs validation to ensure they don't contain null bytes.
+///
+/// # Arguments
+/// * `opts` - Optional HashMap with String keys and values
+///
+/// # Returns
+/// * `Ok(*mut AVDictionary)` - Pointer to created dictionary (caller must free)
+/// * `Err(String)` - Key or value contains embedded null bytes
+///
+/// # Memory Management
+/// Returned AVDictionary must be freed by calling av_dict_free() or similar FFmpeg function.
+///
+/// # Note
+/// Currently unused but kept as a utility function for future user-facing API that accepts
+/// String-based options. The metadata implementation uses direct CString conversion instead.
+#[allow(dead_code)]
+/// Convert a `HashMap<String, String>` into an `AVDictionary`, validating that every key/value is
+/// a valid C string before calling into FFmpeg.
+///
+/// FFmpeg reference: this mirrors the CLI path in `fftools/cmdutils.c` where user-facing strings
+/// are validated and then passed to `av_dict_set()`.
+pub(crate) fn hashmap_to_avdictionary_string(
+    opts: &Option<HashMap<String, String>>,
+) -> Result<*mut AVDictionary, String> {
+    let mut av_dict: *mut AVDictionary = std::ptr::null_mut();
+
+    if let Some(map) = opts {
+        for (key, value) in map {
+            let c_key = string_to_cstring(key)?;
+            let c_value = string_to_cstring(value)?;
+            unsafe {
+                av_dict_set(&mut av_dict, c_key.as_ptr(), c_value.as_ptr(), 0);
+            }
+        }
+    }
+
+    Ok(av_dict)
+}
+
+/// Safe wrapper around `av_strerror()` that returns a Rust `String` instead of writing into a
+/// caller-provided buffer.
+///
+/// FFmpeg reference: `av_strerror()` in `libavutil/error.c` uses a fixed-size buffer (defined by
+/// `AV_ERROR_MAX_STRING_SIZE`), which we allocate on the stack and convert into UTF-8.
 pub fn av_err2str(err: i32) -> String {
     unsafe {
         let mut buffer = [0i8; AV_ERROR_MAX_STRING_SIZE];
@@ -87,7 +169,10 @@ fn av_rescale_rnd(a: i64, b: i64, c: i64, mut rnd: u32) -> i64 {
     // av_assert2(c > 0);
     // av_assert2(b >= 0);
     // av_assert2((unsigned)(rnd&~AV_ROUND_PASS_MINMAX)<=5 && (rnd&~AV_ROUND_PASS_MINMAX)!=4);
-    if c <= 0 || b < 0 || !((rnd & !AV_ROUND_PASS_MINMAX) <= 5 && (rnd & !AV_ROUND_PASS_MINMAX) != 4) {
+    if c <= 0
+        || b < 0
+        || !((rnd & !AV_ROUND_PASS_MINMAX) <= 5 && (rnd & !AV_ROUND_PASS_MINMAX) != 4)
+    {
         return i64::MIN;
     }
 

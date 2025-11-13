@@ -416,6 +416,24 @@ pub mod codec;
 /// chains for your media data.
 pub mod filter;
 
+/// The **metadata** module provides internal metadata handling for FFmpeg operations.
+///
+/// **Internal Use Only**: This module contains unsafe FFmpeg C API wrappers.
+/// Users should use the safe public API on `Output` instead:
+/// - `Output::add_metadata()` for global metadata
+/// - `Output::add_stream_metadata()` for stream metadata
+/// - `Output::map_metadata_from_input()` for metadata mapping
+/// - `Output::disable_auto_copy_metadata()` for controlling auto-copy
+///
+/// # Example
+/// ```rust,ignore
+/// let output = Output::from("output.mp4")
+///     .add_metadata("title", "My Video")
+///     .add_metadata("author", "John Doe")
+///     .add_stream_metadata("v:0", "language", "eng")?;
+/// ```
+pub(crate) mod metadata;
+
 static INIT_FFMPEG: std::sync::Once = std::sync::Once::new();
 
 extern "C" fn cleanup() {
