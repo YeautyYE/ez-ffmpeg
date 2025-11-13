@@ -1,16 +1,78 @@
-use std::collections::HashMap;
 use crate::core::context::encoder_stream::EncoderStream;
-use crate::core::filter::frame_pipeline::FramePipeline;
 use crate::core::context::output::{StreamMap, VSyncMethod};
 use crate::core::context::{FrameBox, PacketBox};
+use crate::core::filter::frame_pipeline::FramePipeline;
+use crate::core::scheduler::input_controller::SchNode;
 use crate::error::OpenOutputError;
 use crossbeam_channel::{Receiver, Sender};
-use ffmpeg_sys_next::{avformat_new_stream, AVCodec, AVFormatContext, AVMediaType, AVRational, AVSampleFormat, AVStream, AVFMT_NOTIMESTAMPS, AVFMT_VARIABLE_FPS};
+use ffmpeg_sys_next::{
+    avformat_new_stream, AVCodec, AVFormatContext, AVMediaType, AVRational, AVSampleFormat,
+    AVStream, AVFMT_NOTIMESTAMPS, AVFMT_VARIABLE_FPS,
+};
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::ptr::null;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use crate::core::scheduler::input_controller::SchNode;
+
+/// Tracks which input stream produced each output stream.
+/// Mirrors FFmpeg's `OutputStream->ist` bookkeeping in
+/// `fftools/ffmpeg_mux_init.c`, enabling accurate metadata propagation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StreamSource {
+    pub(crate) input_file_index: usize,
+    pub(crate) input_stream_index: usize,
+    pub(crate) encoded: bool,
+}
+
+/// Registry for per-output stream source information (FFmpeg reference:
+/// `OutputStream->ist` and related logic in `ffmpeg_mux_init.c`).
+#[derive(Default, Clone)]
+pub(crate) struct StreamSourceRegistry {
+    entries: Vec<Option<StreamSource>>,
+}
+
+impl StreamSourceRegistry {
+    pub(crate) fn register(
+        &mut self,
+        output_idx: usize,
+        input_file_index: usize,
+        input_stream_index: usize,
+        encoded: bool,
+    ) {
+        if self.entries.len() <= output_idx {
+            self.entries.resize(output_idx + 1, None);
+        }
+        self.entries[output_idx] = Some(StreamSource {
+            input_file_index,
+            input_stream_index,
+            encoded,
+        });
+    }
+
+    pub(crate) fn stream_input_mapping(&self) -> Vec<(usize, (usize, usize))> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, entry)| {
+                entry
+                    .as_ref()
+                    .map(|source| (idx, (source.input_file_index, source.input_stream_index)))
+            })
+            .collect()
+    }
+
+    pub(crate) fn encoding_streams(&self) -> Vec<usize> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, entry)| match entry {
+                Some(source) if source.encoded => Some(idx),
+                _ => None,
+            })
+            .collect()
+    }
+}
 
 pub(crate) struct Muxer {
     pub(crate) url: String,
@@ -33,7 +95,6 @@ pub(crate) struct Muxer {
     pub(crate) audio_channels: Option<i32>,
     pub(crate) audio_sample_fmt: Option<AVSampleFormat>,
 
-
     pub(crate) video_qscale: Option<i32>,
     pub(crate) audio_qscale: Option<i32>,
 
@@ -47,6 +108,15 @@ pub(crate) struct Muxer {
     pub(crate) format_opts: Option<HashMap<CString, CString>>,
 
     pub(crate) copy_ts: bool,
+
+    // Metadata fields
+    pub(crate) global_metadata: Option<HashMap<String, String>>,
+    pub(crate) stream_metadata: Vec<(String, String, String)>, // (spec, key, value)
+    pub(crate) chapter_metadata: HashMap<usize, HashMap<String, String>>,
+    pub(crate) program_metadata: HashMap<usize, HashMap<String, String>>,
+    pub(crate) metadata_map: Vec<crate::core::metadata::MetadataMapping>,
+    pub(crate) auto_copy_metadata: bool,
+    pub(crate) stream_sources: StreamSourceRegistry,
 
     streams: Vec<EncoderStream>,
     queue: Option<(Sender<PacketBox>, Receiver<PacketBox>)>,
@@ -89,7 +159,13 @@ impl Muxer {
         audio_codec_opts: Option<HashMap<CString, CString>>,
         subtitle_codec_opts: Option<HashMap<CString, CString>>,
         format_opts: Option<HashMap<CString, CString>>,
-        copy_ts: bool
+        copy_ts: bool,
+        global_metadata: Option<HashMap<String, String>>,
+        stream_metadata: Vec<(String, String, String)>,
+        chapter_metadata: HashMap<usize, HashMap<String, String>>,
+        program_metadata: HashMap<usize, HashMap<String, String>>,
+        metadata_map: Vec<crate::core::metadata::MetadataMapping>,
+        auto_copy_metadata: bool,
     ) -> Self {
         Self {
             url,
@@ -126,7 +202,37 @@ impl Muxer {
             nb_streams_ready: Arc::new(Default::default()),
             is_set_write_callback,
             mux_stream_nodes: vec![],
+            global_metadata,
+            stream_metadata,
+            chapter_metadata,
+            program_metadata,
+            metadata_map,
+            auto_copy_metadata,
+            stream_sources: StreamSourceRegistry::default(),
         }
+    }
+
+    pub(crate) fn register_stream_source(
+        &mut self,
+        output_stream_index: usize,
+        input_file_index: usize,
+        input_stream_index: usize,
+        encoded: bool,
+    ) {
+        self.stream_sources.register(
+            output_stream_index,
+            input_file_index,
+            input_stream_index,
+            encoded,
+        );
+    }
+
+    pub(crate) fn stream_input_mapping(&self) -> Vec<(usize, (usize, usize))> {
+        self.stream_sources.stream_input_mapping()
+    }
+
+    pub(crate) fn encoding_streams(&self) -> Vec<usize> {
+        self.stream_sources.encoding_streams()
     }
 
     pub(crate) fn add_enc_stream(
@@ -140,7 +246,12 @@ impl Muxer {
 
         let vsync_method = if media_type == AVMediaType::AVMEDIA_TYPE_VIDEO {
             Some(unsafe {
-                determine_vsync_method(self.vsync_method, self.framerate, self.out_fmt_ctx, self.copy_ts)
+                determine_vsync_method(
+                    self.vsync_method,
+                    self.framerate,
+                    self.out_fmt_ctx,
+                    self.copy_ts,
+                )
             })
         } else {
             None
@@ -176,7 +287,7 @@ impl Muxer {
     pub(crate) fn new_stream(
         &mut self,
         src: Arc<SchNode>,
-    ) -> crate::error::Result<(Sender<PacketBox>,*mut AVStream, usize)> {
+    ) -> crate::error::Result<(Sender<PacketBox>, *mut AVStream, usize)> {
         let packet_sender = match &self.queue {
             None => {
                 let (packet_sender, packet_receiver) = crossbeam_channel::bounded(8);
@@ -187,11 +298,14 @@ impl Muxer {
         };
 
         let index = self.nb_streams;
-        self.mux_stream_nodes.insert(index, Arc::new(SchNode::MuxStream {
-            src,
-            last_dts: Arc::new(AtomicI64::new(0)),
-            source_finished: Arc::new(AtomicBool::new(false)),
-        }));
+        self.mux_stream_nodes.insert(
+            index,
+            Arc::new(SchNode::MuxStream {
+                src,
+                last_dts: Arc::new(AtomicI64::new(0)),
+                source_finished: Arc::new(AtomicBool::new(false)),
+            }),
+        );
 
         self.nb_streams += 1;
         unsafe {
@@ -241,6 +355,28 @@ impl Muxer {
 
     pub(crate) fn get_is_started(&self) -> Arc<AtomicBool> {
         self.is_started.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StreamSourceRegistry;
+
+    #[test]
+    fn test_stream_source_registry() {
+        let mut registry = StreamSourceRegistry::default();
+        registry.register(2, 0, 1, false);
+        registry.register(0, 1, 3, true);
+
+        assert_eq!(
+            registry.stream_input_mapping(),
+            vec![(0, (1, 3)), (2, (0, 1)),]
+        );
+
+        assert_eq!(registry.encoding_streams(), vec![0]);
+
+        registry.register(0, 1, 3, false);
+        assert!(registry.encoding_streams().is_empty());
     }
 }
 

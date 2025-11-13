@@ -872,29 +872,28 @@ mod tests {
             Box::new(move |offset: i64, whence: i32| -> i64 {
                 let mut file = output_file.lock().unwrap();
 
-                match whence {
-                    // ✅ Handle AVSEEK_SIZE: Return total file size
-                    ffmpeg_sys_next::AVSEEK_SIZE => {
-                        if let Ok(size) = file.metadata().map(|m| m.len() as i64) {
-                            println!("FFmpeg requested stream size: {}", size);
-                            return size;
-                        }
-                        return ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO) as i64;
+                if whence == ffmpeg_sys_next::AVSEEK_SIZE {
+                    if let Ok(size) = file.metadata().map(|m| m.len() as i64) {
+                        println!("FFmpeg requested stream size: {}", size);
+                        return size;
                     }
+                    return ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO) as i64;
+                }
 
-                    // ✅ Handle AVSEEK_FLAG_BYTE: Seek using byte offset
-                    ffmpeg_sys_next::AVSEEK_FLAG_BYTE => {
-                        println!(
-                            "FFmpeg requested byte-based seeking. Seeking to byte offset: {}",
-                            offset
-                        );
-                        if let Ok(new_pos) = file.seek(SeekFrom::Start(offset as u64)) {
-                            return new_pos as i64;
-                        }
-                        return ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO) as i64;
+                if (whence & ffmpeg_sys_next::AVSEEK_FLAG_BYTE) != 0 {
+                    println!(
+                        "FFmpeg requested byte-based seeking. Seeking to byte offset: {}",
+                        offset
+                    );
+                    if let Ok(new_pos) = file.seek(SeekFrom::Start(offset as u64)) {
+                        return new_pos as i64;
                     }
+                    return ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO) as i64;
+                }
 
-                    // ✅ Standard seek modes
+                let normalized_whence = whence & !ffmpeg_sys_next::AVSEEK_FORCE;
+
+                match normalized_whence {
                     ffmpeg_sys_next::SEEK_SET => file.seek(SeekFrom::Start(offset as u64)),
                     ffmpeg_sys_next::SEEK_CUR => file.seek(SeekFrom::Current(offset)),
                     ffmpeg_sys_next::SEEK_END => file.seek(SeekFrom::End(offset)),

@@ -203,6 +203,8 @@ mod tests {
         println!("----------------------");
 
         let decoders = get_decoders();
-        // println!("{:?}", decoders);
+        for decoder in decoders {
+            println!("{:?}", decoder);
+        }
     }
 }
