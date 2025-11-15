@@ -6,6 +6,7 @@ use crate::core::context::input::Input;
 use crate::core::context::input_filter::{InputFilter, IFILTER_FLAG_AUTOROTATE};
 use crate::core::context::muxer::Muxer;
 use crate::core::context::output::{Output, StreamMap};
+use crate::core::metadata::StreamSpecifier;
 use crate::core::context::output_filter::{
     OutputFilter, OFILTER_FLAG_AUDIO_24BIT, OFILTER_FLAG_AUTOSCALE, OFILTER_FLAG_DISABLE_CONVERT,
 };
@@ -22,7 +23,6 @@ use crate::error::Error::{
 use crate::error::FilterGraphParseError::{
     InvalidFileIndexInFg, InvalidFilterSpecifier, OutputUnconnected,
 };
-use crate::error::OpenOutputError::InvalidFileIndexInIntput;
 use crate::error::{
     AllocOutputContextError, FilterGraphParseError, FindStreamError, OpenInputError,
     OpenOutputError,
@@ -456,11 +456,194 @@ unsafe fn process_metadata(mux: &Muxer, demuxs: &Vec<Demuxer>) -> Result<()> {
     Ok(())
 }
 
+/// Check if linklabel refers to a filter graph output
+/// FFmpeg reference: ffmpeg_opt.c:493 - if (arg[0] == '[')
+fn is_filter_output_linklabel(linklabel: &str) -> bool {
+    linklabel.starts_with('[')
+}
+
+/// Parse and expand stream map specifications
+/// This mimics FFmpeg's opt_map() behavior: parse once, expand immediately
+/// FFmpeg reference: ffmpeg_opt.c:478-596
+unsafe fn expand_stream_maps(
+    mux: &mut Muxer,
+    demuxs: &[Demuxer],
+) -> Result<()> {
+    let stream_map_specs = std::mem::take(&mut mux.stream_map_specs);
+
+    for spec in stream_map_specs {
+        // FFmpeg reference: opt_map line 488-491 - check for negative map
+        let (linklabel, is_negative) = if spec.linklabel.starts_with('-') {
+            (&spec.linklabel[1..], true)
+        } else {
+            (spec.linklabel.as_str(), false)
+        };
+
+        // FFmpeg reference: opt_map line 493 - check if this mapping refers to lavfi output
+        if is_filter_output_linklabel(linklabel) {
+            // FFmpeg reference: opt_map line 494-507 - extract linklabel from brackets
+            let pure_linklabel = if linklabel.starts_with('[') {
+                // Extract content between '[' and ']'
+                if let Some(end_pos) = linklabel.find(']') {
+                    &linklabel[1..end_pos]
+                } else {
+                    warn!("Invalid output link label: {}.", linklabel);
+                    return Err(Error::OpenOutput(OpenOutputError::InvalidArgument));
+                }
+            } else {
+                linklabel
+            };
+
+            // FFmpeg reference: opt_map line 504 - validate non-empty
+            if pure_linklabel.is_empty() {
+                warn!("Invalid output link label: {}.", linklabel);
+                return Err(Error::OpenOutput(OpenOutputError::InvalidArgument));
+            }
+
+            // Store pure linklabel (without brackets) for later matching in map_manual()
+            mux.stream_maps.push(StreamMap {
+                file_index: 0,  // Not used for filter outputs
+                stream_index: 0,  // Not used for filter outputs
+                linklabel: Some(pure_linklabel.to_string()),
+                copy: spec.copy,
+                disabled: false,
+            });
+            continue;
+        }
+
+        // FFmpeg reference: opt_map line 512 - parse file index using strtol
+        // Try to parse as file stream; if it fails, treat as filter output
+        let parse_result = strtol(linklabel);
+        if parse_result.is_err() {
+            // Failed to parse file index - treat as filter output linklabel
+            // This allows bare filter output names like "my-out" (without brackets)
+            mux.stream_maps.push(StreamMap {
+                file_index: 0,
+                stream_index: 0,
+                linklabel: Some(linklabel.to_string()),
+                copy: spec.copy,
+                disabled: false,
+            });
+            continue;
+        }
+
+        let (file_idx, remainder) = parse_result.unwrap();
+
+        // FFmpeg reference: opt_map line 513-517 - validate file index
+        if file_idx < 0 || file_idx as usize >= demuxs.len() {
+            warn!("Invalid input file index: {}.", file_idx);
+            return Err(Error::OpenOutput(OpenOutputError::InvalidArgument));
+        }
+        let file_idx = file_idx as usize;
+
+        // FFmpeg reference: opt_map line 520 - parse stream specifier
+        // FFmpeg reference: opt_map line 533 - handle '?' suffix for allow_unused
+        let (spec_str, allow_unused) = if remainder.ends_with('?') {
+            (&remainder[..remainder.len()-1], true)
+        } else {
+            (remainder, false)
+        };
+
+        let stream_spec = if spec_str.is_empty() {
+            // Empty specifier matches all streams (FFmpeg behavior)
+            StreamSpecifier::default()
+        } else {
+            // Strip leading ':' and parse stream specifier
+            let spec_str = if spec_str.starts_with(':') {
+                &spec_str[1..]
+            } else {
+                spec_str
+            };
+
+            StreamSpecifier::parse(spec_str).map_err(|e| {
+                warn!("Invalid stream specifier in '{}': {}", linklabel, e);
+                Error::OpenOutput(OpenOutputError::InvalidArgument)
+            })?
+        };
+
+        // FFmpeg reference: opt_map line 543-553 - negative map: disable matching streams
+        if is_negative {
+            for existing_map in &mut mux.stream_maps {
+                // Only process file-based maps (not filter outputs)
+                if existing_map.linklabel.is_none() &&
+                   existing_map.file_index == file_idx {
+                    // Check if stream specifier matches
+                    let demux = &demuxs[file_idx];
+                    let fmt_ctx = demux.in_fmt_ctx;
+                    let avstream = *(*fmt_ctx).streams.add(existing_map.stream_index);
+
+                    if stream_spec.matches(fmt_ctx, avstream) {
+                        existing_map.disabled = true;
+                    }
+                }
+            }
+            // Negative map doesn't add new entries, just disables existing ones
+            continue;
+        }
+
+        // FFmpeg reference: opt_map line 555-574 - expand to one StreamMap per matched stream
+        let demux = &demuxs[file_idx];
+        let fmt_ctx = demux.in_fmt_ctx;
+        let mut matched_count = 0;
+
+        for (stream_idx, _) in demux.get_streams().iter().enumerate() {
+            let avstream = *(*fmt_ctx).streams.add(stream_idx);
+
+            // FFmpeg reference: opt_map line 556 - stream_specifier_match
+            if stream_spec.matches(fmt_ctx, avstream) {
+                mux.stream_maps.push(StreamMap {
+                    file_index: file_idx,
+                    stream_index: stream_idx,
+                    linklabel: None,
+                    copy: spec.copy,
+                    disabled: false,
+                });
+                matched_count += 1;
+            }
+        }
+
+        // FFmpeg reference: opt_map lines 577-590 - error handling for no matches
+        if matched_count == 0 {
+            if allow_unused {
+                // FFmpeg line 579: verbose log for optional mappings
+                info!(
+                    "Stream map '{}' matches no streams; ignoring.",
+                    linklabel
+                );
+            } else {
+                // FFmpeg line 586-587: fatal error with hint about '?' suffix
+                warn!(
+                    "Stream map '{}' matches no streams.\n\
+                     To ignore this, add a trailing '?' to the map.",
+                    linklabel
+                );
+                return Err(Error::OpenOutput(
+                    OpenOutputError::MatchesNoStreams(linklabel.to_string())
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn outputs_bind(
     muxs: &mut Vec<Muxer>,
     filter_graphs: &mut Vec<FilterGraph>,
     demuxs: &mut Vec<Demuxer>,
 ) -> Result<()> {
+    // FFmpeg reference: ffmpeg.c calls opt_map during command-line parsing
+    // We parse and expand stream maps early, before processing individual streams
+    // This must happen AFTER demuxers are opened (need stream info for matching)
+    // but BEFORE map_manual() is called (which uses the expanded StreamMap entries)
+    unsafe {
+        for mux in muxs.iter_mut() {
+            if !mux.stream_map_specs.is_empty() {
+                expand_stream_maps(mux, demuxs)?;
+            }
+        }
+    }
+
     for (i, mux) in muxs.iter_mut().enumerate() {
         if mux.stream_maps.is_empty() {
             let mut auto_disable = 0;
@@ -491,74 +674,80 @@ fn map_manual(
     filter_graphs: &mut Vec<FilterGraph>,
     demuxs: &mut Vec<Demuxer>,
 ) -> Result<()> {
-    for filter_graph in filter_graphs.iter_mut() {
-        for i in 0..filter_graph.outputs.len() {
-            let option = {
-                let output_filter = &filter_graph.outputs[i];
-                if output_filter.has_dst()
-                    || output_filter.linklabel.is_empty()
-                    || output_filter.linklabel != stream_map.linklabel
-                {
-                    continue;
-                }
+    // FFmpeg reference: ffmpeg_mux_init.c:1720-1721 - check disabled flag
+    if stream_map.disabled {
+        return Ok(());
+    }
 
-                choose_encoder(mux, output_filter.media_type)?
-            };
+    // FFmpeg reference: ffmpeg_mux_init.c:1723 - check for filter output
+    if let Some(linklabel) = &stream_map.linklabel {
+        // This is a filter graph output - match by linklabel
+        for filter_graph in filter_graphs.iter_mut() {
+            for i in 0..filter_graph.outputs.len() {
+                let option = {
+                    let output_filter = &filter_graph.outputs[i];
+                    if output_filter.has_dst()
+                        || output_filter.linklabel.is_empty()
+                        || &output_filter.linklabel != linklabel
+                    {
+                        continue;
+                    }
 
-            match option {
-                None => {
-                    warn!(
-                        "An unexpected media_type {:?} appears in output_filter",
-                        filter_graph.outputs[i].media_type
-                    );
-                }
-                Some((codec_id, enc)) => {
-                    return ofilter_bind_ost(index, mux, filter_graph, i, codec_id, enc, None)
-                        .map(|_| ());
+                    choose_encoder(mux, output_filter.media_type)?
+                };
+
+                match option {
+                    None => {
+                        warn!(
+                            "An unexpected media_type {:?} appears in output_filter",
+                            filter_graph.outputs[i].media_type
+                        );
+                    }
+                    Some((codec_id, enc)) => {
+                        return ofilter_bind_ost(index, mux, filter_graph, i, codec_id, enc, None)
+                            .map(|_| ());
+                    }
                 }
             }
         }
-    }
 
-    let result = output_find_input_idx_by_linklabel(&stream_map.linklabel, demuxs, &mux.url);
-    if let Err(e) = result {
-        return match e {
-            ParseInteger => {
-                warn!("Output stream map '{}' matches no streams; Start with a number to match the input. Such as [0:v]", stream_map.linklabel);
-                Err(OpenOutputError::InvalidArgument.into())
-            }
-            Error::OpenOutput(OpenOutputError::MatchesNoStreams(stream_map)) => {
-                warn!("Output stream map '{stream_map}' matches no streams; To ignore this, add a trailing '?' to the map..");
-                Err(OpenOutputError::MatchesNoStreams(stream_map).into())
-            }
-            e => Err(e),
-        };
-    }
-
-    let option = result.unwrap();
-    if let None = option {
-        info!(
-            "Output stream map '{}' matches no streams; ignoring.",
-            stream_map.linklabel
+        // FFmpeg reference: ffmpeg_mux_init.c:1740-1742 - filter output not found error
+        warn!(
+            "Output with label '{}' does not exist in any defined filter graph, \
+             or was already used elsewhere.",
+            linklabel
         );
-        return Ok(());
+        return Err(OpenOutputError::InvalidArgument.into());
     }
-    let (demux_idx, stream_index, media_type) = option.unwrap();
+
+    // This is an input file stream - use pre-parsed file_index and stream_index
+    // These were already validated and expanded in expand_stream_maps()
+    let demux_idx = stream_map.file_index;
+    let stream_index = stream_map.stream_index;
 
     let demux = &mut demuxs[demux_idx];
 
+    // Get immutable data first to avoid borrow checker issues
+    let demux_node = demux.node.clone();
+    let (media_type, input_stream_duration, input_stream_time_base) = {
+        let input_stream = demux.get_stream_mut(stream_index);
+        (input_stream.codec_type, input_stream.duration, input_stream.time_base)
+    };
+
     info!(
-        "Binding output with label '{}' to input stream {stream_index}:{demux_idx}",
-        stream_map.linklabel
+        "Binding output stream to input {}:{} ({})",
+        demux_idx, stream_index,
+        match media_type {
+            AVMEDIA_TYPE_VIDEO => "video",
+            AVMEDIA_TYPE_AUDIO => "audio",
+            AVMEDIA_TYPE_SUBTITLE => "subtitle",
+            AVMEDIA_TYPE_DATA => "data",
+            AVMEDIA_TYPE_ATTACHMENT => "attachment",
+            _ => "unknown",
+        }
     );
 
-    let demux_node = demux.node.clone();
-    let input_stream = demux.get_stream_mut(stream_index);
-
     let option = choose_encoder(mux, media_type)?;
-
-    let input_stream_duration = input_stream.duration;
-    let input_stream_time_base = input_stream.time_base;
 
     match option {
         None => {
@@ -617,6 +806,7 @@ fn map_manual(
                 } else {
                     let (frame_sender, output_stream_index) =
                         mux.add_enc_stream(media_type, enc, demux_node)?;
+                    let input_stream = demux.get_stream_mut(stream_index);
                     input_stream.add_dst(frame_sender);
                     demux.connect_stream(stream_index);
                     mux.register_stream_source(output_stream_index, demux_idx, stream_index, true);
@@ -957,51 +1147,6 @@ fn configure_output_filter_opts(
         }
     };
     Ok(())
-}
-
-fn output_find_input_idx_by_linklabel(
-    linklabel: &str,
-    demuxs: &mut Vec<Demuxer>,
-    desc: &str,
-) -> Result<Option<(usize, usize, AVMediaType)>> {
-    let new_linklabel = if linklabel.starts_with("[") && linklabel.ends_with("]") {
-        if linklabel.len() <= 2 {
-            warn!("Output linklabel is empty");
-            return Err(OpenOutputError::InvalidArgument.into());
-        } else {
-            &linklabel[1..linklabel.len() - 1]
-        }
-    } else {
-        linklabel
-    };
-
-    let (file_idx, remainder) = strtol(new_linklabel)?;
-    if file_idx < 0 || file_idx as usize >= demuxs.len() {
-        return Err(InvalidFileIndexInIntput(file_idx as usize, desc.to_string()).into());
-    }
-
-    let (media_type, allow_unused) = stream_specifier_parse(remainder)?;
-
-    let demux = &demuxs[file_idx as usize];
-
-    let mut stream_idx = -1i32;
-
-    for (idx, dec_stream) in demux.get_streams().iter().enumerate() {
-        if (*dec_stream).codec_type == media_type {
-            stream_idx = idx as i32;
-            break;
-        }
-    }
-
-    if stream_idx < 0 {
-        if allow_unused {
-            return Ok(None);
-        }
-
-        warn!("Stream specifier '{remainder}' in output {desc} matches no streams.");
-        return Err(OpenOutputError::MatchesNoStreams(linklabel.to_string()).into());
-    }
-    Ok(Some((file_idx as usize, stream_idx as usize, media_type)))
 }
 
 fn map_auto_streams(
@@ -1795,6 +1940,7 @@ unsafe fn open_output_file(index: usize, output: &mut Output, copy_ts: bool) -> 
         output.url.is_none(),
         out_fmt_ctx,
         output.frame_pipelines.take(),
+        output.stream_map_specs.clone(),
         output.stream_maps.clone(),
         output.video_codec.clone(),
         output.audio_codec.clone(),
@@ -2246,12 +2392,16 @@ fn ifilter_bind_ist(
     }
 }
 
+/// Find input stream index by filter graph linklabel
+/// FFmpeg reference: ffmpeg_filter.c - fg_create logic for parsing filter input specifiers
+/// Uses StreamSpecifier for complete stream specifier parsing
 fn fg_find_input_idx_by_linklabel(
     linklabel: &str,
     filter_media_type: AVMediaType,
     demuxs: &mut Vec<Demuxer>,
     desc: &str,
 ) -> Result<(usize, usize)> {
+    // Remove brackets if present
     let new_linklabel = if linklabel.starts_with("[") && linklabel.ends_with("]") {
         if linklabel.len() <= 2 {
             warn!("Filter linklabel is empty");
@@ -2263,62 +2413,68 @@ fn fg_find_input_idx_by_linklabel(
         linklabel
     };
 
-    let (file_idx, remainder) = strtol(new_linklabel)?;
+    // Parse file index using strtol (FFmpeg reference: ffmpeg_opt.c:512)
+    let (file_idx, remainder) = strtol(new_linklabel).map_err(|_| {
+        FilterGraphParseError::InvalidArgument
+    })?;
+
     if file_idx < 0 || file_idx as usize >= demuxs.len() {
         return Err(InvalidFileIndexInFg(file_idx as usize, desc.to_string()).into());
     }
+    let file_idx = file_idx as usize;
 
-    let (media_type, _allow_unused) = stream_specifier_parse(remainder)?;
+    // Parse stream specifier using StreamSpecifier
+    let spec_str = if remainder.is_empty() {
+        // No specifier - will match by media type
+        ""
+    } else if remainder.starts_with(':') {
+        &remainder[1..]
+    } else {
+        remainder
+    };
 
-    if media_type != filter_media_type {
-        warn!("Invalid stream label: {linklabel}");
-        return Err(FilterGraphParseError::InvalidArgument.into());
-    }
+    let stream_spec = if spec_str.is_empty() {
+        // No specifier: create one matching the filter's media type
+        let mut spec = StreamSpecifier::default();
+        spec.media_type = Some(filter_media_type);
+        spec
+    } else {
+        // Parse the specifier
+        StreamSpecifier::parse(spec_str).map_err(|e| {
+            warn!("Invalid stream specifier in filter linklabel '{}': {}", linklabel, e);
+            FilterGraphParseError::InvalidArgument
+        })?
+    };
 
-    let demux = &demuxs[file_idx as usize];
+    // Find first matching stream
+    let demux = &demuxs[file_idx];
+    unsafe {
+        let fmt_ctx = demux.in_fmt_ctx;
 
-    let mut stream_idx = -1i32;
+        for (idx, _) in demux.get_streams().iter().enumerate() {
+            let avstream = *(*fmt_ctx).streams.add(idx);
 
-    for (idx, dec_stream) in demux.get_streams().iter().enumerate() {
-        if (*dec_stream).codec_type == media_type {
-            stream_idx = idx as i32;
-            break;
+            if stream_spec.matches(fmt_ctx, avstream) {
+                // Additional check: must match filter's media type
+                let codec_type = (*avstream).codecpar.as_ref().unwrap().codec_type;
+                if codec_type == filter_media_type {
+                    return Ok((file_idx, idx));
+                }
+            }
         }
     }
 
-    if stream_idx < 0 {
-        warn!(
-            "Stream specifier '{remainder}' in filtergraph description {desc} matches no streams."
-        );
-        return Err(FilterGraphParseError::InvalidArgument.into());
-    }
-    Ok((file_idx as usize, stream_idx as usize))
-}
-
-fn stream_specifier_parse(specifier: &str) -> Result<(AVMediaType, bool)> {
-    let specifier = if specifier.starts_with(':') {
-        &specifier[1..]
-    } else {
-        specifier
-    };
-
-    match specifier {
-        "v" => Ok((AVMEDIA_TYPE_VIDEO, false)),
-        "a" => Ok((AVMEDIA_TYPE_AUDIO, false)),
-        "s" => Ok((AVMEDIA_TYPE_SUBTITLE, false)),
-        "d" => Ok((AVMEDIA_TYPE_DATA, false)),
-        "t" => Ok((AVMEDIA_TYPE_ATTACHMENT, false)),
-        "v?" => Ok((AVMEDIA_TYPE_VIDEO, true)),
-        "a?" => Ok((AVMEDIA_TYPE_AUDIO, true)),
-        "s?" => Ok((AVMEDIA_TYPE_SUBTITLE, true)),
-        "d?" => Ok((AVMEDIA_TYPE_DATA, true)),
-        "t?" => Ok((AVMEDIA_TYPE_ATTACHMENT, true)),
-        // "V" => Ok(AVMEDIA_TYPE_VIDEO),
-        _ => Err(InvalidFilterSpecifier(specifier.to_string()).into()),
-    }
+    // No matching stream found
+    warn!(
+        "Stream specifier '{}' in filtergraph description {} matches no streams.",
+        remainder, desc
+    );
+    Err(FilterGraphParseError::InvalidArgument.into())
 }
 
 /// Similar to strtol() in C
+/// FFmpeg reference: ffmpeg_opt.c:512 - strtol(arg, &endptr, 0)
+/// Used for parsing file indices and other integers in stream specifiers
 fn strtol(input: &str) -> Result<(i64, &str)> {
     let mut chars = input.chars().peekable();
     let mut negative = false;

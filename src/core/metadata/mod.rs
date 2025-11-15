@@ -15,4 +15,4 @@ pub mod stream_specifier;
 pub use default_behavior::{copy_chapters_from_input, copy_metadata_default};
 pub use metadata_type::{MetadataMapping, MetadataType};
 pub use operations::{copy_metadata, of_add_metadata};
-pub use stream_specifier::{StreamListType, StreamSpecifier};
+pub use stream_specifier::StreamSpecifier;

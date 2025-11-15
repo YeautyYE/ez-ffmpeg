@@ -82,6 +82,7 @@ pub(crate) struct Muxer {
     pub(crate) oformat_flags: i32,
     pub(crate) frame_pipelines: Option<Vec<FramePipeline>>,
 
+    pub(crate) stream_map_specs: Vec<crate::core::context::output::StreamMapSpec>,
     pub(crate) stream_maps: Vec<StreamMap>,
     pub(crate) video_codec: Option<String>,
     pub(crate) audio_codec: Option<String>,
@@ -138,6 +139,7 @@ impl Muxer {
         is_set_write_callback: bool,
         out_fmt_ctx: *mut AVFormatContext,
         frame_pipelines: Option<Vec<FramePipeline>>,
+        stream_map_specs: Vec<crate::core::context::output::StreamMapSpec>,
         stream_maps: Vec<StreamMap>,
         video_codec: Option<String>,
         audio_codec: Option<String>,
@@ -172,6 +174,7 @@ impl Muxer {
             frame_pipelines,
             out_fmt_ctx,
             oformat_flags: unsafe { (*(*out_fmt_ctx).oformat).flags },
+            stream_map_specs,
             stream_maps,
             video_codec,
             audio_codec,
