@@ -136,7 +136,7 @@ pub struct MetadataMapping {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::metadata::StreamListType;
+    use crate::core::metadata::stream_specifier::StreamListType;
     use ffmpeg_sys_next::AVMediaType;
 
     #[test]

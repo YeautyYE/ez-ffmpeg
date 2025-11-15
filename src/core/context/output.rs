@@ -155,6 +155,12 @@ pub struct Output {
     /// are sent to the encoder as they are.
     pub(crate) frame_pipelines: Option<Vec<FramePipeline>>,
 
+    /// Unparsed stream map specifications (user input stage)
+    /// These get parsed and expanded into stream_maps during outputs_bind()
+    pub(crate) stream_map_specs: Vec<StreamMapSpec>,
+
+    /// Expanded stream maps (FFmpeg-compatible, ready for use)
+    /// Each entry maps exactly one input stream to one output stream
     pub(crate) stream_maps: Vec<StreamMap>,
 
     /// The output format for the container.
@@ -640,7 +646,7 @@ impl Output {
     ///     .add_stream_map("0:v");
     /// ```
     pub fn add_stream_map(mut self, linklabel: impl Into<String>) -> Self {
-        self.stream_maps.push(linklabel.into().into());
+        self.stream_map_specs.push(linklabel.into().into());
         self
     }
 
@@ -676,7 +682,7 @@ impl Output {
     ///     .add_stream_map_with_copy("0:a?");
     /// ```
     pub fn add_stream_map_with_copy(mut self, linklabel: impl Into<String>) -> Self {
-        self.stream_maps.push(StreamMap {
+        self.stream_map_specs.push(StreamMapSpec {
             linklabel: linklabel.into(),
             copy: true,
         });
@@ -1550,6 +1556,7 @@ impl From<Box<dyn FnMut(&[u8]) -> i32>> for Output {
             write_callback: Some(write_callback_and_format),
             seek_callback: None,
             frame_pipelines: None,
+            stream_map_specs: vec![],
             stream_maps: vec![],
             format: None,
             video_codec: None,
@@ -1591,6 +1598,7 @@ impl From<String> for Output {
             write_callback: None,
             seek_callback: None,
             frame_pipelines: None,
+            stream_map_specs: vec![],
             stream_maps: vec![],
             format: None,
             video_codec: None,
@@ -1631,17 +1639,38 @@ impl From<&str> for Output {
     }
 }
 
+/// Temporary storage for unparsed stream map specifications (user input stage)
+/// Equivalent to FFmpeg's command-line parsing before opt_map() expansion
 #[derive(Debug, Clone)]
-pub(crate) struct StreamMap {
+pub(crate) struct StreamMapSpec {
+    /// Stream specifier string: "0:v", "1:a:0", "0:v?", "[label]", etc.
     pub(crate) linklabel: String,
+    /// Stream copy flag (-c copy)
     pub(crate) copy: bool,
 }
 
-impl<T: Into<String>> From<T> for StreamMap {
+impl<T: Into<String>> From<T> for StreamMapSpec {
     fn from(linklabel: T) -> Self {
         Self {
             linklabel: linklabel.into(),
             copy: false,
         }
     }
+}
+
+/// Final expanded stream map (matches FFmpeg's StreamMap structure)
+/// Created after parsing and expansion in outputs_bind()
+/// FFmpeg reference: fftools/ffmpeg.h:134-141
+#[derive(Debug, Clone)]
+pub(crate) struct StreamMap {
+    /// 1 if this mapping is disabled by a negative map (-map -0:v)
+    pub(crate) disabled: bool,
+    /// Input file index
+    pub(crate) file_index: usize,
+    /// Input stream index within the file
+    pub(crate) stream_index: usize,
+    /// Name of an output link, for mapping lavfi outputs (e.g., "[v]", "myout")
+    pub(crate) linklabel: Option<String>,
+    /// Stream copy flag (-c copy)
+    pub(crate) copy: bool,
 }
