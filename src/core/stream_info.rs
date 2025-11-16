@@ -9,8 +9,8 @@ use ffmpeg_sys_next::AVMediaType::{
     AVMEDIA_TYPE_UNKNOWN, AVMEDIA_TYPE_VIDEO,
 };
 use ffmpeg_sys_next::{
-    av_dict_get, av_find_best_stream, avcodec_get_name, avformat_find_stream_info, AVCodecID,
-    AVDictionary, AVDictionaryEntry, AVRational, AV_DICT_IGNORE_SUFFIX,
+    av_dict_get, av_dict_iterate, av_find_best_stream, avcodec_get_name, avformat_find_stream_info,
+    AVCodecID, AVDictionary, AVDictionaryEntry, AVRational,
 };
 use ffmpeg_sys_next::{avformat_alloc_context, avformat_close_input, avformat_open_input};
 use crate::core::context::AVFormatContextBox;
@@ -812,9 +812,9 @@ fn dict_to_hashmap(dict: *mut AVDictionary) -> HashMap<String, String> {
     }
     let mut map = HashMap::new();
     unsafe {
-        let mut e: *mut AVDictionaryEntry = null_mut();
+        let mut e: *const AVDictionaryEntry = null_mut();
         while {
-            e = av_dict_get(dict, null(), e, AV_DICT_IGNORE_SUFFIX);
+            e = av_dict_iterate(dict, e);
             !e.is_null()
         } {
             let k = CStr::from_ptr((*e).key).to_string_lossy().into_owned();
