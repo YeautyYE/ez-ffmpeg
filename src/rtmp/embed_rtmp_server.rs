@@ -1,5 +1,7 @@
 use crate::core::context::output::Output;
+use crate::core::scheduler::type_to_symbol;
 use crate::error::Error::{RtmpCreateStream, RtmpStreamAlreadyExists};
+use crate::error::OpenDecoderOperationError;
 use crate::flv::flv_buffer::FlvBuffer;
 use crate::flv::flv_tag::FlvTag;
 use crate::rtmp::rtmp_connection::{ConnectionError, ReadResult, RtmpConnection};
@@ -17,8 +19,6 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use crate::core::scheduler::type_to_symbol;
-use crate::error::OpenDecoderOperationError;
 
 #[derive(Clone)]
 pub struct Initialization;
@@ -33,7 +33,8 @@ pub struct EmbedRtmpServer<S> {
     status: Arc<AtomicUsize>,
     stream_keys: dashmap::DashSet<String>,
     // stream_key bytes_receiver
-    publisher_sender: Option<crossbeam_channel::Sender<(String, crossbeam_channel::Receiver<Vec<u8>>)>>,
+    publisher_sender:
+        Option<crossbeam_channel::Sender<(String, crossbeam_channel::Receiver<Vec<u8>>)>>,
     gop_limit: usize,
     state: PhantomData<S>,
 }
@@ -104,7 +105,10 @@ impl EmbedRtmpServer<Initialization> {
     ///
     /// An [`EmbedRtmpServer`] instance configured to listen on the given address and
     /// using the specified GOP limit.
-    pub fn new_with_gop_limit(address: impl Into<String>, gop_limit: usize) -> EmbedRtmpServer<Initialization> {
+    pub fn new_with_gop_limit(
+        address: impl Into<String>,
+        gop_limit: usize,
+    ) -> EmbedRtmpServer<Initialization> {
         Self {
             address: address.into(),
             status: Arc::new(AtomicUsize::new(STATUS_INIT)),
@@ -140,7 +144,15 @@ impl EmbedRtmpServer<Initialization> {
         let status = self.status.clone();
         let result = std::thread::Builder::new()
             .name("rtmp-server-worker".to_string())
-            .spawn(move || handle_connections(stream_receiver, publisher_receiver, stream_keys, self.gop_limit, status));
+            .spawn(move || {
+                handle_connections(
+                    stream_receiver,
+                    publisher_receiver,
+                    stream_keys,
+                    self.gop_limit,
+                    status,
+                )
+            });
         if let Err(e) = result {
             error!("Thread[rtmp-server-worker] exited with error: {e}");
             return Err(crate::error::Error::RtmpThreadExited);
@@ -155,30 +167,30 @@ impl EmbedRtmpServer<Initialization> {
         let result = std::thread::Builder::new()
             .name("rtmp-server-io".to_string())
             .spawn(move || {
-            for stream in listener.incoming() {
-                match stream {
-                    Ok(stream) => {
-                        debug!("New rtmp connection.");
-                        if let Err(_) = stream_sender.send(stream) {
-                            error!("Error sending stream to rtmp connection handler");
-                            status.store(STATUS_END, Ordering::Release);
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        if e.kind() == std::io::ErrorKind::WouldBlock {
-                            if status.load(Ordering::Acquire) == STATUS_END {
-                                info!("Embed rtmp server stopped.");
-                                break;
+                for stream in listener.incoming() {
+                    match stream {
+                        Ok(stream) => {
+                            debug!("New rtmp connection.");
+                            if let Err(_) = stream_sender.send(stream) {
+                                error!("Error sending stream to rtmp connection handler");
+                                status.store(STATUS_END, Ordering::Release);
+                                return;
                             }
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                        } else {
-                            debug!("Rtmp connection error: {:?}", e);
+                        }
+                        Err(e) => {
+                            if e.kind() == std::io::ErrorKind::WouldBlock {
+                                if status.load(Ordering::Acquire) == STATUS_END {
+                                    info!("Embed rtmp server stopped.");
+                                    break;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                            } else {
+                                debug!("Rtmp connection error: {:?}", e);
+                            }
                         }
                     }
                 }
-            }
-        });
+            });
         if let Err(e) = result {
             error!("Thread[rtmp-server-io] exited with error: {e}");
             return Err(crate::error::Error::RtmpThreadExited);
@@ -549,15 +561,16 @@ fn handle_connections(
                         ReadResult::NoBytesReceived => break,
                         ReadResult::HandshakingInProgress => break,
                         ReadResult::BytesReceived { buffer, byte_count } => {
-                            let server_results =
-                                match scheduler.bytes_received(connection_id, &buffer[..byte_count]) {
-                                    Ok(results) => results,
-                                    Err(error) => {
-                                        debug!("Rtmp input caused the following server error: {error}");
-                                        ids_to_clear.push(connection_id);
-                                        break;
-                                    }
-                                };
+                            let server_results = match scheduler
+                                .bytes_received(connection_id, &buffer[..byte_count])
+                            {
+                                Ok(results) => results,
+                                Err(error) => {
+                                    debug!("Rtmp input caused the following server error: {error}");
+                                    ids_to_clear.push(connection_id);
+                                    break;
+                                }
+                            };
 
                             for result in server_results.into_iter() {
                                 match result {
@@ -669,20 +682,9 @@ mod tests {
         let start = current();
 
         let result = FfmpegContext::builder()
-            .input(Input::from("test.mp4")
-                .set_readrate(1.0)
-                .set_stream_loop(3)
-            )
-            .input(
-                Input::from("test.mp4")
-                    .set_readrate(1.0)
-                    .set_stream_loop(3)
-            )
-            .input(
-                Input::from("test.mp4")
-                    .set_readrate(1.0)
-                    .set_stream_loop(3)
-            )
+            .input(Input::from("test.mp4").set_readrate(1.0).set_stream_loop(3))
+            .input(Input::from("test.mp4").set_readrate(1.0).set_stream_loop(3))
+            .input(Input::from("test.mp4").set_readrate(1.0).set_stream_loop(3))
             .filter_desc("[0:v][0:a][1:v][1:a][2:v][2:a]concat=n=3:v=1:a=1")
             .output(output)
             .build()
@@ -712,7 +714,11 @@ mod tests {
         let start = current();
 
         let result = FfmpegContext::builder()
-            .input(Input::from("test.mp4").set_readrate(1.0).set_stream_loop(-1))
+            .input(
+                Input::from("test.mp4")
+                    .set_readrate(1.0)
+                    .set_stream_loop(-1),
+            )
             // .filter_desc("hue=s=0")
             .output(output.set_video_codec("h264_videotoolbox"))
             .build()
@@ -745,14 +751,8 @@ mod tests {
         let result = FfmpegContext::builder()
             .independent_readrate()
             .input(Input::from("test.mp4").set_readrate(1.0))
-            .input(
-                Input::from("test.mp4")
-                    .set_readrate(1.0)
-            )
-            .input(
-                Input::from("test.mp4")
-                    .set_readrate(1.0)
-            )
+            .input(Input::from("test.mp4").set_readrate(1.0))
+            .input(Input::from("test.mp4").set_readrate(1.0))
             .filter_desc("[0:v][0:a][1:v][1:a][2:v][2:a]concat=n=3:v=1:a=1")
             .output(output)
             .build()

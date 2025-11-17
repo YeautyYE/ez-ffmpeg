@@ -14,6 +14,7 @@ use crate::hwaccel::{
     hw_device_get_by_name, hw_device_get_by_type, hw_device_init_from_type,
     hw_device_match_by_codec, HWAccelID,
 };
+use crate::util::ffmpeg_utils::av_err2str;
 use crate::util::ffmpeg_utils::av_rescale_q_rnd;
 use crossbeam_channel::{RecvTimeoutError, Sender};
 use ffmpeg_next::packet::{Mut, Ref};
@@ -22,16 +23,27 @@ use ffmpeg_sys_next::AVHWDeviceType::AV_HWDEVICE_TYPE_QSV;
 use ffmpeg_sys_next::AVMediaType::{AVMEDIA_TYPE_AUDIO, AVMEDIA_TYPE_SUBTITLE, AVMEDIA_TYPE_VIDEO};
 use ffmpeg_sys_next::AVRounding::AV_ROUND_UP;
 use ffmpeg_sys_next::AVSubtitleType::SUBTITLE_BITMAP;
+use ffmpeg_sys_next::{
+    av_buffer_create, av_buffer_ref, av_calloc, av_dict_set, av_frame_apply_cropping,
+    av_frame_copy_props, av_frame_move_ref, av_frame_ref, av_frame_unref, av_free, av_freep,
+    av_gcd, av_hwdevice_get_type_name, av_hwframe_transfer_data, av_inv_q, av_mallocz, av_memdup,
+    av_mul_q, av_opt_set_dict2, av_pix_fmt_desc_get, av_rescale_delta, av_rescale_q, av_strdup,
+    avcodec_alloc_context3, avcodec_decode_subtitle2, avcodec_default_get_buffer2,
+    avcodec_flush_buffers, avcodec_free_context, avcodec_get_hw_config, avcodec_open2,
+    avcodec_parameters_to_context, avcodec_receive_frame, avcodec_send_packet, avsubtitle_free,
+    AVCodec, AVCodecContext, AVDictionary, AVFrame, AVHWDeviceType, AVMediaType, AVPixelFormat,
+    AVRational, AVSubtitle, AVSubtitleRect, AVERROR, AVERROR_EOF, AVPALETTE_SIZE,
+    AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX, AV_FRAME_CROP_UNALIGNED, AV_FRAME_FLAG_CORRUPT,
+    AV_NOPTS_VALUE, AV_PIX_FMT_FLAG_HWACCEL, AV_TIME_BASE_Q, EAGAIN, EINVAL, ENOMEM,
+};
 #[cfg(not(feature = "docs-rs"))]
 use ffmpeg_sys_next::{av_channel_layout_copy, AV_CODEC_FLAG_COPY_OPAQUE};
-use ffmpeg_sys_next::{av_buffer_create, av_buffer_ref, av_calloc, av_dict_set, av_frame_apply_cropping, av_frame_copy_props, av_frame_move_ref, av_frame_ref, av_frame_unref, av_free, av_freep, av_gcd, av_hwdevice_get_type_name, av_hwframe_transfer_data, av_inv_q, av_mallocz, av_memdup, av_mul_q, av_opt_set_dict2, av_pix_fmt_desc_get, av_rescale_delta, av_rescale_q, av_strdup, avcodec_alloc_context3, avcodec_decode_subtitle2, avcodec_default_get_buffer2, avcodec_flush_buffers, avcodec_free_context, avcodec_get_hw_config, avcodec_open2, avcodec_parameters_to_context, avcodec_receive_frame, avcodec_send_packet, avsubtitle_free, AVCodec, AVCodecContext, AVDictionary, AVFrame, AVHWDeviceType, AVMediaType, AVPixelFormat, AVRational, AVSubtitle, AVSubtitleRect, AVERROR, AVERROR_EOF, AVPALETTE_SIZE, AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX, AV_FRAME_CROP_UNALIGNED, AV_FRAME_FLAG_CORRUPT, AV_NOPTS_VALUE, AV_PIX_FMT_FLAG_HWACCEL, AV_TIME_BASE_Q, EAGAIN, EINVAL, ENOMEM};
 use log::{debug, error, info, trace, warn};
 use std::ffi::{c_void, CStr, CString};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
-use crate::util::ffmpeg_utils::av_err2str;
 
 #[cfg(feature = "docs-rs")]
 pub(crate) fn dec_init(
@@ -57,22 +69,31 @@ pub(crate) fn dec_init(
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
 ) -> crate::error::Result<()> {
     let receiver = dec_stream.take_src();
-    
+
     let codec_ptr = dec_stream.codec.as_ptr();
     if codec_ptr.is_null() {
-        error!("Decoder codec pointer is null for stream {}", dec_stream.stream_index);
-        return Err(OpenDecoder(OpenDecoderOperationError::ContextAllocationError(OpenDecoderError::OutOfMemory)));
+        error!(
+            "Decoder codec pointer is null for stream {}",
+            dec_stream.stream_index
+        );
+        return Err(OpenDecoder(
+            OpenDecoderOperationError::ContextAllocationError(OpenDecoderError::OutOfMemory),
+        ));
     }
-    
+
     let codec_name_ptr = unsafe { (*codec_ptr).name };
     if codec_name_ptr.is_null() {
-        error!("Decoder codec name pointer is null for stream {}", dec_stream.stream_index);
-        return Err(OpenDecoder(OpenDecoderOperationError::ContextAllocationError(OpenDecoderError::OutOfMemory)));
+        error!(
+            "Decoder codec name pointer is null for stream {}",
+            dec_stream.stream_index
+        );
+        return Err(OpenDecoder(
+            OpenDecoderOperationError::ContextAllocationError(OpenDecoderError::OutOfMemory),
+        ));
     }
-    
-    let decoder_name = unsafe {
-        std::str::from_utf8_unchecked(CStr::from_ptr(codec_name_ptr).to_bytes())
-    };
+
+    let decoder_name =
+        unsafe { std::str::from_utf8_unchecked(CStr::from_ptr(codec_name_ptr).to_bytes()) };
 
     if receiver.is_none() {
         debug!(
@@ -89,7 +110,6 @@ pub(crate) fn dec_init(
 
     let senders = dec_stream.take_dsts();
     let exit_on_error = exit_on_error.unwrap_or(false);
-
 
     let dp_arc = dp_arc.clone();
     let result = std::thread::Builder::new()
@@ -681,10 +701,7 @@ fn dec_open(
             ));
         }
 
-        let mut ret = avcodec_parameters_to_context(
-            dec_ctx,
-            (*dec_stream.stream.inner).codecpar,
-        );
+        let mut ret = avcodec_parameters_to_context(dec_ctx, (*dec_stream.stream.inner).codecpar);
         if ret < 0 {
             avcodec_free_context(&mut dec_ctx);
             error!("Error initializing the decoder context.");
@@ -712,14 +729,21 @@ fn dec_open(
             ret = hw_device_setup_for_decode(&mut dp, dec_stream.codec.as_ptr(), dec_ctx);
             if ret < 0 {
                 avcodec_free_context(&mut dec_ctx);
-                error!("Hardware device setup failed for decoder: {}", av_err2str(ret));
+                error!(
+                    "Hardware device setup failed for decoder: {}",
+                    av_err2str(ret)
+                );
                 return Err(OpenDecoder(OpenDecoderOperationError::HwSetupError(
                     OpenDecoderError::from(ret),
                 )));
             }
         }
 
-        ret = av_opt_set_dict2(dec_ctx as *mut c_void, &mut dec_opts, ffmpeg_sys_next::AV_OPT_SEARCH_CHILDREN);
+        ret = av_opt_set_dict2(
+            dec_ctx as *mut c_void,
+            &mut dec_opts,
+            ffmpeg_sys_next::AV_OPT_SEARCH_CHILDREN,
+        );
         if ret < 0 {
             avcodec_free_context(&mut dec_ctx);
             error!("Error applying decoder options: {}", av_err2str(ret));
@@ -1095,7 +1119,6 @@ struct DecoderParameter {
     last_filter_in_rescale_delta: i64,
     last_frame_sample_rate: i32,
     // view_map: Vec<ViewMap>,
-
 }
 
 unsafe impl Send for DecoderParameter {}
@@ -1144,7 +1167,6 @@ impl DecoderParameter {
             last_frame_tb: AVRational { num: 1, den: 1 },
             last_filter_in_rescale_delta: 0,
             last_frame_sample_rate: 0,
-
             // view_map: vec![],
         }
     }
@@ -1163,7 +1185,10 @@ struct Decoder {
     decode_errors: u64,
 }
 
-fn dec_done(dp_arc: &Arc<Mutex<DecoderParameter>>, senders: &Vec<(Sender<FrameBox>, usize, Arc<[AtomicBool]>)>) {
+fn dec_done(
+    dp_arc: &Arc<Mutex<DecoderParameter>>,
+    senders: &Vec<(Sender<FrameBox>, usize, Arc<[AtomicBool]>)>,
+) {
     for (sender, fg_input_index, finished_flag_list) in senders {
         if !finished_flag_list.is_empty() && *fg_input_index < finished_flag_list.len() {
             if finished_flag_list[*fg_input_index].load(Ordering::Acquire) {

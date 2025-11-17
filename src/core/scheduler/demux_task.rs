@@ -1,4 +1,3 @@
-use std::ffi::CStr;
 use crate::core::context::decoder_stream::DecoderStream;
 use crate::core::context::demuxer::Demuxer;
 use crate::core::context::obj_pool::ObjPool;
@@ -6,8 +5,10 @@ use crate::core::context::{AVFormatContextBox, PacketBox, PacketData};
 use crate::core::scheduler::ffmpeg_scheduler::{
     packet_is_null, set_scheduler_error, wait_until_not_paused, STATUS_END,
 };
+use crate::core::scheduler::input_controller::SchNode;
 use crate::error::Error::Demuxing;
 use crate::error::{DemuxingError, DemuxingOperationError};
+use crate::util::ffmpeg_utils::av_err2str;
 use crate::util::ffmpeg_utils::av_rescale_q_rnd;
 use crossbeam_channel::Sender;
 use ffmpeg_next::packet::{Mut, Ref};
@@ -18,19 +19,17 @@ use ffmpeg_sys_next::AVRounding::AV_ROUND_NEAR_INF;
 use ffmpeg_sys_next::AV_CODEC_PROP_FIELDS;
 use ffmpeg_sys_next::{
     av_compare_ts, av_gettime_relative, av_inv_q, av_mul_q, av_packet_ref, av_q2d, av_read_frame,
-    av_rescale, av_rescale_q, av_stream_get_parser, av_usleep,
-    avformat_seek_file, AVCodecDescriptor, AVCodecParameters, AVFormatContext, AVMediaType,
-    AVPacket, AVRational, AVStream, AVERROR, AVERROR_EOF, AVFMT_TS_DISCONT,
-    AV_NOPTS_VALUE, AV_PKT_FLAG_CORRUPT, AV_TIME_BASE, AV_TIME_BASE_Q,
-    EAGAIN,
+    av_rescale, av_rescale_q, av_stream_get_parser, av_usleep, avformat_seek_file,
+    AVCodecDescriptor, AVCodecParameters, AVFormatContext, AVMediaType, AVPacket, AVRational,
+    AVStream, AVERROR, AVERROR_EOF, AVFMT_TS_DISCONT, AV_NOPTS_VALUE, AV_PKT_FLAG_CORRUPT,
+    AV_TIME_BASE, AV_TIME_BASE_Q, EAGAIN,
 };
 use libc::{c_int, c_uint};
 use log::{debug, error, info, warn};
+use std::ffi::CStr;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use crate::core::scheduler::input_controller::SchNode;
-use crate::util::ffmpeg_utils::av_err2str;
 
 #[cfg(feature = "docs-rs")]
 pub(crate) fn demux_init(
@@ -73,7 +72,9 @@ pub(crate) fn demux_init(
     #[cfg(windows)]
     let hwaccel = { demux.hwaccel.take() };
 
-    let format_name = unsafe {std::str::from_utf8_unchecked(CStr::from_ptr((*(*in_fmt_ctx).iformat).name).to_bytes())};
+    let format_name = unsafe {
+        std::str::from_utf8_unchecked(CStr::from_ptr((*(*in_fmt_ctx).iformat).name).to_bytes())
+    };
 
     let result = std::thread::Builder::new()
         .name(format!("demuxer{demux_idx}:{format_name}"))
@@ -274,7 +275,11 @@ pub(crate) fn demux_init(
     Ok(())
 }
 
-fn demux_done(demux_paramter: &mut DemuxerParamter, packet_pool: &ObjPool<Packet>, scheduler_status: &Arc<AtomicUsize>) {
+fn demux_done(
+    demux_paramter: &mut DemuxerParamter,
+    packet_pool: &ObjPool<Packet>,
+    scheduler_status: &Arc<AtomicUsize>,
+) {
     for ds in &demux_paramter.demux_streams {
         for (i, (packet_dst, input_stream_index, output_stream_index)) in
             demux_paramter.dsts.iter().enumerate()
@@ -380,7 +385,8 @@ unsafe fn ts_fixup(
     in_fmt_ctx: *mut AVFormatContext,
     pkt: *mut AVPacket,
     copy_ts: bool,
-) {}
+) {
+}
 
 #[cfg(not(feature = "docs-rs"))]
 unsafe fn ts_fixup(
@@ -400,10 +406,7 @@ unsafe fn ts_fixup(
             .get_mut((*pkt).stream_index as usize)
             .unwrap();
 
-        if !ds.wrap_correction_done
-            && start_time != AV_NOPTS_VALUE
-            && (*ist).pts_wrap_bits < 64
-        {
+        if !ds.wrap_correction_done && start_time != AV_NOPTS_VALUE && (*ist).pts_wrap_bits < 64 {
             let stime = av_rescale_q(start_time, AV_TIME_BASE_Q, (*pkt).time_base);
             let stime2 = stime + (1u64 << (*ist).pts_wrap_bits) as i64;
             ds.wrap_correction_done = true;
@@ -500,7 +503,8 @@ unsafe fn ist_dts_update(
     demux_paramter: &mut DemuxerParamter,
     ist: *mut AVStream,
     pkt: *mut AVPacket,
-) {}
+) {
+}
 
 #[cfg(not(feature = "docs-rs"))]
 unsafe fn ist_dts_update(
@@ -586,7 +590,8 @@ unsafe fn ts_discontinuity_process(
     in_fmt_ctx: *mut AVFormatContext,
     ist: *mut AVStream,
     pkt: *mut AVPacket,
-) {}
+) {
+}
 
 #[cfg(not(feature = "docs-rs"))]
 unsafe fn ts_discontinuity_process(
@@ -626,7 +631,8 @@ unsafe fn ts_discontinuity_detect(
     in_fmt_ctx: *mut AVFormatContext,
     ist: *mut AVStream,
     pkt: *mut AVPacket,
-) {}
+) {
+}
 
 #[cfg(not(feature = "docs-rs"))]
 unsafe fn ts_discontinuity_detect(
@@ -818,7 +824,6 @@ impl DemuxerParamter {
             demux_streams.push(DemuxStreamParamter::new(stream))
         }
 
-
         Self {
             dsts_finished,
             have_audio_dec,
@@ -925,9 +930,9 @@ unsafe fn demux_send(
     independent_readrate: bool,
 ) -> i32 {
     let node = demux_node.as_ref();
-    let SchNode::Demux {
-        waiter, ..
-    } = node else { unreachable!() };
+    let SchNode::Demux { waiter, .. } = node else {
+        unreachable!()
+    };
     let wait_time = waiter.wait_with_scheduler_status(scheduler_status, independent_readrate);
     if wait_until_not_paused(scheduler_status) == STATUS_END {
         return ffmpeg_sys_next::AVERROR_EXIT;
@@ -949,7 +954,13 @@ unsafe fn demux_send(
         return demux_flush(packet_pool, &demux_paramter.dsts);
     }
 
-    demux_send_for_stream(demux_paramter, packet_box, packet_pool, flags, scheduler_status)
+    demux_send_for_stream(
+        demux_paramter,
+        packet_box,
+        packet_pool,
+        flags,
+        scheduler_status,
+    )
 }
 
 unsafe fn demux_send_for_stream(
@@ -957,7 +968,7 @@ unsafe fn demux_send_for_stream(
     packet_box: PacketBox,
     packet_pool: &ObjPool<Packet>,
     flags: usize,
-    scheduler_status: &Arc<AtomicUsize>
+    scheduler_status: &Arc<AtomicUsize>,
 ) -> i32 {
     let stream_index = (*packet_box.packet.as_ptr()).stream_index;
 
@@ -1000,7 +1011,7 @@ unsafe fn demux_send_for_stream(
                 output_stream_index,
                 dst_finished,
                 flags,
-                scheduler_status
+                scheduler_status,
             );
             if ret == AVERROR_EOF {
                 nb_done += 1;
@@ -1014,7 +1025,7 @@ unsafe fn demux_send_for_stream(
                 output_stream_index,
                 dst_finished,
                 flags,
-                scheduler_status
+                scheduler_status,
             );
             if ret == AVERROR_EOF {
                 nb_done += 1;
@@ -1040,7 +1051,7 @@ unsafe fn demux_stream_send_to_dst(
     output_stream_index: &Option<usize>,
     dst_finished: &mut bool,
     flags: usize,
-    scheduler_status: &Arc<AtomicUsize>
+    scheduler_status: &Arc<AtomicUsize>,
 ) -> i32 {
     if *dst_finished {
         return AVERROR_EOF;

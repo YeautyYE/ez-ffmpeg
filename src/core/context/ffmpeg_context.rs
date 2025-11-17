@@ -15,7 +15,10 @@ use crate::core::scheduler::ffmpeg_scheduler::{FfmpegScheduler, Initialization};
 #[cfg(not(feature = "docs-rs"))]
 use crate::core::scheduler::filter_task::graph_opts_apply;
 use crate::core::scheduler::input_controller::SchNode;
-use crate::error::Error::{FileSameAsInput, FilterDescUtf8, FilterNameUtf8, FilterZeroOutputs, FrameFilterStreamTypeNoMatched, FrameFilterTypeNoMatched, ParseInteger};
+use crate::error::Error::{
+    FileSameAsInput, FilterDescUtf8, FilterNameUtf8, FilterZeroOutputs,
+    FrameFilterStreamTypeNoMatched, FrameFilterTypeNoMatched, ParseInteger,
+};
 use crate::error::FilterGraphParseError::{
     InvalidFileIndexInFg, InvalidFilterSpecifier, OutputUnconnected,
 };
@@ -40,9 +43,29 @@ use ffmpeg_sys_next::AVMediaType::{
 };
 use ffmpeg_sys_next::AVPixelFormat::AV_PIX_FMT_NONE;
 use ffmpeg_sys_next::AVSampleFormat::AV_SAMPLE_FMT_NONE;
-use ffmpeg_sys_next::{av_add_q, av_channel_layout_default, av_codec_get_id, av_codec_get_tag2, av_dict_free, av_freep, av_get_exact_bits_per_sample, av_guess_codec, av_guess_format, av_guess_frame_rate, av_inv_q, av_malloc, av_rescale_q, av_seek_frame, avcodec_alloc_context3, avcodec_descriptor_get, avcodec_descriptor_get_by_name, avcodec_find_encoder, avcodec_find_encoder_by_name, avcodec_get_name, avcodec_parameters_from_context, avcodec_parameters_to_context, avfilter_graph_alloc, avfilter_graph_free, avfilter_inout_free, avfilter_pad_get_name, avfilter_pad_get_type, avformat_alloc_context, avformat_alloc_output_context2, avformat_close_input, avformat_find_stream_info, avformat_flush, avformat_free_context, avformat_open_input, avio_alloc_context, avio_context_free, avio_open, AVCodec, AVCodecID, AVColorRange, AVColorSpace, AVFilterContext, AVFilterInOut, AVFilterPad, AVFormatContext, AVMediaType, AVOutputFormat, AVPixelFormat, AVRational, AVSampleFormat, AVStream, AVERROR_ENCODER_NOT_FOUND, AVFMT_FLAG_CUSTOM_IO, AVFMT_GLOBALHEADER, AVFMT_NOBINSEARCH, AVFMT_NOFILE, AVFMT_NOGENSEARCH, AVFMT_NOSTREAMS, AVIO_FLAG_WRITE, AVSEEK_FLAG_BACKWARD, AV_CODEC_PROP_BITMAP_SUB, AV_CODEC_PROP_TEXT_SUB, AV_TIME_BASE};
+use ffmpeg_sys_next::{
+    av_add_q, av_channel_layout_default, av_codec_get_id, av_codec_get_tag2, av_dict_free,
+    av_freep, av_get_exact_bits_per_sample, av_guess_codec, av_guess_format, av_guess_frame_rate,
+    av_inv_q, av_malloc, av_rescale_q, av_seek_frame, avcodec_alloc_context3,
+    avcodec_descriptor_get, avcodec_descriptor_get_by_name, avcodec_find_encoder,
+    avcodec_find_encoder_by_name, avcodec_get_name, avcodec_parameters_from_context,
+    avcodec_parameters_to_context, avfilter_graph_alloc, avfilter_graph_free, avfilter_inout_free,
+    avfilter_pad_get_name, avfilter_pad_get_type, avformat_alloc_context,
+    avformat_alloc_output_context2, avformat_close_input, avformat_find_stream_info,
+    avformat_flush, avformat_free_context, avformat_open_input, avio_alloc_context,
+    avio_context_free, avio_open, AVCodec, AVCodecID, AVColorRange, AVColorSpace, AVFilterContext,
+    AVFilterInOut, AVFilterPad, AVFormatContext, AVMediaType, AVOutputFormat, AVPixelFormat,
+    AVRational, AVSampleFormat, AVStream, AVERROR_ENCODER_NOT_FOUND, AVFMT_FLAG_CUSTOM_IO,
+    AVFMT_GLOBALHEADER, AVFMT_NOBINSEARCH, AVFMT_NOFILE, AVFMT_NOGENSEARCH, AVFMT_NOSTREAMS,
+    AVIO_FLAG_WRITE, AVSEEK_FLAG_BACKWARD, AV_CODEC_PROP_BITMAP_SUB, AV_CODEC_PROP_TEXT_SUB,
+    AV_TIME_BASE,
+};
 #[cfg(not(feature = "docs-rs"))]
-use ffmpeg_sys_next::{av_channel_layout_copy, av_packet_side_data_new, avcodec_get_supported_config, avfilter_graph_segment_apply, avfilter_graph_segment_create_filters, avfilter_graph_segment_free, avfilter_graph_segment_parse, AVChannelLayout};
+use ffmpeg_sys_next::{
+    av_channel_layout_copy, av_packet_side_data_new, avcodec_get_supported_config,
+    avfilter_graph_segment_apply, avfilter_graph_segment_create_filters,
+    avfilter_graph_segment_free, avfilter_graph_segment_parse, AVChannelLayout,
+};
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::ffi::{c_uint, c_void, CStr, CString};
@@ -161,16 +184,17 @@ impl FfmpegContext {
     }
 }
 
-const START_AT_ZERO:bool = false;
+const START_AT_ZERO: bool = false;
 
-fn correct_input_start_times(demuxs: &mut Vec<Demuxer>, copy_ts: bool){
+fn correct_input_start_times(demuxs: &mut Vec<Demuxer>, copy_ts: bool) {
     for (i, demux) in demuxs.iter_mut().enumerate() {
         unsafe {
             let is = demux.in_fmt_ctx;
 
             demux.start_time_effective = (*is).start_time;
-            if (*is).start_time == ffmpeg_sys_next::AV_NOPTS_VALUE ||
-                (*(*is).iformat).flags & ffmpeg_sys_next::AVFMT_TS_DISCONT == 0 {
+            if (*is).start_time == ffmpeg_sys_next::AV_NOPTS_VALUE
+                || (*(*is).iformat).flags & ffmpeg_sys_next::AVFMT_TS_DISCONT == 0
+            {
                 continue;
             }
 
@@ -178,10 +202,19 @@ fn correct_input_start_times(demuxs: &mut Vec<Demuxer>, copy_ts: bool){
             let stream_count = (*is).nb_streams;
             for j in 0..stream_count {
                 let st = *(*is).streams.add(j as usize);
-                if (*st).discard == ffmpeg_sys_next::AVDiscard::AVDISCARD_ALL || (*st).start_time == ffmpeg_sys_next::AV_NOPTS_VALUE {
+                if (*st).discard == ffmpeg_sys_next::AVDiscard::AVDISCARD_ALL
+                    || (*st).start_time == ffmpeg_sys_next::AV_NOPTS_VALUE
+                {
                     continue;
                 }
-                new_start_time = std::cmp::min(new_start_time, av_rescale_q((*st).start_time, (*st).time_base, ffmpeg_sys_next::AV_TIME_BASE_Q));
+                new_start_time = std::cmp::min(
+                    new_start_time,
+                    av_rescale_q(
+                        (*st).start_time,
+                        (*st).time_base,
+                        ffmpeg_sys_next::AV_TIME_BASE_Q,
+                    ),
+                );
             }
             let diff = new_start_time - (*is).start_time;
             if diff != 0 {
@@ -189,16 +222,19 @@ fn correct_input_start_times(demuxs: &mut Vec<Demuxer>, copy_ts: bool){
                 demux.start_time_effective = new_start_time;
                 if copy_ts && START_AT_ZERO {
                     demux.ts_offset = -new_start_time;
-                }else if !copy_ts {
+                } else if !copy_ts {
                     let abs_start_seek = (*is).start_time + demux.start_time_us.unwrap_or(0);
-                    demux.ts_offset = if abs_start_seek > new_start_time { -abs_start_seek } else { -new_start_time };
+                    demux.ts_offset = if abs_start_seek > new_start_time {
+                        -abs_start_seek
+                    } else {
+                        -new_start_time
+                    };
                 } else if copy_ts {
                     demux.ts_offset = 0;
                 }
 
                 // demux.ts_offset += demux.input_ts_offset;
             }
-
         }
     }
 }
@@ -225,7 +261,9 @@ fn check_pipeline<T>(
             if let Some(idx) = pipeline.stream_index {
                 streams
                     .iter()
-                    .any(|s| get_stream_index(s) == idx && get_codec_type(s) == &pipeline.media_type)
+                    .any(|s| {
+                        get_stream_index(s) == idx && get_codec_type(s) == &pipeline.media_type
+                    })
                     .then(|| ())
                     .ok_or_else(|| {
                         Into::<crate::error::Error>::into(FrameFilterStreamTypeNoMatched(
@@ -240,10 +278,7 @@ fn check_pipeline<T>(
                     .any(|s| get_codec_type(s) == &pipeline.media_type)
                     .then(|| ())
                     .ok_or_else(|| {
-                        FrameFilterTypeNoMatched(
-                            tag.into(),
-                            format!("{:?}", pipeline.media_type),
-                        )
+                        FrameFilterTypeNoMatched(tag.into(), format!("{:?}", pipeline.media_type))
                             .into()
                     })
             }
@@ -272,7 +307,6 @@ fn check_frame_filter_pipeline(muxs: &[Muxer], demuxs: &[Demuxer]) -> Result<()>
     })?;
     Ok(())
 }
-
 
 fn check_fg_bindings(filter_graphs: &Vec<FilterGraph>) -> Result<()> {
     // check that all outputs were bound
@@ -363,14 +397,7 @@ fn map_manual(
                     );
                 }
                 Some((codec_id, enc)) => {
-                    return ofilter_bind_ost(
-                        index,
-                        mux,
-                        filter_graph,
-                        i,
-                        codec_id,
-                        enc,
-                    );
+                    return ofilter_bind_ost(index, mux, filter_graph, i, codec_id, enc);
                 }
             }
         }
@@ -468,11 +495,8 @@ fn map_manual(
                         filter_graphs,
                     )?;
                 } else {
-                    let (frame_sender, output_stream_index) = mux.add_enc_stream(
-                        media_type,
-                        enc,
-                        demux_node
-                    )?;
+                    let (frame_sender, output_stream_index) =
+                        mux.add_enc_stream(media_type, enc, demux_node)?;
                     input_stream.add_dst(frame_sender);
                     demux.connect_stream(stream_index);
 
@@ -623,7 +647,11 @@ fn configure_output_filter_opts(
             let mut current = framerates;
             let mut count = 0;
             const MAX_FRAMERATES: usize = 64;
-            while !current.is_null() && (*current).num != 0 && (*current).den != 0 && count < MAX_FRAMERATES {
+            while !current.is_null()
+                && (*current).num != 0
+                && (*current).den != 0
+                && count < MAX_FRAMERATES
+            {
                 framerate_list.push(*current);
                 current = current.add(1);
                 count += 1;
@@ -654,7 +682,10 @@ fn configure_output_filter_opts(
             let mut current = color_spaces;
             let mut count = 0;
             const MAX_COLOR_SPACES: usize = 128;
-            while !current.is_null() && *current != AVCOL_SPC_UNSPECIFIED && count < MAX_COLOR_SPACES {
+            while !current.is_null()
+                && *current != AVCOL_SPC_UNSPECIFIED
+                && count < MAX_COLOR_SPACES
+            {
                 color_space_list.push(*current);
                 current = current.add(1);
                 count += 1;
@@ -681,7 +712,10 @@ fn configure_output_filter_opts(
             let mut current = color_ranges;
             let mut count = 0;
             const MAX_COLOR_RANGES: usize = 64;
-            while !current.is_null() && *current != AVCOL_RANGE_UNSPECIFIED && count < MAX_COLOR_RANGES {
+            while !current.is_null()
+                && *current != AVCOL_RANGE_UNSPECIFIED
+                && count < MAX_COLOR_RANGES
+            {
                 color_range_list.push(*current);
                 current = current.add(1);
                 count += 1;
@@ -715,7 +749,8 @@ fn configure_output_filter_opts(
             let mut audio_format_list = Vec::new();
             let mut count = 0;
             const MAX_AUDIO_FORMATS: usize = 32;
-            while !current.is_null() && *current != AV_SAMPLE_FMT_NONE && count < MAX_AUDIO_FORMATS {
+            while !current.is_null() && *current != AV_SAMPLE_FMT_NONE && count < MAX_AUDIO_FORMATS
+            {
                 audio_format_list.push(*current);
                 current = current.add(1);
                 count += 1;
@@ -724,7 +759,6 @@ fn configure_output_filter_opts(
                 warn!("Reached maximum audio format limit");
             }
             output_filter.opts.audio_formats = Some(audio_format_list);
-
 
             if let Some(audio_sample_rate) = &mux.audio_sample_rate {
                 output_filter.opts.sample_rate = *audio_sample_rate;
@@ -756,7 +790,6 @@ fn configure_output_filter_opts(
             }
             output_filter.opts.sample_rates = Some(rate_list);
 
-
             if let Some(channels) = &mux.audio_channels {
                 output_filter.opts.ch_layout.nb_channels = *channels;
             }
@@ -777,7 +810,10 @@ fn configure_output_filter_opts(
             let mut current = layouts;
             let mut count = 0;
             const MAX_CHANNEL_LAYOUTS: usize = 128;
-            while !current.is_null() && (*current).order != AV_CHANNEL_ORDER_UNSPEC && count < MAX_CHANNEL_LAYOUTS {
+            while !current.is_null()
+                && (*current).order != AV_CHANNEL_ORDER_UNSPEC
+                && count < MAX_CHANNEL_LAYOUTS
+            {
                 layout_list.push(*current);
                 current = current.add(1);
                 count += 1;
@@ -874,18 +910,8 @@ fn map_auto_streams(
             filter_graphs,
             auto_disable,
         )?;
-        map_auto_subtitle(
-            mux,
-            demuxs,
-            oformat,
-            auto_disable,
-        )?;
-        map_auto_data(
-            mux,
-            demuxs,
-            oformat,
-            auto_disable,
-        )?;
+        map_auto_subtitle(mux, demuxs, oformat, auto_disable)?;
+        map_auto_data(mux, demuxs, oformat, auto_disable)?;
     }
     Ok(())
 }
@@ -936,20 +962,24 @@ unsafe fn map_auto_subtitle(
 
         let stream_index = option.unwrap();
 
-        let input_descriptor = avcodec_descriptor_get((*demux.get_stream(stream_index).codec_parameters).codec_id);
+        let input_descriptor =
+            avcodec_descriptor_get((*demux.get_stream(stream_index).codec_parameters).codec_id);
         let mut input_props = 0;
         if !input_descriptor.is_null() {
-            input_props = (*input_descriptor).props & (AV_CODEC_PROP_TEXT_SUB | AV_CODEC_PROP_BITMAP_SUB);
+            input_props =
+                (*input_descriptor).props & (AV_CODEC_PROP_TEXT_SUB | AV_CODEC_PROP_BITMAP_SUB);
         }
         let mut output_props = 0;
         if !output_descriptor.is_null() {
-            output_props = (*output_descriptor).props & (AV_CODEC_PROP_TEXT_SUB | AV_CODEC_PROP_BITMAP_SUB);
+            output_props =
+                (*output_descriptor).props & (AV_CODEC_PROP_TEXT_SUB | AV_CODEC_PROP_BITMAP_SUB);
         }
 
         if input_props & output_props != 0 ||
             // Map dvb teletext which has neither property to any output subtitle encoder
             !input_descriptor.is_null() && !output_descriptor.is_null() &&
-                ((*input_descriptor).props == 0 || (*output_descriptor).props == 0) {
+                ((*input_descriptor).props == 0 || (*output_descriptor).props == 0)
+        {
             let option = choose_encoder(mux, AVMEDIA_TYPE_SUBTITLE)?;
 
             if let Some((_codec_id, enc)) = option {
@@ -998,7 +1028,13 @@ unsafe fn map_auto_data(
     }
 
     /* Data only if codec id match */
-    let codec_id = av_guess_codec(oformat, null(), (*mux.out_fmt_ctx).url, null(), AVMEDIA_TYPE_DATA);
+    let codec_id = av_guess_codec(
+        oformat,
+        null(),
+        (*mux.out_fmt_ctx).url,
+        null(),
+        AVMEDIA_TYPE_DATA,
+    );
 
     if codec_id == AV_CODEC_ID_NONE {
         return Ok(());
@@ -1010,7 +1046,9 @@ unsafe fn map_auto_data(
             .iter()
             .enumerate()
             .find_map(|(index, input_stream)| {
-                if input_stream.codec_type == AVMEDIA_TYPE_DATA && (*input_stream.codec_parameters).codec_id == codec_id {
+                if input_stream.codec_type == AVMEDIA_TYPE_DATA
+                    && (*input_stream.codec_parameters).codec_id == codec_id
+                {
                     Some(index)
                 } else {
                     None
@@ -1182,14 +1220,7 @@ fn init_simple_filtergraph(
     // filter_graph.outputs[0].media_type = codec_type;
 
     ifilter_bind_ist(&mut filter_graph, 0, stream_index, demux)?;
-    ofilter_bind_ost(
-        mux_index,
-        mux,
-        &mut filter_graph,
-        0,
-        codec_id,
-        enc,
-    )?;
+    ofilter_bind_ost(mux_index, mux, &mut filter_graph, 0, codec_id, enc)?;
 
     filter_graphs.push(filter_graph);
 
@@ -1351,7 +1382,10 @@ fn output_bind_by_unlabeled_filter(
 
             match option {
                 None => {
-                    warn!("An unexpected media_type {:?} appears in output_filter", media_type);
+                    warn!(
+                        "An unexpected media_type {:?} appears in output_filter",
+                        media_type
+                    );
                 }
                 Some((codec_id, enc)) => {
                     *auto_disable |= 1 << media_type as i32;
@@ -1641,7 +1675,7 @@ unsafe fn open_output_file(index: usize, output: &mut Output, copy_ts: bool) -> 
         audio_codec_opts,
         subtitle_codec_opts,
         format_opts,
-        copy_ts
+        copy_ts,
     );
 
     Ok(mux)
@@ -1802,11 +1836,7 @@ fn fg_bind_inputs(filter_graphs: &mut Vec<FilterGraph>, demuxs: &mut Vec<Demuxer
 
     for filter_graph in filter_graphs.iter_mut() {
         for i in 0..filter_graph.inputs.len() {
-            fg_complex_bind_input(
-                filter_graph,
-                i,
-                demuxs,
-            )?;
+            fg_complex_bind_input(filter_graph, i, demuxs)?;
         }
     }
 
@@ -1871,7 +1901,6 @@ fn bind_fg_inputs_by_fg(filter_graphs: &mut Vec<FilterGraph>) -> Result<()> {
                         if output_filter.has_dst() {
                             continue;
                         }
-
                     }
 
                     let (sender, finished_flag_list) = {
@@ -1901,48 +1930,52 @@ fn fg_complex_bind_input(
 ) -> Result<()> {
     let graph_desc = &filter_graph.graph_desc;
     let input_filter = &mut filter_graph.inputs[input_filter_index];
-    let (demux_idx, stream_idx) =
-        if !input_filter.linklabel.is_empty() && input_filter.linklabel != "in" {
-            let (demux_idx, stream_idx) = fg_find_input_idx_by_linklabel(
-                &input_filter.linklabel,
-                input_filter.media_type,
-                demuxs,
-                graph_desc,
-            )?;
+    let (demux_idx, stream_idx) = if !input_filter.linklabel.is_empty()
+        && input_filter.linklabel != "in"
+    {
+        let (demux_idx, stream_idx) = fg_find_input_idx_by_linklabel(
+            &input_filter.linklabel,
+            input_filter.media_type,
+            demuxs,
+            graph_desc,
+        )?;
 
-            info!(
-                "Binding filter input with label '{}' to input stream {stream_idx}:{demux_idx}",
-                input_filter.linklabel
-            );
-            (demux_idx, stream_idx)
-        } else {
-            let mut demux_idx = -1i32;
-            let mut stream_idx = 0;
-            for (d_idx, demux) in demuxs.iter().enumerate() {
-                for (st_idx, intput_stream) in demux.get_streams().iter().enumerate() {
-                    if intput_stream.is_used() {
-                        continue;
-                    }
-                    if intput_stream.codec_type == input_filter.media_type {
-                        demux_idx = d_idx as i32;
-                        stream_idx = st_idx;
-                        break;
-                    }
+        info!(
+            "Binding filter input with label '{}' to input stream {stream_idx}:{demux_idx}",
+            input_filter.linklabel
+        );
+        (demux_idx, stream_idx)
+    } else {
+        let mut demux_idx = -1i32;
+        let mut stream_idx = 0;
+        for (d_idx, demux) in demuxs.iter().enumerate() {
+            for (st_idx, intput_stream) in demux.get_streams().iter().enumerate() {
+                if intput_stream.is_used() {
+                    continue;
                 }
-                if demux_idx >= 0 {
+                if intput_stream.codec_type == input_filter.media_type {
+                    demux_idx = d_idx as i32;
+                    stream_idx = st_idx;
                     break;
                 }
             }
-
-            if demux_idx < 0 {
-                warn!("Cannot find a matching stream for unlabeled input pad {}", input_filter.name);
-                return Err(FilterGraphParseError::InvalidArgument.into());
+            if demux_idx >= 0 {
+                break;
             }
+        }
 
-            debug!("FilterGraph binding unlabeled input {input_filter_index} to input stream {stream_idx}:{demux_idx}");
+        if demux_idx < 0 {
+            warn!(
+                "Cannot find a matching stream for unlabeled input pad {}",
+                input_filter.name
+            );
+            return Err(FilterGraphParseError::InvalidArgument.into());
+        }
 
-            (demux_idx as usize, stream_idx)
-        };
+        debug!("FilterGraph binding unlabeled input {input_filter_index} to input stream {stream_idx}:{demux_idx}");
+
+        (demux_idx as usize, stream_idx)
+    };
 
     let demux = &mut demuxs[demux_idx];
 
@@ -2060,7 +2093,6 @@ fn ifilter_bind_ist(
             unreachable!()
         };
         inputs.insert(input_index, demux.node.clone());
-
 
         demux.connect_stream(stream_idx);
         Ok(())
@@ -2181,7 +2213,6 @@ fn init_filter_graphs(filter_complexs: Vec<FilterComplex>) -> Result<Vec<FilterG
     }
     Ok(filter_graphs)
 }
-
 
 #[cfg(feature = "docs-rs")]
 fn init_filter_graph(
@@ -2390,20 +2421,12 @@ unsafe fn free_input_av_format_context(demuxs: Vec<Demuxer>) {
 }
 
 #[cfg(feature = "docs-rs")]
-unsafe fn open_input_file(
-    index: usize,
-    input: &mut Input,
-    copy_ts: bool,
-) -> Result<Demuxer> {
+unsafe fn open_input_file(index: usize, input: &mut Input, copy_ts: bool) -> Result<Demuxer> {
     Err(Error::Bug)
 }
 
 #[cfg(not(feature = "docs-rs"))]
-unsafe fn open_input_file(
-    index: usize,
-    input: &mut Input,
-    copy_ts: bool
-) -> Result<Demuxer> {
+unsafe fn open_input_file(index: usize, input: &mut Input, copy_ts: bool) -> Result<Demuxer> {
     let mut in_fmt_ctx = avformat_alloc_context();
     if in_fmt_ctx.is_null() {
         return Err(OpenInputError::OutOfMemory.into());
@@ -2509,13 +2532,30 @@ unsafe fn open_input_file(
             let url_cstr = CString::new(url.as_str())?;
 
             let scan_all_pmts_key = CString::new("scan_all_pmts")?;
-            if ffmpeg_sys_next::av_dict_get(input_opts, scan_all_pmts_key.as_ptr(), null(), ffmpeg_sys_next::AV_DICT_MATCH_CASE).is_null() {
+            if ffmpeg_sys_next::av_dict_get(
+                input_opts,
+                scan_all_pmts_key.as_ptr(),
+                null(),
+                ffmpeg_sys_next::AV_DICT_MATCH_CASE,
+            )
+            .is_null()
+            {
                 let scan_all_pmts_value = CString::new("1")?;
-                ffmpeg_sys_next::av_dict_set(&mut input_opts, scan_all_pmts_key.as_ptr(), scan_all_pmts_value.as_ptr(), ffmpeg_sys_next::AV_DICT_DONT_OVERWRITE);
+                ffmpeg_sys_next::av_dict_set(
+                    &mut input_opts,
+                    scan_all_pmts_key.as_ptr(),
+                    scan_all_pmts_value.as_ptr(),
+                    ffmpeg_sys_next::AV_DICT_DONT_OVERWRITE,
+                );
             };
             (*in_fmt_ctx).flags |= ffmpeg_sys_next::AVFMT_FLAG_NONBLOCK;
 
-            let mut ret = avformat_open_input(&mut in_fmt_ctx, url_cstr.as_ptr(), file_iformat, &mut input_opts);
+            let mut ret = avformat_open_input(
+                &mut in_fmt_ctx,
+                url_cstr.as_ptr(),
+                file_iformat,
+                &mut input_opts,
+            );
             av_dict_free(&mut input_opts);
             if ret < 0 {
                 avformat_close_input(&mut in_fmt_ctx);
@@ -2556,9 +2596,19 @@ unsafe fn open_input_file(
                 seek_timestamp -= 3 * AV_TIME_BASE as i64 / 23;
             }
         }
-        let ret = ffmpeg_sys_next::avformat_seek_file(in_fmt_ctx, -1, i64::MIN, seek_timestamp, seek_timestamp, 0);
+        let ret = ffmpeg_sys_next::avformat_seek_file(
+            in_fmt_ctx,
+            -1,
+            i64::MIN,
+            seek_timestamp,
+            seek_timestamp,
+            0,
+        );
         if ret < 0 {
-            warn!("could not seek to position {:.3}", start_time_us as f64 / AV_TIME_BASE as f64);
+            warn!(
+                "could not seek to position {:.3}",
+                start_time_us as f64 / AV_TIME_BASE as f64
+            );
         }
     }
 
@@ -2566,7 +2616,6 @@ unsafe fn open_input_file(
         .url
         .clone()
         .unwrap_or_else(|| format!("read_callback[{index}]"));
-
 
     let demux = Demuxer::new(
         url,
@@ -2585,7 +2634,7 @@ unsafe fn open_input_file(
         input.hwaccel.clone(),
         input.hwaccel_device.clone(),
         input.hwaccel_output_format.clone(),
-        copy_ts
+        copy_ts,
     )?;
 
     Ok(demux)

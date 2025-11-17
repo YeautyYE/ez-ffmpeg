@@ -1,3 +1,4 @@
+use crate::rtmp::gop::{FrameData, Gops};
 use bytes::Bytes;
 use log::{debug, info, warn};
 use rml_rtmp::chunk_io::Packet;
@@ -9,7 +10,6 @@ use rml_rtmp::time::RtmpTimestamp;
 use slab::Slab;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use crate::rtmp::gop::{FrameData, Gops};
 
 enum ClientAction {
     Waiting,
@@ -124,7 +124,9 @@ impl RtmpScheduler {
         self.publisher_to_client_map
             .insert(publisher_connection_id, client_id.unwrap());
 
-        self.channels.entry(stream_key).or_insert(MediaChannel::new(self.gop_limit));
+        self.channels
+            .entry(stream_key)
+            .or_insert(MediaChannel::new(self.gop_limit));
 
         true
     }
@@ -165,10 +167,11 @@ impl RtmpScheduler {
                 .get(&publisher_connection_id)
                 .unwrap();
             let client = self.clients.get_mut(*client_id).unwrap();
-            let publisher_results: Vec<ServerSessionResult> = match client.session.handle_input(&bytes) {
-                Ok(results) => results,
-                Err(error) => return Err(error.to_string()),
-            };
+            let publisher_results: Vec<ServerSessionResult> =
+                match client.session.handle_input(&bytes) {
+                    Ok(results) => results,
+                    Err(error) => return Err(error.to_string()),
+                };
             publisher_results
         };
 
@@ -187,7 +190,10 @@ impl RtmpScheduler {
                     | ServerSessionEvent::PublishStreamFinished { .. } => {
                         self.handle_raised_event(usize::MAX, event, &mut server_results);
                     }
-                    ServerSessionEvent::ConnectionRequested {request_id, app_name} => {
+                    ServerSessionEvent::ConnectionRequested {
+                        request_id,
+                        app_name,
+                    } => {
                         let client_id = self
                             .publisher_to_client_map
                             .get(&publisher_connection_id)
@@ -195,7 +201,12 @@ impl RtmpScheduler {
                         let client = self.clients.get_mut(*client_id).unwrap();
                         let _ = client.session.accept_request(request_id);
                     }
-                    ServerSessionEvent::PublishStreamRequested {request_id, app_name, stream_key, mode} => {
+                    ServerSessionEvent::PublishStreamRequested {
+                        request_id,
+                        app_name,
+                        stream_key,
+                        mode,
+                    } => {
                         let client_id = self
                             .publisher_to_client_map
                             .get(&publisher_connection_id)
@@ -206,7 +217,7 @@ impl RtmpScheduler {
                     _ => {
                         debug!("Publisher received unexpected event: {:?}", event);
                     }
-                }
+                },
 
                 x => warn!("Server result received: {:?}", x),
             }
@@ -355,11 +366,7 @@ impl RtmpScheduler {
                 app_name,
                 stream_key,
             } => {
-                self.handle_publish_finished(
-                    app_name,
-                    stream_key,
-                    server_results,
-                );
+                self.handle_publish_finished(app_name, stream_key, server_results);
             }
 
             ServerSessionEvent::PlayStreamRequested {
@@ -764,7 +771,13 @@ impl RtmpScheduler {
                     channel.video_sequence_header = Some(data.clone());
                     channel.video_timestamp = timestamp;
                 }
-                channel.gops.save_frame_data(crate::rtmp::gop::FrameData::Video { timestamp, data: data.clone() }, is_video_keyframe(&data));
+                channel.gops.save_frame_data(
+                    crate::rtmp::gop::FrameData::Video {
+                        timestamp,
+                        data: data.clone(),
+                    },
+                    is_video_keyframe(&data),
+                );
             }
 
             ReceivedDataType::Audio => {
@@ -772,7 +785,13 @@ impl RtmpScheduler {
                     channel.audio_sequence_header = Some(data.clone());
                     channel.audio_timestamp = timestamp;
                 }
-                channel.gops.save_frame_data(crate::rtmp::gop::FrameData::Audio { timestamp, data: data.clone() }, false);
+                channel.gops.save_frame_data(
+                    crate::rtmp::gop::FrameData::Audio {
+                        timestamp,
+                        data: data.clone(),
+                    },
+                    false,
+                );
             }
         }
 
@@ -877,4 +896,3 @@ fn is_video_keyframe(data: &Bytes) -> bool {
     // Assuming h264.
     data.len() >= 2 && data[0] == 0x17 && data[1] != 0x00 // 0x00 is the sequence header, don't count that for now
 }
-

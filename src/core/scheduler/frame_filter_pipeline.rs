@@ -80,70 +80,69 @@ pub(crate) fn output_pipeline_init(
 fn match_decoder_stream(
     pipeline: &FramePipeline,
     decoder_streams: &mut Vec<DecoderStream>,
-) -> crate::error::Result<(usize, Receiver<FrameBox>, Vec<(Sender<FrameBox>, usize, Arc<[AtomicBool]>)>)> {
-    let (stream_index, pipeline_frame_receiver, decoder_frame_senders) =
-        match pipeline.stream_index {
-            Some(stream_index) => {
-                match decoder_streams
-                    .iter_mut()
-                    .find(|decoder_stream| decoder_stream.stream_index == stream_index)
-                {
-                    None => {
-                        return Err(FrameFilterStreamTypeNoMatched(
-                            "Input".to_string(),
-                            stream_index,
-                            format!("{:?}", pipeline.media_type),
-                        ))
-                    }
-                    Some(decoder_stream) => {
-                        let (pipeline_frame_sender, pipeline_frame_receiver) =
-                            crossbeam_channel::bounded(8);
-                        let decoder_frame_senders =
-                            decoder_stream.replace_dsts(pipeline_frame_sender, usize::MAX, Arc::new([]));
-
-                        (
-                            stream_index,
-                            pipeline_frame_receiver,
-                            decoder_frame_senders,
-                        )
-                    }
-                }
-            }
-            None => match decoder_streams
+) -> crate::error::Result<(
+    usize,
+    Receiver<FrameBox>,
+    Vec<(Sender<FrameBox>, usize, Arc<[AtomicBool]>)>,
+)> {
+    let (stream_index, pipeline_frame_receiver, decoder_frame_senders) = match pipeline.stream_index
+    {
+        Some(stream_index) => {
+            match decoder_streams
                 .iter_mut()
-                .find(|decoder_stream| decoder_stream.codec_type == pipeline.media_type)
+                .find(|decoder_stream| decoder_stream.stream_index == stream_index)
             {
                 None => {
-                    return Err(FrameFilterTypeNoMatched(
-                        "input".to_string(),
+                    return Err(FrameFilterStreamTypeNoMatched(
+                        "Input".to_string(),
+                        stream_index,
                         format!("{:?}", pipeline.media_type),
                     ))
                 }
                 Some(decoder_stream) => {
                     let (pipeline_frame_sender, pipeline_frame_receiver) =
                         crossbeam_channel::bounded(8);
-                    let decoder_frame_senders = decoder_stream.replace_dsts(pipeline_frame_sender, usize::MAX, Arc::new([]));
-                    (
-                        decoder_stream.stream_index,
-                        pipeline_frame_receiver,
-                        decoder_frame_senders
-                    )
+                    let decoder_frame_senders = decoder_stream.replace_dsts(
+                        pipeline_frame_sender,
+                        usize::MAX,
+                        Arc::new([]),
+                    );
+
+                    (stream_index, pipeline_frame_receiver, decoder_frame_senders)
                 }
-            },
-        };
-    Ok((
-        stream_index,
-        pipeline_frame_receiver,
-        decoder_frame_senders
-    ))
+            }
+        }
+        None => match decoder_streams
+            .iter_mut()
+            .find(|decoder_stream| decoder_stream.codec_type == pipeline.media_type)
+        {
+            None => {
+                return Err(FrameFilterTypeNoMatched(
+                    "input".to_string(),
+                    format!("{:?}", pipeline.media_type),
+                ))
+            }
+            Some(decoder_stream) => {
+                let (pipeline_frame_sender, pipeline_frame_receiver) =
+                    crossbeam_channel::bounded(8);
+                let decoder_frame_senders =
+                    decoder_stream.replace_dsts(pipeline_frame_sender, usize::MAX, Arc::new([]));
+                (
+                    decoder_stream.stream_index,
+                    pipeline_frame_receiver,
+                    decoder_frame_senders,
+                )
+            }
+        },
+    };
+    Ok((stream_index, pipeline_frame_receiver, decoder_frame_senders))
 }
 
 fn match_encoder_stream(
     pipeline: &FramePipeline,
     encoder_streams: &mut Vec<EncoderStream>,
 ) -> crate::error::Result<(usize, Receiver<FrameBox>, Sender<FrameBox>)> {
-    let (stream_index, encoder_frame_receiver, pipeline_frame_sender) = match pipeline
-        .stream_index
+    let (stream_index, encoder_frame_receiver, pipeline_frame_sender) = match pipeline.stream_index
     {
         Some(stream_index) => {
             match encoder_streams
@@ -163,11 +162,7 @@ fn match_encoder_stream(
                     let encoder_frame_receiver =
                         encoder_stream.replace_src(pipeline_frame_receiver);
 
-                    (
-                        stream_index,
-                        encoder_frame_receiver,
-                        pipeline_frame_sender,
-                    )
+                    (stream_index, encoder_frame_receiver, pipeline_frame_sender)
                 }
             }
         }
@@ -194,11 +189,7 @@ fn match_encoder_stream(
             }
         },
     };
-    Ok((
-        stream_index,
-        encoder_frame_receiver,
-        pipeline_frame_sender,
-    ))
+    Ok((stream_index, encoder_frame_receiver, pipeline_frame_sender))
 }
 
 fn pipeline_init(
@@ -288,12 +279,9 @@ fn run_pipeline(
                 Ok(frame_box) => {
                     // filter frame
                     match pipeline.run_filters(frame_box.frame) {
-                        Ok(tmp_frame) => send_frame(
-                            pipeline,
-                            &mut frame_senders,
-                            frame_pool,
-                            tmp_frame,
-                        )?,
+                        Ok(tmp_frame) => {
+                            send_frame(pipeline, &mut frame_senders, frame_pool, tmp_frame)?
+                        }
                         Err(e) => {
                             error!(
                                 "Pipeline [index:{}] failed, during filter frame. error: {e}",
@@ -331,12 +319,9 @@ fn run_pipeline(
                 }
 
                 match pipeline.run_filters_from(i + 1, tmp_frame.unwrap()) {
-                    Ok(tmp_frame) => send_frame(
-                        pipeline,
-                        &mut frame_senders,
-                        frame_pool,
-                        tmp_frame,
-                    )?,
+                    Ok(tmp_frame) => {
+                        send_frame(pipeline, &mut frame_senders, frame_pool, tmp_frame)?
+                    }
                     Err(e) => {
                         error!(
                             "Pipeline [index:{}] failed, during filter frame. error: {e}",
@@ -419,7 +404,8 @@ fn send_frame(
             } else {
                 frame_box.frame_data.fg_input_index = *fg_input_index;
                 if let Err(_) = sender.send(frame_box) {
-                    debug!("Pipeline [index:{}] send frame failed, destination already finished",
+                    debug!(
+                        "Pipeline [index:{}] send frame failed, destination already finished",
                         pipeline.stream_index.unwrap_or(usize::MAX)
                     );
                     finished_senders.push(i);

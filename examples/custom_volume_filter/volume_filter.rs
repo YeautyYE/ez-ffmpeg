@@ -1,7 +1,7 @@
-use ffmpeg_next::Frame;
-use ffmpeg_sys_next::{av_frame_copy_props, av_frame_get_buffer, AVMediaType};
 use ez_ffmpeg::filter::frame_filter::FrameFilter;
 use ez_ffmpeg::filter::frame_filter_context::FrameFilterContext;
+use ffmpeg_next::Frame;
+use ffmpeg_sys_next::{av_frame_copy_props, av_frame_get_buffer, AVMediaType};
 
 pub struct VolumeFilter {
     volume: f32, // The volume gain factor (e.g., 1.0 for no change, 2.0 for doubling the volume)
@@ -10,7 +10,10 @@ pub struct VolumeFilter {
 
 impl VolumeFilter {
     pub fn new(volume: f32) -> Self {
-        Self { volume, resampler: None }
+        Self {
+            volume,
+            resampler: None,
+        }
     }
 }
 
@@ -21,7 +24,7 @@ impl FrameFilter for VolumeFilter {
 
     fn filter_frame(
         &mut self,
-        mut frame: Frame, // The input audio frame to be processed
+        mut frame: Frame,          // The input audio frame to be processed
         _ctx: &FrameFilterContext, // Context of the filter (not used here)
     ) -> Result<Option<Frame>, String> {
         unsafe {
@@ -51,7 +54,7 @@ impl FrameFilter for VolumeFilter {
                 ffmpeg_next::util::channel_layout::ChannelLayout::STEREO,
                 sample_rate as u32,
             )
-                .map_err(|e| format!("failed to create resampler: {:?}", e))?;
+            .map_err(|e| format!("failed to create resampler: {:?}", e))?;
             self.resampler = Some(resampler);
         }
 
@@ -62,22 +65,32 @@ impl FrameFilter for VolumeFilter {
                 let mut resample_frame = unsafe { Frame::empty() };
                 unsafe {
                     if resample_frame.as_ptr().is_null() {
-                        return Err("failed to create resample_frame frame: Out of memory.".to_string());
+                        return Err(
+                            "failed to create resample_frame frame: Out of memory.".to_string()
+                        );
                     }
 
                     let mut ret = av_frame_copy_props(resample_frame.as_mut_ptr(), frame.as_ptr());
                     if ret < 0 {
-                        return Err(format!("failed to copy properties. ret:{}", av_err2str(ret)));
+                        return Err(format!(
+                            "failed to copy properties. ret:{}",
+                            av_err2str(ret)
+                        ));
                     }
 
                     (*resample_frame.as_mut_ptr()).sample_rate = sample_rate;
-                    (*resample_frame.as_mut_ptr()).format = ffmpeg_sys_next::AVSampleFormat::AV_SAMPLE_FMT_FLTP as i32;
+                    (*resample_frame.as_mut_ptr()).format =
+                        ffmpeg_sys_next::AVSampleFormat::AV_SAMPLE_FMT_FLTP as i32;
                     (*resample_frame.as_mut_ptr()).nb_samples = nb_samples;
-                    (*resample_frame.as_mut_ptr()).ch_layout = ffmpeg_next::util::channel_layout::ChannelLayout::STEREO.into();
+                    (*resample_frame.as_mut_ptr()).ch_layout =
+                        ffmpeg_next::util::channel_layout::ChannelLayout::STEREO.into();
 
                     ret = av_frame_get_buffer(resample_frame.as_mut_ptr(), 0);
                     if ret < 0 {
-                        return Err(format!("failed to allocate buffer for resample_frame. {}", av_err2str(ret)));
+                        return Err(format!(
+                            "failed to allocate buffer for resample_frame. {}",
+                            av_err2str(ret)
+                        ));
                     }
 
                     // Perform resampling
@@ -114,11 +127,11 @@ impl FrameFilter for VolumeFilter {
     }
 }
 
+use ez_ffmpeg::util::ffmpeg_utils::av_err2str;
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use std::arch::x86_64::*;
-use ez_ffmpeg::util::ffmpeg_utils::av_err2str;
 
 // SIMD-based volume adjustment
 #[inline]
@@ -213,5 +226,7 @@ pub fn plane(frame: &Frame, channel: usize) -> &[f32] {
 #[inline]
 pub fn plane_mut(frame: &Frame, channel: usize) -> &mut [f32] {
     let num_samples = unsafe { (*frame.as_ptr()).nb_samples } as usize;
-    unsafe { std::slice::from_raw_parts_mut((*frame.as_ptr()).data[channel] as *mut f32, num_samples) }
+    unsafe {
+        std::slice::from_raw_parts_mut((*frame.as_ptr()).data[channel] as *mut f32, num_samples)
+    }
 }

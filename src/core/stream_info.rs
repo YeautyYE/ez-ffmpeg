@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::ptr::{null, null_mut};
 
+use crate::core::context::AVFormatContextBox;
+use crate::error::{FindStreamError, OpenInputError, Result};
 #[cfg(not(feature = "docs-rs"))]
 use ffmpeg_sys_next::AVChannelOrder;
 use ffmpeg_sys_next::AVMediaType::{
@@ -13,8 +15,6 @@ use ffmpeg_sys_next::{
     AVCodecID, AVDictionary, AVDictionaryEntry, AVRational,
 };
 use ffmpeg_sys_next::{avformat_alloc_context, avformat_close_input, avformat_open_input};
-use crate::core::context::AVFormatContextBox;
-use crate::error::{FindStreamError, OpenInputError, Result};
 
 #[derive(Debug, Clone)]
 pub enum StreamInfo {
@@ -232,8 +232,14 @@ pub fn find_video_stream_info(url: impl Into<String>) -> Result<Option<StreamInf
     let in_fmt_ctx_box = init_format_context(url)?;
 
     unsafe {
-        let video_index =
-            av_find_best_stream(in_fmt_ctx_box.fmt_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, null_mut(), 0);
+        let video_index = av_find_best_stream(
+            in_fmt_ctx_box.fmt_ctx,
+            AVMEDIA_TYPE_VIDEO,
+            -1,
+            -1,
+            null_mut(),
+            0,
+        );
         if video_index < 0 {
             return Ok(None);
         }
@@ -320,8 +326,14 @@ pub fn find_audio_stream_info(url: impl Into<String>) -> Result<Option<StreamInf
     let in_fmt_ctx_box = init_format_context(url)?;
 
     unsafe {
-        let audio_index =
-            av_find_best_stream(in_fmt_ctx_box.fmt_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, null_mut(), 0);
+        let audio_index = av_find_best_stream(
+            in_fmt_ctx_box.fmt_ctx,
+            AVMEDIA_TYPE_AUDIO,
+            -1,
+            -1,
+            null_mut(),
+            0,
+        );
         if audio_index < 0 {
             return Ok(None);
         }
@@ -398,8 +410,14 @@ pub fn find_subtitle_stream_info(url: impl Into<String>) -> Result<Option<Stream
     let in_fmt_ctx_box = init_format_context(url)?;
 
     unsafe {
-        let subtitle_index =
-            av_find_best_stream(in_fmt_ctx_box.fmt_ctx, AVMEDIA_TYPE_SUBTITLE, -1, -1, null_mut(), 0);
+        let subtitle_index = av_find_best_stream(
+            in_fmt_ctx_box.fmt_ctx,
+            AVMEDIA_TYPE_SUBTITLE,
+            -1,
+            -1,
+            null_mut(),
+            0,
+        );
         if subtitle_index < 0 {
             return Ok(None);
         }
@@ -457,7 +475,14 @@ pub fn find_data_stream_info(url: impl Into<String>) -> Result<Option<StreamInfo
     let in_fmt_ctx_box = init_format_context(url)?;
 
     unsafe {
-        let data_index = av_find_best_stream(in_fmt_ctx_box.fmt_ctx, AVMEDIA_TYPE_DATA, -1, -1, null_mut(), 0);
+        let data_index = av_find_best_stream(
+            in_fmt_ctx_box.fmt_ctx,
+            AVMEDIA_TYPE_DATA,
+            -1,
+            -1,
+            null_mut(),
+            0,
+        );
         if data_index < 0 {
             return Ok(None);
         }
@@ -502,8 +527,14 @@ pub fn find_attachment_stream_info(url: impl Into<String>) -> Result<Option<Stre
     let in_fmt_ctx_box = init_format_context(url)?;
 
     unsafe {
-        let attachment_index =
-            av_find_best_stream(in_fmt_ctx_box.fmt_ctx, AVMEDIA_TYPE_ATTACHMENT, -1, -1, null_mut(), 0);
+        let attachment_index = av_find_best_stream(
+            in_fmt_ctx_box.fmt_ctx,
+            AVMEDIA_TYPE_ATTACHMENT,
+            -1,
+            -1,
+            null_mut(),
+            0,
+        );
         if attachment_index < 0 {
             return Ok(None);
         }
@@ -550,8 +581,14 @@ pub fn find_unknown_stream_info(url: impl Into<String>) -> Result<Option<StreamI
     let in_fmt_ctx_box = init_format_context(url)?;
 
     unsafe {
-        let unknown_index =
-            av_find_best_stream(in_fmt_ctx_box.fmt_ctx, AVMEDIA_TYPE_UNKNOWN, -1, -1, null_mut(), 0);
+        let unknown_index = av_find_best_stream(
+            in_fmt_ctx_box.fmt_ctx,
+            AVMEDIA_TYPE_UNKNOWN,
+            -1,
+            -1,
+            null_mut(),
+            0,
+        );
         if unknown_index < 0 {
             return Ok(None);
         }
@@ -735,7 +772,10 @@ pub fn find_all_stream_infos(url: impl Into<String>) -> Result<Vec<StreamInfo>> 
             }
         }
 
-        if infos.iter().all(|i| matches!(i, StreamInfo::Unknown { .. })) {
+        if infos
+            .iter()
+            .all(|i| matches!(i, StreamInfo::Unknown { .. }))
+        {
             return Err(FindStreamError::NoStreamFound.into());
         }
 

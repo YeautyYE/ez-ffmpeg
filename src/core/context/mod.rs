@@ -11,7 +11,6 @@ use ffmpeg_sys_next::{
 use std::ffi::c_void;
 use std::ptr::null_mut;
 
-
 /// The **ffmpeg_context** module is responsible for assembling FFmpeg’s configuration:
 /// inputs, outputs, codecs, filters, and other parameters needed to construct a
 /// complete media processing pipeline.
@@ -133,7 +132,6 @@ pub mod output;
 /// // my_filters.set_hw_device("cuda");
 /// ```
 pub mod filter_complex;
-
 
 pub(super) mod decoder_stream;
 pub(super) mod demuxer;

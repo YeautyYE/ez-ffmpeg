@@ -1,6 +1,6 @@
-use std::collections::VecDeque;
 use bytes::Bytes;
 use rml_rtmp::time::RtmpTimestamp;
+use std::collections::VecDeque;
 
 #[derive(Clone)]
 pub(crate) enum FrameData {

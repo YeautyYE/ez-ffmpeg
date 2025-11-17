@@ -11,6 +11,7 @@ use crate::core::scheduler::ffmpeg_scheduler::{
 use crate::core::scheduler::input_controller::{InputController, SchNode};
 use crate::error::{Error, FilterGraphError, FilterGraphOperationError, FilterGraphParseError};
 use crate::hwaccel::{hw_device_for_filter, init_filter_hw_device, HWDevice};
+use crate::util::ffmpeg_utils::av_err2str;
 use crate::util::ffmpeg_utils::av_rescale_q_rnd;
 use crossbeam_channel::{RecvTimeoutError, Sender};
 use ffmpeg_next::Frame;
@@ -34,8 +35,8 @@ use ffmpeg_sys_next::{
     av_color_space_name, av_dict_free, av_frame_alloc, av_frame_free, av_frame_get_side_data,
     av_frame_ref, av_frame_remove_side_data, av_freep, av_get_pix_fmt_name, av_get_sample_fmt_name,
     av_inv_q, av_log2, av_malloc, av_opt_find, av_opt_set, av_opt_set_bin, av_opt_set_int,
-    av_pix_fmt_desc_get, av_q2d, av_rescale_q, avfilter_get_by_name,
-    avfilter_graph_alloc, avfilter_graph_config, avfilter_graph_create_filter, avfilter_graph_free,
+    av_pix_fmt_desc_get, av_q2d, av_rescale_q, avfilter_get_by_name, avfilter_graph_alloc,
+    avfilter_graph_config, avfilter_graph_create_filter, avfilter_graph_free,
     avfilter_graph_request_oldest, avfilter_inout_free, avfilter_link, avfilter_pad_get_type,
     avio_close, avio_closep, avio_open, avio_open2, avio_read, avio_read_to_bprint, avio_size,
     AVBPrint, AVBufferRef, AVColorRange, AVColorSpace, AVFilterContext, AVFilterGraph,
@@ -62,7 +63,6 @@ use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use crate::util::ffmpeg_utils::av_err2str;
 
 pub(crate) fn filter_graph_init(
     fg_index: usize,
@@ -160,7 +160,7 @@ pub(crate) fn filter_graph_init(
 
                 if input_index < finished_flag_list.len() {
                     if finished_flag_list[input_index].load(Ordering::Acquire) {
-                       continue;
+                        continue;
                     }
                 } else {
                     unreachable!()
@@ -185,7 +185,11 @@ pub(crate) fn filter_graph_init(
                             &frame_pool,
                         ) {
                             match e {
-                                Error::FilterGraph(FilterGraphOperationError::BufferSourceAddFrameError(FilterGraphError::EOF)) => {
+                                Error::FilterGraph(
+                                    FilterGraphOperationError::BufferSourceAddFrameError(
+                                        FilterGraphError::EOF,
+                                    ),
+                                ) => {
                                     debug!("Input {} no longer accepts new data", input_index);
                                     filter_receive_finish(&finished_flag_list, input_index);
                                 }
@@ -209,7 +213,11 @@ pub(crate) fn filter_graph_init(
                             &frame_pool,
                         ) {
                             match e {
-                                Error::FilterGraph(FilterGraphOperationError::BufferSourceAddFrameError(FilterGraphError::EOF)) => {
+                                Error::FilterGraph(
+                                    FilterGraphOperationError::BufferSourceAddFrameError(
+                                        FilterGraphError::EOF,
+                                    ),
+                                ) => {
                                     debug!("Input {} no longer accepts new data", input_index);
                                     filter_receive_finish(&finished_flag_list, input_index);
                                 }
@@ -1234,7 +1242,10 @@ unsafe fn fg_read_frames(
             if ret == AVERROR_EOF {
                 trace!("Filtergraph returned EOF, finishing");
             } else {
-                error!("Error requesting a frame from the filtergraph: {}", av_err2str(ret));
+                error!(
+                    "Error requesting a frame from the filtergraph: {}",
+                    av_err2str(ret)
+                );
             }
             return ret;
         }
@@ -1314,7 +1325,10 @@ unsafe fn fg_output_step(
         return 1;
     } else if ret < 0 {
         frame_pool.release(frame);
-        warn!("Error in retrieving a frame from the filtergraph: {}", av_err2str(ret));
+        warn!(
+            "Error in retrieving a frame from the filtergraph: {}",
+            av_err2str(ret)
+        );
         return ret;
     }
 

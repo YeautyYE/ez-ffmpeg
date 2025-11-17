@@ -19,7 +19,10 @@ fn main() {
     FfmpegContext::builder()
         .input("test.mp4") // Input video file (audio will be processed)
         .output(Output::from("output.mp4").add_frame_pipeline(frame_pipeline_builder)) // Output file with applied filter
-        .build().unwrap() // Build the FFmpeg context
-        .start().unwrap() // Start the FFmpeg processing
-        .wait().unwrap(); // Wait for the process to finish
+        .build()
+        .unwrap() // Build the FFmpeg context
+        .start()
+        .unwrap() // Start the FFmpeg processing
+        .wait()
+        .unwrap(); // Wait for the process to finish
 }
