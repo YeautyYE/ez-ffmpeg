@@ -47,6 +47,7 @@ use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::ffi::{c_uint, c_void, CStr, CString};
 use std::ptr::{null, null_mut};
+use std::str::FromStr;
 use std::sync::Arc;
 
 pub struct FfmpegContext {
@@ -162,6 +163,124 @@ impl FfmpegContext {
 }
 
 const START_AT_ZERO:bool = false;
+
+#[derive(Debug, Clone)]
+struct StreamSpec {
+    input: Option<u32>,
+    media_type: Option<AVMediaType>,
+    stream_index: Option<u32>,
+    optional: bool,
+}
+
+#[derive(Debug, Clone)]
+enum StreamSpecComponent {
+    MediaType {
+        media_type: AVMediaType,
+        optional: bool,
+    },
+    Index(u32),
+}
+
+impl FromStr for StreamSpec {
+    type Err = Error;
+    fn from_str(value: &str) -> Result<StreamSpec> {
+        let value = if value.starts_with("[") && value.ends_with("]") {
+            &value[1..value.len() - 1]
+        } else {
+            value
+        };
+        let res = value.split(':').map(StreamSpecComponent::from_str).fold(
+            Ok(StreamSpec::default()),
+            |res, comp| {
+                let mut res = res?;
+                let comp = comp?;
+                match comp {
+                    StreamSpecComponent::MediaType {
+                        media_type,
+                        optional,
+                    } => {
+                        if res.media_type.is_some() {
+                            Err(OpenOutputError::InvalidLabelExtraMediaType(value.into()).into())
+                        } else {
+                            res.media_type = Some(media_type);
+                            res.optional = optional;
+                            Ok(res)
+                        }
+                    }
+                    StreamSpecComponent::Index(i) => {
+                        if res.input.is_none() {
+                            res.input = Some(i);
+                            Ok(res)
+                        } else if res.stream_index.is_none() {
+                            res.stream_index = Some(i);
+                            Ok(res)
+                        } else {
+                            Err(OpenOutputError::InvalidLabelExtraIndex(value.into()).into())
+                        }
+                    }
+                }
+            },
+        );
+        if let Ok(res) = res {
+            if res.input.is_none() && res.media_type.is_none() {
+                Err(OpenOutputError::EmptyLabel.into())
+            } else {
+                Ok(res)
+            }
+        } else {
+            res
+        }
+    }
+}
+
+impl Default for StreamSpec {
+    fn default() -> Self {
+        Self {
+            input: None,
+            media_type: None,
+            stream_index: None,
+            optional: false,
+        }
+    }
+}
+
+impl FromStr for StreamSpecComponent {
+    type Err = Error;
+    fn from_str(value: &str) -> Result<Self> {
+        if let Ok(value) = value.parse::<u32>() {
+            return Ok(Self::Index(value));
+        }
+        if value.len() > 2 {
+            return Err(OpenOutputError::InvalidLabelComponent(value.into()).into());
+        }
+
+        let optional = if let Some(c) = value.chars().nth(1) {
+            if c == '?' {
+                true
+            } else {
+                return Err(OpenOutputError::InvalidLabelComponent(value.into()).into());
+            }
+        } else {
+            false
+        };
+        let media_type = if let Some(c) = value.chars().nth(0) {
+            match c {
+                'v' => AVMEDIA_TYPE_VIDEO,
+                'a' => AVMEDIA_TYPE_AUDIO,
+                's' => AVMEDIA_TYPE_SUBTITLE,
+                'd' => AVMEDIA_TYPE_DATA,
+                't' => AVMEDIA_TYPE_ATTACHMENT,
+                _ => return Err(OpenOutputError::InvalidMediaType(c.into()).into()),
+            }
+        } else {
+            return Err(OpenOutputError::EmptyLabelComponent.into());
+        };
+        Ok(Self::MediaType {
+            media_type,
+            optional,
+        })
+    }
+}
 
 fn correct_input_start_times(demuxs: &mut Vec<Demuxer>, copy_ts: bool){
     for (i, demux) in demuxs.iter_mut().enumerate() {
@@ -807,44 +926,56 @@ fn output_find_input_idx_by_linklabel(
     demuxs: &mut Vec<Demuxer>,
     desc: &str,
 ) -> Result<Option<(usize, usize, AVMediaType)>> {
-    let new_linklabel = if linklabel.starts_with("[") && linklabel.ends_with("]") {
-        if linklabel.len() <= 2 {
-            warn!("Output linklabel is empty");
-            return Err(OpenOutputError::InvalidArgument.into());
-        } else {
-            &linklabel[1..linklabel.len() - 1]
-        }
+    let streamspec = linklabel.parse::<StreamSpec>()?;
+
+    let file_idx = if let Some(file_idx) = streamspec.input {
+        file_idx as usize
     } else {
-        linklabel
+        warn!("Specifing linklable without input index not supported");
+        return Err(OpenOutputError::NotImplemented.into());
     };
 
-    let (file_idx, remainder) = strtol(new_linklabel)?;
-    if file_idx < 0 || file_idx as usize >= demuxs.len() {
+    if file_idx as usize >= demuxs.len() {
         return Err(InvalidFileIndexInIntput(file_idx as usize, desc.to_string()).into());
     }
 
-    let (media_type, allow_unused) = stream_specifier_parse(remainder)?;
+    if streamspec.stream_index.is_none() && streamspec.media_type.is_none() {
+        warn!("Output linklabel has to have either stream_index or media_type");
+        return Err(OpenOutputError::InvalidArgument.into());
+    }
 
-    let demux = &demuxs[file_idx as usize];
+    let mut spec_stream_index = streamspec.stream_index.unwrap_or(0);
 
-    let mut stream_idx = -1i32;
+    let demux = &demuxs[file_idx];
+
+    let mut stream_ref = None;
 
     for (idx, dec_stream) in demux.get_streams().iter().enumerate() {
-        if (*dec_stream).codec_type == media_type {
-            stream_idx = idx as i32;
-            break;
+        let matched = if let Some(media_type) = streamspec.media_type {
+            dec_stream.codec_type == media_type
+        } else {
+            true
+        };
+        if matched {
+            if spec_stream_index == 0 {
+                stream_ref = Some((idx, dec_stream.codec_type));
+                break;
+            } else {
+                spec_stream_index -= 1;
+            }
         }
     }
 
-    if stream_idx < 0 {
-        if allow_unused {
-            return Ok(None);
+    if let Some((stream_idx, media_type)) = stream_ref {
+        Ok(Some((file_idx, stream_idx, media_type)))
+    } else {
+        if streamspec.optional {
+            Ok(None)
+        } else {
+            warn!("Stream specifier '{linklabel}' in output {desc} matches no streams.");
+            Err(OpenOutputError::MatchesNoStreams(linklabel.to_string()).into())
         }
-
-        warn!("Stream specifier '{remainder}' in output {desc} matches no streams.");
-        return Err(OpenOutputError::MatchesNoStreams(linklabel.to_string()).into());
     }
-    Ok(Some((file_idx as usize, stream_idx as usize, media_type)))
 }
 
 fn map_auto_streams(
