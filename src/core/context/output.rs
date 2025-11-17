@@ -306,7 +306,7 @@ pub struct Output {
 
 }
 
-#[derive(Copy, Clone, PartialEq)]
+#[derive(Copy, Clone, PartialEq, Debug)]
 pub enum VSyncMethod {
     VsyncAuto,
     VsyncCfr,
@@ -612,8 +612,8 @@ impl Output {
     /// let output = Output::from("output.mp4")
     ///     .add_stream_map("0:v");
     /// ```
-    pub fn add_stream_map(mut self, linklabel: impl Into<String>) -> Self {
-        self.stream_maps.push(linklabel.into().into());
+    pub fn add_stream_map(mut self, stream_map: impl Into<StreamMap>) -> Self {
+        self.stream_maps.push(stream_map.into());
         self
     }
 
@@ -648,11 +648,10 @@ impl Output {
     /// let output = Output::from("output.mkv")
     ///     .add_stream_map_with_copy("0:a?");
     /// ```
-    pub fn add_stream_map_with_copy(mut self, linklabel: impl Into<String>) -> Self {
-        self.stream_maps.push(StreamMap {
-            linklabel: linklabel.into(),
-            copy: true,
-        });
+    pub fn add_stream_map_with_copy(mut self, stream_map: impl Into<StreamMap>) -> Self {
+        let mut stream_map = stream_map.into();
+        stream_map.set_copy(true);
+        self.stream_maps.push(stream_map);
         self
     }
 
@@ -1287,9 +1286,23 @@ impl From<&str> for Output {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct StreamMap {
+pub struct StreamMap {
     pub(crate) linklabel: String,
     pub(crate) copy: bool,
+
+    pub(crate) codec: Option<String>,
+    pub(crate) start_time_us: Option<i64>,
+    pub(crate) recording_time_us: Option<i64>,
+    pub(crate) stop_time_us: Option<i64>,
+    pub(crate) framerate: Option<AVRational>,
+    pub(crate) vsync_method: VSyncMethod,
+    pub(crate) bits_per_raw_sample: Option<i32>,
+    pub(crate) sample_rate: Option<i32>,
+    pub(crate) channels: Option<i32>,
+    pub(crate) sample_fmt: Option<AVSampleFormat>,
+    pub(crate) qscale: Option<i32>,
+    pub(crate) max_frames: Option<i64>,
+    pub(crate) codec_opts: Option<HashMap<String, String>>,
 }
 
 impl<T: Into<String>> From<T> for StreamMap {
@@ -1297,6 +1310,99 @@ impl<T: Into<String>> From<T> for StreamMap {
         Self {
             linklabel: linklabel.into(),
             copy: false,
+
+            codec: None,
+            start_time_us: None,
+            recording_time_us: None,
+            stop_time_us: None,
+            framerate: None,
+            vsync_method: VSyncMethod::VsyncAuto,
+            bits_per_raw_sample: None,
+            sample_rate: None,
+            channels: None,
+            sample_fmt: None,
+            qscale: None,
+            max_frames: None,
+            codec_opts: None,
+        }
+    }
+}
+
+impl StreamMap {
+    pub fn set_copy(&mut self, copy: bool) {
+        self.copy = copy;
+        self.assert_copy();
+    }
+    pub fn set_codec(&mut self, codec: impl Into<String>) {
+        self.codec = Some(codec.into());
+        self.assert_copy();
+    }
+    pub fn set_start_time_us(&mut self, start_time_us: impl Into<i64>) {
+        self.start_time_us = Some(start_time_us.into());
+        self.assert_copy();
+    }
+    pub fn set_recording_time_us(&mut self, recording_time_us: impl Into<i64>) {
+        self.recording_time_us = Some(recording_time_us.into());
+        self.assert_copy();
+    }
+    pub fn set_stop_time_us(&mut self, stop_time_us: impl Into<i64>) {
+        self.stop_time_us = Some(stop_time_us.into());
+        self.assert_copy();
+    }
+    pub fn set_framerate(&mut self, framerate: impl Into<AVRational>) {
+        self.framerate = Some(framerate.into());
+        self.assert_copy();
+    }
+    pub fn set_vsync_method(&mut self, vsync_method: impl Into<VSyncMethod>) {
+        self.vsync_method = vsync_method.into();
+        self.assert_copy();
+    }
+    pub fn set_bits_per_raw_sample(&mut self, bits_per_raw_sample: impl Into<i32>) {
+        self.bits_per_raw_sample = Some(bits_per_raw_sample.into());
+        self.assert_copy();
+    }
+    pub fn set_sample_rate(&mut self, sample_rate: impl Into<i32>) {
+        self.sample_rate = Some(sample_rate.into());
+        self.assert_copy();
+    }
+    pub fn set_channels(&mut self, channels: impl Into<i32>) {
+        self.channels = Some(channels.into());
+        self.assert_copy();
+    }
+    pub fn set_sample_fmt(&mut self, sample_fmt: impl Into<AVSampleFormat>) {
+        self.sample_fmt = Some(sample_fmt.into());
+        self.assert_copy();
+    }
+    pub fn set_qscale(&mut self, qscale: impl Into<i32>) {
+        self.qscale = Some(qscale.into());
+        self.assert_copy();
+    }
+    pub fn set_max_frames(&mut self, max_frames: impl Into<i64>) {
+        self.max_frames = Some(max_frames.into());
+        self.assert_copy();
+    }
+    pub fn set_codec_opts(&mut self, codec_opts: impl Into<HashMap<String, String>>) {
+        self.codec_opts = Some(codec_opts.into());
+        self.assert_copy();
+    }
+
+    fn assert_copy(&self) {
+        if self.copy {
+            assert!(
+                self.codec.is_none()
+                    && self.start_time_us.is_none()
+                    && self.recording_time_us.is_none()
+                    && self.stop_time_us.is_none()
+                    && self.framerate.is_none()
+                    && self.vsync_method == VSyncMethod::VsyncAuto
+                    && self.bits_per_raw_sample.is_none()
+                    && self.sample_rate.is_none()
+                    && self.channels.is_none()
+                    && self.sample_fmt.is_none()
+                    && self.qscale.is_none()
+                    && self.max_frames.is_none()
+                    && self.codec_opts.is_none()
+            );
         }
     }
 }
