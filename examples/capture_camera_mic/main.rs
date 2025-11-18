@@ -72,7 +72,8 @@ fn main() {
             .set_format("alsa");
 
         let scheduler = FfmpegContext::builder()
-            .input(input)
+            .input(video_input)
+            .input(audio_input)
             .output(output)
             .build().unwrap()
             .start().unwrap();
