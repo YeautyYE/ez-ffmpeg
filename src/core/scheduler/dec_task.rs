@@ -321,12 +321,19 @@ unsafe fn transcode_subtitles(
 
     let dp = dp_arc.clone();
     let mut dp = dp.lock().unwrap();
-    let subtitle = null_mut();
-    let got_output = null_mut();
+    let mut subtitle = AVSubtitle {
+        format: 0,
+        start_display_time: 0,
+        end_display_time: 0,
+        num_rects: 0,
+        rects: null_mut(),
+        pts: 0,
+    };
+    let mut got_output: libc::c_int = 0;
     let ret = avcodec_decode_subtitle2(
         dp.dec_ctx.as_mut_ptr(),
-        subtitle,
-        got_output,
+        &mut subtitle,
+        &mut got_output,
         packet_box.packet.as_mut_ptr(),
     );
     packet_pool.release(packet_box.packet);
@@ -340,7 +347,7 @@ unsafe fn transcode_subtitles(
         };
     }
 
-    if *got_output == 0 {
+    if got_output == 0 {
         return if !packet_is_eof {
             Ok(())
         } else {
@@ -359,8 +366,8 @@ unsafe fn transcode_subtitles(
     // on AVFrames, so we wrap AVSubtitle in an AVBufferRef and put that
     // inside the frame
     // eventually, subtitles should be switched to use AVFrames natively
-    if let Err(e) = subtitle_wrap_frame(frame.as_mut_ptr(), subtitle, false) {
-        avsubtitle_free(subtitle);
+    if let Err(e) = subtitle_wrap_frame(frame.as_mut_ptr(), &mut subtitle, false) {
+        avsubtitle_free(&mut subtitle);
         return Err(e);
     }
 

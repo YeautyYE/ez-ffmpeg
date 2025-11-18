@@ -26,6 +26,7 @@ use ffmpeg_sys_next::AVSideDataProps::AV_SIDE_DATA_PROP_GLOBAL;
 #[cfg(not(feature = "docs-rs"))]
 use ffmpeg_sys_next::{av_channel_layout_copy, av_frame_side_data_clone, av_frame_side_data_desc, AV_CODEC_FLAG_COPY_OPAQUE, AV_CODEC_FLAG_FRAME_DURATION, AV_FRAME_FLAG_INTERLACED, AV_FRAME_FLAG_TOP_FIELD_FIRST, AV_FRAME_SIDE_DATA_FLAG_UNIQUE};
 use ffmpeg_sys_next::{av_add_q, av_buffer_ref, av_compare_ts, av_cpu_max_align, av_frame_copy_props, av_frame_get_buffer, av_frame_ref, av_get_bytes_per_sample, av_get_pix_fmt_name, av_opt_set_dict2, av_pix_fmt_desc_get, av_rescale_q, av_sample_fmt_is_planar, av_samples_copy, av_shrink_packet, avcodec_alloc_context3, avcodec_encode_subtitle, avcodec_get_hw_config, avcodec_open2, avcodec_parameters_from_context, avcodec_receive_packet, avcodec_send_frame, AVBufferRef, AVCodecContext, AVFrame, AVHWFramesContext, AVMediaType, AVRational, AVStream, AVSubtitle, AVERROR, AVERROR_EOF, AVERROR_EXPERIMENTAL, AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE, AV_CODEC_CAP_PARAM_CHANGE, AV_CODEC_FLAG_INTERLACED_DCT, AV_CODEC_FLAG_INTERLACED_ME, AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX, AV_CODEC_HW_CONFIG_METHOD_HW_FRAMES_CTX, AV_NOPTS_VALUE, AV_OPT_SEARCH_CHILDREN, AV_PKT_FLAG_TRUSTED, AV_TIME_BASE_Q, EAGAIN};
+use ffmpeg_sys_next::av_mallocz;
 use log::{debug, error, info, trace, warn};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString};
@@ -820,8 +821,8 @@ fn enc_open(
                 if !frame_box.frame_data.subtitle_header.is_null() {
                     /* ASS code assumes this buffer is null terminated so add extra byte. */
                     let size = (frame_box.frame_data.subtitle_header_size + 1) as usize;
-                    let subtitle_header = vec![0u8; size];
-                    (*enc_ctx).subtitle_header = subtitle_header.as_ptr() as *mut u8;
+                    let subtitle_header = av_mallocz(size) as *mut u8;
+                    (*enc_ctx).subtitle_header = subtitle_header;
                     if (*enc_ctx).subtitle_header.is_null() {
                         return Err(OpenEncoder(
                             OpenEncoderOperationError::SettingSubtitleError(
