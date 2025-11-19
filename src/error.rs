@@ -647,6 +647,24 @@ pub enum OpenOutputError {
 
     #[error("Format '{0}' is unsupported")]
     FormatUnsupported(String),
+
+    #[error("Invalid label {0} have more then 2 indecies")]
+    InvalidLabelExtraIndex(String),
+
+    #[error("Invalid label {0} have more then 1 media type specifiers")]
+    InvalidLabelExtraMediaType(String),
+
+    #[error("Label is empty")]
+    EmptyLabel,
+
+    #[error("Label component is empty")]
+    EmptyLabelComponent,
+
+    #[error("Invalid label component {0}")]
+    InvalidLabelComponent(String),
+
+    #[error("Invalid media type {0}")]
+    InvalidMediaType(String),
 }
 
 impl From<i32> for OpenOutputError {
