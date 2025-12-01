@@ -471,7 +471,7 @@ fn map_manual(
                     continue;
                 }
 
-                choose_encoder(mux, output_filter.media_type)?
+                choose_encoder(mux, output_filter.media_type, stream_map.codec.as_deref())?
             };
 
             match option {
@@ -530,7 +530,7 @@ fn map_manual(
     let demux_node = demux.node.clone();
     let input_stream = demux.get_stream_mut(stream_index);
 
-    let option = choose_encoder(mux, media_type)?;
+    let option = choose_encoder(mux, media_type, stream_map.codec.as_deref())?;
 
     let input_stream_duration = input_stream.duration;
     let input_stream_time_base = input_stream.time_base;
@@ -1081,7 +1081,7 @@ unsafe fn map_auto_subtitle(
             // Map dvb teletext which has neither property to any output subtitle encoder
             !input_descriptor.is_null() && !output_descriptor.is_null() &&
                 ((*input_descriptor).props == 0 || (*output_descriptor).props == 0) {
-            let option = choose_encoder(mux, AVMEDIA_TYPE_SUBTITLE)?;
+            let option = choose_encoder(mux, AVMEDIA_TYPE_SUBTITLE, None)?;
 
             if let Some((_codec_id, enc)) = option {
                 let (frame_sender, output_stream_index) =
@@ -1153,7 +1153,7 @@ unsafe fn map_auto_data(
         }
 
         let stream_index = option.unwrap();
-        let option = choose_encoder(mux, AVMEDIA_TYPE_DATA)?;
+        let option = choose_encoder(mux, AVMEDIA_TYPE_DATA, None)?;
 
         if let Some((_codec_id, enc)) = option {
             let (frame_sender, output_stream_index) =
@@ -1234,7 +1234,7 @@ unsafe fn map_auto_stream(
         }
 
         let stream_index = option.unwrap();
-        let option = choose_encoder(mux, media_type)?;
+        let option = choose_encoder(mux, media_type, None)?;
 
         if let Some((codec_id, enc)) = option {
             if media_type == AVMEDIA_TYPE_VIDEO || media_type == AVMEDIA_TYPE_AUDIO {
@@ -1475,7 +1475,7 @@ fn output_bind_by_unlabeled_filter(
                     continue;
                 }
 
-                choose_encoder(mux, output_filter.media_type)?
+                choose_encoder(mux, output_filter.media_type, None)?
             };
 
             let media_type = filter_graph.outputs[i].media_type;
@@ -1522,12 +1522,17 @@ fn ofilter_bind_ost(
 fn choose_encoder(
     mux: &Muxer,
     media_type: AVMediaType,
+    requested: Option<&str>,
 ) -> Result<Option<(AVCodecID, *const AVCodec)>> {
-    let media_codec = match media_type {
-        AVMEDIA_TYPE_VIDEO => mux.video_codec.clone(),
-        AVMEDIA_TYPE_AUDIO => mux.audio_codec.clone(),
-        AVMEDIA_TYPE_SUBTITLE => mux.subtitle_codec.clone(),
-        _ => return Ok(None),
+    let media_codec = if let Some(media_codec) = requested {
+        Some(media_codec.to_owned())
+    } else {
+        match media_type {
+            AVMEDIA_TYPE_VIDEO => mux.video_codec.clone(),
+            AVMEDIA_TYPE_AUDIO => mux.audio_codec.clone(),
+            AVMEDIA_TYPE_SUBTITLE => mux.subtitle_codec.clone(),
+            _ => return Ok(None),
+        }
     };
 
     match media_codec {

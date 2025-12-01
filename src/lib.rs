@@ -101,6 +101,7 @@ pub mod error;
 pub use self::core::context::ffmpeg_context::FfmpegContext;
 pub use self::core::context::input::Input;
 pub use self::core::context::output::Output;
+pub use self::core::context::output::StreamMap;
 pub use self::core::scheduler::ffmpeg_scheduler::FfmpegScheduler;
 pub use self::core::container_info;
 pub use self::core::stream_info;
