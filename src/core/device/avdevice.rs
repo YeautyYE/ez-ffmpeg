@@ -1,7 +1,7 @@
 use crate::error::FindDevicesError;
 use crate::error::FindDevicesError::MediaTypeSupported;
 use crate::error::FindDevicesError::OsNotSupported;
-use ffmpeg_sys_next::{av_input_audio_device_next, av_input_video_device_next, avdevice_free_list_devices, avdevice_list_input_sources, AVMediaType};
+use ffmpeg_sys_next::{avdevice_free_list_devices, avdevice_list_input_sources, AVMediaType};
 use std::ffi::CStr;
 use std::ptr::{null, null_mut};
 
@@ -12,7 +12,6 @@ pub fn find_input_video_device_list() -> crate::error::Result<Vec<String>> {
 pub fn find_input_audio_device_list() -> crate::error::Result<Vec<String>> {
     find_input_device_list(AVMediaType::AVMEDIA_TYPE_AUDIO)
 }
-
 
 fn find_input_device_list(media_type: AVMediaType) -> crate::error::Result<Vec<String>> {
     unsafe {
@@ -42,7 +41,8 @@ fn find_input_device_list(media_type: AVMediaType) -> crate::error::Result<Vec<S
             return Err(MediaTypeSupported(media_type as i32).into());
         };
 
-        let ret = avdevice_list_input_sources(null(), device_name.as_ptr(), null_mut(), &mut device_list);
+        let ret =
+            avdevice_list_input_sources(null(), device_name.as_ptr(), null_mut(), &mut device_list);
         if ret >= 0 && !device_list.is_null() {
             let nb_devices = (*device_list).nb_devices;
 
@@ -64,11 +64,9 @@ fn find_input_device_list(media_type: AVMediaType) -> crate::error::Result<Vec<S
                     continue;
                 }
 
-                let result = CStr::from_ptr((*device).device_description).to_str();
-                if let Err(e) = result {
-                    return Err(FindDevicesError::UTF8Error.into());
-                }
-                let device_description = result.unwrap();
+                let device_description = CStr::from_ptr((*device).device_description)
+                    .to_str()
+                    .map_err(|_| FindDevicesError::UTF8Error)?;
                 device_descriptions.push(device_description.to_string());
             }
         }

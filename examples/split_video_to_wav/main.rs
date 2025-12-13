@@ -17,12 +17,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .set_format_opt("segment_time", "10");
 
     // Build the FFmpeg context with the specified input and output
-    let context = FfmpegContext::builder()
+    let _context = FfmpegContext::builder()
         .input(input)
         .output(output)
-        .build().unwrap()
-        .start().unwrap()
-        .wait().unwrap();
+        .build()
+        .unwrap()
+        .start()
+        .unwrap()
+        .wait()
+        .unwrap();
 
     Ok(())
 }
