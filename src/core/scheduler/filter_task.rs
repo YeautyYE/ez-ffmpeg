@@ -995,16 +995,11 @@ unsafe fn configure_output_audio_filter(
     let abuffer_str = std::ffi::CString::new("abuffersink").unwrap();
     let abuffer_filter = avfilter_get_by_name(abuffer_str.as_ptr());
 
-    let ret = avfilter_graph_create_filter(
-        &mut ofp.filter,
-        abuffer_filter,
-        name.as_ptr(),
-        null(),
-        null_mut(),
-        graph,
-    );
-    if ret < 0 {
-        return ret;
+    // Use alloc_filter + init_str instead of create_filter so we can set
+    // options before initialization (all_channel_counts is not a runtime option)
+    ofp.filter = ffmpeg_sys_next::avfilter_graph_alloc_filter(graph, abuffer_filter, name.as_ptr());
+    if ofp.filter.is_null() {
+        return AVERROR(ENOMEM);
     }
 
     let all_channel_counts_str = std::ffi::CString::new("all_channel_counts").unwrap();
@@ -1014,6 +1009,11 @@ unsafe fn configure_output_audio_filter(
         1,
         AV_OPT_SEARCH_CHILDREN,
     );
+    if ret < 0 {
+        return ret;
+    }
+
+    ret = ffmpeg_sys_next::avfilter_init_str(ofp.filter, null());
     if ret < 0 {
         return ret;
     }
