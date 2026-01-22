@@ -1,7 +1,7 @@
 use crate::error::FindDevicesError;
 use crate::error::FindDevicesError::MediaTypeSupported;
 use crate::error::FindDevicesError::OsNotSupported;
-use ffmpeg_sys_next::{av_input_audio_device_next, av_input_video_device_next, avdevice_free_list_devices, avdevice_list_input_sources, AVMediaType};
+use ffmpeg_sys_next::{avdevice_free_list_devices, avdevice_list_input_sources, AVMediaType};
 use std::ffi::CStr;
 use std::ptr::{null, null_mut};
 
@@ -65,7 +65,7 @@ fn find_input_device_list(media_type: AVMediaType) -> crate::error::Result<Vec<S
                 }
 
                 let result = CStr::from_ptr((*device).device_description).to_str();
-                if let Err(e) = result {
+                if let Err(_e) = result {
                     return Err(FindDevicesError::UTF8Error.into());
                 }
                 let device_description = result.unwrap();
