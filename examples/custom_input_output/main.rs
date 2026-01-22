@@ -83,6 +83,7 @@ fn main() {
     };
 
     // Define the seek callback for the output file
+    #[allow(unreachable_patterns)]
     let seek_callback: Box<dyn FnMut(i64, i32) -> i64> = {
         let output_file = Arc::clone(&output_file);
         Box::new(move |offset: i64, whence: i32| -> i64 {
