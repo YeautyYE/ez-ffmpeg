@@ -1,4 +1,4 @@
-use crate::flv::{FLV_HEADER_LENGTH, FLV_TAG_HEADER_LENGTH, PREVIOUS_TAG_SIZE_LENGTH};
+use crate::flv::{FLV_HEADER_LENGTH, PREVIOUS_TAG_SIZE_LENGTH};
 
 #[derive(Debug)]
 pub struct FlvHeader {
