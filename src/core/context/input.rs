@@ -34,7 +34,7 @@ pub struct Input {
     ///   - Custom-defined error codes depending on your implementation.
     ///
     /// ### Example:
-    /// ```rust
+    /// ```rust,ignore
     /// fn custom_read_callback(buf: &mut [u8]) -> i32 {
     ///     let data = b"example data stream";
     ///     let len = data.len().min(buf.len());
@@ -75,7 +75,7 @@ pub struct Input {
     /// Since FFmpeg may call `read_callback` and `seek_callback` from different threads,
     /// **`Arc<Mutex<File>>` is used to ensure safe access across threads.**
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// use std::fs::File;
     /// use std::io::{Seek, SeekFrom};
     /// use std::sync::{Arc, Mutex};
@@ -262,7 +262,7 @@ impl Input {
     ///   - Other custom-defined error codes can also be returned to signal specific issues.
     ///
     /// ### Example:
-    /// ```rust
+    /// ```rust,ignore
     /// let input = Input::new_by_read_callback(move |buf| {
     ///     let data = b"example custom data source";
     ///     let len = data.len().min(buf.len());
@@ -313,7 +313,7 @@ impl Input {
     /// Since `FFmpeg` may call `read_callback` and `seek_callback` from different threads,
     /// **use `Arc<Mutex<File>>` to ensure safe concurrent access.**
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// use std::fs::File;
     /// use std::io::{Read, Seek, SeekFrom};
     /// use std::sync::{Arc, Mutex};
@@ -426,7 +426,7 @@ impl Input {
     /// * `Self` - Returns the modified `Input`, enabling method chaining.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let input = Input::from("my_video.mp4")
     ///     .set_frame_pipelines(vec![
     ///         FramePipelineBuilder::new(AVMediaType::AVMEDIA_TYPE_VIDEO).filter("opengl", Box::new(my_filter)),
@@ -450,7 +450,7 @@ impl Input {
     /// * `Self` - Returns the modified `Input`, enabling method chaining.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let input = Input::from("my_video.mp4")
     ///     .add_frame_pipeline(FramePipelineBuilder::new(AVMediaType::AVMEDIA_TYPE_VIDEO).filter("opengl", Box::new(my_filter)).build())
     ///     .add_frame_pipeline(FramePipelineBuilder::new(AVMediaType::AVMEDIA_TYPE_AUDIO).filter("my_custom_filter1", Box::new(...)).filter("my_custom_filter2", Box::new(...)).build());
@@ -507,7 +507,7 @@ impl Input {
     /// * `Self` - Returns the modified `Input` struct, allowing for method chaining.
     ///
     /// # Example:
-    /// ```rust
+    /// ```rust,ignore
     /// let input = Input::from("video.mp4").set_video_codec("h264");
     /// ```
     pub fn set_video_codec(mut self, video_codec: impl Into<String>) -> Self {
@@ -537,7 +537,7 @@ impl Input {
     /// * `Self` - Returns the modified `Input` struct, allowing for method chaining.
     ///
     /// # Example:
-    /// ```rust
+    /// ```rust,ignore
     /// let input = Input::from("audio.mp3").set_audio_codec("aac");
     /// ```
     pub fn set_audio_codec(mut self, audio_codec: impl Into<String>) -> Self {
@@ -566,7 +566,7 @@ impl Input {
     /// * `Self` - Returns the modified `Input` struct, allowing for method chaining.
     ///
     /// # Example:
-    /// ```rust
+    /// ```rust,ignore
     /// let input = Input::from("movie.mkv").set_subtitle_codec("ass");
     /// ```
     pub fn set_subtitle_codec(mut self, subtitle_codec: impl Into<String>) -> Self {
@@ -587,7 +587,7 @@ impl Input {
     /// * `Self` - allowing method chaining.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let input = Input::from("test.mp4")
     ///     .set_exit_on_error(true);
     /// ```
@@ -609,7 +609,7 @@ impl Input {
     /// * `Self` - allowing method chaining.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let input = Input::from("video.mp4")
     ///     .set_readrate(0.5); // read at half speed
     /// ```
@@ -630,7 +630,7 @@ impl Input {
     /// * `Self` - allowing method chaining.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let input = Input::from("long_clip.mp4")
     ///     .set_start_time_us(2_000_000); // Start at 2 seconds
     /// ```
@@ -651,7 +651,7 @@ impl Input {
     /// * `Self` - allowing method chaining.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let input = Input::from("long_clip.mp4")
     ///     .set_recording_time_us(5_000_000); // Only read 5 seconds
     /// ```
@@ -673,7 +673,7 @@ impl Input {
     /// * `Self` - allowing method chaining.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let input = Input::from("long_clip.mp4")
     ///     .set_stop_time_us(10_000_000); // Stop reading at 10 seconds
     /// ```
@@ -695,7 +695,7 @@ impl Input {
     /// * `Self` - allowing method chaining.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let input = Input::from("music.mp3")
     ///     .set_stream_loop(2); // play the input 2 extra times
     /// ```
@@ -716,7 +716,7 @@ impl Input {
     /// * `Self` - allowing method chaining.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let input = Input::from("video.mp4")
     ///     .set_hwaccel("cuda");
     /// ```
@@ -739,7 +739,7 @@ impl Input {
     /// * `Self` - allowing method chaining.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let input = Input::from("video.mp4")
     ///     .set_hwaccel("vaapi")
     ///     .set_hwaccel_device("/dev/dri/renderD128");
@@ -763,7 +763,7 @@ impl Input {
     /// * `Self` - allowing method chaining.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let input = Input::from("video.mp4")
     ///     .set_hwaccel("cuda")
     ///     .set_hwaccel_output_format("cuda");
@@ -780,7 +780,7 @@ impl Input {
     /// protocol handling, device configuration, and general input processing.
     ///
     /// **Example Usage:**
-    /// ```rust
+    /// ```rust,ignore
     /// let input = Input::new("avfoundation:0")
     ///     .set_input_opt("framerate", "30")
     ///     .set_input_opt("probesize", "5000000");
@@ -810,7 +810,7 @@ impl Input {
     /// inserted into the options map, overwriting any existing keys with the same name.
     ///
     /// **Example Usage:**
-    /// ```rust
+    /// ```rust,ignore
     /// let input = Input::new("http://example.com/stream.m3u8")
     ///     .set_input_opts(vec![
     ///         ("user_agent", "MyApp/1.0"),

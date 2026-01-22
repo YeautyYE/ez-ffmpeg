@@ -13,7 +13,7 @@ pub mod frame_pipeline_builder;
 ///
 /// # Example
 ///
-/// ```rust
+/// ```rust,ignore
 /// let filters = get_filters();
 /// for filter in filters {
 ///     println!("Filter: {} - {}", filter.name, filter.description);

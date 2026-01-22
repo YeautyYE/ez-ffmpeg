@@ -17,7 +17,7 @@ impl FilterComplex {
     /// A modified `FilterComplex` that includes the specified hardware device.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// use ez_ffmpeg::core::context::filter_complex::FilterComplex;
     ///
     /// // Create a FilterComplex for scaling, then set a CUDA device

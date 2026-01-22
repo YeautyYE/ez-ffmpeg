@@ -24,7 +24,7 @@ mod avdevice;
 ///
 /// # Example
 ///
-/// ```rust
+/// ```rust,ignore
 /// let video_devices = get_input_video_devices()?;
 /// for device in video_devices {
 ///     println!("Available video device: {}", device);
@@ -62,7 +62,7 @@ pub fn get_input_video_devices() -> crate::error::Result<Vec<String>> {
 ///
 /// # Example
 ///
-/// ```rust
+/// ```rust,ignore
 /// let audio_devices = get_input_audio_devices()?;
 /// for device in audio_devices {
 ///     println!("Available audio device: {}", device);

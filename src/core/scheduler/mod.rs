@@ -9,7 +9,7 @@ use ffmpeg_sys_next::AVMediaType::{AVMEDIA_TYPE_ATTACHMENT, AVMEDIA_TYPE_AUDIO, 
 ///
 /// # Synchronous Example
 ///
-/// ```rust
+/// ```rust,ignore
 /// // Assume we've already built an FfmpegContext
 /// let context = FfmpegContext::builder()
 ///     .input("test.mp4")

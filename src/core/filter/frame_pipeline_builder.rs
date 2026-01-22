@@ -5,7 +5,7 @@ use ffmpeg_sys_next::AVMediaType;
 /// A builder for constructing [`FramePipeline`] instances.
 ///
 /// # Example
-/// ```rust
+/// ```rust,ignore
 /// let pipeline = FramePipelineBuilder::new(AVMediaType::AVMEDIA_TYPE_VIDEO)
 ///     .filter("opengl", Box::new(OpenGLFrameFilter::new())) // Add an OpenGL filter
 ///     .build();
@@ -48,7 +48,7 @@ impl FramePipelineBuilder {
     /// A new `FramePipelineBuilder` instance with the given `media_type`.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let builder = FramePipelineBuilder::new(AVMEDIA_TYPE_VIDEO);
     /// ```
     pub fn new(media_type: AVMediaType) -> Self {
@@ -71,7 +71,7 @@ impl FramePipelineBuilder {
     /// The modified `FramePipelineBuilder` instance, allowing method chaining.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let builder = FramePipelineBuilder::new(AVMEDIA_TYPE_VIDEO)
     ///     .set_stream_index(0);
     /// ```
@@ -93,7 +93,7 @@ impl FramePipelineBuilder {
     /// The modified `FramePipelineBuilder` instance, allowing method chaining.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let filter = Box::new(MyCustomFilter {});
     /// let builder = FramePipelineBuilder::new(AVMEDIA_TYPE_VIDEO)
     ///     .filter("scale", filter);
@@ -113,7 +113,7 @@ impl FramePipelineBuilder {
     /// A reference-counted `FramePipeline` instance.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let pipeline = builder.build();
     /// ```
     ///

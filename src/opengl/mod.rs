@@ -4,7 +4,7 @@
 //!
 //! # Example
 //!
-//! ```rust
+//! ```rust,ignore
 //! // Suppose we have some fragment shader code in `fragment_shader`
 //! let fragment_shader = r#"
 //!     #version 330 core

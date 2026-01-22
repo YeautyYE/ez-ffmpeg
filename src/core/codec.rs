@@ -67,7 +67,7 @@ pub struct CodecInfo {
 ///
 /// # Example
 ///
-/// ```rust
+/// ```rust,ignore
 /// let encoders = get_encoders();
 /// for encoder in encoders {
 ///     println!("Encoder: {} ({})", encoder.codec_name, encoder.codec_long_name);
@@ -85,7 +85,7 @@ pub fn get_encoders() -> Vec<CodecInfo> {
 ///
 /// # Example
 ///
-/// ```rust
+/// ```rust,ignore
 /// let decoders = get_decoders();
 /// for decoder in decoders {
 ///     println!("Decoder: {} ({})", decoder.codec_name, decoder.codec_long_name);

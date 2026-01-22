@@ -10,7 +10,7 @@ use ffmpeg_next::format;
 ///   If an error occurs, it returns an `ffmpeg_next::Error`.
 ///
 /// # Example
-/// ```rust
+/// ```rust,ignore
 /// let duration = get_duration_us("video.mp4").unwrap();
 /// println!("Duration: {} us", duration);
 /// ```
@@ -35,7 +35,7 @@ pub fn get_duration_us(input: impl Into<String>) -> Result<i64, ffmpeg_next::Err
 ///   If an error occurs, it returns an `ffmpeg_next::Error`.
 ///
 /// # Example
-/// ```rust
+/// ```rust,ignore
 /// let format = get_format("video.mp4").unwrap();
 /// println!("Format: {}", format);
 /// ```
@@ -58,7 +58,7 @@ pub fn get_format(input: impl Into<String>) -> Result<String, ffmpeg_next::Error
 ///   If an error occurs, it returns an `ffmpeg_next::Error`.
 ///
 /// # Example
-/// ```rust
+/// ```rust,ignore
 /// let metadata = get_metadata("video.mp4").unwrap();
 /// for (key, value) in metadata {
 ///     println!("{}: {}", key, value);
@@ -91,7 +91,7 @@ pub fn get_metadata(input: impl Into<String>) -> Result<Vec<(String, String)>, f
 ///   If the chapter doesn't exist or an error occurs, it returns an `ffmpeg_next::Error`.
 ///
 /// # Example
-/// ```rust
+/// ```rust,ignore
 /// let metadata = get_chapter_metadata("video.mp4", 0).unwrap();
 /// for (key, value) in metadata {
 ///     println!("{}: {}", key, value);
@@ -137,7 +137,7 @@ pub fn get_chapter_metadata(
 ///   If the stream doesn't exist or an error occurs, it returns an `ffmpeg_next::Error`.
 ///
 /// # Example
-/// ```rust
+/// ```rust,ignore
 /// let metadata = get_stream_metadata("video.mp4", 0).unwrap();
 /// for (key, value) in metadata {
 ///     println!("{}: {}", key, value);

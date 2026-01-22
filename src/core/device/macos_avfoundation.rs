@@ -1,3 +1,5 @@
+#![allow(unexpected_cfgs)]
+
 extern crate core_foundation;
 extern crate objc;
 
