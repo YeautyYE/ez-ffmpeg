@@ -2,23 +2,18 @@ use crate::core::context::output::Output;
 use crate::error::Error::{RtmpCreateStream, RtmpStreamAlreadyExists};
 use crate::flv::flv_buffer::FlvBuffer;
 use crate::flv::flv_tag::FlvTag;
-use crate::rtmp::rtmp_connection::{ConnectionError, ReadResult, RtmpConnection};
-use crate::rtmp::rtmp_scheduler::{RtmpScheduler, ServerResult};
+use crate::rtmp::reactor::{effective_max_connections, Reactor, CHANNEL_HEADROOM};
 use bytes::{BufMut, Bytes};
 use log::{debug, error, info, warn};
 use rml_rtmp::chunk_io::ChunkSerializer;
 use rml_rtmp::messages::{MessagePayload, RtmpMessage};
 use rml_rtmp::rml_amf0::Amf0Value;
 use rml_rtmp::time::RtmpTimestamp;
-use slab::Slab;
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-use crate::core::scheduler::type_to_symbol;
-use crate::error::OpenDecoderOperationError;
 
 #[derive(Clone)]
 pub struct Initialization;
@@ -30,11 +25,13 @@ pub struct Ended;
 #[derive(Clone)]
 pub struct EmbedRtmpServer<S> {
     address: String,
+    bound_addr: Option<std::net::SocketAddr>,
     status: Arc<AtomicUsize>,
     stream_keys: dashmap::DashSet<String>,
     // stream_key bytes_receiver
     publisher_sender: Option<crossbeam_channel::Sender<(String, crossbeam_channel::Receiver<Vec<u8>>)>>,
     gop_limit: usize,
+    max_connections: Option<usize>,
     state: PhantomData<S>,
 }
 
@@ -43,17 +40,15 @@ const STATUS_RUN: usize = 1;
 const STATUS_END: usize = 2;
 
 impl<S: 'static> EmbedRtmpServer<S> {
-    fn is_state<T: 'static>(&self) -> bool {
-        std::any::TypeId::of::<S>() == std::any::TypeId::of::<T>()
-    }
-
     fn into_state<T>(self) -> EmbedRtmpServer<T> {
         EmbedRtmpServer {
             address: self.address,
+            bound_addr: self.bound_addr,
             status: self.status,
             stream_keys: self.stream_keys,
             publisher_sender: self.publisher_sender,
             gop_limit: self.gop_limit,
+            max_connections: self.max_connections,
             state: Default::default(),
         }
     }
@@ -107,12 +102,31 @@ impl EmbedRtmpServer<Initialization> {
     pub fn new_with_gop_limit(address: impl Into<String>, gop_limit: usize) -> EmbedRtmpServer<Initialization> {
         Self {
             address: address.into(),
+            bound_addr: None,
             status: Arc::new(AtomicUsize::new(STATUS_INIT)),
             stream_keys: Default::default(),
             publisher_sender: None,
             gop_limit,
+            max_connections: None,
             state: Default::default(),
         }
+    }
+
+    /// Sets the maximum number of concurrent connections allowed.
+    ///
+    /// If not set, the limit is auto-detected based on system file descriptor limits
+    /// (default: 10000, capped at 80% of system FD limit).
+    ///
+    /// # Parameters
+    ///
+    /// * `max_connections` - Maximum number of concurrent connections
+    ///
+    /// # Returns
+    ///
+    /// Self for method chaining.
+    pub fn set_max_connections(mut self, max_connections: usize) -> Self {
+        self.max_connections = Some(max_connections);
+        self
     }
 
     /// Starts the RTMP server on the configured address, entering a loop that
@@ -127,28 +141,38 @@ impl EmbedRtmpServer<Initialization> {
         let listener = TcpListener::bind(self.address.clone())
             .map_err(|e| <std::io::Error as Into<crate::error::Error>>::into(e))?;
 
+        // Get actual bound address (important for port 0)
+        let actual_addr = listener.local_addr()
+            .map_err(|e| <std::io::Error as Into<crate::error::Error>>::into(e))?;
+        self.bound_addr = Some(actual_addr);
+
         listener
             .set_nonblocking(true)
             .map_err(|e| <std::io::Error as Into<crate::error::Error>>::into(e))?;
 
         self.status.store(STATUS_RUN, Ordering::Release);
 
-        let (stream_sender, stream_receiver) = crossbeam_channel::unbounded();
+        // Calculate effective max and create bounded channel with headroom
+        // This prevents unbounded queue growth when reactor is at capacity
+        let effective_max = effective_max_connections(self.max_connections);
+        let channel_capacity = effective_max.saturating_add(CHANNEL_HEADROOM);
+        let (stream_sender, stream_receiver) = crossbeam_channel::bounded(channel_capacity);
         let (publisher_sender, publisher_receiver) = crossbeam_channel::bounded(1024);
         self.publisher_sender = Some(publisher_sender);
         let stream_keys = self.stream_keys.clone();
         let status = self.status.clone();
+        let max_connections = self.max_connections;
         let result = std::thread::Builder::new()
             .name("rtmp-server-worker".to_string())
-            .spawn(move || handle_connections(stream_receiver, publisher_receiver, stream_keys, self.gop_limit, status));
+            .spawn(move || handle_connections(stream_receiver, publisher_receiver, stream_keys, self.gop_limit, max_connections, status));
         if let Err(e) = result {
             error!("Thread[rtmp-server-worker] exited with error: {e}");
             return Err(crate::error::Error::RtmpThreadExited);
         }
 
         info!(
-            "Embed rtmp server listening for connections on {}.",
-            &self.address
+            "Embed rtmp server listening for connections on {} (actual: {}, max_connections: {}).",
+            &self.address, actual_addr, effective_max
         );
 
         let status = self.status.clone();
@@ -158,11 +182,21 @@ impl EmbedRtmpServer<Initialization> {
             for stream in listener.incoming() {
                 match stream {
                     Ok(stream) => {
-                        debug!("New rtmp connection.");
-                        if let Err(_) = stream_sender.send(stream) {
-                            error!("Error sending stream to rtmp connection handler");
-                            status.store(STATUS_END, Ordering::Release);
-                            return;
+                        // Use try_send to apply backpressure when channel is full
+                        match stream_sender.try_send(stream) {
+                            Ok(_) => {
+                                debug!("New rtmp connection accepted.");
+                            }
+                            Err(crossbeam_channel::TrySendError::Full(s)) => {
+                                // Channel full - server at capacity, reject connection immediately
+                                let _ = s.shutdown(Shutdown::Both);
+                                debug!("Connection rejected: server at capacity (channel full)");
+                            }
+                            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                                error!("Connection channel disconnected");
+                                status.store(STATUS_END, Ordering::Release);
+                                return;
+                            }
                         }
                     }
                     Err(e) => {
@@ -189,6 +223,26 @@ impl EmbedRtmpServer<Initialization> {
 }
 
 impl EmbedRtmpServer<Running> {
+    /// Returns the actual bound socket address of the RTMP server.
+    ///
+    /// This is particularly useful when binding to port 0 (random port allocation),
+    /// as it allows you to discover which port the OS assigned.
+    ///
+    /// # Returns
+    ///
+    /// * `Option<std::net::SocketAddr>` - The actual bound address, or `None` if not available.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let server = EmbedRtmpServer::new("127.0.0.1:0").start().unwrap();
+    /// let actual_port = server.local_addr().unwrap().port();
+    /// println!("Server listening on port: {}", actual_port);
+    /// ```
+    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.bound_addr
+    }
+
     /// Creates an RTMP "input" endpoint for this server (from the server's perspective),
     /// returning an [`Output`] that can be used by FFmpeg to push media data.
     ///
@@ -212,7 +266,7 @@ impl EmbedRtmpServer<Running> {
     ///
     /// # Example
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// # // Assume there are definitions and initializations for FfmpegContext, FfmpegScheduler, etc.
     ///
     /// // 1. Create and start the RTMP server
@@ -249,15 +303,23 @@ impl EmbedRtmpServer<Running> {
             flv_buffer.write_data(buf);
             if let Some(mut flv_tag) = flv_buffer.get_flv_tag() {
                 flv_tag.header.stream_id = 1;
-                let packet = serializer
-                    .serialize(&flv_tag_to_message_payload(flv_tag), false, true)
-                    .unwrap();
-                message_sender.send(packet.bytes).unwrap();
+                match serializer.serialize(&flv_tag_to_message_payload(flv_tag), false, true) {
+                    Ok(packet) => {
+                        if let Err(e) = message_sender.send(packet.bytes) {
+                            error!("Failed to send RTMP packet: {:?}", e);
+                            return -1;
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to serialize RTMP message: {:?}", e);
+                        return -1;
+                    }
+                }
             }
             buf.len() as i32
         });
 
-        let mut output: Output = write_callback.into();
+        let output: Output = write_callback.into();
 
         Ok(output
             .set_format("flv")
@@ -297,9 +359,16 @@ impl EmbedRtmpServer<Running> {
             return Err(RtmpStreamAlreadyExists(stream_key));
         }
 
-        let (sender, receiver) = crossbeam_channel::unbounded();
+        let (sender, receiver) = crossbeam_channel::bounded(1024);
 
-        let publisher_sender = self.publisher_sender.as_ref().unwrap();
+        let publisher_sender = match self.publisher_sender.as_ref() {
+            Some(sender) => sender,
+            None => {
+                error!("Publisher sender not initialized");
+                return Err(RtmpCreateStream.into());
+            }
+        };
+
         if let Err(_) = publisher_sender.send((stream_key.clone(), receiver)) {
             if self.status.load(Ordering::Acquire) != STATUS_END {
                 warn!("Rtmp server worker already exited. Can't create stream sender.");
@@ -320,10 +389,24 @@ impl EmbedRtmpServer<Running> {
             command_object: Amf0Value::Object(properties),
             additional_arguments: Vec::new(),
         }
-        .into_message_payload(RtmpTimestamp { value: 0 }, 0)
-        .unwrap();
+        .into_message_payload(RtmpTimestamp { value: 0 }, 0);
 
-        let connect_packet = serializer.serialize(&connect_cmd, false, true).unwrap();
+        let connect_cmd = match connect_cmd {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                error!("Failed to create connect command: {:?}", e);
+                return Err(RtmpCreateStream.into());
+            }
+        };
+
+        let connect_packet = match serializer.serialize(&connect_cmd, false, true) {
+            Ok(packet) => packet,
+            Err(e) => {
+                error!("Failed to serialize connect command: {:?}", e);
+                return Err(RtmpCreateStream.into());
+            }
+        };
+
         if let Err(_) = sender.send(connect_packet.bytes) {
             error!("Can't send connect command to rtmp server.");
             return Err(RtmpCreateStream.into());
@@ -336,12 +419,24 @@ impl EmbedRtmpServer<Running> {
             command_object: Amf0Value::Null,
             additional_arguments: Vec::new(),
         }
-        .into_message_payload(RtmpTimestamp { value: 0 }, 1)
-        .unwrap();
+        .into_message_payload(RtmpTimestamp { value: 0 }, 1);
 
-        let create_stream_packet = serializer
-            .serialize(&create_stream_cmd, false, true)
-            .unwrap();
+        let create_stream_cmd = match create_stream_cmd {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                error!("Failed to create createStream command: {:?}", e);
+                return Err(RtmpCreateStream.into());
+            }
+        };
+
+        let create_stream_packet = match serializer.serialize(&create_stream_cmd, false, true) {
+            Ok(packet) => packet,
+            Err(e) => {
+                error!("Failed to serialize createStream command: {:?}", e);
+                return Err(RtmpCreateStream.into());
+            }
+        };
+
         if let Err(_) = sender.send(create_stream_packet.bytes) {
             error!("Can't send createStream command to rtmp server.");
             return Err(RtmpCreateStream.into());
@@ -351,19 +446,31 @@ impl EmbedRtmpServer<Running> {
         let mut arguments = Vec::new();
         arguments.push(Amf0Value::Utf8String(stream_key));
         arguments.push(Amf0Value::Utf8String("live".into()));
-        let create_stream_cmd = RtmpMessage::Amf0Command {
+        let publish_cmd = RtmpMessage::Amf0Command {
             command_name: "publish".to_string(),
             transaction_id: 3.0,
             command_object: Amf0Value::Null,
             additional_arguments: arguments,
         }
-        .into_message_payload(RtmpTimestamp { value: 0 }, 1)
-        .unwrap();
+        .into_message_payload(RtmpTimestamp { value: 0 }, 1);
 
-        let create_stream_packet = serializer
-            .serialize(&create_stream_cmd, false, true)
-            .unwrap();
-        if let Err(_) = sender.send(create_stream_packet.bytes) {
+        let publish_cmd = match publish_cmd {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                error!("Failed to create publish command: {:?}", e);
+                return Err(RtmpCreateStream.into());
+            }
+        };
+
+        let publish_packet = match serializer.serialize(&publish_cmd, false, true) {
+            Ok(packet) => packet,
+            Err(e) => {
+                error!("Failed to serialize publish command: {:?}", e);
+                return Err(RtmpCreateStream.into());
+            }
+        };
+
+        if let Err(_) = sender.send(publish_packet.bytes) {
             error!("Can't send publish command to rtmp server.");
             return Err(RtmpCreateStream.into());
         }
@@ -375,7 +482,7 @@ impl EmbedRtmpServer<Running> {
     /// threads will exit gracefully.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let server = EmbedRtmpServer::new("localhost:1935");
     /// // ... start and handle streaming
     /// server.stop();
@@ -387,219 +494,32 @@ impl EmbedRtmpServer<Running> {
     }
 }
 
+/// Handle connections using optimized Reactor
+///
+/// Replaces old multi-threaded handle_connections with single-threaded event-driven model:
+/// - Uses epoll/kqueue/WSAPoll for IO multiplexing
+/// - Write queue with backpressure management
+/// - Strict drain until WouldBlock semantics
 fn handle_connections(
     connection_receiver: crossbeam_channel::Receiver<TcpStream>,
     publisher_receiver: crossbeam_channel::Receiver<(String, crossbeam_channel::Receiver<Vec<u8>>)>,
     stream_keys: dashmap::DashSet<String>,
     gop_limit: usize,
+    max_connections: Option<usize>,
     status: Arc<AtomicUsize>,
 ) {
-    let mut connections = Slab::new();
-    let mut publishers = Slab::new();
-    let mut scheduler = RtmpScheduler::new(gop_limit);
-
-    loop {
-        crossbeam::channel::select! {
-            // receive new tcp connection
-            recv(connection_receiver) -> msg => match msg {
-                Ok(stream) => {
-                    let entry = connections.vacant_entry();
-                    let connection_id = entry.key();
-                    let result = RtmpConnection::new(connection_id, stream);
-                    match result {
-                        Ok(connection) => {
-                            entry.insert(connection);
-                            debug!("Rtmp connection {connection_id} started");
-                        }
-                        Err(e) => debug!("Rtmp connection error: {e:?}"),
-                    }
-                }
-                Err(_) => {
-                    debug!("Embed rtmp server disconnected.");
-                    return;
-                }
-            },
-            // receive new publisher
-            recv(publisher_receiver) -> msg => match msg {
-                Ok((stream_key, bytes_receiver)) => {
-                    let entry = publishers.vacant_entry();
-                    let connection_id = entry.key();
-
-                    if scheduler.new_channel(stream_key.clone(), connection_id) {
-                        entry.insert((stream_key, bytes_receiver));
-                        debug!("Publisher {connection_id} started");
-                    }
-                }
-                Err(_) => {
-                    error!("Embed rtmp server publisher_sender closed.");
-                    return;
-                }
-            },
-            default(Duration::from_millis(5)) => {}
+    // Create Reactor
+    let mut reactor = match Reactor::new(gop_limit, max_connections, stream_keys, status.clone()) {
+        Ok(r) => r,
+        Err(e) => {
+            error!("Failed to create Reactor: {:?}", e);
+            status.store(STATUS_END, Ordering::Release);
+            return;
         }
+    };
 
-        if status.load(Ordering::Acquire) == STATUS_END {
-            info!("Embed rtmp server stopped.");
-            break;
-        }
-
-        let mut packets_to_write = Vec::new();
-        let mut publisher_ids_to_clear = Vec::new();
-        let mut ids_to_clear = Vec::new();
-        for (connection_id, (_stream_key, bytes_receiver)) in publishers.iter_mut() {
-            loop {
-                match bytes_receiver.try_recv() {
-                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                        debug!("Rtmp publisher closed for id {connection_id}");
-                        publisher_ids_to_clear.push(connection_id);
-
-                        let mut arguments = Vec::new();
-                        arguments.push(Amf0Value::Number(1.0));
-                        let create_stream_cmd = RtmpMessage::Amf0Command {
-                            command_name: "deleteStream".to_string(),
-                            transaction_id: 4.0,
-                            command_object: Amf0Value::Null,
-                            additional_arguments: arguments,
-                        }
-                        .into_message_payload(RtmpTimestamp { value: 0 }, 1)
-                        .unwrap();
-
-                        let mut serializer = ChunkSerializer::new();
-                        let create_stream_packet = serializer
-                            .serialize(&create_stream_cmd, false, true)
-                            .unwrap();
-
-                        let server_results = match scheduler
-                            .publish_bytes_received(connection_id, create_stream_packet.bytes)
-                        {
-                            Ok(results) => results,
-                            Err(_) => {
-                                break;
-                            }
-                        };
-
-                        for result in server_results.into_iter() {
-                            match result {
-                                ServerResult::OutboundPacket {
-                                    target_connection_id,
-                                    packet,
-                                } => {
-                                    packets_to_write.push((target_connection_id, packet));
-                                }
-
-                                ServerResult::DisconnectConnection {
-                                    connection_id: id_to_close,
-                                } => {
-                                    ids_to_clear.push(id_to_close);
-                                }
-                            }
-                        }
-                        break;
-                    }
-                    Err(crossbeam_channel::TryRecvError::Empty) => break,
-                    Ok(bytes) => {
-                        let server_results =
-                            match scheduler.publish_bytes_received(connection_id, bytes) {
-                                Ok(results) => results,
-                                Err(error) => {
-                                    debug!("Input caused the following server error: {}", error);
-                                    publisher_ids_to_clear.push(connection_id);
-                                    break;
-                                }
-                            };
-
-                        for result in server_results.into_iter() {
-                            match result {
-                                ServerResult::OutboundPacket {
-                                    target_connection_id,
-                                    packet,
-                                } => {
-                                    packets_to_write.push((target_connection_id, packet));
-                                }
-
-                                ServerResult::DisconnectConnection {
-                                    connection_id: id_to_close,
-                                } => {
-                                    ids_to_clear.push(id_to_close);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        for (connection_id, connection) in connections.iter_mut() {
-            loop {
-                match connection.read() {
-                    Err(ConnectionError::SocketClosed) => {
-                        debug!("Rtmp socket closed for id {connection_id}");
-                        ids_to_clear.push(connection_id);
-                        break;
-                    }
-                    Err(error) => {
-                        debug!(
-                            "I/O error while reading rtmp connection {connection_id}: {:?}",
-                            error
-                        );
-                        ids_to_clear.push(connection_id);
-                        break;
-                    }
-                    Ok(result) => match result {
-                        ReadResult::NoBytesReceived => break,
-                        ReadResult::HandshakingInProgress => break,
-                        ReadResult::BytesReceived { buffer, byte_count } => {
-                            let server_results =
-                                match scheduler.bytes_received(connection_id, &buffer[..byte_count]) {
-                                    Ok(results) => results,
-                                    Err(error) => {
-                                        debug!("Rtmp input caused the following server error: {error}");
-                                        ids_to_clear.push(connection_id);
-                                        break;
-                                    }
-                                };
-
-                            for result in server_results.into_iter() {
-                                match result {
-                                    ServerResult::OutboundPacket {
-                                        target_connection_id,
-                                        packet,
-                                    } => {
-                                        packets_to_write.push((target_connection_id, packet));
-                                    }
-
-                                    ServerResult::DisconnectConnection {
-                                        connection_id: id_to_close,
-                                    } => {
-                                        ids_to_clear.push(id_to_close);
-                                    }
-                                }
-                            }
-                        }
-                    },
-                }
-            }
-        }
-
-        for publisher_id in publisher_ids_to_clear {
-            debug!("Rtmp publisher {publisher_id} closed");
-            let (stream_key, _bytes_receiver) = publishers.remove(publisher_id);
-            scheduler.notify_publisher_closed(publisher_id);
-            stream_keys.remove(&stream_key);
-        }
-
-        for (connection_id, packet) in packets_to_write.into_iter() {
-            if let Some(connection) = connections.get_mut(connection_id) {
-                connection.write(packet.bytes);
-            }
-        }
-
-        for closed_id in ids_to_clear {
-            debug!("Rtmp connection {closed_id} closed");
-            let _ = connections.try_remove(closed_id);
-            scheduler.notify_connection_closed(closed_id);
-        }
-    }
+    // Run Reactor main loop
+    reactor.run(connection_receiver, publisher_receiver);
 
     if status.load(Ordering::Acquire) != STATUS_END {
         error!("Rtmp Server aborted.");
@@ -651,15 +571,17 @@ mod tests {
     use crate::core::scheduler::ffmpeg_scheduler::FfmpegScheduler;
     use ffmpeg_next::time::current;
     use std::thread::sleep;
+    use std::time::Duration;
 
     #[test]
+    #[ignore] // Integration test: requires exclusive port 1935 and test.mp4
     fn test_concat_stream_loop() {
         let _ = env_logger::builder()
             .filter_level(log::LevelFilter::Trace)
             .is_test(true)
             .try_init();
 
-        let mut embed_rtmp_server = EmbedRtmpServer::new("localhost:1935");
+        let embed_rtmp_server = EmbedRtmpServer::new("localhost:1935");
         let embed_rtmp_server = embed_rtmp_server.start().unwrap();
 
         let output = embed_rtmp_server
@@ -696,13 +618,14 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // Integration test: requires exclusive port 1935 and test.mp4
     fn test_stream_loop() {
         let _ = env_logger::builder()
             .filter_level(log::LevelFilter::Trace)
             .is_test(true)
             .try_init();
 
-        let mut embed_rtmp_server = EmbedRtmpServer::new("localhost:1935");
+        let embed_rtmp_server = EmbedRtmpServer::new("localhost:1935");
         let embed_rtmp_server = embed_rtmp_server.start().unwrap();
 
         let output = embed_rtmp_server
@@ -727,13 +650,14 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // Integration test: requires exclusive port 1935 and test.mp4
     fn test_concat_realtime() {
         let _ = env_logger::builder()
             .filter_level(log::LevelFilter::Trace)
             .is_test(true)
             .try_init();
 
-        let mut embed_rtmp_server = EmbedRtmpServer::new("localhost:1935");
+        let embed_rtmp_server = EmbedRtmpServer::new("localhost:1935");
         let embed_rtmp_server = embed_rtmp_server.start().unwrap();
 
         let output = embed_rtmp_server
@@ -768,13 +692,14 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // Integration test: requires exclusive port 1935 and test.mp4
     fn test_realtime() {
         let _ = env_logger::builder()
             .filter_level(log::LevelFilter::Trace)
             .is_test(true)
             .try_init();
 
-        let mut embed_rtmp_server = EmbedRtmpServer::new("localhost:1935");
+        let embed_rtmp_server = EmbedRtmpServer::new("localhost:1935");
         let embed_rtmp_server = embed_rtmp_server.start().unwrap();
 
         let output = embed_rtmp_server
@@ -798,6 +723,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // Integration test: requires test.mp4
     fn test_readrate() {
         let _ = env_logger::builder()
             .filter_level(log::LevelFilter::Trace)
@@ -823,13 +749,14 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // Integration test: requires exclusive port 1935 and test.mp4
     fn test_embed_rtmp_server() {
         let _ = env_logger::builder()
             .filter_level(log::LevelFilter::Trace)
             .is_test(true)
             .try_init();
 
-        let mut embed_rtmp_server = EmbedRtmpServer::new("localhost:1935");
+        let embed_rtmp_server = EmbedRtmpServer::new("localhost:1935");
         let embed_rtmp_server = embed_rtmp_server.start().unwrap();
 
         let output = embed_rtmp_server
