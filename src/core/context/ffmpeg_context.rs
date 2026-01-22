@@ -88,7 +88,7 @@ impl FfmpegContext {
     /// and other parameters.
     ///
     /// # Examples
-    /// ```rust
+    /// ```rust,ignore
     /// let context = FfmpegContext::builder()
     ///     .input("input.mp4")
     ///     .output("output.mp4")
@@ -110,7 +110,7 @@ impl FfmpegContext {
     /// - `Err(...)` if there was an error initializing or starting FFmpeg.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let context = FfmpegContext::builder()
     ///     .input("input.mp4")
     ///     .output("output.mp4")

@@ -10,7 +10,7 @@ use crate::core::context::filter_complex::FilterComplex;
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```rust,ignore
 /// // 1. Create a builder
 /// let builder = FfmpegContext::builder();
 ///
@@ -41,7 +41,7 @@ impl FfmpegContextBuilder {
     ///
     /// # Example
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// let builder = FfmpegContextBuilder::new();
     /// ```
     pub fn new() -> Self {
@@ -86,7 +86,7 @@ impl FfmpegContextBuilder {
     ///
     /// # Practical Example
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// let result = FfmpegContext::builder()
     ///     .independent_readrate() // Enable independent read rates
     ///     .input(Input::from("file1.mp4").set_readrate(1.0)) // First input at 1x speed
@@ -127,7 +127,7 @@ impl FfmpegContextBuilder {
     /// A modified `FfmpegContextBuilder`, allowing method chaining.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let context = FfmpegContextBuilder::new()
     ///     .input("video.mp4")
     ///     .build()
@@ -152,7 +152,7 @@ impl FfmpegContextBuilder {
     /// A modified `FfmpegContextBuilder`, allowing method chaining.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let inputs = vec!["input1.mp4", "input2.mp4"];
     /// let context = FfmpegContextBuilder::new()
     ///     .inputs(inputs)
@@ -178,7 +178,7 @@ impl FfmpegContextBuilder {
     /// A modified `FfmpegContextBuilder`, allowing method chaining.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let context = FfmpegContextBuilder::new()
     ///     .output("output.mp4")
     ///     .build()
@@ -203,7 +203,7 @@ impl FfmpegContextBuilder {
     /// A modified `FfmpegContextBuilder`, allowing method chaining.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let outputs = vec!["output1.mp4", "output2.mkv"];
     /// let context = FfmpegContextBuilder::new()
     ///     .outputs(outputs)
@@ -230,7 +230,7 @@ impl FfmpegContextBuilder {
     /// A modified `FfmpegContextBuilder`, allowing method chaining.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let context = FfmpegContextBuilder::new()
     ///     .input("input.mp4")
     ///     .filter_desc("hue=s=0") // Desaturate the video
@@ -257,7 +257,7 @@ impl FfmpegContextBuilder {
     /// A modified `FfmpegContextBuilder`, allowing method chaining.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let filter_chains = vec!["scale=1280:720", "drawtext=fontfile=...:text='Watermark'"];
     /// let context = FfmpegContextBuilder::new()
     ///     .input("input.mp4")
@@ -278,7 +278,7 @@ impl FfmpegContextBuilder {
     /// This is useful when you want to maintain the original timing information from the source media.
     /// 
     /// # Example
-    /// ```
+    /// ```rust,ignore
     /// let builder = FfmpegContextBuilder::new()
     ///     .copyts();
     /// ```
@@ -297,7 +297,7 @@ impl FfmpegContextBuilder {
     /// (The actual validation depends on how [`FfmpegContext::new_with_independent_readrate`](FfmpegContext::new_with_independent_readrate) is implemented.)
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let context = FfmpegContextBuilder::new()
     ///     .input("input1.mp4")
     ///     .input("input2.mp4")

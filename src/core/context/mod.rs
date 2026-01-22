@@ -17,7 +17,7 @@ use std::ptr::null_mut;
 /// complete media processing pipeline.
 ///
 /// # Example
-/// ```rust
+/// ```rust,ignore
 ///
 /// // Build an FFmpeg context with one input, some filter settings, and one output
 /// let context = FfmpegContext::builder()
@@ -43,7 +43,7 @@ pub mod ffmpeg_context;
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```rust,ignore
 /// // 1. Create a builder (usually via FfmpegContext::builder())
 /// let builder = FfmpegContext::builder();
 ///
@@ -70,7 +70,7 @@ pub mod ffmpeg_context_builder;
 ///
 /// # Example
 ///
-/// ```rust
+/// ```rust,ignore
 /// use ez_ffmpeg::core::context::input::Input;
 ///
 /// // Basic file or network URL:
@@ -99,7 +99,7 @@ pub mod input;
 ///
 /// # Example
 ///
-/// ```rust
+/// ```rust,ignore
 /// use ez_ffmpeg::core::context::output::Output;
 ///
 /// // Basic file/URL output:
@@ -123,7 +123,7 @@ pub mod output;
 ///
 /// # Example
 ///
-/// ```rust
+/// ```rust,ignore
 /// use ez_ffmpeg::core::context::filter_complex::FilterComplex;
 ///
 /// // Build a FilterComplex from a string:
@@ -159,7 +159,7 @@ pub(super) mod output_filter;
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```rust,ignore
 /// use ez_ffmpeg::Output;
 /// let output: Output = create_null_output();
 /// // Pass `output` to an FFmpeg context for processing

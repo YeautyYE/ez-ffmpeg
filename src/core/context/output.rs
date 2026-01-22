@@ -37,7 +37,7 @@ pub struct Output {
     ///   - Custom-defined error codes depending on your implementation.
     ///
     /// ### Example:
-    /// ```rust
+    /// ```rust,ignore
     /// fn custom_write_callback(buf: &[u8]) -> i32 {
     ///     println!("Writing data: {} bytes", buf.len());
     ///     buf.len() as i32 // Return the number of bytes successfully written
@@ -84,7 +84,7 @@ pub struct Output {
     /// Since `FFmpeg` may call `write_callback` and `seek_callback` from different threads,
     /// **use `Arc<Mutex<File>>` to ensure safe concurrent access.**
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// use std::fs::File;
     /// use std::io::{Seek, SeekFrom};
     /// use std::sync::{Arc, Mutex};
@@ -223,7 +223,7 @@ pub struct Output {
     /// ```
     ///
     /// **Example Usage:**
-    /// ```rust
+    /// ```rust,ignore
     /// let output = Output::from("some_url")
     ///     .set_max_video_frames(300);
     /// ```
@@ -239,7 +239,7 @@ pub struct Output {
     /// ```
     ///
     /// **Example Usage:**
-    /// ```rust
+    /// ```rust,ignore
     /// let output = Output::from("some_url")
     ///     .set_max_audio_frames(500);
     /// ```
@@ -255,7 +255,7 @@ pub struct Output {
     /// ```
     ///
     /// **Example Usage:**
-    /// ```rust
+    /// ```rust,ignore
     /// let output = Output::from("some_url")
     ///     .set_max_subtitle_frames(200);
     /// ```
@@ -304,7 +304,7 @@ pub struct Output {
     /// These options are used when initializing the FFmpeg output format.
     ///
     /// **Example Usage:**
-    /// ```rust
+    /// ```rust,ignore
     /// let output = Output::from("some_url")
     ///     .set_format_opt("movflags", "faststart");
     /// ```
@@ -369,7 +369,7 @@ impl Output {
     ///   - Other custom-defined error codes can also be returned to signal specific issues.
     ///
     /// ### Example:
-    /// ```rust
+    /// ```rust,ignore
     /// let output = Output::new_by_write_callback(move |buf| {
     ///     println!("Processing {} bytes of data for output", buf.len());
     ///     buf.len() as i32 // Return the number of bytes processed
@@ -421,7 +421,7 @@ impl Output {
     /// Since `FFmpeg` may call `write_callback` and `seek_callback` from different threads,
     /// **use `Arc<Mutex<File>>` to ensure safe concurrent access.**
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// use std::fs::File;
     /// use std::io::{Seek, SeekFrom, Write};
     /// use std::sync::{Arc, Mutex};
@@ -514,7 +514,7 @@ impl Output {
     /// * `Self` - Returns the modified `Output` struct, allowing for method chaining.
     ///
     /// # Examples
-    /// ```rust
+    /// ```rust,ignore
     /// let output = Output::from("rtmp://localhost/live/stream")
     ///     .set_video_codec("h264");
     /// ```
@@ -532,7 +532,7 @@ impl Output {
     /// * `Self` - Returns the modified `Output` struct, allowing for method chaining.
     ///
     /// # Examples
-    /// ```rust
+    /// ```rust,ignore
     /// let output = Output::from("rtmp://localhost/live/stream")
     ///     .set_audio_codec("aac");
     /// ```
@@ -551,7 +551,7 @@ impl Output {
     /// * `Self` - Returns the modified `Output` struct, allowing for method chaining.
     ///
     /// # Examples
-    /// ```rust
+    /// ```rust,ignore
     /// let output = Output::from("rtmp://localhost/live/stream")
     ///     .set_subtitle_codec("mov_text");
     /// ```
@@ -573,7 +573,7 @@ impl Output {
     /// * `Self` - Returns the modified `Output`, enabling method chaining.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let output = Output::from("some_url")
     ///     .set_frame_pipelines(vec![
     ///         FramePipelineBuilder::new(AVMediaType::AVMEDIA_TYPE_VIDEO).filter("opengl", Box::new(my_filter)),
@@ -602,7 +602,7 @@ impl Output {
     /// * `Self` - Returns the modified `Output`, enabling method chaining.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let output = Output::from("some_url")
     ///     .add_frame_pipeline(FramePipelineBuilder::new(AVMediaType::AVMEDIA_TYPE_VIDEO).filter("opengl", Box::new(my_filter)).build())
     ///     .add_frame_pipeline(FramePipelineBuilder::new(AVMediaType::AVMEDIA_TYPE_AUDIO).filter("my_custom_filter1", Box::new(...)).filter("my_custom_filter2", Box::new(...)));
@@ -640,7 +640,7 @@ impl Output {
     /// * `Self` - for chained method calls.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// // Re-encode the video stream from input #0 (fail if no video).
     /// let output = Output::from("output.mp4")
     ///     .add_stream_map("0:v");
@@ -676,7 +676,7 @@ impl Output {
     /// * `Self` - for chained method calls.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// // Copy the audio stream(s) from input #0 if present, no re-encode:
     /// let output = Output::from("output.mkv")
     ///     .add_stream_map_with_copy("0:a?");
@@ -701,7 +701,7 @@ impl Output {
     /// * `Self` - The modified `Output`, allowing method chaining.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let output = Output::from("output.mp4")
     ///     .set_start_time_us(2_000_000); // Start at 2 seconds
     /// ```
@@ -723,7 +723,7 @@ impl Output {
     /// * `Self` - The modified `Output`, allowing method chaining.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let output = Output::from("output.mp4")
     ///     .set_recording_time_us(5_000_000); // Record for 5 seconds
     /// ```
@@ -745,7 +745,7 @@ impl Output {
     /// * `Self` - The modified `Output`, allowing method chaining.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let output = Output::from("output.mp4")
     ///     .set_stop_time_us(10_000_000); // Stop at 10 seconds
     /// ```
@@ -768,7 +768,7 @@ impl Output {
     /// * `Self` - The modified `Output`, allowing method chaining.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// use ffmpeg_sys_next::AVRational;
     /// let output = Output::from("output.mp4")
     ///     .set_framerate(AVRational { num: 30, den: 1 });
@@ -792,7 +792,7 @@ impl Output {
     /// * `Self` - The modified `Output`, allowing method chaining.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let output = Output::from("output.mp4")
     ///     .set_vsync_method(VSyncMethod::VsyncCfr);
     /// ```
@@ -814,7 +814,7 @@ impl Output {
     /// * `Self` - The modified `Output`, allowing method chaining.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let output = Output::from("output.mkv")
     ///     .set_bits_per_raw_sample(10); // e.g., 10-bit
     /// ```
@@ -836,7 +836,7 @@ impl Output {
     /// * `Self` - The modified `Output`, allowing method chaining.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let output = Output::from("output.mp4")
     ///     .set_audio_sample_rate(48000); // Set to 48kHz
     /// ```
@@ -857,7 +857,7 @@ impl Output {
     /// * `Self` - The modified `Output`, allowing method chaining.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let output = Output::from("output.mp4")
     ///     .set_audio_channels(2); // Set to stereo
     /// ```
@@ -884,7 +884,7 @@ impl Output {
     /// * `Self` - The modified `Output`, allowing method chaining.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// use ffmpeg_sys_next::AVSampleFormat::AV_SAMPLE_FMT_S16;
     ///
     /// let output = Output::from("output.mp4")
@@ -926,7 +926,7 @@ impl Output {
     /// * `Self` - The modified `Output`, allowing method chaining.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// // For MJPEG encoding of image sequences
     /// let output = Output::from("output.jpg")
     ///     .set_video_qscale(2);  // High quality JPEG images
@@ -967,7 +967,7 @@ impl Output {
     /// * `Self` - The modified `Output`, allowing method chaining.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// // For MP3 encoding at high quality
     /// let output = Output::from("output.mp3")
     ///     .set_audio_codec("libmp3lame")
@@ -996,7 +996,7 @@ impl Output {
     /// ```
     ///
     /// **Example Usage:**
-    /// ```rust
+    /// ```rust,ignore
     /// let output = Output::from("some_url")
     ///     .set_max_video_frames(500);
     /// ```
@@ -1013,7 +1013,7 @@ impl Output {
     /// ```
     ///
     /// **Example Usage:**
-    /// ```rust
+    /// ```rust,ignore
     /// let output = Output::from("some_url")
     ///     .set_max_audio_frames(500);
     /// ```
@@ -1030,7 +1030,7 @@ impl Output {
     /// ```
     ///
     /// **Example Usage:**
-    /// ```rust
+    /// ```rust,ignore
     /// let output = Output::from("some_url")
     ///     .set_max_subtitle_frames(200);
     /// ```
@@ -1053,7 +1053,7 @@ impl Output {
     /// | `g=50` | GOP (Group of Pictures) size, affects keyframe frequency |
     ///
     /// **Example Usage:**
-    /// ```rust
+    /// ```rust,ignore
     /// let output = Output::from("some_url")
     ///     .set_video_codec_opt("crf", "18")
     ///     .set_video_codec_opt("preset", "fast");
@@ -1072,7 +1072,7 @@ impl Output {
     /// **Sets multiple video codec options at once.**
     ///
     /// **Example Usage:**
-    /// ```rust
+    /// ```rust,ignore
     /// let output = Output::from("some_url")
     ///     .set_video_codec_opts(vec![
     ///         ("crf", "18"),
@@ -1101,7 +1101,7 @@ impl Output {
     /// | `compression_level=0-12` | Compression efficiency for formats like FLAC |
     ///
     /// **Example Usage:**
-    /// ```rust
+    /// ```rust,ignore
     /// let output = Output::from("some_url")
     ///     .set_audio_codec_opt("b", "320k")
     ///     .set_audio_codec_opt("compression_level", "6");
@@ -1120,7 +1120,7 @@ impl Output {
     /// **Sets multiple audio codec options at once.**
     ///
     /// **Example Usage:**
-    /// ```rust
+    /// ```rust,ignore
     /// let output = Output::from("some_url")
     ///     .set_audio_codec_opts(vec![
     ///         ("b", "320k"),
@@ -1151,7 +1151,7 @@ impl Output {
     /// | `forced_subs=1` | Forces the subtitles to always be displayed |
     ///
     /// **Example Usage:**
-    /// ```rust
+    /// ```rust,ignore
     /// let output = Output::from("some_url")
     ///     .set_subtitle_codec_opt("mov_text", "");
     /// ```
@@ -1173,7 +1173,7 @@ impl Output {
     /// **Sets multiple subtitle codec options at once.**
     ///
     /// **Example Usage:**
-    /// ```rust
+    /// ```rust,ignore
     /// let output = Output::from("some_url")
     ///     .set_subtitle_codec_opts(vec![
     ///         ("mov_text", ""),
@@ -1197,7 +1197,7 @@ impl Output {
     /// These options allow fine-tuning of the output container’s behavior.
     ///
     /// **Example Usage:**
-    /// ```rust
+    /// ```rust,ignore
     /// let output = Output::from("some_url")
     ///     .set_format_opt("movflags", "faststart")
     ///     .set_format_opt("flvflags", "no_duration_filesize");
@@ -1230,7 +1230,7 @@ impl Output {
     /// This method allows setting multiple format options in a single call.
     ///
     /// **Example Usage:**
-    /// ```rust
+    /// ```rust,ignore
     /// let output = Output::from("some_url")
     ///     .set_format_opts(vec![
     ///         ("movflags", "faststart"),

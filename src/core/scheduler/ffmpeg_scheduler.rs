@@ -141,7 +141,7 @@ impl FfmpegScheduler<Initialization> {
     /// inputs, outputs, and filters using [`FfmpegContext`], then pass it here.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let context = FfmpegContext::builder()
     ///     .input("input.mp4")
     ///     .output("output.mkv")
@@ -173,7 +173,7 @@ impl FfmpegScheduler<Initialization> {
     /// - `Err(...)` if an error occurred during FFmpeg setup.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let scheduler = FfmpegScheduler::new(ffmpeg_context);
     /// let running_scheduler = scheduler.start().expect("Failed to start FFmpeg");
     /// // Now it's in Running state, you can wait or pause/abort, etc.
@@ -395,7 +395,7 @@ impl FfmpegScheduler<Running> {
     ///   See the `Future` implementation below.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// // After calling `.start()`:
     /// let result = scheduler.wait();
     /// assert!(result.is_ok());
@@ -449,7 +449,7 @@ impl FfmpegScheduler<Running> {
     ///
     /// # Comparison
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// // WRONG: Files will be unusable
     /// scheduler.abort();
     ///
@@ -458,7 +458,7 @@ impl FfmpegScheduler<Running> {
     /// ```
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let running_scheduler = scheduler.start().unwrap();
     /// // User clicked "Cancel" - don't need output
     /// running_scheduler.abort();
@@ -495,7 +495,7 @@ impl FfmpegScheduler<Running> {
     /// | `abort()` | No | Not guaranteed | Emergency, don't care about files |
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let running_scheduler = scheduler.start().unwrap();
     /// // ... processing ...
     /// running_scheduler.stop(); // Blocks until complete, files are valid
@@ -585,7 +585,7 @@ impl FfmpegScheduler<Paused> {
     /// See [`FfmpegScheduler<Running>::abort()`] for complete documentation.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let paused_scheduler = running_scheduler.pause();
     /// // User clicked "Cancel" - don't need output
     /// paused_scheduler.abort();

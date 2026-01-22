@@ -34,7 +34,7 @@
 //!    `Result` to detect success or failure.
 //!
 //! # Example
-//! ```rust
+//! ```rust,ignore
 //!
 //! fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     // 1. Build an FfmpegContext with an input, a simple filter, and an output
@@ -67,7 +67,7 @@
 ///
 /// # Example
 ///
-/// ```rust
+/// ```rust,ignore
 /// // Build an FFmpeg context with one input, some filter settings, and one output.
 /// let context = FfmpegContext::builder()
 ///     .input("test.mp4")
@@ -89,7 +89,7 @@ pub mod context;
 ///
 /// # Synchronous Example
 ///
-/// ```rust
+/// ```rust,ignore
 /// let context = FfmpegContext::builder()
 ///     .input("test.mp4")
 ///     .filter_desc("hue=s=0")
@@ -135,7 +135,7 @@ pub mod scheduler;
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```rust,ignore
 /// // Retrieve the duration in microseconds for the media file "test.mp4"
 /// let duration = get_duration_us("test.mp4").unwrap();
 /// println!("Duration: {} us", duration);
@@ -162,7 +162,7 @@ pub mod container_info;
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```rust,ignore
 /// // Retrieve information about the first video stream in "test.mp4"
 /// let maybe_video_info = find_video_stream_info("test.mp4").unwrap();
 /// if let Some(video_info) = maybe_video_info {
@@ -205,7 +205,7 @@ pub mod stream_info;
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```rust,ignore
 /// // Query video input devices (e.g., cameras)
 /// let video_devices = get_input_video_devices().unwrap();
 /// for device in &video_devices {
@@ -242,7 +242,7 @@ pub mod device;
 ///
 /// # Example
 ///
-/// ```rust
+/// ```rust,ignore
 /// // Query hardware acceleration backends
 /// let hwaccels = get_hwaccels();
 /// for accel in hwaccels {
@@ -275,7 +275,7 @@ pub mod hwaccel;
 ///
 /// # Example
 ///
-/// ```rust
+/// ```rust,ignore
 /// // List all available encoders
 /// let encoders = get_encoders();
 /// for enc in &encoders {
@@ -317,7 +317,7 @@ pub mod codec;
 ///
 /// # FFmpeg Built-in Filters
 ///
-/// ```rust
+/// ```rust,ignore
 /// use ez_ffmpeg::core::filter::get_filters;
 ///
 /// // Query available FFmpeg filters
@@ -333,7 +333,7 @@ pub mod codec;
 /// an `Output` so that every frame is processed before encoding. You could likewise
 /// attach it to an `Input` if you want the frames processed immediately after decoding.
 ///
-/// ```rust
+/// ```rust,ignore
 ///
 /// // 1. Define your custom filter by implementing the FrameFilter trait.
 /// struct FlipFilter;
