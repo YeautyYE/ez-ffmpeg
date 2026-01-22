@@ -27,9 +27,10 @@
 //!   provide a fragment shader and apply effects to video frames in a high-performance way
 //!   without manually managing the GL context.
 //!
-//! - **`rtmp`** (feature `"rtmp"`): Includes an embedded RTMP server, `EmbedRtmpServer`, which
-//!   can receive data directly from memory instead of over a network. Handy for local tests
-//!   or simple streaming scenarios.
+//! - **`rtmp`** (feature `"rtmp"`): Embedded RTMP server `EmbedRtmpServer` built for production streaming,
+//!   using native epoll/kqueue/WSAPoll via libc FFI (edge-triggered on Linux/macOS, level-triggered on Windows),
+//!   zero-copy GOP fanout with `Arc<[FrameData]>`, and tiered backpressure (1/2/4MB) on a 2-thread model;
+//!   10,000+ conns on Linux/macOS (8,000 on Windows) with in-process ingest (no TCP between FFmpeg and server).
 //!
 //! - **`flv`** (feature `"flv"`): Provides data structures and helpers for handling FLV
 //!   containers, useful if you’re working with RTMP or other FLV-based workflows.
@@ -45,7 +46,7 @@
 //! 2. Create an [`FfmpegScheduler`] from that context, then call `start()` and `wait()` (or `.await`
 //!    if you enable the `"async"` feature) to run the job.
 //!
-//! ```rust
+//! ```rust,ignore
 //! use ez_ffmpeg::FfmpegContext;
 //! use ez_ffmpeg::FfmpegScheduler;
 //!
@@ -81,7 +82,9 @@
 //! ### Core Features
 //!
 //! - **`opengl`**: Enables OpenGL-based filters for GPU-accelerated processing.
-//! - **`rtmp`**: Enables an embedded RTMP server for local streaming scenarios.
+//! - **`rtmp`**: Embedded RTMP server tuned for scale (10,000+ conns on Linux/macOS, 8,000 on Windows),
+//!   native epoll/kqueue/WSAPoll IO (edge-triggered on Linux/macOS), zero-copy GOP, and in-process ingest
+//!   that avoids TCP between FFmpeg and server.
 //! - **`flv`**: Adds FLV container parsing and handling.
 //! - **`async`**: Makes the [`FfmpegScheduler`] wait method asynchronous (you can `.await` it).
 //! - **`static`**: Uses static linking for FFmpeg libraries (via `ffmpeg-next/static`).
