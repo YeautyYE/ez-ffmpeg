@@ -2349,8 +2349,11 @@ fn ifilter_bind_ist(
         }
         (*fallback).time_base = (*dec_ctx).pkt_timebase;
 
-        //TODO Set this flag according to the input stream parameters
-        input_filter.opts.flags |= IFILTER_FLAG_AUTOROTATE;
+        // Set autorotate flag based on demuxer configuration
+        // FFmpeg source: ffmpeg_demux.c:1137, ffmpeg_filter.c:1744-1778 (FFmpeg 7.x)
+        if demux.autorotate {
+            input_filter.opts.flags |= IFILTER_FLAG_AUTOROTATE;
+        }
 
         let tsoffset = if demux.copy_ts {
             let mut tsoffset = if demux.start_time_us.is_some() {
@@ -2933,6 +2936,8 @@ unsafe fn open_input_file(index: usize, input: &mut Input, copy_ts: bool) -> Res
         input.hwaccel_device.clone(),
         input.hwaccel_output_format.clone(),
         copy_ts,
+        input.autorotate.unwrap_or(true),  // Default to true (enabled)
+        input.ts_scale.unwrap_or(1.0),     // Default to 1.0 (no scaling)
     )?;
 
     Ok(demux)

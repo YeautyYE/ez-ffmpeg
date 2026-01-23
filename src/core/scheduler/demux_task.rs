@@ -432,11 +432,18 @@ unsafe fn ts_fixup(
         (*pkt).pts += av_rescale_q(demux_paramter.ts_offset, AV_TIME_BASE_Q, (*pkt).time_base);
     }
 
-    // TODO ts_scale
-    /*if ((*pkt).pts != AV_NOPTS_VALUE)
-    (*pkt).pts *= ds.ts_scale;
-    if ((*pkt).dts != AV_NOPTS_VALUE)
-    (*pkt).dts *= ds.ts_scale;*/
+    // Apply timestamp scaling (after ts_offset, before duration)
+    // FFmpeg source: ffmpeg_demux.c:420-422 (FFmpeg 7.x)
+    // Note: C's `int64_t *= double` truncates toward zero, Rust's `as i64` behaves the same.
+    let ts_scale = demux_paramter.ts_scale;
+    if ts_scale != 1.0 {
+        if (*pkt).pts != AV_NOPTS_VALUE {
+            (*pkt).pts = ((*pkt).pts as f64 * ts_scale) as i64;
+        }
+        if (*pkt).dts != AV_NOPTS_VALUE {
+            (*pkt).dts = ((*pkt).dts as f64 * ts_scale) as i64;
+        }
+    }
 
     let duration = av_rescale_q(
         demux_paramter.duration.ts,
@@ -784,6 +791,13 @@ struct DemuxerParamter {
     exit_on_error: bool,
     stream_loop: i32,
 
+    /// Timestamp scale factor for pts/dts values.
+    /// Applied after ts_offset addition. Default is 1.0.
+    ///
+    /// FFmpeg CLI: `-itsscale <scale>`
+    /// FFmpeg source: `ffmpeg_demux.c:420-422` (FFmpeg 7.x)
+    ts_scale: f64,
+
     end_pts: Timestamp,
 
     /* duration of the looped segment of the input file */
@@ -832,6 +846,7 @@ impl DemuxerParamter {
             recording_time_us: demux.recording_time_us,
             exit_on_error: demux.exit_on_error.unwrap_or(false),
             stream_loop: demux.stream_loop.unwrap_or(0),
+            ts_scale: demux.ts_scale,
 
             end_pts: Default::default(),
 
@@ -1123,4 +1138,180 @@ unsafe fn demux_flush(
     }
 
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use ffmpeg_sys_next::AV_NOPTS_VALUE;
+
+    /// Apply ts_scale to a timestamp value.
+    /// Returns the scaled timestamp, or AV_NOPTS_VALUE if input is AV_NOPTS_VALUE.
+    ///
+    /// This mirrors the logic in `adjust_pkt_for_stream`:
+    /// - If ts_scale == 1.0, no change
+    /// - Otherwise, multiply and truncate toward zero (same as C's int64_t *= double)
+    fn apply_ts_scale(ts: i64, ts_scale: f64) -> i64 {
+        if ts == AV_NOPTS_VALUE {
+            return AV_NOPTS_VALUE;
+        }
+        if ts_scale == 1.0 {
+            return ts;
+        }
+        (ts as f64 * ts_scale) as i64
+    }
+
+    #[test]
+    fn ts_scale_default_no_change() {
+        // ts_scale = 1.0 should not modify timestamps
+        assert_eq!(apply_ts_scale(1000, 1.0), 1000);
+        assert_eq!(apply_ts_scale(0, 1.0), 0);
+        assert_eq!(apply_ts_scale(-1000, 1.0), -1000);
+    }
+
+    #[test]
+    fn ts_scale_double() {
+        // ts_scale = 2.0 should double timestamps
+        assert_eq!(apply_ts_scale(1000, 2.0), 2000);
+        assert_eq!(apply_ts_scale(500, 2.0), 1000);
+        assert_eq!(apply_ts_scale(-500, 2.0), -1000);
+    }
+
+    #[test]
+    fn ts_scale_half() {
+        // ts_scale = 0.5 should halve timestamps (truncate toward zero)
+        assert_eq!(apply_ts_scale(1000, 0.5), 500);
+        assert_eq!(apply_ts_scale(1001, 0.5), 500); // truncates, not rounds
+        assert_eq!(apply_ts_scale(-1000, 0.5), -500);
+        assert_eq!(apply_ts_scale(-1001, 0.5), -500); // truncates toward zero
+    }
+
+    #[test]
+    fn ts_scale_fractional() {
+        // ts_scale = 1.5 should multiply and truncate
+        assert_eq!(apply_ts_scale(100, 1.5), 150);
+        assert_eq!(apply_ts_scale(101, 1.5), 151); // 101 * 1.5 = 151.5 -> 151
+        assert_eq!(apply_ts_scale(-100, 1.5), -150);
+        assert_eq!(apply_ts_scale(-101, 1.5), -151); // -101 * 1.5 = -151.5 -> -151
+    }
+
+    #[test]
+    fn ts_scale_zero() {
+        // ts_scale = 0.0 should make all timestamps zero
+        assert_eq!(apply_ts_scale(1000, 0.0), 0);
+        assert_eq!(apply_ts_scale(-1000, 0.0), 0);
+        assert_eq!(apply_ts_scale(i64::MAX, 0.0), 0);
+    }
+
+    #[test]
+    fn ts_scale_preserves_nopts() {
+        // AV_NOPTS_VALUE should always be preserved
+        assert_eq!(apply_ts_scale(AV_NOPTS_VALUE, 1.0), AV_NOPTS_VALUE);
+        assert_eq!(apply_ts_scale(AV_NOPTS_VALUE, 2.0), AV_NOPTS_VALUE);
+        assert_eq!(apply_ts_scale(AV_NOPTS_VALUE, 0.5), AV_NOPTS_VALUE);
+        assert_eq!(apply_ts_scale(AV_NOPTS_VALUE, 0.0), AV_NOPTS_VALUE);
+    }
+
+    #[test]
+    fn ts_scale_negative_scale() {
+        // Negative scale should negate timestamps (truncate toward zero)
+        assert_eq!(apply_ts_scale(1000, -1.0), -1000);
+        assert_eq!(apply_ts_scale(-1000, -1.0), 1000);
+        assert_eq!(apply_ts_scale(100, -0.5), -50);
+    }
+
+    #[test]
+    fn ts_scale_large_values() {
+        // Test with large timestamp values (common in media files)
+        let large_pts: i64 = 90000 * 3600; // 1 hour at 90kHz timebase
+        assert_eq!(apply_ts_scale(large_pts, 2.0), large_pts * 2);
+        assert_eq!(apply_ts_scale(large_pts, 0.5), large_pts / 2);
+    }
+
+    #[test]
+    fn ts_scale_nan_inf_behavior() {
+        // Document Rust's behavior for NaN/Inf (differs from C):
+        // - Rust `as i64` saturates: NaN -> 0, Inf -> i64::MAX, -Inf -> i64::MIN
+        // - C behavior is undefined for these cases
+        // These tests document the actual behavior, not necessarily "correct" behavior
+
+        // NaN * any = NaN, Rust maps NaN to 0
+        assert_eq!(apply_ts_scale(1000, f64::NAN), 0);
+
+        // Inf * positive = Inf, Rust saturates to i64::MAX
+        assert_eq!(apply_ts_scale(1000, f64::INFINITY), i64::MAX);
+
+        // -Inf * positive = -Inf, Rust saturates to i64::MIN
+        assert_eq!(apply_ts_scale(1000, f64::NEG_INFINITY), i64::MIN);
+
+        // Inf * negative = -Inf
+        assert_eq!(apply_ts_scale(-1000, f64::INFINITY), i64::MIN);
+    }
+
+    #[test]
+    fn ts_scale_precision_edge_cases() {
+        // Test near f64 precision limits (2^53 is max exact integer in f64)
+        let near_precision_limit: i64 = (1i64 << 52) + 1; // Just above 2^52
+
+        // At this scale, f64 can still represent the value exactly
+        let result = apply_ts_scale(near_precision_limit, 1.0);
+        assert_eq!(result, near_precision_limit);
+
+        // Test with value that may lose precision when converted to f64
+        let large_value: i64 = (1i64 << 53) + 1;
+        // After f64 conversion and back, precision loss may occur
+        let scaled = apply_ts_scale(large_value, 1.0);
+        // With scale=1.0, we skip the conversion, so value is preserved
+        assert_eq!(scaled, large_value);
+
+        // With scale != 1.0, conversion happens and precision may be lost
+        let scaled_2x = apply_ts_scale(large_value, 2.0);
+        // The result may not be exactly large_value * 2 due to f64 precision
+        // We just verify it's in a reasonable range
+        assert!(scaled_2x > large_value);
+    }
+
+    #[test]
+    fn ts_scale_overflow_saturation() {
+        // Test overflow behavior: Rust saturates instead of wrapping
+        // i64::MAX * 2.0 overflows, Rust saturates to i64::MAX
+        assert_eq!(apply_ts_scale(i64::MAX, 2.0), i64::MAX);
+
+        // i64::MIN * 2.0 overflows negative, Rust saturates to i64::MIN
+        assert_eq!(apply_ts_scale(i64::MIN, 2.0), i64::MIN);
+
+        // Large positive * large scale
+        assert_eq!(apply_ts_scale(i64::MAX / 2, 3.0), i64::MAX);
+    }
+
+    /// Simulates packet with separate pts and dts handling
+    /// This mirrors the actual code structure more closely
+    fn apply_ts_scale_to_packet(pts: i64, dts: i64, ts_scale: f64) -> (i64, i64) {
+        let new_pts = apply_ts_scale(pts, ts_scale);
+        let new_dts = apply_ts_scale(dts, ts_scale);
+        (new_pts, new_dts)
+    }
+
+    #[test]
+    fn ts_scale_pts_dts_independent() {
+        // Test that pts and dts are scaled independently
+        // Case 1: Both valid
+        let (pts, dts) = apply_ts_scale_to_packet(1000, 900, 2.0);
+        assert_eq!(pts, 2000);
+        assert_eq!(dts, 1800);
+
+        // Case 2: Only pts is AV_NOPTS_VALUE
+        let (pts, dts) = apply_ts_scale_to_packet(AV_NOPTS_VALUE, 900, 2.0);
+        assert_eq!(pts, AV_NOPTS_VALUE);
+        assert_eq!(dts, 1800);
+
+        // Case 3: Only dts is AV_NOPTS_VALUE
+        let (pts, dts) = apply_ts_scale_to_packet(1000, AV_NOPTS_VALUE, 2.0);
+        assert_eq!(pts, 2000);
+        assert_eq!(dts, AV_NOPTS_VALUE);
+
+        // Case 4: Both are AV_NOPTS_VALUE
+        let (pts, dts) = apply_ts_scale_to_packet(AV_NOPTS_VALUE, AV_NOPTS_VALUE, 2.0);
+        assert_eq!(pts, AV_NOPTS_VALUE);
+        assert_eq!(dts, AV_NOPTS_VALUE);
+    }
 }

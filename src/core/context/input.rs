@@ -234,6 +234,52 @@ pub struct Input {
     /// These options allow fine-tuning of input behavior across different components
     /// of the FFmpeg input pipeline.
     pub(crate) input_opts: Option<HashMap<String, String>>,
+
+    /// Automatically rotate video based on display matrix metadata.
+    ///
+    /// When enabled (default), videos with rotation metadata (common in smartphone
+    /// recordings) will be automatically rotated to the correct orientation using
+    /// transpose/hflip/vflip filters.
+    ///
+    /// Set to `false` to disable automatic rotation and preserve the original
+    /// video orientation.
+    ///
+    /// ## FFmpeg CLI equivalent
+    /// ```bash
+    /// # Disable autorotate
+    /// ffmpeg -autorotate 0 -i input.mp4 output.mp4
+    ///
+    /// # Enable autorotate (default)
+    /// ffmpeg -autorotate 1 -i input.mp4 output.mp4
+    /// ```
+    ///
+    /// ## FFmpeg source reference (FFmpeg 7.x)
+    /// - Default value: `ffmpeg_demux.c:1319` (`ds->autorotate = 1`)
+    /// - Flag setting: `ffmpeg_demux.c:1137` (`IFILTER_FLAG_AUTOROTATE`)
+    /// - Filter insertion: `ffmpeg_filter.c:1744-1778`
+    pub(crate) autorotate: Option<bool>,
+
+    /// Timestamp scale factor for pts/dts values.
+    ///
+    /// This multiplier is applied to packet timestamps after ts_offset addition.
+    /// Default is 1.0 (no scaling). Values must be positive.
+    ///
+    /// This is useful for fixing videos with incorrect timestamps or for
+    /// special timestamp manipulation scenarios.
+    ///
+    /// ## FFmpeg CLI equivalent
+    /// ```bash
+    /// # Scale timestamps by 2x
+    /// ffmpeg -itsscale 2.0 -i input.mp4 output.mp4
+    ///
+    /// # Scale timestamps by 0.5x (half speed effect on timestamps)
+    /// ffmpeg -itsscale 0.5 -i input.mp4 output.mp4
+    /// ```
+    ///
+    /// ## FFmpeg source reference (FFmpeg 7.x)
+    /// - Default value: `ffmpeg_demux.c:1316` (`ds->ts_scale = 1.0`)
+    /// - Application: `ffmpeg_demux.c:420-422` (applied after ts_offset)
+    pub(crate) ts_scale: Option<f64>,
 }
 
 impl Input {
@@ -839,6 +885,63 @@ impl Input {
         self
     }
 
+    /// Sets whether to automatically rotate video based on display matrix metadata.
+    ///
+    /// When enabled (default is `true`), videos with rotation metadata (common in
+    /// smartphone recordings) will be automatically rotated to the correct orientation
+    /// using transpose/hflip/vflip filters.
+    ///
+    /// # Parameters
+    /// - `autorotate`: `true` to enable automatic rotation (default), `false` to disable.
+    ///
+    /// # Returns
+    /// * `Self` - allowing method chaining.
+    ///
+    /// # FFmpeg CLI equivalent
+    /// ```bash
+    /// ffmpeg -autorotate 0 -i input.mp4 output.mp4
+    /// ```
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// // Disable automatic rotation to preserve original video orientation
+    /// let input = Input::from("smartphone_video.mp4")
+    ///     .set_autorotate(false);
+    /// ```
+    pub fn set_autorotate(mut self, autorotate: bool) -> Self {
+        self.autorotate = Some(autorotate);
+        self
+    }
+
+    /// Sets a timestamp scale factor for pts/dts values.
+    ///
+    /// This multiplier is applied to packet timestamps after ts_offset addition.
+    /// Default is `1.0` (no scaling). Values must be positive.
+    ///
+    /// This is useful for fixing videos with incorrect timestamps or for
+    /// special timestamp manipulation scenarios.
+    ///
+    /// # Parameters
+    /// - `scale`: A positive floating-point value for timestamp scaling.
+    ///
+    /// # Returns
+    /// * `Self` - allowing method chaining.
+    ///
+    /// # FFmpeg CLI equivalent
+    /// ```bash
+    /// ffmpeg -itsscale 2.0 -i input.mp4 output.mp4
+    /// ```
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// // Scale timestamps by 2x (double the playback speed effect on timestamps)
+    /// let input = Input::from("video.mp4")
+    ///     .set_ts_scale(2.0);
+    /// ```
+    pub fn set_ts_scale(mut self, scale: f64) -> Self {
+        self.ts_scale = Some(scale);
+        self
+    }
 }
 
 impl From<Box<dyn FnMut(&mut [u8]) -> i32>> for Input {
@@ -862,6 +965,8 @@ impl From<Box<dyn FnMut(&mut [u8]) -> i32>> for Input {
             hwaccel_device: None,
             hwaccel_output_format: None,
             input_opts: None,
+            autorotate: None,
+            ts_scale: None,
         }
     }
 }
@@ -887,6 +992,8 @@ impl From<String> for Input {
             hwaccel_device: None,
             hwaccel_output_format: None,
             input_opts: None,
+            autorotate: None,
+            ts_scale: None,
         }
     }
 }
