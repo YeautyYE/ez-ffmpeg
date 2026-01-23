@@ -562,6 +562,291 @@ fn wrap_metadata(data: Bytes) -> Bytes {
     bytes.freeze()
 }
 
+
+// ============================================================================
+// StreamBuilder API - Simplified RTMP streaming interface
+// ============================================================================
+
+use crate::core::context::ffmpeg_context::FfmpegContext;
+use crate::core::context::input::Input;
+use crate::core::scheduler::ffmpeg_scheduler::{FfmpegScheduler, Running as SchedulerRunning};
+use crate::error::StreamError;
+use std::path::{Path, PathBuf};
+
+/// A builder for creating RTMP streaming sessions with a simplified API.
+///
+/// This builder provides a fluent interface for configuring and starting
+/// RTMP streaming without needing to manually manage the server lifecycle.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use ez_ffmpeg::rtmp::embed_rtmp_server::EmbedRtmpServer;
+///
+/// let handle = EmbedRtmpServer::stream_builder()
+///     .address("localhost:1935")
+///     .app_name("live")
+///     .stream_key("stream1")
+///     .input_file("video.mp4")
+///     // readrate defaults to 1.0 (realtime)
+///     .start()?;
+///
+/// handle.wait()?;
+/// ```
+pub struct StreamBuilder {
+    address: Option<String>,
+    app_name: Option<String>,
+    stream_key: Option<String>,
+    input_file: Option<PathBuf>,
+    readrate: Option<f32>,
+    gop_limit: Option<usize>,
+    max_connections: Option<usize>,
+}
+
+impl Default for StreamBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StreamBuilder {
+    /// Creates a new `StreamBuilder` with default settings.
+    ///
+    /// By default, `readrate` is set to `1.0` (real-time playback speed),
+    /// which is equivalent to FFmpeg's `-re` flag. This is the recommended
+    /// setting for live RTMP streaming scenarios.
+    pub fn new() -> Self {
+        Self {
+            address: None,
+            app_name: None,
+            stream_key: None,
+            input_file: None,
+            readrate: Some(1.0), // Default to real-time speed for live streaming
+            gop_limit: None,
+            max_connections: None,
+        }
+    }
+
+    /// Sets the address for the RTMP server (e.g., "localhost:1935").
+    pub fn address(mut self, address: impl Into<String>) -> Self {
+        self.address = Some(address.into());
+        self
+    }
+
+    /// Sets the RTMP application name.
+    pub fn app_name(mut self, app_name: impl Into<String>) -> Self {
+        self.app_name = Some(app_name.into());
+        self
+    }
+
+    /// Sets the stream key (publishing name).
+    pub fn stream_key(mut self, stream_key: impl Into<String>) -> Self {
+        self.stream_key = Some(stream_key.into());
+        self
+    }
+
+    /// Sets the input file path to stream.
+    pub fn input_file(mut self, path: impl AsRef<Path>) -> Self {
+        self.input_file = Some(path.as_ref().to_path_buf());
+        self
+    }
+
+    /// Sets the read rate for the input file.
+    ///
+    /// A value of 1.0 means realtime playback speed.
+    /// This is useful for simulating live streaming from a file.
+    pub fn readrate(mut self, rate: f32) -> Self {
+        self.readrate = Some(rate);
+        self
+    }
+
+    /// Sets the GOP (Group of Pictures) limit for the RTMP server.
+    ///
+    /// This controls how many GOPs are buffered for new subscribers.
+    pub fn gop_limit(mut self, limit: usize) -> Self {
+        self.gop_limit = Some(limit);
+        self
+    }
+
+    /// Sets the maximum number of connections the server will accept.
+    pub fn max_connections(mut self, max: usize) -> Self {
+        self.max_connections = Some(max);
+        self
+    }
+
+    /// Starts the RTMP streaming session.
+    ///
+    /// This method validates all required parameters, starts the RTMP server,
+    /// and begins streaming the input file.
+    ///
+    /// # Required Parameters
+    ///
+    /// - `address`: The server address
+    /// - `app_name`: The RTMP application name
+    /// - `stream_key`: The stream key (publishing name)
+    /// - `input_file`: The file to stream
+    ///
+    /// # Returns
+    ///
+    /// A `StreamHandle` that can be used to wait for completion or manage the stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StreamError` if:
+    /// - Any required parameter is missing
+    /// - The input file does not exist
+    /// - The server fails to start
+    /// - FFmpeg context creation fails
+    pub fn start(self) -> Result<StreamHandle, StreamError> {
+        // Validate required parameters
+        let address = self
+            .address
+            .ok_or(StreamError::MissingParameter("address"))?;
+        let app_name = self
+            .app_name
+            .ok_or(StreamError::MissingParameter("app_name"))?;
+        let stream_key = self
+            .stream_key
+            .ok_or(StreamError::MissingParameter("stream_key"))?;
+        let input_file = self
+            .input_file
+            .ok_or(StreamError::MissingParameter("input_file"))?;
+
+        // Validate input file exists and is a file (not a directory)
+        if !input_file.is_file() {
+            return Err(StreamError::InputNotFound { path: input_file });
+        }
+
+        // Create and configure the server
+        let mut server = if let Some(gop_limit) = self.gop_limit {
+            EmbedRtmpServer::new_with_gop_limit(&address, gop_limit)
+        } else {
+            EmbedRtmpServer::new(&address)
+        };
+
+        if let Some(max_conn) = self.max_connections {
+            server = server.set_max_connections(max_conn);
+        }
+
+        // Start the server
+        let server = server.start().map_err(StreamError::Ffmpeg)?;
+        let server = Arc::new(server);
+
+        // Create the RTMP output
+        let output = server
+            .create_rtmp_input(&app_name, &stream_key)
+            .map_err(StreamError::Ffmpeg)?;
+
+        // Create the input with optional readrate
+        let input_path = input_file.to_string_lossy().to_string();
+        let mut input = Input::from(input_path);
+        if let Some(rate) = self.readrate {
+            input = input.set_readrate(rate);
+        }
+
+        // Build and start the FFmpeg context
+        let scheduler = FfmpegContext::builder()
+            .input(input)
+            .output(output)
+            .build()
+            .map_err(StreamError::Ffmpeg)?
+            .start()
+            .map_err(StreamError::Ffmpeg)?;
+
+        Ok(StreamHandle {
+            _server: server,
+            scheduler: Some(scheduler),
+        })
+    }
+}
+
+/// A handle to a running RTMP streaming session.
+///
+/// This handle manages the lifecycle of both the RTMP server and the FFmpeg
+/// streaming context. When dropped, it will attempt to clean up resources.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let handle = EmbedRtmpServer::stream_builder()
+///     .address("localhost:1935")
+///     .app_name("live")
+///     .stream_key("stream1")
+///     .input_file("video.mp4")
+///     .start()?;
+///
+/// // Wait for streaming to complete
+/// handle.wait()?;
+/// ```
+pub struct StreamHandle {
+    _server: Arc<EmbedRtmpServer<Running>>,
+    scheduler: Option<FfmpegScheduler<SchedulerRunning>>,
+}
+
+impl StreamHandle {
+    /// Waits for the streaming session to complete.
+    ///
+    /// This method blocks until the FFmpeg context finishes processing
+    /// (e.g., when the input file ends or an error occurs).
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` if streaming completed successfully, or an error
+    /// if something went wrong during streaming.
+    pub fn wait(mut self) -> Result<(), StreamError> {
+        if let Some(scheduler) = self.scheduler.take() {
+            scheduler.wait().map_err(StreamError::Ffmpeg)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for StreamHandle {
+    fn drop(&mut self) {
+        // Best-effort cleanup: if scheduler wasn't consumed by wait(),
+        // we attempt to stop it gracefully here.
+        // The server will be stopped when the Arc is dropped.
+        if let Some(scheduler) = self.scheduler.take() {
+            // Attempt to wait for graceful shutdown, but don't block forever
+            let _ = scheduler.wait();
+        }
+    }
+}
+
+impl EmbedRtmpServer<Initialization> {
+    /// Creates a new `StreamBuilder` for simplified RTMP streaming.
+    ///
+    /// This is the recommended entry point for simple streaming scenarios
+    /// where you want to stream a file to an embedded RTMP server.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use ez_ffmpeg::rtmp::embed_rtmp_server::EmbedRtmpServer;
+    ///
+    /// let handle = EmbedRtmpServer::stream_builder()
+    ///     .address("localhost:1935")
+    ///     .app_name("live")
+    ///     .stream_key("stream1")
+    ///     .input_file("video.mp4")
+    ///     .start()?;
+    ///
+    /// handle.wait()?;
+    /// ```
+    ///
+    /// For more complex scenarios requiring full control over the server
+    /// and FFmpeg context, use the traditional API:
+    ///
+    /// ```rust,ignore
+    /// let server = EmbedRtmpServer::new("localhost:1935").start()?;
+    /// let output = server.create_rtmp_input("app", "stream")?;
+    /// // ... configure Input and FfmpegContext manually
+    /// ```
+    pub fn stream_builder() -> StreamBuilder {
+        StreamBuilder::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -3,14 +3,34 @@ use ez_ffmpeg::{FfmpegContext, Input, Output};
 
 fn main() {
     // ============================================================
-    // Method 1: Using Embedded RTMP Server (Requires `rtmp` feature)
+    // Method 1: StreamBuilder API (Recommended for simple cases)
     // ============================================================
+    // The simplest way to stream a file to an embedded RTMP server.
+    // Just 5 lines of code with clear, self-documenting parameters.
+
+    let handle = EmbedRtmpServer::stream_builder()
+        .address("localhost:1935")
+        .app_name("my-app")
+        .stream_key("my-stream")
+        .input_file("../../test.mp4")
+        // readrate defaults to 1.0 (realtime), no need to set explicitly
+        .start()
+        .unwrap();
+
+    handle.wait().unwrap();
+
+    // ============================================================
+    // Method 2: Traditional API (For full control)
+    // ============================================================
+    // Use this when you need more control over the server, input,
+    // or FFmpeg context configuration.
+    //
     // Architecture: Reactor pattern with edge-triggered IO (epoll/kqueue)
     // Thread model: 2-3 threads (accept + reactor + optional publisher)
     // Backpressure: 1MB warning, 2MB high, 4MB critical (disconnect)
 
-    // 1. Create and start an embedded RTMP server on "localhost:1935"
-    let embed_rtmp_server = EmbedRtmpServer::new("localhost:1935")
+    // 1. Create and start an embedded RTMP server on "localhost:1936"
+    let embed_rtmp_server = EmbedRtmpServer::new("localhost:1936")
         .start()
         .unwrap();
 
@@ -34,7 +54,7 @@ fn main() {
         .wait().unwrap();
 
     // ============================================================
-    // Method 2: Using External RTMP Server (No `rtmp` feature needed)
+    // Method 3: Using External RTMP Server (No `rtmp` feature needed)
     // ============================================================
 
     // 1. Prepare an `Input` using builder pattern
@@ -43,7 +63,7 @@ fn main() {
 
     // 2. Output the stream to an external RTMP server
     //    Note: RTMP requires FLV format with H.264 video and AAC audio
-    let output = Output::from("rtmp://localhost/my-app/my-stream")
+    let output = Output::from("rtmp://localhost:1937/my-app/my-stream")
         .set_format("flv") // Required for RTMP
         .set_video_codec("h264")
         .set_audio_codec("aac")

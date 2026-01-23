@@ -136,6 +136,20 @@ pub enum Error {
     Bug,
 }
 
+/// Error type for RTMP streaming operations using StreamBuilder
+#[cfg(feature = "rtmp")]
+#[derive(thiserror::Error, Debug)]
+pub enum StreamError {
+    #[error("missing required parameter: {0}")]
+    MissingParameter(&'static str),
+
+    #[error("input path is not a valid file: {path}")]
+    InputNotFound { path: std::path::PathBuf },
+
+    #[error("ffmpeg error: {0}")]
+    Ffmpeg(#[from] crate::error::Error),
+}
+
 impl PartialEq for Error {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
