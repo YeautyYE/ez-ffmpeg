@@ -311,7 +311,7 @@ pub unsafe fn copy_metadata(
             av_dict_copy(
                 &mut output_ref.metadata,
                 src_dict,
-                AV_DICT_DONT_OVERWRITE as i32,
+                AV_DICT_DONT_OVERWRITE,
             );
         }
 
@@ -326,7 +326,7 @@ pub unsafe fn copy_metadata(
                     av_dict_copy(
                         &mut stream_ref.metadata,
                         src_dict,
-                        AV_DICT_DONT_OVERWRITE as i32,
+                        AV_DICT_DONT_OVERWRITE,
                     );
                 }
             }
@@ -346,7 +346,7 @@ pub unsafe fn copy_metadata(
             av_dict_copy(
                 &mut chapter_ref.metadata,
                 src_dict,
-                AV_DICT_DONT_OVERWRITE as i32,
+                AV_DICT_DONT_OVERWRITE,
             );
         }
 
@@ -364,7 +364,7 @@ pub unsafe fn copy_metadata(
             av_dict_copy(
                 &mut program_ref.metadata,
                 src_dict,
-                AV_DICT_DONT_OVERWRITE as i32,
+                AV_DICT_DONT_OVERWRITE,
             );
         }
     }

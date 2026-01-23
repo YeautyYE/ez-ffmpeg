@@ -394,7 +394,7 @@ unsafe fn determine_vsync_method(
     }
 
     // 1. Check if frame rate is set
-    let mut vsync_method = if framerate.map_or(false, |fr| fr.num != 0) {
+    let mut vsync_method = if framerate.is_some_and(|fr| fr.num != 0) {
         VSyncMethod::VsyncCfr
     }
     // 2. If output format is "avi", set VSYNC_VFR

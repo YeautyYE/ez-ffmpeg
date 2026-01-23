@@ -413,7 +413,7 @@ fn receive_frame(
             return SyncFrame::Break;
         }
 
-        if let Err(e) = enc_open(enc_ctx, stream, &mut frame_box, ready_sender.clone(), bits_per_raw_sample.clone()) {
+        if let Err(e) = enc_open(enc_ctx, stream, &mut frame_box, ready_sender.clone(), *bits_per_raw_sample) {
             frame_pool.release(frame_box.frame);
             error!("Open encoder error: {e}");
             set_scheduler_error(scheduler_status, scheduler_result, e);
@@ -448,12 +448,12 @@ fn receive_frame(
             }
         }
 
-        let frame_box = match receive_from(receiver, scheduler_status) {
+        
+
+        match receive_from(receiver, scheduler_status) {
             Ok(frame) => frame,
             Err(sync) => return sync,
-        };
-
-        frame_box
+        }
     };
 
     if *frame_samples > 0 {
@@ -486,7 +486,7 @@ fn receive_frame(
             frames_sent,
             is_finished,
             scheduler_status,
-            &scheduler_result,
+            scheduler_result,
         ) {
             Ok(Some(frame)) => SyncFrame::FrameBox(frame),
             Ok(None) => SyncFrame::Continue,
@@ -787,11 +787,7 @@ fn enc_open(
                     != 0
                     || ((*frame).flags & AV_FRAME_FLAG_INTERLACED) != 0
                 {
-                    let top_field_first = if ((*frame).flags & AV_FRAME_FLAG_TOP_FIELD_FIRST) != 0 {
-                        true
-                    } else {
-                        false
-                    };
+                    let top_field_first = ((*frame).flags & AV_FRAME_FLAG_TOP_FIELD_FIRST) != 0;
 
                     if (*enc).id == AV_CODEC_ID_MJPEG {
                         (*enc_ctx).field_order = if top_field_first {
@@ -1085,13 +1081,11 @@ fn frame_encode(
             if (*enc_ctx).codec_type == AVMEDIA_TYPE_VIDEO {
                 (*frame).quality = (*enc_ctx).global_quality;
                 (*frame).pict_type = AV_PICTURE_TYPE_NONE;
-            } else {
-                if (*(*enc_ctx).codec).capabilities & AV_CODEC_CAP_PARAM_CHANGE as i32 == 0
-                    && (*enc_ctx).ch_layout.nb_channels != (*frame).ch_layout.nb_channels
-                {
-                    error!("Audio channel count changed and encoder does not support parameter changes");
-                    return Ok(false);
-                }
+            } else if (*(*enc_ctx).codec).capabilities & AV_CODEC_CAP_PARAM_CHANGE as i32 == 0
+                && (*enc_ctx).ch_layout.nb_channels != (*frame).ch_layout.nb_channels
+            {
+                error!("Audio channel count changed and encoder does not support parameter changes");
+                return Ok(false);
             }
         }
         encode_frame(enc_ctx, frame, pkt_sender,  pre_pkt_sender, mux_started, stream, packet_pool)
@@ -1229,11 +1223,10 @@ unsafe fn encode_frame(
     stream: *mut AVStream,
     packet_pool: &ObjPool<Packet>,
 ) -> crate::error::Result<bool> {
-    if !frame.is_null() {
-        if (*frame).sample_aspect_ratio.num != 0 {
+    if !frame.is_null()
+        && (*frame).sample_aspect_ratio.num != 0 {
             (*enc_ctx).sample_aspect_ratio = (*frame).sample_aspect_ratio;
         }
-    }
 
     let ret = avcodec_send_frame(enc_ctx, frame);
     if ret < 0 && !(ret == AVERROR_EOF && frame.is_null()) {

@@ -13,7 +13,7 @@ use crate::error::FindDevicesError::AVCaptureDeviceNotFound;
 
 pub fn get_avfoundation_devices(media_type: &str) -> crate::error::Result<Vec<String>> {
     let option =  Class::get("AVCaptureDevice");
-    if let None = option {
+    if option.is_none() {
         return Err(AVCaptureDeviceNotFound.into());
     }
 

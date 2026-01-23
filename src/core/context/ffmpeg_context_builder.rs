@@ -34,6 +34,12 @@ pub struct FfmpegContextBuilder {
     copy_ts: bool,
 }
 
+impl Default for FfmpegContextBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FfmpegContextBuilder {
 
     /// Creates a new, empty `FfmpegContextBuilder`. Generally, you won't call this

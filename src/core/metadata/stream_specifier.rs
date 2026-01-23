@@ -110,7 +110,7 @@ impl StreamSpecifier {
                 'v' | 'a' | 's' | 't' | 'V' => {
                     let next_char = chars.clone().nth(1);
                     // FFmpeg uses cmdutils_isalnum() which checks ASCII-only (0-9, A-Z, a-z)
-                    if next_char.map_or(true, |c| !c.is_ascii_alphanumeric()) {
+                    if next_char.is_none_or(|c| !c.is_ascii_alphanumeric()) {
                         if ss.media_type.is_some() {
                             return Err("Stream type specified multiple times".to_string());
                         }
@@ -161,7 +161,7 @@ impl StreamSpecifier {
                     } else {
                         // Data type parsing
                         let next_char = chars.clone().nth(1);
-                        if next_char.map_or(true, |c| !c.is_ascii_alphanumeric()) {
+                        if next_char.is_none_or(|c| !c.is_ascii_alphanumeric()) {
                             if ss.media_type.is_some() {
                                 return Err("Stream type specified multiple times".to_string());
                             }
@@ -573,7 +573,7 @@ impl StreamSpecifier {
                     }
                     // Check no_apic flag (V specifier - video without attached pictures)
                     if self.no_apic
-                        && (candidate.disposition & AV_DISPOSITION_ATTACHED_PIC as i32) != 0
+                        && (candidate.disposition & AV_DISPOSITION_ATTACHED_PIC) != 0
                     {
                         continue;
                     }

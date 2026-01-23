@@ -111,7 +111,7 @@ pub fn get_chapter_metadata(
     // ffmpeg_next::Error::InvalidData so callers can treat it the same way as FFmpeg C APIs.
     let chapter = format_context
         .chapter(chapter_index)
-        .ok_or_else(|| ffmpeg_next::Error::InvalidData)?;
+        .ok_or(ffmpeg_next::Error::InvalidData)?;
 
     // Get the chapter metadata and convert it to a vector of key-value pairs
     // FFmpeg reference: AVChapter->metadata (AVDictionary) in avformat.h:1253
@@ -154,7 +154,7 @@ pub fn get_stream_metadata(
     // FFmpeg reference: AVFormatContext->streams[stream_index] in avformat.h:1476
     let stream = format_context
         .stream(stream_index)
-        .ok_or_else(|| ffmpeg_next::Error::StreamNotFound)?;
+        .ok_or(ffmpeg_next::Error::StreamNotFound)?;
 
     // Get the stream metadata and convert it to a vector of key-value pairs
     // FFmpeg reference: AVStream->metadata (AVDictionary) in avformat.h:1310

@@ -507,7 +507,7 @@ unsafe extern "C" fn ffmpeg_log_callback(
     // Convert the C string in the buffer to a Rust &str.
     if let Ok(msg) = std::ffi::CStr::from_ptr(buffer.as_ptr() as *const libc::c_char).to_str() {
         // Trim any trailing newline characters (\n or \r).
-        let trimmed_msg = msg.trim_end_matches(|c| c == '\n' || c == '\r');
+        let trimmed_msg = msg.trim_end_matches(['\n', '\r']);
 
         // Map FFmpeg log levels to the corresponding Rust log levels.
         if level <= ffmpeg_sys_next::AV_LOG_ERROR {

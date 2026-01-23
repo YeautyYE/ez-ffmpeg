@@ -668,15 +668,15 @@ unsafe fn ts_discontinuity_detect(
     if ds.next_dts != AV_NOPTS_VALUE && !disable_discontinuity_correction {
         let mut delta = pkt_dts - ds.next_dts;
         if fmt_is_discont != 0 {
-            if delta.abs() > 1i64 * DTS_DELTA_THRESHOLD * AV_TIME_BASE as i64
+            if delta.abs() > DTS_DELTA_THRESHOLD * AV_TIME_BASE as i64
                 || (pkt_dts + (AV_TIME_BASE / 10) as i64) < ds.dts
             {
-                (*demux_paramter).ts_offset_discont -= delta;
+                demux_paramter.ts_offset_discont -= delta;
                 warn!(
                     "timestamp discontinuity (stream id={}): {}, new offset= {}",
                     (*ist).id,
                     delta,
-                    (*demux_paramter).ts_offset_discont
+                    demux_paramter.ts_offset_discont
                 );
                 (*pkt).dts -= av_rescale_q(delta, AV_TIME_BASE_Q, (*pkt).time_base);
                 if (*pkt).pts != AV_NOPTS_VALUE {
@@ -685,7 +685,7 @@ unsafe fn ts_discontinuity_detect(
             }
         } else {
             const DTS_ERROR_THRESHOLD: i64 = 108000;
-            if delta.abs() > 1i64 * DTS_ERROR_THRESHOLD * AV_TIME_BASE as i64 {
+            if delta.abs() > DTS_ERROR_THRESHOLD * AV_TIME_BASE as i64 {
                 warn!(
                     "DTS {}, next:{} st:{} invalid dropping",
                     (*pkt).dts,
@@ -697,7 +697,7 @@ unsafe fn ts_discontinuity_detect(
             if (*pkt).pts != AV_NOPTS_VALUE {
                 let pkt_pts = av_rescale_q((*pkt).pts, (*pkt).time_base, AV_TIME_BASE_Q);
                 delta = pkt_pts - ds.next_dts;
-                if delta.abs() > 1i64 * DTS_ERROR_THRESHOLD * AV_TIME_BASE as i64 {
+                if delta.abs() > DTS_ERROR_THRESHOLD * AV_TIME_BASE as i64 {
                     warn!(
                         "PTS {}, next:{} invalid dropping st:{}",
                         (*pkt).pts,
@@ -711,15 +711,15 @@ unsafe fn ts_discontinuity_detect(
     } else if ds.next_dts == AV_NOPTS_VALUE
         && !copy_ts
         && fmt_is_discont != 0
-        && (*demux_paramter).last_ts != AV_NOPTS_VALUE
+        && demux_paramter.last_ts != AV_NOPTS_VALUE
     {
-        let delta = pkt_dts - (*demux_paramter).last_ts;
-        if delta.abs() > 1i64 * DTS_DELTA_THRESHOLD * AV_TIME_BASE as i64 {
-            (*demux_paramter).ts_offset_discont -= delta;
+        let delta = pkt_dts - demux_paramter.last_ts;
+        if delta.abs() > DTS_DELTA_THRESHOLD * AV_TIME_BASE as i64 {
+            demux_paramter.ts_offset_discont -= delta;
             debug!(
                 "Inter stream timestamp discontinuity {}, new offset= {}",
                 delta,
-                (*demux_paramter).ts_offset_discont
+                demux_paramter.ts_offset_discont
             );
             (*pkt).dts -= av_rescale_q(delta, AV_TIME_BASE_Q, (*pkt).time_base);
             if (*pkt).pts != AV_NOPTS_VALUE {
@@ -728,7 +728,7 @@ unsafe fn ts_discontinuity_detect(
         }
     }
 
-    (*demux_paramter).last_ts = av_rescale_q((*pkt).dts, (*pkt).time_base, AV_TIME_BASE_Q);
+    demux_paramter.last_ts = av_rescale_q((*pkt).dts, (*pkt).time_base, AV_TIME_BASE_Q);
 }
 
 struct DemuxStreamParamter {

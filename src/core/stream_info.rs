@@ -634,8 +634,8 @@ pub fn find_all_stream_infos(url: impl Into<String>) -> Result<Vec<StreamInfo>> 
                     let bit_rate = codecpar.bit_rate;
                     let pixel_format = codecpar.format;
                     let video_delay = codecpar.video_delay;
-                    let r_frame_rate = (*stream).r_frame_rate;
-                    let sample_aspect_ratio = (*stream).sample_aspect_ratio;
+                    let r_frame_rate = stream.r_frame_rate;
+                    let sample_aspect_ratio = stream.sample_aspect_ratio;
                     let fps = if avg_frame_rate.den == 0 {
                         0.0
                     } else {
