@@ -33,6 +33,20 @@ pub(crate) struct Demuxer {
     pub(crate) stream_loop: Option<i32>,
     pub(crate) copy_ts: bool,
 
+    /// Automatically rotate video based on display matrix metadata.
+    /// Default is true (enabled).
+    ///
+    /// FFmpeg CLI: `-autorotate 0/1`
+    /// FFmpeg source: `ffmpeg_demux.c:1319`, `ffmpeg_filter.c` (FFmpeg 7.x)
+    pub(crate) autorotate: bool,
+
+    /// Timestamp scale factor for pts/dts values.
+    /// Default is 1.0 (no scaling).
+    ///
+    /// FFmpeg CLI: `-itsscale <scale>`
+    /// FFmpeg source: `ffmpeg_demux.c:420-422` (FFmpeg 7.x)
+    pub(crate) ts_scale: f64,
+
     #[cfg(windows)]
     pub(crate) hwaccel: Option<String>,
 
@@ -65,6 +79,8 @@ impl Demuxer {
         hwaccel_device: Option<String>,
         hwaccel_output_format: Option<String>,
         copy_ts: bool,
+        autorotate: bool,
+        ts_scale: f64,
     ) -> crate::error::Result<Self> {
         let streams = Self::init_streams(
             in_fmt_ctx,
@@ -88,6 +104,8 @@ impl Demuxer {
             exit_on_error,
             stream_loop,
             copy_ts,
+            autorotate,
+            ts_scale,
             #[cfg(windows)]
             hwaccel,
             node: Arc::new(SchNode::Demux { waiter: Arc::new(Default::default()), task_exited: Arc::new(Default::default()) }),
