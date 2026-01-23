@@ -196,28 +196,26 @@ pub(crate) fn filter_graph_init(
                                 }
                             }
                         }
-                    } else {
-                        if let Err(e) = fg_send_eof(
-                            fg_index,
-                            &mut graph,
-                            &mut fgp,
-                            &graph_desc,
-                            frame_box,
-                            &mut ifps,
-                            &mut ofps,
-                            input_index,
-                            &frame_pool,
-                        ) {
-                            match e {
-                                Error::FilterGraph(FilterGraphOperationError::BufferSourceAddFrameError(FilterGraphError::EOF)) => {
-                                    debug!("Input {} no longer accepts new data", input_index);
-                                    filter_receive_finish(&finished_flag_list, input_index);
-                                }
-                                e => {
-                                    error!("filter_graph send_eof error: {e}");
-                                    set_scheduler_error(&scheduler_status, &scheduler_result, e);
-                                    break;
-                                }
+                    } else if let Err(e) = fg_send_eof(
+                        fg_index,
+                        &mut graph,
+                        &mut fgp,
+                        &graph_desc,
+                        frame_box,
+                        &mut ifps,
+                        &mut ofps,
+                        input_index,
+                        &frame_pool,
+                    ) {
+                        match e {
+                            Error::FilterGraph(FilterGraphOperationError::BufferSourceAddFrameError(FilterGraphError::EOF)) => {
+                                debug!("Input {} no longer accepts new data", input_index);
+                                filter_receive_finish(&finished_flag_list, input_index);
+                            }
+                            e => {
+                                error!("filter_graph send_eof error: {e}");
+                                set_scheduler_error(&scheduler_status, &scheduler_result, e);
+                                break;
                             }
                         }
                     }
@@ -947,9 +945,9 @@ fn filter_is_buffersrc(f: *mut AVFilterContext) -> bool {
     unsafe {
         (*f).nb_inputs == 0
             && (CStr::from_ptr((*(*f).filter).name)
-                == CStr::from_bytes_with_nul(b"buffer\0").unwrap()
+                == c"buffer"
                 || CStr::from_ptr((*(*f).filter).name)
-                    == CStr::from_bytes_with_nul(b"abuffer\0").unwrap())
+                    == c"abuffer")
     }
 }
 
@@ -987,7 +985,7 @@ unsafe fn configure_output_audio_filter(
     let mut last_filter = (*output).filter_ctx;
 
     let result = CString::new(format!("out_{}", ofp.opts.name));
-    if let Err(_) = result {
+    if result.is_err() {
         return AVERROR(ENOMEM);
     }
     let name = result.unwrap();
@@ -1049,7 +1047,7 @@ unsafe fn configure_output_audio_filter(
         let mut filter = null_mut();
 
         let result = CString::new(format!("format_out_{}", ofp.name));
-        if let Err(_) = result {
+        if result.is_err() {
             av_bprint_finalize(&mut bprint, null_mut());
             return AVERROR(ENOMEM);
         }
@@ -1331,15 +1329,14 @@ unsafe fn fg_output_step(
 
     }*/
 
-    if ofp.media_type == AVMEDIA_TYPE_VIDEO {
-        if (*frame.as_ptr()).duration == 0 {
+    if ofp.media_type == AVMEDIA_TYPE_VIDEO
+        && (*frame.as_ptr()).duration == 0 {
             let fr = av_buffersink_get_frame_rate(ofp.filter);
             if fr.num > 0 && fr.den > 0 {
                 (*frame.as_mut_ptr()).duration =
                     av_rescale_q(1, av_inv_q(fr), (*frame.as_ptr()).time_base);
             }
         }
-    }
 
     ret = fg_output_frame(fgp, ofp, frame, frame_pool);
     if ret < 0 {
@@ -1417,13 +1414,12 @@ unsafe fn fg_output_frame(
     mut frame: Frame,
     frame_pool: &ObjPool<Frame>,
 ) -> i32 {
-    if !ofp.finished_flag_list.is_empty() && ofp.fg_input_index < ofp.finished_flag_list.len() {
-        if ofp.finished_flag_list[ofp.fg_input_index].load(Ordering::Acquire) {
+    if !ofp.finished_flag_list.is_empty() && ofp.fg_input_index < ofp.finished_flag_list.len()
+        && ofp.finished_flag_list[ofp.fg_input_index].load(Ordering::Acquire) {
             ofp.eof = true;
             fgp.nb_outputs_done += 1;
             return 0;
         }
-    }
 
     let mut nb_frames = if !frame_is_null(&frame) { 1 } else { 0 };
     let mut nb_frames_prev = 0;
@@ -1441,7 +1437,7 @@ unsafe fn fg_output_frame(
                 &frame
             };
 
-            if frame_is_null(&frame_in) {
+            if frame_is_null(frame_in) {
                 break;
             }
 
@@ -1528,11 +1524,10 @@ unsafe fn fg_output_frame(
             ofp.fpsconv_context.frame_number += 1;
             ofp.next_pts += 1;
 
-            if i == nb_frames_prev {
-                if !frame_is_null(&frame) {
+            if i == nb_frames_prev
+                && !frame_is_null(&frame) {
                     (*frame.as_mut_ptr()).flags &= !AV_FRAME_FLAG_KEY;
                 }
-            }
         }
 
         fgp.got_frame = true;
@@ -1586,7 +1581,7 @@ unsafe fn close_output(
         if ofp.opts.ch_layout.nb_channels != 0 {
             let ret = av_channel_layout_copy(
                 &mut (*frame.as_mut_ptr()).ch_layout,
-                &mut (*frame.as_mut_ptr()).ch_layout,
+                &(*frame.as_mut_ptr()).ch_layout,
             );
             if ret < 0 {
                 return ret;
@@ -1833,14 +1828,12 @@ fn mid_pred(a: i64, b: i64, c: i64) -> i64 {
         } else {
             a // c > a > b
         }
+    } else if a > c {
+        a // b > a > c
+    } else if b > c {
+        c // b > c > a
     } else {
-        if a > c {
-            a // b > a > c
-        } else if b > c {
-            c // b > c > a
-        } else {
-            b // c > b > a
-        }
+        b // c > b > a
     }
 }
 
@@ -1964,11 +1957,10 @@ fn choose_sample_fmts(
     format: AVSampleFormat,
     formats: Option<Vec<AVSampleFormat>>,
 ) {
-    if format == AV_SAMPLE_FMT_NONE {
-        if formats.is_none() || formats.as_ref().unwrap().is_empty() {
+    if format == AV_SAMPLE_FMT_NONE
+        && (formats.is_none() || formats.as_ref().unwrap().is_empty()) {
             return;
         }
-    }
 
     unsafe {
         {
@@ -2006,11 +1998,10 @@ fn choose_sample_rates(bprint: &mut AVBPrint, rate: i32, rates: Option<Vec<i32>>
 
 #[cfg(not(feature = "docs-rs"))]
 fn choose_sample_rates(bprint: &mut AVBPrint, rate: i32, rates: Option<Vec<i32>>) {
-    if rate == 0 {
-        if rates.is_none() || rates.as_ref().unwrap().is_empty() {
+    if rate == 0
+        && (rates.is_none() || rates.as_ref().unwrap().is_empty()) {
             return;
         }
-    }
 
     unsafe {
         {
@@ -2091,7 +2082,7 @@ unsafe fn configure_output_video_filter(
     let mut last_filter = (*output).filter_ctx;
 
     let result = CString::new(format!("out_{}", ofp.opts.name));
-    if let Err(_) = result {
+    if result.is_err() {
         return AVERROR(ENOMEM);
     }
     let name = result.unwrap();
@@ -2126,12 +2117,12 @@ unsafe fn configure_output_video_filter(
     choose_color_spaces(
         &mut bprint,
         AVCOL_SPC_UNSPECIFIED,
-        ofp.opts.color_spaces.clone().unwrap_or(Vec::new()),
+        ofp.opts.color_spaces.clone().unwrap_or_default(),
     );
     choose_color_ranges(
         &mut bprint,
         AVCOL_RANGE_UNSPECIFIED,
-        ofp.opts.color_ranges.clone().unwrap_or(Vec::new()),
+        ofp.opts.color_ranges.clone().unwrap_or_default(),
     );
 
     if bprint.len >= bprint.size {
@@ -2355,32 +2346,32 @@ unsafe fn configure_input_audio_filter(
     };
 
     av_bprint_init(&mut args, 0, AV_BPRINT_SIZE_AUTOMATIC as u32);
-    let sample_fmt_name = av_get_sample_fmt_name(std::mem::transmute((*ifp).format));
+    let sample_fmt_name = av_get_sample_fmt_name(std::mem::transmute(ifp.format));
 
     {
         let fmt_str = CString::new("time_base=%d/%d:sample_rate=%d:sample_fmt=%s").unwrap();
         av_bprintf(
             &mut args,
             fmt_str.as_ptr(),
-            (*ifp).time_base.num,
-            (*ifp).time_base.den,
-            (*ifp).sample_rate,
+            ifp.time_base.num,
+            ifp.time_base.den,
+            ifp.sample_rate,
             sample_fmt_name,
         );
     }
 
-    if av_channel_layout_check(&(*ifp).ch_layout) != 0
-        && (*ifp).ch_layout.order != AV_CHANNEL_ORDER_UNSPEC
+    if av_channel_layout_check(&ifp.ch_layout) != 0
+        && ifp.ch_layout.order != AV_CHANNEL_ORDER_UNSPEC
     {
         let channel_layout_str = CString::new(":channel_layout=").unwrap();
         av_bprintf(&mut args, channel_layout_str.as_ptr());
-        av_channel_layout_describe_bprint(&(*ifp).ch_layout, &mut args);
+        av_channel_layout_describe_bprint(&ifp.ch_layout, &mut args);
     } else {
         let channels_fmt = CString::new(":channels=%d").unwrap();
         av_bprintf(
             &mut args,
             channels_fmt.as_ptr(),
-            (*ifp).ch_layout.nb_channels,
+            ifp.ch_layout.nb_channels,
         );
     }
 
@@ -2388,7 +2379,7 @@ unsafe fn configure_input_audio_filter(
     let name = CString::new(name.as_str()).expect("CString::new failed");
 
     let mut ret = avfilter_graph_create_filter(
-        &mut (*ifp).filter,
+        &mut ifp.filter,
         abuffer_filter,
         name.as_ptr(),
         args.str_,
@@ -2469,7 +2460,7 @@ unsafe fn configure_input_video_filter(
         "graph {fg_index} input from stream {}",
         ifp.opts.name
     ));
-    if let Err(_) = result {
+    if result.is_err() {
         av_freep(&mut par as *mut _ as *mut c_void);
         return AVERROR(ENOMEM);
     }
@@ -2544,11 +2535,10 @@ unsafe fn configure_input_video_filter(
         } else if theta.abs() > 1.0 {
             let rotate_buf = format!("{:.6}*PI/180", theta);
             ret = insert_filter(&mut last_filter, &mut pad_idx, "rotate", Some(&rotate_buf));
-        } else if theta.abs() < 1.0 {
-            if displaymatrix[4] < 0 {
+        } else if theta.abs() < 1.0
+            && displaymatrix[4] < 0 {
                 ret = insert_filter(&mut last_filter, &mut pad_idx, "vflip", None);
             }
-        }
 
         if ret < 0 {
             return ret;
@@ -2880,7 +2870,7 @@ unsafe fn read_binary(path: *mut c_char) -> crate::error::Result<(*mut c_void, i
     }
 
     let fsize = avio_size(io);
-    if fsize < 0 || fsize > i64::MAX {
+    if !(0..=i64::MAX).contains(&fsize) {
         error!(
             "Cannot obtain size of file '{}'",
             CStr::from_ptr(path).to_str().unwrap_or("[unknow path]")

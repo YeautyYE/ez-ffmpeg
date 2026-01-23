@@ -71,9 +71,9 @@ impl MetadataType {
                 if remainder.is_empty() {
                     // "s" - all streams
                     Ok(MetadataType::Stream(StreamSpecifier::default()))
-                } else if remainder.starts_with(':') {
+                } else if let Some(stream_spec) = remainder.strip_prefix(':') {
                     // "s:spec" - specific streams
-                    let stream_spec = &remainder[1..]; // skip the ':'
+                    // skip the ':'
                     let specifier = if stream_spec.is_empty() {
                         StreamSpecifier::default()
                     } else {

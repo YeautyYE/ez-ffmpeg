@@ -339,7 +339,7 @@ unsafe fn transcode_subtitles(
     packet_pool.release(packet_box.packet);
     if ret < 0 {
         error!("Error decoding subtitles: {}", av_err2str(ret));
-        dp.dec.decode_errors = dp.dec.decode_errors + 1;
+        dp.dec.decode_errors += 1;
         return if exit_on_error {
             Err(Decoding(DecodeSubtitleError(DecodingError::from(ret))))
         } else {
@@ -355,7 +355,7 @@ unsafe fn transcode_subtitles(
         };
     }
 
-    dp.dec.frames_decoded = dp.dec.frames_decoded + 1;
+    dp.dec.frames_decoded += 1;
 
     let Ok(mut frame) = frame_pool.get() else {
         return Err(Decoding(DecodingOperationError::FrameAllocationError(
@@ -539,7 +539,7 @@ unsafe fn copy_av_subtitle(dst: *mut AVSubtitle, src: *const AVSubtitle) -> i32 
             let buf_size = if (*src_rect).type_ == SUBTITLE_BITMAP && j == 1 {
                 AVPALETTE_SIZE
             } else {
-                ((*src_rect).h * (*src_rect).linesize[j as usize]) as i32
+                (*src_rect).h * (*src_rect).linesize[j as usize]
             };
 
             if !(*src_rect).data[j as usize].is_null() {
@@ -573,12 +573,11 @@ unsafe fn dec_send(
 ) -> crate::error::Result<()> {
     let mut nb_done = 0;
     for (i, (sender, fg_input_index, finished_flag_list)) in senders.iter().enumerate() {
-        if !finished_flag_list.is_empty() && *fg_input_index < finished_flag_list.len() {
-            if finished_flag_list[*fg_input_index].load(Ordering::Acquire) {
+        if !finished_flag_list.is_empty() && *fg_input_index < finished_flag_list.len()
+            && finished_flag_list[*fg_input_index].load(Ordering::Acquire) {
                 nb_done += 1;
                 continue;
             }
-        }
         if i < senders.len() - 1 {
             let Ok(mut to_send) = frame_pool.get() else {
                 return Err(Decoding(DecodingOperationError::FrameAllocationError(
@@ -637,7 +636,8 @@ unsafe fn dec_send(
 unsafe fn dec_frame_to_box(dp_arc: Arc<Mutex<DecoderParameter>>, frame: Frame) -> FrameBox {
     let dp = dp_arc.lock().unwrap();
     let dec_ctx = dp.dec_ctx.as_ptr();
-    let frame_box = FrameBox {
+    
+    FrameBox {
         frame,
         frame_data: FrameData {
             framerate: Some((*dec_ctx).framerate),
@@ -648,8 +648,7 @@ unsafe fn dec_frame_to_box(dp_arc: Arc<Mutex<DecoderParameter>>, frame: Frame) -
             subtitle_header: (*dec_ctx).subtitle_header,
             fg_input_index: usize::MAX,
         },
-    };
-    frame_box
+    }
 }
 
 #[repr(i32)]
@@ -775,7 +774,7 @@ fn dec_open(
                 (*param_out).sample_rate = (*dec_ctx).sample_rate;
 
                 ret =
-                    av_channel_layout_copy(&mut (*param_out).ch_layout, &mut (*dec_ctx).ch_layout);
+                    av_channel_layout_copy(&mut (*param_out).ch_layout, &(*dec_ctx).ch_layout);
                 if ret < 0 {
                     return Err(OpenDecoder(
                         OpenDecoderOperationError::ChannelLayoutCopyError(OpenDecoderError::from(
@@ -850,35 +849,33 @@ fn hw_device_setup_for_decode(
                 }
             }
         }
+    } else if dp.hwaccel_id == HWAccelID::HwaccelAuto {
+        auto_device = true;
+    } else if dp.hwaccel_id == HWAccelID::HwaccelGeneric {
+        device_type = dp.hwaccel_device_type;
+        dev = hw_device_get_by_type(device_type);
+
+        // When "-qsv_device device" is used, an internal QSV device named
+        // as "__qsv_device" is created. Another QSV device is created too
+        // if "-init_hw_device qsv=name:device" is used. There are 2 QSV devices
+        // if both "-qsv_device device" and "-init_hw_device qsv=name:device"
+        // are used, hw_device_get_by_type(AV_HWDEVICE_TYPE_QSV) returns NULL.
+        // To keep back-compatibility with the removed ad-hoc libmfx setup code,
+        // call hw_device_get_by_name("__qsv_device") to select the internal QSV
+        // device.
+        if dev.is_none() && device_type == AV_HWDEVICE_TYPE_QSV {
+            dev = hw_device_get_by_name("__qsv_device");
+        }
+
+        if dev.is_none() {
+            (err, dev) = hw_device_init_from_type(device_type, None);
+        };
     } else {
-        if dp.hwaccel_id == HWAccelID::HwaccelAuto {
-            auto_device = true;
-        } else if dp.hwaccel_id == HWAccelID::HwaccelGeneric {
-            device_type = dp.hwaccel_device_type;
-            dev = hw_device_get_by_type(device_type);
-
-            // When "-qsv_device device" is used, an internal QSV device named
-            // as "__qsv_device" is created. Another QSV device is created too
-            // if "-init_hw_device qsv=name:device" is used. There are 2 QSV devices
-            // if both "-qsv_device device" and "-init_hw_device qsv=name:device"
-            // are used, hw_device_get_by_type(AV_HWDEVICE_TYPE_QSV) returns NULL.
-            // To keep back-compatibility with the removed ad-hoc libmfx setup code,
-            // call hw_device_get_by_name("__qsv_device") to select the internal QSV
-            // device.
-            if dev.is_none() && device_type == AV_HWDEVICE_TYPE_QSV {
-                dev = hw_device_get_by_name("__qsv_device");
-            }
-
-            if dev.is_none() {
-                (err, dev) = hw_device_init_from_type(device_type, None);
-            };
-        } else {
-            dev = hw_device_match_by_codec(codec);
-            if dev.is_none() {
-                // No device for this codec, but not using generic hwaccel
-                // and therefore may well not need one - ignore.
-                return 0;
-            }
+        dev = hw_device_match_by_codec(codec);
+        if dev.is_none() {
+            // No device for this codec, but not using generic hwaccel
+            // and therefore may well not need one - ignore.
+            return 0;
         }
     }
 
@@ -1165,11 +1162,10 @@ struct Decoder {
 
 fn dec_done(dp_arc: &Arc<Mutex<DecoderParameter>>, senders: &Vec<(Sender<FrameBox>, usize, Arc<[AtomicBool]>)>) {
     for (sender, fg_input_index, finished_flag_list) in senders {
-        if !finished_flag_list.is_empty() && *fg_input_index < finished_flag_list.len() {
-            if finished_flag_list[*fg_input_index].load(Ordering::Acquire) {
+        if !finished_flag_list.is_empty() && *fg_input_index < finished_flag_list.len()
+            && finished_flag_list[*fg_input_index].load(Ordering::Acquire) {
                 continue;
             }
-        }
 
         let mut frame_box = unsafe { dec_frame_to_box(dp_arc.clone(), null_frame()) };
         frame_box.frame_data.fg_input_index = *fg_input_index;
@@ -1328,16 +1324,14 @@ unsafe fn packet_decode(
             dp.dec.samples_decoded += (*frame_box.frame.as_ptr()).nb_samples as u64;
 
             audio_ts_process(dp, frame_box.frame.as_mut_ptr());
-        } else {
-            if let Err(e) = video_frame_process(
-                dp_arc.clone(),
-                frame_box.frame.as_mut_ptr(),
-                &mut outputs_mask,
-                frame_pool,
-            ) {
-                error!("Error while processing the decoded data");
-                return Err(e);
-            }
+        } else if let Err(e) = video_frame_process(
+            dp_arc.clone(),
+            frame_box.frame.as_mut_ptr(),
+            &mut outputs_mask,
+            frame_pool,
+        ) {
+            error!("Error while processing the decoded data");
+            return Err(e);
         }
 
         {
@@ -1346,7 +1340,7 @@ unsafe fn packet_decode(
             dp.dec.frames_decoded += 1;
         }
 
-        if let Err(e) = dec_send(frame_box, &frame_pool, &senders) {
+        if let Err(e) = dec_send(frame_box, frame_pool, senders) {
             return if e == Error::EOF {
                 Err(Error::Exit)
             } else {

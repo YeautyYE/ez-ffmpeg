@@ -187,7 +187,7 @@ impl FfmpegScheduler<Initialization> {
         let scheduler_result = self.result.clone();
 
         let demux_nodes = self.ffmpeg_context.demuxs.iter().map(|demux| demux.node.clone()).collect::<Vec<_>>();
-        let mux_stream_nodes = self.ffmpeg_context.muxs.iter().flat_map(|mux| mux.mux_stream_nodes.clone()).map(|mux_stream| mux_stream.clone()).collect::<Vec<_>>();
+        let mux_stream_nodes = self.ffmpeg_context.muxs.iter().flat_map(|mux| mux.mux_stream_nodes.clone()).collect::<Vec<_>>();
         let input_controller = InputController::new(demux_nodes, mux_stream_nodes);
         let input_controller = Arc::new(input_controller);
 

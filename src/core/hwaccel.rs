@@ -132,7 +132,7 @@ pub(crate) fn hw_device_for_filter() -> Option<HWDevice> {
             return Some(dev.clone());
         }
     }
-    let devices = HW_DEVICES.get_or_init(|| new_hw_devices());
+    let devices = HW_DEVICES.get_or_init(new_hw_devices);
 
     let devices = devices.lock().unwrap();
     if !devices.is_empty() {
@@ -188,7 +188,7 @@ pub(crate) fn hw_device_match_by_codec(codec: *const AVCodec) -> Option<HWDevice
 pub(crate) fn hw_device_get_by_type(device_type: AVHWDeviceType) -> Option<HWDevice> {
     let mut found = None;
 
-    let devices = HW_DEVICES.get_or_init(|| new_hw_devices());
+    let devices = HW_DEVICES.get_or_init(new_hw_devices);
     let devices = devices.lock().unwrap();
     for device in devices.iter() {
         if device.device_type == device_type {
@@ -205,7 +205,7 @@ pub(crate) fn hw_device_init_from_string(arg: &str) -> (i32, Option<HWDevice>) {
     let mut device_ref = null_mut();
 
     let k = arg
-        .find(|c| c == ':' || c == '=' || c == '@')
+        .find([':', '=', '@'])
         .unwrap_or(arg.len());
     let mut p = &arg[k..];
 
@@ -221,7 +221,7 @@ pub(crate) fn hw_device_init_from_string(arg: &str) -> (i32, Option<HWDevice>) {
 
     let name = if p.starts_with('=') {
         let name_end = p[1..]
-            .find(|c| c == ':' || c == '@' || c == ',')
+            .find([':', '@', ','])
             .unwrap_or(p.len() - 1);
         let name = Some(p[1..=name_end].to_string());
 
@@ -279,10 +279,8 @@ pub(crate) fn hw_device_init_from_string(arg: &str) -> (i32, Option<HWDevice>) {
                     return (AVERROR(EINVAL), None);
                 }
             }
-        } else {
-            if !p.is_empty() {
-                device_name = Some(p.to_string());
-            }
+        } else if !p.is_empty() {
+            device_name = Some(p.to_string());
         }
 
         let err = unsafe {
@@ -311,9 +309,8 @@ pub(crate) fn hw_device_init_from_string(arg: &str) -> (i32, Option<HWDevice>) {
             }
             return (err, None);
         }
-    } else if p.starts_with('@') {
+    } else if let Some(src_name) = p.strip_prefix('@') {
         // Derive from existing device.
-        let src_name = &p[1..];
         let Some(src_device) = hw_device_get_by_name(src_name) else {
             error!("Invalid device specification \"{arg}\": invalid source device name");
             unsafe {
@@ -331,10 +328,9 @@ pub(crate) fn hw_device_init_from_string(arg: &str) -> (i32, Option<HWDevice>) {
             }
             return (err, None);
         }
-    } else if p.starts_with(',') {
+    } else if let Some(v) = p.strip_prefix(',') {
         unsafe {
             let mut options = null_mut();
-            let v = &p[1..];
             let Ok(v_cstr) = CString::new(v) else {
                 error!("Device creation failed: option:{v} can't convert to CString");
                 av_buffer_unref(&mut device_ref);
@@ -450,7 +446,7 @@ pub(crate) fn hw_device_default_name(device_type: AVHWDeviceType) -> Option<Stri
 }
 
 pub(crate) fn hw_device_get_by_name(name: &str) -> Option<HWDevice> {
-    let devices = HW_DEVICES.get_or_init(|| new_hw_devices());
+    let devices = HW_DEVICES.get_or_init(new_hw_devices);
 
     let devices = devices.lock().unwrap();
     for device in devices.iter() {
@@ -463,7 +459,7 @@ pub(crate) fn hw_device_get_by_name(name: &str) -> Option<HWDevice> {
 }
 
 fn add_hw_device(device: HWDevice) {
-    let devices = HW_DEVICES.get_or_init(|| new_hw_devices());
+    let devices = HW_DEVICES.get_or_init(new_hw_devices);
     let mut devices = devices.lock().unwrap();
     devices.push(device);
 }

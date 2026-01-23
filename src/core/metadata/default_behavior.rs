@@ -67,7 +67,7 @@ pub unsafe fn copy_metadata_default(
         av_dict_copy(
             &mut output_ref.metadata,
             first_input.metadata,
-            AV_DICT_DONT_OVERWRITE as i32,
+            AV_DICT_DONT_OVERWRITE,
         );
 
         // Remove specific keys per FFmpeg's default behavior
@@ -158,7 +158,7 @@ pub unsafe fn copy_metadata_default(
             av_dict_copy(
                 &mut output_stream.metadata,
                 input_stream.metadata,
-                AV_DICT_DONT_OVERWRITE as i32,
+                AV_DICT_DONT_OVERWRITE,
             );
 
             // Remove encoder key for streams being encoded
