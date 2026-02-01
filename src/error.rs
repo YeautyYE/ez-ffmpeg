@@ -84,6 +84,10 @@ pub enum Error {
     #[error("Demuxing operation failed {0}")]
     Demuxing(#[from] DemuxingOperationError),
 
+    // ---- Packet Scanner ----
+    #[error("Packet scanner error: {0}")]
+    PacketScanner(#[from] PacketScannerError),
+
     // ---- Frame Filter ----
     #[error("Frame filter init failed: {0}")]
     FrameFilterInit(String),
@@ -1218,4 +1222,16 @@ impl From<i32> for DemuxingError {
             _ => DemuxingError::UnknownError(err_code),
         }
     }
+}
+
+/// Errors that can occur during packet scanning operations.
+#[derive(thiserror::Error, Debug)]
+pub enum PacketScannerError {
+    /// Failed to seek to the requested timestamp.
+    #[error("while seeking: {0}")]
+    SeekError(DemuxingError),
+
+    /// Failed to read the next packet from the demuxer.
+    #[error("while reading packet: {0}")]
+    ReadError(DemuxingError),
 }
