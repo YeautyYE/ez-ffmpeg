@@ -9,8 +9,8 @@ use ffmpeg_sys_next::AVMediaType::{
     AVMEDIA_TYPE_UNKNOWN, AVMEDIA_TYPE_VIDEO,
 };
 use ffmpeg_sys_next::{
-    av_dict_get, av_dict_iterate, av_find_best_stream, avcodec_get_name, avformat_find_stream_info,
-    AVCodecID, AVDictionary, AVDictionaryEntry, AVRational,
+    av_dict_free, av_dict_get, av_dict_iterate, av_find_best_stream, avcodec_get_name,
+    avformat_find_stream_info, AVCodecID, AVDictionary, AVDictionaryEntry, AVRational,
 };
 use ffmpeg_sys_next::{avformat_alloc_context, avformat_close_input, avformat_open_input};
 use crate::core::context::AVFormatContextBox;
@@ -755,7 +755,7 @@ fn codec_name(id: AVCodecID) -> String {
     }
 }
 
-fn init_format_context(url: impl Into<String>) -> Result<AVFormatContextBox> {
+pub(crate) fn init_format_context(url: impl Into<String>) -> Result<AVFormatContextBox> {
     crate::core::initialize_ffmpeg();
 
     unsafe {
@@ -790,6 +790,9 @@ fn init_format_context(url: impl Into<String>) -> Result<AVFormatContextBox> {
             { avformat_open_input(&mut in_fmt_ctx, url_cstr.as_ptr(), null(), &mut format_opts) };
         #[cfg(feature = "docs-rs")]
         let mut ret = 0;
+
+        // Free leftover options not consumed by avformat_open_input.
+        av_dict_free(&mut format_opts);
 
         if ret < 0 {
             avformat_close_input(&mut in_fmt_ctx);

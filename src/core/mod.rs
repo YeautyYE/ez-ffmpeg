@@ -188,9 +188,34 @@ pub mod container_info;
 /// ```
 ///
 /// These helper functions return `Result<Option<StreamInfo>, Error>` or `Result<Vec<StreamInfo>, Error>`
-/// depending on the call, allowing you to differentiate between “no stream found” (returns `Ok(None)`)
+/// depending on the call, allowing you to differentiate between "no stream found" (returns `Ok(None)`)
 /// and encountering an actual error (returns `Err(...)`).
 pub mod stream_info;
+
+/// The **packet_scanner** module provides a lightweight packet-level scanner for media files.
+///
+/// Unlike the full demuxing pipeline, `PacketScanner` iterates over raw demuxed packets
+/// without any decoding. This is useful for inspecting packet metadata such as timestamps,
+/// keyframe flags, sizes, and stream indices.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// use ez_ffmpeg::packet_scanner::PacketScanner;
+///
+/// let mut scanner = PacketScanner::open("test.mp4")?;
+/// for packet in scanner.packets() {
+///     let packet = packet?;
+///     println!(
+///         "stream={} pts={:?} size={} keyframe={}",
+///         packet.stream_index(),
+///         packet.pts(),
+///         packet.size(),
+///         packet.is_keyframe(),
+///     );
+/// }
+/// ```
+pub mod packet_scanner;
 
 /// The **device** module provides cross-platform methods to query available audio and video
 /// input devices on the system. Depending on the target operating system, it internally

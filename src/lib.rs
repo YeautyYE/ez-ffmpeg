@@ -107,6 +107,7 @@ pub use self::core::context::output::Output;
 pub use self::core::scheduler::ffmpeg_scheduler::FfmpegScheduler;
 pub use self::core::container_info;
 pub use self::core::stream_info;
+pub use self::core::packet_scanner;
 pub use self::core::device;
 pub use self::core::hwaccel;
 pub use self::core::codec;
