@@ -61,7 +61,7 @@ pub(crate) fn ready_to_init_mux(
     scheduler_status: Arc<AtomicUsize>,
     thread_sync: ThreadSynchronizer,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
-) -> Option<crossbeam_channel::Sender<i32>> {
+) -> crate::error::Result<Option<crossbeam_channel::Sender<i32>>> {
     if !mux.is_ready() {
         let (sender, receiver) = crossbeam_channel::bounded(1);
 
@@ -81,7 +81,7 @@ pub(crate) fn ready_to_init_mux(
         let out_fmt_ctx_box =
             AVFormatContextBox::new(out_fmt_ctx, false, is_set_write_callback);
 
-        let _ = std::thread::Builder::new().name(format!("ready-to-init-muxer{mux_idx}")).spawn(move || {
+        let result = std::thread::Builder::new().name(format!("ready-to-init-muxer{mux_idx}")).spawn(move || {
             let mut out_fmt_ctx_box = out_fmt_ctx_box;
             loop {
                 let result = receiver.recv_timeout(Duration::from_millis(100));
@@ -134,9 +134,13 @@ pub(crate) fn ready_to_init_mux(
                 }
             }
         });
-        Some(sender)
+        if let Err(e) = result {
+            error!("Mux init thread exited with error: {e}");
+            return Err(MuxingOperationError::ThreadExited.into());
+        }
+        Ok(Some(sender))
     } else {
-        None
+        Ok(None)
     }
 }
 

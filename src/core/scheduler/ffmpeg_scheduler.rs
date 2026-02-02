@@ -179,8 +179,20 @@ impl FfmpegScheduler<Initialization> {
     /// // Now it's in Running state, you can wait or pause/abort, etc.
     /// ```
     pub fn start(mut self) -> crate::error::Result<FfmpegScheduler<Running>> {
-        let packet_pool = ObjPool::new(64, new_packet, unref_packet, packet_is_null)?;
-        let frame_pool = ObjPool::new(64, new_frame, unref_frame, frame_is_null)?;
+        let packet_pool = match ObjPool::new(64, new_packet, unref_packet, packet_is_null) {
+            Ok(pool) => pool,
+            Err(e) => {
+                Self::cleanup(&self.status, &self.ffmpeg_context);
+                return Err(e);
+            }
+        };
+        let frame_pool = match ObjPool::new(64, new_frame, unref_frame, frame_is_null) {
+            Ok(pool) => pool,
+            Err(e) => {
+                Self::cleanup(&self.status, &self.ffmpeg_context);
+                return Err(e);
+            }
+        };
         let scheduler_status = self.status.clone();
         scheduler_status.store(STATUS_RUN, Ordering::Release);
         let thread_sync = self.thread_sync.clone();
@@ -235,7 +247,7 @@ impl FfmpegScheduler<Initialization> {
         // Encoder
         let ffmpeg_context = &mut self.ffmpeg_context;
         for (mux_idx, mux) in &mut ffmpeg_context.muxs.iter_mut().enumerate() {
-            let ready_sender = ready_to_init_mux(
+            let ready_sender = match ready_to_init_mux(
                 mux_idx,
                 mux,
                 packet_pool.clone(),
@@ -243,7 +255,13 @@ impl FfmpegScheduler<Initialization> {
                 scheduler_status.clone(),
                 thread_sync.clone(),
                 scheduler_result.clone(),
-            );
+            ) {
+                Ok(sender) => sender,
+                Err(e) => {
+                    Self::cleanup(&scheduler_status, ffmpeg_context);
+                    return Err(e);
+                }
+            };
 
             for enc_stream in mux.take_streams_mut() {
                 if let Err(e) = enc_init(
