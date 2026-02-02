@@ -467,9 +467,6 @@ pub enum FindStreamError {
     #[error("No Stream found")]
     NoStreamFound,
 
-    #[error("No codec parameters found")]
-    NoCodecparFound,
-
     #[error("An unknown error occurred. ret:{0}")]
     UnknownError(i32),
 }

@@ -7,6 +7,7 @@ use ffmpeg_sys_next::{
 use std::iter::FusedIterator;
 
 use crate::core::context::AVFormatContextBox;
+use crate::core::stream_info::StreamInfo;
 use crate::error::{DemuxingError, OpenInputError, PacketScannerError, Result};
 
 /// Read-only metadata extracted from a single demuxed packet.
@@ -93,6 +94,7 @@ impl PacketInfo {
 pub struct PacketScanner {
     fmt_ctx_box: AVFormatContextBox,
     pkt: *mut AVPacket,
+    streams: Vec<StreamInfo>,
 }
 
 // SAFETY: PacketScanner owns its AVFormatContext and AVPacket exclusively.
@@ -102,16 +104,26 @@ unsafe impl Send for PacketScanner {}
 
 impl PacketScanner {
     /// Open a media file or URL for packet scanning.
+    ///
+    /// Stream information is extracted and cached at open time so that
+    /// [`streams`](Self::streams), [`video_stream`](Self::video_stream),
+    /// [`audio_stream`](Self::audio_stream), and
+    /// [`stream_for_packet`](Self::stream_for_packet) are available
+    /// immediately without additional I/O.
     pub fn open(url: impl Into<String>) -> Result<Self> {
         let fmt_ctx_box = crate::core::stream_info::init_format_context(url)?;
+        // SAFETY: fmt_ctx_box is fully initialized by init_format_context.
+        let streams = unsafe { crate::core::stream_info::extract_stream_infos(&fmt_ctx_box)? };
 
+        // SAFETY: av_packet_alloc returns a valid packet or null.
+        // Null is checked immediately; the packet is freed in Drop.
         unsafe {
             let pkt = av_packet_alloc();
             if pkt.is_null() {
                 return Err(OpenInputError::OutOfMemory.into());
             }
 
-            Ok(Self { fmt_ctx_box, pkt })
+            Ok(Self { fmt_ctx_box, pkt, streams })
         }
     }
 
@@ -123,6 +135,8 @@ impl PacketScanner {
     /// On failure you may continue reading or attempt another seek, though
     /// the exact read position is not guaranteed to be unchanged.
     pub fn seek(&mut self, timestamp_us: i64) -> Result<()> {
+        // SAFETY: fmt_ctx is valid for the lifetime of self. avformat_seek_file
+        // accepts any timestamp and returns a negative value on failure.
         unsafe {
             let ret = avformat_seek_file(
                 self.fmt_ctx_box.fmt_ctx,
@@ -149,6 +163,9 @@ impl PacketScanner {
     pub fn next_packet(&mut self) -> Result<Option<PacketInfo>> {
         const MAX_EAGAIN_RETRIES: u32 = 500;
 
+        // SAFETY: self.pkt is a valid, non-null AVPacket allocated in open().
+        // av_packet_unref resets the packet for reuse; av_read_frame fills it.
+        // We read only scalar fields from the filled packet.
         unsafe {
             av_packet_unref(self.pkt);
 
@@ -201,6 +218,27 @@ impl PacketScanner {
         }
     }
 
+    /// Returns all stream information cached at open time.
+    pub fn streams(&self) -> &[StreamInfo] {
+        &self.streams
+    }
+
+    /// Returns the first video stream, if any.
+    pub fn video_stream(&self) -> Option<&StreamInfo> {
+        self.streams.iter().find(|s| s.is_video())
+    }
+
+    /// Returns the first audio stream, if any.
+    pub fn audio_stream(&self) -> Option<&StreamInfo> {
+        self.streams.iter().find(|s| s.is_audio())
+    }
+
+    /// Returns the stream information for the given packet, if the stream
+    /// index is within bounds.
+    pub fn stream_for_packet(&self, packet: &PacketInfo) -> Option<&StreamInfo> {
+        self.streams.get(packet.stream_index())
+    }
+
     /// Returns an iterator for convenient `for packet in scanner.packets()` usage.
     ///
     /// Each call creates a fresh iterator, so you can `seek()` and then call
@@ -215,6 +253,8 @@ impl PacketScanner {
 
 impl Drop for PacketScanner {
     fn drop(&mut self) {
+        // SAFETY: pkt was allocated by av_packet_alloc in open().
+        // av_packet_free handles null gracefully, but we check anyway.
         unsafe {
             if !self.pkt.is_null() {
                 av_packet_free(&mut self.pkt);
@@ -290,5 +330,39 @@ mod tests {
         scanner.seek(1_000_000).unwrap();
         let packet = scanner.next_packet().unwrap();
         assert!(packet.is_some(), "expected a packet after seeking");
+    }
+
+    #[test]
+    fn test_streams() {
+        let scanner = PacketScanner::open("test.mp4").unwrap();
+        let streams = scanner.streams();
+        assert!(!streams.is_empty(), "expected at least one stream");
+        assert_eq!(streams.len(), 2, "test.mp4 should have 2 streams (video + audio)");
+    }
+
+    #[test]
+    fn test_video_stream() {
+        let scanner = PacketScanner::open("test.mp4").unwrap();
+        let video = scanner.video_stream();
+        assert!(video.is_some(), "expected a video stream");
+        assert!(video.unwrap().is_video());
+    }
+
+    #[test]
+    fn test_audio_stream() {
+        let scanner = PacketScanner::open("test.mp4").unwrap();
+        let audio = scanner.audio_stream();
+        assert!(audio.is_some(), "expected an audio stream");
+        assert!(audio.unwrap().is_audio());
+    }
+
+    #[test]
+    fn test_stream_for_packet() {
+        let mut scanner = PacketScanner::open("test.mp4").unwrap();
+        let packet = scanner.next_packet().unwrap();
+        assert!(packet.is_some(), "expected at least one packet");
+        let info = packet.unwrap();
+        let stream = scanner.stream_for_packet(&info);
+        assert!(stream.is_some(), "stream_for_packet should return Some for valid packet");
     }
 }
