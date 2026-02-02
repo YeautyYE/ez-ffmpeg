@@ -64,7 +64,7 @@ pub(crate) fn demux_init(
     }
 
     let copy_ts = demux.copy_ts;
-    let mut demux_paramter = DemuxerParamter::new(demux);
+    let mut demux_parameter = DemuxerParameter::new(demux);
 
     let in_fmt_ctx = demux.in_fmt_ctx;
     demux.in_fmt_ctx = null_mut();
@@ -80,7 +80,7 @@ pub(crate) fn demux_init(
         .spawn(move || {
             let in_fmt_ctx_box = in_fmt_ctx_box;
             let mut is_started = false;
-            demux_paramter.wallclock_start = unsafe { av_gettime_relative() };
+            demux_parameter.wallclock_start = unsafe { av_gettime_relative() };
 
             loop {
                 let mut send_flags = 0usize;
@@ -114,7 +114,7 @@ pub(crate) fn demux_init(
                             debug!("EOF while reading input");
                         } else {
                             error!("Error during demuxing: {}", av_err2str(ret));
-                            ret = if !is_started || demux_paramter.exit_on_error {
+                            ret = if !is_started || demux_parameter.exit_on_error {
                                 ret
                             } else {
                                 0
@@ -125,7 +125,7 @@ pub(crate) fn demux_init(
                             ret = 0;
                         }
 
-                        if demux_paramter.stream_loop != 0 {
+                        if demux_parameter.stream_loop != 0 {
                             // Windows-specific CUDA handling logic
                             #[cfg(windows)]
                             let should_skip_packet_send = hwaccel.as_deref() == Some("cuda");
@@ -154,12 +154,12 @@ pub(crate) fn demux_init(
                                         codecpar: null_mut(),
                                     },
                                 };
-                                demux_send(&mut demux_paramter, packet_box, &packet_pool, 0, &demux_node, &scheduler_status, independent_readrate)
+                                demux_send(&mut demux_parameter, packet_box, &packet_pool, 0, &demux_node, &scheduler_status, independent_readrate)
                             };
 
                             // Common seek operation for both cases
                             if ret >= 0 {
-                                ret = seek_to_start(&mut demux_paramter, in_fmt_ctx_box.fmt_ctx);
+                                ret = seek_to_start(&mut demux_parameter, in_fmt_ctx_box.fmt_ctx);
                                 if ret >= 0 {
                                     continue;
                                 }
@@ -180,13 +180,13 @@ pub(crate) fn demux_init(
                         break;
                     }
 
-                    demux_paramter.end_pts = Timestamp {
+                    demux_parameter.end_pts = Timestamp {
                         ts: (*packet.as_ptr()).pts,
                         tb: (*packet.as_ptr()).time_base,
                     };
 
                     if (*packet.as_ptr()).flags & AV_PKT_FLAG_CORRUPT != 0 {
-                        if demux_paramter.exit_on_error {
+                        if demux_parameter.exit_on_error {
                             error!(
                                 "corrupt input packet in stream {}",
                                 (*packet.as_ptr()).stream_index
@@ -202,7 +202,7 @@ pub(crate) fn demux_init(
                         }
                     }
 
-                    if demux_paramter.demux_streams.len()
+                    if demux_parameter.demux_streams.len()
                         <= (*packet.as_ptr()).stream_index as usize
                     {
                         warn!("Incorrect stream id:{}", (*packet.as_ptr()).stream_index);
@@ -211,7 +211,7 @@ pub(crate) fn demux_init(
 
                     is_started = true;
                     ret = input_packet_process(
-                        &mut demux_paramter,
+                        &mut demux_parameter,
                         in_fmt_ctx_box.fmt_ctx,
                         packet.as_mut_ptr(),
                         &mut send_flags,
@@ -221,10 +221,10 @@ pub(crate) fn demux_init(
                         break;
                     }
 
-                    if let Some(readrate) = demux_paramter.readrate {
+                    if let Some(readrate) = demux_parameter.readrate {
                         if readrate != 0.0 {
                             readrate_sleep(
-                                &demux_paramter,
+                                &demux_parameter,
                                 (*in_fmt_ctx_box.fmt_ctx).nb_streams,
                                 readrate,
                             );
@@ -232,7 +232,7 @@ pub(crate) fn demux_init(
                     }
 
                     {
-                        let ds = demux_paramter
+                        let ds = demux_parameter
                             .demux_streams
                             .get_mut((*packet.as_ptr()).stream_index as usize)
                             .unwrap();
@@ -246,7 +246,7 @@ pub(crate) fn demux_init(
                                 codecpar: ds.codecpar,
                             },
                         };
-                        ret = demux_send(&mut demux_paramter, packet_box, &packet_pool, send_flags, &demux_node, &scheduler_status, independent_readrate);
+                        ret = demux_send(&mut demux_parameter, packet_box, &packet_pool, send_flags, &demux_node, &scheduler_status, independent_readrate);
 
                         if ret < 0 {
                             break;
@@ -256,7 +256,7 @@ pub(crate) fn demux_init(
             }
 
             if is_started {
-                demux_done(&mut demux_paramter, &packet_pool, &scheduler_status);
+                demux_done(&mut demux_parameter, &packet_pool, &scheduler_status);
             }
 
             let node = demux_node.as_ref();
@@ -274,12 +274,12 @@ pub(crate) fn demux_init(
     Ok(())
 }
 
-fn demux_done(demux_paramter: &mut DemuxerParamter, packet_pool: &ObjPool<Packet>, scheduler_status: &Arc<AtomicUsize>) {
-    for ds in &demux_paramter.demux_streams {
+fn demux_done(demux_parameter: &mut DemuxerParameter, packet_pool: &ObjPool<Packet>, scheduler_status: &Arc<AtomicUsize>) {
+    for ds in &demux_parameter.demux_streams {
         for (i, (packet_dst, input_stream_index, output_stream_index)) in
-            demux_paramter.dsts.iter().enumerate()
+            demux_parameter.dsts.iter().enumerate()
         {
-            let dst_finished = &mut demux_paramter.dsts_finished[i];
+            let dst_finished = &mut demux_parameter.dsts_finished[i];
 
             if ds.stream_index != *input_stream_index {
                 continue;
@@ -304,7 +304,7 @@ fn demux_done(demux_paramter: &mut DemuxerParamter, packet_pool: &ObjPool<Packet
                 },
             };
 
-            let _ret = unsafe {
+            let ret = unsafe {
                 demux_stream_send_to_dst(
                     packet_box,
                     packet_dst,
@@ -314,17 +314,20 @@ fn demux_done(demux_paramter: &mut DemuxerParamter, packet_pool: &ObjPool<Packet
                     scheduler_status,
                 )
             };
+            if ret < 0 {
+                warn!("demux_done: failed to send flush packet for stream {i}, ret={ret}");
+            }
         }
     }
 }
 
 const READRATE_INITIAL_BURST: f32 = 0.5;
-unsafe fn readrate_sleep(demux_paramter: &DemuxerParamter, nb_streams: c_uint, readrate: f32) {
+unsafe fn readrate_sleep(demux_parameter: &DemuxerParameter, nb_streams: c_uint, readrate: f32) {
     let file_start = 0;
     let burst_until = (AV_TIME_BASE as f32 * READRATE_INITIAL_BURST) as i64;
 
     for i in 0..nb_streams {
-        let option = demux_paramter.demux_streams.get(i as usize);
+        let option = demux_parameter.demux_streams.get(i as usize);
         if let Some(ds) = option {
             let mut stream_ts_offset = if ds.first_dts != AV_NOPTS_VALUE {
                 ds.first_dts
@@ -333,7 +336,7 @@ unsafe fn readrate_sleep(demux_paramter: &DemuxerParamter, nb_streams: c_uint, r
             };
             stream_ts_offset = std::cmp::max(stream_ts_offset, file_start);
             let pts = av_rescale(ds.dts, 1000000, AV_TIME_BASE as i64);
-            let now = ((av_gettime_relative() - demux_paramter.wallclock_start) as f32 * readrate)
+            let now = ((av_gettime_relative() - demux_parameter.wallclock_start) as f32 * readrate)
                 as i64
                 + stream_ts_offset;
             if pts - burst_until > now {
@@ -344,21 +347,23 @@ unsafe fn readrate_sleep(demux_paramter: &DemuxerParamter, nb_streams: c_uint, r
 }
 
 unsafe fn input_packet_process(
-    demux_paramter: &mut DemuxerParamter,
+    demux_parameter: &mut DemuxerParameter,
     in_fmt_ctx: *mut AVFormatContext,
     pkt: *mut AVPacket,
     send_flags: &mut usize,
     copy_ts: bool,
 ) -> c_int {
-    ts_fixup(demux_paramter, in_fmt_ctx, pkt, copy_ts);
+    ts_fixup(demux_parameter, in_fmt_ctx, pkt, copy_ts);
 
-    if let Some(recording_time_us) = demux_paramter.recording_time_us {
+    if let Some(recording_time_us) = demux_parameter.recording_time_us {
         if recording_time_us != i64::MAX {
             let mut start_time = 0;
             if copy_ts {
-                start_time += demux_paramter.start_time_us.unwrap_or(0);
+                start_time += demux_parameter.start_time_us.unwrap_or(0);
+                // FFmpeg CLI: start_time += start_at_zero ? 0 : f->start_time_effective;
+                start_time += demux_parameter.start_time_effective;
             }
-            let ds = demux_paramter
+            let ds = demux_parameter
                 .demux_streams
                 .get_mut((*pkt).stream_index as usize)
                 .unwrap();
@@ -376,7 +381,7 @@ unsafe fn input_packet_process(
 
 #[cfg(feature = "docs-rs")]
 unsafe fn ts_fixup(
-    demux_paramter: &mut DemuxerParamter,
+    demux_parameter: &mut DemuxerParameter,
     in_fmt_ctx: *mut AVFormatContext,
     pkt: *mut AVPacket,
     copy_ts: bool,
@@ -384,18 +389,18 @@ unsafe fn ts_fixup(
 
 #[cfg(not(feature = "docs-rs"))]
 unsafe fn ts_fixup(
-    demux_paramter: &mut DemuxerParamter,
+    demux_parameter: &mut DemuxerParameter,
     in_fmt_ctx: *mut AVFormatContext,
     pkt: *mut AVPacket,
     copy_ts: bool,
 ) {
     let streams = (*in_fmt_ctx).streams;
     let ist = *streams.offset((*pkt).stream_index as isize);
-    let start_time = demux_paramter.start_time_effective;
+    let start_time = demux_parameter.start_time_effective;
     (*pkt).time_base = (*ist).time_base;
 
     {
-        let ds = demux_paramter
+        let ds = demux_parameter
             .demux_streams
             .get_mut((*pkt).stream_index as usize)
             .unwrap();
@@ -426,16 +431,16 @@ unsafe fn ts_fixup(
     }
 
     if (*pkt).dts != AV_NOPTS_VALUE {
-        (*pkt).dts += av_rescale_q(demux_paramter.ts_offset, AV_TIME_BASE_Q, (*pkt).time_base);
+        (*pkt).dts += av_rescale_q(demux_parameter.ts_offset, AV_TIME_BASE_Q, (*pkt).time_base);
     }
     if (*pkt).pts != AV_NOPTS_VALUE {
-        (*pkt).pts += av_rescale_q(demux_paramter.ts_offset, AV_TIME_BASE_Q, (*pkt).time_base);
+        (*pkt).pts += av_rescale_q(demux_parameter.ts_offset, AV_TIME_BASE_Q, (*pkt).time_base);
     }
 
     // Apply timestamp scaling (after ts_offset, before duration)
     // FFmpeg source: ffmpeg_demux.c:420-422 (FFmpeg 7.x)
     // Note: C's `int64_t *= double` truncates toward zero, Rust's `as i64` behaves the same.
-    let ts_scale = demux_paramter.ts_scale;
+    let ts_scale = demux_parameter.ts_scale;
     if ts_scale != 1.0 {
         if (*pkt).pts != AV_NOPTS_VALUE {
             (*pkt).pts = ((*pkt).pts as f64 * ts_scale) as i64;
@@ -446,14 +451,14 @@ unsafe fn ts_fixup(
     }
 
     let duration = av_rescale_q(
-        demux_paramter.duration.ts,
-        demux_paramter.duration.tb,
+        demux_parameter.duration.ts,
+        demux_parameter.duration.tb,
         (*pkt).time_base,
     );
 
     if (*pkt).pts != AV_NOPTS_VALUE {
         // audio decoders take precedence for estimating total file duration
-        let pkt_duration = if demux_paramter.have_audio_dec {
+        let pkt_duration = if demux_parameter.have_audio_dec {
             0
         } else {
             (*pkt).duration
@@ -463,28 +468,28 @@ unsafe fn ts_fixup(
 
         // update max/min pts that will be used to compute total file duration
         // when using -stream_loop
-        if demux_paramter.max_pts.ts == AV_NOPTS_VALUE
+        if demux_parameter.max_pts.ts == AV_NOPTS_VALUE
             || av_compare_ts(
-                demux_paramter.max_pts.ts,
-                demux_paramter.max_pts.tb,
+                demux_parameter.max_pts.ts,
+                demux_parameter.max_pts.tb,
                 (*pkt).pts + pkt_duration,
                 (*pkt).time_base,
             ) < 0
         {
-            demux_paramter.max_pts = Timestamp {
+            demux_parameter.max_pts = Timestamp {
                 ts: (*pkt).pts + pkt_duration,
                 tb: (*pkt).time_base,
             };
         }
-        if demux_paramter.min_pts.ts == AV_NOPTS_VALUE
+        if demux_parameter.min_pts.ts == AV_NOPTS_VALUE
             || av_compare_ts(
-                demux_paramter.min_pts.ts,
-                demux_paramter.min_pts.tb,
+                demux_parameter.min_pts.ts,
+                demux_parameter.min_pts.tb,
                 (*pkt).pts,
                 (*pkt).time_base,
             ) > 0
         {
-            demux_paramter.min_pts = Timestamp {
+            demux_parameter.min_pts = Timestamp {
                 ts: (*pkt).pts,
                 tb: (*pkt).time_base,
             };
@@ -496,35 +501,40 @@ unsafe fn ts_fixup(
     }
 
     // detect and try to correct for timestamp discontinuities
-    ts_discontinuity_process(demux_paramter, in_fmt_ctx, ist, pkt, copy_ts);
+    ts_discontinuity_process(demux_parameter, in_fmt_ctx, ist, pkt, copy_ts);
 
     // update estimated/predicted dts
-    ist_dts_update(demux_paramter, ist, pkt);
+    ist_dts_update(demux_parameter, ist, pkt);
 }
 
 #[cfg(feature = "docs-rs")]
 unsafe fn ist_dts_update(
-    demux_paramter: &mut DemuxerParamter,
+    demux_parameter: &mut DemuxerParameter,
     ist: *mut AVStream,
     pkt: *mut AVPacket,
 ) {}
 
 #[cfg(not(feature = "docs-rs"))]
 unsafe fn ist_dts_update(
-    demux_paramter: &mut DemuxerParamter,
+    demux_parameter: &mut DemuxerParameter,
     ist: *mut AVStream,
     pkt: *mut AVPacket,
 ) {
-    let ds = demux_paramter
+    let ds = demux_parameter
         .demux_streams
         .get_mut((*pkt).stream_index as usize)
         .unwrap();
 
     let par = (*ist).codecpar;
 
+    let framerate = demux_parameter.framerate;
+
     if !ds.saw_first_ts {
-        ds.dts = if (*ist).avg_frame_rate.num != 0 {
-            (((-(*par).video_delay) * AV_TIME_BASE) as f64 / av_q2d((*ist).avg_frame_rate)) as i64
+        // Use stream's avg_frame_rate (metadata) for initial DTS — NOT the forced framerate.
+        // CLI: ist->st->avg_frame_rate (ffmpeg_demux.c:303), here ist IS the AVStream.
+        let avg_frame_rate = (*ist).avg_frame_rate;
+        ds.dts = if avg_frame_rate.num != 0 {
+            (((-(*par).video_delay) * AV_TIME_BASE) as f64 / av_q2d(avg_frame_rate)) as i64
         } else {
             0
         };
@@ -557,13 +567,12 @@ unsafe fn ist_dts_update(
             }
         }
         AVMEDIA_TYPE_VIDEO => {
-            if (*ist).avg_frame_rate.num != 0 {
-                // TODO: Remove work-around for c99-to-c89 issue 7
+            if framerate.num != 0 {
                 let time_base_q = AV_TIME_BASE_Q;
                 let next_dts =
-                    av_rescale_q(ds.next_dts, time_base_q, av_inv_q((*ist).avg_frame_rate));
+                    av_rescale_q(ds.next_dts, time_base_q, av_inv_q(framerate));
                 ds.next_dts =
-                    av_rescale_q(next_dts + 1, av_inv_q((*ist).avg_frame_rate), time_base_q);
+                    av_rescale_q(next_dts + 1, av_inv_q(framerate), time_base_q);
             } else if (*pkt).duration != 0 {
                 ds.next_dts += av_rescale_q((*pkt).duration, (*pkt).time_base, AV_TIME_BASE_Q);
             } else if (*par).framerate.num != 0 {
@@ -571,7 +580,7 @@ unsafe fn ist_dts_update(
                 let mut fields = 2;
 
                 if !ds.codec_desc.is_null()
-                    && ((*ds.codec_desc).props != 0 & AV_CODEC_PROP_FIELDS)
+                    && ((*ds.codec_desc).props & AV_CODEC_PROP_FIELDS) != 0
                     && !av_stream_get_parser(ist).is_null()
                 {
                     fields = 1 + (*av_stream_get_parser(ist)).repeat_pict;
@@ -583,13 +592,11 @@ unsafe fn ist_dts_update(
         _ => {}
     }
 
-    //TODO
-    // fd -> dts_est = ds.dts;
 }
 
 #[cfg(feature = "docs-rs")]
 unsafe fn ts_discontinuity_process(
-    demux_paramter: &mut DemuxerParamter,
+    demux_parameter: &mut DemuxerParameter,
     in_fmt_ctx: *mut AVFormatContext,
     ist: *mut AVStream,
     pkt: *mut AVPacket,
@@ -597,14 +604,14 @@ unsafe fn ts_discontinuity_process(
 
 #[cfg(not(feature = "docs-rs"))]
 unsafe fn ts_discontinuity_process(
-    demux_paramter: &mut DemuxerParamter,
+    demux_parameter: &mut DemuxerParameter,
     in_fmt_ctx: *mut AVFormatContext,
     ist: *mut AVStream,
     pkt: *mut AVPacket,
     copy_ts: bool,
 ) {
     let offset = av_rescale_q(
-        demux_paramter.ts_offset_discont,
+        demux_parameter.ts_offset_discont,
         AV_TIME_BASE_Q,
         (*pkt).time_base,
     );
@@ -623,13 +630,13 @@ unsafe fn ts_discontinuity_process(
         || (*(*ist).codecpar).codec_type == AVMEDIA_TYPE_AUDIO)
         && (*pkt).dts != AV_NOPTS_VALUE
     {
-        ts_discontinuity_detect(demux_paramter, in_fmt_ctx, ist, pkt, copy_ts);
+        ts_discontinuity_detect(demux_parameter, in_fmt_ctx, ist, pkt, copy_ts);
     }
 }
 
 #[cfg(feature = "docs-rs")]
 unsafe fn ts_discontinuity_detect(
-    demux_paramter: &mut DemuxerParamter,
+    demux_parameter: &mut DemuxerParameter,
     in_fmt_ctx: *mut AVFormatContext,
     ist: *mut AVStream,
     pkt: *mut AVPacket,
@@ -637,13 +644,13 @@ unsafe fn ts_discontinuity_detect(
 
 #[cfg(not(feature = "docs-rs"))]
 unsafe fn ts_discontinuity_detect(
-    demux_paramter: &mut DemuxerParamter,
+    demux_parameter: &mut DemuxerParameter,
     in_fmt_ctx: *mut AVFormatContext,
     ist: *mut AVStream,
     pkt: *mut AVPacket,
     copy_ts: bool,
 ) {
-    let ds = demux_paramter
+    let ds = demux_parameter
         .demux_streams
         .get_mut((*pkt).stream_index as usize)
         .unwrap();
@@ -678,12 +685,12 @@ unsafe fn ts_discontinuity_detect(
             if delta.abs() > DTS_DELTA_THRESHOLD * AV_TIME_BASE as i64
                 || (pkt_dts + (AV_TIME_BASE / 10) as i64) < ds.dts
             {
-                demux_paramter.ts_offset_discont -= delta;
+                demux_parameter.ts_offset_discont -= delta;
                 warn!(
                     "timestamp discontinuity (stream id={}): {}, new offset= {}",
                     (*ist).id,
                     delta,
-                    demux_paramter.ts_offset_discont
+                    demux_parameter.ts_offset_discont
                 );
                 (*pkt).dts -= av_rescale_q(delta, AV_TIME_BASE_Q, (*pkt).time_base);
                 if (*pkt).pts != AV_NOPTS_VALUE {
@@ -718,15 +725,15 @@ unsafe fn ts_discontinuity_detect(
     } else if ds.next_dts == AV_NOPTS_VALUE
         && !copy_ts
         && fmt_is_discont != 0
-        && demux_paramter.last_ts != AV_NOPTS_VALUE
+        && demux_parameter.last_ts != AV_NOPTS_VALUE
     {
-        let delta = pkt_dts - demux_paramter.last_ts;
+        let delta = pkt_dts - demux_parameter.last_ts;
         if delta.abs() > DTS_DELTA_THRESHOLD * AV_TIME_BASE as i64 {
-            demux_paramter.ts_offset_discont -= delta;
+            demux_parameter.ts_offset_discont -= delta;
             debug!(
                 "Inter stream timestamp discontinuity {}, new offset= {}",
                 delta,
-                demux_paramter.ts_offset_discont
+                demux_parameter.ts_offset_discont
             );
             (*pkt).dts -= av_rescale_q(delta, AV_TIME_BASE_Q, (*pkt).time_base);
             if (*pkt).pts != AV_NOPTS_VALUE {
@@ -735,10 +742,10 @@ unsafe fn ts_discontinuity_detect(
         }
     }
 
-    demux_paramter.last_ts = av_rescale_q((*pkt).dts, (*pkt).time_base, AV_TIME_BASE_Q);
+    demux_parameter.last_ts = av_rescale_q((*pkt).dts, (*pkt).time_base, AV_TIME_BASE_Q);
 }
 
-struct DemuxStreamParamter {
+struct DemuxStreamParameter {
     codec_type: AVMediaType,
     stream_index: usize,
     codecpar: *mut AVCodecParameters,
@@ -754,9 +761,9 @@ struct DemuxStreamParamter {
     dts: i64,
 }
 
-unsafe impl Send for DemuxStreamParamter {}
-unsafe impl Sync for DemuxStreamParamter {}
-impl DemuxStreamParamter {
+unsafe impl Send for DemuxStreamParameter {}
+unsafe impl Sync for DemuxStreamParameter {}
+impl DemuxStreamParameter {
     fn new(ds: &DecoderStream) -> Self {
         Self {
             codec_type: ds.codec_type,
@@ -771,7 +778,7 @@ impl DemuxStreamParamter {
         }
     }
 }
-struct DemuxerParamter {
+struct DemuxerParameter {
     dsts_finished: Vec<bool>,
     have_audio_dec: bool,
 
@@ -798,6 +805,15 @@ struct DemuxerParamter {
     /// FFmpeg source: `ffmpeg_demux.c:420-422` (FFmpeg 7.x)
     ts_scale: f64,
 
+    /// Forced framerate for the input video stream.
+    /// When `num != 0`, overrides DTS estimation to use framerate-based grid.
+    /// When `{0, 0}` (default), packet duration is used, matching FFmpeg CLI
+    /// behavior when `-r` is not specified.
+    ///
+    /// FFmpeg CLI: `-r <rate>`
+    /// FFmpeg source: `ffmpeg.h:452`, `ffmpeg_demux.c:329-333` (FFmpeg 7.x)
+    framerate: AVRational,
+
     end_pts: Timestamp,
 
     /* duration of the looped segment of the input file */
@@ -806,13 +822,13 @@ struct DemuxerParamter {
     min_pts: Timestamp,
     max_pts: Timestamp,
 
-    demux_streams: Vec<DemuxStreamParamter>,
+    demux_streams: Vec<DemuxStreamParameter>,
 
     dsts: Vec<(Sender<PacketBox>, usize, Option<usize>)>,
 }
-unsafe impl Send for DemuxerParamter {}
-unsafe impl Sync for DemuxerParamter {}
-impl DemuxerParamter {
+unsafe impl Send for DemuxerParameter {}
+unsafe impl Sync for DemuxerParameter {}
+impl DemuxerParameter {
     fn new(demux: &mut Demuxer) -> Self {
         let dsts = demux.take_dsts();
         let dsts_finished = vec![false; dsts.len()];
@@ -826,10 +842,10 @@ impl DemuxerParamter {
         }
 
         let nb_streams = unsafe { (*demux.in_fmt_ctx).nb_streams };
-        let mut demux_streams: Vec<DemuxStreamParamter> = Vec::with_capacity(nb_streams as usize);
+        let mut demux_streams: Vec<DemuxStreamParameter> = Vec::with_capacity(nb_streams as usize);
         for i in 0..nb_streams {
             let stream = demux.get_stream(i as usize);
-            demux_streams.push(DemuxStreamParamter::new(stream))
+            demux_streams.push(DemuxStreamParameter::new(stream))
         }
 
 
@@ -847,6 +863,7 @@ impl DemuxerParamter {
             exit_on_error: demux.exit_on_error.unwrap_or(false),
             stream_loop: demux.stream_loop.unwrap_or(0),
             ts_scale: demux.ts_scale,
+            framerate: demux.framerate,
 
             end_pts: Default::default(),
 
@@ -878,48 +895,48 @@ impl Default for Timestamp {
 }
 
 unsafe fn seek_to_start(
-    demux_paramter: &mut DemuxerParamter,
+    demux_parameter: &mut DemuxerParameter,
     in_fmt_ctx: *mut AVFormatContext,
 ) -> i32 {
-    let start_time = demux_paramter.start_time_us.unwrap_or(0);
+    let start_time = demux_parameter.start_time_us.unwrap_or(0);
     let ret = avformat_seek_file(in_fmt_ctx, -1, i64::MIN, start_time, start_time, 0);
     if ret < 0 {
         return ret;
     }
 
-    if demux_paramter.end_pts.ts != AV_NOPTS_VALUE && demux_paramter.max_pts.ts == AV_NOPTS_VALUE
+    if demux_parameter.end_pts.ts != AV_NOPTS_VALUE && demux_parameter.max_pts.ts == AV_NOPTS_VALUE
         || av_compare_ts(
-            demux_paramter.max_pts.ts,
-            demux_paramter.max_pts.tb,
-            demux_paramter.end_pts.ts,
-            demux_paramter.end_pts.tb,
+            demux_parameter.max_pts.ts,
+            demux_parameter.max_pts.tb,
+            demux_parameter.end_pts.ts,
+            demux_parameter.end_pts.tb,
         ) < 0
     {
-        demux_paramter.max_pts = demux_paramter.end_pts.clone();
+        demux_parameter.max_pts = demux_parameter.end_pts.clone();
     }
 
-    if demux_paramter.max_pts.ts != AV_NOPTS_VALUE {
-        let min_pts = if demux_paramter.min_pts.ts == AV_NOPTS_VALUE {
+    if demux_parameter.max_pts.ts != AV_NOPTS_VALUE {
+        let min_pts = if demux_parameter.min_pts.ts == AV_NOPTS_VALUE {
             0
         } else {
-            demux_paramter.min_pts.ts
+            demux_parameter.min_pts.ts
         };
-        demux_paramter.duration.ts = demux_paramter.max_pts.ts
+        demux_parameter.duration.ts = demux_parameter.max_pts.ts
             - av_rescale_q(
                 min_pts,
-                demux_paramter.min_pts.tb,
-                demux_paramter.max_pts.tb,
+                demux_parameter.min_pts.tb,
+                demux_parameter.max_pts.tb,
             );
     }
-    demux_paramter.duration.tb = demux_paramter.max_pts.tb;
+    demux_parameter.duration.tb = demux_parameter.max_pts.tb;
 
-    if demux_paramter.stream_loop > 0 {
-        demux_paramter.stream_loop -= 1;
+    if demux_parameter.stream_loop > 0 {
+        demux_parameter.stream_loop -= 1;
     }
 
-    let loop_status = if demux_paramter.stream_loop > 0 {
-        format!("Remaining loops: {}", demux_paramter.stream_loop)
-    } else if demux_paramter.stream_loop == 0 {
+    let loop_status = if demux_parameter.stream_loop > 0 {
+        format!("Remaining loops: {}", demux_parameter.stream_loop)
+    } else if demux_parameter.stream_loop == 0 {
         "Last loop".to_string()
     } else {
         "Infinite loop mode".to_string()
@@ -931,7 +948,7 @@ unsafe fn seek_to_start(
 }
 
 unsafe fn demux_send(
-    demux_paramter: &mut DemuxerParamter,
+    demux_parameter: &mut DemuxerParameter,
     packet_box: PacketBox,
     packet_pool: &ObjPool<Packet>,
     flags: usize,
@@ -948,12 +965,12 @@ unsafe fn demux_send(
         return ffmpeg_sys_next::AVERROR_EXIT;
     }
     if independent_readrate && wait_time != 0 {
-        if let Some(readrate) = demux_paramter.readrate {
+        if let Some(readrate) = demux_parameter.readrate {
             if readrate != 0.0 {
-                let fix_wallclock_start = demux_paramter.wallclock_start + wait_time;
+                let fix_wallclock_start = demux_parameter.wallclock_start + wait_time;
                 debug!("FFmpeg on-demand scheduling caused the initial wallclock_start to not meet the specified readrate:{readrate}. Adjusting wallclock_start from {} to {fix_wallclock_start}",
-                    demux_paramter.wallclock_start);
-                demux_paramter.wallclock_start = fix_wallclock_start;
+                    demux_parameter.wallclock_start);
+                demux_parameter.wallclock_start = fix_wallclock_start;
             }
         }
     }
@@ -961,14 +978,14 @@ unsafe fn demux_send(
     // flush the downstreams after seek
     if (*packet_box.packet.as_ptr()).stream_index == -1 {
         packet_pool.release(packet_box.packet);
-        return demux_flush(packet_pool, &demux_paramter.dsts);
+        return demux_flush(packet_pool, &demux_parameter.dsts);
     }
 
-    demux_send_for_stream(demux_paramter, packet_box, packet_pool, flags, scheduler_status)
+    demux_send_for_stream(demux_parameter, packet_box, packet_pool, flags, scheduler_status)
 }
 
 unsafe fn demux_send_for_stream(
-    demux_paramter: &mut DemuxerParamter,
+    demux_parameter: &mut DemuxerParameter,
     packet_box: PacketBox,
     packet_pool: &ObjPool<Packet>,
     flags: usize,
@@ -976,7 +993,7 @@ unsafe fn demux_send_for_stream(
 ) -> i32 {
     let stream_index = (*packet_box.packet.as_ptr()).stream_index;
 
-    let send_dsts = demux_paramter
+    let send_dsts = demux_parameter
         .dsts
         .iter()
         .enumerate()
@@ -990,7 +1007,7 @@ unsafe fn demux_send_for_stream(
     let mut nb_done = 0;
 
     for (i, (dst_i, (packet_dst, _, output_stream_index))) in send_dsts.iter().enumerate() {
-        let dst_finished = &mut demux_paramter.dsts_finished[*dst_i];
+        let dst_finished = &mut demux_parameter.dsts_finished[*dst_i];
 
         if i < send_dsts.len() - 1 {
             let Ok(mut to_send) = packet_pool.get() else {
@@ -1040,7 +1057,7 @@ unsafe fn demux_send_for_stream(
         }
     }
 
-    if nb_done == demux_paramter.dsts.len() {
+    if nb_done == demux_parameter.dsts.len() {
         AVERROR_EOF
     } else {
         0
@@ -1072,7 +1089,9 @@ unsafe fn demux_stream_send_to_dst(
     }
 
     if let Some(output_stream_index) = output_stream_index {
-        (*packet_box.packet.as_mut_ptr()).stream_index = *output_stream_index as i32;
+        if (flags & DEMUX_SEND_STREAMCOPY_EOF) == 0 {
+            (*packet_box.packet.as_mut_ptr()).stream_index = *output_stream_index as i32;
+        }
         packet_box.packet_data.output_stream_index = *output_stream_index as i32;
         packet_box.packet_data.is_copy = true;
     }
@@ -1142,12 +1161,12 @@ unsafe fn demux_flush(
 
 #[cfg(test)]
 mod tests {
-    use ffmpeg_sys_next::AV_NOPTS_VALUE;
+    use ffmpeg_sys_next::{av_inv_q, av_rescale_q, AVRational, AV_NOPTS_VALUE, AV_TIME_BASE, AV_TIME_BASE_Q};
 
     /// Apply ts_scale to a timestamp value.
     /// Returns the scaled timestamp, or AV_NOPTS_VALUE if input is AV_NOPTS_VALUE.
     ///
-    /// This mirrors the logic in `adjust_pkt_for_stream`:
+    /// This mirrors the ts_scale logic in FFmpeg CLI's `ffmpeg_demux.c`:
     /// - If ts_scale == 1.0, no change
     /// - Otherwise, multiply and truncate toward zero (same as C's int64_t *= double)
     fn apply_ts_scale(ts: i64, ts_scale: f64) -> i64 {
@@ -1313,5 +1332,127 @@ mod tests {
         let (pts, dts) = apply_ts_scale_to_packet(AV_NOPTS_VALUE, AV_NOPTS_VALUE, 2.0);
         assert_eq!(pts, AV_NOPTS_VALUE);
         assert_eq!(dts, AV_NOPTS_VALUE);
+    }
+
+    // --- Framerate DTS estimation tests ---
+    //
+    // Mirrors the VIDEO branch in `dts_estimated_process` (lines 566-572):
+    //   if framerate.num != 0 {
+    //       let next_dts = av_rescale_q(ds.next_dts, AV_TIME_BASE_Q, av_inv_q(framerate));
+    //       ds.next_dts = av_rescale_q(next_dts + 1, av_inv_q(framerate), AV_TIME_BASE_Q);
+    //   }
+
+    /// Pure-function version of the framerate-based next_dts calculation.
+    /// Given `current_dts` in AV_TIME_BASE units and a forced `framerate`,
+    /// returns the next_dts after one frame.
+    fn compute_next_dts_with_framerate(current_dts: i64, framerate: AVRational) -> i64 {
+        assert!(framerate.num != 0, "framerate.num must be non-zero");
+        let time_base_q = AV_TIME_BASE_Q;
+        let inv_fr = unsafe { av_inv_q(framerate) };
+        let next_dts = unsafe { av_rescale_q(current_dts, time_base_q, inv_fr) };
+        unsafe { av_rescale_q(next_dts + 1, inv_fr, time_base_q) }
+    }
+
+    #[test]
+    fn framerate_dts_30fps() {
+        // 30 fps: each frame = 1/30 s = 33333.33.. us
+        let fr = AVRational { num: 30, den: 1 };
+        let next = compute_next_dts_with_framerate(0, fr);
+        // Expected: ~33333 us (1/30 of AV_TIME_BASE)
+        let expected = AV_TIME_BASE as i64 / 30;
+        assert!((next - expected).abs() <= 1, "30fps: next={next}, expected={expected}");
+    }
+
+    #[test]
+    fn framerate_dts_24000_1001() {
+        // 23.976 fps (NTSC film): framerate = 24000/1001
+        let fr = AVRational { num: 24000, den: 1001 };
+        let next = compute_next_dts_with_framerate(0, fr);
+        // Expected: 1001/24000 * 1_000_000 = 41708.33.. us
+        let expected_us = (1001.0 / 24000.0 * AV_TIME_BASE as f64) as i64;
+        assert!((next - expected_us).abs() <= 1,
+            "23.976fps: next={next}, expected~={expected_us}");
+    }
+
+    #[test]
+    fn framerate_dts_25fps() {
+        // 25 fps (PAL): each frame = 40000 us
+        let fr = AVRational { num: 25, den: 1 };
+        let next = compute_next_dts_with_framerate(0, fr);
+        assert_eq!(next, 40000, "25fps: next={next}, expected=40000");
+    }
+
+    #[test]
+    fn framerate_dts_consecutive_frames() {
+        // Simulate 3 consecutive frames at 30fps
+        let fr = AVRational { num: 30, den: 1 };
+        let dts0 = 0i64;
+        let dts1 = compute_next_dts_with_framerate(dts0, fr);
+        let dts2 = compute_next_dts_with_framerate(dts1, fr);
+        let dts3 = compute_next_dts_with_framerate(dts2, fr);
+
+        // Each frame should be ~33333us apart
+        let frame_dur = AV_TIME_BASE as i64 / 30;
+        assert!((dts1 - dts0 - frame_dur).abs() <= 1);
+        assert!((dts2 - dts1 - frame_dur).abs() <= 1);
+        assert!((dts3 - dts2 - frame_dur).abs() <= 1);
+        // After 3 frames, should be close to 3 * frame_dur
+        assert!((dts3 - 3 * frame_dur).abs() <= 3,
+            "3 frames at 30fps: dts3={dts3}, expected~={}", 3 * frame_dur);
+    }
+
+    #[test]
+    fn framerate_dts_nonzero_start() {
+        // Start from a non-zero DTS (e.g., 1 second in)
+        let fr = AVRational { num: 24, den: 1 };
+        let start_dts = AV_TIME_BASE as i64; // 1 second
+        let next = compute_next_dts_with_framerate(start_dts, fr);
+        let expected = start_dts + AV_TIME_BASE as i64 / 24;
+        assert!((next - expected).abs() <= 1,
+            "24fps from 1s: next={next}, expected~={expected}");
+    }
+
+    #[test]
+    fn framerate_dts_60fps() {
+        // 60 fps: each frame = 16666.67 us
+        let fr = AVRational { num: 60, den: 1 };
+        let next = compute_next_dts_with_framerate(0, fr);
+        let expected = AV_TIME_BASE as i64 / 60;
+        assert!((next - expected).abs() <= 1, "60fps: next={next}, expected={expected}");
+    }
+
+    /// Mirrors the initial DTS calculation for first frame:
+    ///   dts = ((-video_delay) * AV_TIME_BASE) as f64 / av_q2d(avg_frame_rate)
+    fn compute_initial_dts(video_delay: i32, avg_frame_rate: AVRational) -> i64 {
+        if avg_frame_rate.num != 0 {
+            let fr_d = avg_frame_rate.num as f64 / avg_frame_rate.den as f64;
+            ((-video_delay as i64 * AV_TIME_BASE as i64) as f64 / fr_d) as i64
+        } else {
+            0
+        }
+    }
+
+    #[test]
+    fn initial_dts_no_delay() {
+        // No B-frames (video_delay=0): initial DTS should be 0
+        let dts = compute_initial_dts(0, AVRational { num: 30, den: 1 });
+        assert_eq!(dts, 0);
+    }
+
+    #[test]
+    fn initial_dts_with_bframes() {
+        // video_delay=1 (1 B-frame): initial DTS should be negative by one frame
+        let fr = AVRational { num: 30, den: 1 };
+        let dts = compute_initial_dts(1, fr);
+        let expected = -(AV_TIME_BASE as i64 / 30);
+        assert!((dts - expected).abs() <= 1,
+            "video_delay=1 at 30fps: dts={dts}, expected={expected}");
+    }
+
+    #[test]
+    fn initial_dts_no_framerate() {
+        // avg_frame_rate.num == 0: falls back to 0
+        let dts = compute_initial_dts(1, AVRational { num: 0, den: 1 });
+        assert_eq!(dts, 0);
     }
 }

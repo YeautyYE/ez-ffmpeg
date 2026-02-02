@@ -26,7 +26,7 @@ pub enum Error {
     #[error("Filter graph parse error: {0}")]
     FilterGraphParse(#[from] FilterGraphParseError),
 
-    #[error("Ffilter description converted to utf8 string error")]
+    #[error("Filter description converted to utf8 string error")]
     FilterDescUtf8,
 
     #[error("Filter name converted to utf8 string error")]

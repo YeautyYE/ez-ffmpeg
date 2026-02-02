@@ -219,7 +219,8 @@ fn _mux_init(
 
     let result = std::thread::Builder::new().name(format!("muxer{mux_idx}:{format_name}")).spawn(move || {
         let out_fmt_ctx_box = out_fmt_ctx_box;
-        let mut started = false;
+        let mut stream_started: Vec<bool> = vec![false; stream_count];
+        let mut stream_eof: Vec<bool> = vec![false; stream_count];
         let mut st_rescale_delta_last_map = HashMap::new();
         let mut st_last_dts_map = HashMap::new();
 
@@ -247,7 +248,36 @@ fn _mux_init(
             let pkt = packet_box.packet.as_ptr();
             let packet_data = &packet_box.packet_data;
 
-            let stream_index = unsafe { (*pkt).stream_index as usize };
+            // Handle demux EOF signal: stream_index < 0 means a specific stream reached
+            // recording_time on the demux side. Use packet_data.output_stream_index
+            // to identify which stream finished.
+            // Note: differs from CLI where stream_idx < 0 means ALL streams finished
+            // (ffmpeg_mux.c:428-431). ez-ffmpeg uses per-stream EOF signaling instead.
+            let raw_stream_index = unsafe { (*pkt).stream_index };
+            if raw_stream_index < 0 {
+                let eof_stream = packet_box.packet_data.output_stream_index;
+                if eof_stream >= 0 {
+                    let eof_idx = eof_stream as usize;
+                    if eof_idx < stream_count && !stream_eof[eof_idx] {
+                        stream_eof[eof_idx] = true;
+                        nb_done += 1;
+                        if eof_idx < mux_stream_nodes.len() {
+                            let node = mux_stream_nodes[eof_idx].as_ref();
+                            let SchNode::MuxStream { src: _, last_dts: _, source_finished } = node else { unreachable!() };
+                            source_finished.store(true, Ordering::Release);
+                            input_controller.update_locked(&scheduler_status);
+                        }
+                    }
+                }
+                packet_pool.release(packet_box.packet);
+                if nb_done == stream_count {
+                    trace!("All streams finished (demux EOF signal)");
+                    break;
+                }
+                continue;
+            }
+
+            let stream_index = raw_stream_index as usize;
             if stream_index >= mux_stream_nodes.len() {
                 error!("Invalid stream_index: {} >= {}", stream_index, mux_stream_nodes.len());
                 packet_pool.release(packet_box.packet);
@@ -262,6 +292,12 @@ fn _mux_init(
                         debug!("Muxer detected abort from stream {}, exiting without trailer", stream_index);
                         packet_pool.release(packet_box.packet);
                         break;
+                    }
+
+                    // Guard: skip if this stream already finished via recording_time EOF
+                    if stream_eof[stream_index] {
+                        packet_pool.release(packet_box.packet);
+                        continue;
                     }
 
                     nb_done += 1;
@@ -282,17 +318,40 @@ fn _mux_init(
 
                 update_last_dts(mux_stream_node, &input_controller, &scheduler_status, pkt);
 
+                // Skip packets for streams that already hit recording_time EOF
+                if stream_eof[stream_index] {
+                    packet_pool.release(packet_box.packet);
+                    continue;
+                }
+
                 if !packet_is_null(&packet_box.packet) && packet_data.is_copy {
+                    let started = &mut stream_started[stream_index];
                     ret = streamcopy_rescale(
                         packet_box.packet.as_mut_ptr(),
                         packet_data,
                         &start_time_us,
                         &recording_time_us,
-                        &mut started,
+                        started,
                     );
                     if ret == AVERROR(EAGAIN) {
                         continue;
                     } else if ret == AVERROR_EOF {
+                        // Per-stream EOF: mark this stream as finished, matching CLI's
+                        // sch_mux_receive_finish behavior in ffmpeg_mux.c:442
+                        stream_eof[stream_index] = true;
+                        packet_pool.release(packet_box.packet);
+
+                        nb_done += 1;
+                        let mux_stream_node = mux_stream_node.as_ref();
+                        let SchNode::MuxStream { src: _, last_dts: _, source_finished } = mux_stream_node else { unreachable!() };
+                        source_finished.store(true, Ordering::Release);
+                        input_controller.update_locked(&scheduler_status);
+
+                        if nb_done == stream_count {
+                            trace!("All streams finished (recording_time)");
+                            break;
+                        }
+                        continue;
                     }
                 }
 
@@ -313,7 +372,7 @@ fn _mux_init(
                         trace!("Muxer returned EOF");
                         break;
                     } else if ret < 0 {
-                        error!("Error muxing a packet");
+                        error!("Error muxing a packet: stream_index={stream_index}, ret={ret}");
                         break;
                     }
                 }
@@ -400,8 +459,12 @@ unsafe fn streamcopy_rescale(
         return AVERROR(EAGAIN);
     }
 
-    //-ss start_time
-    if !*started {
+    // Match FFmpeg CLI: only filter packets before start_time when output start_time is set.
+    // CLI default: copy_prior_start=-1 → !(-1)=false → check skipped;
+    //              of->start_time=AV_NOPTS_VALUE → check skipped.
+    // Without this guard, packets with negative timestamps (between seek keyframe
+    // and exact seek point) are incorrectly dropped, causing start_pts mismatch.
+    if !*started && start_time_us.is_some() {
         let no_pts = (*pkt).pts == AV_NOPTS_VALUE;
         let not_start = if no_pts {
             dts < start_time
