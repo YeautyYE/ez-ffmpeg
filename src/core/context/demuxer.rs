@@ -12,7 +12,7 @@ use ffmpeg_sys_next::AVPixelFormat::{
     AV_PIX_FMT_CUDA, AV_PIX_FMT_MEDIACODEC, AV_PIX_FMT_NONE, AV_PIX_FMT_QSV,
 };
 use ffmpeg_sys_next::{
-    av_channel_layout_default, av_codec_is_decoder, av_codec_iterate, av_get_pix_fmt, av_hwdevice_find_type_by_name, av_hwdevice_get_type_name, avcodec_descriptor_get, avcodec_descriptor_get_by_name, avcodec_find_decoder, avcodec_find_decoder_by_name, avcodec_get_hw_config, AVChannelOrder, AVCodecID, AVCodecParameters, AVFormatContext, AVHWDeviceType, AVMediaType, AVPixelFormat, AVERROR, AVERROR_DECODER_NOT_FOUND, EINVAL
+    av_channel_layout_default, av_codec_is_decoder, av_codec_iterate, av_get_pix_fmt, av_hwdevice_find_type_by_name, av_hwdevice_get_type_name, avcodec_descriptor_get, avcodec_descriptor_get_by_name, avcodec_find_decoder, avcodec_find_decoder_by_name, avcodec_get_hw_config, AVChannelOrder, AVCodecID, AVCodecParameters, AVFormatContext, AVHWDeviceType, AVMediaType, AVPixelFormat, AVRational, AVERROR, AVERROR_DECODER_NOT_FOUND, EINVAL
 };
 use log::{debug, error, warn};
 use std::ffi::{CStr, CString};
@@ -46,6 +46,15 @@ pub(crate) struct Demuxer {
     /// FFmpeg CLI: `-itsscale <scale>`
     /// FFmpeg source: `ffmpeg_demux.c:420-422` (FFmpeg 7.x)
     pub(crate) ts_scale: f64,
+
+    /// Forced framerate for the input video stream.
+    /// When set (num != 0), overrides the DTS estimation logic to use framerate-based
+    /// grid calculation. When `{0, 0}` (default), packet duration is used for DTS
+    /// estimation, matching FFmpeg CLI behavior when `-r` is not specified.
+    ///
+    /// FFmpeg CLI: `-r <rate>`
+    /// FFmpeg source: `ffmpeg.h:452`, `ffmpeg_demux.c:329-333` (FFmpeg 7.x)
+    pub(crate) framerate: AVRational,
 
     #[cfg(windows)]
     pub(crate) hwaccel: Option<String>,
@@ -81,6 +90,7 @@ impl Demuxer {
         copy_ts: bool,
         autorotate: bool,
         ts_scale: f64,
+        framerate: AVRational,
     ) -> crate::error::Result<Self> {
         let streams = Self::init_streams(
             in_fmt_ctx,
@@ -106,6 +116,7 @@ impl Demuxer {
             copy_ts,
             autorotate,
             ts_scale,
+            framerate,
             #[cfg(windows)]
             hwaccel,
             node: Arc::new(SchNode::Demux { waiter: Arc::new(Default::default()), task_exited: Arc::new(Default::default()) }),

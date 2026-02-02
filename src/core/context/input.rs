@@ -280,6 +280,28 @@ pub struct Input {
     /// - Default value: `ffmpeg_demux.c:1316` (`ds->ts_scale = 1.0`)
     /// - Application: `ffmpeg_demux.c:420-422` (applied after ts_offset)
     pub(crate) ts_scale: Option<f64>,
+
+    /// Forced framerate for the input video stream.
+    ///
+    /// When set, this overrides the DTS estimation logic to use the specified
+    /// framerate for computing `next_dts` in the video stream. By default (None),
+    /// the actual packet duration is used for DTS estimation, matching FFmpeg CLI
+    /// behavior when `-r` is not specified.
+    ///
+    /// This affects all video DTS estimation, including recording_time cutoff
+    /// decisions during stream copy and the output stream time_base when set via
+    /// `streamcopy_init`.
+    ///
+    /// ## FFmpeg CLI equivalent
+    /// ```bash
+    /// # Force input framerate to 30fps
+    /// ffmpeg -r 30 -i input.mp4 output.mp4
+    /// ```
+    ///
+    /// ## FFmpeg source reference (FFmpeg 7.x)
+    /// - Field: `ffmpeg.h:452` (`ist->framerate`, only set with `-r`)
+    /// - Application: `ffmpeg_demux.c:329-333` (used in `ist_dts_update`)
+    pub(crate) framerate: Option<(i32, i32)>,
 }
 
 impl Input {
@@ -939,7 +961,46 @@ impl Input {
     ///     .set_ts_scale(2.0);
     /// ```
     pub fn set_ts_scale(mut self, scale: f64) -> Self {
+        assert!(scale.is_finite(), "ts_scale must be finite, got {scale}");
+        assert!(scale > 0.0, "ts_scale must be positive, got {scale}");
         self.ts_scale = Some(scale);
+        self
+    }
+
+    /// Sets a forced framerate for the input video stream.
+    ///
+    /// When set, this overrides the default DTS estimation behavior. By default,
+    /// ez-ffmpeg uses the actual packet duration for DTS estimation (matching FFmpeg
+    /// CLI behavior without `-r`). Setting a framerate forces DTS estimation to use
+    /// the specified rate instead, which snaps timestamps to a fixed frame grid.
+    ///
+    /// # Parameters
+    /// - `num`: Framerate numerator (e.g., 30 for 30fps, 24000 for 23.976fps)
+    /// - `den`: Framerate denominator (e.g., 1 for 30fps, 1001 for 23.976fps)
+    ///
+    /// # Returns
+    /// * `Self` - allowing method chaining.
+    ///
+    /// # FFmpeg CLI equivalent
+    /// ```bash
+    /// ffmpeg -r 30 -i input.mp4 output.mp4
+    /// ffmpeg -r 24000/1001 -i input.mp4 output.mp4
+    /// ```
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// // Force 30fps framerate for DTS estimation
+    /// let input = Input::from("video.mp4")
+    ///     .set_framerate(30, 1);
+    ///
+    /// // Force 23.976fps framerate
+    /// let input = Input::from("video.mp4")
+    ///     .set_framerate(24000, 1001);
+    /// ```
+    pub fn set_framerate(mut self, num: i32, den: i32) -> Self {
+        assert!(num > 0, "framerate numerator must be positive, got {num}");
+        assert!(den > 0, "framerate denominator must be positive, got {den}");
+        self.framerate = Some((num, den));
         self
     }
 }
@@ -967,6 +1028,7 @@ impl From<Box<dyn FnMut(&mut [u8]) -> i32>> for Input {
             input_opts: None,
             autorotate: None,
             ts_scale: None,
+            framerate: None,
         }
     }
 }
@@ -994,6 +1056,7 @@ impl From<String> for Input {
             input_opts: None,
             autorotate: None,
             ts_scale: None,
+            framerate: None,
         }
     }
 }
@@ -1008,6 +1071,84 @@ impl From<&str> for Input {
 #[cfg(test)]
 mod tests {
     use crate::core::context::input::Input;
+
+    #[test]
+    fn set_framerate_valid() {
+        let input = Input::from("test.mp4").set_framerate(24000, 1001);
+        assert_eq!(input.framerate, Some((24000, 1001)));
+    }
+
+    #[test]
+    fn set_framerate_simple() {
+        let input = Input::from("test.mp4").set_framerate(30, 1);
+        assert_eq!(input.framerate, Some((30, 1)));
+    }
+
+    #[test]
+    #[should_panic(expected = "framerate numerator must be positive")]
+    fn set_framerate_zero_num() {
+        Input::from("test.mp4").set_framerate(0, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "framerate denominator must be positive")]
+    fn set_framerate_zero_den() {
+        Input::from("test.mp4").set_framerate(24, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "framerate numerator must be positive")]
+    fn set_framerate_negative_num() {
+        Input::from("test.mp4").set_framerate(-1, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "framerate denominator must be positive")]
+    fn set_framerate_negative_den() {
+        Input::from("test.mp4").set_framerate(24, -1);
+    }
+
+    #[test]
+    fn set_ts_scale_valid() {
+        let input = Input::from("test.mp4").set_ts_scale(2.0);
+        assert_eq!(input.ts_scale, Some(2.0));
+    }
+
+    #[test]
+    fn set_ts_scale_fractional() {
+        let input = Input::from("test.mp4").set_ts_scale(0.5);
+        assert_eq!(input.ts_scale, Some(0.5));
+    }
+
+    #[test]
+    #[should_panic(expected = "ts_scale must be finite")]
+    fn set_ts_scale_nan() {
+        Input::from("test.mp4").set_ts_scale(f64::NAN);
+    }
+
+    #[test]
+    #[should_panic(expected = "ts_scale must be finite")]
+    fn set_ts_scale_infinity() {
+        Input::from("test.mp4").set_ts_scale(f64::INFINITY);
+    }
+
+    #[test]
+    #[should_panic(expected = "ts_scale must be finite")]
+    fn set_ts_scale_neg_infinity() {
+        Input::from("test.mp4").set_ts_scale(f64::NEG_INFINITY);
+    }
+
+    #[test]
+    #[should_panic(expected = "ts_scale must be positive")]
+    fn set_ts_scale_zero() {
+        Input::from("test.mp4").set_ts_scale(0.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "ts_scale must be positive")]
+    fn set_ts_scale_negative() {
+        Input::from("test.mp4").set_ts_scale(-1.0);
+    }
 
     #[test]
     fn test_new_by_read_callback() {

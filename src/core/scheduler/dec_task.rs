@@ -1312,9 +1312,9 @@ unsafe fn packet_decode(
         }
 
         let mut frame_box = dec_frame_to_box(dp_arc.clone(), frame);
-        // fdemux_paramter.dec.pts                 = (*frame).pts;
-        // fdemux_paramter.dec.tb                  = dec->pkt_timebase;
-        // fdemux_paramter.dec.frame_num           = dec->frame_num - 1;
+        // fdemux_parameter.dec.pts                 = (*frame).pts;
+        // fdemux_parameter.dec.tb                  = dec->pkt_timebase;
+        // fdemux_parameter.dec.frame_num           = dec->frame_num - 1;
 
         (*frame_box.frame.as_mut_ptr()).time_base = (*dec_ctx).pkt_timebase;
 

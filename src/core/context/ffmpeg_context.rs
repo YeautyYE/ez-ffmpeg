@@ -167,6 +167,29 @@ impl FfmpegContext {
 
         outputs_bind(&mut muxs, &mut filter_graphs, &mut demuxs)?;
 
+        // Propagate input recording_time to mux as a convenience feature.
+        // This allows users to set recording_time on Input and have it work
+        // correctly for stream-copy scenarios (where the mux-side check in
+        // streamcopy_rescale needs recording_time). Only propagate when all
+        // mapped streams come from the same input file to avoid incorrect
+        // truncation in multi-input scenarios.
+        for mux in muxs.iter_mut() {
+            if mux.recording_time_us.is_none() {
+                let mapping = mux.stream_input_mapping();
+                if !mapping.is_empty() {
+                    let first_input = mapping[0].1.0;
+                    let all_same_input = mapping.iter().all(|(_, (idx, _))| *idx == first_input);
+                    if all_same_input {
+                        if let Some(demux) = demuxs.get(first_input) {
+                            if let Some(recording_time) = demux.recording_time_us {
+                                mux.recording_time_us = Some(recording_time);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         correct_input_start_times(&mut demuxs, copy_ts);
 
         check_output_streams(&muxs)?;
@@ -760,6 +783,7 @@ fn map_manual(
                     mux,
                     *(*demux.in_fmt_ctx).streams.add(stream_index),
                     *(*mux.out_fmt_ctx).streams.add(output_stream_index),
+                    demux.framerate,
                 )?;
                 rescale_duration(
                     input_stream_duration,
@@ -782,6 +806,7 @@ fn map_manual(
                         mux,
                         *(*demux.in_fmt_ctx).streams.add(stream_index),
                         *(*mux.out_fmt_ctx).streams.add(output_stream_index),
+                        demux.framerate,
                     )?;
                     rescale_duration(
                         input_stream_duration,
@@ -1452,6 +1477,7 @@ unsafe fn map_auto_stream(
                 mux,
                 *(*demux.in_fmt_ctx).streams.add(stream_index),
                 *(*mux.out_fmt_ctx).streams.add(output_stream_index),
+                demux.framerate,
             )?;
             rescale_duration(
                 input_stream_duration,
@@ -1512,6 +1538,7 @@ fn streamcopy_init(
     mux: &mut Muxer,
     input_stream: *mut AVStream,
     output_stream: *mut AVStream,
+    input_framerate: AVRational,
 ) -> Result<()> {
     Ok(())
 }
@@ -1521,6 +1548,7 @@ fn streamcopy_init(
     mux: &mut Muxer,
     input_stream: *mut AVStream,
     output_stream: *mut AVStream,
+    input_framerate: AVRational,
 ) -> Result<()> {
     unsafe {
         let codec_ctx = avcodec_alloc_context3(null_mut());
@@ -1559,9 +1587,18 @@ fn streamcopy_init(
         }
         (*(*output_stream).codecpar).codec_tag = codec_tag;
 
-        let mut fr = (*output_stream).r_frame_rate;
-        if fr.num == 0 {
-            fr = (*input_stream).r_frame_rate;
+        // Match FFmpeg CLI: framerate only applies to video streams.
+        // In CLI, ist->framerate is only set for video (ffmpeg_demux.c:1428, case AVMEDIA_TYPE_VIDEO)
+        // and ost->frame_rate is only set in new_stream_video() (ffmpeg_mux_init.c:607).
+        // Since ez-ffmpeg stores framerate per-file (not per-stream), we need an explicit guard
+        // to prevent applying framerate to audio/subtitle streams in streamcopy mode.
+        let codec_type = (*(*output_stream).codecpar).codec_type;
+        let mut fr = AVRational { num: 0, den: 0 };
+        if codec_type == AVMEDIA_TYPE_VIDEO {
+            fr = mux.framerate.unwrap_or(AVRational { num: 0, den: 0 });
+            if fr.num == 0 {
+                fr = input_framerate;
+            }
         }
 
         if fr.num != 0 {
@@ -2938,6 +2975,10 @@ unsafe fn open_input_file(index: usize, input: &mut Input, copy_ts: bool) -> Res
         copy_ts,
         input.autorotate.unwrap_or(true),  // Default to true (enabled)
         input.ts_scale.unwrap_or(1.0),     // Default to 1.0 (no scaling)
+        match input.framerate {            // Default to {0, 0} (use packet duration)
+            Some((num, den)) => AVRational { num, den },
+            None => AVRational { num: 0, den: 0 },
+        },
     )?;
 
     Ok(demux)
