@@ -1,4 +1,5 @@
 use ez_ffmpeg::packet_scanner::PacketScanner;
+use ez_ffmpeg::stream_info::StreamInfo;
 
 fn main() {
     // =========================================================
@@ -199,6 +200,124 @@ fn main() {
                 info.dts(),
                 info.size(),
                 info.pos(),
+            );
+        }
+    }
+
+    // =========================================================
+    // Example 8: Stream info overview — list all streams
+    // =========================================================
+    println!();
+    println!("=== Example 8: Stream Info Overview ===");
+    let scanner = PacketScanner::open("test.mp4").unwrap();
+
+    // streams() returns all stream info cached at open time
+    for stream in scanner.streams() {
+        println!(
+            "  Stream #{}: type={}, is_video={}, is_audio={}",
+            stream.index(),
+            stream.stream_type(),
+            stream.is_video(),
+            stream.is_audio(),
+        );
+        // Print type-specific details via Debug
+        match stream {
+            StreamInfo::Video { codec_name, width, height, fps, .. } => {
+                println!("    codec={}, {}x{}, {:.2} fps", codec_name, width, height, fps);
+            }
+            StreamInfo::Audio { codec_name, sample_rate, nb_channels, .. } => {
+                println!("    codec={}, {} Hz, {} ch", codec_name, sample_rate, nb_channels);
+            }
+            _ => {}
+        }
+    }
+
+    // =========================================================
+    // Example 9: Quick video/audio stream access
+    // =========================================================
+    println!();
+    println!("=== Example 9: Video & Audio Stream Access ===");
+    let scanner = PacketScanner::open("test.mp4").unwrap();
+
+    // video_stream() and audio_stream() return the first match
+    if let Some(video) = scanner.video_stream() {
+        println!("  Video stream index: {}", video.index());
+        if let StreamInfo::Video { codec_name, width, height, fps, bit_rate, .. } = video {
+            println!(
+                "    {} {}x{} {:.2}fps bitrate={}",
+                codec_name, width, height, fps, bit_rate,
+            );
+        }
+    } else {
+        println!("  No video stream found.");
+    }
+
+    if let Some(audio) = scanner.audio_stream() {
+        println!("  Audio stream index: {}", audio.index());
+        if let StreamInfo::Audio { codec_name, sample_rate, nb_channels, bit_rate, .. } = audio {
+            println!(
+                "    {} {}Hz {}ch bitrate={}",
+                codec_name, sample_rate, nb_channels, bit_rate,
+            );
+        }
+    } else {
+        println!("  No audio stream found.");
+    }
+
+    // =========================================================
+    // Example 10: Stream-aware packet processing
+    // =========================================================
+    println!();
+    println!("=== Example 10: Stream-Aware Packet Processing ===");
+    let mut scanner = PacketScanner::open("test.mp4").unwrap();
+
+    // Pre-build a lookup: which stream index is video / audio?
+    let streams = scanner.streams();
+    let video_indices: Vec<usize> = streams.iter()
+        .filter(|s| s.is_video())
+        .map(|s| s.index() as usize)
+        .collect();
+    let audio_indices: Vec<usize> = streams.iter()
+        .filter(|s| s.is_audio())
+        .map(|s| s.index() as usize)
+        .collect();
+
+    let mut video_packets = 0u64;
+    let mut audio_packets = 0u64;
+    let mut video_bytes = 0u64;
+    let mut audio_bytes = 0u64;
+
+    for packet in scanner.packets() {
+        let pkt = packet.unwrap();
+        let idx = pkt.stream_index();
+        if video_indices.contains(&idx) {
+            video_packets += 1;
+            video_bytes += pkt.size() as u64;
+        } else if audio_indices.contains(&idx) {
+            audio_packets += 1;
+            audio_bytes += pkt.size() as u64;
+        }
+    }
+
+    println!("  Video: {} packets, {} bytes", video_packets, video_bytes);
+    println!("  Audio: {} packets, {} bytes", audio_packets, audio_bytes);
+
+    // =========================================================
+    // Example 11: stream_for_packet — correlate after reading
+    // =========================================================
+    println!();
+    println!("=== Example 11: stream_for_packet Usage ===");
+    let mut scanner = PacketScanner::open("test.mp4").unwrap();
+
+    // Read a packet, then look up its stream info
+    if let Some(pkt) = scanner.next_packet().unwrap() {
+        if let Some(stream) = scanner.stream_for_packet(&pkt) {
+            println!(
+                "  First packet: stream #{} type={} pts={:?} size={}",
+                pkt.stream_index(),
+                stream.stream_type(),
+                pkt.pts(),
+                pkt.size(),
             );
         }
     }
