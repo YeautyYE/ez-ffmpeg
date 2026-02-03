@@ -39,6 +39,7 @@ This example demonstrates how to use `PacketScanner` to iterate over demuxed pac
    - `pos()` — Byte position in the input file.
    - `is_keyframe()` — Whether the packet contains a keyframe.
    - `is_corrupt()` — Whether the packet is flagged as corrupt.
+   - `is_video()` / `is_audio()` — Whether this packet belongs to a video or audio stream.
 
 10. **`StreamInfo` helpers**:
     - `is_video()` / `is_audio()` — Check stream type.
@@ -58,8 +59,8 @@ The following scenarios are demonstrated:
 7. **First Keyframe Per Stream**: Find and print the first keyframe in each stream.
 8. **Stream Info Overview**: List all streams with their type, codec, and key parameters.
 9. **Video & Audio Stream Access**: Use `video_stream()` and `audio_stream()` for quick access.
-10. **Stream-Aware Packet Processing**: Classify packets by stream type using pre-built index lookup.
-11. **stream_for_packet Usage**: Correlate a single packet with its stream info after reading.
+10. **Stream-Aware Packet Processing**: Classify packets by stream type using `PacketInfo::is_video()`/`is_audio()`.
+11. **stream_for_packet Usage**: Use `PacketInfo::is_video()`/`is_audio()` for quick checks and `stream_for_packet()` for full stream details.
 
 ## When to Use
 
