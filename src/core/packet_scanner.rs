@@ -12,8 +12,15 @@ use crate::error::{DemuxingError, OpenInputError, PacketScannerError, Result};
 
 /// Read-only metadata extracted from a single demuxed packet.
 ///
-/// `PacketInfo` contains scalar values copied out of an `AVPacket`, so it has no
-/// lifetime ties to the scanner. It is cheap to clone and store.
+/// `PacketInfo` contains scalar values copied out of an `AVPacket` together with
+/// stream-type flags looked up at read time, so it has no lifetime ties to the
+/// scanner. It is cheap to clone and store.
+///
+/// # Defensive fields
+///
+/// `stream_index` and `size` are clamped to non-negative values before storage.
+/// FFmpeg's internal asserts guarantee valid ranges in practice, so the clamping
+/// is purely defensive and not expected to trigger.
 #[derive(Debug, Clone)]
 pub struct PacketInfo {
     stream_index: usize,
@@ -24,6 +31,8 @@ pub struct PacketInfo {
     pos: i64,
     is_keyframe: bool,
     is_corrupt: bool,
+    is_video: bool,
+    is_audio: bool,
 }
 
 impl PacketInfo {
@@ -66,6 +75,16 @@ impl PacketInfo {
     pub fn is_corrupt(&self) -> bool {
         self.is_corrupt
     }
+
+    /// Whether this packet belongs to a video stream.
+    pub fn is_video(&self) -> bool {
+        self.is_video
+    }
+
+    /// Whether this packet belongs to an audio stream.
+    pub fn is_audio(&self) -> bool {
+        self.is_audio
+    }
 }
 
 /// A stateful packet-level scanner for media files.
@@ -99,6 +118,8 @@ pub struct PacketScanner {
 
 // SAFETY: PacketScanner owns its AVFormatContext and AVPacket exclusively.
 // It is moved between threads, never shared. No thread-affine callbacks are registered.
+// This is safe only because `open()` does not expose custom AVIO or interrupt callbacks.
+// If custom callbacks are added in the future, this impl must be re-evaluated.
 // This matches the safety reasoning of AVFormatContextBox's own `unsafe impl Send`.
 unsafe impl Send for PacketScanner {}
 
@@ -205,15 +226,26 @@ impl PacketScanner {
                 Some(pkt.dts)
             };
 
+            // FFmpeg guarantees via av_assert0 in handle_new_packet() (demux.c:571)
+            // that stream_index is in [0, nb_streams). The .max(0) and .unwrap_or()
+            // are purely defensive and not expected to trigger in practice.
+            let stream_index = pkt.stream_index.max(0) as usize;
+            let (is_video, is_audio) = self.streams.get(stream_index)
+                .map(|s| (s.is_video(), s.is_audio()))
+                .unwrap_or((false, false));
+
             Ok(Some(PacketInfo {
-                stream_index: pkt.stream_index.max(0) as usize,
+                stream_index,
                 pts,
                 dts,
                 duration: pkt.duration,
-                size: pkt.size.max(0) as usize,
+                // FFmpeg does not document negative size; clamp to 0 defensively.
+                size: { debug_assert!(pkt.size >= 0, "negative pkt.size: {}", pkt.size); pkt.size.max(0) as usize },
                 pos: pkt.pos,
                 is_keyframe: (pkt.flags & AV_PKT_FLAG_KEY) != 0,
                 is_corrupt: (pkt.flags & AV_PKT_FLAG_CORRUPT) != 0,
+                is_video,
+                is_audio,
             }))
         }
     }

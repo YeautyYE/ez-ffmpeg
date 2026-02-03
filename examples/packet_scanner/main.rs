@@ -271,17 +271,7 @@ fn main() {
     println!("=== Example 10: Stream-Aware Packet Processing ===");
     let mut scanner = PacketScanner::open("test.mp4").unwrap();
 
-    // Pre-build a lookup: which stream index is video / audio?
-    let streams = scanner.streams();
-    let video_indices: Vec<usize> = streams.iter()
-        .filter(|s| s.is_video())
-        .map(|s| s.index() as usize)
-        .collect();
-    let audio_indices: Vec<usize> = streams.iter()
-        .filter(|s| s.is_audio())
-        .map(|s| s.index() as usize)
-        .collect();
-
+    // PacketInfo carries is_video()/is_audio() — no pre-build lookup needed
     let mut video_packets = 0u64;
     let mut audio_packets = 0u64;
     let mut video_bytes = 0u64;
@@ -289,11 +279,10 @@ fn main() {
 
     for packet in scanner.packets() {
         let pkt = packet.unwrap();
-        let idx = pkt.stream_index();
-        if video_indices.contains(&idx) {
+        if pkt.is_video() {
             video_packets += 1;
             video_bytes += pkt.size() as u64;
-        } else if audio_indices.contains(&idx) {
+        } else if pkt.is_audio() {
             audio_packets += 1;
             audio_bytes += pkt.size() as u64;
         }
@@ -309,16 +298,19 @@ fn main() {
     println!("=== Example 11: stream_for_packet Usage ===");
     let mut scanner = PacketScanner::open("test.mp4").unwrap();
 
-    // Read a packet, then look up its stream info
+    // Read a packet, then look up its full stream info
     if let Some(pkt) = scanner.next_packet().unwrap() {
+        println!(
+            "  First packet: stream #{} video={} audio={} pts={:?} size={}",
+            pkt.stream_index(),
+            pkt.is_video(),
+            pkt.is_audio(),
+            pkt.pts(),
+            pkt.size(),
+        );
+        // stream_for_packet() is still useful when you need full stream details
         if let Some(stream) = scanner.stream_for_packet(&pkt) {
-            println!(
-                "  First packet: stream #{} type={} pts={:?} size={}",
-                pkt.stream_index(),
-                stream.stream_type(),
-                pkt.pts(),
-                pkt.size(),
-            );
+            println!("  Stream detail: {:?}", stream);
         }
     }
 }
