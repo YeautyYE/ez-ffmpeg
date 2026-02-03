@@ -130,8 +130,10 @@ pub(crate) struct Muxer {
     pub(crate) mux_stream_nodes: Vec<Arc<SchNode>>,
 }
 
+// SAFETY: Muxer can be sent to another thread. The raw FFmpeg pointers are only
+// accessed from the owning thread. Note: Muxer is NOT Sync because it contains
+// frame_pipelines with Box<dyn FrameFilter> which only implements Send.
 unsafe impl Send for Muxer {}
-unsafe impl Sync for Muxer {}
 
 impl Muxer {
     pub(crate) fn new(

@@ -2,7 +2,9 @@ use crate::filter::frame_pipeline::FramePipeline;
 use ffmpeg_sys_next::{AVRational, AVSampleFormat};
 use std::collections::HashMap;
 
-unsafe impl Send for Output {}
+// Note: Output is Send if all callback fields are Send.
+// We require `+ Send` on callback types to ensure this.
+// Output is !Sync because FnMut callbacks require exclusive access.
 
 pub struct Output {
     /// The URL of the output destination.
@@ -47,7 +49,7 @@ pub struct Output {
     /// It is recommended to set the `format` field to the desired output format (e.g., `mp4`, `flv`, etc.)
     /// when using a custom `write_callback`. The `format` ensures that FFmpeg processes the output
     /// correctly for the specified format.
-    pub(crate) write_callback: Option<Box<dyn FnMut(&[u8]) -> i32>>,
+    pub(crate) write_callback: Option<Box<dyn FnMut(&[u8]) -> i32 + Send>>,
 
     /// A callback function for custom seeking within the output stream.
     ///
@@ -141,7 +143,7 @@ pub struct Output {
     ///     })
     /// };
     /// ```
-    pub(crate) seek_callback: Option<Box<dyn FnMut(i64, i32) -> i64>>,
+    pub(crate) seek_callback: Option<Box<dyn FnMut(i64, i32) -> i64 + Send>>,
 
     /// A pipeline specifying how frames will be processed **before encoding**.
     ///
@@ -378,9 +380,9 @@ impl Output {
     /// ```
     pub fn new_by_write_callback<F>(write_callback: F) -> Self
     where
-        F: FnMut(&[u8]) -> i32 + 'static,
+        F: FnMut(&[u8]) -> i32 + Send + 'static,
     {
-        (Box::new(write_callback) as Box<dyn FnMut(&[u8]) -> i32>).into()
+        (Box::new(write_callback) as Box<dyn FnMut(&[u8]) -> i32 + Send>).into()
     }
 
     /// Sets a custom seek callback for the output stream.
@@ -484,9 +486,9 @@ impl Output {
     /// ```
     pub fn set_seek_callback<F>(mut self, seek_callback: F) -> Self
     where
-        F: FnMut(i64, i32) -> i64 + 'static,
+        F: FnMut(i64, i32) -> i64 + Send + 'static,
     {
-        self.seek_callback = Some(Box::new(seek_callback) as Box<dyn FnMut(i64, i32) -> i64>);
+        self.seek_callback = Some(Box::new(seek_callback) as Box<dyn FnMut(i64, i32) -> i64 + Send>);
         self
     }
 
@@ -1549,8 +1551,8 @@ impl Output {
 
 }
 
-impl From<Box<dyn FnMut(&[u8]) -> i32>> for Output {
-    fn from(write_callback_and_format: Box<dyn FnMut(&[u8]) -> i32>) -> Self {
+impl From<Box<dyn FnMut(&[u8]) -> i32 + Send>> for Output {
+    fn from(write_callback_and_format: Box<dyn FnMut(&[u8]) -> i32 + Send>) -> Self {
         Self {
             url: None,
             write_callback: Some(write_callback_and_format),

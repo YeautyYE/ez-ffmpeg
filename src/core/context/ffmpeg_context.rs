@@ -79,8 +79,12 @@ pub struct FfmpegContext {
     pub(crate) muxs: Vec<Muxer>,
 }
 
+// SAFETY: FfmpegContext can be sent to another thread because all its fields
+// are either Send or wrapped in thread-safe containers. The raw FFmpeg pointers
+// are only accessed from the thread that owns the FfmpegContext.
+// Note: FfmpegContext is NOT Sync because it contains non-Sync fields like
+// Box<dyn FrameFilter> which only implements Send.
 unsafe impl Send for FfmpegContext {}
-unsafe impl Sync for FfmpegContext {}
 
 impl FfmpegContext {
     /// Creates a new [`FfmpegContextBuilder`] which allows you to configure
@@ -2098,14 +2102,14 @@ unsafe fn output_requires_seek(fmt_ctx: *mut AVFormatContext) -> bool {
 }
 
 struct InputOpaque {
-    read: Box<dyn FnMut(&mut [u8]) -> i32>,
-    seek: Option<Box<dyn FnMut(i64, i32) -> i64>>,
+    read: Box<dyn FnMut(&mut [u8]) -> i32 + Send>,
+    seek: Option<Box<dyn FnMut(i64, i32) -> i64 + Send>>,
 }
 
 #[allow(dead_code)]
 struct OutputOpaque {
-    write: Box<dyn FnMut(&[u8]) -> i32>,
-    seek: Option<Box<dyn FnMut(i64, i32) -> i64>>,
+    write: Box<dyn FnMut(&[u8]) -> i32 + Send>,
+    seek: Option<Box<dyn FnMut(i64, i32) -> i64 + Send>>,
 }
 
 unsafe extern "C" fn write_packet_wrapper(
