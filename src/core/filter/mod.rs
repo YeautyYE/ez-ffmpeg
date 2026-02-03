@@ -37,8 +37,8 @@ pub fn get_filters() -> Vec<FilterInfo> {
             }
 
             // Convert the filter's name and description from C strings to Rust strings.
-            let name = std::str::from_utf8_unchecked(CStr::from_ptr((*filter).name).to_bytes());
-            let description = std::str::from_utf8_unchecked(CStr::from_ptr((*filter).description).to_bytes());
+            let name = CStr::from_ptr((*filter).name).to_str().unwrap_or("unknown");
+            let description = CStr::from_ptr((*filter).description).to_str().unwrap_or("");
             // Retrieve the filter's flags.
             let flags = ffmpeg_next::filter::Flags::from_bits_truncate((*filter).flags);
 

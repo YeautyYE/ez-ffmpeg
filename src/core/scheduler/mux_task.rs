@@ -219,7 +219,7 @@ fn _mux_init(
         (*oformat).flags
     };
 
-    let format_name = unsafe {std::str::from_utf8_unchecked(CStr::from_ptr((*(*out_fmt_ctx).oformat).name).to_bytes())};
+    let format_name = unsafe { CStr::from_ptr((*(*out_fmt_ctx).oformat).name).to_str().unwrap_or("unknown") };
 
     let result = std::thread::Builder::new().name(format!("muxer{mux_idx}:{format_name}")).spawn(move || {
         let out_fmt_ctx_box = out_fmt_ctx_box;

@@ -73,7 +73,7 @@ pub(crate) fn demux_init(
     #[cfg(windows)]
     let hwaccel = { demux.hwaccel.take() };
 
-    let format_name = unsafe {std::str::from_utf8_unchecked(CStr::from_ptr((*(*in_fmt_ctx).iformat).name).to_bytes())};
+    let format_name = unsafe { CStr::from_ptr((*(*in_fmt_ctx).iformat).name).to_str().unwrap_or("unknown") };
 
     let result = std::thread::Builder::new()
         .name(format!("demuxer{demux_idx}:{format_name}"))
@@ -761,6 +761,13 @@ struct DemuxStreamParameter {
     dts: i64,
 }
 
+// SAFETY: DemuxStreamParameter contains raw pointers (codecpar, codec_desc) but is safe to
+// Send/Sync because:
+// 1. codecpar points to AVCodecParameters owned by AVStream, which lives for the duration
+//    of the demuxer and is only read (not written) after initialization
+// 2. codec_desc points to static FFmpeg codec descriptor data (read-only)
+// 3. The demuxer thread has exclusive access during demuxing operations
+// 4. Data is passed to other threads via crossbeam channels (by value, not pointer)
 unsafe impl Send for DemuxStreamParameter {}
 unsafe impl Sync for DemuxStreamParameter {}
 impl DemuxStreamParameter {
@@ -826,6 +833,12 @@ struct DemuxerParameter {
 
     dsts: Vec<(Sender<PacketBox>, usize, Option<usize>)>,
 }
+
+// SAFETY: DemuxerParameter is safe to Send/Sync because:
+// 1. All contained raw pointers are within DemuxStreamParameter (see its SAFETY comment)
+// 2. The Sender<PacketBox> channels are inherently Send/Sync (crossbeam-channel)
+// 3. The demuxer thread has exclusive ownership during demuxing operations
+// 4. No mutable aliasing occurs - the parameter is used by a single thread at a time
 unsafe impl Send for DemuxerParameter {}
 unsafe impl Sync for DemuxerParameter {}
 impl DemuxerParameter {
