@@ -71,7 +71,7 @@ pub(crate) fn dec_init(
     }
     
     let decoder_name = unsafe {
-        std::str::from_utf8_unchecked(CStr::from_ptr(codec_name_ptr).to_bytes())
+        CStr::from_ptr(codec_name_ptr).to_str().unwrap_or("unknown")
     };
 
     if receiver.is_none() {
@@ -692,8 +692,15 @@ fn dec_open(
             ));
         }
 
+        // SAFETY: Store Arc<Mutex<DecoderParameter>> as raw pointer in FFmpeg's opaque field.
+        // This follows the C FFI pattern used by FFmpeg (see ffmpeg_dec.c:1568).
+        // Invariants:
+        // 1. Arc::into_raw does not decrement the reference count
+        // 2. The pointer remains valid until drop_opaque_ptr() is called
+        // 3. FFmpeg callbacks (get_format, get_buffer2) must reconstruct the Arc via
+        //    Arc::from_raw, clone it, and store back via Arc::into_raw to maintain refcount
+        // 4. drop_opaque_ptr() calls Arc::from_raw exactly once to drop the Arc
         let dp_ptr = Arc::into_raw(dp_arc.clone());
-        // Set `opaque` to point to the boxed `DecoderParameter`.
         (*dec_ctx).opaque = dp_ptr as *mut libc::c_void;
 
         (*dec_ctx).get_format = Some(get_format_callback);
@@ -982,10 +989,16 @@ unsafe extern "C" fn get_format_callback(
         return AVPixelFormat::AV_PIX_FMT_NONE;
     }
 
-    // Retrieve `DecoderParameter` from `opaque`
+    // SAFETY: Retrieve Arc<Mutex<DecoderParameter>> from FFmpeg's opaque field.
+    // This callback is invoked synchronously by FFmpeg from the decoder thread.
+    // The Arc lifecycle is managed as follows:
+    // 1. Arc::from_raw reconstructs the Arc from the raw pointer (takes ownership)
+    // 2. Arc::clone increments the reference count
+    // 3. Arc::into_raw stores one reference back (does not decrement)
+    // 4. The cloned Arc (dp_arc) is used in this function and dropped at scope end
+    // Net effect: reference count unchanged, pointer remains valid for future callbacks
     let dp_ptr = (*s).opaque as *const Mutex<DecoderParameter>;
     let dp_arc = Arc::from_raw(dp_ptr);
-    // Create a new Arc to extend the lifetime
     let dp_ptr = Arc::into_raw(dp_arc.clone());
     (*s).opaque = dp_ptr as *mut libc::c_void;
 
@@ -1095,6 +1108,14 @@ struct DecoderParameter {
 
 }
 
+// SAFETY: DecoderParameter contains raw pointers (dec_ctx, subtitle_header) but is safe to
+// Send/Sync because:
+// 1. The decoder thread has exclusive ownership of the AVCodecContext during decoding
+// 2. DecoderParameter is wrapped in Arc<Mutex<>> ensuring synchronized access
+// 3. The scheduler architecture guarantees that FFmpeg contexts are only accessed from
+//    their owning thread, with data passed via crossbeam channels
+// 4. Raw pointers are only dereferenced within the decoder thread or FFmpeg callbacks
+//    which are invoked synchronously from the decoder thread
 unsafe impl Send for DecoderParameter {}
 unsafe impl Sync for DecoderParameter {}
 

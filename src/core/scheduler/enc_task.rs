@@ -112,7 +112,7 @@ pub(crate) fn enc_init(
     let stream_box = enc_stream.stream;
     let stream_index = enc_stream.stream_index;
 
-    let encoder_name = unsafe {std::str::from_utf8_unchecked(CStr::from_ptr((*enc_stream.encoder).name).to_bytes())};
+    let encoder_name = unsafe { CStr::from_ptr((*enc_stream.encoder).name).to_str().unwrap_or("unknown") };
 
     let result = std::thread::Builder::new().name(format!("encoder{stream_index}:{mux_idx}:{encoder_name}")).spawn(move || unsafe {
         let enc_ctx_box = enc_ctx_box;
