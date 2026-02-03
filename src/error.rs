@@ -662,6 +662,9 @@ pub enum OpenOutputError {
 
     #[error("Format '{0}' is unsupported")]
     FormatUnsupported(String),
+
+    #[error("Unknown pixel format: '{0}'")]
+    UnknownPixelFormat(String),
 }
 
 impl From<i32> for OpenOutputError {

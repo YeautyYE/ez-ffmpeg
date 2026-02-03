@@ -2120,8 +2120,8 @@ unsafe fn configure_output_video_filter(
     };
     av_bprint_init(&mut bprint, 0, u32::MAX);
 
-    //TODO To support specifying the following parameters
-    choose_pix_fmts(&mut bprint, AV_PIX_FMT_NONE, ofp.opts.formats.clone());
+    // Use user-specified format (via -pix_fmt) if set, otherwise use encoder-supported formats
+    choose_pix_fmts(&mut bprint, ofp.opts.format, ofp.opts.formats.clone());
     choose_color_spaces(
         &mut bprint,
         AVCOL_SPC_UNSPECIFIED,
