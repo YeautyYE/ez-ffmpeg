@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use crate::filter::frame_pipeline::FramePipeline;
 
-unsafe impl Send for Input {}
+// Note: Input is Send if all callback fields are Send.
+// We require `+ Send` on callback types to ensure this.
+// Input is !Sync because FnMut callbacks require exclusive access.
 
 pub struct Input {
     /// The URL of the input source.
@@ -42,7 +44,7 @@ pub struct Input {
     ///     len as i32 // Return the number of bytes written into the buffer
     /// }
     /// ```
-    pub(crate) read_callback: Option<Box<dyn FnMut(&mut [u8]) -> i32>>,
+    pub(crate) read_callback: Option<Box<dyn FnMut(&mut [u8]) -> i32 + Send>>,
 
     /// A callback function for custom seeking within the input stream.
     ///
@@ -144,7 +146,7 @@ pub struct Input {
     ///     })
     /// };
     /// ```
-    pub(crate) seek_callback: Option<Box<dyn FnMut(i64, i32) -> i64>>,
+    pub(crate) seek_callback: Option<Box<dyn FnMut(i64, i32) -> i64 + Send>>,
 
     /// The pipeline that provides custom processing for decoded frames.
     ///
@@ -340,9 +342,9 @@ impl Input {
     /// ```
     pub fn new_by_read_callback<F>(read_callback: F) -> Self
     where
-        F: FnMut(&mut [u8]) -> i32 + 'static,
+        F: FnMut(&mut [u8]) -> i32 + Send + 'static,
     {
-        (Box::new(read_callback) as Box<dyn FnMut(&mut [u8]) -> i32>).into()
+        (Box::new(read_callback) as Box<dyn FnMut(&mut [u8]) -> i32 + Send>).into()
     }
 
     /// Sets a custom seek callback for the input stream.
@@ -475,9 +477,9 @@ impl Input {
     /// ```
     pub fn set_seek_callback<F>(mut self, seek_callback: F) -> Self
     where
-        F: FnMut(i64, i32) -> i64 + 'static,
+        F: FnMut(i64, i32) -> i64 + Send + 'static,
     {
-        self.seek_callback = Some(Box::new(seek_callback) as Box<dyn FnMut(i64, i32) -> i64>);
+        self.seek_callback = Some(Box::new(seek_callback) as Box<dyn FnMut(i64, i32) -> i64 + Send>);
         self
     }
 
@@ -1005,8 +1007,8 @@ impl Input {
     }
 }
 
-impl From<Box<dyn FnMut(&mut [u8]) -> i32>> for Input {
-    fn from(read_callback: Box<dyn FnMut(&mut [u8]) -> i32>) -> Self {
+impl From<Box<dyn FnMut(&mut [u8]) -> i32 + Send>> for Input {
+    fn from(read_callback: Box<dyn FnMut(&mut [u8]) -> i32 + Send>) -> Self {
         Self {
             url: None,
             read_callback: Some(read_callback),

@@ -15,7 +15,7 @@ fn main() {
     ));
 
     // Define the read callback for custom input handling
-    let read_callback: Box<dyn FnMut(&mut [u8]) -> i32> = {
+    let read_callback: Box<dyn FnMut(&mut [u8]) -> i32 + Send> = {
         let input = Arc::clone(&input_file);
         Box::new(move |buf: &mut [u8]| -> i32 {
             let mut input = input.lock().unwrap();
@@ -28,7 +28,7 @@ fn main() {
     };
 
     // Define the seek callback for custom input handling
-    let seek_callback: Box<dyn FnMut(i64, i32) -> i64> = {
+    let seek_callback: Box<dyn FnMut(i64, i32) -> i64 + Send> = {
         let input = Arc::clone(&input_file);
         Box::new(move |offset: i64, whence: i32| -> i64 {
             let mut input = input.lock().unwrap();
@@ -71,7 +71,7 @@ fn main() {
     ));
 
     // Define the write callback for custom output handling
-    let write_callback: Box<dyn FnMut(&[u8]) -> i32> = {
+    let write_callback: Box<dyn FnMut(&[u8]) -> i32 + Send> = {
         let output_file = Arc::clone(&output_file);
         Box::new(move |buf: &[u8]| -> i32 {
             let mut output_file = output_file.lock().unwrap();
@@ -84,7 +84,7 @@ fn main() {
 
     // Define the seek callback for the output file
     #[allow(unreachable_patterns)]
-    let seek_callback: Box<dyn FnMut(i64, i32) -> i64> = {
+    let seek_callback: Box<dyn FnMut(i64, i32) -> i64 + Send> = {
         let output_file = Arc::clone(&output_file);
         Box::new(move |offset: i64, whence: i32| -> i64 {
             let mut file = output_file.lock().unwrap();

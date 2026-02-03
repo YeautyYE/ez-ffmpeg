@@ -11,6 +11,8 @@ use ffmpeg_sys_next::{
 use std::ffi::c_void;
 use std::ptr::null_mut;
 
+use ffmpeg_context::{InputOpaque, OutputOpaque};
+
 
 /// The **ffmpeg_context** module is responsible for assembling FFmpeg’s configuration:
 /// inputs, outputs, codecs, filters, and other parameters needed to construct a
@@ -178,7 +180,13 @@ pub(crate) struct CodecContext {
     inner: *mut AVCodecContext,
 }
 
+// SAFETY: CodecContext can be sent to another thread. The raw AVCodecContext pointer
+// is only accessed from the thread that owns the CodecContext, and the crate ensures
+// single-threaded access to codec operations.
 unsafe impl Send for CodecContext {}
+// SAFETY: CodecContext can be shared across threads because the crate's architecture
+// ensures that codec operations are synchronized at the scheduler level. Direct
+// concurrent access to AVCodecContext is prevented by the ownership model.
 unsafe impl Sync for CodecContext {}
 
 impl CodecContext {
@@ -225,7 +233,13 @@ pub(crate) struct Stream {
     pub(crate) inner: *mut AVStream,
 }
 
+// SAFETY: Stream can be sent to another thread. The raw AVStream pointer is owned
+// by the parent AVFormatContext, and the crate ensures the format context outlives
+// all Stream references.
 unsafe impl Send for Stream {}
+// SAFETY: Stream is Copy and contains only a raw pointer. Concurrent read access to
+// AVStream metadata is safe. The crate architecture ensures no concurrent mutations
+// to the underlying AVStream occur during stream processing.
 unsafe impl Sync for Stream {}
 
 pub(crate) struct FrameBox {
@@ -234,7 +248,11 @@ pub(crate) struct FrameBox {
     pub(crate) frame_data: FrameData,
 }
 
+// SAFETY: FrameBox can be sent to another thread. It contains an ffmpeg_next::Frame
+// (which wraps AVFrame) and FrameData, both of which are only accessed from the owning thread.
 unsafe impl Send for FrameBox {}
+// SAFETY: FrameBox is Sync because the scheduler ensures frames are processed sequentially
+// within their pipeline. No concurrent access occurs to the underlying AVFrame data.
 unsafe impl Sync for FrameBox {}
 
 pub fn frame_alloc() -> crate::error::Result<ffmpeg_next::Frame> {
@@ -263,7 +281,11 @@ pub(crate) struct FrameData {
     pub(crate) fg_input_index: usize,
 }
 
+// SAFETY: FrameData can be sent to another thread. The subtitle_header pointer is owned
+// by the FrameData and only accessed from the processing thread.
 unsafe impl Send for FrameData {}
+// SAFETY: FrameData is Sync because concurrent access is prevented by the scheduler's
+// sequential frame processing within each pipeline.
 unsafe impl Sync for FrameData {}
 
 pub(crate) struct PacketBox {
@@ -271,7 +293,11 @@ pub(crate) struct PacketBox {
     pub(crate) packet_data: PacketData,
 }
 
+// SAFETY: PacketBox can be sent to another thread. It contains an ffmpeg_next::Packet
+// and PacketData, both only accessed from the owning thread.
 unsafe impl Send for PacketBox {}
+// SAFETY: PacketBox is Sync because the scheduler ensures packets are processed sequentially.
+// No concurrent access occurs to the underlying AVPacket data.
 unsafe impl Sync for PacketBox {}
 
 // optionally attached as opaque_ref to decoded AVFrames
@@ -286,7 +312,11 @@ pub(crate) struct PacketData {
     pub(crate) codecpar: *mut AVCodecParameters,
 }
 
+// SAFETY: PacketData can be sent to another thread. The codecpar pointer references
+// data owned by the parent stream/context and is only read, not mutated.
 unsafe impl Send for PacketData {}
+// SAFETY: PacketData is Sync because the codecpar pointer is only used for reading
+// codec parameters, and concurrent reads are safe.
 unsafe impl Sync for PacketData {}
 
 pub(crate) struct AVFormatContextBox {
@@ -294,7 +324,11 @@ pub(crate) struct AVFormatContextBox {
     pub(crate) is_input: bool,
     pub(crate) is_set_callback: bool,
 }
+// SAFETY: AVFormatContextBox can be sent to another thread. The fmt_ctx pointer is only
+// accessed from the thread that owns the box, and the crate ensures proper cleanup.
 unsafe impl Send for AVFormatContextBox {}
+// SAFETY: AVFormatContextBox is Sync because the crate architecture ensures the format
+// context is only accessed from its owning demuxer/muxer thread during processing.
 unsafe impl Sync for AVFormatContextBox {}
 
 impl AVFormatContextBox {
@@ -348,7 +382,7 @@ unsafe fn free_output_opaque(mut avio_ctx: *mut AVIOContext) {
     if !(*avio_ctx).buffer.is_null() {
         av_freep(&mut (*avio_ctx).buffer as *mut _ as *mut c_void);
     }
-    let opaque_ptr = (*avio_ctx).opaque as *mut Box<dyn FnMut(&[u8]) -> i32>;
+    let opaque_ptr = (*avio_ctx).opaque as *mut OutputOpaque;
     if !opaque_ptr.is_null() {
         let _ = Box::from_raw(opaque_ptr);
     }
@@ -371,7 +405,7 @@ pub(crate) fn in_fmt_ctx_free(mut in_fmt_ctx: *mut AVFormatContext, is_set_read_
 
 unsafe fn free_input_opaque(mut avio_ctx: *mut AVIOContext) {
     if !avio_ctx.is_null() {
-        let opaque_ptr = (*avio_ctx).opaque as *mut Box<dyn FnMut(&mut [u8]) -> i32>;
+        let opaque_ptr = (*avio_ctx).opaque as *mut InputOpaque;
         if !opaque_ptr.is_null() {
             let _ = Box::from_raw(opaque_ptr);
         }

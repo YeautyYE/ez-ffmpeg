@@ -828,7 +828,7 @@ mod tests {
         let input_file = Arc::new(Mutex::new(
             File::open(input_file).expect("Failed to open input file"),
         ));
-        let read_callback: Box<dyn FnMut(&mut [u8]) -> i32> = {
+        let read_callback: Box<dyn FnMut(&mut [u8]) -> i32 + Send> = {
             let input = Arc::clone(&input_file);
             Box::new(move |buf: &mut [u8]| -> i32 {
                 let mut input = input.lock().unwrap();
@@ -840,7 +840,7 @@ mod tests {
             })
         };
 
-        let seek_callback: Box<dyn FnMut(i64, i32) -> i64> = {
+        let seek_callback: Box<dyn FnMut(i64, i32) -> i64 + Send> = {
             let input = Arc::clone(&input_file);
             Box::new(move |offset: i64, whence: i32| -> i64 {
                 let mut input = input.lock().unwrap();
@@ -874,7 +874,7 @@ mod tests {
         let output_file = Arc::new(Mutex::new(
             File::create(output_file).expect("Failed to create output file"),
         ));
-        let write_callback: Box<dyn FnMut(&[u8]) -> i32> = {
+        let write_callback: Box<dyn FnMut(&[u8]) -> i32 + Send> = {
             let output_file = Arc::clone(&output_file);
             Box::new(move |buf: &[u8]| -> i32 {
                 let mut output_file = output_file.lock().unwrap();
@@ -885,7 +885,7 @@ mod tests {
             })
         };
 
-        let seek_callback: Box<dyn FnMut(i64, i32) -> i64> = {
+        let seek_callback: Box<dyn FnMut(i64, i32) -> i64 + Send> = {
             let output_file = Arc::clone(&output_file);
             Box::new(move |offset: i64, whence: i32| -> i64 {
                 let mut file = output_file.lock().unwrap();

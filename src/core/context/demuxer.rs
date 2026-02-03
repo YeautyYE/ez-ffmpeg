@@ -66,8 +66,10 @@ pub(crate) struct Demuxer {
     dsts: Vec<(Sender<PacketBox>, usize, Option<usize>)>,
 }
 
+// SAFETY: Demuxer can be sent to another thread. The raw FFmpeg pointers are only
+// accessed from the owning thread. Note: Demuxer is NOT Sync because it contains
+// frame_pipelines with Box<dyn FrameFilter> which only implements Send.
 unsafe impl Send for Demuxer {}
-unsafe impl Sync for Demuxer {}
 
 impl Demuxer {
     pub(crate) fn new(

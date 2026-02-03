@@ -19,7 +19,7 @@ pub fn create_null_output() -> Output {
     });
 
     // Write callback: discards data and updates position atomically
-    let write_callback: Box<dyn FnMut(&[u8]) -> i32> = {
+    let write_callback: Box<dyn FnMut(&[u8]) -> i32 + Send> = {
         let state = std::sync::Arc::clone(&null_state);
         Box::new(move |buf: &[u8]| -> i32 {
             let len = buf.len() as u64;
@@ -30,7 +30,7 @@ pub fn create_null_output() -> Output {
     };
 
     // Seek callback: handles positioning and size queries atomically
-    let seek_callback: Box<dyn FnMut(i64, i32) -> i64> = {
+    let seek_callback: Box<dyn FnMut(i64, i32) -> i64 + Send> = {
         let state = std::sync::Arc::clone(&null_state);
         Box::new(move |offset: i64, whence: i32| -> i64 {
             match whence {

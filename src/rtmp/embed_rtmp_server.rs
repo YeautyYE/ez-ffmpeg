@@ -299,7 +299,7 @@ impl EmbedRtmpServer<Running> {
 
         let mut flv_buffer = FlvBuffer::new();
         let mut serializer = ChunkSerializer::new();
-        let write_callback: Box<dyn FnMut(&[u8]) -> i32> = Box::new(move |buf: &[u8]| -> i32 {
+        let write_callback: Box<dyn FnMut(&[u8]) -> i32 + Send> = Box::new(move |buf: &[u8]| -> i32 {
             flv_buffer.write_data(buf);
             if let Some(mut flv_tag) = flv_buffer.get_flv_tag() {
                 flv_tag.header.stream_id = 1;
