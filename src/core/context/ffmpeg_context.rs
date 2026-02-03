@@ -45,7 +45,7 @@ use ffmpeg_sys_next::AVPixelFormat::AV_PIX_FMT_NONE;
 use ffmpeg_sys_next::AVSampleFormat::AV_SAMPLE_FMT_NONE;
 use ffmpeg_sys_next::{
     av_add_q, av_channel_layout_default, av_codec_get_id, av_codec_get_tag2, av_dict_free,
-    av_freep, av_get_exact_bits_per_sample, av_guess_codec, av_guess_format, av_guess_frame_rate,
+    av_freep, av_get_exact_bits_per_sample, av_get_pix_fmt, av_guess_codec, av_guess_format, av_guess_frame_rate,
     av_inv_q, av_malloc, av_rescale_q, av_seek_frame, avcodec_alloc_context3,
     avcodec_descriptor_get, avcodec_descriptor_get_by_name, avcodec_find_encoder,
     avcodec_find_encoder_by_name, avcodec_get_name, avcodec_parameters_from_context,
@@ -672,7 +672,22 @@ fn outputs_bind(
 
     for (i, mux) in muxs.iter_mut().enumerate() {
         if mux.stream_maps.is_empty() {
-            let mut auto_disable = 0;
+            // Initialize auto_disable with muxer's stream disable flags
+            // FFmpeg reference: fftools/ffmpeg_mux_init.c:1891-1895
+            // auto_disable bitmask: 1 << AVMEDIA_TYPE_* disables that stream type
+            let mut auto_disable = 0i32;
+            if mux.video_disable {
+                auto_disable |= 1 << (AVMEDIA_TYPE_VIDEO as i32);
+            }
+            if mux.audio_disable {
+                auto_disable |= 1 << (AVMEDIA_TYPE_AUDIO as i32);
+            }
+            if mux.subtitle_disable {
+                auto_disable |= 1 << (AVMEDIA_TYPE_SUBTITLE as i32);
+            }
+            if mux.data_disable {
+                auto_disable |= 1 << (AVMEDIA_TYPE_DATA as i32);
+            }
             output_bind_by_unlabeled_filter(i, mux, filter_graphs, &mut auto_disable)?;
             /* pick the first stream of each type */
             map_auto_streams(i, mux, demuxs, filter_graphs, auto_disable)?;
@@ -759,6 +774,29 @@ fn map_manual(
         let input_stream = demux.get_stream_mut(stream_index);
         (input_stream.codec_type, input_stream.duration, input_stream.time_base)
     };
+
+    // FFmpeg reference: fftools/ffmpeg_mux_init.c:1761-1768
+    // Check stream disable flags for manual mapping
+    // If a stream type is disabled, skip mapping even if explicitly requested
+    match media_type {
+        AVMEDIA_TYPE_VIDEO if mux.video_disable => {
+            info!("Skipping video stream mapping (video_disable=true)");
+            return Ok(());
+        }
+        AVMEDIA_TYPE_AUDIO if mux.audio_disable => {
+            info!("Skipping audio stream mapping (audio_disable=true)");
+            return Ok(());
+        }
+        AVMEDIA_TYPE_SUBTITLE if mux.subtitle_disable => {
+            info!("Skipping subtitle stream mapping (subtitle_disable=true)");
+            return Ok(());
+        }
+        AVMEDIA_TYPE_DATA if mux.data_disable => {
+            info!("Skipping data stream mapping (data_disable=true)");
+            return Ok(());
+        }
+        _ => {}
+    }
 
     info!(
         "Binding output stream to input {}:{} ({})",
@@ -1000,6 +1038,12 @@ fn configure_output_filter_opts(
 
             if let Some(framerate) = mux.framerate {
                 output_filter.opts.framerate = framerate;
+            }
+
+            // Set user-requested pixel format (equivalent to -pix_fmt in FFmpeg)
+            // FFmpeg reference: fftools/ffmpeg_filter.c - ofilter_bind_ost sets format from OptionsContext
+            if let Some(pix_fmt) = mux.pix_fmt {
+                output_filter.opts.format = pix_fmt;
             }
 
             // color_spaces
@@ -1684,6 +1728,13 @@ fn output_bind_by_unlabeled_filter(
         let filter_graph = &mut filter_graphs[i];
 
         for i in 0..filter_graph.outputs.len() {
+            let media_type = filter_graph.outputs[i].media_type;
+
+            // Check if this stream type is disabled
+            if *auto_disable & (1 << media_type as i32) != 0 {
+                continue;
+            }
+
             let option = {
                 let output_filter = &filter_graph.outputs[i];
                 if (!output_filter.linklabel.is_empty() && output_filter.linklabel != "out")
@@ -1694,8 +1745,6 @@ fn output_bind_by_unlabeled_filter(
 
                 choose_encoder(mux, output_filter.media_type)?
             };
-
-            let media_type = filter_graph.outputs[i].media_type;
 
             match option {
                 None => {
@@ -1895,7 +1944,7 @@ unsafe fn open_output_file(index: usize, output: &mut Output, copy_ts: bool) -> 
                 None,
                 Some(write_packet_wrapper),
                 if have_seek_callback {
-                    Some(seek_packet_wrapper)
+                    Some(seek_output_packet_wrapper)
                 } else {
                     None
                 },
@@ -1971,6 +2020,23 @@ unsafe fn open_output_file(index: usize, output: &mut Output, copy_ts: bool) -> 
     let subtitle_codec_opts = convert_options(output.subtitle_codec_opts.clone())?;
     let format_opts = convert_options(output.format_opts.clone())?;
 
+    // Parse pix_fmt string to AVPixelFormat
+    // FFmpeg CLI also fails on invalid format names (e.g., `ffmpeg -pix_fmt foobar` errors with
+    // "Unknown pixel format requested: foobar"). Valid but encoder-incompatible formats are
+    // auto-converted by the filter graph, matching FFmpeg behavior.
+    let pix_fmt = match &output.pix_fmt {
+        Some(fmt_str) => {
+            let cstr = CString::new(fmt_str.as_str())?;
+            let pf = av_get_pix_fmt(cstr.as_ptr());
+            if pf == AV_PIX_FMT_NONE {
+                return Err(OpenOutputError::UnknownPixelFormat(fmt_str.clone()).into());
+            } else {
+                Some(pf)
+            }
+        }
+        None => None,
+    };
+
     let mux = Muxer::new(
         url,
         output.url.is_none(),
@@ -2005,6 +2071,11 @@ unsafe fn open_output_file(index: usize, output: &mut Output, copy_ts: bool) -> 
         output.program_metadata.clone(),
         output.metadata_map.clone(),
         output.auto_copy_metadata,
+        output.video_disable,
+        output.audio_disable,
+        output.subtitle_disable,
+        output.data_disable,
+        pix_fmt,
     );
 
     Ok(mux)
@@ -2101,15 +2172,14 @@ unsafe fn output_requires_seek(fmt_ctx: *mut AVFormatContext) -> bool {
     false
 }
 
-struct InputOpaque {
-    read: Box<dyn FnMut(&mut [u8]) -> i32 + Send>,
-    seek: Option<Box<dyn FnMut(i64, i32) -> i64 + Send>>,
+pub(super) struct InputOpaque {
+    pub(super) read: Box<dyn FnMut(&mut [u8]) -> i32 + Send>,
+    pub(super) seek: Option<Box<dyn FnMut(i64, i32) -> i64 + Send>>,
 }
 
-#[allow(dead_code)]
-struct OutputOpaque {
-    write: Box<dyn FnMut(&[u8]) -> i32 + Send>,
-    seek: Option<Box<dyn FnMut(i64, i32) -> i64 + Send>>,
+pub(super) struct OutputOpaque {
+    pub(super) write: Box<dyn FnMut(&[u8]) -> i32 + Send>,
+    pub(super) seek: Option<Box<dyn FnMut(i64, i32) -> i64 + Send>>,
 }
 
 unsafe extern "C" fn write_packet_wrapper(
@@ -2120,11 +2190,11 @@ unsafe extern "C" fn write_packet_wrapper(
     if buf.is_null() {
         return ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO);
     }
-    let closure = &mut *(opaque as *mut Box<dyn FnMut(&[u8]) -> i32>);
+    let context = &mut *(opaque as *mut OutputOpaque);
 
     let slice = std::slice::from_raw_parts(buf, buf_size as usize);
 
-    (*closure)(slice)
+    (context.write)(slice)
 }
 
 unsafe extern "C" fn read_packet_wrapper(
@@ -2143,12 +2213,26 @@ unsafe extern "C" fn read_packet_wrapper(
     (context.read)(slice)
 }
 
-unsafe extern "C" fn seek_packet_wrapper(
+unsafe extern "C" fn seek_input_packet_wrapper(
     opaque: *mut libc::c_void,
     offset: i64,
     whence: libc::c_int,
 ) -> i64 {
     let context = &mut *(opaque as *mut InputOpaque);
+
+    if let Some(seek_func) = &mut context.seek {
+        (*seek_func)(offset, whence)
+    } else {
+        ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::ESPIPE) as i64
+    }
+}
+
+unsafe extern "C" fn seek_output_packet_wrapper(
+    opaque: *mut libc::c_void,
+    offset: i64,
+    whence: libc::c_int,
+) -> i64 {
+    let context = &mut *(opaque as *mut OutputOpaque);
 
     if let Some(seek_func) = &mut context.seek {
         (*seek_func)(offset, whence)
@@ -2832,7 +2916,7 @@ unsafe fn open_input_file(index: usize, input: &mut Input, copy_ts: bool) -> Res
                 Some(read_packet_wrapper),
                 None,
                 if have_seek_callback {
-                    Some(seek_packet_wrapper)
+                    Some(seek_input_packet_wrapper)
                 } else {
                     None
                 },

@@ -334,6 +334,29 @@ pub struct Output {
     /// Whether to automatically copy metadata from input files (default: true)
     /// Replicates FFmpeg's default behavior of copying global and stream metadata
     pub(crate) auto_copy_metadata: bool,
+
+    // ========== Stream Disable Flags (P1 Features) ==========
+    /// Disable video stream mapping (equivalent to `-vn` in FFmpeg).
+    /// When true, video streams will be excluded from automatic stream mapping.
+    pub(crate) video_disable: bool,
+
+    /// Disable audio stream mapping (equivalent to `-an` in FFmpeg).
+    /// When true, audio streams will be excluded from automatic stream mapping.
+    pub(crate) audio_disable: bool,
+
+    /// Disable subtitle stream mapping (equivalent to `-sn` in FFmpeg).
+    /// When true, subtitle streams will be excluded from automatic stream mapping.
+    pub(crate) subtitle_disable: bool,
+
+    /// Disable data stream mapping (equivalent to `-dn` in FFmpeg).
+    /// When true, data streams will be excluded from automatic stream mapping.
+    /// Data streams include things like timed metadata, chapter markers, etc.
+    pub(crate) data_disable: bool,
+
+    /// Output pixel format (equivalent to `-pix_fmt` in FFmpeg).
+    /// When set, forces the output video to use the specified pixel format.
+    /// Only effective when re-encoding (not when using stream copy).
+    pub(crate) pix_fmt: Option<String>,
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -1548,7 +1571,169 @@ impl Output {
         Ok(self)
     }
 
+    // ========== Stream Disable & Format API Methods (P1 Features) ==========
+    // These methods replicate FFmpeg's `-vn`, `-an`, `-sn`, `-b:v`, `-b:a`, and `-pix_fmt` options.
 
+    /// Disables video stream mapping (equivalent to `-vn` in FFmpeg).
+    ///
+    /// Video streams will be excluded from automatic stream mapping.
+    /// This is useful when you want to extract only audio from a video file.
+    ///
+    /// **Equivalent FFmpeg Command:**
+    /// ```sh
+    /// ffmpeg -i input.mp4 -vn output.mp3
+    /// ```
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// // Extract audio only, no video
+    /// let output = Output::from("output.mp3")
+    ///     .disable_video();
+    /// ```
+    pub fn disable_video(mut self) -> Self {
+        self.video_disable = true;
+        self
+    }
+
+    /// Disables audio stream mapping (equivalent to `-an` in FFmpeg).
+    ///
+    /// Audio streams will be excluded from automatic stream mapping.
+    /// This is useful when you want to create a silent video.
+    ///
+    /// **Equivalent FFmpeg Command:**
+    /// ```sh
+    /// ffmpeg -i input.mp4 -an output.mp4
+    /// ```
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// // Create video without audio
+    /// let output = Output::from("output.mp4")
+    ///     .disable_audio();
+    /// ```
+    pub fn disable_audio(mut self) -> Self {
+        self.audio_disable = true;
+        self
+    }
+
+    /// Disables subtitle stream mapping (equivalent to `-sn` in FFmpeg).
+    ///
+    /// Subtitle streams will be excluded from automatic stream mapping.
+    ///
+    /// **Equivalent FFmpeg Command:**
+    /// ```sh
+    /// ffmpeg -i input.mkv -sn output.mkv
+    /// ```
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// // Copy video and audio, but exclude subtitles
+    /// let output = Output::from("output.mkv")
+    ///     .disable_subtitle();
+    /// ```
+    pub fn disable_subtitle(mut self) -> Self {
+        self.subtitle_disable = true;
+        self
+    }
+
+    /// Disables data stream mapping (equivalent to `-dn` in FFmpeg).
+    ///
+    /// Data streams (timed metadata, chapter markers, etc.) will be
+    /// excluded from automatic stream mapping.
+    ///
+    /// **Equivalent FFmpeg Command:**
+    /// ```sh
+    /// ffmpeg -i input.mkv -dn output.mp4
+    /// ```
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// // Copy video and audio, but exclude data streams
+    /// let output = Output::from("output.mp4")
+    ///     .disable_data();
+    /// ```
+    pub fn disable_data(mut self) -> Self {
+        self.data_disable = true;
+        self
+    }
+
+    /// Sets the video bitrate (equivalent to `-b:v` in FFmpeg).
+    ///
+    /// The bitrate string follows FFmpeg conventions:
+    /// - `"1M"` or `"1000k"` for 1 Mbps
+    /// - `"500k"` for 500 Kbps
+    /// - `"2M"` for 2 Mbps
+    ///
+    /// **Equivalent FFmpeg Command:**
+    /// ```sh
+    /// ffmpeg -i input.mp4 -b:v 2M output.mp4
+    /// ```
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// let output = Output::from("output.mp4")
+    ///     .set_video_bitrate("2M");
+    /// ```
+    pub fn set_video_bitrate(self, bitrate: impl Into<String>) -> Self {
+        self.set_video_codec_opt("b", bitrate)
+    }
+
+    /// Sets the audio bitrate (equivalent to `-b:a` in FFmpeg).
+    ///
+    /// The bitrate string follows FFmpeg conventions:
+    /// - `"128k"` for 128 Kbps
+    /// - `"192k"` for 192 Kbps
+    /// - `"320k"` for 320 Kbps
+    ///
+    /// **Equivalent FFmpeg Command:**
+    /// ```sh
+    /// ffmpeg -i input.mp4 -b:a 192k output.mp4
+    /// ```
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// let output = Output::from("output.mp4")
+    ///     .set_audio_bitrate("192k");
+    /// ```
+    pub fn set_audio_bitrate(self, bitrate: impl Into<String>) -> Self {
+        self.set_audio_codec_opt("b", bitrate)
+    }
+
+    /// Sets the output pixel format (equivalent to `-pix_fmt` in FFmpeg).
+    ///
+    /// Common pixel formats include:
+    /// - `"yuv420p"` - Most compatible format for H.264
+    /// - `"yuv444p"` - Higher quality, less compatible
+    /// - `"rgb24"` - RGB format
+    /// - `"nv12"` - Common for hardware encoding
+    ///
+    /// To see all available formats, run: `ffmpeg -pix_fmts`
+    ///
+    /// # Behavior
+    ///
+    /// - **Unknown format name**: Returns [`OpenOutputError::UnknownPixelFormat`] error.
+    ///   This matches FFmpeg CLI behavior (e.g., `ffmpeg -pix_fmt foobar` also fails).
+    /// - **Format incompatible with encoder**: The filter graph automatically converts
+    ///   to a compatible format. For example, specifying `rgb48be` with libx264 will
+    ///   auto-convert to `yuv420p`.
+    /// - **Stream copy mode**: This setting has no effect when using `-c:v copy`.
+    ///
+    /// **Equivalent FFmpeg Command:**
+    /// ```sh
+    /// ffmpeg -i input.mp4 -pix_fmt yuv420p output.mp4
+    /// ```
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// let output = Output::from("output.mp4")
+    ///     .set_pix_fmt("yuv420p");
+    /// ```
+    ///
+    /// [`OpenOutputError::UnknownPixelFormat`]: crate::error::OpenOutputError::UnknownPixelFormat
+    pub fn set_pix_fmt(mut self, pix_fmt: impl Into<String>) -> Self {
+        self.pix_fmt = Some(pix_fmt.into());
+        self
+    }
 }
 
 impl From<Box<dyn FnMut(&[u8]) -> i32 + Send>> for Output {
@@ -1589,6 +1774,12 @@ impl From<Box<dyn FnMut(&[u8]) -> i32 + Send>> for Output {
             program_metadata: HashMap::new(),
             metadata_map: Vec::new(),
             auto_copy_metadata: true, // FFmpeg default: auto-copy enabled
+            // Stream disable flags - initialized to false (all streams enabled)
+            video_disable: false,
+            audio_disable: false,
+            subtitle_disable: false,
+            data_disable: false,
+            pix_fmt: None,
         }
     }
 }
@@ -1631,6 +1822,12 @@ impl From<String> for Output {
             program_metadata: HashMap::new(),
             metadata_map: Vec::new(),
             auto_copy_metadata: true, // FFmpeg default: auto-copy enabled
+            // Stream disable flags - initialized to false (all streams enabled)
+            video_disable: false,
+            audio_disable: false,
+            subtitle_disable: false,
+            data_disable: false,
+            pix_fmt: None,
         }
     }
 }

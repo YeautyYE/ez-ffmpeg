@@ -119,6 +119,16 @@ pub(crate) struct Muxer {
     pub(crate) auto_copy_metadata: bool,
     pub(crate) stream_sources: StreamSourceRegistry,
 
+    // Stream disable flags (P1 Features)
+    pub(crate) video_disable: bool,
+    pub(crate) audio_disable: bool,
+    pub(crate) subtitle_disable: bool,
+    pub(crate) data_disable: bool,
+
+    // Output pixel format (P1 Features)
+    // Parsed from string in open_output_file, stored as AVPixelFormat
+    pub(crate) pix_fmt: Option<ffmpeg_sys_next::AVPixelFormat>,
+
     streams: Vec<EncoderStream>,
     queue: Option<(Sender<PacketBox>, Receiver<PacketBox>)>,
     src_pre_receivers: Vec<Receiver<PacketBox>>,
@@ -170,6 +180,11 @@ impl Muxer {
         program_metadata: HashMap<usize, HashMap<String, String>>,
         metadata_map: Vec<crate::core::metadata::MetadataMapping>,
         auto_copy_metadata: bool,
+        video_disable: bool,
+        audio_disable: bool,
+        subtitle_disable: bool,
+        data_disable: bool,
+        pix_fmt: Option<ffmpeg_sys_next::AVPixelFormat>,
     ) -> Self {
         Self {
             url,
@@ -214,6 +229,11 @@ impl Muxer {
             metadata_map,
             auto_copy_metadata,
             stream_sources: StreamSourceRegistry::default(),
+            video_disable,
+            audio_disable,
+            subtitle_disable,
+            data_disable,
+            pix_fmt,
         }
     }
 
