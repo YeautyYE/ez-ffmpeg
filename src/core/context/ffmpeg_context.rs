@@ -739,10 +739,14 @@ fn map_manual(
 
                 match option {
                     None => {
-                        warn!(
-                            "An unexpected media_type {:?} appears in output_filter",
+                        // FFmpeg reference: ffmpeg_mux_init.c:1237-1242
+                        // Filtering and streamcopy cannot be used together
+                        error!(
+                            "Filtering and streamcopy cannot be used together. \
+                             No encoder available for filter output type {:?}.",
                             filter_graph.outputs[i].media_type
                         );
+                        return Err(OpenOutputError::InvalidArgument.into());
                     }
                     Some((codec_id, enc)) => {
                         return ofilter_bind_ost(index, mux, filter_graph, i, codec_id, enc, None)
@@ -1399,23 +1403,34 @@ unsafe fn map_auto_data(
         let stream_index = option.unwrap();
         let option = choose_encoder(mux, AVMEDIA_TYPE_DATA)?;
 
-        if let Some((_codec_id, enc)) = option {
-            let (frame_sender, output_stream_index) =
-                mux.add_enc_stream(AVMEDIA_TYPE_DATA, enc, demux.node.clone())?;
-            demux.get_stream_mut(stream_index).add_dst(frame_sender);
-            demux.connect_stream(stream_index);
-            mux.register_stream_source(output_stream_index, demux_idx, stream_index, true);
-            let input_stream = demux.get_stream(stream_index);
-            unsafe {
-                rescale_duration(
-                    input_stream.duration,
-                    input_stream.time_base,
-                    *(*mux.out_fmt_ctx).streams.add(output_stream_index),
-                );
-            }
+        if option.is_some() {
+            // FFmpeg reference: ffmpeg_mux_init.c:79-89
+            // choose_encoder always returns enc=NULL for AVMEDIA_TYPE_DATA
+            unreachable!("DATA streams do not have encoders in FFmpeg");
         } else {
-            error!("Error selecting an encoder(data)");
-            return Err(OpenOutputError::from(AVERROR_ENCODER_NOT_FOUND).into());
+            // FFmpeg behavior: DATA streams use stream copy when no encoder is available
+            // Reference: fftools/ffmpeg_mux_init.c:79-89 - choose_encoder returns enc=NULL for DATA
+            // Reference: fftools/ffmpeg_mux_init.c:1236-1246 - ost_add uses stream copy when enc=NULL
+            let input_stream = demux.get_stream(stream_index);
+            let input_stream_duration = input_stream.duration;
+            let input_stream_time_base = input_stream.time_base;
+
+            let (packet_sender, _st, output_stream_index) = mux.new_stream(demux.node.clone())?;
+            demux.add_packet_dst(packet_sender, stream_index, output_stream_index);
+            mux.register_stream_source(output_stream_index, demux_idx, stream_index, false);
+
+            streamcopy_init(
+                mux,
+                *(*demux.in_fmt_ctx).streams.add(stream_index),
+                *(*mux.out_fmt_ctx).streams.add(output_stream_index),
+                demux.framerate,
+            )?;
+            rescale_duration(
+                input_stream_duration,
+                input_stream_time_base,
+                *(*mux.out_fmt_ctx).streams.add(output_stream_index),
+            );
+            mux.stream_ready()
         }
 
         break;
