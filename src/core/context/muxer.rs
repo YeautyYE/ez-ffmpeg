@@ -446,5 +446,4 @@ unsafe fn determine_vsync_method(
     }
 
     vsync_method
-    // TODO 5. If VSYNC_CFR and copy_ts is true, change to VSYNC_VSCFR
 }
