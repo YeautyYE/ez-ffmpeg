@@ -154,36 +154,50 @@ pub(crate) fn enc_init(
                 &packet_pool,
             );
             frame_pool.release(receive_frame_box.frame);
-            if let Err(e) = result {
-                if is_stopping(scheduler_status.load(Ordering::Acquire))
-                    && matches!(e, Encoding(EncodingOperationError::MuxerFinished))
-                {
-                    // stop()/abort(): the muxer legitimately exited first; a
-                    // user-requested shutdown must not be recorded as a failure.
-                    debug!("Encoder stopping: muxer already finished");
-                } else {
-                    error!("Error encoding a frame: {}", e);
-                    set_scheduler_error(&scheduler_status, &scheduler_result, e);
+            let status = match result {
+                Err(e) => {
+                    if is_stopping(scheduler_status.load(Ordering::Acquire))
+                        && matches!(e, Encoding(EncodingOperationError::MuxerFinished))
+                    {
+                        // stop()/abort(): the muxer legitimately exited first; a
+                        // user-requested shutdown must not be recorded as a failure.
+                        debug!("Encoder stopping: muxer already finished");
+                    } else {
+                        error!("Error encoding a frame: {}", e);
+                        set_scheduler_error(&scheduler_status, &scheduler_result, e);
+                    }
+                    break;
                 }
-                break;
+                Ok(status) => status,
+            };
+
+            match status {
+                EncodeStatus::Eof => {
+                    trace!("Encoder returned EOF, finishing");
+                    finished = true;
+                    break;
+                }
+                EncodeStatus::LimitReached => {
+                    // recording_time hit: stop feeding the encoder, but frames
+                    // already sent may still sit in its reorder buffer — leave
+                    // `finished` false so the flush below drains them.
+                    debug!("sq: {stream_index} recording_time reached");
+                    break;
+                }
+                EncodeStatus::Continue => {}
             }
 
             if let Some(max_frames) = max_frames.as_ref() {
                 if frames_sent >= *max_frames {
+                    // Same as LimitReached: the last frames sent are still
+                    // buffered inside the encoder; do not skip the flush.
                     debug!("sq: {stream_index} frames_max {max_frames} reached");
-                    finished = true;
                     break;
                 }
             }
-
-            finished = result.unwrap();
-            if finished {
-                trace!("Encoder returned EOF, finishing");
-                break;
-            }
         }
 
-        // Encoder flush logic - handles two different exit scenarios:
+        // Encoder flush logic - handles three different exit scenarios:
         //
         // SCENARIO 1: finished=true (normal completion)
         //   - Encoder received NULL frame from upstream (frame_encode() processed it)
@@ -191,13 +205,24 @@ pub(crate) fn enc_init(
         //   - All buffered packets (B-frames, etc.) have been drained via receive_packet() loop
         //   - Encoder is completely flushed, no additional flush needed
         //
-        // SCENARIO 2: finished=false (early exit: abort or disconnect)
+        // SCENARIO 2: finished=false, limit reached (max_frames / recording_time)
+        //   - Every accepted frame is within the limit, but the last ones may
+        //     still sit in the encoder's reorder buffer (B-frame lookahead)
+        //   - Flush, or the tail of the output is silently dropped; drained
+        //     packets only cover frames sent before the limit, so the limit
+        //     still holds (fftools flushes after its encode loop the same way)
+        //
+        // SCENARIO 3: finished=false (early exit: abort or disconnect)
         //   - Encoder did NOT receive NULL frame (thread exited early via abort() or Disconnected)
         //   - Encoder buffer may still contain unencoded frames (B-frames waiting for future frames)
         //   - If NOT abort: actively flush encoder to drain buffered frames
         //   - If abort: skip flush (user doesn't care about incomplete output)
         //
-        if !finished && opened {
+        // Subtitle encoders buffer nothing (avcodec_encode_subtitle is
+        // stateless) and do not implement the send_frame API: flushing one
+        // would only produce a spurious EINVAL — fftools' frame_encode notes
+        // "no flushing for subtitles".
+        if !finished && opened && (*enc_ctx_box.as_mut_ptr()).codec_type != AVMEDIA_TYPE_SUBTITLE {
             let status = scheduler_status.load(Ordering::Acquire);
 
             if status != STATUS_ABORT {
@@ -309,6 +334,17 @@ pub(crate) fn enc_init(
     }
 
     Ok(())
+}
+
+/// Outcome of pushing one frame through the encoder.
+enum EncodeStatus {
+    /// Frame consumed; more may follow.
+    Continue,
+    /// recording_time boundary hit before this frame: stop encoding. Frames
+    /// already sent may still sit in the encoder and must be flushed.
+    LimitReached,
+    /// EOF fully processed: the encoder has been drained, nothing to flush.
+    Eof,
 }
 
 enum SyncFrame {
@@ -448,6 +484,18 @@ fn receive_frame(
                 *frame_samples = (*enc_ctx).frame_size;
                 *align_mask = av_cpu_max_align() - 1;
             }
+        }
+
+        // A data-less frame is a dummy carrying only encoder init parameters:
+        // the filtergraph sends one when a stream produced no frames at all
+        // (close_output), so the encoder can open and the muxer become ready.
+        // Mirror fftools ffmpeg_sched.c send_to_enc(): open with it, then
+        // discard it — there is nothing to encode.
+        // SAFETY: the frame pointer is non-null — the frame_is_null early
+        // return above already handled the null (EOF marker) case.
+        if unsafe { (*frame_box.frame.as_ptr()).buf[0].is_null() } {
+            frame_pool.release(frame_box.frame);
+            return SyncFrame::Continue;
         }
 
         frame_box
@@ -1062,7 +1110,7 @@ fn frame_encode(
     mux_started: &Arc<AtomicBool>,
     stream: *mut AVStream,
     packet_pool: &ObjPool<Packet>,
-) -> crate::error::Result<bool> {
+) -> crate::error::Result<EncodeStatus> {
     unsafe {
         if (*enc_ctx).codec_type == AVMEDIA_TYPE_SUBTITLE {
             let subtitle = if !frame.is_null() && !(*frame).buf[0].is_null() {
@@ -1083,7 +1131,7 @@ fn frame_encode(
                     stream,
                 )
             } else {
-                Ok(false)
+                Ok(EncodeStatus::Continue)
             };
         }
 
@@ -1097,7 +1145,7 @@ fn frame_encode(
                 ) >= 0
                 {
                     debug!("Reached the target time: {recording_time_us} us, frame time: {} us. Ending the recording.", (*frame).pts);
-                    return Ok(true);
+                    return Ok(EncodeStatus::LimitReached);
                 }
             }
 
@@ -1108,10 +1156,11 @@ fn frame_encode(
                 && (*enc_ctx).ch_layout.nb_channels != (*frame).ch_layout.nb_channels
             {
                 error!("Audio channel count changed and encoder does not support parameter changes");
-                return Ok(false);
+                return Ok(EncodeStatus::Continue);
             }
         }
         encode_frame(enc_ctx, frame, pkt_sender,  pre_pkt_sender, mux_started, stream, packet_pool)
+            .map(|eof| if eof { EncodeStatus::Eof } else { EncodeStatus::Continue })
     }
 }
 
@@ -1125,14 +1174,14 @@ unsafe fn do_subtitle_out(
     pre_pkt_sender: &Sender<PacketBox>,
     mux_started: &Arc<AtomicBool>,
     stream: *mut AVStream,
-) -> crate::error::Result<bool> {
+) -> crate::error::Result<EncodeStatus> {
     let subtitle_out_max_size = 1024 * 1024;
     if (*sub).pts == AV_NOPTS_VALUE {
         return Err(Encoding(EncodingOperationError::SubtitleNotPts));
     }
     if let Some(start_time_us) = start_time_us {
         if (*sub).pts < start_time_us {
-            return Ok(false);
+            return Ok(EncodeStatus::Continue);
         }
     }
 
@@ -1152,7 +1201,7 @@ unsafe fn do_subtitle_out(
         let mut local_sub = *sub;
         if let Some(recording_time_us) = recording_time_us {
             if av_compare_ts(pts, AV_TIME_BASE_Q, recording_time_us, AV_TIME_BASE_Q) >= 0 {
-                return Ok(true);
+                return Ok(EncodeStatus::LimitReached);
             }
         }
 
@@ -1233,7 +1282,7 @@ unsafe fn do_subtitle_out(
         }
     }
 
-    Ok(false)
+    Ok(EncodeStatus::Continue)
 }
 
 #[cfg(not(feature = "docs-rs"))]

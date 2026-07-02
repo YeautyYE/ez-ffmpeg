@@ -131,7 +131,9 @@ pub(crate) fn ready_to_init_mux(
                         thread_sync,
                         scheduler_result,
                     ) {
-                        error!("Muxer init error: {e}");
+                        // mux_task_start already logged the root cause and
+                        // recorded it via set_scheduler_error.
+                        debug!("Muxer init failed: {e}");
                     }
                     break;
                 }
@@ -208,10 +210,16 @@ fn _mux_init(
     let ret = unsafe { avformat_write_header(out_fmt_ctx, &mut opts) };
     if ret < 0 {
         error!("Could not write header (incorrect codec parameters ?): {}", av_err2str(ret));
+        // Record the failure BEFORE releasing this muxer's thread slot, so
+        // wait() can never observe "all threads done" without the error
+        // (set_scheduler_error also publishes STATUS_END, which unwinds the
+        // encoders still feeding the pre-mux channels).
+        set_scheduler_error(
+            &scheduler_status,
+            &scheduler_result,
+            Muxing(MuxingOperationError::WriteHeader(WriteHeaderError::from(ret))),
+        );
         thread_sync.thread_done();
-        if thread_sync.is_all_threads_done() {
-            scheduler_status.store(STATUS_END, Ordering::Release);
-        }
         return Err(Muxing(MuxingOperationError::WriteHeader(
             WriteHeaderError::from(ret),
         )));
