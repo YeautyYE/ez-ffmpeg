@@ -1,0 +1,12 @@
+[package]
+name = "gpu_benchmark"
+version = "0.1.0"
+edition = "2021"
+authors = ["Yeauty <YeautyYE@gmail.com>"]
+publish = false
+
+[dependencies]
+ez-ffmpeg = { path = "../..", features = ["opengl", "wgpu"] }
+libc = "0.2"
+env_logger = "0.10"
+log = "0.4"
