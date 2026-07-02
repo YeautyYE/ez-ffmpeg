@@ -32,6 +32,10 @@ surfman = { version = "0.9", features = ["chains"], optional = true }
 glow = { version = "0.16", optional = true }
 bytemuck = { version = "1.8", optional = true }
 
+#wgpu
+wgpu = { version = "26", optional = true }
+pollster = { version = "0.4", optional = true }
+
 #flv
 bytes = { version = "1.9.0", optional = true }
 
@@ -49,6 +53,7 @@ core-foundation = "0.10"
 default = []
 async = []
 opengl = ["dep:surfman", "dep:glow", "dep:bytemuck"]
+wgpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 rtmp = ["dep:rml_rtmp", "dep:slab", "dep:dashmap", "flv"]
 flv = ["dep:bytes", "dep:byteorder"]
 static = ["ffmpeg-next/static"]
