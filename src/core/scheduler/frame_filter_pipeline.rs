@@ -425,7 +425,10 @@ fn send_frame(
             }
         }
 
-        for i in finished_senders {
+        // Indices were collected in ascending order: remove from the back so
+        // earlier indices stay valid (forward removal shifts the vector and
+        // removes the wrong senders).
+        for i in finished_senders.into_iter().rev() {
             frame_senders.remove(i);
         }
     }

@@ -792,13 +792,13 @@ fn enc_open(
 
         match (*enc_ctx).codec_type {
             AVMEDIA_TYPE_AUDIO => {
-                assert!(
-                    (*frame).format != AV_SAMPLE_FMT_NONE as i32
-                        && (*frame).sample_rate > 0
-                        && (*frame).ch_layout.nb_channels > 0
-                );
-
-                if (*frame).format == -1 {
+                // A malformed init frame must fail the task with a clear
+                // error, not abort the process (the old assert! shadowed the
+                // graceful branch below it).
+                if (*frame).format == AV_SAMPLE_FMT_NONE as i32
+                    || (*frame).sample_rate <= 0
+                    || (*frame).ch_layout.nb_channels <= 0
+                {
                     return Err(OpenOutputError::UnknownFrameFormat.into());
                 }
                 (*enc_ctx).sample_fmt = std::mem::transmute((*frame).format);
@@ -822,20 +822,18 @@ fn enc_open(
                 }
             }
             AVMEDIA_TYPE_VIDEO => {
-                assert!(
-                    (*frame).format != AV_SAMPLE_FMT_NONE as i32
-                        && (*frame).width > 0
-                        && (*frame).height > 0
-                );
+                if (*frame).format == AV_PIX_FMT_NONE as i32
+                    || (*frame).width <= 0
+                    || (*frame).height <= 0
+                {
+                    return Err(OpenOutputError::UnknownFrameFormat.into());
+                }
 
                 (*enc_ctx).width = (*frame).width;
                 (*enc_ctx).height = (*frame).height;
                 (*enc_ctx).sample_aspect_ratio = (*frame).sample_aspect_ratio;
                 (*stream).sample_aspect_ratio = (*frame).sample_aspect_ratio;
 
-                if (*frame).format == -1 {
-                    return Err(OpenEncoder(OpenEncoderOperationError::UnknownFrameFormat));
-                }
                 (*enc_ctx).pix_fmt = std::mem::transmute((*frame).format);
 
                 if let Some(bits_per_raw_sample) = bits_per_raw_sample {

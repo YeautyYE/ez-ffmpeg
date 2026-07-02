@@ -1586,9 +1586,13 @@ unsafe fn close_output(
         (*frame.as_mut_ptr()).sample_rate = ofp.sample_rate;
 
         if ofp.opts.ch_layout.nb_channels != 0 {
+            // Copy from the output filter's negotiated layout; copying the
+            // frame's own (empty) layout onto itself left the dummy audio
+            // frame without channels (ffmpeg_filter.c close_output copies
+            // from ofp->ch_layout).
             let ret = av_channel_layout_copy(
                 &mut (*frame.as_mut_ptr()).ch_layout,
-                &(*frame.as_mut_ptr()).ch_layout,
+                &ofp.opts.ch_layout,
             );
             if ret < 0 {
                 return ret;
@@ -1692,6 +1696,15 @@ unsafe fn video_sync_process(
             );
         }
 
+        // Same duplication cap as the live path below: the flush replays the
+        // history median, which must not emit absurd counts either
+        // (ffmpeg_filter.c:2601-2610 shares one finish tail for both).
+        if *nb_frames > 3_240_000 {
+            error!("{} frame duplication too large, skipping", *nb_frames - 1);
+            *nb_frames = 0;
+            return;
+        }
+
         fps.last_dropped = (nb_frames == nb_frames_prev && !frame.is_null()) as i32;
 
         if fps.last_dropped != 0 && (*frame).flags & AV_FRAME_FLAG_KEY != 0 {
@@ -1771,6 +1784,15 @@ unsafe fn video_sync_process(
             fps.frame_number,
             (*fps.last_frame.as_ptr()).pts
         );
+    }
+
+    // dts_error_threshold (3600*30) * 30: duplication this large means
+    // broken timestamps; skip the frame instead of emitting millions of
+    // duplicates (ffmpeg_filter.c:2601-2610, after the history update).
+    if *nb_frames > 3_240_000 {
+        error!("{} frame duplication too large, skipping", *nb_frames - 1);
+        *nb_frames = 0;
+        return;
     }
 
     fps.last_dropped = (nb_frames == nb_frames_prev) as i32;
