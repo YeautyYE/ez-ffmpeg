@@ -2,7 +2,7 @@ use crate::core::filter::frame_filter_context::FrameFilterContext;
 use crate::filter::frame_filter::FrameFilter;
 use ffmpeg_next::Frame;
 use ffmpeg_sys_next::{
-    av_frame_get_buffer, av_q2d, sws_scale, AVFrame,
+    av_frame_get_buffer, av_frame_make_writable, av_q2d, sws_scale, AVFrame,
     AVMediaType,
 };
 use glow::{HasContext, NativeProgram, PixelPackData, PixelUnpackData};
@@ -51,9 +51,11 @@ pub struct OpenGLFrameFilter {
     vbo: Option<glow::NativeBuffer>,
     ebo: Option<glow::NativeBuffer>,
 
-    // Width and height of the current frame.
+    // Dimensions and pixel format the buffers, viewport and scalers were
+    // built for; a mid-stream change forces a rebuild.
     width: i32,
     height: i32,
+    format: ffmpeg_sys_next::AVPixelFormat,
 
     // Framebuffer and textures for rendering.
     framebuffer: Option<glow::Framebuffer>,
@@ -159,6 +161,7 @@ impl OpenGLFrameFilter {
             ebo: None,
             width: -1,
             height: -1,
+            format: ffmpeg_sys_next::AVPixelFormat::AV_PIX_FMT_NONE,
             framebuffer: None,
             output_texture: None,
             input_texture: None,
@@ -285,6 +288,7 @@ impl OpenGLFrameFilter {
     ) -> Result<(), String> {
         self.width = width;
         self.height = height;
+        self.format = format;
 
         unsafe {
             self.gl.as_ref().unwrap().viewport(0, 0, width, height);
@@ -486,6 +490,28 @@ impl OpenGLFrameFilter {
         Ok(())
     }
 
+    /// Drops every resource tied to one (width, height, format): the GL
+    /// textures/framebuffer plus the RGB staging frame and both scalers.
+    /// Safe to call with nothing allocated (each slot is take()n).
+    fn release_frame_resources(&mut self) {
+        if let Some(gl) = self.gl.as_ref() {
+            unsafe {
+                if let Some(texture) = self.input_texture.take() {
+                    gl.delete_texture(texture);
+                }
+                if let Some(texture) = self.output_texture.take() {
+                    gl.delete_texture(texture);
+                }
+                if let Some(framebuffer) = self.framebuffer.take() {
+                    gl.delete_framebuffer(framebuffer);
+                }
+            }
+        }
+        self.rgb_frame = None;
+        self.to_rgb_scaler = None;
+        self.to_original_scaler = None;
+    }
+
     fn process_frame_through_texture(&self, frame: &Frame) -> Result<(), String> {
         self.upload_frame_to_texture(frame)?;
 
@@ -509,19 +535,65 @@ impl OpenGLFrameFilter {
         let gl = self.gl.as_ref().unwrap();
 
         unsafe {
+            let linesize = (*frame.as_ptr()).linesize[0];
+            let data = frame_data_mut(frame.as_ptr(), 0)?;
+
             gl.bind_texture(glow::TEXTURE_2D, self.input_texture);
 
-            gl.tex_sub_image_2d(
-                glow::TEXTURE_2D,
-                0,
-                0,
-                0,
-                self.width,
-                self.height,
-                glow::RGB,
-                glow::UNSIGNED_BYTE,
-                glow::PixelUnpackData::Slice(Some(frame_data_mut(frame.as_ptr(), 0)?)),
-            );
+            // GL defaults to 4-byte row alignment and tightly packed rows;
+            // FFmpeg rows carry padding and width*3 is rarely 4-aligned, so
+            // uploading with the defaults shears the picture sideways.
+            gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+            match row_layout(linesize, self.width, 3) {
+                RowLayout::Tight => {
+                    gl.tex_sub_image_2d(
+                        glow::TEXTURE_2D,
+                        0,
+                        0,
+                        0,
+                        self.width,
+                        self.height,
+                        glow::RGB,
+                        glow::UNSIGNED_BYTE,
+                        glow::PixelUnpackData::Slice(Some(data)),
+                    );
+                }
+                RowLayout::RowLength(pixels) => {
+                    gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, pixels);
+                    gl.tex_sub_image_2d(
+                        glow::TEXTURE_2D,
+                        0,
+                        0,
+                        0,
+                        self.width,
+                        self.height,
+                        glow::RGB,
+                        glow::UNSIGNED_BYTE,
+                        glow::PixelUnpackData::Slice(Some(data)),
+                    );
+                    gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
+                }
+                RowLayout::PerRow => {
+                    // The stride is not a whole number of RGB pixels, which
+                    // GL cannot express: upload row by row.
+                    let stride = linesize as usize;
+                    let row_bytes = self.width as usize * 3;
+                    for y in 0..self.height {
+                        let start = y as usize * stride;
+                        gl.tex_sub_image_2d(
+                            glow::TEXTURE_2D,
+                            0,
+                            0,
+                            y,
+                            self.width,
+                            1,
+                            glow::RGB,
+                            glow::UNSIGNED_BYTE,
+                            glow::PixelUnpackData::Slice(Some(&data[start..start + row_bytes])),
+                        );
+                    }
+                }
+            }
             Ok(())
         }
     }
@@ -531,14 +603,54 @@ impl OpenGLFrameFilter {
         let gl = self.gl.as_ref().unwrap();
 
         unsafe {
-            gl.bind_texture(glow::TEXTURE_2D,self.output_texture);
-            gl.get_tex_image(
-                glow::TEXTURE_2D,
-                0,                   // Mipmap level
-                glow::RGB,           // Pixel format
-                glow::UNSIGNED_BYTE, // Data type
-                PixelPackData::Slice(Some(frame_data_mut(frame.as_ptr(), 0)?)),
-            );
+            let linesize = (*frame.as_ptr()).linesize[0];
+            let data = frame_data_mut(frame.as_ptr(), 0)?;
+
+            gl.bind_texture(glow::TEXTURE_2D, self.output_texture);
+
+            // Mirror of the upload path: readback must honor the frame's
+            // row stride or the written picture is sheared.
+            gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
+            match row_layout(linesize, self.width, 3) {
+                RowLayout::Tight => {
+                    gl.get_tex_image(
+                        glow::TEXTURE_2D,
+                        0,                   // Mipmap level
+                        glow::RGB,           // Pixel format
+                        glow::UNSIGNED_BYTE, // Data type
+                        PixelPackData::Slice(Some(data)),
+                    );
+                }
+                RowLayout::RowLength(pixels) => {
+                    gl.pixel_store_i32(glow::PACK_ROW_LENGTH, pixels);
+                    gl.get_tex_image(
+                        glow::TEXTURE_2D,
+                        0,
+                        glow::RGB,
+                        glow::UNSIGNED_BYTE,
+                        PixelPackData::Slice(Some(data)),
+                    );
+                    gl.pixel_store_i32(glow::PACK_ROW_LENGTH, 0);
+                }
+                RowLayout::PerRow => {
+                    // glGetTexImage fetches whole levels only: read tightly
+                    // packed, then scatter the rows at the frame's stride.
+                    let stride = linesize as usize;
+                    let row_bytes = self.width as usize * 3;
+                    let mut tight = vec![0u8; row_bytes * self.height as usize];
+                    gl.get_tex_image(
+                        glow::TEXTURE_2D,
+                        0,
+                        glow::RGB,
+                        glow::UNSIGNED_BYTE,
+                        PixelPackData::Slice(Some(&mut tight)),
+                    );
+                    for y in 0..self.height as usize {
+                        data[y * stride..y * stride + row_bytes]
+                            .copy_from_slice(&tight[y * row_bytes..(y + 1) * row_bytes]);
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -734,6 +846,27 @@ fn setup_vertex_data(
     }
 }
 
+/// How a frame row maps onto GL's pixel-transfer parameters.
+#[derive(Debug, PartialEq, Eq)]
+enum RowLayout {
+    /// stride == width * bytes_per_pixel: rows are tightly packed.
+    Tight,
+    /// Padded stride that is a whole number of pixels: GL ROW_LENGTH covers it.
+    RowLength(i32),
+    /// Stride is not a multiple of the pixel size: transfer row by row.
+    PerRow,
+}
+
+fn row_layout(linesize: i32, width: i32, bytes_per_pixel: i32) -> RowLayout {
+    if linesize == width * bytes_per_pixel {
+        RowLayout::Tight
+    } else if linesize % bytes_per_pixel == 0 {
+        RowLayout::RowLength(linesize / bytes_per_pixel)
+    } else {
+        RowLayout::PerRow
+    }
+}
+
 pub unsafe fn frame_data_mut<'a>(
     frame: *const AVFrame,
     index: usize,
@@ -800,12 +933,34 @@ impl FrameFilter for OpenGLFrameFilter {
         let original_format: ffmpeg_sys_next::AVPixelFormat =
             unsafe { std::mem::transmute((*frame.as_ptr()).format) };
 
-        if self.input_texture.is_none() {
-            let (width, height) = unsafe { ((*frame.as_ptr()).width, (*frame.as_ptr()).height) };
-            if width <= 0 || height <= 0 {
-                return Ok(Some(frame));
-            }
+        let (width, height) = unsafe { ((*frame.as_ptr()).width, (*frame.as_ptr()).height) };
+        if width <= 0 || height <= 0 {
+            return Ok(Some(frame));
+        }
+
+        // Buffers, viewport and both sws contexts are sized for exactly one
+        // (width, height, format). A mid-stream change (h264 resolution
+        // switch, filter reconfiguration) must rebuild them: scaling into
+        // the old geometry writes past the new frame's smaller buffers.
+        if self.input_texture.is_none()
+            || width != self.width
+            || height != self.height
+            || original_format != self.format
+        {
+            self.release_frame_resources();
             self.init_buffer(width, height, original_format)?;
+        }
+
+        // The GL result is written back into this frame's buffers, which may
+        // still be shared with the decoder's frame pool (refcount > 1).
+        unsafe {
+            let ret = av_frame_make_writable(frame.as_mut_ptr());
+            if ret < 0 {
+                return Err(format!(
+                    "Failed to make frame writable: {}",
+                    av_err2str(ret)
+                ));
+            }
         }
 
         if original_format == ffmpeg_sys_next::AVPixelFormat::AV_PIX_FMT_RGB24 {
@@ -824,17 +979,9 @@ impl FrameFilter for OpenGLFrameFilter {
     fn uninit(&mut self, _ctx: &FrameFilterContext) {
         // init may have failed halfway and uninit may run twice: take() each
         // resource so missing ones are skipped and none is deleted twice.
+        self.release_frame_resources();
         if let Some(gl) = self.gl.as_ref() {
             unsafe {
-                if let Some(texture) = self.input_texture.take() {
-                    gl.delete_texture(texture);
-                }
-                if let Some(texture) = self.output_texture.take() {
-                    gl.delete_texture(texture);
-                }
-                if let Some(framebuffer) = self.framebuffer.take() {
-                    gl.delete_framebuffer(framebuffer);
-                }
                 if let Some(ebo) = self.ebo.take() {
                     gl.delete_buffer(ebo);
                 }
@@ -870,6 +1017,26 @@ mod tests {
     use crate::core::scheduler::ffmpeg_scheduler::{FfmpegScheduler, Initialization};
     use crate::core::context::ffmpeg_context::FfmpegContext;
     use crate::filter::frame_pipeline_builder::FramePipelineBuilder;
+
+    #[test]
+    fn row_layout_tight_rows_need_no_stride_handling() {
+        // 320 * 3 == 960: no padding.
+        assert_eq!(row_layout(960, 320, 3), RowLayout::Tight);
+    }
+
+    #[test]
+    fn row_layout_padded_rows_map_to_row_length_pixels() {
+        // 1918 * 3 == 5754, padded to 5760 by av_frame_get_buffer:
+        // expressible as 1920 whole RGB pixels.
+        assert_eq!(row_layout(5760, 1918, 3), RowLayout::RowLength(1920));
+    }
+
+    #[test]
+    fn row_layout_non_pixel_stride_falls_back_to_per_row() {
+        // 100 * 3 == 300, padded to 320: not a multiple of 3, GL cannot
+        // express this stride via ROW_LENGTH.
+        assert_eq!(row_layout(320, 100, 3), RowLayout::PerRow);
+    }
 
     #[test]
     fn test_filter_with_fg() {
