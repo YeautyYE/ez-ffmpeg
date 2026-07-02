@@ -155,8 +155,16 @@ pub(crate) fn enc_init(
             );
             frame_pool.release(receive_frame_box.frame);
             if let Err(e) = result {
-                error!("Error encoding a frame: {}", e);
-                set_scheduler_error(&scheduler_status, &scheduler_result, e);
+                if is_stopping(scheduler_status.load(Ordering::Acquire))
+                    && matches!(e, Encoding(EncodingOperationError::MuxerFinished))
+                {
+                    // stop()/abort(): the muxer legitimately exited first; a
+                    // user-requested shutdown must not be recorded as a failure.
+                    debug!("Encoder stopping: muxer already finished");
+                } else {
+                    error!("Error encoding a frame: {}", e);
+                    set_scheduler_error(&scheduler_status, &scheduler_result, e);
+                }
                 break;
             }
 
@@ -189,7 +197,7 @@ pub(crate) fn enc_init(
         //   - If NOT abort: actively flush encoder to drain buffered frames
         //   - If abort: skip flush (user doesn't care about incomplete output)
         //
-        if !finished {
+        if !finished && opened {
             let status = scheduler_status.load(Ordering::Acquire);
 
             if status != STATUS_ABORT {
@@ -243,7 +251,7 @@ pub(crate) fn enc_init(
                                 codecpar: (*stream).codecpar,
                             },
                         }, &pkt_sender, &pre_pkt_sender, &mux_started) {
-                            error!("send flushed packet failed, mux already finished");
+                            debug!("send flushed packet failed, mux already finished");
                             break;
                         }
                     }
@@ -278,12 +286,18 @@ pub(crate) fn enc_init(
                     codecpar: (*stream).codecpar,
                 },
             }, &pkt_sender, &pre_pkt_sender, &mux_started) {
-                error!("Error sending end packet: {}", e);
-                set_scheduler_error(
-                    &scheduler_status,
-                    &scheduler_result,
-                    Encoding(EncodingOperationError::MuxerFinished),
-                );
+                if is_stopping(scheduler_status.load(Ordering::Acquire)) {
+                    // Normal shutdown ordering: muxer exits before the encoder's
+                    // end-of-stream marker; not an error and not a task failure.
+                    debug!("end packet not delivered, muxer already finished: {e}");
+                } else {
+                    error!("Error sending end packet: {}", e);
+                    set_scheduler_error(
+                        &scheduler_status,
+                        &scheduler_result,
+                        Encoding(EncodingOperationError::MuxerFinished),
+                    );
+                }
             }
         }
 
@@ -409,7 +423,16 @@ fn receive_frame(
 
         if frame_is_null(&frame_box.frame) {
             frame_pool.release(frame_box.frame);
-            error!("Receive frame is null on open encoder");
+            // EOF before the first frame: nothing was decoded for this stream,
+            // the encoder never opened and the muxer can never become ready.
+            // Record a real error so wait() does not report a false success.
+            let output_stream_index = unsafe { (*stream).index };
+            error!("No frames were received for output stream {output_stream_index}; encoder never opened");
+            set_scheduler_error(
+                scheduler_status,
+                scheduler_result,
+                OpenEncoder(OpenEncoderOperationError::NoFramesReceived),
+            );
             return SyncFrame::Break;
         }
 
@@ -1205,7 +1228,7 @@ unsafe fn do_subtitle_out(
                 codecpar: (*stream).codecpar,
             },
         }, pkt_sender, pre_pkt_sender, mux_started) {
-            error!("send subtitle packet failed, mux already finished");
+            debug!("send subtitle packet failed, mux already finished");
             return Err(Encoding(EncodingOperationError::MuxerFinished));
         }
     }
@@ -1276,7 +1299,7 @@ unsafe fn encode_frame(
                 codecpar: (*stream).codecpar,
             },
         }, pkt_sender, pre_pkt_sender, mux_started) {
-            error!("send packet failed, mux already finished");
+            debug!("send packet failed, mux already finished");
             return Err(Encoding(EncodingOperationError::MuxerFinished));
         }
     }
