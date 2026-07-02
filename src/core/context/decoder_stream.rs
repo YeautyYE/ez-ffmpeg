@@ -27,6 +27,9 @@ pub(crate) struct DecoderStream {
     pub(crate) hwaccel_device: Option<String>,
     pub(crate) hwaccel_output_format: AVPixelFormat,
 
+    /// Applied to `AVCodecContext.log_level_offset` when the decoder opens.
+    pub(crate) log_level_offset: i32,
+
     src: Option<Receiver<PacketBox>>,
     dsts: Vec<(Sender<FrameBox>, usize, Arc<[AtomicBool]>)>,
 }
@@ -46,6 +49,7 @@ impl DecoderStream {
         hwaccel_device_type: AVHWDeviceType,
         hwaccel_device: Option<String>,
         hwaccel_output_format: AVPixelFormat,
+        log_level_offset: i32,
     ) -> Self {
         Self {
             stream_index,
@@ -62,6 +66,7 @@ impl DecoderStream {
             hwaccel_device_type,
             hwaccel_device,
             hwaccel_output_format,
+            log_level_offset,
             src: None,
             dsts: vec![],
         }

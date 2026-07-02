@@ -507,18 +507,119 @@ type VaListType = *mut ffmpeg_sys_next::__va_list_tag_powerpc;
 #[cfg(target_arch = "s390x")]
 type VaListType = *mut ffmpeg_sys_next::__va_list_tag_s390x;
 
+/// Log target used for every message forwarded from FFmpeg, so applications
+/// can tune FFmpeg's verbosity independently of ez-ffmpeg's own logs,
+/// e.g. `RUST_LOG=ez_ffmpeg=info,ez_ffmpeg::ffmpeg=warn`.
+pub const FFMPEG_LOG_TARGET: &str = "ez_ffmpeg::ffmpeg";
+
+/// Highest FFmpeg log level forwarded to the Rust `log` facade.
+/// Defaults to [`FfmpegLogLevel::Info`], matching the historical behavior.
+static FFMPEG_LOG_MAX_LEVEL: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(ffmpeg_sys_next::AV_LOG_INFO);
+
+/// Verbosity levels of the FFmpeg logging system (mirrors `AV_LOG_*`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FfmpegLogLevel {
+    Quiet,
+    Panic,
+    Fatal,
+    Error,
+    Warning,
+    Info,
+    Verbose,
+    Debug,
+    Trace,
+}
+
+impl FfmpegLogLevel {
+    fn to_av_level(self) -> libc::c_int {
+        match self {
+            FfmpegLogLevel::Quiet => ffmpeg_sys_next::AV_LOG_QUIET,
+            FfmpegLogLevel::Panic => ffmpeg_sys_next::AV_LOG_PANIC,
+            FfmpegLogLevel::Fatal => ffmpeg_sys_next::AV_LOG_FATAL,
+            FfmpegLogLevel::Error => ffmpeg_sys_next::AV_LOG_ERROR,
+            FfmpegLogLevel::Warning => ffmpeg_sys_next::AV_LOG_WARNING,
+            FfmpegLogLevel::Info => ffmpeg_sys_next::AV_LOG_INFO,
+            FfmpegLogLevel::Verbose => ffmpeg_sys_next::AV_LOG_VERBOSE,
+            FfmpegLogLevel::Debug => ffmpeg_sys_next::AV_LOG_DEBUG,
+            FfmpegLogLevel::Trace => ffmpeg_sys_next::AV_LOG_TRACE,
+        }
+    }
+}
+
+/// Sets the highest FFmpeg log level forwarded to the `log` facade
+/// (under the [`FFMPEG_LOG_TARGET`] target).
+///
+/// Messages above this level are dropped before any formatting work.
+/// Defaults to [`FfmpegLogLevel::Info`]; raise to [`FfmpegLogLevel::Trace`]
+/// to receive FFmpeg's debug/trace diagnostics (they map to `log::trace!`),
+/// or lower to [`FfmpegLogLevel::Error`] to keep only errors.
+pub fn set_ffmpeg_log_level(level: FfmpegLogLevel) {
+    FFMPEG_LOG_MAX_LEVEL.store(level.to_av_level(), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn av_level_to_rust(level: libc::c_int) -> log::Level {
+    if level <= ffmpeg_sys_next::AV_LOG_ERROR {
+        log::Level::Error
+    } else if level <= ffmpeg_sys_next::AV_LOG_WARNING {
+        log::Level::Warn
+    } else if level <= ffmpeg_sys_next::AV_LOG_INFO {
+        log::Level::Info
+    } else if level <= ffmpeg_sys_next::AV_LOG_VERBOSE {
+        log::Level::Debug
+    } else {
+        log::Level::Trace
+    }
+}
+
+/// Shared formatting state for [`ffmpeg_log_callback`].
+///
+/// `print_prefix` must survive across invocations: FFmpeg emits partial log
+/// lines (not ending in '\n') and uses this flag to decide whether the next
+/// chunk starts a new prefixed line; a per-call flag broke multi-part
+/// messages. The same lock serializes `av_log_format_line` across threads
+/// and carries the duplicate-folding state (`AV_LOG_SKIP_REPEATED`
+/// semantics), mirroring FFmpeg's own default callback (libavutil/log.c).
+struct FfmpegLogState {
+    print_prefix: libc::c_int,
+    last_level: libc::c_int,
+    repeated: u64,
+    last_msg: String,
+}
+
+static FFMPEG_LOG_STATE: std::sync::Mutex<FfmpegLogState> =
+    std::sync::Mutex::new(FfmpegLogState {
+        print_prefix: 1,
+        last_level: ffmpeg_sys_next::AV_LOG_INFO,
+        repeated: 0,
+        last_msg: String::new(),
+    });
+
 unsafe extern "C" fn ffmpeg_log_callback(
     ptr: *mut libc::c_void,
     level: libc::c_int,
     fmt: *const libc::c_char,
     args: VaListType,
 ) {
-    // Create a fixed-size buffer to hold the formatted log message.
-    let mut buffer = [0u8; 1024];
-    // 'print_prefix' is used internally by av_log_format_line to decide whether to print a prefix.
-    let mut print_prefix = 1;
+    // Cheap early exits before any formatting: av_vlog does not filter by
+    // level for custom callbacks, so verbose/debug/trace chatter would
+    // otherwise be vsnprintf-formatted only to be thrown away.
+    if level > FFMPEG_LOG_MAX_LEVEL.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let rust_level = av_level_to_rust(level);
+    if rust_level > log::max_level() {
+        return;
+    }
 
-    // Call FFmpeg's av_log_format_line to format the variable arguments into the buffer.
+    // A panicked holder cannot exist (no panicking code below), but never
+    // propagate poisoning out of an extern "C" callback.
+    let mut state = FFMPEG_LOG_STATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let mut buffer = [0u8; 1024];
     ffmpeg_sys_next::av_log_format_line(
         ptr,
         level,
@@ -526,23 +627,44 @@ unsafe extern "C" fn ffmpeg_log_callback(
         args,
         buffer.as_mut_ptr() as *mut libc::c_char,
         buffer.len() as libc::c_int,
-        &mut print_prefix,
+        &mut state.print_prefix,
     );
 
-    // Convert the C string in the buffer to a Rust &str.
-    if let Ok(msg) = std::ffi::CStr::from_ptr(buffer.as_ptr() as *const libc::c_char).to_str() {
-        // Trim any trailing newline characters (\n or \r).
-        let trimmed_msg = msg.trim_end_matches(['\n', '\r']);
+    let Ok(msg) = std::ffi::CStr::from_ptr(buffer.as_ptr() as *const libc::c_char).to_str() else {
+        return;
+    };
+    let trimmed_msg = msg.trim_end_matches(['\n', '\r']);
 
-        // Map FFmpeg log levels to the corresponding Rust log levels.
-        if level <= ffmpeg_sys_next::AV_LOG_ERROR {
-            log::error!("FFmpeg: {}", trimmed_msg);
-        } else if level <= ffmpeg_sys_next::AV_LOG_WARNING {
-            log::warn!("FFmpeg: {}", trimmed_msg);
-        } else if level <= ffmpeg_sys_next::AV_LOG_INFO {
-            log::info!("FFmpeg: {}", trimmed_msg);
-        }
+    // Fold consecutive duplicates, like ffmpeg CLI's AV_LOG_SKIP_REPEATED
+    // (e.g. per-frame h264 decode errors after a mid-GOP seek).
+    if level == state.last_level && trimmed_msg == state.last_msg {
+        state.repeated += 1;
+        return;
     }
+    let flush_repeated = if state.repeated > 0 {
+        Some((av_level_to_rust(state.last_level), state.repeated))
+    } else {
+        None
+    };
+    state.repeated = 0;
+    state.last_level = level;
+    state.last_msg.clear();
+    state.last_msg.push_str(trimmed_msg);
+
+    // Emit outside the lock: a logger backend may itself call into FFmpeg
+    // (re-entering this callback and self-deadlocking the Mutex) or panic
+    // (which must not unwind while the state lock is held).
+    drop(state);
+
+    if let Some((repeated_level, repeated)) = flush_repeated {
+        log::log!(
+            target: FFMPEG_LOG_TARGET,
+            repeated_level,
+            "FFmpeg: last message repeated {} times",
+            repeated
+        );
+    }
+    log::log!(target: FFMPEG_LOG_TARGET, rust_level, "FFmpeg: {}", trimmed_msg);
 }
 
 fn initialize_ffmpeg() {

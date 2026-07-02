@@ -684,6 +684,8 @@ fn dec_open(
                 OpenDecoderOperationError::ContextAllocationError(OpenDecoderError::OutOfMemory),
             ));
         }
+        // Per-input decoder log demotion (Input::set_log_level_offset).
+        (*dec_ctx).log_level_offset = dec_stream.log_level_offset;
 
         let mut ret = avcodec_parameters_to_context(
             dec_ctx,

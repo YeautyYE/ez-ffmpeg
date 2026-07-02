@@ -60,10 +60,26 @@ fn recorded() -> Vec<(Level, String, String)> {
     RECORDER.entries.lock().unwrap().clone()
 }
 
-/// Detached worker threads may log shortly after wait()/stop() returns;
-/// give them time to settle so stragglers are caught by the assertion.
+/// Detached worker threads may log shortly after wait()/stop() returns.
+/// Wait until the recorder has been quiet for a while (no new entries for
+/// 300ms, capped at 2s) so stragglers are caught by the assertion without
+/// racing the next test under CI load.
 fn settle() {
-    std::thread::sleep(Duration::from_millis(400));
+    let mut last_len = recorded().len();
+    let mut quiet_for = 0u32;
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(100));
+        let len = recorded().len();
+        if len == last_len {
+            quiet_for += 1;
+            if quiet_for >= 3 {
+                return;
+            }
+        } else {
+            last_len = len;
+            quiet_for = 0;
+        }
+    }
 }
 
 fn assert_no_noise(scenario: &str) {
@@ -82,7 +98,10 @@ fn assert_no_noise(scenario: &str) {
 }
 
 fn tmp_path(name: &str) -> String {
-    let dir = std::env::temp_dir().join("ez_ffmpeg_log_noise_tests");
+    let dir = std::env::temp_dir().join(format!(
+        "ez_ffmpeg_log_noise_tests_{}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     dir.join(name).to_string_lossy().into_owned()
 }
@@ -150,6 +169,40 @@ fn max_frames_screenshot_emits_no_warn_or_error() {
         "screenshot output missing or empty"
     );
     assert_no_noise("max_frames=1 screenshot");
+}
+
+#[test]
+fn pattern_filename_screenshot_keeps_sequence_naming() {
+    init_logging();
+    let _guard = test_guard();
+    clear_recorded();
+
+    // A '%03d' sequence pattern must NOT trigger the single-image 'update'
+    // mode: image2 should keep expanding the pattern (shot_001.png).
+    let pattern = tmp_path("shot_%03d.png");
+    let expanded = tmp_path("shot_001.png");
+    let _ = std::fs::remove_file(&expanded);
+    let _ = std::fs::remove_file(&pattern);
+
+    let result = FfmpegContext::builder()
+        .input(lavfi_input())
+        .output(Output::from(pattern.as_str()).set_max_video_frames(1))
+        .build()
+        .unwrap()
+        .start()
+        .unwrap()
+        .wait();
+
+    assert!(result.is_ok(), "pattern screenshot task failed: {result:?}");
+    assert!(
+        std::fs::metadata(&expanded).map(|m| m.len() > 0).unwrap_or(false),
+        "expected pattern-expanded output shot_001.png to exist"
+    );
+    assert!(
+        std::fs::metadata(&pattern).is_err(),
+        "a literal 'shot_%03d.png' file must not be created"
+    );
+    assert_no_noise("pattern filename screenshot");
 }
 
 #[test]
