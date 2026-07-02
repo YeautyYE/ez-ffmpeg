@@ -937,8 +937,11 @@ fn hw_device_setup_for_decode(
             i += 1;
         }
 
+        // Only try creating a new device when no existing one matched;
+        // a failed creation attempt must not clobber a found device
+        // (ffmpeg_dec.c hw auto: `for (i = 0; !dev; i++)`).
         i = 0;
-        loop {
+        while dev.is_none() {
             let config = unsafe { avcodec_get_hw_config(codec, i) };
             if config.is_null() {
                 break;
