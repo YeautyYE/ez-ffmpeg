@@ -261,6 +261,7 @@ pub(crate) fn filter_graph_init(
             }
 
             cleanup_filtergraph(&mut graph, &mut ifps, &mut ofps);
+            free_input_filter_resources(&mut ifps);
             debug!("FilterGraph finished.");
         });
     if let Err(e) = result {
@@ -1187,6 +1188,16 @@ fn insert_trim(
     0
 }
 
+/// Tears down the current graph so it can be (re)configured.
+///
+/// Mirrors fftools' cleanup_filtergraph: only the filter pointers and the
+/// graph itself are released. `ifp.hw_frames_ctx` must survive — it is an
+/// input PARAMETER (set from the incoming frame by
+/// `ifilter_parameters_from_frame` right before reconfiguration) that the
+/// next `configure_filtergraph` hands to buffersrc. Unrefing it here made
+/// every hw-frame filter chain fail with "Setting BufferSourceContext.pix_fmt
+/// to a HW format requires hw_frames_ctx to be non-NULL". Its lifetime ends
+/// in `free_input_filter_resources` when the filter task exits.
 fn cleanup_filtergraph(
     graph: *mut *mut AVFilterGraph,
     ifps: &mut Vec<InputFilterParameter>,
@@ -1194,9 +1205,6 @@ fn cleanup_filtergraph(
 ) {
     for input_filter_parameter in ifps {
         input_filter_parameter.filter = null_mut();
-        if !input_filter_parameter.hw_frames_ctx.is_null() {
-            unsafe { av_buffer_unref(&mut input_filter_parameter.hw_frames_ctx) };
-        }
     }
     for output_filter_parameter in ofps {
         output_filter_parameter.filter = null_mut();
@@ -1206,6 +1214,20 @@ fn cleanup_filtergraph(
     }
     unsafe {
         avfilter_graph_free(graph);
+    }
+}
+
+/// Final release of per-input resources owned by the filter task, called once
+/// when the task thread ends (counterpart of fftools' ifilter_free).
+fn free_input_filter_resources(ifps: &mut Vec<InputFilterParameter>) {
+    for input_filter_parameter in ifps {
+        if !input_filter_parameter.hw_frames_ctx.is_null() {
+            unsafe { av_buffer_unref(&mut input_filter_parameter.hw_frames_ctx) };
+        }
+        // Custom channel layouts allocated by av_channel_layout_copy.
+        unsafe {
+            ffmpeg_sys_next::av_channel_layout_uninit(&mut input_filter_parameter.ch_layout)
+        };
     }
 }
 
