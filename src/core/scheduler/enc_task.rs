@@ -885,24 +885,19 @@ fn enc_open(
                     (*enc_ctx).height = frame_box.frame_data.input_stream_height;
                 }
 
-                if !frame_box.frame_data.subtitle_header.is_null() {
+                if let Some(header) = frame_box.frame_data.subtitle_header.as_deref() {
                     /* ASS code assumes this buffer is null terminated so add extra byte. */
-                    let size = (frame_box.frame_data.subtitle_header_size + 1) as usize;
-                    let subtitle_header = av_mallocz(size) as *mut u8;
-                    (*enc_ctx).subtitle_header = subtitle_header;
-                    if (*enc_ctx).subtitle_header.is_null() {
+                    let subtitle_header = av_mallocz(header.len() + 1) as *mut u8;
+                    if subtitle_header.is_null() {
                         return Err(OpenEncoder(
                             OpenEncoderOperationError::SettingSubtitleError(
                                 OpenEncoderError::OutOfMemory,
                             ),
                         ));
                     }
-                    std::ptr::copy_nonoverlapping(
-                        frame_box.frame_data.subtitle_header as *const u8,
-                        (*enc_ctx).subtitle_header,
-                        frame_box.frame_data.subtitle_header_size as usize,
-                    );
-                    (*enc_ctx).subtitle_header_size = frame_box.frame_data.subtitle_header_size;
+                    std::ptr::copy_nonoverlapping(header.as_ptr(), subtitle_header, header.len());
+                    (*enc_ctx).subtitle_header = subtitle_header;
+                    (*enc_ctx).subtitle_header_size = header.len() as i32;
                 }
             }
             _ => panic!("Unsupported codec type"),

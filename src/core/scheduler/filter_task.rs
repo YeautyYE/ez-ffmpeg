@@ -1513,8 +1513,7 @@ unsafe fn fg_output_frame(
                     bits_per_raw_sample: 0,
                     input_stream_width: 0,
                     input_stream_height: 0,
-                    subtitle_header_size: 0,
-                    subtitle_header: null_mut(),
+                    subtitle_header: None,
                     fg_input_index: ofp.fg_input_index,
                 },
             };
@@ -1612,8 +1611,7 @@ unsafe fn close_output(
                     bits_per_raw_sample: 0,
                     input_stream_width: 0,
                     input_stream_height: 0,
-                    subtitle_header_size: 0,
-                    subtitle_header: null_mut(),
+                    subtitle_header: None,
                     fg_input_index: ofp.fg_input_index,
                 },
             };
@@ -1634,8 +1632,7 @@ unsafe fn close_output(
                 bits_per_raw_sample: 0,
                 input_stream_width: 0,
                 input_stream_height: 0,
-                subtitle_header_size: 0,
-                subtitle_header: null_mut(),
+                subtitle_header: None,
                 fg_input_index: ofp.fg_input_index,
             },
         };

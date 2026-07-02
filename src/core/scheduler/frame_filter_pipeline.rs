@@ -12,7 +12,6 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use ffmpeg_next::Frame;
 use ffmpeg_sys_next::{av_frame_copy_props, av_frame_ref};
 use log::{debug, error, info, warn};
-use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
@@ -369,8 +368,7 @@ fn send_frame(
                 bits_per_raw_sample: 0,
                 input_stream_width: 0,
                 input_stream_height: 0,
-                subtitle_header_size: 0,
-                subtitle_header: null_mut(),
+                subtitle_header: None,
                 fg_input_index: usize::MAX,
             },
         };
