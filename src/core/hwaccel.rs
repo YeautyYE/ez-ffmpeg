@@ -1,7 +1,8 @@
+use crate::util::ffmpeg_utils::av_err2str;
 use ffmpeg_sys_next::{
     av_buffer_unref, av_dict_parse_string, av_hwdevice_ctx_create, av_hwdevice_ctx_create_derived,
     av_hwdevice_find_type_by_name, av_hwdevice_get_type_name, av_hwdevice_iterate_types,
-    avcodec_get_hw_config, AVBufferRef, AVCodec, AVHWDeviceType, AVERROR,
+    avcodec_get_hw_config, avfilter_get_by_name, AVBufferRef, AVCodec, AVHWDeviceType, AVERROR,
     AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX, EINVAL, ENOMEM,
 };
 use log::{error, warn};
@@ -464,6 +465,182 @@ fn add_hw_device(device: HWDevice) {
     devices.push(device);
 }
 
+/// Runtime availability of one GPU filter backend: the hardware device type
+/// plus the FFmpeg filters that run on it.
+///
+/// Produced by [`get_gpu_filter_backends`]. `device_available` reflects this
+/// machine (driver present, device usable); `filters[i].present_in_build`
+/// reflects the linked FFmpeg build (compiled with that filter or not).
+/// A filter chain such as `scale_cuda=1280:720` is usable only when both are true.
+#[derive(Clone, Debug)]
+pub struct GpuFilterBackend {
+    /// FFmpeg device type name, e.g. "cuda", "vaapi", "qsv", "vulkan", "opencl".
+    pub name: String,
+    pub device_type: AVHWDeviceType,
+    /// Whether a device of this type could actually be created on this machine.
+    pub device_available: bool,
+    /// FFmpeg error text when device creation failed — surface this to users,
+    /// it usually names the missing piece (driver, permission, library).
+    pub device_error: Option<String>,
+    /// Known GPU filters of this backend and whether the linked FFmpeg build has them.
+    pub filters: Vec<GpuFilterAvailability>,
+}
+
+/// Presence of a single named filter in the linked FFmpeg build.
+#[derive(Clone, Debug)]
+pub struct GpuFilterAvailability {
+    pub name: &'static str,
+    pub present_in_build: bool,
+}
+
+/// Well-known GPU filters per backend, used to pre-fill
+/// [`GpuFilterBackend::filters`]. Presence is still checked at runtime.
+fn known_filters_for(device_type: AVHWDeviceType) -> &'static [&'static str] {
+    match device_type {
+        AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA => &[
+            "scale_cuda",
+            "overlay_cuda",
+            "yadif_cuda",
+            "bwdif_cuda",
+            "chromakey_cuda",
+            "colorspace_cuda",
+            "bilateral_cuda",
+            "thumbnail_cuda",
+            "hwupload_cuda",
+        ],
+        AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI => &[
+            "scale_vaapi",
+            "deinterlace_vaapi",
+            "denoise_vaapi",
+            "procamp_vaapi",
+            "sharpness_vaapi",
+            "tonemap_vaapi",
+            "overlay_vaapi",
+            "transpose_vaapi",
+        ],
+        AVHWDeviceType::AV_HWDEVICE_TYPE_QSV => {
+            &["scale_qsv", "vpp_qsv", "overlay_qsv", "deinterlace_qsv"]
+        }
+        AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN => &[
+            "scale_vulkan",
+            "gblur_vulkan",
+            "avgblur_vulkan",
+            "chromaber_vulkan",
+            "overlay_vulkan",
+            "flip_vulkan",
+            "hflip_vulkan",
+            "vflip_vulkan",
+            "transpose_vulkan",
+            "nlmeans_vulkan",
+            "bwdif_vulkan",
+            "blend_vulkan",
+            "xfade_vulkan",
+            "libplacebo",
+        ],
+        AVHWDeviceType::AV_HWDEVICE_TYPE_OPENCL => &[
+            "program_opencl",
+            "avgblur_opencl",
+            "boxblur_opencl",
+            "overlay_opencl",
+            "tonemap_opencl",
+            "unsharp_opencl",
+            "nlmeans_opencl",
+            "xfade_opencl",
+        ],
+        _ => &[],
+    }
+}
+
+/// Returns whether the linked FFmpeg build contains a filter with this name.
+///
+/// ```rust,ignore
+/// assert!(ez_ffmpeg::hwaccel::is_filter_available("scale"));
+/// let has_cuda_scale = ez_ffmpeg::hwaccel::is_filter_available("scale_cuda");
+/// ```
+pub fn is_filter_available(name: &str) -> bool {
+    let Ok(name_cstr) = CString::new(name) else {
+        return false;
+    };
+    !unsafe { avfilter_get_by_name(name_cstr.as_ptr()) }.is_null()
+}
+
+/// Probes every hardware device type known to the linked FFmpeg build and
+/// reports, per backend, whether a device can be created on this machine and
+/// which of its GPU filters are compiled into the build.
+///
+/// Use this before constructing a GPU `filter_desc` chain to pick a working
+/// backend and to give users actionable errors instead of a mid-pipeline failure:
+///
+/// ```rust,ignore
+/// let usable: Vec<_> = ez_ffmpeg::hwaccel::get_gpu_filter_backends()
+///     .into_iter()
+///     .filter(|b| b.device_available)
+///     .collect();
+/// ```
+///
+/// Note: probing creates (and immediately frees) one device per type, which can
+/// load vendor libraries; call it once at startup, not per job. Probe devices
+/// are never registered for pipeline use, so this has no effect on
+/// `filter_hw_device` selection.
+pub fn get_gpu_filter_backends() -> Vec<GpuFilterBackend> {
+    let mut backends = Vec::new();
+    let mut device_type = AVHWDeviceType::AV_HWDEVICE_TYPE_NONE;
+
+    loop {
+        device_type = unsafe { av_hwdevice_iterate_types(device_type) };
+        if device_type == AVHWDeviceType::AV_HWDEVICE_TYPE_NONE {
+            break;
+        }
+
+        let name = unsafe {
+            let name = av_hwdevice_get_type_name(device_type);
+            if name.is_null() {
+                continue;
+            }
+            match CStr::from_ptr(name).to_str() {
+                Ok(name) => name.to_string(),
+                Err(_) => "unknown name".to_string(),
+            }
+        };
+
+        let (device_available, device_error) = probe_hw_device(device_type);
+
+        let filters = known_filters_for(device_type)
+            .iter()
+            .map(|filter_name| GpuFilterAvailability {
+                name: filter_name,
+                present_in_build: is_filter_available(filter_name),
+            })
+            .collect();
+
+        backends.push(GpuFilterBackend {
+            name,
+            device_type,
+            device_available,
+            device_error,
+            filters,
+        });
+    }
+
+    backends
+}
+
+/// Tries to create a device of the given type and frees it immediately.
+/// Deliberately does NOT register the device in `HW_DEVICES`: probing must not
+/// change which device `hw_device_for_filter()` later picks for real pipelines.
+fn probe_hw_device(device_type: AVHWDeviceType) -> (bool, Option<String>) {
+    let mut device_ref: *mut AVBufferRef = null_mut();
+    let err =
+        unsafe { av_hwdevice_ctx_create(&mut device_ref, device_type, null(), null_mut(), 0) };
+    if err < 0 {
+        unsafe { av_buffer_unref(&mut device_ref) };
+        (false, Some(av_err2str(err)))
+    } else {
+        unsafe { av_buffer_unref(&mut device_ref) };
+        (true, None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,5 +649,46 @@ mod tests {
     fn test_get_hwaccels() {
         let hwaccels = get_hwaccels();
         println!("{:?}", hwaccels);
+    }
+
+    #[test]
+    fn test_is_filter_available() {
+        // "scale" exists in every FFmpeg build; garbage names never do.
+        assert!(is_filter_available("scale"));
+        assert!(!is_filter_available("definitely_not_a_filter_xyz"));
+        assert!(!is_filter_available("bad\0name"));
+    }
+
+    #[test]
+    fn test_get_gpu_filter_backends_does_not_register_devices() {
+        let devices_before = HW_DEVICES
+            .get()
+            .map(|m| m.lock().unwrap().len())
+            .unwrap_or(0);
+
+        let backends = get_gpu_filter_backends();
+        for backend in &backends {
+            println!(
+                "{}: device_available={} error={:?} filters_in_build={}/{}",
+                backend.name,
+                backend.device_available,
+                backend.device_error,
+                backend
+                    .filters
+                    .iter()
+                    .filter(|f| f.present_in_build)
+                    .count(),
+                backend.filters.len(),
+            );
+        }
+
+        let devices_after = HW_DEVICES
+            .get()
+            .map(|m| m.lock().unwrap().len())
+            .unwrap_or(0);
+        assert_eq!(
+            devices_before, devices_after,
+            "probing must not register devices in HW_DEVICES"
+        );
     }
 }
