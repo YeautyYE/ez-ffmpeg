@@ -1,3 +1,11 @@
+//! Deprecated OpenGL-based frame filtering. Superseded by
+//! [`crate::wgpu_filter::WgpuFrameFilter`] (feature `wgpu`); see the
+//! `opengl` module docs for the migration mapping.
+
+// The deprecation targets downstream users; the module's own impls and tests
+// legitimately keep using the type.
+#![allow(deprecated)]
+
 use crate::core::filter::frame_filter_context::FrameFilterContext;
 use crate::filter::frame_filter::FrameFilter;
 use ffmpeg_next::Frame;
@@ -13,7 +21,17 @@ use crate::util::frame_utils::ensure_software_format;
 /// OpenGLFrameFilter: A struct to manage OpenGL-based frame filtering.
 /// It allows custom shader setup, OpenGL initialization, and texture-based processing of video frames.
 /// This is particularly useful for applying GPU-accelerated filters in video processing pipelines.
-
+///
+/// **Deprecated**: superseded by [`crate::wgpu_filter::WgpuFrameFilter`],
+/// which runs headless, converts colors on the GPU with the correct matrix,
+/// and overlaps GPU work with CPU work. This type remains functional but
+/// will be removed in a future major release.
+#[deprecated(
+    since = "0.11.0",
+    note = "use `wgpu_filter::WgpuFrameFilter` (feature \"wgpu\") for custom GPU shaders, or \
+            FFmpeg native hardware filters (scale_vaapi/scale_cuda/...) in filter_desc; the \
+            OpenGL path requires a display connection and does CPU color conversion"
+)]
 pub struct OpenGLFrameFilter {
     /// GLSL vertex shader code provided by the user.
     vertex_shader_code: String,
