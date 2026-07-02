@@ -10,6 +10,7 @@ use ffmpeg_sys_next::{
 };
 use std::ffi::c_void;
 use std::ptr::null_mut;
+use std::sync::Arc;
 
 use ffmpeg_context::{InputOpaque, OutputOpaque};
 
@@ -275,18 +276,14 @@ pub(crate) struct FrameData {
     pub(crate) bits_per_raw_sample: i32,
     pub(crate) input_stream_width: i32,
     pub(crate) input_stream_height: i32,
-    pub(crate) subtitle_header_size: i32,
-    pub(crate) subtitle_header: *mut u8,
+    /// Owned copy of the decoder's subtitle header (e.g. ASS script info),
+    /// shared across fan-out sends without reallocation. Owning the bytes
+    /// keeps the header valid after the decoder context is freed.
+    pub(crate) subtitle_header: Option<Arc<[u8]>>,
 
     pub(crate) fg_input_index: usize,
 }
-
-// SAFETY: FrameData can be sent to another thread. The subtitle_header pointer is owned
-// by the FrameData and only accessed from the processing thread.
-unsafe impl Send for FrameData {}
-// SAFETY: FrameData is Sync because concurrent access is prevented by the scheduler's
-// sequential frame processing within each pipeline.
-unsafe impl Sync for FrameData {}
+// Send + Sync are auto-derived: every field is owned data.
 
 pub(crate) struct PacketBox {
     pub(crate) packet: ffmpeg_next::Packet,

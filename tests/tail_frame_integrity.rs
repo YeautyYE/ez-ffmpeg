@@ -43,8 +43,15 @@ fn wait_with_watchdog(
     std::thread::spawn(move || {
         let _ = tx.send(scheduler.wait());
     });
-    rx.recv_timeout(Duration::from_secs(secs))
-        .unwrap_or_else(|_| panic!("scenario `{scenario}` did not finish within {secs}s (hang)"))
+    match rx.recv_timeout(Duration::from_secs(secs)) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("scenario `{scenario}` did not finish within {secs}s (hang)")
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("scenario `{scenario}`: wait() thread panicked before reporting")
+        }
+    }
 }
 
 fn video_nb_frames(path: &str) -> i64 {

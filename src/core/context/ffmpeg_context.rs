@@ -1277,51 +1277,56 @@ unsafe fn map_auto_subtitle(
         return Ok(());
     }
 
+    // An explicit user codec (including "copy") must not be gated on the
+    // container's default subtitle encoder being available
+    // (matches ffmpeg_mux_init.c:1698 `!avcodec_find_encoder(...) && !subtitle_codec_name`).
     let output_codec = avcodec_find_encoder((*oformat).subtitle_codec);
-    if output_codec.is_null() {
+    if output_codec.is_null() && mux.subtitle_codec.is_none() {
         return Ok(());
     }
-    let output_descriptor = avcodec_descriptor_get((*output_codec).id);
+    let output_descriptor = if output_codec.is_null() {
+        null()
+    } else {
+        avcodec_descriptor_get((*output_codec).id)
+    };
 
+    // Scan every subtitle stream of every input and map the first compatible
+    // one (matches ffmpeg_mux_init.c:1701-1725, which iterates all input
+    // streams and only stops after a successful mapping — an incompatible
+    // first track, e.g. PGS before srt, must not end the search).
     for (demux_idx, demux) in demuxs.iter_mut().enumerate() {
-        let option = demux
-            .get_streams()
-            .iter()
-            .enumerate()
-            .find_map(|(index, input_stream)| {
-                if input_stream.codec_type == AVMEDIA_TYPE_SUBTITLE {
-                    Some(index)
-                } else {
-                    None
-                }
-            });
+        for stream_index in 0..demux.get_streams().len() {
+            if demux.get_stream(stream_index).codec_type != AVMEDIA_TYPE_SUBTITLE {
+                continue;
+            }
 
-        if option.is_none() {
-            continue;
-        }
+            let input_descriptor =
+                avcodec_descriptor_get((*demux.get_stream(stream_index).codec_parameters).codec_id);
+            let mut input_props = 0;
+            if !input_descriptor.is_null() {
+                input_props =
+                    (*input_descriptor).props & (AV_CODEC_PROP_TEXT_SUB | AV_CODEC_PROP_BITMAP_SUB);
+            }
+            let mut output_props = 0;
+            if !output_descriptor.is_null() {
+                output_props =
+                    (*output_descriptor).props & (AV_CODEC_PROP_TEXT_SUB | AV_CODEC_PROP_BITMAP_SUB);
+            }
 
-        let stream_index = option.unwrap();
+            // A user-chosen codec short-circuits the text/bitmap check
+            // (matches ffmpeg_mux_init.c:1717 `subtitle_codec_name || ...`).
+            let compatible = mux.subtitle_codec.is_some()
+                || input_props & output_props != 0
+                // Map dvb teletext which has neither property to any output subtitle encoder
+                || !input_descriptor.is_null() && !output_descriptor.is_null()
+                    && ((*input_descriptor).props == 0 || (*output_descriptor).props == 0);
+            if !compatible {
+                continue;
+            }
 
-        let input_descriptor =
-            avcodec_descriptor_get((*demux.get_stream(stream_index).codec_parameters).codec_id);
-        let mut input_props = 0;
-        if !input_descriptor.is_null() {
-            input_props =
-                (*input_descriptor).props & (AV_CODEC_PROP_TEXT_SUB | AV_CODEC_PROP_BITMAP_SUB);
-        }
-        let mut output_props = 0;
-        if !output_descriptor.is_null() {
-            output_props =
-                (*output_descriptor).props & (AV_CODEC_PROP_TEXT_SUB | AV_CODEC_PROP_BITMAP_SUB);
-        }
-
-        if input_props & output_props != 0 ||
-            // Map dvb teletext which has neither property to any output subtitle encoder
-            !input_descriptor.is_null() && !output_descriptor.is_null() &&
-                ((*input_descriptor).props == 0 || (*output_descriptor).props == 0)
-        {
+            // choose_encoder returns None for "copy": take the streamcopy
+            // path like map_auto_stream instead of failing.
             let option = choose_encoder(mux, AVMEDIA_TYPE_SUBTITLE)?;
-
             if let Some((_codec_id, enc)) = option {
                 let (frame_sender, output_stream_index) =
                     mux.add_enc_stream(AVMEDIA_TYPE_SUBTITLE, enc, demux.node.clone())?;
@@ -1337,11 +1342,32 @@ unsafe fn map_auto_subtitle(
                     );
                 }
             } else {
-                error!("Error selecting an encoder(subtitle)");
-                return Err(OpenOutputError::from(AVERROR_ENCODER_NOT_FOUND).into());
+                let input_stream = demux.get_stream(stream_index);
+                let input_stream_duration = input_stream.duration;
+                let input_stream_time_base = input_stream.time_base;
+
+                let (packet_sender, _st, output_stream_index) =
+                    mux.new_stream(demux.node.clone())?;
+                demux.add_packet_dst(packet_sender, stream_index, output_stream_index);
+                mux.register_stream_source(output_stream_index, demux_idx, stream_index, false);
+
+                unsafe {
+                    streamcopy_init(
+                        mux,
+                        *(*demux.in_fmt_ctx).streams.add(stream_index),
+                        *(*mux.out_fmt_ctx).streams.add(output_stream_index),
+                        demux.framerate,
+                    )?;
+                    rescale_duration(
+                        input_stream_duration,
+                        input_stream_time_base,
+                        *(*mux.out_fmt_ctx).streams.add(output_stream_index),
+                    );
+                    mux.stream_ready()
+                }
             }
+            return Ok(());
         }
-        break;
     }
 
     Ok(())

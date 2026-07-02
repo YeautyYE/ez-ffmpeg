@@ -313,8 +313,11 @@ unsafe fn transcode_subtitles(
         return Ok(());
     }
 
+    // Only EOF/flush sentinels (null packet or the demuxer's stream_index < 0
+    // flush marker) are replaced with an empty packet to drain the decoder;
+    // real packets must be decoded as-is (matches ffmpeg_dec.c's `!pkt`).
     let mut packet_is_eof = false;
-    if packet_is_null(&packet_box.packet) || (*packet_box.packet.as_ptr()).stream_index >= 0 {
+    if packet_is_null(&packet_box.packet) || (*packet_box.packet.as_ptr()).stream_index < 0 {
         let Ok(packet) = packet_pool.get() else {
             return Err(Decoding(DecodingOperationError::PacketAllocationError(
                 DecodingError::OutOfMemory,
@@ -649,8 +652,7 @@ unsafe fn dec_frame_to_box(dp_arc: Arc<Mutex<DecoderParameter>>, frame: Frame) -
             bits_per_raw_sample: (*dec_ctx).bits_per_raw_sample,
             input_stream_width: (*dec_ctx).width,
             input_stream_height: (*dec_ctx).height,
-            subtitle_header_size: (*dec_ctx).subtitle_header_size,
-            subtitle_header: (*dec_ctx).subtitle_header,
+            subtitle_header: dp.dec.subtitle_header.clone(),
             fg_input_index: usize::MAX,
         },
     }
@@ -778,8 +780,19 @@ fn dec_open(
         {
             let dp_arc_clone = dp_arc.clone();
             let mut dp = dp_arc_clone.lock().unwrap();
-            dp.dec.subtitle_header = (*dec_ctx).subtitle_header;
-            dp.dec.subtitle_header_size = (*dec_ctx).subtitle_header_size;
+            // Own a copy of the subtitle header: dec_ctx (and the buffer it
+            // points to) is freed when the decoder exits, while encoders read
+            // the header later (matches ffmpeg_dec.c owning its own copy).
+            dp.dec.subtitle_header = if (*dec_ctx).subtitle_header.is_null()
+                || (*dec_ctx).subtitle_header_size <= 0
+            {
+                None
+            } else {
+                Some(Arc::from(std::slice::from_raw_parts(
+                    (*dec_ctx).subtitle_header as *const u8,
+                    (*dec_ctx).subtitle_header_size as usize,
+                )))
+            };
         }
 
         if !param_out.is_null() {
@@ -1115,7 +1128,7 @@ struct DecoderParameter {
 
 }
 
-// SAFETY: DecoderParameter contains raw pointers (dec_ctx, subtitle_header) but is safe to
+// SAFETY: DecoderParameter contains a raw pointer (dec_ctx) but is safe to
 // Send/Sync because:
 // 1. The decoder thread has exclusive ownership of the AVCodecContext during decoding
 // 2. DecoderParameter is wrapped in Arc<Mutex<>> ensuring synchronized access
@@ -1148,8 +1161,7 @@ impl DecoderParameter {
         Self {
             dec: Decoder {
                 media_type: dec_stream.codec_type,
-                subtitle_header_size: 0,
-                subtitle_header: null_mut(),
+                subtitle_header: None,
                 frames_decoded: 0,
                 samples_decoded: 0,
                 decode_errors: 0,
@@ -1179,8 +1191,9 @@ struct Decoder {
     #[allow(dead_code)]
     media_type: AVMediaType,
 
-    subtitle_header_size: i32,
-    subtitle_header: *mut u8,
+    /// Owned copy of dec_ctx.subtitle_header, captured right after
+    /// avcodec_open2; outlives the decoder context for downstream encoders.
+    subtitle_header: Option<Arc<[u8]>>,
 
     // number of frames/samples retrieved from the decoder
     frames_decoded: u64,
