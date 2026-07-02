@@ -23,6 +23,10 @@
 //!   - `context`: Houses [`FfmpegContext`] for assembling an FFmpeg job.
 //!   - `scheduler`: Provides [`FfmpegScheduler`] which manages the lifecycle of that job.
 //!
+//! - **`wgpu_filter`** (feature `"wgpu"`): GPU-accelerated frame filters via wgpu
+//!   (Vulkan/Metal/DX12/GL). Provide a WGSL fragment shader and apply effects with
+//!   correct color handling, headless operation, and GPU/CPU overlap.
+//!
 //! - **`opengl`** (feature `"opengl"`): Offers GPU-accelerated OpenGL filters, letting you
 //!   provide a fragment shader and apply effects to video frames in a high-performance way
 //!   without manually managing the GL context.
@@ -76,11 +80,12 @@
 //! ```toml
 //! [dependencies.ez-ffmpeg]
 //! version = "*"
-//! features = ["opengl", "rtmp", "flv", "async"]
+//! features = ["wgpu", "rtmp", "flv", "async"]
 //! ```
 //!
 //! ### Core Features
 //!
+//! - **`wgpu`**: Enables wgpu-based GPU filters (WGSL shaders, headless-capable).
 //! - **`opengl`**: Enables OpenGL-based filters for GPU-accelerated processing.
 //! - **`rtmp`**: Embedded RTMP server tuned for scale (10,000+ conns on Linux/macOS, 8,000 on Windows),
 //!   native epoll/kqueue/WSAPoll IO (edge-triggered on Linux/macOS), zero-copy GOP, and in-process ingest
@@ -124,6 +129,9 @@ pub mod opengl;
 use surfman::declare_surfman;
 #[cfg(feature = "opengl")]
 declare_surfman!();
+
+#[cfg(feature = "wgpu")]
+pub mod wgpu_filter;
 
 #[cfg(feature = "rtmp")]
 pub mod rtmp;
