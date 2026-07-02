@@ -2333,7 +2333,7 @@ fn bind_fg_inputs_by_fg(filter_graphs: &mut Vec<FilterGraph>) -> Result<()> {
         .collect::<Vec<_>>();
 
     for (i, (inputs, _outputs)) in fg_labels.iter().enumerate() {
-        for input_filter_label in inputs.iter() {
+        for (input_pad_idx, input_filter_label) in inputs.iter().enumerate() {
             if input_filter_label.linklabel.is_empty() {
                 continue;
             }
@@ -2371,9 +2371,15 @@ fn bind_fg_inputs_by_fg(filter_graphs: &mut Vec<FilterGraph>) -> Result<()> {
                     {
                         let filter_graph = &mut filter_graphs[j];
                         filter_graph.outputs[output_idx].set_dst(sender);
-                        filter_graph.outputs[output_idx].fg_input_index = i;
+                        // The consumer routes frames and indexes its per-pad
+                        // finished_flag_list by INPUT PAD index, not by the
+                        // consumer's graph index.
+                        filter_graph.outputs[output_idx].fg_input_index = input_pad_idx;
                         filter_graph.outputs[output_idx].finished_flag_list = finished_flag_list;
                     }
+                    // Mark the pad so fg_complex_bind_input does not bind it
+                    // to a demuxer stream on top of this connection.
+                    filter_graphs[i].inputs[input_pad_idx].bound = true;
 
                     break 'outer;
                 }
@@ -2388,6 +2394,13 @@ fn fg_complex_bind_input(
     input_filter_index: usize,
     demuxs: &mut Vec<Demuxer>,
 ) -> Result<()> {
+    // A pad already connected to another filtergraph's output must not also
+    // be bound to a demuxer stream (covers labeled pads including the
+    // reserved "in" label, which otherwise takes the auto-bind branch).
+    if filter_graph.inputs[input_filter_index].bound {
+        return Ok(());
+    }
+
     let graph_desc = &filter_graph.graph_desc;
     let input_filter = &mut filter_graph.inputs[input_filter_index];
     let (demux_idx, stream_idx) = if !input_filter.linklabel.is_empty()
@@ -3310,6 +3323,118 @@ mod tests {
     use ffmpeg_sys_next::{
         avfilter_graph_alloc, avfilter_graph_free, avfilter_graph_parse_ptr, avfilter_inout_free,
     };
+
+    use crate::core::context::ffmpeg_context::{bind_fg_inputs_by_fg, fg_complex_bind_input};
+    use crate::core::context::filter_graph::FilterGraph;
+    use crate::core::context::input_filter::InputFilter;
+    use crate::core::context::null_frame;
+    use crate::core::context::output_filter::OutputFilter;
+    use ffmpeg_sys_next::AVMediaType::AVMEDIA_TYPE_VIDEO;
+
+    fn test_input(linklabel: &str, name: &str) -> InputFilter {
+        InputFilter::new(
+            linklabel.to_string(),
+            AVMEDIA_TYPE_VIDEO,
+            name.to_string(),
+            null_frame(),
+        )
+    }
+
+    fn test_graph(inputs: Vec<InputFilter>, outputs: Vec<OutputFilter>) -> FilterGraph {
+        FilterGraph::new("null".to_string(), None, inputs, outputs)
+    }
+
+    #[test]
+    fn cross_graph_binding_uses_input_pad_index_and_marks_bound() {
+        // Producer (graph 0): one output labeled "mid".
+        // Consumer (graph 1): pad 0 labeled "mid", pad 1 unlabeled.
+        // The consumer's GRAPH index (1) differs from the matching PAD
+        // index (0) on purpose: routing and finished_flag_list indexing
+        // work per input pad, not per graph.
+        let producer = test_graph(
+            vec![test_input("", "in0")],
+            vec![OutputFilter::new(
+                "mid".to_string(),
+                AVMEDIA_TYPE_VIDEO,
+                "out0".to_string(),
+            )],
+        );
+        let consumer = test_graph(
+            vec![test_input("mid", "in0"), test_input("", "in1")],
+            vec![OutputFilter::new(
+                String::new(),
+                AVMEDIA_TYPE_VIDEO,
+                "out0".to_string(),
+            )],
+        );
+        let mut graphs = vec![producer, consumer];
+
+        bind_fg_inputs_by_fg(&mut graphs).unwrap();
+
+        assert!(
+            graphs[0].outputs[0].has_dst(),
+            "producer output must be connected to the consumer"
+        );
+        assert_eq!(
+            graphs[0].outputs[0].fg_input_index, 0,
+            "fg_input_index must be the consumer's input PAD index, not its graph index"
+        );
+        assert_eq!(
+            graphs[0].outputs[0].finished_flag_list.len(),
+            2,
+            "the producer must hold the consumer's per-pad finished flags"
+        );
+        assert!(
+            graphs[1].inputs[0].bound,
+            "the cross-connected pad must be marked bound"
+        );
+        assert!(
+            !graphs[1].inputs[1].bound,
+            "unrelated pads must stay unbound"
+        );
+    }
+
+    #[test]
+    fn complex_bind_skips_already_bound_labeled_input() {
+        let mut consumer = test_graph(
+            vec![test_input("mid", "in0")],
+            vec![OutputFilter::new(
+                String::new(),
+                AVMEDIA_TYPE_VIDEO,
+                "out0".to_string(),
+            )],
+        );
+        consumer.inputs[0].bound = true;
+
+        // No demuxers exist: if the pad were (re-)bound to an input stream
+        // this would fail with "stream not found".
+        let result = fg_complex_bind_input(&mut consumer, 0, &mut Vec::new());
+        assert!(
+            result.is_ok(),
+            "a pad already bound to another graph must not be re-bound: {result:?}"
+        );
+    }
+
+    #[test]
+    fn complex_bind_skips_bound_reserved_in_label() {
+        // The reserved label "in" takes the auto-bind branch, which must
+        // also respect an existing cross-graph binding.
+        let mut consumer = test_graph(
+            vec![test_input("in", "in0")],
+            vec![OutputFilter::new(
+                String::new(),
+                AVMEDIA_TYPE_VIDEO,
+                "out0".to_string(),
+            )],
+        );
+        consumer.inputs[0].bound = true;
+
+        let result = fg_complex_bind_input(&mut consumer, 0, &mut Vec::new());
+        assert!(
+            result.is_ok(),
+            "a bound pad labeled 'in' must not fall through to stream auto-binding: {result:?}"
+        );
+    }
 
     #[test]
     fn test_filter() {

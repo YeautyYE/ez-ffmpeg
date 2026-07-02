@@ -7,6 +7,9 @@ pub(crate) struct InputFilter {
     pub(crate) media_type: AVMediaType,
     pub(crate) name: String,
     pub(crate) opts: InputFilterOptions,
+    /// Set when this pad was connected to another filtergraph's output;
+    /// such a pad must not additionally be bound to a demuxer stream.
+    pub(crate) bound: bool,
 }
 
 impl InputFilter {
@@ -16,6 +19,7 @@ impl InputFilter {
             media_type,
             name,
             opts: InputFilterOptions::new(fallback),
+            bound: false,
         }
     }
 }
