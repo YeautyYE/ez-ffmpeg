@@ -43,7 +43,10 @@ pub fn get_hwaccels() -> Vec<HWAccelInfo> {
 }
 
 static HW_DEVICES: OnceLock<Mutex<Vec<HWDevice>>> = OnceLock::new();
-static FILTER_HW_DEVICE: OnceLock<Mutex<Option<HWDevice>>> = OnceLock::new();
+// Stores only the device NAME: the device itself lives in HW_DEVICES,
+// mirroring ffmpeg_hw.c where filter_hw_device is a borrowed pointer into
+// hw_devices — one owner, freed exactly once.
+static FILTER_HW_DEVICE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 pub(crate) fn new_hw_devices() -> Mutex<Vec<HWDevice>> {
     Mutex::new(Vec::new())
@@ -55,8 +58,8 @@ pub(crate) fn init_filter_hw_device(hw_device: &str) -> i32 {
         return 0;
     }
     match hw_device_init_from_string(hw_device) {
-        (err, Some(dev)) if err == 0 => {
-            FILTER_HW_DEVICE.set(Mutex::new(Some(dev.clone()))).ok();
+        (0, Some(dev)) => {
+            FILTER_HW_DEVICE.set(Mutex::new(Some(dev.name.clone()))).ok();
             0
         }
         (_, _) => {
@@ -86,21 +89,11 @@ unsafe impl Send for HWDevice {}
 unsafe impl Sync for HWDevice {}
 
 pub(crate) unsafe fn hw_device_free_all() {
-    // Free the global filter hardware device
-    if let Some(filter_device) = FILTER_HW_DEVICE.get() {
-        match filter_device.lock() {
-            Ok(mut device_guard) => {
-                if let Some(device) = device_guard.as_mut() {
-                    // Check if device reference is valid to avoid double free
-                    if !device.device_ref.is_null() {
-                        av_buffer_unref(&mut device.device_ref);
-                        // Note: av_buffer_unref will set the pointer to null
-                    }
-                }
-            }
-            Err(e) => {
-                error!("Failed to lock global filter hardware device: {}", e);
-            }
+    // The filter device slot holds only a name; the device it refers to is
+    // owned by HW_DEVICES and freed exactly once below.
+    if let Some(slot) = FILTER_HW_DEVICE.get() {
+        if let Ok(mut slot) = slot.lock() {
+            slot.take();
         }
     }
 
@@ -126,10 +119,12 @@ pub(crate) unsafe fn hw_device_free_all() {
 }
 
 pub(crate) fn hw_device_for_filter() -> Option<HWDevice> {
-    if let Some(dev) = FILTER_HW_DEVICE.get() {
-        let dev_option = dev.lock().unwrap();
-        if let Some(dev) = dev_option.as_ref() {
-            return Some(dev.clone());
+    if let Some(slot) = FILTER_HW_DEVICE.get() {
+        let slot = slot.lock().unwrap();
+        if let Some(name) = slot.as_ref() {
+            // An explicitly configured filter device wins; resolve it from
+            // the single owning list.
+            return hw_device_get_by_name(name);
         }
     }
     let devices = HW_DEVICES.get_or_init(new_hw_devices);
@@ -201,16 +196,38 @@ pub(crate) fn hw_device_get_by_type(device_type: AVHWDeviceType) -> Option<HWDev
     found
 }
 
+/// Split a device specification into the device type name and the remainder
+/// starting at the first ':', '=' or '@' separator (e.g. "cuda:0" -> ("cuda", ":0")).
+fn split_device_type(arg: &str) -> (&str, &str) {
+    // k is a byte offset of an ASCII separator (or arg.len()), so both
+    // slices split at a char boundary.
+    let k = arg.find([':', '=', '@']).unwrap_or(arg.len());
+    // The type is the prefix BEFORE the separator (ffmpeg_hw.c
+    // hw_device_init_from_string: av_strndup(arg, k)).
+    (&arg[..k], &arg[k..])
+}
+
+/// Parse the ":device[,key=value...]" tail of a device specification into
+/// the device name and the options string. The leading ':' is a separator,
+/// not part of the device name (ffmpeg_hw.c skips it with `++p` first).
+fn split_device_and_options(p: &str) -> (Option<&str>, Option<&str>) {
+    let rest = p.strip_prefix(':').unwrap_or(p);
+    match rest.find(',') {
+        Some(comma_pos) => (
+            (comma_pos > 0).then(|| &rest[..comma_pos]),
+            Some(&rest[comma_pos + 1..]),
+        ),
+        None => (if rest.is_empty() { None } else { Some(rest) }, None),
+    }
+}
+
 pub(crate) fn hw_device_init_from_string(arg: &str) -> (i32, Option<HWDevice>) {
     let mut device_ref = null_mut();
 
-    let k = arg
-        .find([':', '=', '@'])
-        .unwrap_or(arg.len());
-    let mut p = &arg[k..];
+    let (type_str, mut p) = split_device_type(arg);
 
-    let Ok(type_name) = CString::new(p) else {
-        error!("Device creation failed: type:{p} can't convert to CString");
+    let Ok(type_name) = CString::new(type_str) else {
+        error!("Device creation failed: type:{type_str} can't convert to CString");
         return (AVERROR(ENOMEM), None);
     };
     let device_type = unsafe { av_hwdevice_find_type_by_name(type_name.as_ptr()) };
@@ -250,15 +267,11 @@ pub(crate) fn hw_device_init_from_string(arg: &str) -> (i32, Option<HWDevice>) {
         }
     } else if p.starts_with(':') {
         // New device with some parameters.
-        let mut device_name: Option<String> = None;
+        let (device_name, options_str) = split_device_and_options(p);
         let mut options = null_mut();
 
-        if let Some(comma_pos) = p.find(',') {
-            if comma_pos > 0 {
-                device_name = Some(p[..comma_pos].to_string());
-            }
+        if let Some(v) = options_str {
             unsafe {
-                let v = &p[comma_pos + 1..];
                 let Ok(v_cstr) = CString::new(v) else {
                     error!("Device creation failed: option:{v} can't convert to CString");
                     av_buffer_unref(&mut device_ref);
@@ -279,15 +292,13 @@ pub(crate) fn hw_device_init_from_string(arg: &str) -> (i32, Option<HWDevice>) {
                     return (AVERROR(EINVAL), None);
                 }
             }
-        } else if !p.is_empty() {
-            device_name = Some(p.to_string());
         }
 
         let err = unsafe {
             match device_name {
                 None => av_hwdevice_ctx_create(&mut device_ref, device_type, null(), options, 0),
                 Some(device_name) => {
-                    let Ok(device_name_cstr) = CString::new(device_name.clone()) else {
+                    let Ok(device_name_cstr) = CString::new(device_name) else {
                         error!("Device creation failed: device_name:{device_name} can't convert to CString");
                         av_buffer_unref(&mut device_ref);
                         return (AVERROR(EINVAL), None);
@@ -472,5 +483,50 @@ mod tests {
     fn test_get_hwaccels() {
         let hwaccels = get_hwaccels();
         println!("{:?}", hwaccels);
+    }
+
+    // Device specifications follow ffmpeg's -init_hw_device syntax:
+    // type[=name][:device[,key=value...]] or type@source. The TYPE is the
+    // part BEFORE the first separator (ffmpeg_hw.c: av_strndup(arg, k)).
+    #[test]
+    fn split_plain_type() {
+        assert_eq!(split_device_type("cuda"), ("cuda", ""));
+    }
+
+    #[test]
+    fn split_type_with_device_ordinal() {
+        assert_eq!(split_device_type("cuda:0"), ("cuda", ":0"));
+    }
+
+    #[test]
+    fn split_type_with_name_and_source() {
+        assert_eq!(split_device_type("vaapi=va@src"), ("vaapi", "=va@src"));
+    }
+
+    // The ":device[,key=value...]" tail: the leading ':' is a separator,
+    // not part of the device name (ffmpeg_hw.c: `++p` before parsing) —
+    // "cuda:1" must select device "1", not a device named ":1" (which CUDA's
+    // strtol would silently read as 0).
+    #[test]
+    fn device_tail_plain_ordinal() {
+        assert_eq!(split_device_and_options(":0"), (Some("0"), None));
+    }
+
+    #[test]
+    fn device_tail_with_options() {
+        assert_eq!(
+            split_device_and_options(":/dev/dri/renderD128,k=v"),
+            (Some("/dev/dri/renderD128"), Some("k=v"))
+        );
+    }
+
+    #[test]
+    fn device_tail_options_only() {
+        assert_eq!(split_device_and_options(":,k=v"), (None, Some("k=v")));
+    }
+
+    #[test]
+    fn device_tail_empty() {
+        assert_eq!(split_device_and_options(":"), (None, None));
     }
 }
