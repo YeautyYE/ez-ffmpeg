@@ -98,7 +98,10 @@ pub(crate) fn ready_to_init_mux(
                         if thread_sync.is_all_threads_done() {
                             scheduler_status.store(STATUS_END, Ordering::Release);
                         }
-                        error!("mux init thread exit");
+                        warn!(
+                            "mux init aborted: encoder(s) exited before all {stream_count} streams became ready ({} ready)",
+                            nb_streams_ready.load(Ordering::Acquire)
+                        );
                         break;
                     }
                     continue;

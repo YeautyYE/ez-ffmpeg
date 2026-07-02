@@ -214,6 +214,9 @@ pub enum DecodingOperationError {
     #[error("corrupt decoded frame")]
     CorruptFrame,
 
+    #[error("decode error rate exceeded the maximum allowed")]
+    ErrorRateExceeded,
+
     #[error("during retrieve data on hw: {0}")]
     HWRetrieveDataError(DecodingError),
 
@@ -345,6 +348,9 @@ pub enum OpenEncoderOperationError {
 
     #[error("during context allocation: {0}")]
     ContextAllocationError(OpenEncoderError),
+
+    #[error(": no frames were received before EOF; encoder never opened")]
+    NoFramesReceived,
 
     #[error("Thread exited")]
     ThreadExited,

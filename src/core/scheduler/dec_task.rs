@@ -100,7 +100,6 @@ pub(crate) fn dec_init(
         .spawn(move || {
             let dp_arc = dp_arc;
             let input_status = false;
-            let ret = 0;
             let mut err_exit = false;
 
             loop {
@@ -176,8 +175,8 @@ pub(crate) fn dec_init(
                             avcodec_flush_buffers(dp.dec_ctx.as_mut_ptr());
                         } else {
                             err_exit = true;
+                            error!("Error processing packet in decoder: {e}");
                             set_scheduler_error(&scheduler_status, &scheduler_result, e);
-                            error!("Error processing packet in decoder: {}", av_err2str(ret));
                             break;
                         }
                     }
@@ -219,8 +218,14 @@ pub(crate) fn dec_init(
                     };
                     let max_error_rate = 2.0 / 3.0;
                     if err_rate > max_error_rate {
+                        // Mirrors FFmpeg's -max_error_rate contract: exceeding the
+                        // rate must fail the task, not just log.
                         error!("Decoder error rate {err_rate} exceeds maximum {max_error_rate}");
-                        // ret = FFMPEG_ERROR_RATE_EXCEEDED;
+                        set_scheduler_error(
+                            &scheduler_status,
+                            &scheduler_result,
+                            Decoding(crate::error::DecodingOperationError::ErrorRateExceeded),
+                        );
                     } else if err_rate != 0.0 {
                         debug!("Decoder error rate {err_rate}");
                     }
