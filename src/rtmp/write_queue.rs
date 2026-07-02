@@ -195,6 +195,12 @@ impl WriteQueue {
             if entry.is_sequence_header {
                 break;
             }
+            // A partially written entry is pinned: evicting it mid-send
+            // would resume the byte stream inside a different tag and
+            // corrupt the whole connection.
+            if entry.offset > 0 {
+                break;
+            }
             if entry.age_secs() > max_age {
                 if let Some(removed) = self.queue.pop_front() {
                     self.total_bytes = self.total_bytes.saturating_sub(removed.remaining_bytes());
@@ -264,6 +270,24 @@ impl WriteQueue {
     #[cfg(test)]
     fn dropped_frames(&self) -> u64 {
         self.dropped_frames
+    }
+
+    /// Backdate the front entry past any eviction window (test only)
+    #[cfg(test)]
+    fn backdate_front(&mut self, secs: u64) {
+        if let Some(front) = self.queue.front_mut() {
+            if let Some(t) =
+                Instant::now().checked_sub(std::time::Duration::from_secs(secs))
+            {
+                front.timestamp = t;
+            }
+        }
+    }
+
+    /// Write offset of the front entry (test only)
+    #[cfg(test)]
+    fn front_offset(&self) -> Option<usize> {
+        self.queue.front().map(|e| e.offset)
     }
 
     /// Has video flag (test only)
@@ -486,6 +510,53 @@ mod tests {
         let result = queue.try_flush(&mut writer).unwrap();
         assert!(matches!(result, FlushResult::WouldBlock { bytes_written: 3 }));
         assert!(!queue.is_empty());
+    }
+
+    #[test]
+    fn eviction_keeps_partially_written_front_entry() {
+        struct WouldBlockWriter {
+            written: usize,
+            block_after: usize,
+        }
+
+        impl Write for WouldBlockWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                if self.written >= self.block_after {
+                    return Err(io::Error::from(io::ErrorKind::WouldBlock));
+                }
+                let n = buf.len().min(self.block_after - self.written);
+                self.written += n;
+                Ok(n)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut queue = WriteQueue::new();
+        queue.enqueue(Bytes::from_static(b"hello"), false, false, true);
+
+        // Send the first 3 bytes: the peer now holds half an FLV tag.
+        let mut writer = WouldBlockWriter {
+            written: 0,
+            block_after: 3,
+        };
+        let _ = queue.try_flush(&mut writer).unwrap();
+        assert_eq!(queue.front_offset(), Some(3));
+
+        // Age it far past the eviction window, then trigger eviction via a
+        // Warning-level enqueue. Evicting a half-sent entry would resume the
+        // byte stream in the middle of a different tag and corrupt it.
+        queue.backdate_front(60);
+        queue.enqueue(make_data(QUEUE_WARN_BYTES), true, false, true);
+        queue.enqueue(make_data(10), true, false, true);
+
+        assert_eq!(
+            queue.front_offset(),
+            Some(3),
+            "a partially written entry must never be evicted"
+        );
     }
 
     #[test]
