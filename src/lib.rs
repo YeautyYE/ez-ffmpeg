@@ -1,3 +1,7 @@
+// In test builds, libtest-generated code references test items through the
+// deprecated `opengl` module path, which a file-level allow cannot cover.
+#![cfg_attr(test, allow(deprecated))]
+
 //! # ez-ffmpeg
 //!
 //! **ez-ffmpeg** provides a safe and ergonomic Rust interface for [FFmpeg](https://ffmpeg.org)
@@ -27,9 +31,9 @@
 //!   (Vulkan/Metal/DX12/GL). Provide a WGSL fragment shader and apply effects with
 //!   correct color handling, headless operation, and GPU/CPU overlap.
 //!
-//! - **`opengl`** (feature `"opengl"`): Offers GPU-accelerated OpenGL filters, letting you
-//!   provide a fragment shader and apply effects to video frames in a high-performance way
-//!   without manually managing the GL context.
+//! - **`opengl`** (feature `"opengl"`, deprecated): The former OpenGL filter path,
+//!   superseded by `wgpu_filter`. Kept for backward compatibility; it requires a
+//!   display connection and will be removed in a future major release.
 //!
 //! - **`rtmp`** (feature `"rtmp"`): Embedded RTMP server `EmbedRtmpServer` built for production streaming,
 //!   using native epoll/kqueue/WSAPoll via libc FFI (edge-triggered on Linux/macOS, level-triggered on Windows),
@@ -86,7 +90,7 @@
 //! ### Core Features
 //!
 //! - **`wgpu`**: Enables wgpu-based GPU filters (WGSL shaders, headless-capable).
-//! - **`opengl`**: Enables OpenGL-based filters for GPU-accelerated processing.
+//! - **`opengl`** (deprecated): Enables the former OpenGL-based filters; superseded by `wgpu`.
 //! - **`rtmp`**: Embedded RTMP server tuned for scale (10,000+ conns on Linux/macOS, 8,000 on Windows),
 //!   native epoll/kqueue/WSAPoll IO (edge-triggered on Linux/macOS), zero-copy GOP, and in-process ingest
 //!   that avoids TCP between FFmpeg and server.
@@ -124,6 +128,11 @@ pub use ffmpeg_next::Frame;
 
 
 #[cfg(feature = "opengl")]
+#[deprecated(
+    since = "0.11.0",
+    note = "the OpenGL filter path is superseded by `wgpu_filter` (feature \"wgpu\"): it needs a \
+            display connection and converts colors on the CPU; see the module docs for migration"
+)]
 pub mod opengl;
 #[cfg(feature = "opengl")]
 use surfman::declare_surfman;
