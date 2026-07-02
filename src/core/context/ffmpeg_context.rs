@@ -33,6 +33,11 @@ use crate::util::ffmpeg_utils::hashmap_to_avdictionary;
 #[cfg(not(feature = "docs-rs"))]
 use ffmpeg_sys_next::AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC;
 #[cfg(not(feature = "docs-rs"))]
+use ffmpeg_sys_next::{
+    avformat_query_codec, AVSTREAM_EVENT_FLAG_NEW_PACKETS, AV_DISPOSITION_ATTACHED_PIC,
+    AV_DISPOSITION_DEFAULT,
+};
+#[cfg(not(feature = "docs-rs"))]
 use ffmpeg_sys_next::AVCodecConfig::*;
 use ffmpeg_sys_next::AVCodecID::{AV_CODEC_ID_AC3, AV_CODEC_ID_MP3, AV_CODEC_ID_NONE};
 use ffmpeg_sys_next::AVColorRange::AVCOL_RANGE_UNSPECIFIED;
@@ -1500,84 +1505,169 @@ unsafe fn map_auto_stream(
             return Ok(());
         }
 
-    for (demux_idx, demux) in demuxs.iter_mut().enumerate() {
-        let option = demux
-            .get_streams()
-            .iter()
-            .enumerate()
-            .find_map(|(index, input_stream)| {
-                if input_stream.codec_type == media_type {
-                    Some(index)
-                } else {
-                    None
-                }
-            });
+    // Mirror ffmpeg_mux_init.c map_auto_video/map_auto_audio: score every
+    // stream of every input and map the single global best (video: highest
+    // resolution; audio: most channels). Other types keep first-found.
+    let selected = if media_type == AVMEDIA_TYPE_VIDEO || media_type == AVMEDIA_TYPE_AUDIO {
+        unsafe { select_best_stream(demuxs, oformat, media_type) }
+    } else {
+        demuxs.iter().enumerate().find_map(|(demux_idx, demux)| {
+            demux
+                .get_streams()
+                .iter()
+                .position(|input_stream| input_stream.codec_type == media_type)
+                .map(|stream_index| (demux_idx, stream_index))
+        })
+    };
+    let Some((demux_idx, stream_index)) = selected else {
+        return Ok(());
+    };
 
-        if option.is_none() {
-            continue;
-        }
+    let demux = &mut demuxs[demux_idx];
+    let input_file_idx = demux_idx;
+    let option = choose_encoder(mux, media_type)?;
 
-        let stream_index = option.unwrap();
-        let input_file_idx = demux_idx;
-        let option = choose_encoder(mux, media_type)?;
-
-        if let Some((codec_id, enc)) = option {
-            if media_type == AVMEDIA_TYPE_VIDEO || media_type == AVMEDIA_TYPE_AUDIO {
-                init_simple_filtergraph(
-                    demux,
-                    stream_index,
-                    codec_id,
-                    enc,
-                    mux_index,
-                    mux,
-                    filter_graphs,
-                    input_file_idx,
-                )?;
-            } else {
-                let (frame_sender, output_stream_index) =
-                    mux.add_enc_stream(media_type, enc, demux.node.clone())?;
-                demux.get_stream_mut(stream_index).add_dst(frame_sender);
-                demux.connect_stream(stream_index);
-                mux.register_stream_source(output_stream_index, input_file_idx, stream_index, true);
-                let input_stream = demux.get_stream(stream_index);
-                unsafe {
-                    rescale_duration(
-                        input_stream.duration,
-                        input_stream.time_base,
-                        *(*mux.out_fmt_ctx).streams.add(output_stream_index),
-                    );
-                }
-            }
-
-            return Ok(());
-        }
-
-        // copy
-        let input_stream = demux.get_stream(stream_index);
-        let input_stream_duration = input_stream.duration;
-        let input_stream_time_base = input_stream.time_base;
-
-        let (packet_sender, _st, output_stream_index) = mux.new_stream(demux.node.clone())?;
-        demux.add_packet_dst(packet_sender, stream_index, output_stream_index);
-        mux.register_stream_source(output_stream_index, input_file_idx, stream_index, false);
-
-        unsafe {
-            streamcopy_init(
+    if let Some((codec_id, enc)) = option {
+        if media_type == AVMEDIA_TYPE_VIDEO || media_type == AVMEDIA_TYPE_AUDIO {
+            init_simple_filtergraph(
+                demux,
+                stream_index,
+                codec_id,
+                enc,
+                mux_index,
                 mux,
-                *(*demux.in_fmt_ctx).streams.add(stream_index),
-                *(*mux.out_fmt_ctx).streams.add(output_stream_index),
-                demux.framerate,
+                filter_graphs,
+                input_file_idx,
             )?;
-            rescale_duration(
-                input_stream_duration,
-                input_stream_time_base,
-                *(*mux.out_fmt_ctx).streams.add(output_stream_index),
-            );
-            mux.stream_ready()
+        } else {
+            let (frame_sender, output_stream_index) =
+                mux.add_enc_stream(media_type, enc, demux.node.clone())?;
+            demux.get_stream_mut(stream_index).add_dst(frame_sender);
+            demux.connect_stream(stream_index);
+            mux.register_stream_source(output_stream_index, input_file_idx, stream_index, true);
+            let input_stream = demux.get_stream(stream_index);
+            unsafe {
+                rescale_duration(
+                    input_stream.duration,
+                    input_stream.time_base,
+                    *(*mux.out_fmt_ctx).streams.add(output_stream_index),
+                );
+            }
         }
+
+        return Ok(());
+    }
+
+    // copy: like the encoder branch, the CLI maps exactly one stream per
+    // media type.
+    let input_stream = demux.get_stream(stream_index);
+    let input_stream_duration = input_stream.duration;
+    let input_stream_time_base = input_stream.time_base;
+
+    let (packet_sender, _st, output_stream_index) = mux.new_stream(demux.node.clone())?;
+    demux.add_packet_dst(packet_sender, stream_index, output_stream_index);
+    mux.register_stream_source(output_stream_index, input_file_idx, stream_index, false);
+
+    unsafe {
+        streamcopy_init(
+            mux,
+            *(*demux.in_fmt_ctx).streams.add(stream_index),
+            *(*mux.out_fmt_ctx).streams.add(output_stream_index),
+            demux.framerate,
+        )?;
+        rescale_duration(
+            input_stream_duration,
+            input_stream_time_base,
+            *(*mux.out_fmt_ctx).streams.add(output_stream_index),
+        );
+        mux.stream_ready()
     }
 
     Ok(())
+}
+
+/// Pick the globally best video/audio stream across all inputs
+/// (ffmpeg_mux_init.c map_auto_video:1539 / map_auto_audio:1648): video is
+/// scored by resolution, audio by channel count, both raised by
+/// NEW_PACKETS/DEFAULT-disposition bonuses; attached pictures only win where
+/// the container itself is picture-based (avformat_query_codec == 'APIC').
+#[cfg(not(feature = "docs-rs"))]
+unsafe fn select_best_stream(
+    demuxs: &[Demuxer],
+    oformat: *const AVOutputFormat,
+    media_type: AVMediaType,
+) -> Option<(usize, usize)> {
+    const APIC_TAG: i32 =
+        (b'A' as i32) | ((b'P' as i32) << 8) | ((b'I' as i32) << 16) | ((b'C' as i32) << 24);
+    let qcr = if media_type == AVMEDIA_TYPE_VIDEO {
+        avformat_query_codec(oformat, (*oformat).video_codec, 0)
+    } else {
+        0
+    };
+
+    let mut best: Option<(usize, usize)> = None;
+    let mut best_score: i64 = 0;
+
+    for (demux_idx, demux) in demuxs.iter().enumerate() {
+        let mut file_best: Option<usize> = None;
+        let mut file_best_score: i64 = 0;
+
+        for (stream_index, input_stream) in demux.get_streams().iter().enumerate() {
+            if input_stream.codec_type != media_type {
+                continue;
+            }
+            // The CLI also skips AV_CODEC_PROP_ENHANCEMENT streams (LCEVC
+            // enhancement layers); ffmpeg-sys-next 7.1 has no binding for
+            // that flag yet, so the check is deferred to the bindings bump.
+
+            let par = input_stream.codec_parameters;
+            let st = input_stream.stream.inner;
+            let attached_pic = (*st).disposition & AV_DISPOSITION_ATTACHED_PIC != 0;
+
+            let mut score: i64 = if media_type == AVMEDIA_TYPE_VIDEO {
+                (*par).width as i64 * (*par).height as i64
+            } else {
+                (*par).ch_layout.nb_channels as i64
+            };
+            if (*st).event_flags & AVSTREAM_EVENT_FLAG_NEW_PACKETS != 0 {
+                score += 100_000_000;
+            }
+            if (*st).disposition & AV_DISPOSITION_DEFAULT != 0 {
+                score += 5_000_000;
+            }
+            if media_type == AVMEDIA_TYPE_VIDEO && qcr != APIC_TAG && attached_pic {
+                // Cover art only wins when nothing else is available.
+                score = 1;
+            }
+
+            if score > file_best_score {
+                if media_type == AVMEDIA_TYPE_VIDEO && qcr == APIC_TAG && !attached_pic {
+                    // This container carries video only as an attached picture.
+                    continue;
+                }
+                file_best_score = score;
+                file_best = Some(stream_index);
+            }
+        }
+
+        if let Some(stream_index) = file_best {
+            let st = demux.get_stream(stream_index).stream.inner;
+            let attached_pic = (*st).disposition & AV_DISPOSITION_ATTACHED_PIC != 0;
+            // The DEFAULT-disposition bonus ranks streams within one file
+            // only; drop it before comparing across files.
+            if (media_type != AVMEDIA_TYPE_VIDEO || qcr == APIC_TAG || !attached_pic)
+                && (*st).disposition & AV_DISPOSITION_DEFAULT != 0
+            {
+                file_best_score -= 5_000_000;
+            }
+            if file_best_score > best_score {
+                best_score = file_best_score;
+                best = Some((demux_idx, stream_index));
+            }
+        }
+    }
+
+    best
 }
 
 fn init_simple_filtergraph(
@@ -1658,7 +1748,12 @@ fn streamcopy_init(
             return Err(OpenOutputError::from(ret).into());
         }
 
-        let mut codec_tag = (*(*output_stream).codecpar).codec_tag;
+        // In the CLI this is the user's -tag value, 0 when absent; ez has no
+        // per-stream tag option yet. Seeding it from the copied parameters
+        // made the check below unreachable, so a source tag the target
+        // container cannot represent (e.g. AVI's FMP4 into mp4) was kept and
+        // avformat_write_header rejected it.
+        let mut codec_tag = 0;
         if codec_tag == 0 {
             let ct = (*(*mux.out_fmt_ctx).oformat).codec_tag;
             let mut codec_tag_tmp = 0;
