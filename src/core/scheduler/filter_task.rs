@@ -1,5 +1,6 @@
 use crate::core::context::filter_graph::FilterGraph;
 use crate::core::context::input_filter::{InputFilterOptions, IFILTER_FLAG_AUTOROTATE};
+use crate::core::display::get_rotation;
 use crate::core::context::obj_pool::ObjPool;
 use crate::core::context::output::VSyncMethod;
 use crate::core::context::output::VSyncMethod::{VsyncCfr, VsyncVscfr};
@@ -56,7 +57,6 @@ use ffmpeg_sys_next::{
 };
 use log::{debug, error, info, trace, warn};
 use std::collections::VecDeque;
-use std::f64::consts::PI;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -2635,51 +2635,6 @@ fn insert_filter(
     *last_filter = ctx;
     *pad_idx = 0;
     0
-}
-
-fn get_rotation(displaymatrix: &[i32; 9]) -> f64 {
-    let mut theta = -round(display_rotation_get(displaymatrix));
-
-    theta -= 360.0 * (theta / 360.0 + 0.9 / 360.0).floor();
-
-    if (theta - 90.0 * (theta / 90.0).round()).abs() > 2.0 {
-        warn!(
-            "Odd rotation angle.\n\
-            If you want to help, upload a sample \
-            of this file to https://streams.videolan.org/upload/ \
-            and contact the ffmpeg-devel mailing list. (ffmpeg-devel@ffmpeg.org)"
-        );
-    }
-
-    theta
-}
-
-fn display_rotation_get(matrix: &[i32; 9]) -> f64 {
-    let mut scale = [0.0; 2];
-
-    scale[0] = hypot(conv_fp(matrix[0]), conv_fp(matrix[3]));
-    scale[1] = hypot(conv_fp(matrix[1]), conv_fp(matrix[4]));
-
-    if scale[0] == 0.0 || scale[1] == 0.0 {
-        return f64::NAN;
-    }
-
-    let rotation =
-        (conv_fp(matrix[1]) / scale[1]).atan2(conv_fp(matrix[0]) / scale[0]) * 180.0 / PI;
-
-    -rotation
-}
-
-fn hypot(x: f64, y: f64) -> f64 {
-    (x.powi(2) + y.powi(2)).sqrt()
-}
-
-fn conv_fp(value: i32) -> f64 {
-    value as f64 / 1_073_741_824.0 // CONV_FP converts fixed-point values
-}
-
-fn round(value: f64) -> f64 {
-    value.round()
 }
 
 #[cfg(feature = "docs-rs")]

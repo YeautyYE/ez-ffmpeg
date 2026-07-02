@@ -79,6 +79,9 @@
 /// ```
 pub mod context;
 
+/// Display matrix helpers shared by stream probing and filter graph setup.
+pub(crate) mod display;
+
 /// The **scheduler** module orchestrates the execution of a configured [`FfmpegContext`](context::ffmpeg_context::FfmpegContext).
 /// It provides the [`FfmpegScheduler`](scheduler::ffmpeg_scheduler::FfmpegScheduler) struct, which:
 ///
