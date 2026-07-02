@@ -240,6 +240,24 @@ impl StreamInfo {
     }
 }
 
+/// Rotation in whole degrees from the stream-level display matrix, or None
+/// when the stream carries none.
+///
+/// # Safety
+/// The caller must ensure `codecpar` points into a live `AVStream`.
+unsafe fn display_matrix_rotation(
+    codecpar: &ffmpeg_sys_next::AVCodecParameters,
+) -> Option<i32> {
+    if codecpar.coded_side_data.is_null() || codecpar.nb_coded_side_data <= 0 {
+        return None;
+    }
+    let side_data = std::slice::from_raw_parts(
+        codecpar.coded_side_data,
+        codecpar.nb_coded_side_data as usize,
+    );
+    crate::core::display::rotation_from_side_data(side_data)
+}
+
 /// Extracts a `StreamInfo` from a single raw `AVStream` pointer.
 ///
 /// # Safety
@@ -280,9 +298,16 @@ unsafe fn extract_stream_info_from_stream(raw_stream: *mut ffmpeg_sys_next::AVSt
             } else {
                 avg_frame_rate.num as f64 / avg_frame_rate.den as f64
             };
-            let rotate = metadata
-                .get("rotate")
-                .and_then(|rotate| rotate.parse::<i32>().ok())
+            // Modern demuxers (mov.c, matroskadec.c) export rotation only as
+            // an AV_PKT_DATA_DISPLAYMATRIX entry in coded_side_data; the
+            // metadata "rotate" tag survives as a fallback for nonstandard
+            // containers (matches fftools get_rotation, cmdutils.c:1553).
+            let rotate = display_matrix_rotation(codecpar)
+                .or_else(|| {
+                    metadata
+                        .get("rotate")
+                        .and_then(|rotate| rotate.parse::<i32>().ok())
+                })
                 .unwrap_or(0);
 
             StreamInfo::Video {
@@ -742,6 +767,54 @@ mod tests {
     fn test_find_unknown_stream_info() {
         let option = find_unknown_stream_info("test.mp4").unwrap();
         assert!(option.is_none())
+    }
+
+    #[test]
+    fn rotate_reads_display_matrix_side_data() {
+        use ffmpeg_sys_next::AVPacketSideDataType::AV_PKT_DATA_DISPLAYMATRIX;
+        use ffmpeg_sys_next::{
+            av_display_rotation_set, av_malloc, av_packet_side_data_add,
+            avformat_alloc_context, avformat_free_context, avformat_new_stream,
+        };
+
+        unsafe {
+            let mut fmt_ctx = avformat_alloc_context();
+            assert!(!fmt_ctx.is_null());
+            let stream = avformat_new_stream(fmt_ctx, null());
+            assert!(!stream.is_null());
+            let codecpar = (*stream).codecpar;
+            (*codecpar).codec_type = AVMEDIA_TYPE_VIDEO;
+
+            // iPhone portrait: the display matrix says "rotate 90 degrees
+            // clockwise to show upright" — the legacy metadata tag for the
+            // same file was rotate=90. No metadata is set here: modern
+            // demuxers only export the matrix.
+            let matrix = av_malloc(36);
+            assert!(!matrix.is_null());
+            av_display_rotation_set(matrix as *mut i32, 90.0);
+            let added = av_packet_side_data_add(
+                &mut (*codecpar).coded_side_data,
+                &mut (*codecpar).nb_coded_side_data,
+                AV_PKT_DATA_DISPLAYMATRIX,
+                matrix,
+                36,
+                0,
+            );
+            assert!(!added.is_null());
+
+            let info = extract_stream_info_from_stream(stream);
+            match info {
+                StreamInfo::Video { rotate, .. } => assert_eq!(
+                    rotate, 90,
+                    "rotate must come from the display matrix side data"
+                ),
+                other => panic!("expected video stream info, got {other:?}"),
+            }
+
+            avformat_free_context(fmt_ctx);
+            fmt_ctx = null_mut();
+            let _ = fmt_ctx;
+        }
     }
 
     #[test]
