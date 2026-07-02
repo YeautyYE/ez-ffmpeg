@@ -1720,7 +1720,7 @@ unsafe fn video_sync_process(
     /* delta0 is the "drift" between the input frame and
      * where it would fall in the output. */
     let mut delta0 = sync_ipts - ofp.next_pts as f64;
-    let delta = delta0 + duration;
+    let mut delta = delta0 + duration;
 
     // tracks the number of times the PREVIOUS frame should be duplicated,
     // mostly for variable framerate (VFR)
@@ -1740,15 +1740,19 @@ unsafe fn video_sync_process(
     }
 
     match vsync_method {
-        VSyncMethod::VsyncVscfr => {
-            if fps.frame_number == 0 && delta0 >= 0.5 {
-                log::debug!("Not duplicating {} initial frames", delta0 as i32);
-                // delta = duration;
-                // delta0 = 0.0;
+        // VSCFR is CFR that keeps the first frame's original timestamp: its
+        // prologue suppresses the initial padding, then FALLS THROUGH into
+        // the CFR drop/duplicate logic (ffmpeg_filter.c:2554-2570).
+        VSyncMethod::VsyncVscfr | VSyncMethod::VsyncCfr => {
+            if vsync_method == VSyncMethod::VsyncVscfr
+                && fps.frame_number == 0
+                && delta0 >= 0.5
+            {
+                debug!("Not duplicating {} initial frames", delta0.round() as i32);
+                delta = duration;
+                delta0 = 0.0;
                 ofp.next_pts = sync_ipts.round() as i64;
             }
-        }
-        VSyncMethod::VsyncCfr => {
             if delta < -1.1 {
                 *nb_frames = 0;
             } else if delta > 1.1 {
