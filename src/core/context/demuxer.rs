@@ -93,6 +93,7 @@ impl Demuxer {
         autorotate: bool,
         ts_scale: f64,
         framerate: AVRational,
+        log_level_offset: i32,
     ) -> crate::error::Result<Self> {
         let streams = Self::init_streams(
             in_fmt_ctx,
@@ -102,6 +103,7 @@ impl Demuxer {
             hwaccel.clone(),
             hwaccel_device,
             hwaccel_output_format,
+            log_level_offset,
         )?;
 
         Ok(Self {
@@ -136,6 +138,7 @@ impl Demuxer {
         hwaccel: Option<String>,
         hwaccel_device: Option<String>,
         hwaccel_output_format: Option<String>,
+        log_level_offset: i32,
     ) -> crate::error::Result<Vec<DecoderStream>> {
         unsafe {
             let stream_count = (*fmt_ctx).nb_streams;
@@ -195,6 +198,7 @@ impl Demuxer {
                     hwaccel_device_type,
                     hwaccel_device,
                     hwaccel_output_format,
+                    log_level_offset,
                 );
                 streams.push(stream);
             }

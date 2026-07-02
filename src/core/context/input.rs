@@ -209,6 +209,10 @@ pub struct Input {
     /// select output format used with HW accelerated decoding
     pub(crate) hwaccel_output_format: Option<String>,
 
+    /// Log-level offset applied to this input's decoders
+    /// (`AVCodecContext.log_level_offset`).
+    pub(crate) log_level_offset: Option<i32>,
+
     /// Input options for avformat_open_input.
     ///
     /// This field stores options that are passed to FFmpeg's `avformat_open_input()` function.
@@ -688,6 +692,34 @@ impl Input {
         self
     }
 
+    /// Sets a **log-level offset** for this input's decoders
+    /// (`AVCodecContext.log_level_offset`).
+    ///
+    /// FFmpeg shifts the effective level of every message a decoder emits by
+    /// this offset. Expected decoder noise — e.g. h264 `Missing reference
+    /// picture` / `decode_slice_header error` bursts right after seeking to a
+    /// non-keyframe (open GOP) — is logged at ERROR level; an offset of `8`
+    /// (one AV_LOG step) demotes those to WARNING for this input only,
+    /// without hiding errors from other inputs.
+    ///
+    /// # Arguments
+    /// * `offset` - Added to each message's log level; positive values make
+    ///   this input's decoders quieter, negative values make them louder.
+    ///
+    /// # Returns
+    /// * `Self` - allowing method chaining.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// // Screenshot after seek: demote expected h264 reference errors.
+    /// let input = Input::from("video.mp4")
+    ///     .set_log_level_offset(8);
+    /// ```
+    pub fn set_log_level_offset(mut self, offset: i32) -> Self {
+        self.log_level_offset = Some(offset);
+        self
+    }
+
     /// Sets the **start time** (in microseconds) from which to begin reading.
     ///
     /// FFmpeg will skip all data before this timestamp. This can be used to
@@ -1027,6 +1059,7 @@ impl From<Box<dyn FnMut(&mut [u8]) -> i32 + Send>> for Input {
             hwaccel: None,
             hwaccel_device: None,
             hwaccel_output_format: None,
+            log_level_offset: None,
             input_opts: None,
             autorotate: None,
             ts_scale: None,
@@ -1055,6 +1088,7 @@ impl From<String> for Input {
             hwaccel: None,
             hwaccel_device: None,
             hwaccel_output_format: None,
+            log_level_offset: None,
             input_opts: None,
             autorotate: None,
             ts_scale: None,

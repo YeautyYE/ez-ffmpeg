@@ -2034,6 +2034,12 @@ unsafe fn open_output_file(index: usize, output: &mut Output, copy_ts: bool) -> 
     let audio_codec_opts = convert_options(output.audio_codec_opts.clone())?;
     let subtitle_codec_opts = convert_options(output.subtitle_codec_opts.clone())?;
     let format_opts = convert_options(output.format_opts.clone())?;
+    let format_opts = maybe_enable_image2_update(
+        out_fmt_ctx,
+        output.url.as_deref(),
+        output.max_video_frames,
+        format_opts,
+    );
 
     // Parse pix_fmt string to AVPixelFormat
     // FFmpeg CLI also fails on invalid format names (e.g., `ffmpeg -pix_fmt foobar` errors with
@@ -3082,9 +3088,64 @@ unsafe fn open_input_file(index: usize, input: &mut Input, copy_ts: bool) -> Res
             Some((num, den)) => AVRational { num, den },
             None => AVRational { num: 0, den: 0 },
         },
+        input.log_level_offset.unwrap_or(0),
     )?;
 
     Ok(demux)
+}
+
+/// Single-image convenience, equivalent to `ffmpeg ... -frames:v 1 -update 1`.
+///
+/// Writing one frame to an image2 output whose filename has no `%d` sequence
+/// pattern makes the muxer warn on the first frame and hard-fail on a second
+/// (libavformat/img2enc.c). With `max_video_frames == Some(1)` the
+/// single-image intent is explicit, so enable the muxer's `update` mode
+/// automatically — unless the user already configured a conflicting image2
+/// option (`update`, `strftime`, `frame_pts`) themselves. Multi-frame
+/// outputs are left untouched, keeping FFmpeg's missing-pattern protection.
+fn maybe_enable_image2_update(
+    out_fmt_ctx: *mut AVFormatContext,
+    url: Option<&str>,
+    max_video_frames: Option<i64>,
+    format_opts: Option<HashMap<CString, CString>>,
+) -> Option<HashMap<CString, CString>> {
+    if max_video_frames != Some(1) {
+        return format_opts;
+    }
+    // A filename carrying a sequence pattern ('%03d', strftime '%'-codes, …)
+    // must keep image2's pattern expansion: update mode would write the
+    // pattern string as a literal filename. Only plain URLs qualify;
+    // write-callback outputs (no URL) are left untouched.
+    let Some(url) = url else {
+        return format_opts;
+    };
+    if url.contains('%') {
+        return format_opts;
+    }
+    // SAFETY: out_fmt_ctx was successfully allocated by
+    // avformat_alloc_output_context2 earlier in open_output_file and is not
+    // freed before Muxer::new takes ownership; oformat/name are read-only
+    // static muxer metadata.
+    let is_image2 = unsafe {
+        let oformat = (*out_fmt_ctx).oformat;
+        !oformat.is_null()
+            && !(*oformat).name.is_null()
+            && std::ffi::CStr::from_ptr((*oformat).name).to_bytes() == b"image2"
+    };
+    if !is_image2 {
+        return format_opts;
+    }
+
+    let mut opts = format_opts.unwrap_or_default();
+    let user_configured = opts.keys().any(|key| {
+        matches!(key.to_bytes(), b"update" | b"strftime" | b"frame_pts")
+    });
+    if !user_configured {
+        info!("single-image output detected (max_video_frames=1): enabling image2 'update' mode");
+        // Both literals are NUL-free; unwrap cannot fail.
+        opts.insert(CString::new("update").unwrap(), CString::new("1").unwrap());
+    }
+    Some(opts)
 }
 
 fn convert_options(
