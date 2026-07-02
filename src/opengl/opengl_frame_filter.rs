@@ -1,16 +1,14 @@
 use crate::core::filter::frame_filter_context::FrameFilterContext;
 use crate::filter::frame_filter::FrameFilter;
 use ffmpeg_next::Frame;
-use ffmpeg_sys_next::{
-    av_frame_get_buffer, av_q2d, sws_scale, AVFrame,
-    AVMediaType,
-};
+use ffmpeg_sys_next::{av_frame_get_buffer, av_q2d, sws_scale, AVFrame, AVMediaType};
 use glow::{HasContext, NativeProgram, PixelPackData, PixelUnpackData};
 use log::{info, warn};
 use surfman::{
     Connection, ContextAttributeFlags, ContextAttributes,
 };
 use crate::util::ffmpeg_utils::av_err2str;
+use crate::util::frame_utils::ensure_software_format;
 
 /// OpenGLFrameFilter: A struct to manage OpenGL-based frame filtering.
 /// It allows custom shader setup, OpenGL initialization, and texture-based processing of video frames.
@@ -287,7 +285,12 @@ impl OpenGLFrameFilter {
         self.height = height;
 
         unsafe {
-            self.gl.as_ref().unwrap().viewport(0, 0, width, height);
+            let gl = self.gl.as_ref().unwrap();
+            gl.viewport(0, 0, width, height);
+            // RGB24 rows are 3-byte aligned; the GL default of 4 would skew any
+            // width whose row size (width*3) is not a multiple of 4.
+            gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+            gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
         }
 
         self.setup_framebuffer(width, height)?;
@@ -450,7 +453,9 @@ impl OpenGLFrameFilter {
             (*rgb_frame.as_mut_ptr()).height = height;
             (*rgb_frame.as_mut_ptr()).format = ffmpeg_sys_next::AVPixelFormat::AV_PIX_FMT_RGB24 as i32;
 
-            let ret = av_frame_get_buffer(rgb_frame.as_mut_ptr(), 0);
+            // align=1: tightly packed rows (linesize == width*3), matching what the
+            // GL texture upload/readback paths expect for RGB24 without row padding.
+            let ret = av_frame_get_buffer(rgb_frame.as_mut_ptr(), 1);
             if ret < 0 {
                 return Err(format!("Failed to allocate buffer for RGB frame. {}", av_err2str(ret)));
             }
@@ -505,42 +510,98 @@ impl OpenGLFrameFilter {
         Ok(())
     }
 
+    // `is_multiple_of` would need Rust 1.87; keep `%` for the older MSRV.
+    #[allow(clippy::manual_is_multiple_of)]
     fn upload_frame_to_texture(&self, frame: &Frame) -> Result<(), String> {
         let gl = self.gl.as_ref().unwrap();
 
+        let width_bytes = self.width as usize * 3;
+        let height = self.height as usize;
+        // frame_data_mut rejects null/zero/negative strides, so the cast below
+        // only ever sees a positive linesize.
+        let data = unsafe { frame_data_mut(frame.as_ptr(), 0)? };
+        let linesize = unsafe { (*frame.as_ptr()).linesize[0] } as usize;
+
+        // SAFETY: `data` spans linesize*height bytes (guaranteed by frame_data_mut);
+        // every branch below reads at most (height-1)*linesize + width_bytes of it.
         unsafe {
             gl.bind_texture(glow::TEXTURE_2D, self.input_texture);
 
-            gl.tex_sub_image_2d(
-                glow::TEXTURE_2D,
-                0,
-                0,
-                0,
-                self.width,
-                self.height,
-                glow::RGB,
-                glow::UNSIGNED_BYTE,
-                glow::PixelUnpackData::Slice(Some(frame_data_mut(frame.as_ptr(), 0)?)),
-            );
-            Ok(())
+            if linesize == width_bytes {
+                self.tex_sub_image(gl, PixelUnpackData::Slice(Some(data)));
+            } else if linesize % 3 == 0 {
+                // FFmpeg pads rows to its own alignment; express the stride in
+                // pixels via GL_UNPACK_ROW_LENGTH so GL skips the padding.
+                gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, (linesize / 3) as i32);
+                self.tex_sub_image(gl, PixelUnpackData::Slice(Some(data)));
+                gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
+            } else {
+                // Stride not expressible in whole pixels: repack rows tightly.
+                let tight = copy_rows_tight(data, linesize, width_bytes, height);
+                self.tex_sub_image(gl, PixelUnpackData::Slice(Some(&tight)));
+            }
         }
+        Ok(())
+    }
+
+    /// Uploads pixel data for the full frame quad into the currently bound texture.
+    unsafe fn tex_sub_image(&self, gl: &glow::Context, pixels: PixelUnpackData) {
+        gl.tex_sub_image_2d(
+            glow::TEXTURE_2D,
+            0,
+            0,
+            0,
+            self.width,
+            self.height,
+            glow::RGB,
+            glow::UNSIGNED_BYTE,
+            pixels,
+        );
     }
 
     /// Reads the texture data from OpenGL and writes it to the specified AVFrame.
+    // `is_multiple_of` would need Rust 1.87; keep `%` for the older MSRV.
+    #[allow(clippy::manual_is_multiple_of)]
     fn read_texture_to_frame(&self, frame: &Frame) -> Result<(), String> {
         let gl = self.gl.as_ref().unwrap();
 
+        let width_bytes = self.width as usize * 3;
+        let height = self.height as usize;
+        // frame_data_mut rejects null/zero/negative strides, so the cast below
+        // only ever sees a positive linesize.
+        let data = unsafe { frame_data_mut(frame.as_ptr(), 0)? };
+        let linesize = unsafe { (*frame.as_ptr()).linesize[0] } as usize;
+
+        // SAFETY: `data` spans linesize*height bytes (guaranteed by frame_data_mut);
+        // every branch below writes at most (height-1)*linesize + width_bytes of it.
         unsafe {
-            gl.bind_texture(glow::TEXTURE_2D,self.output_texture);
-            gl.get_tex_image(
-                glow::TEXTURE_2D,
-                0,                   // Mipmap level
-                glow::RGB,           // Pixel format
-                glow::UNSIGNED_BYTE, // Data type
-                PixelPackData::Slice(Some(frame_data_mut(frame.as_ptr(), 0)?)),
-            );
+            gl.bind_texture(glow::TEXTURE_2D, self.output_texture);
+
+            if linesize == width_bytes {
+                self.get_tex_image(gl, PixelPackData::Slice(Some(data)));
+            } else if linesize % 3 == 0 {
+                // Mirror of the upload path: write rows at the frame's stride.
+                gl.pixel_store_i32(glow::PACK_ROW_LENGTH, (linesize / 3) as i32);
+                self.get_tex_image(gl, PixelPackData::Slice(Some(data)));
+                gl.pixel_store_i32(glow::PACK_ROW_LENGTH, 0);
+            } else {
+                let mut tight = vec![0u8; width_bytes * height];
+                self.get_tex_image(gl, PixelPackData::Slice(Some(&mut tight)));
+                scatter_rows_from_tight(&tight, data, linesize, width_bytes, height);
+            }
         }
         Ok(())
+    }
+
+    /// Reads the full output texture into the provided pixel destination.
+    unsafe fn get_tex_image(&self, gl: &glow::Context, pixels: PixelPackData) {
+        gl.get_tex_image(
+            glow::TEXTURE_2D,
+            0,                   // Mipmap level
+            glow::RGB,           // Pixel format
+            glow::UNSIGNED_BYTE, // Data type
+            pixels,
+        );
     }
 
     fn print_opengl_info(&self) {
@@ -734,6 +795,40 @@ fn setup_vertex_data(
     }
 }
 
+/// Copies image rows with stride `linesize` into a tightly packed buffer
+/// (`width_bytes` per row). Used when the source stride cannot be expressed
+/// through `GL_UNPACK_ROW_LENGTH` (i.e. `linesize % bytes_per_pixel != 0`).
+fn copy_rows_tight(data: &[u8], linesize: usize, width_bytes: usize, height: usize) -> Vec<u8> {
+    let mut tight = Vec::with_capacity(width_bytes * height);
+    for row in 0..height {
+        let start = row * linesize;
+        tight.extend_from_slice(&data[start..start + width_bytes]);
+    }
+    tight
+}
+
+/// Scatters a tightly packed buffer (`width_bytes` per row) back into an
+/// image buffer with stride `linesize`. Inverse of [`copy_rows_tight`].
+fn scatter_rows_from_tight(
+    tight: &[u8],
+    data: &mut [u8],
+    linesize: usize,
+    width_bytes: usize,
+    height: usize,
+) {
+    for row in 0..height {
+        let src = row * width_bytes;
+        let dst = row * linesize;
+        data[dst..dst + width_bytes].copy_from_slice(&tight[src..src + width_bytes]);
+    }
+}
+
+/// # Safety
+///
+/// `frame` must point to a valid `AVFrame` whose `data[index]` buffer holds at
+/// least `linesize[index] * height` bytes, and the returned slice must not
+/// outlive that buffer. The caller must also ensure no other reference to the
+/// frame data is alive for the returned lifetime.
 pub unsafe fn frame_data_mut<'a>(
     frame: *const AVFrame,
     index: usize,
@@ -742,10 +837,17 @@ pub unsafe fn frame_data_mut<'a>(
         return Err("Frame pointer is null".to_owned());
     }
 
-    let linesize = (*frame).linesize[index] as usize;
-    if linesize == 0 {
-        return Err(format!("Invalid linesize at index {}", index));
+    let linesize_raw = (*frame).linesize[index];
+    if linesize_raw <= 0 {
+        // Negative linesize means a bottom-up frame (data[0] points at the last
+        // row, e.g. some vflip outputs); casting it to usize would wrap around
+        // and produce an out-of-bounds slice. Reject instead of risking UB.
+        return Err(format!(
+            "Unsupported linesize {linesize_raw} at index {index}: zero or negative \
+             (bottom-up) strides are not supported by OpenGLFrameFilter"
+        ));
     }
+    let linesize = linesize_raw as usize;
 
     let data_ptr = (*frame).data[index];
     if data_ptr.is_null() {
@@ -793,8 +895,8 @@ impl FrameFilter for OpenGLFrameFilter {
             }
         }
 
-        let original_format: ffmpeg_sys_next::AVPixelFormat =
-            unsafe { std::mem::transmute((*frame.as_ptr()).format) };
+        let original_format = ensure_software_format(unsafe { (*frame.as_ptr()).format })
+            .map_err(|e| format!("OpenGLFrameFilter: {e}"))?;
 
         if self.input_texture.is_none() {
             let (width, height) = unsafe { ((*frame.as_ptr()).width, (*frame.as_ptr()).height) };
@@ -847,10 +949,96 @@ impl Drop for OpenGLFrameFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ffmpeg_sys_next::AVPixelFormat;
     use crate::core::context::output::Output;
     use crate::core::scheduler::ffmpeg_scheduler::{FfmpegScheduler, Initialization};
     use crate::core::context::ffmpeg_context::FfmpegContext;
     use crate::filter::frame_pipeline_builder::FramePipelineBuilder;
+
+    #[test]
+    fn test_ensure_software_format_accepts_cpu_formats() {
+        assert!(ensure_software_format(AVPixelFormat::AV_PIX_FMT_YUV420P as i32).is_ok());
+        assert!(ensure_software_format(AVPixelFormat::AV_PIX_FMT_RGB24 as i32).is_ok());
+        assert!(ensure_software_format(AVPixelFormat::AV_PIX_FMT_NV12 as i32).is_ok());
+    }
+
+    #[test]
+    fn test_ensure_software_format_rejects_hw_formats() {
+        for fmt in [
+            AVPixelFormat::AV_PIX_FMT_CUDA,
+            AVPixelFormat::AV_PIX_FMT_VAAPI,
+            AVPixelFormat::AV_PIX_FMT_VULKAN,
+            AVPixelFormat::AV_PIX_FMT_QSV,
+        ] {
+            let err = ensure_software_format(fmt as i32).unwrap_err();
+            assert!(err.contains("hardware frame"), "unexpected error: {err}");
+        }
+    }
+
+    #[test]
+    fn test_ensure_software_format_rejects_invalid_values() {
+        assert!(ensure_software_format(-1).is_err());
+        // Value from upstream issue #46 ("enum from invalid value 0x2005").
+        assert!(ensure_software_format(0x2005).is_err());
+        assert!(ensure_software_format(i32::MAX).is_err());
+    }
+
+    #[test]
+    fn test_copy_rows_tight_and_scatter_roundtrip() {
+        let width_bytes = 5;
+        let height = 3;
+        let linesize = 8; // padded stride, not a multiple of the row size
+        let mut padded = vec![0u8; linesize * height];
+        for row in 0..height {
+            for col in 0..width_bytes {
+                padded[row * linesize + col] = (row * 10 + col) as u8;
+            }
+        }
+
+        let tight = copy_rows_tight(&padded, linesize, width_bytes, height);
+        assert_eq!(tight.len(), width_bytes * height);
+        assert_eq!(&tight[0..5], &[0, 1, 2, 3, 4]);
+        assert_eq!(&tight[5..10], &[10, 11, 12, 13, 14]);
+        assert_eq!(&tight[10..15], &[20, 21, 22, 23, 24]);
+
+        let mut out = vec![0xFFu8; linesize * height];
+        scatter_rows_from_tight(&tight, &mut out, linesize, width_bytes, height);
+        for row in 0..height {
+            assert_eq!(
+                &out[row * linesize..row * linesize + width_bytes],
+                &tight[row * width_bytes..(row + 1) * width_bytes]
+            );
+            assert!(
+                out[row * linesize + width_bytes..(row + 1) * linesize]
+                    .iter()
+                    .all(|&b| b == 0xFF),
+                "padding bytes must stay untouched"
+            );
+        }
+    }
+
+    #[test]
+    fn test_frame_data_mut_rejects_non_positive_linesize() {
+        unsafe {
+            let mut frame = Frame::empty();
+            (*frame.as_mut_ptr()).width = 16;
+            (*frame.as_mut_ptr()).height = 16;
+            (*frame.as_mut_ptr()).format = AVPixelFormat::AV_PIX_FMT_RGB24 as i32;
+            assert!(av_frame_get_buffer(frame.as_mut_ptr(), 1) >= 0);
+
+            assert!(frame_data_mut(frame.as_ptr(), 0).is_ok());
+
+            // Simulate a bottom-up frame (negative stride, e.g. produced by
+            // vflip on some paths): must be rejected, not wrapped to a huge usize.
+            let positive = (*frame.as_ptr()).linesize[0];
+            (*frame.as_mut_ptr()).linesize[0] = -positive;
+            let err = frame_data_mut(frame.as_ptr(), 0).unwrap_err();
+            assert!(err.contains("bottom-up"), "unexpected error: {err}");
+
+            // Restore before drop so buffer bookkeeping stays consistent.
+            (*frame.as_mut_ptr()).linesize[0] = positive;
+        }
+    }
 
     #[test]
     fn test_filter_with_fg() {
