@@ -742,10 +742,14 @@ pub unsafe fn frame_data_mut<'a>(
         return Err("Frame pointer is null".to_owned());
     }
 
-    let linesize = (*frame).linesize[index] as usize;
-    if linesize == 0 {
-        return Err(format!("Invalid linesize at index {}", index));
+    let linesize = (*frame).linesize[index];
+    if linesize <= 0 {
+        // Negative linesize means a bottom-up frame layout, which this GL
+        // path does not support; casting it to usize would slice far out of
+        // bounds.
+        return Err(format!("Invalid linesize {} at index {}", linesize, index));
     }
+    let linesize = linesize as usize;
 
     let data_ptr = (*frame).data[index];
     if data_ptr.is_null() {
@@ -818,18 +822,33 @@ impl FrameFilter for OpenGLFrameFilter {
     }
 
     fn uninit(&mut self, _ctx: &FrameFilterContext) {
+        // init may have failed halfway and uninit may run twice: take() each
+        // resource so missing ones are skipped and none is deleted twice.
         if let Some(gl) = self.gl.as_ref() {
             unsafe {
-                gl.delete_texture(self.input_texture.unwrap());
-                gl.delete_texture(self.output_texture.unwrap());
-                gl.delete_framebuffer(self.framebuffer.unwrap());
-                gl.delete_buffer(self.ebo.unwrap());
-                gl.delete_buffer(self.vbo.unwrap());
-                gl.delete_vertex_array(self.vao.unwrap());
-                gl.delete_program(self.program.unwrap());
+                if let Some(texture) = self.input_texture.take() {
+                    gl.delete_texture(texture);
+                }
+                if let Some(texture) = self.output_texture.take() {
+                    gl.delete_texture(texture);
+                }
+                if let Some(framebuffer) = self.framebuffer.take() {
+                    gl.delete_framebuffer(framebuffer);
+                }
+                if let Some(ebo) = self.ebo.take() {
+                    gl.delete_buffer(ebo);
+                }
+                if let Some(vbo) = self.vbo.take() {
+                    gl.delete_buffer(vbo);
+                }
+                if let Some(vao) = self.vao.take() {
+                    gl.delete_vertex_array(vao);
+                }
+                if let Some(program) = self.program.take() {
+                    gl.delete_program(program);
+                }
             }
         }
-
     }
 }
 
