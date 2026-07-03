@@ -7,7 +7,7 @@
 //! by the borrow on `&mut self`).
 
 use super::fonts::{FontStore, LoadedFace};
-use super::layout::{render_event, FrameContext, RenderOptions, RenderedNode};
+use super::layout::{render_event, unsupported, FrameContext, RenderOptions, RenderedNode};
 use crate::subtitle::ass::{Script, VALIGN_CENTER, VALIGN_TOP};
 use crate::subtitle::backend::SubtitleRenderer;
 use crate::subtitle::blend::OverlayImage;
@@ -30,6 +30,8 @@ pub(crate) struct PureRenderer {
     /// Cache key: the visible event set of `nodes`, when time-independent.
     cache: Option<CacheKey>,
     lazy_inited: bool,
+    /// `unsupported::*` features already warned about (once per feature).
+    warned_unsupported: u32,
 }
 
 #[derive(PartialEq, Eq)]
@@ -53,7 +55,20 @@ impl PureRenderer {
             nodes: Vec::new(),
             cache: None,
             lazy_inited: false,
+            warned_unsupported: 0,
         }
+    }
+
+    /// Logs each unsupported feature exactly once per renderer, so scripts
+    /// that rely on unimplemented tags degrade loudly instead of silently.
+    fn warn_unsupported(&mut self, flags: u32) {
+        let mut new_flags = flags & !self.warned_unsupported;
+        while new_flags != 0 {
+            let flag = 1 << new_flags.trailing_zeros();
+            log::warn!("subtitle render: {}", unsupported::describe(flag));
+            new_flags &= !flag;
+        }
+        self.warned_unsupported |= flags;
     }
 
     #[cfg(test)]
@@ -153,11 +168,13 @@ impl SubtitleRenderer for PureRenderer {
             let mut all_nodes: Vec<RenderedNode> = Vec::new();
             let mut occupied: Vec<(i32, i32, i32, i32)> = Vec::new();
             let mut time_dependent = false;
+            let mut seen_unsupported = 0u32;
             for &index in &visible {
                 let event = &self.script.events[index];
-                let (mut nodes, uses_time) =
-                    render_event(&ctx, event, now_ms, &mut self.face_cache);
-                time_dependent |= uses_time;
+                let mut rendered = render_event(&ctx, event, now_ms, &mut self.face_cache);
+                time_dependent |= rendered.uses_time;
+                seen_unsupported |= rendered.unsupported;
+                let nodes = &mut rendered.nodes;
                 if nodes.is_empty() {
                     continue;
                 }
@@ -165,14 +182,15 @@ impl SubtitleRenderer for PureRenderer {
                 // whole block off previously occupied rectangles.
                 let positioned = uses_time_or_positioned(event);
                 if !positioned {
-                    stack_block(&mut nodes, &mut occupied, &self.script, event, self.frame_h);
-                } else if let Some(bbox) = block_bbox(&nodes) {
+                    stack_block(nodes, &mut occupied, &self.script, event, self.frame_h);
+                } else if let Some(bbox) = block_bbox(nodes) {
                     occupied.push(bbox);
                 }
-                all_nodes.append(&mut nodes);
+                all_nodes.append(nodes);
             }
             self.nodes = all_nodes;
             self.cache = (!time_dependent).then_some(key);
+            self.warn_unsupported(seen_unsupported);
         }
 
         self.nodes
@@ -384,6 +402,35 @@ mod tests {
         assert!(
             late_min > early_max,
             "fade-out increases transparency (early {early_max}, late {late_min})"
+        );
+    }
+
+    #[test]
+    fn unsupported_features_warn_once_per_renderer() {
+        let events = "Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\frz45}Rotated\n\
+                      Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\k50}Kara{\\k50}oke\n\
+                      Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\t(0,500,\\fs30)}Anim\n";
+        let Some(mut renderer) = renderer_with(events) else {
+            eprintln!("skipping: no known test font present on this machine");
+            return;
+        };
+        assert_eq!(renderer.warned_unsupported, 0);
+        let _ = renderer.render_frame(1_000);
+        let flags = renderer.warned_unsupported;
+        assert!(flags & unsupported::ROTATION != 0, "\\frz must be flagged");
+        assert!(flags & unsupported::KARAOKE != 0, "\\k must be flagged");
+        assert!(flags & unsupported::ANIMATION != 0, "\\t must be flagged");
+        // Supported-only scripts stay silent.
+        let mut clean = renderer_with(test_util::HELLO_EVENT).expect("font probed above");
+        let _ = clean.render_frame(1_000);
+        assert_eq!(clean.warned_unsupported, 0, "plain text must not warn");
+        // A bare \frz reset with zero style angle is a genuine no-op.
+        let noop = "Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\frz}Reset\n";
+        let mut noop_renderer = renderer_with(noop).expect("font probed above");
+        let _ = noop_renderer.render_frame(1_000);
+        assert_eq!(
+            noop_renderer.warned_unsupported, 0,
+            "\\frz reset-to-0 must not warn"
         );
     }
 

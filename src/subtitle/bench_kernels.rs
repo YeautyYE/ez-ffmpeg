@@ -441,3 +441,47 @@ fn bench_blend_kernels() {
         println!();
     }
 }
+
+/// End-to-end renderer benchmark: full render_frame calls (layout, shaping
+/// and rasterization) on cold frames vs cache hits. Run with:
+///
+/// ```text
+/// cargo test --release --features subtitle bench_render -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "benchmark; run explicitly with --ignored --nocapture"]
+fn bench_render_frame() {
+    let Some(font) = test_util::test_font() else {
+        eprintln!("skipping: no known test font present on this machine");
+        return;
+    };
+    for (name, events) in [("dense", dense_events()), ("sparse", sparse_events())] {
+        let script = super::ass::parse(&ass_1080(events)).expect("parse");
+        let mut fonts = FontStore::new(false);
+        assert!(fonts.load_default_font_file(std::path::Path::new(font)));
+        let mut renderer = PureRenderer::new(script, fonts, RenderOptions::default());
+        renderer.set_frame_size(FRAME_W as i32, FRAME_H as i32);
+        renderer.set_storage_size(FRAME_W as i32, FRAME_H as i32);
+
+        // Cold render: invalidate the static-frame cache each call by
+        // toggling the frame size (same dims twice would cache-hit).
+        let mut flip = false;
+        let cold = measure(|| {
+            flip = !flip;
+            // Toggling PAR invalidates the cache without changing geometry.
+            renderer.set_pixel_aspect(if flip { 1.0 } else { 1.000001 });
+            black_box(renderer.render_frame(1000).len());
+        });
+
+        renderer.set_pixel_aspect(1.0);
+        let _ = renderer.render_frame(1000);
+        let warm = measure(|| {
+            black_box(renderer.render_frame(1000).len());
+        });
+
+        println!(
+            "render {name}: cold {:>10.0} ns/frame   cache-hit {:>8.0} ns/frame",
+            cold, warm
+        );
+    }
+}
