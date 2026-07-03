@@ -347,21 +347,45 @@ fn blend_direct<S: Sample>(
         let mask_start = (ym0 + row) * image.stride + xm0;
         let mask_row = &image.bitmap[mask_start..mask_start + w];
         let dst_start = (y0 + row) * plane.linesize + x0 * step;
-        let dst_row = &mut plane.data[dst_start..dst_start + w * step];
+        let dst_row = &mut plane.data[dst_start..dst_start + row_len::<S>(w, step)];
 
-        let mut dst_blocks = dst_row.chunks_exact_mut(S::SKIP_CHUNK * step);
-        let mut mask_blocks = mask_row.chunks_exact(S::SKIP_CHUNK);
-        for (dst_block, mask_block) in (&mut dst_blocks).zip(&mut mask_blocks) {
+        // Blocks are paired by explicit pixel index: the dst row may end
+        // `step - BYTES` bytes short of `w * step` (right-edge interleaved
+        // views), so chunked iterators over dst and mask could disagree on
+        // the number of full blocks.
+        let block = S::SKIP_CHUNK;
+        let full_blocks = dst_row.len() / (block * step);
+        for index in 0..full_blocks {
+            let mask_block = &mask_row[index * block..(index + 1) * block];
             if mask_is_zero(mask_block) {
                 continue;
             }
+            let dst_block = &mut dst_row[index * block * step..(index + 1) * block * step];
             blend_span::<S>(dst_block, mask_block, src, alpha, step);
         }
-        let tail_dst = dst_blocks.into_remainder();
-        let tail_mask = mask_blocks.remainder();
-        if !tail_mask.iter().all(|&mask| mask == 0) {
-            blend_span::<S>(tail_dst, tail_mask, src, alpha, step);
+        let tail_px = full_blocks * block;
+        if tail_px < w {
+            let tail_mask = &mask_row[tail_px..];
+            if !tail_mask.iter().all(|&mask| mask == 0) {
+                blend_span::<S>(&mut dst_row[tail_px * step..], tail_mask, src, alpha, step);
+            }
         }
+    }
+}
+
+/// Byte length of a destination row of `pixels` interleaved samples: it
+/// ends at the LAST sample's end, not at `pixels * step`. On offset
+/// interleaved components (NV12/NV21 chroma, P010, packed RGB) the plane
+/// view is `step - BYTES` bytes shorter than the full stride, so slicing a
+/// right-edge rectangle to `pixels * step` would overrun the plane. The
+/// bytes between samples are never written, so the shorter slice is
+/// otherwise equivalent (and identical to the old length when
+/// `step == BYTES`, i.e. on every planar path).
+fn row_len<S: Sample>(pixels: usize, step: usize) -> usize {
+    if pixels == 0 {
+        0
+    } else {
+        (pixels - 1) * step + S::BYTES
     }
 }
 
@@ -369,10 +393,22 @@ fn blend_direct<S: Sample>(
 /// yields alpha 0, and `S::blend(dst, src, 0)` returns `dst` bit-exactly
 /// (the blend constants replicate `dst` across the numerator).
 fn blend_span<S: Sample>(dst: &mut [u8], mask: &[u8], src: u32, alpha: u32, step: usize) {
-    for (chunk, &mask) in dst.chunks_exact_mut(step).zip(mask) {
+    let full = dst.len() / step;
+    let mut chunks = dst.chunks_exact_mut(step);
+    for (chunk, &mask) in (&mut chunks).zip(mask) {
         let sample = &mut chunk[..S::BYTES];
         let blended = S::blend(S::load(sample), src, u32::from(mask) * alpha);
         S::store(sample, blended);
+    }
+    // A right-edge row ends at its last SAMPLE, so the final pixel arrives
+    // here `step - BYTES` bytes short and chunks_exact_mut skips it.
+    let tail = chunks.into_remainder();
+    if tail.len() >= S::BYTES {
+        if let Some(&mask) = mask.get(full) {
+            let sample = &mut tail[..S::BYTES];
+            let blended = S::blend(S::load(sample), src, u32::from(mask) * alpha);
+            S::store(sample, blended);
+        }
     }
 }
 
@@ -442,7 +478,7 @@ fn blend_pooled_h2<S: Sample>(
             let mask0 = row0 + ((ipx0 << 1) - x0 + xm0);
             let top = &image.bitmap[mask0..mask0 + 2 * n];
             let dst_start = dst_row + ipx0 * step;
-            let dst = &mut plane.data[dst_start..dst_start + n * step];
+            let dst = &mut plane.data[dst_start..dst_start + row_len::<S>(n, step)];
             if two_rows {
                 let bot = &image.bitmap[mask0 + image.stride..mask0 + image.stride + 2 * n];
                 pool_interior::<S, true>(dst, top, bot, src, alpha, shift, step);
@@ -480,25 +516,37 @@ fn pool_interior<S: Sample, const TWO_ROWS: bool>(
     shift: u32,
     step: usize,
 ) {
-    let mask_block = 2 * S::SKIP_CHUNK;
-    let mut dst_blocks = dst.chunks_exact_mut(S::SKIP_CHUNK * step);
-    let mut top_blocks = top.chunks_exact(mask_block);
-    let mut bot_blocks = bot.chunks_exact(mask_block);
-    for ((dst_block, top_block), bot_block) in
-        (&mut dst_blocks).zip(&mut top_blocks).zip(&mut bot_blocks)
-    {
+    // Explicit pixel-index pairing; see `blend_direct` for why the
+    // chunked-iterator zip is unsound on short right-edge rows.
+    let block = S::SKIP_CHUNK;
+    let pixels = top.len() / 2;
+    let full_blocks = dst.len() / (block * step);
+    for index in 0..full_blocks {
+        let top_block = &top[index * 2 * block..(index + 1) * 2 * block];
+        let bot_block = &bot[index * 2 * block..(index + 1) * 2 * block];
         if mask_is_zero(top_block) && (!TWO_ROWS || mask_is_zero(bot_block)) {
             continue;
         }
+        let dst_block = &mut dst[index * block * step..(index + 1) * block * step];
         pool_span::<S, TWO_ROWS>(dst_block, top_block, bot_block, src, alpha, shift, step);
     }
-    let tail_dst = dst_blocks.into_remainder();
-    let tail_top = top_blocks.remainder();
-    let tail_bot = bot_blocks.remainder();
-    let tail_zero = tail_top.iter().all(|&mask| mask == 0)
-        && (!TWO_ROWS || tail_bot.iter().all(|&mask| mask == 0));
-    if !tail_zero {
-        pool_span::<S, TWO_ROWS>(tail_dst, tail_top, tail_bot, src, alpha, shift, step);
+    let tail_px = full_blocks * block;
+    if tail_px < pixels {
+        let tail_top = &top[tail_px * 2..];
+        let tail_bot = &bot[tail_px * 2..];
+        let tail_zero = tail_top.iter().all(|&mask| mask == 0)
+            && (!TWO_ROWS || tail_bot.iter().all(|&mask| mask == 0));
+        if !tail_zero {
+            pool_span::<S, TWO_ROWS>(
+                &mut dst[tail_px * step..],
+                tail_top,
+                tail_bot,
+                src,
+                alpha,
+                shift,
+                step,
+            );
+        }
     }
 }
 
@@ -512,8 +560,9 @@ fn pool_span<S: Sample, const TWO_ROWS: bool>(
     shift: u32,
     step: usize,
 ) {
-    for ((chunk, pair), bot_pair) in dst
-        .chunks_exact_mut(step)
+    let full = dst.len() / step;
+    let mut chunks = dst.chunks_exact_mut(step);
+    for ((chunk, pair), bot_pair) in (&mut chunks)
         .zip(top.chunks_exact(2))
         .zip(bot.chunks_exact(2))
     {
@@ -525,6 +574,18 @@ fn pool_span<S: Sample, const TWO_ROWS: bool>(
         }
         let alpha_total = (u32::from(sum) >> shift) * alpha;
         let sample = &mut chunk[..S::BYTES];
+        let blended = S::blend(S::load(sample), src, alpha_total);
+        S::store(sample, blended);
+    }
+    // Right-edge rows end at the last sample; see `blend_span`.
+    let tail = chunks.into_remainder();
+    if tail.len() >= S::BYTES && top.len() >= 2 * (full + 1) {
+        let mut sum = u16::from(top[2 * full]) + u16::from(top[2 * full + 1]);
+        if TWO_ROWS {
+            sum += u16::from(bot[2 * full]) + u16::from(bot[2 * full + 1]);
+        }
+        let alpha_total = (u32::from(sum) >> shift) * alpha;
+        let sample = &mut tail[..S::BYTES];
         let blended = S::blend(S::load(sample), src, alpha_total);
         S::store(sample, blended);
     }
@@ -787,20 +848,33 @@ fn apply_sums<S: Sample>(
     for row in 0..rect.ph {
         let sums_row = &sums[row * rect.pw..(row + 1) * rect.pw];
         let dst_start = (rect.py0 + row) * plane.linesize + rect.px0 * step;
-        let dst_row = &mut plane.data[dst_start..dst_start + rect.pw * step];
+        let dst_row = &mut plane.data[dst_start..dst_start + row_len::<S>(rect.pw, step)];
 
-        let mut dst_blocks = dst_row.chunks_exact_mut(S::SKIP_CHUNK * step);
-        let mut sum_blocks = sums_row.chunks_exact(S::SKIP_CHUNK);
-        for (dst_block, sum_block) in (&mut dst_blocks).zip(&mut sum_blocks) {
+        // Explicit pixel-index pairing; see `blend_direct` for why the
+        // chunked-iterator zip is unsound on short right-edge rows.
+        let block = S::SKIP_CHUNK;
+        let full_blocks = dst_row.len() / (block * step);
+        for index in 0..full_blocks {
+            let sum_block = &sums_row[index * block..(index + 1) * block];
             if sum_block.iter().all(|&sum| sum == 0) {
                 continue;
             }
+            let dst_block = &mut dst_row[index * block * step..(index + 1) * block * step];
             apply_sums_span::<S>(dst_block, sum_block, src, alpha, rect.shift, step);
         }
-        let tail_dst = dst_blocks.into_remainder();
-        let tail_sums = sum_blocks.remainder();
-        if !tail_sums.iter().all(|&sum| sum == 0) {
-            apply_sums_span::<S>(tail_dst, tail_sums, src, alpha, rect.shift, step);
+        let tail_px = full_blocks * block;
+        if tail_px < rect.pw {
+            let tail_sums = &sums_row[tail_px..];
+            if !tail_sums.iter().all(|&sum| sum == 0) {
+                apply_sums_span::<S>(
+                    &mut dst_row[tail_px * step..],
+                    tail_sums,
+                    src,
+                    alpha,
+                    rect.shift,
+                    step,
+                );
+            }
         }
     }
 }
@@ -813,11 +887,23 @@ fn apply_sums_span<S: Sample>(
     shift: u32,
     step: usize,
 ) {
-    for (chunk, &sum) in dst.chunks_exact_mut(step).zip(sums) {
+    let full = dst.len() / step;
+    let mut chunks = dst.chunks_exact_mut(step);
+    for (chunk, &sum) in (&mut chunks).zip(sums) {
         let alpha_total = (u32::from(sum) >> shift) * alpha;
         let sample = &mut chunk[..S::BYTES];
         let blended = S::blend(S::load(sample), src, alpha_total);
         S::store(sample, blended);
+    }
+    // Right-edge rows end at the last sample; see `blend_span`.
+    let tail = chunks.into_remainder();
+    if tail.len() >= S::BYTES {
+        if let Some(&sum) = sums.get(full) {
+            let alpha_total = (u32::from(sum) >> shift) * alpha;
+            let sample = &mut tail[..S::BYTES];
+            let blended = S::blend(S::load(sample), src, alpha_total);
+            S::store(sample, blended);
+        }
     }
 }
 
@@ -1582,6 +1668,76 @@ mod tests {
             data,
             linesize,
             pixel_step: 1,
+        }
+    }
+
+    /// Offset interleaved component views (NV12/NV21 chroma, P010, packed
+    /// RGB) are `step - BYTES` bytes shorter than the full stride. A mask
+    /// reaching the plane's right edge used to slice `pixels * step` past
+    /// the view end and panic; rows now end at the last sample and the
+    /// span tails blend the final pixel — byte-identical to the same blend
+    /// on a padded plane.
+    #[test]
+    fn right_edge_offset_component_stays_in_bounds() {
+        let pseudo = |len: usize, mut state: u64| -> Vec<u8> {
+            (0..len)
+                .map(|_| {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    (state >> 56) as u8
+                })
+                .collect()
+        };
+        for (sample, step, bytes, src, hsub, vsub) in [
+            (SampleFormat::U8, 2usize, 1usize, 128u32, 0u32, 0u32), // interleaved direct
+            (SampleFormat::U8, 2, 1, 128, 1, 1),                    // NV12 chroma pooled
+            (SampleFormat::U16Le, 4, 2, 33000, 1, 1),               // P010 chroma pooled
+            (SampleFormat::U8, 3, 1, 90, 0, 0),                     // RGB24 component
+        ] {
+            // 34 -> pw 17 (odd tails); 64 -> pw 32 (a full-block multiple,
+            // which exposed chunked-zip block miscounts on short rows).
+            for grid_w in [34usize, 64, 16] {
+                let grid_h = 6usize;
+                let plane_w = (grid_w + (1 << hsub) - 1) >> hsub;
+                let plane_h = (grid_h + (1 << vsub) - 1) >> vsub;
+                // Tight stride: nothing after the last sample of a row.
+                let linesize = plane_w * step;
+                let full_len = linesize * (plane_h - 1) + plane_w * step;
+                // The view ends at the last SAMPLE, like component views do.
+                let short_len = full_len - (step - bytes);
+                // Full-coverage mask: the clipped rect reaches the right edge.
+                let bitmap = pseudo(grid_w * grid_h, 0xE06E);
+                let overlay = image(&bitmap, grid_w, grid_h, grid_w, 0xFFFFFF00);
+                let alpha = sample.alpha_fixed(200);
+                let base = pseudo(full_len, 0xBA5E);
+
+                let mut short = base[..short_len].to_vec();
+                {
+                    let mut plane = PlaneView {
+                        data: &mut short,
+                        linesize,
+                        pixel_step: step,
+                    };
+                    blend_component(
+                        &mut plane, grid_w, grid_h, &overlay, src, alpha, hsub, vsub, sample,
+                    );
+                }
+                let mut padded = base.clone();
+                {
+                    let mut plane = PlaneView {
+                        data: &mut padded,
+                        linesize,
+                        pixel_step: step,
+                    };
+                    blend_component(
+                        &mut plane, grid_w, grid_h, &overlay, src, alpha, hsub, vsub, sample,
+                    );
+                }
+                assert_eq!(
+                    short[..],
+                    padded[..short_len],
+                    "grid_w={grid_w} step={step} bytes={bytes} hsub={hsub} vsub={vsub}"
+                );
+            }
         }
     }
 
