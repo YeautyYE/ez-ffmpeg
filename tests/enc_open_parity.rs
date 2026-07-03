@@ -7,6 +7,7 @@
 //! packet inside the muxed range — the CLI still writes the stream and the
 //! header; first-frame-open reported NoFramesReceived and failed the task.
 
+use ez_ffmpeg::packet_scanner::PacketScanner;
 use ez_ffmpeg::stream_info::{find_subtitle_stream_info, find_video_stream_info, StreamInfo};
 use ez_ffmpeg::{FfmpegContext, FfmpegScheduler, Input, Output};
 use std::time::Duration;
@@ -93,6 +94,24 @@ fn subtitle_stream_with_no_cues_in_range_still_muxes() {
         "empty subtitle track fixture",
     );
     assert!(result.is_ok(), "mkv fixture failed: {result:?}");
+
+    // Prove the fixture premise before relying on it: the subtitle track
+    // must carry ZERO packets, or this test stops proving that the encoder
+    // opens without ever receiving a frame.
+    let mut scanner = PacketScanner::open(mkv.as_str()).expect("failed to open mkv fixture");
+    let mut sub_packets = 0usize;
+    while let Some(pkt) = scanner
+        .next_packet()
+        .expect("failed to scan mkv fixture")
+    {
+        if !pkt.is_video() && !pkt.is_audio() {
+            sub_packets += 1;
+        }
+    }
+    assert_eq!(
+        sub_packets, 0,
+        "fixture subtitle track must be packet-less"
+    );
 
     // CLI: ffmpeg -i empty_sub.mkv -map 0:v -map 0:s -c:s mov_text succeeds
     // and writes both streams even though the subtitle encoder receives no
