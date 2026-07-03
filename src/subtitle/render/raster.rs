@@ -1,0 +1,427 @@
+//! Path rasterization and bitmap effects for the pure-Rust renderer:
+//! zeno-backed fill/stroke of glyph and drawing outlines, plus the ASS
+//! `\be` box blur and `\blur` gaussian approximation.
+
+use zeno::{Cap, Command, Fill, Join, Mask, Placement, Stroke, Style, Vector};
+
+/// An 8-bit coverage bitmap positioned on the frame — the pure-Rust
+/// equivalent of one `ASS_Image` node's geometry.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CoverageBitmap {
+    pub w: usize,
+    pub h: usize,
+    /// Top-left placement in frame coordinates.
+    pub x: i32,
+    pub y: i32,
+    /// Row-major, stride == w.
+    pub data: Vec<u8>,
+}
+
+impl CoverageBitmap {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.w == 0 || self.h == 0
+    }
+
+    fn from_mask(data: Vec<u8>, placement: Placement) -> Self {
+        Self {
+            w: placement.width as usize,
+            h: placement.height as usize,
+            x: placement.left,
+            y: placement.top,
+            data,
+        }
+    }
+
+    /// Union of two coverage bitmaps (per-pixel max) — used to merge the
+    /// fill into the stroke for ASS borders.
+    pub(crate) fn max_with(&self, other: &CoverageBitmap) -> CoverageBitmap {
+        if self.is_empty() {
+            return other.clone();
+        }
+        if other.is_empty() {
+            return self.clone();
+        }
+        let x0 = self.x.min(other.x);
+        let y0 = self.y.min(other.y);
+        let x1 = (self.x + self.w as i32).max(other.x + other.w as i32);
+        let y1 = (self.y + self.h as i32).max(other.y + other.h as i32);
+        let w = (x1 - x0) as usize;
+        let h = (y1 - y0) as usize;
+        let mut data = vec![0u8; w * h];
+        for src in [self, other] {
+            let ox = (src.x - x0) as usize;
+            let oy = (src.y - y0) as usize;
+            for row in 0..src.h {
+                let dst_row = &mut data[(oy + row) * w + ox..(oy + row) * w + ox + src.w];
+                let src_row = &src.data[row * src.w..(row + 1) * src.w];
+                for (d, s) in dst_row.iter_mut().zip(src_row) {
+                    *d = (*d).max(*s);
+                }
+            }
+        }
+        CoverageBitmap {
+            w,
+            h,
+            x: x0,
+            y: y0,
+            data,
+        }
+    }
+
+    /// Restricts coverage to `rect` (frame coordinates, exclusive right and
+    /// bottom edges). `inverse` zeroes the inside instead.
+    pub(crate) fn clip_rect(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, inverse: bool) {
+        if self.is_empty() {
+            return;
+        }
+        for row in 0..self.h {
+            let frame_y = self.y + row as i32;
+            let inside_row = frame_y >= y0 && frame_y < y1;
+            for col in 0..self.w {
+                let frame_x = self.x + col as i32;
+                let inside = inside_row && frame_x >= x0 && frame_x < x1;
+                if inside == inverse {
+                    self.data[row * self.w + col] = 0;
+                }
+            }
+        }
+    }
+}
+
+/// Rasterizes a filled path (non-zero rule, like FreeType/VSFilter).
+pub(crate) fn fill_path(commands: &[Command]) -> CoverageBitmap {
+    if commands.is_empty() {
+        return CoverageBitmap::default();
+    }
+    let (data, placement) = Mask::new(commands)
+        .style(Style::Fill(Fill::NonZero))
+        .render();
+    CoverageBitmap::from_mask(data, placement)
+}
+
+/// Rasterizes the ASS border of a path: a stroke of width `2 * border`
+/// merged with the fill (the stroke is centered on the contour, so it
+/// extends `border` pixels outward; the union removes the inner half).
+pub(crate) fn border_path(
+    commands: &[Command],
+    fill: &CoverageBitmap,
+    border: f32,
+) -> CoverageBitmap {
+    if commands.is_empty() || border <= 0.0 {
+        return CoverageBitmap::default();
+    }
+    let mut stroke = Stroke::new(2.0 * border);
+    stroke.cap(Cap::Round).join(Join::Round);
+    let (data, placement) = Mask::new(commands).style(Style::Stroke(stroke)).render();
+    CoverageBitmap::from_mask(data, placement).max_with(fill)
+}
+
+/// `\be`: the VSFilter "blur edges" effect — `passes` iterations of a
+/// 3x3 box kernel with the exact libass weighting (corner 1, edge 2,
+/// center 4, /16). The bitmap grows by one pixel per pass.
+pub(crate) fn be_blur(bitmap: &mut CoverageBitmap, passes: i32) {
+    for _ in 0..passes.clamp(0, 127) {
+        if bitmap.is_empty() {
+            return;
+        }
+        pad(bitmap, 1);
+        let w = bitmap.w;
+        let h = bitmap.h;
+        let src = bitmap.data.clone();
+        let at = |x: i32, y: i32| -> u32 {
+            if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
+                0
+            } else {
+                u32::from(src[y as usize * w + x as usize])
+            }
+        };
+        for y in 0..h as i32 {
+            for x in 0..w as i32 {
+                let sum = at(x - 1, y - 1)
+                    + at(x + 1, y - 1)
+                    + at(x - 1, y + 1)
+                    + at(x + 1, y + 1)
+                    + 2 * (at(x, y - 1) + at(x, y + 1) + at(x - 1, y) + at(x + 1, y))
+                    + 4 * at(x, y);
+                bitmap.data[y as usize * w + x as usize] = (sum >> 4) as u8;
+            }
+        }
+    }
+}
+
+/// `\blur`: gaussian with radius `r`, approximated by three box-blur
+/// passes (the standard Kovesi construction, indistinguishable at ASS
+/// blur radii).
+pub(crate) fn gaussian_blur(bitmap: &mut CoverageBitmap, radius: f64) {
+    if bitmap.is_empty() || radius <= 0.0 {
+        return;
+    }
+    let radius = radius.min(100.0);
+    // Box length per pass for an equivalent gaussian sigma == radius.
+    let boxes = boxes_for_gauss(radius, 3);
+    pad(bitmap, (radius.ceil() as usize + 1) * 2);
+    let mut tmp = bitmap.data.clone();
+    let w = bitmap.w;
+    let h = bitmap.h;
+    for r in boxes {
+        if r == 0 {
+            continue;
+        }
+        box_blur_h(&bitmap.data, &mut tmp, w, h, r);
+        box_blur_v(&tmp, &mut bitmap.data, w, h, r);
+    }
+}
+
+fn boxes_for_gauss(sigma: f64, n: usize) -> Vec<usize> {
+    let w_ideal = (12.0 * sigma * sigma / n as f64 + 1.0).sqrt();
+    let mut wl = w_ideal.floor() as i64;
+    if wl % 2 == 0 {
+        wl -= 1;
+    }
+    let wu = wl + 2;
+    let m_ideal = (12.0 * sigma * sigma
+        - (n as f64) * (wl as f64) * (wl as f64)
+        - 4.0 * n as f64 * wl as f64
+        - 3.0 * n as f64)
+        / (-4.0 * wl as f64 - 4.0);
+    let m = m_ideal.round() as i64;
+    (0..n as i64)
+        .map(|i| {
+            let width = if i < m { wl } else { wu };
+            (width.max(1) as usize - 1) / 2
+        })
+        .collect()
+}
+
+fn box_blur_h(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize) {
+    let norm = (2 * r + 1) as u32;
+    for y in 0..h {
+        let row = &src[y * w..(y + 1) * w];
+        let mut acc: u32 = 0;
+        for &v in &row[..=r.min(w.saturating_sub(1))] {
+            acc += u32::from(v);
+        }
+        for x in 0..w {
+            dst[y * w + x] = (acc / norm) as u8;
+            if x + r + 1 < w {
+                acc += u32::from(row[x + r + 1]);
+            }
+            if x >= r {
+                acc -= u32::from(row[x - r]);
+            }
+        }
+    }
+}
+
+fn box_blur_v(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize) {
+    let norm = (2 * r + 1) as u32;
+    for x in 0..w {
+        let mut acc: u32 = 0;
+        for y in 0..=r.min(h.saturating_sub(1)) {
+            acc += u32::from(src[y * w + x]);
+        }
+        for y in 0..h {
+            dst[y * w + x] = (acc / norm) as u8;
+            if y + r + 1 < h {
+                acc += u32::from(src[(y + r + 1) * w + x]);
+            }
+            if y >= r {
+                acc -= u32::from(src[(y - r) * w + x]);
+            }
+        }
+    }
+}
+
+/// Grows the bitmap by `margin` pixels on every side (blur needs room).
+fn pad(bitmap: &mut CoverageBitmap, margin: usize) {
+    let w = bitmap.w + margin * 2;
+    let h = bitmap.h + margin * 2;
+    let mut data = vec![0u8; w * h];
+    for row in 0..bitmap.h {
+        let dst = (row + margin) * w + margin;
+        data[dst..dst + bitmap.w]
+            .copy_from_slice(&bitmap.data[row * bitmap.w..(row + 1) * bitmap.w]);
+    }
+    bitmap.w = w;
+    bitmap.h = h;
+    bitmap.x -= margin as i32;
+    bitmap.y -= margin as i32;
+    bitmap.data = data;
+}
+
+/// Builds zeno commands from a ttf-parser glyph outline. The transform
+/// maps font units to frame pixels: scale, then flip Y (fonts are Y-up),
+/// then offset; an optional shear implements `\fax`/`\fay` later.
+pub(crate) struct OutlinePath {
+    pub commands: Vec<Command>,
+    scale_x: f32,
+    scale_y: f32,
+    dx: f32,
+    dy: f32,
+}
+
+impl OutlinePath {
+    pub(crate) fn new(scale_x: f32, scale_y: f32, dx: f32, dy: f32) -> Self {
+        Self {
+            commands: Vec::new(),
+            scale_x,
+            scale_y,
+            dx,
+            dy,
+        }
+    }
+
+    fn point(&self, x: f32, y: f32) -> Vector {
+        Vector::new(self.dx + x * self.scale_x, self.dy - y * self.scale_y)
+    }
+}
+
+impl ttf_parser::OutlineBuilder for OutlinePath {
+    fn move_to(&mut self, x: f32, y: f32) {
+        let p = self.point(x, y);
+        self.commands.push(Command::MoveTo(p));
+    }
+
+    fn line_to(&mut self, x: f32, y: f32) {
+        let p = self.point(x, y);
+        self.commands.push(Command::LineTo(p));
+    }
+
+    fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
+        let c = self.point(x1, y1);
+        let p = self.point(x, y);
+        self.commands.push(Command::QuadTo(c, p));
+    }
+
+    fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
+        let c1 = self.point(x1, y1);
+        let c2 = self.point(x2, y2);
+        let p = self.point(x, y);
+        self.commands.push(Command::CurveTo(c1, c2, p));
+    }
+
+    fn close(&mut self) {
+        self.commands.push(Command::Close);
+    }
+}
+
+/// Converts a parsed ASS drawing (26.6 fixed point, Y-down already) into
+/// zeno commands. `scale` divides by `2^(p-1)` per the `\p` scale level,
+/// times the screen scale.
+pub(crate) fn drawing_commands(
+    drawing: &crate::subtitle::ass::Drawing,
+    scale_x: f32,
+    scale_y: f32,
+    dx: f32,
+    dy: f32,
+) -> Vec<Command> {
+    use crate::subtitle::ass::{DrawCmd, Point6};
+    let map = |p: Point6| -> Vector {
+        Vector::new(
+            dx + (p.x as f32 / 64.0) * scale_x,
+            dy + (p.y as f32 / 64.0) * scale_y,
+        )
+    };
+    drawing
+        .cmds
+        .iter()
+        .map(|cmd| match *cmd {
+            DrawCmd::Move(p) => Command::MoveTo(map(p)),
+            DrawCmd::Line(p) => Command::LineTo(map(p)),
+            DrawCmd::Cubic(c1, c2, p) => Command::CurveTo(map(c1), map(c2), map(p)),
+            DrawCmd::Close => Command::Close,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn square(side: f32) -> Vec<Command> {
+        vec![
+            Command::MoveTo(Vector::new(0.0, 0.0)),
+            Command::LineTo(Vector::new(side, 0.0)),
+            Command::LineTo(Vector::new(side, side)),
+            Command::LineTo(Vector::new(0.0, side)),
+            Command::Close,
+        ]
+    }
+
+    #[test]
+    fn fill_produces_opaque_interior() {
+        let bitmap = fill_path(&square(20.0));
+        assert!(!bitmap.is_empty());
+        // Sample the center: fully covered.
+        let cx = bitmap.w / 2;
+        let cy = bitmap.h / 2;
+        assert_eq!(bitmap.data[cy * bitmap.w + cx], 255);
+    }
+
+    #[test]
+    fn border_extends_beyond_fill() {
+        let fill = fill_path(&square(20.0));
+        let border = border_path(&square(20.0), &fill, 3.0);
+        assert!(border.w >= fill.w + 4, "stroke must widen the bitmap");
+        assert!(border.x <= fill.x - 2);
+        // Border contains the fill (union semantics).
+        let cx = border.w / 2;
+        let cy = border.h / 2;
+        assert_eq!(border.data[cy * border.w + cx], 255);
+    }
+
+    #[test]
+    fn be_blur_spreads_coverage() {
+        let mut bitmap = fill_path(&square(8.0));
+        let before_w = bitmap.w;
+        be_blur(&mut bitmap, 2);
+        assert_eq!(bitmap.w, before_w + 4, "one pixel of padding per pass");
+        // Blur must strictly reduce the peak of a small solid square's edge.
+        assert!(bitmap.data.iter().any(|&v| v > 0 && v < 255));
+    }
+
+    #[test]
+    fn gaussian_blur_preserves_total_energy_roughly() {
+        let mut bitmap = fill_path(&square(10.0));
+        let sum_before: u64 = bitmap.data.iter().map(|&v| u64::from(v)).sum();
+        gaussian_blur(&mut bitmap, 2.0);
+        let sum_after: u64 = bitmap.data.iter().map(|&v| u64::from(v)).sum();
+        let ratio = sum_after as f64 / sum_before as f64;
+        assert!((0.85..=1.15).contains(&ratio), "energy ratio {ratio}");
+    }
+
+    #[test]
+    fn clip_rect_zeroes_outside() {
+        let mut bitmap = fill_path(&square(10.0));
+        let (bx, by) = (bitmap.x, bitmap.y);
+        bitmap.clip_rect(bx, by, bx + 3, by + 3, false);
+        assert_eq!(bitmap.data[0], 255, "inside the clip");
+        assert_eq!(bitmap.data[5 * bitmap.w + 5], 0, "outside the clip");
+
+        let mut inv = fill_path(&square(10.0));
+        inv.clip_rect(bx, by, bx + 3, by + 3, true);
+        assert_eq!(inv.data[0], 0, "inverse clip zeroes the inside");
+        assert_eq!(inv.data[5 * inv.w + 5], 255);
+    }
+
+    #[test]
+    fn max_with_unions_disjoint_bitmaps() {
+        let a = CoverageBitmap {
+            w: 2,
+            h: 1,
+            x: 0,
+            y: 0,
+            data: vec![10, 20],
+        };
+        let b = CoverageBitmap {
+            w: 1,
+            h: 1,
+            x: 3,
+            y: 0,
+            data: vec![30],
+        };
+        let union = a.max_with(&b);
+        assert_eq!((union.w, union.h, union.x, union.y), (4, 1, 0, 0));
+        assert_eq!(union.data, vec![10, 20, 0, 30]);
+    }
+}
