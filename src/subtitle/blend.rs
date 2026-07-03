@@ -18,6 +18,21 @@
 //!   limited-range white at 10 bit is 943, FFmpeg's stretch — not the
 //!   broadcast 940).
 
+#[cfg(target_arch = "x86_64")]
+mod avx2;
+
+/// True when the AVX2 kernels are compiled in and the CPU supports them.
+fn avx2_available() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        avx2::enabled()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
 /// One rendered coverage bitmap positioned on the frame (the libass
 /// `ASS_Image` shape, kept for exact FFmpeg blend parity). Alpha 0 in
 /// `color` = opaque.
@@ -272,6 +287,26 @@ fn blend_typed<S: Sample>(
     };
 
     if hsub == 0 && vsub == 0 {
+        // Tightly-packed planes take the AVX2 kernels when the CPU has
+        // them; `S::BYTES` uniquely identifies the codec among the two
+        // `Sample` impls, so the constant branches fold at monomorphization.
+        #[cfg(target_arch = "x86_64")]
+        if plane.pixel_step == S::BYTES && avx2::enabled() {
+            if S::BYTES == SampleU8::BYTES {
+                // SAFETY: `avx2::enabled()` just verified AVX2 support.
+                unsafe {
+                    avx2::blend_direct_u8(plane, image, src, alpha, (x0, y0), (xm0, ym0), (w, h))
+                };
+                return;
+            }
+            if S::BYTES == SampleU16Le::BYTES {
+                // SAFETY: `avx2::enabled()` just verified AVX2 support.
+                unsafe {
+                    avx2::blend_direct_u16(plane, image, src, alpha, (x0, y0), (xm0, ym0), (w, h))
+                };
+                return;
+            }
+        }
         blend_direct::<S>(plane, image, src, alpha, (x0, y0), (xm0, ym0), (w, h));
     } else if hsub == 1 && vsub <= 1 {
         // Every subsampled format in the layout table (4:2:0, 4:2:2, NV12,
@@ -545,7 +580,7 @@ pub(crate) struct PooledRect {
 }
 
 /// Pools one node's clipped mask at hsub == 1 into raw per-output-pixel
-/// sums (row-major into `out`, resized to `pw * ph`), so several chroma
+/// sums (row-major into `out`, `pw * ph` entries), so several chroma
 /// components can be blended from ONE mask traversal
 /// ([`blend_pooled_from_sums`] per component). Returns `None` when the node
 /// is fully clipped away.
@@ -559,6 +594,20 @@ pub(crate) fn pool_sums_h2(
     image: &OverlayImage<'_>,
     vsub: u32,
     out: &mut Vec<u16>,
+) -> Option<PooledRect> {
+    pool_sums_h2_impl(grid_w, grid_h, image, vsub, out, avx2_available())
+}
+
+/// [`pool_sums_h2`] body. `allow_simd` lets the bench/test harness force
+/// the scalar interior loops; the shipping wrapper passes
+/// [`avx2_available`].
+fn pool_sums_h2_impl(
+    grid_w: usize,
+    grid_h: usize,
+    image: &OverlayImage<'_>,
+    vsub: u32,
+    out: &mut Vec<u16>,
+    allow_simd: bool,
 ) -> Option<PooledRect> {
     if image.w == 0 || image.h == 0 {
         return None;
@@ -598,23 +647,9 @@ pub(crate) fn pool_sums_h2(
             let mask0 = row0 + ((ipx0 << 1) - x0 + xm0);
             let top = &image.bitmap[mask0..mask0 + 2 * n];
             let span = &mut out_row[ipx0 - px0..ipx0 - px0 + n];
-            if two_rows {
-                let bot = &image.bitmap[mask0 + image.stride..mask0 + image.stride + 2 * n];
-                for ((sum, pair), bot_pair) in span
-                    .iter_mut()
-                    .zip(top.chunks_exact(2))
-                    .zip(bot.chunks_exact(2))
-                {
-                    *sum = u16::from(pair[0])
-                        + u16::from(pair[1])
-                        + u16::from(bot_pair[0])
-                        + u16::from(bot_pair[1]);
-                }
-            } else {
-                for (sum, pair) in span.iter_mut().zip(top.chunks_exact(2)) {
-                    *sum = u16::from(pair[0]) + u16::from(pair[1]);
-                }
-            }
+            let bot =
+                two_rows.then(|| &image.bitmap[mask0 + image.stride..mask0 + image.stride + 2 * n]);
+            pair_sums(span, top, bot, allow_simd);
         }
         if right_partial && (px1 > px0 || !left_partial) {
             let cols = (px1 << 1).max(x0)..((px1 + 1) << 1).min(x0 + w);
@@ -631,9 +666,49 @@ pub(crate) fn pool_sums_h2(
     })
 }
 
+/// Adjacent-pair sums of one interior span: `span[i] = top[2i] + top[2i+1]`
+/// (+ the same pair from `bot` when present). Scalar sums stay u16 so LLVM
+/// can use narrow lanes; the AVX2 kernel is bit-identical (max sum 1020,
+/// no saturation anywhere).
+fn pair_sums(span: &mut [u16], top: &[u8], bot: Option<&[u8]>, allow_simd: bool) {
+    #[cfg(target_arch = "x86_64")]
+    if allow_simd && avx2::enabled() {
+        // SAFETY: `avx2::enabled()` just verified AVX2 support.
+        unsafe {
+            match bot {
+                Some(bot) => avx2::pair_sums_two_rows(span, top, bot),
+                None => avx2::pair_sums_one_row(span, top),
+            }
+        }
+        return;
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = allow_simd;
+    match bot {
+        Some(bot) => {
+            for ((sum, pair), bot_pair) in span
+                .iter_mut()
+                .zip(top.chunks_exact(2))
+                .zip(bot.chunks_exact(2))
+            {
+                *sum = u16::from(pair[0])
+                    + u16::from(pair[1])
+                    + u16::from(bot_pair[0])
+                    + u16::from(bot_pair[1]);
+            }
+        }
+        None => {
+            for (sum, pair) in span.iter_mut().zip(top.chunks_exact(2)) {
+                *sum = u16::from(pair[0]) + u16::from(pair[1]);
+            }
+        }
+    }
+}
+
 /// Blends one component plane from precomputed pooled sums: the apply half
 /// of the two-phase pooled path. Same skip-block/branchless structure as the
-/// other kernels, with the sums standing in for the mask.
+/// other kernels, with the sums standing in for the mask. Tightly-packed
+/// planes dispatch to the AVX2 apply kernels when available.
 pub(crate) fn blend_pooled_from_sums(
     plane: &mut PlaneView<'_>,
     sums: &[u16],
@@ -642,9 +717,40 @@ pub(crate) fn blend_pooled_from_sums(
     alpha: u32,
     sample: SampleFormat,
 ) {
+    #[cfg(target_arch = "x86_64")]
+    if avx2::enabled() {
+        match (sample, plane.pixel_step) {
+            (SampleFormat::U8, 1) => {
+                // SAFETY: `avx2::enabled()` just verified AVX2 support.
+                unsafe { avx2::apply_sums_u8(plane, sums, rect, src, alpha) };
+                return;
+            }
+            (SampleFormat::U16Le, 2) => {
+                // SAFETY: `avx2::enabled()` just verified AVX2 support.
+                unsafe { avx2::apply_sums_u16(plane, sums, rect, src, alpha) };
+                return;
+            }
+            _ => {}
+        }
+    }
     match sample {
         SampleFormat::U8 => apply_sums::<SampleU8>(plane, sums, rect, src, alpha),
         SampleFormat::U16Le => apply_sums::<SampleU16Le>(plane, sums, rect, src, alpha),
+    }
+}
+
+/// Route choice for subsampled chroma pairs in `filter::blend_images`
+/// (measured in `bench_kernels.rs`, dense 1080p chroma pair): pooling each
+/// node once and applying per component beats the fused per-component path
+/// for 8-bit always (scalar 372us vs 544us fused). For 16-bit the scalar
+/// routes were a wash (487us vs 516us), so it kept the fused path — but
+/// the AVX2 apply kernels put two-phase far ahead (125us vs 454us), so
+/// 16-bit takes it exactly when the AVX2 kernels are live. Both routes are
+/// byte-identical (lab parity tests).
+pub(crate) fn two_phase_pooled_preferred(sample: SampleFormat) -> bool {
+    match sample {
+        SampleFormat::U8 => true,
+        SampleFormat::U16Le => avx2_available(),
     }
 }
 
@@ -782,16 +888,21 @@ pub(crate) mod lab {
         ChunkSkip8,
         /// Zero-test the mask 16 pixels at a time (two u64s), branchless body.
         ChunkSkip16,
-        /// Whatever `blend_direct` currently ships (`S::SKIP_CHUNK` blocks).
+        /// The scalar shipping kernel (`blend_direct`, `S::SKIP_CHUNK`
+        /// blocks) — the AVX2 fallback and parity reference.
         Shipping,
+        /// The runtime-dispatched AVX2 kernels (falls back to `Shipping`
+        /// when unavailable or the plane is not tightly packed).
+        Avx2,
     }
 
-    pub(crate) const ALL_DIRECT: [DirectKernel; 5] = [
+    pub(crate) const ALL_DIRECT: [DirectKernel; 6] = [
         DirectKernel::PerPixelSkip,
         DirectKernel::Branchless,
         DirectKernel::ChunkSkip8,
         DirectKernel::ChunkSkip16,
         DirectKernel::Shipping,
+        DirectKernel::Avx2,
     ];
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -915,6 +1026,59 @@ pub(crate) mod lab {
             DirectKernel::Shipping => {
                 blend_direct::<S>(plane, image, src, alpha, coords.0, coords.1, coords.2)
             }
+            DirectKernel::Avx2 => {
+                // Mirror of the shipping dispatch in `blend_typed`.
+                #[cfg(target_arch = "x86_64")]
+                if plane.pixel_step == S::BYTES && avx2::enabled() {
+                    if S::BYTES == SampleU8::BYTES {
+                        // SAFETY: `avx2::enabled()` verified AVX2 support.
+                        unsafe {
+                            avx2::blend_direct_u8(
+                                plane, image, src, alpha, coords.0, coords.1, coords.2,
+                            )
+                        };
+                        return;
+                    }
+                    if S::BYTES == SampleU16Le::BYTES {
+                        // SAFETY: `avx2::enabled()` verified AVX2 support.
+                        unsafe {
+                            avx2::blend_direct_u16(
+                                plane, image, src, alpha, coords.0, coords.1, coords.2,
+                            )
+                        };
+                        return;
+                    }
+                }
+                blend_direct::<S>(plane, image, src, alpha, coords.0, coords.1, coords.2);
+            }
+        }
+    }
+
+    /// Scalar-forced [`pool_sums_h2`]: the bench/test reference for the
+    /// AVX2 interior pair-sum kernel.
+    pub(crate) fn pool_sums_h2_scalar(
+        grid_w: usize,
+        grid_h: usize,
+        image: &OverlayImage<'_>,
+        vsub: u32,
+        out: &mut Vec<u16>,
+    ) -> Option<PooledRect> {
+        pool_sums_h2_impl(grid_w, grid_h, image, vsub, out, false)
+    }
+
+    /// Scalar-forced [`blend_pooled_from_sums`]: the bench/test reference
+    /// for the AVX2 apply kernels.
+    pub(crate) fn blend_pooled_from_sums_scalar(
+        plane: &mut PlaneView<'_>,
+        sums: &[u16],
+        rect: PooledRect,
+        src: u32,
+        alpha: u32,
+        sample: SampleFormat,
+    ) {
+        match sample {
+            SampleFormat::U8 => apply_sums::<SampleU8>(plane, sums, rect, src, alpha),
+            SampleFormat::U16Le => apply_sums::<SampleU16Le>(plane, sums, rect, src, alpha),
         }
     }
 
@@ -1287,6 +1451,80 @@ pub(crate) mod lab {
                             }
                         }
                         assert_eq!(got, expected, "interleaved {case}");
+                    }
+                }
+            }
+        }
+
+        /// The shipping two-phase dispatchers (AVX2 on capable CPUs) must
+        /// match their scalar-forced twins exactly: same rects, same sums,
+        /// same blended bytes, at both sample widths and awkward clip
+        /// geometry.
+        #[test]
+        fn simd_dispatch_matches_scalar_two_phase() {
+            let (grid_w, grid_h) = (49usize, 23usize);
+            let mut sums_auto = Vec::new();
+            let mut sums_scalar = Vec::new();
+            for vsub in [0u32, 1] {
+                for (dst_x, dst_y) in [(-3i32, -2i32), (0, 0), (7, 5)] {
+                    for (w, h) in [(61usize, 13usize), (64, 16), (2, 3), (33, 1)] {
+                        let stride = w + 6;
+                        let bitmap = structured_mask(stride * (h - 1) + w, 0xD15C ^ (w * h) as u64);
+                        let image = OverlayImage {
+                            w,
+                            h,
+                            stride,
+                            bitmap: &bitmap,
+                            color: 0xFFFFFF00,
+                            dst_x,
+                            dst_y,
+                        };
+                        let case = format!("vsub={vsub} dst=({dst_x},{dst_y}) size=({w},{h})");
+                        let rect = pool_sums_h2(grid_w, grid_h, &image, vsub, &mut sums_auto);
+                        let rect_scalar =
+                            pool_sums_h2_scalar(grid_w, grid_h, &image, vsub, &mut sums_scalar);
+                        assert_eq!(rect, rect_scalar, "{case}");
+                        let Some(rect) = rect else { continue };
+                        let used = rect.pw * rect.ph;
+                        assert_eq!(sums_auto[..used], sums_scalar[..used], "{case}");
+
+                        let plane_w = (grid_w + 1) >> 1;
+                        let plane_h = (grid_h + (1 << vsub) - 1) >> vsub;
+                        for (sample, step, src) in [
+                            (SampleFormat::U8, 1usize, 200u32),
+                            (SampleFormat::U16Le, 2, 943),
+                        ] {
+                            let linesize = plane_w * step + 3;
+                            let base = structured_mask(linesize * plane_h, 0xFACE ^ w as u64);
+                            let alpha = sample.alpha_fixed(200);
+                            let mut expected = base.clone();
+                            blend_pooled_from_sums_scalar(
+                                &mut PlaneView {
+                                    data: &mut expected,
+                                    linesize,
+                                    pixel_step: step,
+                                },
+                                &sums_auto,
+                                rect,
+                                src,
+                                alpha,
+                                sample,
+                            );
+                            let mut got = base.clone();
+                            blend_pooled_from_sums(
+                                &mut PlaneView {
+                                    data: &mut got,
+                                    linesize,
+                                    pixel_step: step,
+                                },
+                                &sums_auto,
+                                rect,
+                                src,
+                                alpha,
+                                sample,
+                            );
+                            assert_eq!(got, expected, "{case} sample={sample:?}");
+                        }
                     }
                 }
             }

@@ -235,14 +235,16 @@ impl SubtitleFilter {
                 pooled_count += 1;
             }
         }
-        // Two-phase wins for 8-bit samples (dense 1080p chroma pair: 411us
-        // vs 496us fused); for 16-bit the fused per-component path measured
-        // faster (472us vs 537us), so it keeps the old route.
-        let share_pooling = pooled_count == 2 && spec.sample == SampleFormat::U8 && {
-            let a = &spec.comps[pooled[0]].1;
-            let b = &spec.comps[pooled[1]].1;
-            a.hsub == 1 && b.hsub == 1 && a.vsub == b.vsub && a.vsub <= 1
-        };
+        // Route choice measured in bench_kernels.rs (see
+        // blend::two_phase_pooled_preferred): two-phase always wins for
+        // 8-bit; 16-bit takes it exactly when the AVX2 apply kernels are
+        // live.
+        let share_pooling =
+            pooled_count == 2 && blend::two_phase_pooled_preferred(spec.sample) && {
+                let a = &spec.comps[pooled[0]].1;
+                let b = &spec.comps[pooled[1]].1;
+                a.hsub == 1 && b.hsub == 1 && a.vsub == b.vsub && a.vsub <= 1
+            };
 
         for overlay in images {
             let alpha = spec.sample.alpha_fixed(overlay.opacity());
