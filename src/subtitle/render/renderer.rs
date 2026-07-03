@@ -382,6 +382,34 @@ mod tests {
         assert!(renderer.cache.is_none(), "\\move must disable the cache");
     }
 
+    /// transform_is_noop_initial_state: while \t interpolation is
+    /// unsupported the output is time-invariant, so \t must not poison the
+    /// static-frame cache — and a cold render at another timestamp must
+    /// produce the identical overlay set. Update this test when real \t
+    /// interpolation lands.
+    #[test]
+    fn noop_transform_keeps_static_cache() {
+        let events = "Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\t(0,500,\\fs30)}Anim\n";
+        let Some(mut renderer) = renderer_with(events) else {
+            eprintln!("skipping: no known test font present on this machine");
+            return;
+        };
+        let snapshot = |overlays: Vec<crate::subtitle::blend::OverlayImage<'_>>| -> Vec<(i32, i32, usize, usize, u32, Vec<u8>)> {
+            overlays
+                .into_iter()
+                .map(|o| (o.dst_x, o.dst_y, o.w, o.h, o.color, o.bitmap.to_vec()))
+                .collect()
+        };
+        let early = snapshot(renderer.render_frame(1_000));
+        assert!(!early.is_empty());
+        assert!(renderer.cache.is_some(), "noop \\t must keep the cache");
+        // A fresh renderer cold-rendering at a different timestamp must
+        // agree byte-for-byte (time-invariance, not just cache reuse).
+        let mut fresh = renderer_with(events).expect("font probed above");
+        let late = snapshot(fresh.render_frame(3_500));
+        assert_eq!(early, late, "noop \\t output must not depend on time");
+    }
+
     #[test]
     fn fade_reduces_alpha_over_time() {
         let fading = "Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\fad(0,4000)}Bye\n";
