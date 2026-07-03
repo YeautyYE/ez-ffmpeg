@@ -1,8 +1,5 @@
-use crate::core::context::demuxer::Demuxer;
 use crate::core::context::ffmpeg_context::FfmpegContext;
-use crate::core::context::muxer::Muxer;
 use crate::core::context::obj_pool::ObjPool;
-use crate::core::context::{in_fmt_ctx_free, out_fmt_ctx_free};
 use crate::core::scheduler::dec_task::dec_init;
 use crate::core::scheduler::demux_task::demux_init;
 use crate::core::scheduler::enc_task::enc_init;
@@ -438,9 +435,11 @@ impl FfmpegScheduler<Initialization> {
 
     /// Cleans up Muxers/Demuxers and signals the job to end if an error occurs
     /// during initialization. This is invoked internally when `start()` fails.
-    fn cleanup(scheduler_status: &Arc<AtomicUsize>, ffmpeg_context: &FfmpegContext) {
-        muxs_free(&ffmpeg_context.muxs);
-        demuxs_free(&ffmpeg_context.demuxs);
+    fn cleanup(scheduler_status: &Arc<AtomicUsize>, _ffmpeg_context: &FfmpegContext) {
+        // Contexts still owned by Demuxer/Muxer are freed by their Drop when
+        // the FfmpegContext goes down with the failed scheduler; contexts
+        // already handed to worker threads are freed by those threads
+        // (STATUS_END makes them exit).
         scheduler_status.store(STATUS_END, Ordering::Release);
     }
 }
@@ -724,18 +723,6 @@ pub(crate) fn frame_is_null(frame: &Frame) -> bool {
 
 pub(crate) fn packet_is_null(packet: &Packet) -> bool {
     packet.as_ptr().is_null()
-}
-
-fn demuxs_free(demuxs: &Vec<Demuxer>) {
-    for demux in demuxs {
-        in_fmt_ctx_free(demux.in_fmt_ctx, demux.is_set_read_callback);
-    }
-}
-
-fn muxs_free(muxs: &Vec<Muxer>) {
-    for mux in muxs {
-        out_fmt_ctx_free(mux.out_fmt_ctx, mux.is_set_write_callback);
-    }
 }
 
 pub(crate) fn wait_until_not_paused(scheduler_status: &Arc<AtomicUsize>) -> usize {

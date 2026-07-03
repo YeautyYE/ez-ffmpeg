@@ -5,7 +5,7 @@ use crate::core::scheduler::ffmpeg_scheduler::{is_stopping, packet_is_null, set_
 use crate::core::scheduler::input_controller::{InputController, SchNode};
 use crate::error::Error::Muxing;
 use crate::error::{MuxingError, MuxingOperationError, WriteHeaderError};
-use crate::util::ffmpeg_utils::{av_err2str, hashmap_to_avdictionary};
+use crate::util::ffmpeg_utils::{av_err2str, hashmap_to_avdictionary, DictGuard};
 use crate::util::thread_synchronizer::ThreadSynchronizer;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use ffmpeg_next::packet::{Mut, Ref};
@@ -213,9 +213,11 @@ fn _mux_init(
 ) -> crate::error::Result<()> {
     let out_fmt_ctx_box = AVFormatContextBox::new(out_fmt_ctx, false, is_set_write_callback);
 
-    let mut opts = hashmap_to_avdictionary(&format_opts);
+    // Guard owns the dict on every path: write_header leaves unrecognized
+    // entries behind, which leaked (and were silently swallowed) before.
+    let mut opts = DictGuard::new(hashmap_to_avdictionary(&format_opts));
 
-    let ret = unsafe { avformat_write_header(out_fmt_ctx, &mut opts) };
+    let ret = unsafe { avformat_write_header(out_fmt_ctx, opts.as_double_ptr()) };
     if ret < 0 {
         error!("Could not write header (incorrect codec parameters ?): {}", av_err2str(ret));
         // Record the failure BEFORE releasing this muxer's thread slot, so
@@ -233,6 +235,10 @@ fn _mux_init(
         return Err(Muxing(MuxingOperationError::WriteHeader(
             WriteHeaderError::from(ret),
         )));
+    }
+
+    for key in opts.leftover_keys() {
+        warn!("Option '{key}' was not recognized by output {mux_idx}");
     }
 
     let oformat_flags = unsafe {

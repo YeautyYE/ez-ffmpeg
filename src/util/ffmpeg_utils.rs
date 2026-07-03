@@ -3,10 +3,75 @@
 //! implementations from libavutil/libavformat when debugging.
 
 use ffmpeg_sys_next::{
-    av_dict_set, av_strerror, AVDictionary, AVRational, AV_ERROR_MAX_STRING_SIZE,
+    av_dict_free, av_dict_get, av_dict_iterate, av_dict_set, av_strerror, AVDictionary,
+    AVRational, AV_DICT_MATCH_CASE, AV_ERROR_MAX_STRING_SIZE,
 };
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
+
+/// Owns an `*mut AVDictionary` and frees it on drop.
+///
+/// FFmpeg consumer APIs (avformat_open_input, avcodec_open2, av_opt_set_dict2)
+/// take `&mut *mut AVDictionary` and leave the UNRECOGNIZED entries behind in
+/// a reallocated dictionary — which leaks on every early return unless
+/// something owns it. Construct the guard immediately after building the
+/// dict, hand `as_double_ptr()` to the consumer, and let drop clean up
+/// whatever remains on every path.
+pub(crate) struct DictGuard {
+    dict: *mut AVDictionary,
+}
+
+impl DictGuard {
+    pub(crate) fn new(dict: *mut AVDictionary) -> Self {
+        Self { dict }
+    }
+
+    /// Pointer for FFmpeg consumer APIs; the guard keeps owning the result.
+    pub(crate) fn as_double_ptr(&mut self) -> *mut *mut AVDictionary {
+        &mut self.dict
+    }
+
+    pub(crate) fn as_ptr(&self) -> *const AVDictionary {
+        self.dict as *const _
+    }
+
+    /// Iterate leftover keys (the entries no consumer recognized).
+    pub(crate) fn leftover_keys(&self) -> Vec<String> {
+        let mut keys = Vec::new();
+        let mut entry = std::ptr::null();
+        unsafe {
+            loop {
+                entry = av_dict_iterate(self.dict, entry);
+                if entry.is_null() {
+                    break;
+                }
+                keys.push(CStr::from_ptr((*entry).key).to_string_lossy().into_owned());
+            }
+        }
+        keys
+    }
+
+    /// Remove one key (e.g. an internally injected option that must not be
+    /// reported as "unrecognized user option").
+    pub(crate) fn remove(&mut self, key: &CStr) {
+        unsafe {
+            if !av_dict_get(self.dict, key.as_ptr(), std::ptr::null(), AV_DICT_MATCH_CASE)
+                .is_null()
+            {
+                // Setting a key to NULL deletes it (libavutil/dict.c).
+                av_dict_set(&mut self.dict, key.as_ptr(), std::ptr::null(), 0);
+            }
+        }
+    }
+}
+
+impl Drop for DictGuard {
+    fn drop(&mut self) {
+        unsafe {
+            av_dict_free(&mut self.dict);
+        }
+    }
+}
 
 /// Convert an optional `HashMap<CString, CString>` into an `AVDictionary` by invoking
 /// `av_dict_set()` for each entry.

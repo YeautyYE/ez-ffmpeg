@@ -29,7 +29,7 @@ use crate::error::{
 };
 use crate::error::{Error, Result};
 use crate::filter::frame_pipeline::FramePipeline;
-use crate::util::ffmpeg_utils::hashmap_to_avdictionary;
+use crate::util::ffmpeg_utils::{hashmap_to_avdictionary, DictGuard};
 #[cfg(not(feature = "docs-rs"))]
 use ffmpeg_sys_next::AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC;
 #[cfg(not(feature = "docs-rs"))]
@@ -49,7 +49,7 @@ use ffmpeg_sys_next::AVMediaType::{
 use ffmpeg_sys_next::AVPixelFormat::AV_PIX_FMT_NONE;
 use ffmpeg_sys_next::AVSampleFormat::AV_SAMPLE_FMT_NONE;
 use ffmpeg_sys_next::{
-    av_add_q, av_channel_layout_default, av_codec_get_id, av_codec_get_tag2, av_dict_free,
+    av_add_q, av_channel_layout_default, av_codec_get_id, av_codec_get_tag2,
     av_freep, av_get_exact_bits_per_sample, av_get_pix_fmt, av_guess_codec, av_guess_format, av_guess_frame_rate,
     av_inv_q, av_malloc, av_rescale_q, av_seek_frame, avcodec_alloc_context3,
     avcodec_descriptor_get, avcodec_descriptor_get_by_name, avcodec_find_encoder,
@@ -58,7 +58,7 @@ use ffmpeg_sys_next::{
     avfilter_pad_get_name, avfilter_pad_get_type, avformat_alloc_context,
     avformat_alloc_output_context2, avformat_close_input, avformat_find_stream_info,
     avformat_flush, avformat_free_context, avformat_open_input, avio_alloc_context,
-    avio_context_free, avio_open2, AVCodec, AVCodecID, AVColorRange, AVColorSpace, AVFilterContext,
+    avio_open2, AVCodec, AVCodecID, AVColorRange, AVColorSpace, AVFilterContext,
     AVFilterInOut, AVFilterPad, AVFormatContext, AVMediaType, AVOutputFormat, AVPixelFormat,
     AVRational, AVSampleFormat, AVStream, AVERROR_ENCODER_NOT_FOUND, AVFMT_FLAG_CUSTOM_IO,
     AVFMT_GLOBALHEADER, AVFMT_NOBINSEARCH, AVFMT_NOFILE, AVFMT_NOGENSEARCH, AVFMT_NOSTREAMS,
@@ -2045,7 +2045,7 @@ fn open_output_files(
         unsafe {
             let result = open_output_file(i, output, copy_ts, interrupt_state);
             if let Err(e) = result {
-                free_output_av_format_context(muxs);
+                // Already-built muxers free their contexts on drop.
                 return Err(e);
             }
             let mux = result.unwrap();
@@ -2053,12 +2053,6 @@ fn open_output_files(
         }
     }
     Ok(muxs)
-}
-
-unsafe fn free_output_av_format_context(muxs: Vec<Muxer>) {
-    for mut mux in muxs {
-        avformat_close_input(&mut mux.out_fmt_ctx);
-    }
 }
 
 #[cfg(feature = "docs-rs")]
@@ -2102,7 +2096,7 @@ unsafe fn open_output_file(
             });
             let opaque = Box::into_raw(input_opaque) as *mut libc::c_void;
 
-            let mut avio_ctx = avio_alloc_context(
+            let avio_ctx = avio_alloc_context(
                 avio_ctx_buffer as *mut libc::c_uchar,
                 avio_ctx_buffer_size as i32,
                 1,
@@ -2117,20 +2111,21 @@ unsafe fn open_output_file(
             );
             if avio_ctx.is_null() {
                 av_freep(&mut avio_ctx_buffer as *mut _ as *mut c_void);
+                // avio_alloc_context never took ownership: reclaim the Box.
+                let _ = Box::from_raw(opaque as *mut OutputOpaque);
                 return Err(OpenOutputError::OutOfMemory.into());
             }
 
             let ret = avformat_alloc_output_context2(&mut out_fmt_ctx, format, null(), null());
             if out_fmt_ctx.is_null() {
                 warn!("Error initializing the muxer for write_callback");
-                av_freep(&mut (*avio_ctx).buffer as *mut _ as *mut c_void);
-                avio_context_free(&mut avio_ctx);
+                // Reclaims buffer, callback Box and the AVIOContext itself.
+                crate::core::context::free_output_opaque(avio_ctx);
                 return Err(AllocOutputContextError::from(ret).into());
             }
 
             if !have_seek_callback && output_requires_seek(out_fmt_ctx) {
-                av_freep(&mut (*avio_ctx).buffer as *mut _ as *mut c_void);
-                avio_context_free(&mut avio_ctx);
+                crate::core::context::free_output_opaque(avio_ctx);
                 avformat_free_context(out_fmt_ctx);
                 warn!("The output format supports seeking, but no seek callback is provided. This may cause issues.");
                 return Err(OpenOutputError::SeekFunctionMissing.into());
@@ -2373,7 +2368,9 @@ unsafe extern "C" fn write_packet_wrapper(
     buf: *const u8,
     buf_size: libc::c_int,
 ) -> libc::c_int {
-    if buf.is_null() {
+    // buf_size is a C int: a non-positive value must not be cast to usize
+    // (it would produce a giant slice length).
+    if buf.is_null() || buf_size <= 0 {
         return ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO);
     }
     let context = &mut *(opaque as *mut OutputOpaque);
@@ -2388,7 +2385,9 @@ unsafe extern "C" fn read_packet_wrapper(
     buf: *mut u8,
     buf_size: libc::c_int,
 ) -> libc::c_int {
-    if buf.is_null() {
+    // buf_size is a C int: a non-positive value must not be cast to usize
+    // (it would produce a giant slice length).
+    if buf.is_null() || buf_size <= 0 {
         return ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO);
     }
 
@@ -3033,7 +3032,7 @@ fn open_input_files(
         unsafe {
             let result = open_input_file(i, input, copy_ts, interrupt_state);
             if let Err(e) = result {
-                free_input_av_format_context(demuxs);
+                // Already-built demuxers free their contexts on drop.
                 return Err(e);
             }
             let demux = result.unwrap();
@@ -3041,12 +3040,6 @@ fn open_input_files(
         }
     }
     Ok(demuxs)
-}
-
-unsafe fn free_input_av_format_context(demuxs: Vec<Demuxer>) {
-    for mut demux in demuxs {
-        avformat_close_input(&mut demux.in_fmt_ctx);
-    }
 }
 
 #[cfg(feature = "docs-rs")]
@@ -3105,8 +3098,11 @@ unsafe fn open_input_file(
     };
 
     let input_opts = convert_options(input.input_opts.clone())?;
-    let mut input_opts = hashmap_to_avdictionary(&input_opts);
+    // Guard owns the dict on every path: avformat_open_input reallocates it
+    // to hold unrecognized entries, which leaked on all early returns.
+    let mut input_opts = DictGuard::new(hashmap_to_avdictionary(&input_opts));
 
+    let mut injected_scan_all_pmts = false;
     match &input.url {
         None => {
             if input.read_callback.is_none() {
@@ -3128,7 +3124,7 @@ unsafe fn open_input_file(
             });
             let opaque = Box::into_raw(input_opaque) as *mut libc::c_void;
 
-            let mut avio_ctx = avio_alloc_context(
+            let avio_ctx = avio_alloc_context(
                 avio_ctx_buffer as *mut libc::c_uchar,
                 avio_ctx_buffer_size as i32,
                 0,
@@ -3143,6 +3139,8 @@ unsafe fn open_input_file(
             );
             if avio_ctx.is_null() {
                 av_freep(&mut avio_ctx_buffer as *mut _ as *mut c_void);
+                // avio_alloc_context never took ownership: reclaim the Box.
+                let _ = Box::from_raw(opaque as *mut InputOpaque);
                 avformat_close_input(&mut in_fmt_ctx);
                 return Err(OpenInputError::OutOfMemory.into());
             }
@@ -3150,26 +3148,26 @@ unsafe fn open_input_file(
             (*in_fmt_ctx).pb = avio_ctx;
             (*in_fmt_ctx).flags = AVFMT_FLAG_CUSTOM_IO;
 
-            let ret = avformat_open_input(&mut in_fmt_ctx, null(), file_iformat, &mut input_opts);
+            let ret =
+                avformat_open_input(&mut in_fmt_ctx, null(), file_iformat, input_opts.as_double_ptr());
             if ret < 0 {
-                av_freep(&mut (*avio_ctx).buffer as *mut _ as *mut c_void);
-                avio_context_free(&mut avio_ctx);
+                // close_input first: read_close may still touch s->pb. The
+                // helper also reclaims the callback Box, which leaked here.
                 avformat_close_input(&mut in_fmt_ctx);
+                crate::core::context::free_input_opaque(avio_ctx);
                 return Err(OpenInputError::from(ret).into());
             }
 
             let ret = avformat_find_stream_info(in_fmt_ctx, null_mut());
             if ret < 0 {
-                av_freep(&mut (*avio_ctx).buffer as *mut _ as *mut c_void);
-                avio_context_free(&mut avio_ctx);
                 avformat_close_input(&mut in_fmt_ctx);
+                crate::core::context::free_input_opaque(avio_ctx);
                 return Err(FindStreamError::from(ret).into());
             }
 
             if !have_seek_callback && input_requires_seek(in_fmt_ctx) {
-                av_freep(&mut (*avio_ctx).buffer as *mut _ as *mut c_void);
-                avio_context_free(&mut avio_ctx);
                 avformat_close_input(&mut in_fmt_ctx);
+                crate::core::context::free_input_opaque(avio_ctx);
                 warn!("The input format supports seeking, but no seek callback is provided. This may cause issues.");
                 return Err(OpenInputError::SeekFunctionMissing.into());
             }
@@ -3179,7 +3177,7 @@ unsafe fn open_input_file(
 
             let scan_all_pmts_key = CString::new("scan_all_pmts")?;
             if ffmpeg_sys_next::av_dict_get(
-                input_opts,
+                input_opts.as_ptr(),
                 scan_all_pmts_key.as_ptr(),
                 null(),
                 ffmpeg_sys_next::AV_DICT_MATCH_CASE,
@@ -3188,11 +3186,12 @@ unsafe fn open_input_file(
             {
                 let scan_all_pmts_value = CString::new("1")?;
                 ffmpeg_sys_next::av_dict_set(
-                    &mut input_opts,
+                    input_opts.as_double_ptr(),
                     scan_all_pmts_key.as_ptr(),
                     scan_all_pmts_value.as_ptr(),
                     ffmpeg_sys_next::AV_DICT_DONT_OVERWRITE,
                 );
+                injected_scan_all_pmts = true;
             };
             (*in_fmt_ctx).flags |= ffmpeg_sys_next::AVFMT_FLAG_NONBLOCK;
 
@@ -3200,9 +3199,8 @@ unsafe fn open_input_file(
                 &mut in_fmt_ctx,
                 url_cstr.as_ptr(),
                 file_iformat,
-                &mut input_opts,
+                input_opts.as_double_ptr(),
             );
-            av_dict_free(&mut input_opts);
             if ret < 0 {
                 avformat_close_input(&mut in_fmt_ctx);
                 return Err(OpenInputError::from(ret).into());
@@ -3214,6 +3212,16 @@ unsafe fn open_input_file(
                 return Err(FindStreamError::from(ret).into());
             }
         }
+    }
+
+    // Options no demuxer consumed are user typos; report them instead of
+    // silently swallowing (fftools check_avoptions aborts here — we warn).
+    // The auto-injected scan_all_pmts must not be blamed on the user.
+    if injected_scan_all_pmts {
+        input_opts.remove(&CString::new("scan_all_pmts")?);
+    }
+    for key in input_opts.leftover_keys() {
+        warn!("Option '{key}' was not recognized by input {index}");
     }
 
     let mut timestamp = input.start_time_us.unwrap_or(0);

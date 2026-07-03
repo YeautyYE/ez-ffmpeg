@@ -506,7 +506,7 @@ pub(crate) fn out_fmt_ctx_free(out_fmt_ctx: *mut AVFormatContext, is_set_write_c
     }
 }
 
-unsafe fn free_output_opaque(mut avio_ctx: *mut AVIOContext) {
+pub(crate) unsafe fn free_output_opaque(mut avio_ctx: *mut AVIOContext) {
     if avio_ctx.is_null() {
         return;
     }
@@ -524,17 +524,22 @@ pub(crate) fn in_fmt_ctx_free(mut in_fmt_ctx: *mut AVFormatContext, is_set_read_
     if in_fmt_ctx.is_null() {
         return;
     }
-    if is_set_read_callback {
-        unsafe {
-            free_input_opaque((*in_fmt_ctx).pb);
-        }
-    }
     unsafe {
+        // Close the input FIRST: the demuxer's read_close may still touch
+        // s->pb (the official custom-IO example frees the AVIOContext only
+        // after avformat_close_input). With AVFMT_FLAG_CUSTOM_IO the close
+        // leaves pb alone, so capture it beforehand and free it after.
+        let avio_ctx = if is_set_read_callback {
+            (*in_fmt_ctx).pb
+        } else {
+            null_mut()
+        };
         avformat_close_input(&mut in_fmt_ctx);
+        free_input_opaque(avio_ctx);
     }
 }
 
-unsafe fn free_input_opaque(mut avio_ctx: *mut AVIOContext) {
+pub(crate) unsafe fn free_input_opaque(mut avio_ctx: *mut AVIOContext) {
     if !avio_ctx.is_null() {
         let opaque_ptr = (*avio_ctx).opaque as *mut InputOpaque;
         if !opaque_ptr.is_null() {
