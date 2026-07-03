@@ -8,8 +8,8 @@
 
 use super::fonts::{FontStore, LoadedFace};
 use super::layout::{
-    render_event, unsupported, EventDynamics, EventSamples, FrameContext, RenderOptions,
-    RenderedNode,
+    apply_fade, render_event, unsupported, EventDynamics, EventSamples, FrameContext, MaskSamples,
+    RenderOptions, RenderedNode,
 };
 use crate::subtitle::ass::{Script, VALIGN_CENTER, VALIGN_TOP};
 use crate::subtitle::backend::SubtitleRenderer;
@@ -29,7 +29,13 @@ pub(crate) struct PureRenderer {
     /// Face cache shared across frames (font selection is stable).
     face_cache: HashMap<(String, u16, bool), Option<Arc<LoadedFace>>>,
     /// Nodes of the last rendered frame (backing store for the borrows).
+    /// Colors are UNFADED; emission applies the per-frame fade, so fading
+    /// frames reuse these nodes byte-for-byte.
     nodes: Vec<RenderedNode>,
+    /// Visible-order of the event each node belongs to (parallel to
+    /// `nodes`); indexes the per-frame fade values at emission. Valid
+    /// whenever `cache.events` matches the current visible set.
+    node_orders: Vec<u32>,
     /// Key describing exactly what `nodes` renders; see [`CacheKey`].
     cache: Option<CacheKey>,
     /// Time-dependent inputs captured per event index on its first cold
@@ -56,18 +62,20 @@ pub(crate) struct PureRenderer {
 }
 
 /// One event's rendered output before collision stacking, reusable while
-/// its dynamic samples stay unchanged.
+/// its mask-affecting samples stay unchanged (colors are unfaded; the
+/// fade value is emission-only).
 struct EventTemplate {
-    samples: EventSamples,
+    samples: MaskSamples,
     nodes: Vec<RenderedNode>,
     detect_collisions: bool,
 }
 
 /// Frame-cache identity: the visible event set, the output geometry, and
-/// the per-event time samples. Equal keys imply byte-identical output, so
+/// the per-event MASK samples. Equal keys imply byte-identical nodes, so
 /// animated events hit the cache on every frame where their resolved
-/// dynamic values (fade plateau, karaoke steady state, settled \move) are
-/// unchanged — only frames where a sample actually moves re-render.
+/// mask-affecting values (karaoke state, \move anchor, fade active or
+/// saturated) are unchanged — an interpolating \fad hits every frame and
+/// only re-emits colors; karaoke re-renders only at syllable boundaries.
 #[derive(PartialEq, Eq)]
 struct CacheKey {
     events: Vec<usize>,
@@ -76,7 +84,7 @@ struct CacheKey {
     /// borders/blur/shadows, so it must key the cache even though the
     /// public setter also invalidates on change.
     storage: (i32, i32),
-    samples: Vec<EventSamples>,
+    samples: Vec<MaskSamples>,
 }
 
 impl PureRenderer {
@@ -92,6 +100,7 @@ impl PureRenderer {
             par: 1.0,
             face_cache: HashMap::new(),
             nodes: Vec::new(),
+            node_orders: Vec::new(),
             cache: None,
             dynamics: HashMap::new(),
             templates: HashMap::new(),
@@ -227,17 +236,27 @@ impl SubtitleRenderer for PureRenderer {
                 })
             })
             .collect();
+        // Per-frame emission fades (deliberately NOT part of any cache
+        // key: nodes are stored unfaded and faded at emission below).
+        let mut fades: Vec<Option<i32>> = samples
+            .iter()
+            .map(|sample| sample.as_ref().and_then(EventSamples::fade))
+            .collect();
+        let mask_samples: Vec<Option<MaskSamples>> = samples
+            .iter()
+            .map(|sample| sample.as_ref().map(EventSamples::mask_key))
+            .collect();
 
         let cache_valid = match &self.cache {
             Some(cache) => {
                 cache.events == visible
                     && cache.frame == frame
                     && cache.storage == storage
-                    && cache.samples.len() == samples.len()
+                    && cache.samples.len() == mask_samples.len()
                     && cache
                         .samples
                         .iter()
-                        .zip(&samples)
+                        .zip(&mask_samples)
                         .all(|(cached, now)| now.as_ref() == Some(cached))
             }
             None => false,
@@ -259,14 +278,15 @@ impl SubtitleRenderer for PureRenderer {
             };
 
             let mut all_nodes: Vec<RenderedNode> = Vec::new();
+            let mut node_orders: Vec<u32> = Vec::new();
             let mut occupied: Vec<(i32, i32, i32, i32)> = Vec::new();
             let mut seen_unsupported = 0u32;
             for (order, &index) in visible.iter().enumerate() {
                 let event = &self.script.events[index];
-                // Reuse this event's template when its samples are
+                // Reuse this event's template when its mask samples are
                 // unchanged: layout, shaping and rasterization are then
                 // skipped and only the bitmap copy + stacking replay run.
-                let sample_now = samples[order].as_ref();
+                let sample_now = mask_samples[order].as_ref();
                 let (mut nodes, detect_collisions) = match sample_now.and_then(|sample| {
                     self.templates
                         .get(&index)
@@ -281,12 +301,15 @@ impl SubtitleRenderer for PureRenderer {
                         let rendered = render_event(&ctx, event, now_ms, &mut self.face_cache);
                         seen_unsupported |= rendered.unsupported;
                         self.dynamics.insert(index, rendered.dynamics);
-                        let samples = self.dynamics[&index]
+                        let full = self.dynamics[&index]
                             .sample(now_ms - event.start_ms, event.duration_ms);
+                        // First render of this event: the pre-loop fade was
+                        // None (no record yet); emission needs the real one.
+                        fades[order] = full.fade();
                         self.templates.insert(
                             index,
                             EventTemplate {
-                                samples,
+                                samples: full.mask_key(),
                                 nodes: rendered.nodes.clone(),
                                 detect_collisions: rendered.detect_collisions,
                             },
@@ -294,6 +317,13 @@ impl SubtitleRenderer for PureRenderer {
                         (rendered.nodes, rendered.detect_collisions)
                     }
                 };
+                // A saturated fade (>= 255 pre-clamp) turns every node
+                // fully transparent; before the emission split those nodes
+                // were dropped ahead of collision stacking, so the event
+                // must contribute neither nodes nor an occupied rectangle.
+                if fades[order].is_some_and(|fade| fade >= 255) {
+                    continue;
+                }
                 if nodes.is_empty() {
                     continue;
                 }
@@ -304,21 +334,25 @@ impl SubtitleRenderer for PureRenderer {
                 } else if let Some(bbox) = block_bbox(&nodes) {
                     occupied.push(bbox);
                 }
+                node_orders.extend(std::iter::repeat_n(order as u32, nodes.len()));
                 all_nodes.append(&mut nodes);
             }
             self.nodes = all_nodes;
+            self.node_orders = node_orders;
             // Bound template memory to the visible set (masks are the big
             // allocation; dynamics records are tiny and stay).
             self.templates.retain(|index, _| visible.contains(index));
-            // Key the result by the samples the render actually used — the
-            // records are complete now, so resolve any that were missing.
+            // Key the result by the mask samples the render actually used —
+            // the records are complete now, so resolve any missing ones.
             let samples = visible
                 .iter()
-                .zip(samples)
-                .map(|(&index, sample)| {
-                    sample.unwrap_or_else(|| {
+                .zip(mask_samples)
+                .map(|(&index, mask)| {
+                    mask.unwrap_or_else(|| {
                         let event = &self.script.events[index];
-                        self.dynamics[&index].sample(now_ms - event.start_ms, event.duration_ms)
+                        self.dynamics[&index]
+                            .sample(now_ms - event.start_ms, event.duration_ms)
+                            .mask_key()
                     })
                 })
                 .collect();
@@ -333,13 +367,14 @@ impl SubtitleRenderer for PureRenderer {
 
         self.nodes
             .iter()
-            .filter(|node| !node.bitmap.is_empty())
-            .map(|node| OverlayImage {
+            .zip(&self.node_orders)
+            .filter(|(node, _)| !node.bitmap.is_empty())
+            .map(|(node, &order)| OverlayImage {
                 w: node.bitmap.w,
                 h: node.bitmap.h,
                 stride: node.bitmap.w,
                 bitmap: node.bitmap.data.as_slice(),
-                color: node.color,
+                color: apply_fade(node.color, fades[order as usize]),
                 dst_x: node.bitmap.x,
                 dst_y: node.bitmap.y,
             })
@@ -348,6 +383,7 @@ impl SubtitleRenderer for PureRenderer {
 
     fn teardown(&mut self) {
         self.nodes.clear();
+        self.node_orders.clear();
         self.face_cache.clear();
         self.cache = None;
         self.dynamics.clear();
@@ -542,26 +578,69 @@ mod tests {
         assert_eq!(renderer.cold_renders, 3, "settled \\move must cache-hit");
     }
 
-    /// \fad plateau frames resolve to a constant fade sample, so only the
-    /// interpolating fade-in/out frames pay a cold render.
+    /// Fading only changes the emitted colors: masks are cached across the
+    /// whole fade (the mask key tracks just fade-active and saturation),
+    /// so interpolating frames hit the cache and re-emit — and the emitted
+    /// alpha still tracks the fade value frame by frame.
     #[test]
-    fn fade_plateau_frames_hit_the_cache() {
+    fn interpolating_fade_hits_the_cache_and_re_emits() {
         let fading = "Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\fad(500,500)}Plateau\n";
         let Some(mut renderer) = renderer_with(fading) else {
             eprintln!("skipping: no known test font present on this machine");
             return;
         };
-        let _ = renderer.render_frame(1_000); // plateau
-        let _ = renderer.render_frame(2_000); // plateau: same sample
-        let _ = renderer.render_frame(3_500); // plateau: same sample
-        assert_eq!(renderer.cold_renders, 1, "plateau frames must cache-hit");
-        let _ = renderer.render_frame(100); // fade-in: interpolating
-        let _ = renderer.render_frame(200); // fade-in: different sample
-        assert_eq!(renderer.cold_renders, 3, "interpolating frames re-render");
-        // NOT 4_800: its fade-out sample (255*0.6) equals the 200ms fade-in
-        // sample and legitimately cache-hits — equal samples, equal bytes.
-        let _ = renderer.render_frame(4_700); // fade-out: 255*0.4
-        assert_eq!(renderer.cold_renders, 4);
+        let alpha_max = |renderer: &mut PureRenderer, ms: i64| -> u32 {
+            renderer
+                .render_frame(ms)
+                .iter()
+                .map(|o| o.color & 0xFF)
+                .max()
+                .expect("some overlay")
+        };
+        let early = alpha_max(&mut renderer, 100); // fade-in, mostly transparent
+        assert_eq!(renderer.cold_renders, 1);
+        let later = alpha_max(&mut renderer, 400); // fade-in, mostly opaque
+        assert_eq!(
+            renderer.cold_renders, 1,
+            "interpolating fade must reuse the cached masks"
+        );
+        assert!(
+            early > later,
+            "fade-in must reduce transparency over time ({early} !> {later})"
+        );
+        let _ = alpha_max(&mut renderer, 2_000);
+        assert_eq!(
+            renderer.cold_renders, 2,
+            "fade-active flip (slope -> plateau) re-renders masks once"
+        );
+        let _ = alpha_max(&mut renderer, 3_000);
+        assert_eq!(renderer.cold_renders, 2, "plateau frames cache-hit");
+        // Warmed emission must equal a cold render at the same timestamp.
+        let warmed: Vec<u32> = renderer
+            .render_frame(4_800)
+            .iter()
+            .map(|o| o.color)
+            .collect();
+        let mut fresh = renderer_with(fading).expect("font probed above");
+        let cold: Vec<u32> = fresh.render_frame(4_800).iter().map(|o| o.color).collect();
+        assert_eq!(warmed, cold, "faded emission must match a cold render");
+    }
+
+    /// A saturated fade (255) drops every node before stacking — the event
+    /// must vanish entirely, exactly like the pre-split renderer.
+    #[test]
+    fn saturated_fade_contributes_nothing() {
+        // \fad(1000,1000): at t=0 the fade multiplier is exactly 255.
+        let fading = "Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\fad(1000,1000)}Gone\n";
+        let Some(mut renderer) = renderer_with(fading) else {
+            eprintln!("skipping: no known test font present on this machine");
+            return;
+        };
+        assert!(
+            renderer.render_frame(0).is_empty(),
+            "fully faded-out frame renders nothing"
+        );
+        assert!(!renderer.render_frame(1_000).is_empty());
     }
 
     /// Stepwise karaoke flags flip only at syllable boundaries; frames in
@@ -587,19 +666,21 @@ mod tests {
     /// events must reuse their node templates instead of re-rendering.
     #[test]
     fn static_siblings_reuse_templates_next_to_animated_events() {
+        // \move changes the mask key every frame (unlike \fad, whose value
+        // is emission-only), so it exercises the per-event template path.
         let events = "Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,Static line\n\
-                      Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\fad(2000,2000)}Fading\n";
+                      Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\move(100,100,600,100)}Moving\n";
         let Some(mut renderer) = renderer_with(events) else {
             eprintln!("skipping: no known test font present on this machine");
             return;
         };
         let _ = renderer.render_frame(1_000);
         assert_eq!(renderer.event_renders, 2, "first frame renders both");
-        let _ = renderer.render_frame(1_100); // fade sample moved
-        assert_eq!(renderer.cold_renders, 2, "interpolating fade misses");
+        let _ = renderer.render_frame(1_100); // anchor sample moved
+        assert_eq!(renderer.cold_renders, 2, "moving anchor misses");
         assert_eq!(
             renderer.event_renders, 3,
-            "only the fading event re-renders; the static line reuses its template"
+            "only the moving event re-renders; the static line reuses its template"
         );
         // Template reuse must compose byte-identically to a cold render of
         // the same timestamp.
