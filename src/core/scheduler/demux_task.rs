@@ -196,6 +196,33 @@ pub(crate) fn demux_init(
                         break;
                     }
 
+                    if demux_parameter.demux_streams.len()
+                        <= (*packet.as_ptr()).stream_index as usize
+                    {
+                        let stream_index = (*packet.as_ptr()).stream_index as usize;
+                        if stream_index >= nb_streams_warn {
+                            warn!("Incorrect stream id:{stream_index}, ignoring its packets");
+                            nb_streams_warn = stream_index + 1;
+                        }
+                        packet_pool.release(packet);
+                        continue;
+                    }
+
+                    // Discarded and finished streams are dropped before the
+                    // corrupt check and any ts_fixup/readrate/send
+                    // bookkeeping, like the loop-top skip in fftools
+                    // (ffmpeg_demux.c:751 precedes the corrupt handling at
+                    // :756-766): a bad packet on a dead stream must not
+                    // fail streams that are still consuming.
+                    {
+                        let ds = &demux_parameter.demux_streams
+                            [(*packet.as_ptr()).stream_index as usize];
+                        if ds.discard || ds.finished {
+                            packet_pool.release(packet);
+                            continue;
+                        }
+                    }
+
                     if (*packet.as_ptr()).flags & AV_PKT_FLAG_CORRUPT != 0 {
                         if demux_parameter.exit_on_error {
                             error!(
@@ -218,30 +245,6 @@ pub(crate) fn demux_init(
                                 "corrupt input packet in stream {}",
                                 (*packet.as_ptr()).stream_index
                             );
-                        }
-                    }
-
-                    if demux_parameter.demux_streams.len()
-                        <= (*packet.as_ptr()).stream_index as usize
-                    {
-                        let stream_index = (*packet.as_ptr()).stream_index as usize;
-                        if stream_index >= nb_streams_warn {
-                            warn!("Incorrect stream id:{stream_index}, ignoring its packets");
-                            nb_streams_warn = stream_index + 1;
-                        }
-                        packet_pool.release(packet);
-                        continue;
-                    }
-
-                    // Discarded and finished streams are dropped before
-                    // ts_fixup/readrate/send bookkeeping, like the loop-top
-                    // skip in fftools (ffmpeg_demux.c:751).
-                    {
-                        let ds = &demux_parameter.demux_streams
-                            [(*packet.as_ptr()).stream_index as usize];
-                        if ds.discard || ds.finished {
-                            packet_pool.release(packet);
-                            continue;
                         }
                     }
 
@@ -1063,7 +1066,11 @@ unsafe fn demux_send(
     // flush the downstreams after seek
     if (*packet_box.packet.as_ptr()).stream_index == -1 {
         packet_pool.release(packet_box.packet);
-        return demux_flush(packet_pool, &demux_parameter.dsts);
+        return demux_flush(
+            packet_pool,
+            &demux_parameter.dsts,
+            &mut demux_parameter.dsts_finished,
+        );
     }
 
     let stream_index = (*packet_box.packet.as_ptr()).stream_index as usize;
@@ -1230,14 +1237,17 @@ unsafe fn demux_stream_send_to_dst(
 unsafe fn demux_flush(
     packet_pool: &ObjPool<Packet>,
     dsts: &Vec<(Sender<PacketBox>, usize, Option<usize>)>,
+    dsts_finished: &mut [bool],
 ) -> i32 {
     // let ts = AV_NOPTS_VALUE;
     // let tb = AVRational{ num: 0, den: 0 };
     // let max_end_ts = Timestamp { ts: AV_NOPTS_VALUE, tb: AVRational { num: 0, den: 0 } };
 
-    for (packet_dst, _input_stream_index, output_stream_index) in dsts {
-        //only send to decoder
-        if output_stream_index.is_some() {
+    for (i, (packet_dst, _input_stream_index, output_stream_index)) in dsts.iter().enumerate() {
+        // Finished and non-decoder destinations are skipped, like the
+        // fftools flush loop (ffmpeg_sched.c:1979-1980): a consumer that
+        // completed in an earlier pass must not fail the next loop.
+        if dsts_finished[i] || output_stream_index.is_some() {
             continue;
         }
 
@@ -1257,8 +1267,8 @@ unsafe fn demux_flush(
         };
 
         if let Err(_) = packet_dst.send(packet_box) {
-            debug!("Demuxer dst finished, stop sending flush packet");
-            return AVERROR_EOF;
+            debug!("Demuxer dst finished, skipping flush packet");
+            dsts_finished[i] = true;
         }
 
         //TODO max_end_ts

@@ -279,3 +279,82 @@ fn one_finished_stream_does_not_stop_the_demuxer() {
         other => panic!("expected audio stream info, got {other:?}"),
     }
 }
+
+#[test]
+fn stream_loop_survives_a_stream_that_finished_in_an_earlier_pass() {
+    // Two-stream 1s fixture, looped twice more. The video consumer is done
+    // after a single frame, so every later loop flush meets a dead video
+    // destination: it must skip it like the fftools flush loop
+    // (ffmpeg_sched.c:1979-1980) instead of failing the whole job, while
+    // audio keeps collecting frames across passes.
+    let fixture = tmp_path("loop_two_stream_fixture.mp4");
+    let result = wait_with_watchdog(
+        FfmpegContext::builder()
+            .input(
+                Input::from(
+                    "testsrc=size=320x240:rate=30:duration=1[out0];\
+                     sine=frequency=440:sample_rate=44100:duration=1[out1]",
+                )
+                .set_format("lavfi"),
+            )
+            .output(
+                Output::from(fixture.as_str())
+                    .set_video_codec("mpeg4")
+                    .set_audio_codec("aac"),
+            )
+            .build()
+            .unwrap()
+            .start()
+            .unwrap(),
+        60,
+        "two-stream loop fixture",
+    );
+    assert!(result.is_ok(), "fixture task failed: {result:?}");
+
+    let out = tmp_path("loop_survivor.mp4");
+    let result = wait_with_watchdog(
+        FfmpegContext::builder()
+            .input(Input::from(fixture.as_str()).set_stream_loop(2))
+            .output(
+                Output::from(out.as_str())
+                    .set_video_codec("mpeg4")
+                    .set_audio_codec("aac")
+                    .set_max_video_frames(1)
+                    .set_max_audio_frames(100),
+            )
+            .build()
+            .unwrap()
+            .start()
+            .unwrap(),
+        60,
+        "loop with finished stream",
+    );
+    assert!(
+        result.is_ok(),
+        "a finished stream must not fail the loop flush: {result:?}"
+    );
+
+    match find_video_stream_info(&out)
+        .expect("failed to probe output")
+        .expect("output has no video stream")
+    {
+        StreamInfo::Video { nb_frames, .. } => {
+            assert_eq!(nb_frames, 1, "video stream must respect its frame limit");
+        }
+        other => panic!("expected video stream info, got {other:?}"),
+    }
+
+    match find_audio_stream_info(&out)
+        .expect("failed to probe output")
+        .expect("output has no audio stream")
+    {
+        StreamInfo::Audio { nb_frames, .. } => {
+            // 100 encoded frames + the AAC priming packet (CLI parity).
+            assert_eq!(
+                nb_frames, 101,
+                "audio must keep flowing across loop passes"
+            );
+        }
+        other => panic!("expected audio stream info, got {other:?}"),
+    }
+}
