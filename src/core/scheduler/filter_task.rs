@@ -2921,7 +2921,7 @@ unsafe fn read_binary(path: *mut c_char) -> crate::error::Result<(*mut c_void, i
         return Err(AVERROR(EIO));
     }
 
-    let data = av_malloc(fsize as usize);
+    let mut data = av_malloc(fsize as usize);
     if data.is_null() {
         avio_close(io);
         return Err(AVERROR(ENOMEM));
@@ -2933,7 +2933,10 @@ unsafe fn read_binary(path: *mut c_char) -> crate::error::Result<(*mut c_void, i
             "Error reading file '{}'. read_size:{read_size}",
             CStr::from_ptr(path).to_str().unwrap_or("[unknow path]")
         );
-        av_freep(data);
+        // av_freep takes the address of the pointer; passing the buffer
+        // itself freed whatever its first bytes happened to contain
+        // (ffmpeg_filter.c:470, where data is already a uint8_t**).
+        av_freep(&mut data as *mut _ as *mut c_void);
         avio_close(io);
         return Err(if read_size < 0 {
             read_size
