@@ -194,7 +194,13 @@ pub(crate) fn dec_init(
 
             // on success send EOF timestamp to our downstreams
             if !err_exit {
-                let mut frame = frame_pool.get().unwrap();
+                let Ok(mut frame) = frame_pool.get() else {
+                    // Losing the EOF marker only skips the last-frame
+                    // duration hint; killing the decoder thread over an
+                    // allocation failure is worse.
+                    warn!("Failed to allocate the EOF marker frame, skipping EOF timestamp");
+                    return;
+                };
                 unsafe {
                     {
                         let dp = dp_arc.clone();

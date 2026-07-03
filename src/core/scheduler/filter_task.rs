@@ -43,7 +43,7 @@ use ffmpeg_sys_next::{
     AVFilterInOut, AVFrame, AVMediaType, AVPixelFormat, AVRational, AVSampleFormat, AVERROR,
     AVERROR_BUG, AVERROR_EOF, AVERROR_OPTION_NOT_FOUND, AVIO_FLAG_READ, AV_BPRINT_SIZE_AUTOMATIC,
     AV_BUFFERSINK_FLAG_NO_REQUEST, AV_BUFFERSRC_FLAG_PUSH, AV_NOPTS_VALUE, AV_OPT_SEARCH_CHILDREN,
-    AV_PIX_FMT_FLAG_HWACCEL, AV_TIME_BASE_Q, EAGAIN, EIO, ENOMEM,
+    AV_PIX_FMT_FLAG_HWACCEL, AV_TIME_BASE_Q, EAGAIN, EINVAL, EIO, ENOMEM,
 };
 #[cfg(not(feature = "docs-rs"))]
 use ffmpeg_sys_next::{
@@ -1175,7 +1175,9 @@ fn insert_trim(
             return ffmpeg_sys_next::AVERROR_FILTER_NOT_FOUND;
         }
 
-        let filter_name_cstring = CString::new(filter_name).unwrap();
+        let Ok(filter_name_cstring) = CString::new(filter_name) else {
+            return AVERROR(EINVAL);
+        };
         let ctx =
             ffmpeg_sys_next::avfilter_graph_alloc_filter(graph, trim, filter_name_cstring.as_ptr());
         if ctx.is_null() {
@@ -2539,7 +2541,10 @@ unsafe fn configure_input_video_filter(
     }
     let name = result.unwrap();
 
-    let args_cstr = CString::new(args).unwrap();
+    let Ok(args_cstr) = CString::new(args) else {
+        av_freep(&mut par as *mut _ as *mut c_void);
+        return AVERROR(EINVAL);
+    };
     let mut ret = avfilter_graph_create_filter(
         &mut ifp.filter,
         buffer_filter,
@@ -2646,20 +2651,24 @@ fn insert_filter(
     args: Option<&str>,
 ) -> i32 {
     let graph = unsafe { (*(*last_filter)).graph };
-    let filter_name_cstr = CString::new(filter_name).unwrap();
+    let Ok(filter_name_cstr) = CString::new(filter_name) else {
+        return AVERROR(EINVAL);
+    };
     let filter = unsafe { avfilter_get_by_name(filter_name_cstr.as_ptr()) };
     if filter.is_null() {
         return AVERROR_BUG;
     }
 
     let mut ctx = std::ptr::null_mut();
-    let args_cstr = args.map(|a| CString::new(a).unwrap());
+    let args_cstr = match args.map(CString::new).transpose() {
+        Ok(args_cstr) => args_cstr,
+        Err(_) => return AVERROR(EINVAL),
+    };
     let args_ptr = args_cstr
         .as_ref()
         .map_or(std::ptr::null(), |cstr| cstr.as_ptr());
 
     let ret = unsafe {
-        let filter_name_cstr = CString::new(filter_name).unwrap();
         avfilter_graph_create_filter(
             &mut ctx,
             filter,
@@ -2702,7 +2711,10 @@ unsafe fn graph_parse(
     outputs: *mut *mut AVFilterInOut,
     hw_device: Option<HWDevice>,
 ) -> i32 {
-    let desc = CString::new(graph_desc).expect("CString::new failed");
+    let Ok(desc) = CString::new(graph_desc) else {
+        error!("Filter graph description contains an interior NUL byte");
+        return AVERROR(EINVAL);
+    };
     let mut seg = null_mut();
     *inputs = null_mut();
     *outputs = null_mut();

@@ -1968,7 +1968,7 @@ fn choose_encoder(
 
     match media_codec {
         None => {
-            let url = CString::new(&*mux.url).unwrap();
+            let url = CString::new(&*mux.url)?;
             unsafe {
                 let codec_id = av_guess_codec(
                     (*mux.out_fmt_ctx).oformat,

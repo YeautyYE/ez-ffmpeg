@@ -367,6 +367,9 @@ pub enum OpenEncoderOperationError {
     #[error(": no frames were received before EOF; encoder never opened")]
     NoFramesReceived,
 
+    #[error(": unsupported media type for encoding")]
+    UnsupportedMediaType,
+
     #[error("Thread exited")]
     ThreadExited,
 }
