@@ -485,7 +485,13 @@ impl FfmpegScheduler<Running> {
             self.status.store(STATUS_END, Ordering::Release);
         }
 
-        let option = self.result.lock().unwrap().take();
+        // A worker that panicked while holding the lock must surface as an
+        // error on the caller's thread, not as a second panic.
+        let option = self
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         match option {
             None => {
                 log::info!("FFmpeg task succeeded.");
@@ -615,7 +621,10 @@ impl std::future::Future for FfmpegScheduler<Running> {
         fn ready(
             result: &Arc<Mutex<Option<crate::error::Result<()>>>>,
         ) -> std::task::Poll<crate::error::Result<()>> {
-            let option = result.lock().unwrap().take();
+            let option = result
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
             std::task::Poll::Ready(match option {
                 None => {
                     log::info!("FFmpeg task succeeded.");
@@ -741,7 +750,12 @@ pub(crate) fn set_scheduler_error(
     scheduler_result: &Arc<Mutex<Option<crate::error::Result<()>>>>,
     error: impl Into<crate::error::Error>,
 ) {
-    let mut scheduler_result = scheduler_result.lock().unwrap();
+    // First-error-wins must keep working even after some worker panicked
+    // with the lock held; poisoning here would cascade panics through every
+    // other worker's error path.
+    let mut scheduler_result = scheduler_result
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if scheduler_result.is_none() {
         scheduler_result.replace(Err(error.into()));
         scheduler_status.store(STATUS_END, Ordering::Release);
@@ -764,6 +778,36 @@ mod tests {
     use std::thread::sleep;
     use std::time::Duration;
     use crate::filter::frame_pipeline_builder::FramePipelineBuilder;
+
+    #[test]
+    fn set_scheduler_error_survives_a_poisoned_result_lock() {
+        use crate::core::scheduler::ffmpeg_scheduler::{set_scheduler_error, STATUS_END};
+        use std::sync::atomic::AtomicUsize;
+
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let result: Arc<Mutex<Option<crate::error::Result<()>>>> = Arc::new(Mutex::new(None));
+
+        // Poison the lock the way a worker panicking mid-error would.
+        let poisoned = Arc::clone(&result);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("worker panicked while holding the result lock");
+        })
+        .join();
+        assert!(result.is_poisoned(), "test setup must poison the lock");
+
+        // First-error-wins must still record the error instead of panicking.
+        set_scheduler_error(
+            &status,
+            &result,
+            crate::error::Error::NotStarted,
+        );
+        assert_eq!(status.load(Ordering::Acquire), STATUS_END);
+        assert!(result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some());
+    }
 
     #[test]
     fn test_img_to_video() {

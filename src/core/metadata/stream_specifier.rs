@@ -582,7 +582,11 @@ impl StreamSpecifier {
 
             // Check metadata filter
             if let Some(ref meta_key) = self.meta_key {
-                let c_key = std::ffi::CString::new(meta_key.as_str()).unwrap();
+                // A key with an interior NUL cannot exist in an AVDictionary:
+                // treat it as a non-match instead of panicking.
+                let Ok(c_key) = std::ffi::CString::new(meta_key.as_str()) else {
+                    continue;
+                };
                 let entry = av_dict_get(candidate.metadata, c_key.as_ptr(), std::ptr::null(), 0);
 
                 if entry.is_null() {

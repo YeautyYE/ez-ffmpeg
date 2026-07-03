@@ -98,6 +98,9 @@ impl FramePipelineBuilder {
     /// let builder = FramePipelineBuilder::new(AVMEDIA_TYPE_VIDEO)
     ///     .filter("scale", filter);
     /// ```
+    ///
+    /// # Panics
+    /// Panics if the filter's media type differs from the builder's.
     pub fn filter(mut self, name: &str, filter: Box<dyn FrameFilter>) -> Self {
         assert_eq!(self.media_type, filter.media_type());
         self.filters.push((name.to_string(), filter));

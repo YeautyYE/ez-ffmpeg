@@ -994,6 +994,9 @@ impl Input {
     /// let input = Input::from("video.mp4")
     ///     .set_ts_scale(2.0);
     /// ```
+    ///
+    /// # Panics
+    /// Panics if `scale` is not a positive finite number.
     pub fn set_ts_scale(mut self, scale: f64) -> Self {
         assert!(scale.is_finite(), "ts_scale must be finite, got {scale}");
         assert!(scale > 0.0, "ts_scale must be positive, got {scale}");
@@ -1031,6 +1034,9 @@ impl Input {
     /// let input = Input::from("video.mp4")
     ///     .set_framerate(24000, 1001);
     /// ```
+    ///
+    /// # Panics
+    /// Panics if `num` or `den` is not positive.
     pub fn set_framerate(mut self, num: i32, den: i32) -> Self {
         assert!(num > 0, "framerate numerator must be positive, got {num}");
         assert!(den > 0, "framerate denominator must be positive, got {den}");

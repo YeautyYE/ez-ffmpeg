@@ -923,7 +923,10 @@ fn enc_open(
                     (*enc_ctx).subtitle_header_size = header.len() as i32;
                 }
             }
-            _ => panic!("Unsupported codec type"),
+            // fftools av_assert0(0) (ffmpeg_enc.c:319): the mapping layer
+            // never routes DATA/ATTACHMENT into an encoder, but a library
+            // fails the task instead of aborting on the broken invariant.
+            _ => return Err(OpenEncoder(OpenEncoderOperationError::UnsupportedMediaType)),
         }
 
         if (*enc).capabilities as u32 & AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE != 0 {
