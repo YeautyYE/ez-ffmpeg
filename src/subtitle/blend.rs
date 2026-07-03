@@ -622,8 +622,16 @@ fn pool_sums_h2_impl(
     let py1 = (y0 + h - 1) >> vsub;
     let pw = px1 - px0 + 1;
     let ph = py1 - py0 + 1;
-    out.clear();
-    out.resize(pw * ph, 0);
+    // Grow-only, no zero-fill: every element of the pw x ph rect is written
+    // below — each row is fully partitioned into the left-edge pixel, the
+    // interior span and the right-edge pixel — so stale contents from
+    // earlier nodes are never read and the previous per-node
+    // `clear` + `resize(.., 0)` memset (~300 KB per dense 1080p chroma
+    // rect) is gone. Readers index through `PooledRect`, never past
+    // `pw * ph`.
+    if out.len() < pw * ph {
+        out.resize(pw * ph, 0);
+    }
 
     let left_partial = (px0 << 1) < x0;
     let right_partial = ((px1 + 1) << 1) > x0 + w;
