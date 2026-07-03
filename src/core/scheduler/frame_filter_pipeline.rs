@@ -383,24 +383,34 @@ fn send_frame(
                     continue;
                 }
             if i < frame_senders.len() - 1 {
-                let mut to_send = frame_pool.get()?;
+                let to_send = if crate::core::scheduler::ffmpeg_scheduler::frame_is_null(
+                    &frame_box.frame,
+                ) {
+                    // EOF sentinel (null AVFrame pointer): every destination
+                    // gets its own null frame, mirroring dec_done. It must
+                    // not be dereferenced below.
+                    crate::core::context::null_frame()
+                } else {
+                    let mut to_send = frame_pool.get()?;
 
-                // frame may sometimes contain props only,
-                // e.g. to signal EOF timestamp
-                unsafe {
-                    if !(*frame_box.frame.as_ptr()).buf[0].is_null() {
-                        let ret = av_frame_ref(to_send.as_mut_ptr(), frame_box.frame.as_ptr());
-                        if ret < 0 {
-                            return Err(FrameFilterSendOOM);
-                        }
-                    } else {
-                        let ret =
-                            av_frame_copy_props(to_send.as_mut_ptr(), frame_box.frame.as_ptr());
-                        if ret < 0 {
-                            return Err(FrameFilterSendOOM);
-                        }
-                    };
-                }
+                    // frame may sometimes contain props only,
+                    // e.g. to signal EOF timestamp
+                    unsafe {
+                        if !(*frame_box.frame.as_ptr()).buf[0].is_null() {
+                            let ret = av_frame_ref(to_send.as_mut_ptr(), frame_box.frame.as_ptr());
+                            if ret < 0 {
+                                return Err(FrameFilterSendOOM);
+                            }
+                        } else {
+                            let ret =
+                                av_frame_copy_props(to_send.as_mut_ptr(), frame_box.frame.as_ptr());
+                            if ret < 0 {
+                                return Err(FrameFilterSendOOM);
+                            }
+                        };
+                    }
+                    to_send
+                };
                 let mut frame_data = frame_box.frame_data.clone();
                 frame_data.fg_input_index = *fg_input_index;
                 let frame_box = FrameBox {
@@ -427,7 +437,9 @@ fn send_frame(
             }
         }
 
-        for i in finished_senders {
+        // Indices were collected in ascending order; remove back-to-front so
+        // earlier removals do not shift the positions of later ones.
+        for i in finished_senders.into_iter().rev() {
             frame_senders.remove(i);
         }
     }
