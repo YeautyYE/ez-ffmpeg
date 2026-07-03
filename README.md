@@ -18,7 +18,7 @@
 **`ez-ffmpeg`** provides a **safe and ergonomic Rust interface for FFmpeg integration**, offering a familiar API that closely follows FFmpeg’s original logic and parameter structures.
 
 This library:
-- Ensures full safety without using `unsafe` code
+- Exposes a safe public API; the internal FFmpeg FFI layer uses audited `unsafe` code
 - Keeps the execution logic and parameter conventions as close to FFmpeg as possible
 - Provides an intuitive and user-friendly API for media processing
 - Supports custom Rust filters and flexible input/output handling
