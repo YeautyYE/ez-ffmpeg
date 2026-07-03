@@ -194,35 +194,37 @@ pub(crate) fn dec_init(
 
             // on success send EOF timestamp to our downstreams
             if !err_exit {
-                let Ok(mut frame) = frame_pool.get() else {
-                    // Losing the EOF marker only skips the last-frame
-                    // duration hint; killing the decoder thread over an
-                    // allocation failure is worse.
-                    warn!("Failed to allocate the EOF marker frame, skipping EOF timestamp");
-                    return;
-                };
-                unsafe {
-                    {
-                        let dp = dp_arc.clone();
-                        let dp = dp.lock().unwrap();
-                        (*frame.as_mut_ptr()).opaque =
-                            FrameOpaque::FrameOpaqueEof as i32 as *mut c_void;
-                        (*frame.as_mut_ptr()).pts = if dp.last_frame_pts == AV_NOPTS_VALUE {
-                            AV_NOPTS_VALUE
-                        } else {
-                            dp.last_frame_pts + dp.last_frame_duration_est
-                        };
-                        (*frame.as_mut_ptr()).time_base = dp.last_frame_tb;
-                    }
-                    let frame_box = dec_frame_to_box(dp_arc.clone(), frame);
-                    if let Err(e) = dec_send(frame_box, &frame_pool, &senders) {
-                        if e != Error::EOF {
-                            error!("Error signalling EOF: {e}");
-                            set_scheduler_error(&scheduler_status, &scheduler_result, e);
-                            return;
+                // Failures here must still fall through to dec_done below —
+                // skipping it starves downstream of the finish signal.
+                // Losing the EOF marker itself only costs the last-frame
+                // duration hint.
+                if let Ok(mut frame) = frame_pool.get() {
+                    unsafe {
+                        {
+                            let dp = dp_arc.clone();
+                            let dp = dp.lock().unwrap();
+                            (*frame.as_mut_ptr()).opaque =
+                                FrameOpaque::FrameOpaqueEof as i32 as *mut c_void;
+                            (*frame.as_mut_ptr()).pts = if dp.last_frame_pts == AV_NOPTS_VALUE {
+                                AV_NOPTS_VALUE
+                            } else {
+                                dp.last_frame_pts + dp.last_frame_duration_est
+                            };
+                            (*frame.as_mut_ptr()).time_base = dp.last_frame_tb;
+                        }
+                        let frame_box = dec_frame_to_box(dp_arc.clone(), frame);
+                        if let Err(e) = dec_send(frame_box, &frame_pool, &senders) {
+                            if e != Error::EOF {
+                                error!("Error signalling EOF: {e}");
+                                set_scheduler_error(&scheduler_status, &scheduler_result, e);
+                            }
                         }
                     }
+                } else {
+                    warn!("Failed to allocate the EOF marker frame, skipping EOF timestamp");
+                }
 
+                {
                     let dp = dp_arc.clone();
                     let dp = dp.lock().unwrap();
                     let err_rate = if dp.dec.frames_decoded != 0 || dp.dec.decode_errors != 0 {
