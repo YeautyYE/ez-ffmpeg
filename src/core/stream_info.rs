@@ -301,7 +301,7 @@ unsafe fn extract_stream_info_from_stream(raw_stream: *mut ffmpeg_sys_next::AVSt
             // Modern demuxers (mov.c, matroskadec.c) export rotation only as
             // an AV_PKT_DATA_DISPLAYMATRIX entry in coded_side_data; the
             // metadata "rotate" tag survives as a fallback for nonstandard
-            // containers (matches fftools get_rotation, cmdutils.c:1553).
+            // containers (matches fftools get_rotation, cmdutils.c:1475).
             let rotate = display_matrix_rotation(codecpar)
                 .or_else(|| {
                     metadata

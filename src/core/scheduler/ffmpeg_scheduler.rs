@@ -91,9 +91,10 @@ pub struct FfmpegScheduler<S> {
 // in the public API needs &FfmpegScheduler from multiple threads: waiting
 // consumes self, and the async Future only requires Send.
 
-// fftools: SCH_STATE_UNINIT/STARTED + the `terminate` flag
-// (ffmpeg_sched.c SchedulerState). ez splits terminate into END (graceful)
-// vs ABORT (drop everything) and adds PAUSE, which has no CLI counterpart.
+// fftools: SCH_STATE_UNINIT/STARTED/STOPPED + the `terminate` flag
+// (ffmpeg_sched.c SchedulerState; sch_stop enters STOPPED at :2604). ez
+// splits terminate into END (graceful) vs ABORT (drop everything) and
+// adds PAUSE, which has no CLI counterpart.
 pub(crate) const STATUS_INIT: usize = 0;
 pub(crate) const STATUS_RUN: usize = 1;
 pub(crate) const STATUS_PAUSE: usize = 2;

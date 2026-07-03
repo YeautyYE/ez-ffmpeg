@@ -178,7 +178,7 @@ pub unsafe fn copy_metadata_default(
 }
 
 /// Copy chapters from an input AVFormatContext into the output context, emulating
-/// FFmpeg's `copy_chapters` (ffmpeg_mux_init.c:2784-2852).
+/// FFmpeg's `copy_chapters` (ffmpeg_mux_init.c:2784-2824).
 pub unsafe fn copy_chapters_from_input(
     input_ctx: *const AVFormatContext,
     input_ts_offset_us: i64,

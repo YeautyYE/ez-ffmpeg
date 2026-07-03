@@ -94,7 +94,8 @@
 //! The transcoding pipeline (demux -> decode -> filter -> encode -> mux) is
 //! ported from the FFmpeg CLI sources, `fftools/ffmpeg` of **FFmpeg 7.x**:
 //! function names, timestamp handling and scheduling semantics follow that
-//! release, and code comments cite the corresponding fftools file and line.
+//! release, and code comments cite the corresponding fftools file and line
+//! (line numbers refer to the FFmpeg `n7.1` tag).
 //! If you know `ffmpeg_demux.c` or `ffmpeg_filter.c`, grepping this crate
 //! for the same function names (`ts_fixup`, `video_sync_process`,
 //! `enc_open`, `mux_fixup_ts`, ...) lands in the equivalent Rust.

@@ -1,5 +1,5 @@
 //! vsync AUTO must resolve to VSCFR for single-stream inputs fed directly by
-//! a decoder with zero input_ts_offset (ffmpeg_mux_init.c:765-773), so a
+//! a decoder with zero input_ts_offset (ffmpeg_mux_init.c:817-822), so a
 //! late-starting single-stream input is not padded back to ts 0 with
 //! duplicate frames.
 
@@ -66,7 +66,7 @@ fn auto_vsync_single_stream_input_is_not_padded_to_zero() {
 
     // CLI: ffmpeg -i single_late.ts -c:v mpeg4 out.mp4 emits exactly 30
     // frames — no duplicates padding the reorder-delay gap
-    // (ffmpeg_mux_init.c:765-773 flips CFR to VSCFR for single-stream
+    // (ffmpeg_mux_init.c:817-822 flips CFR to VSCFR for single-stream
     // inputs fed directly by a decoder with zero input_ts_offset).
     let out = tmp_path("single_late_out.mp4");
     let result = wait_with_watchdog(

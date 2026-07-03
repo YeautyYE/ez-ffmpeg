@@ -1314,7 +1314,7 @@ impl Output {
     // ========== Metadata API Methods ==========
     // The following helpers mirror FFmpeg's command-line metadata options as implemented in
     // fftools/ffmpeg_opt.c (opt_metadata / opt_map_metadata) and the automatic propagation rules
-    // in fftools/ffmpeg_mux_init.c:3050-3070. Each method references the corresponding FFmpeg
+    // in fftools/ffmpeg_mux_init.c:2913-2983. Each method references the corresponding FFmpeg
     // behavior so callers can cross-check the C implementation when needed.
 
     /// Add or update global metadata for the output file.
