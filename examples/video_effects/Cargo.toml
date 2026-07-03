@@ -6,4 +6,4 @@ authors = ["Yeauty <YeautyYE@gmail.com>"]
 publish = false
 
 [dependencies]
-ez-ffmpeg = { path = "../../../ez-ffmpeg" , features = ["opengl"]}
+ez-ffmpeg = { path = "../..", features = ["opengl"] }
