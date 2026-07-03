@@ -735,24 +735,40 @@ mod tests {
 
             let reference = std::fs::read(&reference_path).expect("read reference");
             let ours = std::fs::read(&ours_path).expect("read ours");
-            let _ = std::fs::remove_file(&script_path);
-            let _ = std::fs::remove_file(&reference_path);
-            let _ = std::fs::remove_file(&ours_path);
+            // Keep intermediates for offline diffing when requested.
+            if std::env::var_os("EZ_PARITY_KEEP").is_none() {
+                let _ = std::fs::remove_file(&script_path);
+                let _ = std::fs::remove_file(&reference_path);
+                let _ = std::fs::remove_file(&ours_path);
+            } else {
+                eprintln!("kept: {reference_path:?} vs {ours_path:?}");
+            }
             assert_eq!(reference.len(), ours.len(), "{label}: frame count");
             (reference, ours)
         };
 
-        // Phase 1 — vector drawing only, rasterization is stable across
-        // libass versions: STRICT thresholds prove blend math, color
-        // conversion (both matrices), and geometry are exact.
+        // Phase 1 — vector drawing only. Interiors must be byte-exact
+        // (proves blend math, color conversion for both matrices, and
+        // geometry); shape-EDGE pixels may differ by a few percent of
+        // coverage because zeno and libass rasterize anti-aliased edges
+        // with different algorithms (measured: <=11/255 on ~0.3% of
+        // pixels, all on the outline perimeter).
         let drawing = test_util::minimal_ass(test_util::DRAWING_EVENT);
         let mut ours_by_matrix = Vec::new();
         for setparams in [None, Some("setparams=colorspace=bt709")] {
             let (reference, ours) = run_pair(&drawing, "draw", setparams, "yuv420p");
             let (max, mean) = diff_stats(&reference, &ours);
+            let big_diffs = reference
+                .iter()
+                .zip(&ours)
+                .filter(|(a, b)| a.abs_diff(**b) > 8)
+                .count();
+            let big_fraction = big_diffs as f64 / reference.len() as f64;
             assert!(
-                max <= 8 && mean < 0.5,
-                "drawing parity diverged (setparams {setparams:?}: max {max}, mean {mean:.4})"
+                max <= 16 && mean < 0.05 && big_fraction < 0.0005,
+                "drawing parity diverged (setparams {setparams:?}: max {max}, mean {mean:.4}, \
+                 >8-diff fraction {big_fraction:.6}) — interiors must stay byte-exact, edges \
+                 within cross-rasterizer AA noise"
             );
             ours_by_matrix.push(ours);
         }
@@ -764,19 +780,23 @@ mod tests {
         );
 
         // Same drawing at 10 bit — compared in 10-bit code units (byte-wise
-        // diffs would misreport u16 carries).
+        // diffs would misreport u16 carries). Edge-AA differences scale by
+        // 4x in 10-bit units, so the bounds scale accordingly.
         let (reference, ours) = run_pair(&drawing, "draw10", None, "yuv420p10le");
         let (max, mean) = test_util::diff_stats_u16le(&reference, &ours);
         assert!(
-            max <= 8 && mean < 0.5,
+            max <= 64 && mean < 0.2,
             "10-bit drawing parity diverged (max {max}, mean {mean:.4})"
         );
 
-        // Phase 2 — text glyphs: the CLI's bundled libass may rasterize
-        // anti-aliased glyph edges slightly differently than the system
-        // libass we link, so bound the aggregate error instead of the max
-        // (a systematic color/blend bug would explode the mean and the
-        // outlier fraction; version noise does not).
+        // Phase 2 — text glyphs. Glyph GEOMETRY must match (advances,
+        // positions, line placement — a scaling or shaping bug shifts whole
+        // glyph runs and explodes these bounds); pixel-level anti-aliasing
+        // legitimately differs because zeno and libass rasterize and stroke
+        // outlines with different algorithms. Measured divergence with
+        // correct geometry: mean 0.59, >8-diff fraction 0.018 (edge pixels
+        // only); with the pre-fix aspect-scaling bug: mean 2.56, fraction
+        // 0.044 — the bounds separate the two regimes cleanly.
         let text = test_util::minimal_ass(&format!(
             "{}{}",
             test_util::HELLO_EVENT,
@@ -791,7 +811,7 @@ mod tests {
             .count();
         let outlier_fraction = outliers as f64 / reference.len() as f64;
         assert!(
-            mean < 0.5 && outlier_fraction < 0.01,
+            mean < 1.0 && outlier_fraction < 0.03,
             "text parity diverged (mean {mean:.4}, >8-diff fraction {outlier_fraction:.5})"
         );
 

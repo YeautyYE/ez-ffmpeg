@@ -869,9 +869,11 @@ fn build_text_segments(
     let extent = (asc + desc).max(1.0);
     let pixel_size = state.font_size * ctx.scale_y() * ctx.opts.font_scale;
     let unit_scale = pixel_size / extent;
-    let aspect = ctx.scale_x() / ctx.scale_y() * ctx.par;
+    // VSFilter compatibility (ass_render.c:2166): font glyphs use PlayResY
+    // scaling in BOTH dimensions — text is NOT stretched by the
+    // PlayResX/PlayResY ratio; `par` compensates non-square output pixels.
     let y_scale = (unit_scale * state.scale_y) as f32;
-    let x_scale = (unit_scale * state.scale_x * aspect) as f32;
+    let x_scale = (unit_scale * state.scale_x * ctx.par) as f32;
     let ascent_px = asc * f64::from(y_scale);
     let descent_px = desc * f64::from(y_scale);
     let letter_spacing = state.spacing * ctx.scale_x() * state.scale_x;

@@ -405,6 +405,33 @@ mod tests {
         );
     }
 
+    /// One-off diagnostic (dev tool, keep #[ignore]): dumps the pure
+    /// renderer's overlay list for a given script so glyph geometry can be
+    /// compared against a libass CLI render offline.
+    #[test]
+    #[ignore = "diagnostic; run explicitly"]
+    fn dump_overlays_for_diag() {
+        let Some(script_path) = std::env::var_os("EZ_DIAG_SCRIPT") else {
+            eprintln!("set EZ_DIAG_SCRIPT to an .ass file");
+            return;
+        };
+        let content = std::fs::read_to_string(script_path).expect("read script");
+        let script = ass::parse(&content).expect("parse");
+        let font = test_util::test_font().expect("font");
+        let mut fonts = FontStore::new(false);
+        assert!(fonts.load_default_font_file(std::path::Path::new(font)));
+        let mut renderer = PureRenderer::new(script, fonts, RenderOptions::default());
+        renderer.set_frame_size(320, 240);
+        renderer.set_storage_size(320, 240);
+        for overlay in renderer.render_frame(500) {
+            let ink: usize = overlay.bitmap.iter().filter(|&&v| v > 0).count();
+            println!(
+                "node: dst=({}, {}) size={}x{} color={:08x} ink={}",
+                overlay.dst_x, overlay.dst_y, overlay.w, overlay.h, overlay.color, ink
+            );
+        }
+    }
+
     #[test]
     fn unsupported_features_warn_once_per_renderer() {
         let events = "Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\frz45}Rotated\n\
