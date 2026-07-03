@@ -2,7 +2,7 @@
 
 use super::backend::SubtitleRenderer;
 use super::blend::{self, ColorMatrix, ColorRange, OverlayImage, PlaneView, SampleFormat};
-use super::layout::{self, ColorModel, ComponentPlacement, FormatSpec};
+use super::layout::{self, ColorModel, FormatSpec};
 use super::options::SubtitleFilterBuilder;
 use crate::core::filter::frame_filter::FrameFilter;
 use crate::core::filter::frame_filter_context::FrameFilterContext;
@@ -48,9 +48,8 @@ pub struct SubtitleFilter {
     original_size: Option<(u32, u32)>,
     /// Frame geometry the renderer is currently configured for.
     configured_dims: Option<(i32, i32)>,
-    /// Reusable per-node mask-sum buffer for the two-phase pooled blend
-    /// (grows to the largest node once, then no per-frame allocation).
-    pool_scratch: Vec<u16>,
+    /// Reusable blend buffers (grow once, then no per-frame allocation).
+    blend_scratch: BlendScratch,
     warned_missing_time: bool,
     warned_colorspace: bool,
     /// Matrix/range locked on the first timed frame (vf_subtitles wires
@@ -87,7 +86,7 @@ impl SubtitleFilter {
             renderer,
             original_size,
             configured_dims: None,
-            pool_scratch: Vec::new(),
+            blend_scratch: BlendScratch::default(),
             warned_missing_time: false,
             warned_colorspace: false,
             locked_color: None,
@@ -164,18 +163,24 @@ impl SubtitleFilter {
     }
 
     /// Composites rendered overlays onto a writable software frame laid out
-    /// as described by `spec`.
+    /// as described by `spec`. With `parallel` (callers gate it through
+    /// [`should_parallelize`]) the components split into two plane-disjoint
+    /// groups blended on two threads; the split silently stays serial when
+    /// the format only touches one plane (packed RGB, gray).
     ///
     /// # Safety
     /// `frame` must be a writable software frame whose pixel format matches
-    /// `spec`, with positive linesizes.
+    /// `spec`, with positive linesizes, exclusively owned by the caller for
+    /// the duration of the call (`filter_frame` guarantees this after
+    /// `av_frame_make_writable`).
     unsafe fn blend_images(
         frame: *mut AVFrame,
         images: &[OverlayImage<'_>],
         spec: &FormatSpec,
         matrix: ColorMatrix,
         range: Option<ColorRange>,
-        scratch: &mut Vec<u16>,
+        scratch: &mut BlendScratch,
+        parallel: bool,
     ) {
         // ff_draw_init2: an EXPLICIT range is honored; only an unspecified
         // one falls back to the format default (yuvj/RGB full, else
@@ -188,117 +193,263 @@ impl SubtitleFilter {
         let width = (*frame).width as usize;
         let height = (*frame).height as usize;
 
-        /// Builds the writable view of one component. Returns `None` when
-        /// the plane is unusable (defensive; the scheduler never feeds such
-        /// frames).
-        ///
-        /// # Safety
-        /// `frame` must outlive the returned view, and no two views over
-        /// the same plane may be alive at once (the callers below build and
-        /// consume views strictly one at a time).
-        unsafe fn component_view<'a>(
-            frame: *mut AVFrame,
-            placement: &ComponentPlacement,
-            width: usize,
-            height: usize,
-        ) -> Option<PlaneView<'a>> {
-            let plane_w = (width + (1usize << placement.hsub) - 1) >> placement.hsub;
-            let plane_h = (height + (1usize << placement.vsub) - 1) >> placement.vsub;
-            let linesize = (*frame).linesize[placement.plane];
-            let data = (*frame).data[placement.plane];
-            if linesize <= 0 || data.is_null() || plane_w == 0 || plane_h == 0 {
-                return None;
-            }
-            let linesize = linesize as usize;
-            let plane_bytes = linesize * (plane_h - 1) + plane_w * placement.pixel_step;
-            Some(PlaneView {
-                data: std::slice::from_raw_parts_mut(
-                    data.add(placement.offset),
-                    plane_bytes - placement.offset,
-                ),
-                linesize,
-                pixel_step: placement.pixel_step,
-            })
-        }
-
-        // Every layout-table format has at most two subsampled components.
-        // When there are exactly two (4:2:0/4:2:2 planar, NV12/NV21, P010),
-        // each node's mask is pooled ONCE into `scratch` and applied to both
-        // components, instead of re-pooling per component.
-        let mut pooled = [usize::MAX; 2];
-        let mut pooled_count = 0usize;
-        for (index, (_, placement)) in spec.comps.iter().enumerate() {
-            if placement.hsub != 0 || placement.vsub != 0 {
-                if pooled_count < 2 {
-                    pooled[pooled_count] = index;
-                }
-                pooled_count += 1;
-            }
-        }
-        // Route choice measured in bench_kernels.rs (see
-        // blend::two_phase_pooled_preferred): two-phase always wins for
-        // 8-bit; 16-bit takes it exactly when the AVX2 apply kernels are
-        // live.
-        let share_pooling =
-            pooled_count == 2 && blend::two_phase_pooled_preferred(spec.sample) && {
-                let a = &spec.comps[pooled[0]].1;
-                let b = &spec.comps[pooled[1]].1;
-                a.hsub == 1 && b.hsub == 1 && a.vsub == b.vsub && a.vsub <= 1
-            };
-
+        // Per-overlay alpha + converted color, computed once and shared by
+        // both workers.
+        scratch.preps.clear();
+        scratch.preps.reserve(images.len());
         for overlay in images {
             let alpha = spec.sample.alpha_fixed(overlay.opacity());
             if alpha == 0 {
+                scratch.preps.push(OverlayPrep { alpha, src: [0; 3] });
                 continue;
             }
-            let source_values = match spec.model {
+            let src = match spec.model {
                 ColorModel::Yuv => {
                     blend::yuv_components(overlay.rgb(), matrix, range, spec.scale_bits)
                 }
                 ColorModel::Rgb => blend::rgb_components(overlay.rgb(), range, spec.scale_bits),
             };
+            scratch.preps.push(OverlayPrep { alpha, src });
+        }
 
-            if share_pooling {
-                let vsub = spec.comps[pooled[0]].1.vsub;
-                if let Some(rect) = blend::pool_sums_h2(width, height, overlay, vsub, scratch) {
-                    for &index in &pooled {
-                        let (source, placement) = &spec.comps[index];
-                        let Some(mut plane) = component_view(frame, placement, width, height)
-                        else {
-                            continue;
-                        };
-                        blend::blend_pooled_from_sums(
-                            &mut plane,
-                            scratch,
-                            rect,
-                            source_values[*source],
-                            alpha,
-                            spec.sample,
-                        );
-                    }
-                }
+        // Raw component geometry, captured once on this thread. Unusable
+        // planes are skipped (defensive; the scheduler never feeds such
+        // frames) exactly like the old per-view checks.
+        let mut tasks: Vec<CompTask> = Vec::with_capacity(spec.comps.len());
+        for (source, placement) in spec.comps {
+            let plane_w = (width + (1usize << placement.hsub) - 1) >> placement.hsub;
+            let plane_h = (height + (1usize << placement.vsub) - 1) >> placement.vsub;
+            let linesize = (*frame).linesize[placement.plane];
+            let data = (*frame).data[placement.plane];
+            if linesize <= 0 || data.is_null() || plane_w == 0 || plane_h == 0 {
+                continue;
             }
-            for (index, (source, placement)) in spec.comps.iter().enumerate() {
-                if share_pooling && (index == pooled[0] || index == pooled[1]) {
-                    continue;
-                }
-                let Some(mut plane) = component_view(frame, placement, width, height) else {
-                    continue;
-                };
-                blend::blend_component(
-                    &mut plane,
-                    width,
-                    height,
-                    overlay,
-                    source_values[*source],
-                    alpha,
-                    placement.hsub,
-                    placement.vsub,
-                    spec.sample,
-                );
+            let linesize = linesize as usize;
+            let plane_bytes = linesize * (plane_h - 1) + plane_w * placement.pixel_step;
+            tasks.push(CompTask {
+                plane: placement.plane,
+                data: data.add(placement.offset),
+                len: plane_bytes - placement.offset,
+                linesize,
+                pixel_step: placement.pixel_step,
+                source: *source,
+                hsub: placement.hsub,
+                vsub: placement.vsub,
+            });
+        }
+
+        let dims = (width, height);
+        let sample = spec.sample;
+        let preps = &scratch.preps;
+        if parallel {
+            if let Some((group_a, group_b)) = split_tasks(&tasks) {
+                let (pool_a, pool_b) = (&mut scratch.pool_a, &mut scratch.pool_b);
+                std::thread::scope(|s| {
+                    // Group A (the first plane — luma) on the spawned
+                    // thread, the remaining planes inline: one spawn per
+                    // frame. `split_tasks` verified the groups' byte
+                    // ranges are disjoint, so the two workers never touch
+                    // the same memory; per-plane compositing order is
+                    // preserved because every plane lives entirely inside
+                    // one group and each worker walks overlays in order.
+                    s.spawn(move || blend_task_group(group_a, images, preps, sample, dims, pool_a));
+                    blend_task_group(group_b, images, preps, sample, dims, pool_b);
+                });
+                return;
             }
         }
+        blend_task_group(&tasks, images, preps, sample, dims, &mut scratch.pool_a);
     }
+}
+
+/// Reusable buffers for [`SubtitleFilter::blend_images`] (grow once, then
+/// no per-frame allocation).
+#[derive(Default)]
+struct BlendScratch {
+    /// Per-overlay alpha + converted color, shared by both blend workers.
+    preps: Vec<OverlayPrep>,
+    /// Mask-sum buffer for the serial path / parallel group A.
+    pool_a: Vec<u16>,
+    /// Mask-sum buffer for parallel group B (each worker pools into its
+    /// own buffer).
+    pool_b: Vec<u16>,
+}
+
+/// Precomputed per-overlay blend parameters (`alpha_fixed` + the converted
+/// component triple).
+struct OverlayPrep {
+    alpha: u32,
+    src: [u32; 3],
+}
+
+/// One component's blend work over one frame, described by raw plane
+/// geometry so component groups can cross the `thread::scope` boundary.
+#[derive(Clone, Copy)]
+struct CompTask {
+    /// AVFrame plane index (drives the group split only).
+    plane: usize,
+    /// First byte of this component (plane base + component offset).
+    data: *mut u8,
+    /// Addressable bytes from `data` (same bound the serial views used:
+    /// `linesize * (plane_h - 1) + plane_w * pixel_step - offset`).
+    len: usize,
+    linesize: usize,
+    pixel_step: usize,
+    /// Index into the converted color triple.
+    source: usize,
+    hsub: u32,
+    vsub: u32,
+}
+
+/// SAFETY: a `CompTask` only describes a byte range inside an AVFrame that
+/// `filter_frame` exclusively owns after `av_frame_make_writable`; the
+/// bytes are touched exclusively through [`CompTask::view`] under its
+/// contract (one live view at a time per worker, and byte-disjoint task
+/// groups across workers — enforced by [`split_tasks`] before any spawn).
+unsafe impl Send for CompTask {}
+/// SAFETY: shared references expose only the plain-data fields; all writes
+/// go through [`CompTask::view`] under the same contract as `Send` above.
+unsafe impl Sync for CompTask {}
+
+impl CompTask {
+    /// Materializes the writable component view.
+    ///
+    /// # Safety
+    /// No other view over an overlapping byte range may be alive anywhere:
+    /// within a worker, views are created and dropped strictly one at a
+    /// time (NV12/P010 interleaved components overlap in memory); across
+    /// workers, [`split_tasks`] verified the groups byte-disjoint. The
+    /// backing frame outlives the view (it is owned by the running
+    /// `filter_frame` call).
+    unsafe fn view(&self) -> PlaneView<'_> {
+        PlaneView {
+            data: std::slice::from_raw_parts_mut(self.data, self.len),
+            linesize: self.linesize,
+            pixel_step: self.pixel_step,
+        }
+    }
+}
+
+/// Splits tasks into (components on the first plane, the rest) for the
+/// two-thread blend. `None` when the split is impossible: fewer than two
+/// planes touched (packed RGB, gray) or any byte overlap between the groups
+/// (never true for the layout table, but checked so the unsafe plane split
+/// can never alias).
+fn split_tasks(tasks: &[CompTask]) -> Option<(&[CompTask], &[CompTask])> {
+    let first_plane = tasks.first()?.plane;
+    let split = tasks.iter().position(|task| task.plane != first_plane)?;
+    let (a, b) = tasks.split_at(split);
+    if b.iter().any(|task| task.plane == first_plane) {
+        return None;
+    }
+    let disjoint = a.iter().all(|ta| {
+        b.iter().all(|tb| {
+            let (a0, a1) = (ta.data as usize, ta.data as usize + ta.len);
+            let (b0, b1) = (tb.data as usize, tb.data as usize + tb.len);
+            a1 <= b0 || b1 <= a0
+        })
+    });
+    disjoint.then_some((a, b))
+}
+
+/// Blends every overlay onto the components in `tasks`, in overlay order.
+/// This is the whole per-frame blend when called with all components
+/// (serial path) and one worker's half in the parallel split; compositing
+/// order is a per-plane contract and every plane lives entirely inside one
+/// group, so both call shapes produce identical bytes.
+fn blend_task_group(
+    tasks: &[CompTask],
+    images: &[OverlayImage<'_>],
+    preps: &[OverlayPrep],
+    sample: SampleFormat,
+    (width, height): (usize, usize),
+    pool: &mut Vec<u16>,
+) {
+    // When this group carries exactly two h2-subsampled components
+    // (4:2:0/4:2:2 planar, NV12/NV21, P010 chroma) and the two-phase route
+    // is preferred for the sample width, each node's mask is pooled ONCE
+    // and applied to both components instead of re-pooling per component.
+    let mut pooled = [usize::MAX; 2];
+    let mut pooled_count = 0usize;
+    for (index, task) in tasks.iter().enumerate() {
+        if task.hsub != 0 || task.vsub != 0 {
+            if pooled_count < 2 {
+                pooled[pooled_count] = index;
+            }
+            pooled_count += 1;
+        }
+    }
+    let share_pooling = pooled_count == 2 && blend::two_phase_pooled_preferred(sample) && {
+        let (a, b) = (&tasks[pooled[0]], &tasks[pooled[1]]);
+        a.hsub == 1 && b.hsub == 1 && a.vsub == b.vsub && a.vsub <= 1
+    };
+
+    for (overlay, prep) in images.iter().zip(preps) {
+        if prep.alpha == 0 {
+            continue;
+        }
+        if share_pooling {
+            if let Some(rect) =
+                blend::pool_sums_h2(width, height, overlay, tasks[pooled[0]].vsub, pool)
+            {
+                for &index in &pooled {
+                    let task = &tasks[index];
+                    // SAFETY: views live one at a time inside this worker;
+                    // other workers' tasks are byte-disjoint (split_tasks).
+                    let mut plane = unsafe { task.view() };
+                    blend::blend_pooled_from_sums(
+                        &mut plane,
+                        pool,
+                        rect,
+                        prep.src[task.source],
+                        prep.alpha,
+                        sample,
+                    );
+                }
+            }
+        }
+        for (index, task) in tasks.iter().enumerate() {
+            if share_pooling && (index == pooled[0] || index == pooled[1]) {
+                continue;
+            }
+            // SAFETY: views live one at a time inside this worker; other
+            // workers' tasks are byte-disjoint (split_tasks).
+            let mut plane = unsafe { task.view() };
+            blend::blend_component(
+                &mut plane,
+                width,
+                height,
+                overlay,
+                prep.src[task.source],
+                prep.alpha,
+                task.hsub,
+                task.vsub,
+                sample,
+            );
+        }
+    }
+}
+
+/// Minimum total clipped mask pixels before [`SubtitleFilter::blend_images`]
+/// splits plane work across two threads. Below this the spawn/join overhead
+/// (tens of microseconds) rivals the blend itself: the bench's sparse
+/// one-line 1080p dialogue measures ~42k mask px and blends in well under
+/// 50us with the AVX2 kernels, while the dense multi-line scene measures
+/// ~640k px and ~220us — 256k separates the two regimes with margin on
+/// both sides (`bench_kernels.rs` scenario stats).
+const PARALLEL_MASK_PX_THRESHOLD: usize = 256 * 1024;
+
+/// The parallel-blend gate, kept pure for unit testing.
+fn should_parallelize(clipped_mask_px: usize) -> bool {
+    clipped_mask_px > PARALLEL_MASK_PX_THRESHOLD
+}
+
+/// Total overlay mask pixels that actually intersect the frame.
+fn clipped_mask_px(images: &[OverlayImage<'_>], width: usize, height: usize) -> usize {
+    images
+        .iter()
+        .map(|image| blend::clipped_area(width, height, image))
+        .sum()
 }
 
 impl FrameFilter for SubtitleFilter {
@@ -417,8 +568,11 @@ impl FrameFilter for SubtitleFilter {
             );
         }
 
+        let parallel =
+            should_parallelize(clipped_mask_px(&images, width as usize, height as usize));
         // SAFETY: frame verified software with a supported layout and made
-        // writable; `images` comes from the render call above.
+        // writable (exclusively owned for the call); `images` comes from
+        // the render call above.
         unsafe {
             Self::blend_images(
                 frame.as_mut_ptr(),
@@ -426,7 +580,8 @@ impl FrameFilter for SubtitleFilter {
                 spec,
                 matrix,
                 range,
-                &mut self.pool_scratch,
+                &mut self.blend_scratch,
+                parallel,
             )
         };
 
@@ -477,6 +632,7 @@ mod tests {
     use super::*;
     use crate::subtitle::test_util::{self, diff_stats, temp_path, transcode_test_mp4};
     use crate::subtitle::FontProvider;
+    use ffmpeg_sys_next::{av_frame_alloc, av_frame_free, av_frame_get_buffer};
 
     const W: usize = 320;
     const H: usize = 240;
@@ -681,6 +837,354 @@ mod tests {
                 "{pix_fmt}: outside sample must not change"
             );
         }
+    }
+
+    /// Deterministic LCG byte stream for synthetic planes and masks.
+    fn lcg_bytes(len: usize, seed: &mut u64) -> Vec<u8> {
+        (0..len)
+            .map(|_| {
+                *seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (*seed >> 33) as u8
+            })
+            .collect()
+    }
+
+    /// Rows of one AVFrame plane, derived from the format spec (0 when the
+    /// plane is unused by the format).
+    fn plane_rows(spec: &FormatSpec, plane: usize, height: usize) -> usize {
+        spec.comps
+            .iter()
+            .filter(|(_, p)| p.plane == plane)
+            .map(|(_, p)| (height + (1usize << p.vsub) - 1) >> p.vsub)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Allocates a `w x h` frame of `format` and fills every used plane
+    /// (including alignment padding) with a deterministic pattern.
+    ///
+    /// # Safety
+    /// Caller frees the frame with `av_frame_free`.
+    unsafe fn filled_frame(
+        w: i32,
+        h: i32,
+        format: AVPixelFormat,
+        spec: &FormatSpec,
+        mut seed: u64,
+    ) -> *mut AVFrame {
+        let frame = av_frame_alloc();
+        assert!(!frame.is_null());
+        (*frame).width = w;
+        (*frame).height = h;
+        (*frame).format = format as i32;
+        assert!(av_frame_get_buffer(frame, 0) >= 0, "av_frame_get_buffer");
+        for plane in 0..4usize {
+            let rows = plane_rows(spec, plane, h as usize);
+            let data = (*frame).data[plane];
+            if rows == 0 || data.is_null() {
+                continue;
+            }
+            let len = (*frame).linesize[plane] as usize * rows;
+            let bytes = lcg_bytes(len, &mut seed);
+            std::slice::from_raw_parts_mut(data, len).copy_from_slice(&bytes);
+        }
+        frame
+    }
+
+    /// Copies out every used plane (full linesize x rows, padding included).
+    ///
+    /// # Safety
+    /// `frame` must be a valid frame produced by [`filled_frame`].
+    unsafe fn plane_bytes(frame: *mut AVFrame, spec: &FormatSpec, height: usize) -> Vec<Vec<u8>> {
+        (0..4usize)
+            .map(|plane| {
+                let rows = plane_rows(spec, plane, height);
+                let data = (*frame).data[plane];
+                if rows == 0 || data.is_null() {
+                    return Vec::new();
+                }
+                let len = (*frame).linesize[plane] as usize * rows;
+                std::slice::from_raw_parts(data, len).to_vec()
+            })
+            .collect()
+    }
+
+    /// The parallel plane split must produce byte-identical frames to the
+    /// serial path on every layout family: planar 4:2:0, semi-planar
+    /// (NV12), no-subsampling planar, high-depth planar + P010, and the
+    /// single-plane formats where the split falls back to serial.
+    #[test]
+    fn parallel_blend_matches_serial_bitexact() {
+        use ffmpeg_sys_next::AVPixelFormat::*;
+        let (w, h) = (318i32, 178i32);
+        let mut seed = 0x00C0_FFEE_0DDB_A11Du64;
+
+        // Three overlays: dense structured (overhanging top-left),
+        // translucent red, and a solid overhanging the bottom — different
+        // colors and opacities so every source component and the
+        // compositing order matter. None touches the exact right plane
+        // edge: interleaved components (NV12 V, P010 V, RGB G/B) have a
+        // pre-existing 1-byte view overrun there (predates this test and
+        // is identical on both paths compared here).
+        let mask_a = {
+            let mut mask = lcg_bytes(220 * 130, &mut seed);
+            for (i, byte) in mask.iter_mut().enumerate() {
+                if (i / 40) % 3 == 0 {
+                    *byte = 0;
+                }
+            }
+            mask
+        };
+        let mask_b = lcg_bytes(97 * 53, &mut seed);
+        let mask_c = vec![255u8; 64 * 33];
+        let images = [
+            OverlayImage {
+                w: 220,
+                h: 130,
+                stride: 220,
+                bitmap: &mask_a,
+                color: 0xFFFFFF00,
+                dst_x: -8,
+                dst_y: -6,
+            },
+            OverlayImage {
+                w: 97,
+                h: 53,
+                stride: 97,
+                bitmap: &mask_b,
+                color: 0xFF000040,
+                dst_x: 40,
+                dst_y: 30,
+            },
+            OverlayImage {
+                w: 64,
+                h: 33,
+                stride: 64,
+                bitmap: &mask_c,
+                color: 0x00FF0080,
+                dst_x: 240,
+                dst_y: 160,
+            },
+        ];
+
+        for format in [
+            AV_PIX_FMT_YUV420P,
+            AV_PIX_FMT_NV12,
+            AV_PIX_FMT_YUV444P,
+            AV_PIX_FMT_YUV420P10LE,
+            AV_PIX_FMT_P010LE,
+            AV_PIX_FMT_RGB24,
+            AV_PIX_FMT_GRAY8,
+        ] {
+            let spec = layout::format_spec(format).expect("supported format");
+            let fill_seed = 0x5EED_0000 ^ format as u64;
+            // SAFETY: frames allocated and freed here; blend_images gets a
+            // writable, exclusively-owned software frame matching `spec`.
+            unsafe {
+                let serial = filled_frame(w, h, format, spec, fill_seed);
+                let parallel = filled_frame(w, h, format, spec, fill_seed);
+                let original = plane_bytes(serial, spec, h as usize);
+
+                let mut scratch_serial = BlendScratch::default();
+                let mut scratch_parallel = BlendScratch::default();
+                SubtitleFilter::blend_images(
+                    serial,
+                    &images,
+                    spec,
+                    ColorMatrix::Bt601,
+                    Some(ColorRange::Limited),
+                    &mut scratch_serial,
+                    false,
+                );
+                SubtitleFilter::blend_images(
+                    parallel,
+                    &images,
+                    spec,
+                    ColorMatrix::Bt601,
+                    Some(ColorRange::Limited),
+                    &mut scratch_parallel,
+                    true,
+                );
+
+                let serial_planes = plane_bytes(serial, spec, h as usize);
+                let parallel_planes = plane_bytes(parallel, spec, h as usize);
+                assert_ne!(
+                    original, serial_planes,
+                    "{format:?}: blend must alter the frame"
+                );
+                assert_eq!(
+                    serial_planes, parallel_planes,
+                    "{format:?}: parallel blend diverged from serial"
+                );
+
+                let mut serial = serial;
+                let mut parallel = parallel;
+                av_frame_free(&mut serial);
+                av_frame_free(&mut parallel);
+            }
+        }
+    }
+
+    /// End-to-end `blend_images` timing, serial vs plane-parallel, on the
+    /// captured dense/sparse scenes (real rendered masks). Deliberately NOT
+    /// named `bench_blend...` so it never times concurrently with the
+    /// kernel tables; run it on its own with:
+    ///
+    /// ```text
+    /// cargo test --release --features subtitle bench_plane_parallel -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "manual micro-benchmark; run in release with --nocapture"]
+    fn bench_plane_parallel_blend_images() {
+        use crate::subtitle::bench_kernels::{capture, dense_events, measure, sparse_events};
+        use ffmpeg_sys_next::AVPixelFormat::*;
+
+        let Some(dense) = capture(dense_events()) else {
+            eprintln!("skipping: no known test font present on this machine");
+            return;
+        };
+        let sparse = capture(sparse_events()).expect("font present per the check above");
+        for (name, owned) in [("dense", dense), ("sparse", sparse)] {
+            let images: Vec<OverlayImage<'_>> = owned.iter().map(|o| o.as_view()).collect();
+            let px = clipped_mask_px(&images, 1920, 1080);
+            println!(
+                "blend_images {name}: mask_px={px} gate_parallel={}",
+                should_parallelize(px)
+            );
+            for (format, label) in [
+                (AV_PIX_FMT_YUV420P, "yuv420p"),
+                (AV_PIX_FMT_YUV420P10LE, "yuv420p10le"),
+            ] {
+                let spec = layout::format_spec(format).expect("supported format");
+                // SAFETY: frame allocated and freed here; blend_images gets
+                // a writable, exclusively-owned software frame matching
+                // `spec`. Repeated composites only change dst values, not
+                // the amount of work (the kernels are branchless in dst).
+                unsafe {
+                    let frame = filled_frame(1920, 1080, format, spec, 0xBEEF);
+                    let mut scratch = BlendScratch::default();
+                    let serial = measure(|| {
+                        SubtitleFilter::blend_images(
+                            frame,
+                            &images,
+                            spec,
+                            ColorMatrix::Bt601,
+                            Some(ColorRange::Limited),
+                            &mut scratch,
+                            false,
+                        );
+                    });
+                    let parallel = measure(|| {
+                        SubtitleFilter::blend_images(
+                            frame,
+                            &images,
+                            spec,
+                            ColorMatrix::Bt601,
+                            Some(ColorRange::Limited),
+                            &mut scratch,
+                            true,
+                        );
+                    });
+                    println!(
+                        "  {label:<12} serial {serial:>10.0} ns/frame   parallel \
+                         {parallel:>10.0} ns/frame   {:>5.2}x",
+                        serial / parallel
+                    );
+                    let mut frame = frame;
+                    av_frame_free(&mut frame);
+                }
+            }
+        }
+    }
+
+    /// The gate is pure and exclusive at the threshold.
+    #[test]
+    fn parallel_gate_threshold_is_exclusive() {
+        assert!(!should_parallelize(0));
+        assert!(!should_parallelize(PARALLEL_MASK_PX_THRESHOLD));
+        assert!(should_parallelize(PARALLEL_MASK_PX_THRESHOLD + 1));
+    }
+
+    /// Work estimation counts only mask area intersecting the frame.
+    #[test]
+    fn clipped_mask_px_counts_only_intersecting_area() {
+        let bitmap = vec![255u8; 100 * 50];
+        let image = |dst_x: i32, dst_y: i32| OverlayImage {
+            w: 100,
+            h: 50,
+            stride: 100,
+            bitmap: &bitmap,
+            color: 0xFFFFFF00,
+            dst_x,
+            dst_y,
+        };
+        let on_frame = image(10, 10);
+        assert_eq!(
+            clipped_mask_px(std::slice::from_ref(&on_frame), 640, 360),
+            5000
+        );
+        let half_off = image(-50, 0);
+        assert_eq!(
+            clipped_mask_px(std::slice::from_ref(&half_off), 640, 360),
+            2500
+        );
+        let fully_off = image(640, 0);
+        assert_eq!(
+            clipped_mask_px(std::slice::from_ref(&fully_off), 640, 360),
+            0
+        );
+        let both = [image(10, 10), image(-50, 0)];
+        assert_eq!(clipped_mask_px(&both, 640, 360), 7500);
+    }
+
+    /// Split rules: multi-plane formats split after the first plane's
+    /// components; single-plane formats and (defensively) overlapping
+    /// ranges refuse to split.
+    #[test]
+    fn split_tasks_by_plane_and_overlap() {
+        let mut buf_a = vec![0u8; 64];
+        let mut buf_b = vec![0u8; 64];
+        let task = |plane: usize, data: *mut u8, len: usize| CompTask {
+            plane,
+            data,
+            len,
+            linesize: 8,
+            pixel_step: 1,
+            source: 0,
+            hsub: 0,
+            vsub: 0,
+        };
+        let a_ptr = buf_a.as_mut_ptr();
+        let b_ptr = buf_b.as_mut_ptr();
+
+        // Planar layout: luma group + two chroma planes.
+        // SAFETY: pointer arithmetic stays inside the owned buffers.
+        let chroma2 = unsafe { b_ptr.add(32) };
+        let tasks = [task(0, a_ptr, 64), task(1, b_ptr, 32), task(2, chroma2, 32)];
+        let (group_a, group_b) = split_tasks(&tasks).expect("planar split");
+        assert_eq!((group_a.len(), group_b.len()), (1, 2));
+
+        // Packed RGB: everything on plane 0 -> no split.
+        // SAFETY: as above.
+        let (rgb1, rgb2) = unsafe { (a_ptr.add(1), a_ptr.add(2)) };
+        let tasks = [task(0, a_ptr, 62), task(0, rgb1, 62), task(0, rgb2, 62)];
+        assert!(split_tasks(&tasks).is_none());
+
+        // Single component (gray): no split.
+        assert!(split_tasks(&[task(0, a_ptr, 64)]).is_none());
+        assert!(split_tasks(&[]).is_none());
+
+        // Defensive: distinct plane indices but overlapping bytes.
+        // SAFETY: as above.
+        let overlap = unsafe { a_ptr.add(32) };
+        let tasks = [task(0, a_ptr, 64), task(1, overlap, 32)];
+        assert!(split_tasks(&tasks).is_none());
+
+        // Defensive: the first plane reappears after the split point.
+        let tasks = [task(0, a_ptr, 32), task(1, b_ptr, 32), task(0, overlap, 32)];
+        assert!(split_tasks(&tasks).is_none());
     }
 
     fn ffmpeg_cli_has_libass() -> bool {
