@@ -3,6 +3,7 @@
 //! input geometry changes.
 
 use crate::wgpu_filter::frame_io::PlaneLayout;
+use crate::wgpu_filter::hw_interop::{self, HwVulkanInterop};
 use crate::wgpu_filter::shaders;
 use log::info;
 
@@ -39,6 +40,9 @@ pub(crate) struct GpuState {
     pub(crate) convert_uniforms: wgpu::Buffer,
     pub(crate) pack_uniforms: wgpu::Buffer,
     pub(crate) resources: Option<FrameResources>,
+    /// Raw Vulkan handles for dmabuf import; present only when the device
+    /// was opened with the external-memory extensions (hw zero-copy input).
+    pub(crate) hw_interop: Option<HwVulkanInterop>,
 }
 
 /// Size/format-dependent resources, recreated when the input geometry changes.
@@ -60,6 +64,12 @@ pub(crate) struct FrameResources {
     pub(crate) storage: wgpu::Buffer,
     /// Idle MAP_READ staging buffers; one is taken per in-flight frame and
     /// returned (or dropped, after a geometry change) on completion.
+    ///
+    /// Uploads deliberately stay on `queue.write_texture`: wgpu's internal
+    /// staging belt is already a persistently mapped ring with the same
+    /// one-CPU-copy + one-GPU-copy cost. A hand-rolled MAP_WRITE ring was
+    /// measured slower here (256-aligned row padding plus an extra map_async
+    /// per frame; 1080p upload 0.77 -> 0.95 ms/frame on RADV RENOIR).
     pub(crate) staging_pool: Vec<wgpu::Buffer>,
     pub(crate) y_stride: usize,
     pub(crate) c_stride: usize,
@@ -82,6 +92,16 @@ const ALIGN_WORD: u32 = 4;
 
 fn align4(v: u32) -> u32 {
     v.div_ceil(ALIGN_WORD) * ALIGN_WORD
+}
+
+/// Creates one MAP_READ readback staging buffer of `buf_size` bytes.
+pub(crate) fn create_staging(device: &wgpu::Device, buf_size: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("ez_staging"),
+        size: buf_size,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
 }
 
 fn render_pipeline(
@@ -152,7 +172,11 @@ fn uniform_bgl_entry(
 }
 
 impl GpuState {
-    pub(crate) fn new(user_fragment_shader: &str, params_len: usize) -> Result<Self, String> {
+    pub(crate) fn new(
+        user_fragment_shader: &str,
+        params_len: usize,
+        hw_input: bool,
+    ) -> Result<Self, String> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -167,9 +191,28 @@ impl GpuState {
             adapter_info.name, adapter_info.backend, adapter_info.device_type
         );
 
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+        // Zero-copy hardware input needs the device opened with dmabuf-import
+        // extensions; when that is not possible the filter still works, hw
+        // frames just take the download path.
+        let (device, queue, hw_interop) = match hw_input {
+            true => match hw_interop::try_open_dmabuf_device(&adapter) {
+                Some((device, queue, interop)) => (device, queue, Some(interop)),
+                None => {
+                    let (device, queue) = pollster::block_on(
+                        adapter.request_device(&wgpu::DeviceDescriptor::default()),
+                    )
+                    .map_err(|e| format!("Failed to create wgpu device: {e}"))?;
+                    (device, queue, None)
+                }
+            },
+            false => {
+                let (device, queue) = pollster::block_on(
+                    adapter.request_device(&wgpu::DeviceDescriptor::default()),
+                )
                 .map_err(|e| format!("Failed to create wgpu device: {e}"))?;
+                (device, queue, None)
+            }
+        };
 
         let vs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("ez_fullscreen_vs"),
@@ -369,6 +412,7 @@ impl GpuState {
             convert_uniforms,
             pack_uniforms,
             resources: None,
+            hw_interop,
         })
     }
 
@@ -377,6 +421,39 @@ impl GpuState {
             PlaneLayout::Planar { .. } => &self.convert_pipeline_planar,
             PlaneLayout::Nv12 => &self.convert_pipeline_nv12,
         }
+    }
+
+    /// Builds an NV12 convert bind group for a pair of imported hardware
+    /// plane textures (per-frame: each hw frame is a distinct VkImage).
+    pub(crate) fn hw_convert_bind(
+        &self,
+        tex_y: &wgpu::Texture,
+        tex_uv: &wgpu::Texture,
+    ) -> wgpu::BindGroup {
+        let y_view = tex_y.create_view(&wgpu::TextureViewDescriptor::default());
+        let uv_view = tex_uv.create_view(&wgpu::TextureViewDescriptor::default());
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ez_hw_convert_bind"),
+            layout: &self.convert_bgl_nv12,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&y_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&uv_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.convert_uniforms.as_entire_binding(),
+                },
+            ],
+        })
     }
 
     /// (Re)creates size/format-dependent resources. In-flight readbacks keep
@@ -464,14 +541,7 @@ impl GpuState {
             mapped_at_creation: false,
         });
         let staging_pool: Vec<wgpu::Buffer> = (0..staging_count)
-            .map(|_| {
-                device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("ez_staging"),
-                    size: buf_size,
-                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                })
-            })
+            .map(|_| create_staging(device, buf_size))
             .collect();
 
         let view = |t: &wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor::default());

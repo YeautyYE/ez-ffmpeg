@@ -3,16 +3,17 @@
 
 use crate::core::filter::frame_filter_context::FrameFilterContext;
 use crate::filter::frame_filter::FrameFilter;
-use crate::util::frame_utils::ensure_software_format;
-use crate::wgpu_filter::frame_io;
-use crate::wgpu_filter::gpu_state::{GpuState, OutputGeometry};
+use crate::util::frame_utils::{ensure_software_format, is_hw_format};
+use crate::wgpu_filter::frame_io::{self, HwMappedFrame, PlaneLayout};
+use crate::wgpu_filter::gpu_state::{create_staging, GpuState, OutputGeometry};
+use crate::wgpu_filter::hw_interop;
 use crate::wgpu_filter::params::SharedParams;
 use crate::wgpu_filter::shaders;
 use ffmpeg_next::Frame;
 use ffmpeg_sys_next::AVMediaType;
 use std::collections::VecDeque;
 use std::marker::PhantomData;
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -27,6 +28,8 @@ pub struct WgpuFrameFilterBuilder {
     output_size: Option<(u32, u32)>,
     params_bytes: Vec<u8>,
     frames_in_flight: usize,
+    zero_copy_readback: bool,
+    hw_zero_copy_input: bool,
 }
 
 impl WgpuFrameFilterBuilder {
@@ -68,6 +71,49 @@ impl WgpuFrameFilterBuilder {
         self
     }
 
+    /// Experimental: hand output frames to the pipeline whose planes point
+    /// directly into the GPU readback buffer, skipping the per-frame CPU
+    /// copy into a freshly allocated AVFrame.
+    ///
+    /// The readback buffer stays mapped and lent out until every reference
+    /// to the frame is dropped (typically right after encoding), then
+    /// returns to the filter for reuse. Frames are marked read-only; FFmpeg
+    /// code that needs to write them copies first (`av_frame_make_writable`).
+    ///
+    /// Trade-offs: peak GPU-visible memory grows from `frames_in_flight`
+    /// readback buffers to one per frame simultaneously alive downstream —
+    /// the pipeline channel plus whatever the encoder holds internally
+    /// (e.g. libx264's default lookahead keeps ~40 frames, so 4K output
+    /// pins ~500 MB until those frames are consumed). Downstream consumers
+    /// also read from GPU-mapped memory, which can be slower than system
+    /// RAM on discrete cards. Best suited to integrated GPUs with unified
+    /// memory and consumers that release frames promptly.
+    pub fn zero_copy_readback(mut self, enabled: bool) -> Self {
+        self.zero_copy_readback = enabled;
+        self
+    }
+
+    /// Experimental: import hardware decoder frames (VAAPI) directly into
+    /// GPU textures over DRM PRIME dmabufs, skipping the download to system
+    /// memory and the re-upload entirely.
+    ///
+    /// Requires the Vulkan backend with dmabuf-import extensions (Linux;
+    /// RADV/ANV). When unavailable — or when a particular frame cannot be
+    /// imported — hardware frames transparently fall back to
+    /// `av_hwframe_transfer_data` download, so enabling this is always safe.
+    /// Software input frames are unaffected.
+    ///
+    /// Marked experimental because wgpu tracks imported textures as
+    /// uninitialized and its first layout transition is from `UNDEFINED`,
+    /// which the Vulkan spec allows to discard contents. On drivers where
+    /// video dmabuf surfaces carry no compression metadata (verified on
+    /// RADV) the transition preserves texels; validate on your target
+    /// driver before production use.
+    pub fn hw_zero_copy_input(mut self, enabled: bool) -> Self {
+        self.hw_zero_copy_input = enabled;
+        self
+    }
+
     pub fn build(self) -> Result<WgpuFrameFilter, String> {
         if self.fragment_shader.is_empty() {
             return Err("WgpuFrameFilter requires a fragment shader (shader_wgsl)".to_string());
@@ -96,10 +142,13 @@ impl WgpuFrameFilterBuilder {
             fragment_shader: self.fragment_shader,
             output_size: self.output_size,
             frames_in_flight: self.frames_in_flight,
+            zero_copy_readback: self.zero_copy_readback,
+            hw_zero_copy_input: self.hw_zero_copy_input,
             params: SharedParams::new(self.params_bytes),
             stats: Arc::new(Mutex::new(WgpuFilterStats::default())),
             gpu: None,
             pending: VecDeque::new(),
+            recycle: mpsc::channel(),
         })
     }
 }
@@ -119,16 +168,29 @@ impl WgpuFrameFilterBuilder {
 /// [`WgpuFrameFilterBuilder::frames_in_flight`]), so readback of one frame
 /// overlaps the next frame's upload; output order is always preserved.
 ///
-/// The filter consumes and produces CPU frames, so it works with any
-/// decoder/encoder combination; hardware frames are rejected with guidance.
+/// The filter consumes CPU frames and produces CPU frames, so it works with
+/// any decoder/encoder combination. Hardware decoder frames are accepted
+/// too: they are downloaded to system memory automatically, or imported
+/// zero-copy via [`WgpuFrameFilterBuilder::hw_zero_copy_input`].
+/// On unified-memory GPUs, [`WgpuFrameFilterBuilder::zero_copy_readback`]
+/// can additionally skip the readback copy into system RAM.
 pub struct WgpuFrameFilter {
     fragment_shader: String,
     output_size: Option<(u32, u32)>,
     frames_in_flight: usize,
+    zero_copy_readback: bool,
+    hw_zero_copy_input: bool,
     params: SharedParams,
     stats: Arc<Mutex<WgpuFilterStats>>,
     gpu: Option<GpuState>,
     pending: VecDeque<PendingOutput>,
+    /// Return path for zero-copy staging buffers: the AVBuffer free callback
+    /// sends `(buffer, size)` from whichever thread drops the last frame
+    /// reference; `filter_frame` drains it back into the staging pool.
+    recycle: (
+        mpsc::Sender<(wgpu::Buffer, u64)>,
+        Receiver<(wgpu::Buffer, u64)>,
+    ),
 }
 
 /// A frame submitted to the GPU whose readback has not completed yet.
@@ -136,8 +198,14 @@ struct InFlightFrame {
     staging: wgpu::Buffer,
     submission: wgpu::SubmissionIndex,
     map_rx: Receiver<Result<(), wgpu::BufferAsyncError>>,
+    /// Submission time, for detecting a wedged device during polling.
+    submitted_at: Instant,
     /// Input frame kept alive as the property donor (pts, color tags, ...).
     src_props: Frame,
+    /// For zero-copy hardware input: the mapped DRM frame and imported
+    /// textures, which must stay alive until this submission's GPU reads
+    /// complete (the decoder must not recycle the surface underneath them).
+    _hw: Option<HwMappedFrame>,
     /// Geometry snapshot so the readback stays valid even if the shared
     /// resources are rebuilt for a new input size in the meantime.
     geo: OutputGeometry,
@@ -146,6 +214,10 @@ struct InFlightFrame {
 /// Output queue entry. Frames leave from the front strictly in arrival
 /// order; a `Gpu` entry morphs into `Done` in place once its readback
 /// completes, so pass-through frames can never overtake GPU frames.
+// The size difference between variants is fine: the queue holds at most
+// frames_in_flight + a few marker entries, never enough for Box overhead
+// to pay off.
+#[allow(clippy::large_enum_variant)]
 enum PendingOutput {
     /// Submitted to the GPU, result pending.
     Gpu(InFlightFrame),
@@ -161,6 +233,8 @@ impl WgpuFrameFilter {
             output_size: None,
             params_bytes: Vec::new(),
             frames_in_flight: 2,
+            zero_copy_readback: false,
+            hw_zero_copy_input: false,
         }
     }
 
@@ -205,6 +279,27 @@ impl WgpuFrameFilter {
             .count()
     }
 
+    /// Returns released zero-copy staging buffers to the pool. Buffers whose
+    /// size no longer matches the current geometry are dropped, as is any
+    /// surplus beyond the pool cap (downstream can briefly hold more frames
+    /// than the pool wants to keep across an idle stretch).
+    fn drain_recycled(&mut self) {
+        // frames_in_flight covers submission; the extra headroom mirrors the
+        // pipeline's bounded channel, where released frames arrive in bursts.
+        let cap = self.frames_in_flight + 8;
+        let res = self.gpu.as_mut().and_then(|g| g.resources.as_mut());
+        match res {
+            Some(res) => {
+                while let Ok((buffer, size)) = self.recycle.1.try_recv() {
+                    if size == res.buf_size && res.staging_pool.len() < cap {
+                        res.staging_pool.push(buffer);
+                    }
+                }
+            }
+            None => while self.recycle.1.try_recv().is_ok() {},
+        }
+    }
+
     /// Completes the oldest in-flight GPU frame in place: it keeps its output
     /// queue position, morphing from `Gpu` to `Done`. With `block = false`
     /// this returns `Ok(false)` when the result is not ready yet; with
@@ -236,22 +331,35 @@ impl WgpuFrameFilter {
             unreachable!("pos still points at the Gpu entry checked above");
         };
         let t_download = Instant::now();
-        let mapped = slot.staging.slice(..).get_mapped_range();
-        let built = frame_io::build_output_frame(&mapped, &slot.geo, &slot.src_props);
-        drop(mapped);
-        slot.staging.unmap();
-        let frame = built?;
-        let download_secs = t_download.elapsed().as_secs_f64();
+        let frame = if self.zero_copy_readback {
+            // Lend the mapped staging buffer out inside the frame; it comes
+            // back through `recycle` when the last reference drops.
+            frame_io::build_output_frame_zero_copy(
+                slot.staging,
+                &slot.geo,
+                &slot.src_props,
+                &self.recycle.0,
+            )?
+        } else {
+            let mapped = slot.staging.slice(..).get_mapped_range();
+            let built = frame_io::build_output_frame(&mapped, &slot.geo, &slot.src_props);
+            drop(mapped);
+            slot.staging.unmap();
+            let frame = built?;
 
-        // Recycle the staging buffer while it matches the current geometry;
-        // buffers from an older geometry are dropped (the pool was refilled
-        // when the resources were rebuilt).
-        if let Some(res) = self.gpu.as_mut().and_then(|g| g.resources.as_mut()) {
-            if res.buf_size == slot.geo.buf_size && res.staging_pool.len() < self.frames_in_flight
-            {
-                res.staging_pool.push(slot.staging);
+            // Recycle the staging buffer while it matches the current
+            // geometry; buffers from an older geometry are dropped (the pool
+            // was refilled when the resources were rebuilt).
+            if let Some(res) = self.gpu.as_mut().and_then(|g| g.resources.as_mut()) {
+                if res.buf_size == slot.geo.buf_size
+                    && res.staging_pool.len() < self.frames_in_flight
+                {
+                    res.staging_pool.push(slot.staging);
+                }
             }
-        }
+            frame
+        };
+        let download_secs = t_download.elapsed().as_secs_f64();
 
         if let Ok(mut stats) = self.stats.lock() {
             stats.frames += 1;
@@ -284,6 +392,15 @@ impl WgpuFrameFilter {
     }
 }
 
+/// Upper bound on readback progress: a submission older than this whose map
+/// callback has not fired means the device is wedged (hung driver, lost
+/// device with no error callback). Both the blocking wait and the
+/// non-blocking drain polls enforce it, so a wedged device surfaces as a
+/// filter error instead of a silent hang; the scheduler cannot interrupt a
+/// thread that is inside a filter call, and the completed work a healthy
+/// device delivers on the next poll is never affected.
+const GPU_COMPLETION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Waits (or polls) for a staging buffer map to complete. Returns `Ok(false)`
 /// when `block` is false and the map is not ready yet.
 fn wait_for_map(
@@ -309,8 +426,18 @@ fn wait_for_map(
         device
             .poll(wgpu::PollType::Poll)
             .map_err(|e| format!("Device poll failed: {e:?}"))?;
-        return Ok(check(&slot.map_rx)?.is_some());
+        if check(&slot.map_rx)?.is_some() {
+            return Ok(true);
+        }
+        if slot.submitted_at.elapsed() > GPU_COMPLETION_TIMEOUT {
+            return Err(format!(
+                "GPU readback made no progress for {}s; the device appears hung",
+                GPU_COMPLETION_TIMEOUT.as_secs()
+            ));
+        }
+        return Ok(false);
     }
+    let deadline = Instant::now() + GPU_COMPLETION_TIMEOUT;
     loop {
         device
             .poll(wgpu::PollType::WaitForSubmissionIndex(
@@ -325,6 +452,12 @@ fn wait_for_map(
         device
             .poll(wgpu::PollType::Wait)
             .map_err(|e| format!("Device poll failed: {e:?}"))?;
+        if Instant::now() > deadline {
+            return Err(format!(
+                "GPU readback made no progress for {}s; the device appears hung",
+                GPU_COMPLETION_TIMEOUT.as_secs()
+            ));
+        }
     }
 }
 
@@ -334,7 +467,7 @@ impl FrameFilter for WgpuFrameFilter {
     }
 
     fn init(&mut self, _ctx: &FrameFilterContext) -> Result<(), String> {
-        let gpu = GpuState::new(&self.fragment_shader, self.params.len)?;
+        let gpu = GpuState::new(&self.fragment_shader, self.params.len, self.hw_zero_copy_input)?;
         self.gpu = Some(gpu);
         Ok(())
     }
@@ -345,9 +478,14 @@ impl FrameFilter for WgpuFrameFilter {
         _ctx: &FrameFilterContext,
     ) -> Result<Option<Frame>, String> {
         // SAFETY: probing only reads pointers/scalars of a live frame.
+        // `buf[0]` is the marker signature used across the scheduler
+        // (dec_task, send_frame): props-only frames carry no buffer refs.
+        // Checking `data[0]` instead would misclassify hardware frames,
+        // whose data pointers are API handles (VAAPI keeps the surface in
+        // data[3] and leaves data[0] null).
         let bypass = unsafe {
             frame.as_ptr().is_null()
-                || frame.is_empty()
+                || (*frame.as_ptr()).buf[0].is_null()
                 || (*frame.as_ptr()).width <= 0
                 || (*frame.as_ptr()).height <= 0
         };
@@ -361,10 +499,51 @@ impl FrameFilter for WgpuFrameFilter {
 
         // SAFETY: `frame` is a live frame; scalar field reads only.
         let raw = unsafe { frame.as_ptr() };
-        let pix_fmt = ensure_software_format(unsafe { (*raw).format })
-            .map_err(|e| format!("WgpuFrameFilter: {e}"))?;
-        let (layout, full_range) =
-            frame_io::detect_format(pix_fmt, unsafe { (*raw).color_range })?;
+
+        // Hardware frames (hwaccel_output_format vaapi/cuda/...): try the
+        // zero-copy dmabuf import when enabled, otherwise download to system
+        // memory. Their data pointers are GPU handles that must never be
+        // read as CPU planes.
+        let mut hw_mapped: Option<HwMappedFrame> = None;
+        let frame = if is_hw_format(unsafe { (*raw).format }) {
+            if self.hw_zero_copy_input {
+                let gpu = self.gpu.as_ref().ok_or("WgpuFrameFilter not initialized")?;
+                match frame_io::import_hw_frame(gpu, &frame) {
+                    Ok(mapped) => hw_mapped = Some(mapped),
+                    Err(reason) => hw_interop::warn_import_failed_once(&reason),
+                }
+            }
+            if hw_mapped.is_some() {
+                frame
+            } else {
+                let t_download = Instant::now();
+                let sw = frame_io::download_hw_frame(&frame)
+                    .map_err(|e| format!("WgpuFrameFilter: {e}"))?;
+                if let Ok(mut stats) = self.stats.lock() {
+                    stats.upload_secs += t_download.elapsed().as_secs_f64();
+                }
+                sw
+            }
+        } else {
+            frame
+        };
+
+        // SAFETY: `frame` is a live frame; scalar field reads only.
+        let raw = unsafe { frame.as_ptr() };
+        let (layout, full_range) = match &hw_mapped {
+            // Imported hardware frames are NV12 by construction; hw frames
+            // carry the same color_range field as software ones.
+            Some(_) => (
+                PlaneLayout::Nv12,
+                unsafe { (*raw).color_range }
+                    == ffmpeg_sys_next::AVColorRange::AVCOL_RANGE_JPEG,
+            ),
+            None => {
+                let pix_fmt = ensure_software_format(unsafe { (*raw).format })
+                    .map_err(|e| format!("WgpuFrameFilter: {e}"))?;
+                frame_io::detect_format(pix_fmt, unsafe { (*raw).color_range })?
+            }
+        };
         let (in_w, in_h) = unsafe { ((*raw).width as u32, (*raw).height as u32) };
         let matrix_id = frame_io::matrix_id_for(unsafe { (*raw).colorspace }, in_h as i32);
 
@@ -384,47 +563,78 @@ impl FrameFilter for WgpuFrameFilter {
         }
         gpu.ensure_resources(in_w, in_h, layout, self.output_size, self.frames_in_flight);
 
-        // Cap in-flight work: when the staging pool is exhausted, block for
-        // the oldest result (it keeps its position in the output queue).
-        while self
-            .gpu
-            .as_ref()
-            .and_then(|g| g.resources.as_ref())
-            .is_some_and(|r| r.staging_pool.is_empty())
-        {
-            if self.gpu_pending_count() == 0 {
-                return Err(
-                    "WgpuFrameFilter internal error: staging pool exhausted with no \
-                     in-flight frames"
-                        .to_string(),
-                );
+        // Return zero-copy staging buffers that downstream frame owners have
+        // released since the last call.
+        self.drain_recycled();
+
+        if self.zero_copy_readback {
+            // Zero-copy: buffers come back only when downstream drops its
+            // frame, so pool emptiness cannot regulate (waiting on it could
+            // deadlock against a slow consumer). Cap the submitted GPU work
+            // instead and allocate staging on demand below.
+            while self.gpu_pending_count() >= self.frames_in_flight {
+                self.complete_oldest_gpu(true)?;
             }
-            self.complete_oldest_gpu(true)?;
+        } else {
+            // Cap in-flight work: when the staging pool is exhausted, block
+            // for the oldest result (it keeps its position in the output
+            // queue and returns its buffer to the pool).
+            while self
+                .gpu
+                .as_ref()
+                .and_then(|g| g.resources.as_ref())
+                .is_some_and(|r| r.staging_pool.is_empty())
+            {
+                if self.gpu_pending_count() == 0 {
+                    return Err(
+                        "WgpuFrameFilter internal error: staging pool exhausted with no \
+                         in-flight frames"
+                            .to_string(),
+                    );
+                }
+                self.complete_oldest_gpu(true)?;
+            }
         }
 
         let (staging, geo) = {
-            let res = self
-                .gpu
-                .as_mut()
-                .and_then(|g| g.resources.as_mut())
-                .expect("resources ensured above");
-            (
-                res.staging_pool.pop().expect("pool refilled above"),
-                res.geometry(),
-            )
+            let gpu = self.gpu.as_mut().expect("initialized above");
+            let res = gpu.resources.as_mut().expect("resources ensured above");
+            let geo = res.geometry();
+            let staging = match res.staging_pool.pop() {
+                Some(buffer) => buffer,
+                None => create_staging(&gpu.device, geo.buf_size),
+            };
+            (staging, geo)
         };
 
         let t_upload = Instant::now();
         let gpu = self.gpu.as_ref().expect("initialized above");
-        let submitted = frame_io::upload_and_encode(
-            gpu,
-            &frame,
-            layout,
-            matrix_id,
-            full_range,
-            &staging,
-            &self.params,
-        );
+        let submitted = match &hw_mapped {
+            Some(mapped) => {
+                // Imported planes bind straight into the NV12 convert pass;
+                // no CPU-side upload happens on this path.
+                let bind = gpu.hw_convert_bind(&mapped.imported.tex_y, &mapped.imported.tex_uv);
+                frame_io::encode_and_submit(
+                    gpu,
+                    gpu.convert_pipeline(PlaneLayout::Nv12),
+                    &bind,
+                    &frame,
+                    matrix_id,
+                    full_range,
+                    &staging,
+                    &self.params,
+                )
+            }
+            None => frame_io::upload_and_encode(
+                gpu,
+                &frame,
+                layout,
+                matrix_id,
+                full_range,
+                &staging,
+                &self.params,
+            ),
+        };
         let (submission, map_rx) = match submitted {
             Ok(v) => v,
             Err(e) => {
@@ -443,7 +653,9 @@ impl FrameFilter for WgpuFrameFilter {
             staging,
             submission,
             map_rx,
+            submitted_at: Instant::now(),
             src_props: frame,
+            _hw: hw_mapped,
             geo,
         }));
 
@@ -459,8 +671,12 @@ impl FrameFilter for WgpuFrameFilter {
 
     fn uninit(&mut self, _ctx: &FrameFilterContext) {
         // Abandon any in-flight readbacks; wgpu unmaps and frees buffers on
-        // drop, and pass-through frames are simply released.
+        // drop, and pass-through frames are simply released. Zero-copy
+        // frames still alive downstream keep their staging buffer through
+        // the AVBuffer free callback; once the filter itself is dropped the
+        // recycle receiver goes with it and returned buffers just drop.
         self.pending.clear();
+        self.drain_recycled();
         self.gpu = None;
     }
 }

@@ -4,9 +4,14 @@
 use crate::util::ffmpeg_utils::av_err2str;
 use crate::util::frame_utils::copy_plane;
 use crate::wgpu_filter::gpu_state::{GpuState, OutputGeometry};
+use crate::wgpu_filter::hw_interop::{self, ImportedNv12};
 use crate::wgpu_filter::params::SharedParams;
 use ffmpeg_next::Frame;
-use ffmpeg_sys_next::{av_frame_copy_props, av_frame_get_buffer, av_q2d, AVPixelFormat};
+use ffmpeg_sys_next::{
+    av_buffer_create, av_frame_copy_props, av_frame_get_buffer, av_hwframe_map,
+    av_hwframe_transfer_data, av_q2d, AVDRMFrameDescriptor, AVPixelFormat,
+    AV_BUFFER_FLAG_READONLY, AV_HWFRAME_MAP_READ,
+};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 
@@ -73,6 +78,84 @@ pub(crate) fn matrix_id_for(colorspace: ffmpeg_sys_next::AVColorSpace, height: i
     }
 }
 
+/// Downloads a hardware frame (VAAPI, CUDA, ...) into a freshly allocated
+/// CPU frame via `av_hwframe_transfer_data`, preserving properties. The
+/// transfer picks the hw context's native software format (NV12 for VAAPI),
+/// which the caller then feeds through the normal software path.
+pub(crate) fn download_hw_frame(src: &Frame) -> Result<Frame, String> {
+    // SAFETY: `dst` is freshly allocated; `src` is a live hardware frame.
+    // av_hwframe_transfer_data allocates dst's buffers and sets its format.
+    unsafe {
+        let mut dst = Frame::empty();
+        let p = dst.as_mut_ptr();
+        if p.is_null() {
+            return Err("Failed to allocate download frame".to_string());
+        }
+        let ret = av_hwframe_transfer_data(p, src.as_ptr(), 0);
+        if ret < 0 {
+            return Err(format!(
+                "Failed to download hardware frame to system memory: {}",
+                av_err2str(ret)
+            ));
+        }
+        let ret = av_frame_copy_props(p, src.as_ptr());
+        if ret < 0 {
+            return Err(format!("Failed to copy frame props: {}", av_err2str(ret)));
+        }
+        (*p).time_base = (*src.as_ptr()).time_base;
+        Ok(dst)
+    }
+}
+
+/// A hardware frame mapped to DRM_PRIME with both NV12 planes imported as
+/// wgpu textures. `_drm_frame` keeps the export (and through it the decoder
+/// surface) alive; it must outlive all GPU reads of the textures, so the
+/// caller stores this in its in-flight slot until readback completes.
+pub(crate) struct HwMappedFrame {
+    pub(crate) imported: ImportedNv12,
+    _drm_frame: Frame,
+}
+
+/// Maps a VAAPI (or already DRM_PRIME) frame to a dmabuf descriptor and
+/// imports its planes as wgpu textures — the zero-copy input path. Any error
+/// is a signal to fall back to `download_hw_frame`.
+pub(crate) fn import_hw_frame(gpu: &GpuState, src: &Frame) -> Result<HwMappedFrame, String> {
+    let interop = gpu
+        .hw_interop
+        .as_ref()
+        .ok_or("dmabuf import not available on this device")?;
+
+    // SAFETY: `src` is a live hardware frame; the mapped frame owns a ref on
+    // it (AV_HWFRAME_MAP_READ) plus the exported fds, released on drop.
+    unsafe {
+        let mut drm_frame = Frame::empty();
+        let p = drm_frame.as_mut_ptr();
+        if p.is_null() {
+            return Err("Failed to allocate DRM map frame".to_string());
+        }
+        (*p).format = AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
+        let ret = av_hwframe_map(p, src.as_ptr(), AV_HWFRAME_MAP_READ as i32);
+        if ret < 0 {
+            return Err(format!(
+                "av_hwframe_map to DRM_PRIME failed: {}",
+                av_err2str(ret)
+            ));
+        }
+
+        let desc = (*p).data[0] as *const AVDRMFrameDescriptor;
+        if desc.is_null() {
+            return Err("mapped DRM_PRIME frame has no descriptor".to_string());
+        }
+        let drm = hw_interop::parse_drm_nv12(desc)?;
+        let (w, h) = ((*src.as_ptr()).width as u32, (*src.as_ptr()).height as u32);
+        let imported = interop.import_nv12(&gpu.device, &drm, w, h)?;
+        Ok(HwMappedFrame {
+            imported,
+            _drm_frame: drm_frame,
+        })
+    }
+}
+
 /// Returns a read-only slice for one plane plus its stride. The slice is
 /// tight: it ends after `width_bytes` of the last row, so externally wrapped
 /// frames whose last row is not stride-padded are never over-read.
@@ -111,6 +194,13 @@ fn plane_slice(
 /// Uploads one validated input frame, encodes the convert/effect/pack passes
 /// plus the copy into `staging`, submits, and registers the readback map.
 /// Returns the submission index and the map-completion receiver.
+///
+/// Uploads use `queue.write_texture`: wgpu's internal staging belt is already
+/// a persistently mapped ring with one CPU copy + one GPU copy per plane. A
+/// hand-rolled MAP_WRITE ring buffer was measured slower on this path
+/// (COPY_BYTES_PER_ROW_ALIGNMENT padding inflates the CPU copy for widths
+/// that are not multiples of 256, plus an extra map_async round trip per
+/// frame; 1080p upload 0.77 -> 0.95 ms/frame on RADV RENOIR).
 pub(crate) fn upload_and_encode(
     gpu: &GpuState,
     frame: &Frame,
@@ -166,6 +256,40 @@ pub(crate) fn upload_and_encode(
             write_plane(&res.tex_u, uv_data, uv_stride, cw, ch);
         }
     }
+
+    encode_and_submit(
+        gpu,
+        gpu.convert_pipeline(layout),
+        &res.convert_bind,
+        frame,
+        matrix_id,
+        full_range,
+        staging,
+        params,
+    )
+}
+
+/// Encodes the convert/effect/pack passes against an already-uploaded (or
+/// imported) input bound by `convert_bind`, submits, and registers the
+/// readback map. Shared tail of the software and hardware input paths.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_and_submit(
+    gpu: &GpuState,
+    convert_pipeline: &wgpu::RenderPipeline,
+    convert_bind: &wgpu::BindGroup,
+    frame: &Frame,
+    matrix_id: u32,
+    full_range: bool,
+    staging: &wgpu::Buffer,
+    params: &SharedParams,
+) -> Result<
+    (
+        wgpu::SubmissionIndex,
+        mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+    ),
+    String,
+> {
+    let res = gpu.resources.as_ref().expect("resources ensured");
 
     // Per-frame uniforms. Queue writes are ordered on the queue timeline, so
     // sharing one uniform buffer across in-flight frames is race-free: the
@@ -238,8 +362,8 @@ pub(crate) fn upload_and_encode(
             timestamp_writes: None,
             occlusion_query_set: None,
         });
-        pass.set_pipeline(gpu.convert_pipeline(layout));
-        pass.set_bind_group(0, &res.convert_bind, &[]);
+        pass.set_pipeline(convert_pipeline);
+        pass.set_bind_group(0, convert_bind, &[]);
         pass.draw(0..3, 0..1);
     }
     {
@@ -297,8 +421,8 @@ pub(crate) fn build_output_frame(
         ));
     }
 
-    // SAFETY: `out` is freshly allocated; av_frame_get_buffer(align=1) sizes
-    // each plane to at least linesize * rows, which bounds every slice below.
+    // SAFETY: `out` is freshly allocated; av_frame_get_buffer sizes each plane
+    // to at least linesize * rows, which bounds every slice below.
     // `src` is only read through FFmpeg's own props-copy API.
     unsafe {
         let mut out = Frame::empty();
@@ -309,7 +433,11 @@ pub(crate) fn build_output_frame(
         (*p).width = geo.out_w as i32;
         (*p).height = geo.out_h as i32;
         (*p).format = AVPixelFormat::AV_PIX_FMT_YUV420P as i32;
-        let ret = av_frame_get_buffer(p, 1);
+        // align=4 makes FFmpeg's linesizes equal to the GPU-side strides
+        // (both round the 8-bit plane width up to 4), so every copy_plane
+        // below takes its contiguous fast path. The copies still consult the
+        // actual linesize, so a different allocator choice stays correct.
+        let ret = av_frame_get_buffer(p, 4);
         if ret < 0 {
             return Err(format!(
                 "Failed to allocate output frame buffer: {}",
@@ -349,6 +477,119 @@ pub(crate) fn build_output_frame(
             out_cw,
             out_ch,
         );
+        Ok(out)
+    }
+}
+
+/// Owner of a mapped staging buffer lent out inside a zero-copy output frame.
+/// Dropped by the AVBuffer free callback when the last frame reference is
+/// released (encoder thread, frame pool, ...): unmaps and returns the buffer
+/// to the filter for reuse. The filter may already be gone by then — the
+/// send failure just lets the buffer drop entirely, which wgpu handles from
+/// any thread.
+struct ZeroCopyHolder {
+    staging: Option<wgpu::Buffer>,
+    buf_size: u64,
+    recycle_tx: mpsc::Sender<(wgpu::Buffer, u64)>,
+}
+
+impl Drop for ZeroCopyHolder {
+    fn drop(&mut self) {
+        if let Some(staging) = self.staging.take() {
+            staging.unmap();
+            let _ = self.recycle_tx.send((staging, self.buf_size));
+        }
+    }
+}
+
+/// AVBuffer free callback: reclaims the [`ZeroCopyHolder`] leaked into the
+/// buffer's opaque pointer. Runs on whichever thread drops the last frame
+/// reference.
+unsafe extern "C" fn zero_copy_free(opaque: *mut libc::c_void, _data: *mut u8) {
+    drop(Box::from_raw(opaque as *mut ZeroCopyHolder));
+}
+
+/// Builds a YUV420P output frame whose planes point directly into the mapped
+/// staging buffer — no CPU copy. The buffer stays mapped and borrowed until
+/// every reference to the frame is dropped; the AVBuffer free callback then
+/// unmaps it and hands it back to the filter through `recycle_tx`.
+///
+/// The frame is marked read-only (`AV_BUFFER_FLAG_READONLY`): encoders only
+/// read their input, and any FFmpeg code that needs to write goes through
+/// `av_frame_make_writable`, which copies first.
+pub(crate) fn build_output_frame_zero_copy(
+    staging: wgpu::Buffer,
+    geo: &OutputGeometry,
+    src: &Frame,
+    recycle_tx: &mpsc::Sender<(wgpu::Buffer, u64)>,
+) -> Result<Frame, String> {
+    let out_h = geo.out_h as usize;
+    let out_ch = geo.out_h.div_ceil(2) as usize;
+    let y_end = geo.y_stride * out_h;
+    let u_end = y_end + geo.c_stride * out_ch;
+    let v_end = u_end + geo.c_stride * out_ch;
+
+    let mapped = staging.slice(..).get_mapped_range();
+    if mapped.len() < v_end {
+        drop(mapped);
+        staging.unmap();
+        let _ = recycle_tx.send((staging, geo.buf_size));
+        return Err(format!(
+            "Mapped readback too small: need {v_end} bytes"
+        ));
+    }
+    let base = mapped.as_ptr() as *mut u8;
+    drop(mapped);
+    // `base` stays valid: the buffer remains mapped until the holder unmaps
+    // it in the free callback, and `get_mapped_range` of a whole-buffer map
+    // is stable across calls.
+
+    let holder = Box::new(ZeroCopyHolder {
+        staging: Some(staging),
+        buf_size: geo.buf_size,
+        recycle_tx: recycle_tx.clone(),
+    });
+
+    // SAFETY: `out` is freshly allocated. The AVBuffer wraps the mapped
+    // range; FFmpeg frees it exactly once through `zero_copy_free`, which
+    // reclaims the holder. On the error path below the holder is still owned
+    // by the Box and cleans up through its Drop.
+    unsafe {
+        let mut out = Frame::empty();
+        let p = out.as_mut_ptr();
+        if p.is_null() {
+            return Err("Failed to allocate output frame".to_string());
+        }
+        (*p).width = geo.out_w as i32;
+        (*p).height = geo.out_h as i32;
+        (*p).format = AVPixelFormat::AV_PIX_FMT_YUV420P as i32;
+
+        let holder_ptr = Box::into_raw(holder);
+        let buf = av_buffer_create(
+            base,
+            v_end,
+            Some(zero_copy_free),
+            holder_ptr as *mut libc::c_void,
+            AV_BUFFER_FLAG_READONLY,
+        );
+        if buf.is_null() {
+            drop(Box::from_raw(holder_ptr));
+            return Err("Failed to wrap readback buffer (av_buffer_create)".to_string());
+        }
+        (*p).buf[0] = buf;
+        (*p).data[0] = base;
+        (*p).data[1] = base.add(y_end);
+        (*p).data[2] = base.add(u_end);
+        (*p).linesize[0] = geo.y_stride as i32;
+        (*p).linesize[1] = geo.c_stride as i32;
+        (*p).linesize[2] = geo.c_stride as i32;
+
+        let ret = av_frame_copy_props(p, src.as_ptr());
+        if ret < 0 {
+            // Dropping `out` releases buf[0] and thus the holder.
+            return Err(format!("Failed to copy frame props: {}", av_err2str(ret)));
+        }
+        (*p).time_base = (*src.as_ptr()).time_base;
         Ok(out)
     }
 }
