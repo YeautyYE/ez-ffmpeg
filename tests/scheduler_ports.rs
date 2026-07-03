@@ -5,8 +5,11 @@
 //!   estimation: 30 input frames at -r 60 produce a 0.5s/60fps output.
 //! - stream_loop across a transcode must produce N*loops frames with
 //!   monotonic timestamps (loop end_pts bookkeeping).
+//! - The demuxer must stop once every stream's consumers are done
+//!   (ffmpeg_demux.c do_send nb_streams_finished bookkeeping): an infinite
+//!   source with per-stream frame limits must terminate, not spin forever.
 
-use ez_ffmpeg::stream_info::{find_video_stream_info, StreamInfo};
+use ez_ffmpeg::stream_info::{find_audio_stream_info, find_video_stream_info, StreamInfo};
 use ez_ffmpeg::{FfmpegContext, FfmpegScheduler, Input, Output};
 use std::time::Duration;
 
@@ -106,6 +109,69 @@ fn input_framerate_forces_cfr_grid_through_decode() {
             );
         }
         other => panic!("expected video stream info, got {other:?}"),
+    }
+}
+
+#[test]
+fn demuxer_stops_when_all_consumers_are_done() {
+    // Infinite lavfi source with one video and one audio stream, both
+    // destinations bounded by frame limits. demux_send must report
+    // AVERROR_EOF once each stream's own consumers finished — counting
+    // *all* destinations against one stream's done-count never terminates
+    // (ffmpeg_sched.c demux_send_for_stream: nb_done == ds->nb_dst).
+    let out = tmp_path("consumers_done.mp4");
+    let result = wait_with_watchdog(
+        FfmpegContext::builder()
+            .input(
+                Input::from(
+                    "testsrc=size=320x240:rate=30[out0];\
+                     sine=frequency=440:sample_rate=44100[out1]",
+                )
+                .set_format("lavfi"),
+            )
+            .output(
+                Output::from(out.as_str())
+                    .set_video_codec("mpeg4")
+                    .set_audio_codec("aac")
+                    .set_max_video_frames(20)
+                    .set_max_audio_frames(30),
+            )
+            .build()
+            .unwrap()
+            .start()
+            .unwrap(),
+        30,
+        "all consumers done",
+    );
+    assert!(result.is_ok(), "bounded transcode failed: {result:?}");
+
+    match find_video_stream_info(&out)
+        .expect("failed to probe output")
+        .expect("output has no video stream")
+    {
+        StreamInfo::Video { nb_frames, .. } => {
+            assert_eq!(nb_frames, 20, "video stream must respect its frame limit");
+        }
+        other => panic!("expected video stream info, got {other:?}"),
+    }
+
+    // The video consumers finish first (20 frames < 31 aac frames): the
+    // demuxer must keep feeding audio afterwards instead of stopping at the
+    // first finished stream (ffmpeg_demux.c do_send marks the stream
+    // finished and continues until nb_streams_finished == nb_streams_used).
+    match find_audio_stream_info(&out)
+        .expect("failed to probe output")
+        .expect("output has no audio stream")
+    {
+        StreamInfo::Audio { nb_frames, .. } => {
+            // 30 encoded frames + the AAC priming packet, same as the CLI
+            // (`-frames:v 20 -frames:a 30` probes video=20, audio=31).
+            assert_eq!(
+                nb_frames, 31,
+                "audio must keep flowing after the video consumers finish"
+            );
+        }
+        other => panic!("expected audio stream info, got {other:?}"),
     }
 }
 
