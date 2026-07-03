@@ -7,7 +7,10 @@
 //! by the borrow on `&mut self`).
 
 use super::fonts::{FontStore, LoadedFace};
-use super::layout::{render_event, unsupported, FrameContext, RenderOptions, RenderedNode};
+use super::layout::{
+    render_event, unsupported, EventDynamics, EventSamples, FrameContext, RenderOptions,
+    RenderedNode,
+};
 use crate::subtitle::ass::{Script, VALIGN_CENTER, VALIGN_TOP};
 use crate::subtitle::backend::SubtitleRenderer;
 use crate::subtitle::blend::OverlayImage;
@@ -27,17 +30,34 @@ pub(crate) struct PureRenderer {
     face_cache: HashMap<(String, u16, bool), Option<Arc<LoadedFace>>>,
     /// Nodes of the last rendered frame (backing store for the borrows).
     nodes: Vec<RenderedNode>,
-    /// Cache key: the visible event set of `nodes`, when time-independent.
+    /// Key describing exactly what `nodes` renders; see [`CacheKey`].
     cache: Option<CacheKey>,
+    /// Time-dependent inputs captured per event index on its first cold
+    /// render. Specs live in script coordinates/milliseconds, so geometry
+    /// changes don't stale them; the script is immutable after parse.
+    dynamics: HashMap<usize, EventDynamics>,
     lazy_inited: bool,
     /// `unsupported::*` features already warned about (once per feature).
     warned_unsupported: u32,
+    /// Cold (cache-miss) render count, observable by cache tests.
+    #[cfg(test)]
+    cold_renders: u64,
 }
 
+/// Frame-cache identity: the visible event set, the output geometry, and
+/// the per-event time samples. Equal keys imply byte-identical output, so
+/// animated events hit the cache on every frame where their resolved
+/// dynamic values (fade plateau, karaoke steady state, settled \move) are
+/// unchanged — only frames where a sample actually moves re-render.
 #[derive(PartialEq, Eq)]
 struct CacheKey {
     events: Vec<usize>,
     frame: (i32, i32),
+    /// Effective storage size (falls back to the frame size): it scales
+    /// borders/blur/shadows, so it must key the cache even though the
+    /// public setter also invalidates on change.
+    storage: (i32, i32),
+    samples: Vec<EventSamples>,
 }
 
 impl PureRenderer {
@@ -54,8 +74,11 @@ impl PureRenderer {
             face_cache: HashMap::new(),
             nodes: Vec::new(),
             cache: None,
+            dynamics: HashMap::new(),
             lazy_inited: false,
             warned_unsupported: 0,
+            #[cfg(test)]
+            cold_renders: 0,
         }
     }
 
@@ -132,6 +155,9 @@ impl SubtitleRenderer for PureRenderer {
     }
 
     fn set_storage_size(&mut self, width: i32, height: i32) {
+        if (self.storage_w, self.storage_h) != (width, height) {
+            self.cache = None;
+        }
         self.storage_w = width;
         self.storage_h = height;
     }
@@ -150,41 +176,66 @@ impl SubtitleRenderer for PureRenderer {
         }
 
         let visible = self.visible_events(now_ms);
-        let key = CacheKey {
-            events: visible.clone(),
-            frame: (self.frame_w, self.frame_h),
+        let frame = (self.frame_w, self.frame_h);
+        let storage = (
+            if self.storage_w > 0 {
+                self.storage_w
+            } else {
+                self.frame_w
+            },
+            if self.storage_h > 0 {
+                self.storage_h
+            } else {
+                self.frame_h
+            },
+        );
+        // Resolve every visible event's dynamic samples. An event that was
+        // never rendered has no captured record yet and forces a miss — a
+        // made-up "static" sample could wrongly hit for a dynamic event.
+        let samples: Option<Vec<EventSamples>> = visible
+            .iter()
+            .map(|&index| {
+                self.dynamics.get(&index).map(|dynamics| {
+                    let event = &self.script.events[index];
+                    dynamics.sample(now_ms - event.start_ms, event.duration_ms)
+                })
+            })
+            .collect();
+
+        let cache_valid = match (&self.cache, &samples) {
+            (Some(cache), Some(samples)) => {
+                cache.events == visible
+                    && cache.frame == frame
+                    && cache.storage == storage
+                    && &cache.samples == samples
+            }
+            _ => false,
         };
-        let cache_valid = self.cache.as_ref() == Some(&key);
         if !cache_valid {
+            #[cfg(test)]
+            {
+                self.cold_renders += 1;
+            }
             let ctx = FrameContext {
                 script: &self.script,
                 fonts: &self.fonts,
                 frame_w: self.frame_w,
                 frame_h: self.frame_h,
-                storage_w: if self.storage_w > 0 {
-                    self.storage_w
-                } else {
-                    self.frame_w
-                },
-                storage_h: if self.storage_h > 0 {
-                    self.storage_h
-                } else {
-                    self.frame_h
-                },
+                storage_w: storage.0,
+                storage_h: storage.1,
                 par: self.par,
                 opts: &self.opts,
             };
 
             let mut all_nodes: Vec<RenderedNode> = Vec::new();
             let mut occupied: Vec<(i32, i32, i32, i32)> = Vec::new();
-            let mut time_dependent = false;
             let mut seen_unsupported = 0u32;
             for &index in &visible {
                 let event = &self.script.events[index];
                 let mut rendered = render_event(&ctx, event, now_ms, &mut self.face_cache);
-                time_dependent |= rendered.uses_time;
                 seen_unsupported |= rendered.unsupported;
                 let detect_collisions = rendered.detect_collisions;
+                self.dynamics.insert(index, rendered.dynamics);
                 let nodes = &mut rendered.nodes;
                 if nodes.is_empty() {
                     continue;
@@ -199,7 +250,21 @@ impl SubtitleRenderer for PureRenderer {
                 all_nodes.append(nodes);
             }
             self.nodes = all_nodes;
-            self.cache = (!time_dependent).then_some(key);
+            // Key the result by the samples the render actually used — the
+            // records are complete now, so re-resolve any that were missing.
+            let samples = visible
+                .iter()
+                .map(|&index| {
+                    let event = &self.script.events[index];
+                    self.dynamics[&index].sample(now_ms - event.start_ms, event.duration_ms)
+                })
+                .collect();
+            self.cache = Some(CacheKey {
+                events: visible,
+                frame,
+                storage,
+                samples,
+            });
             self.warn_unsupported(seen_unsupported);
         }
 
@@ -222,6 +287,7 @@ impl SubtitleRenderer for PureRenderer {
         self.nodes.clear();
         self.face_cache.clear();
         self.cache = None;
+        self.dynamics.clear();
     }
 }
 
@@ -375,11 +441,100 @@ mod tests {
         assert!(!renderer.render_frame(1_000).is_empty());
         assert!(renderer.cache.is_some(), "static event set caches");
         assert!(!renderer.render_frame(2_000).is_empty());
+        assert_eq!(renderer.cold_renders, 1, "static frames must cache-hit");
 
-        let moving = "Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\move(0,0,100,100)}Go\n";
+        // A mid-flight \move changes its anchor sample every frame, so each
+        // frame re-renders — while the cache stays warm for repeats of the
+        // same timestamp and after the move window ends.
+        let moving =
+            "Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\move(0,0,100,100,500,4500)}Go\n";
         let mut renderer = renderer_with(moving).expect("font probed above");
-        assert!(!renderer.render_frame(1_000).is_empty());
-        assert!(renderer.cache.is_none(), "\\move must disable the cache");
+        let first: Vec<i32> = renderer
+            .render_frame(1_000)
+            .iter()
+            .map(|o| o.dst_x)
+            .collect();
+        assert!(!first.is_empty());
+        assert_eq!(renderer.cold_renders, 1);
+        let repeat: Vec<i32> = renderer
+            .render_frame(1_000)
+            .iter()
+            .map(|o| o.dst_x)
+            .collect();
+        assert_eq!(first, repeat);
+        assert_eq!(renderer.cold_renders, 1, "same timestamp must hit");
+        let later: Vec<i32> = renderer
+            .render_frame(3_000)
+            .iter()
+            .map(|o| o.dst_x)
+            .collect();
+        assert_eq!(renderer.cold_renders, 2, "moved anchor must re-render");
+        assert_ne!(first, later, "\\move must move the block");
+        // After t2 the anchor is settled at `to`: samples stop changing and
+        // the cache holds again.
+        let _ = renderer.render_frame(4_700);
+        assert_eq!(renderer.cold_renders, 3);
+        let _ = renderer.render_frame(4_900);
+        assert_eq!(renderer.cold_renders, 3, "settled \\move must cache-hit");
+    }
+
+    /// \fad plateau frames resolve to a constant fade sample, so only the
+    /// interpolating fade-in/out frames pay a cold render.
+    #[test]
+    fn fade_plateau_frames_hit_the_cache() {
+        let fading = "Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\fad(500,500)}Plateau\n";
+        let Some(mut renderer) = renderer_with(fading) else {
+            eprintln!("skipping: no known test font present on this machine");
+            return;
+        };
+        let _ = renderer.render_frame(1_000); // plateau
+        let _ = renderer.render_frame(2_000); // plateau: same sample
+        let _ = renderer.render_frame(3_500); // plateau: same sample
+        assert_eq!(renderer.cold_renders, 1, "plateau frames must cache-hit");
+        let _ = renderer.render_frame(100); // fade-in: interpolating
+        let _ = renderer.render_frame(200); // fade-in: different sample
+        assert_eq!(renderer.cold_renders, 3, "interpolating frames re-render");
+        // NOT 4_800: its fade-out sample (255*0.6) equals the 200ms fade-in
+        // sample and legitimately cache-hits — equal samples, equal bytes.
+        let _ = renderer.render_frame(4_700); // fade-out: 255*0.4
+        assert_eq!(renderer.cold_renders, 4);
+    }
+
+    /// Stepwise karaoke flags flip only at syllable boundaries; frames in
+    /// between must hit the cache.
+    #[test]
+    fn karaoke_steady_frames_hit_the_cache() {
+        let events = "Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\k100}Ka{\\k100}ra\n";
+        let Some(mut renderer) = renderer_with(events) else {
+            eprintln!("skipping: no known test font present on this machine");
+            return;
+        };
+        let _ = renderer.render_frame(300);
+        let _ = renderer.render_frame(600); // same syllable state
+        let _ = renderer.render_frame(900); // same syllable state
+        assert_eq!(renderer.cold_renders, 1, "steady karaoke must cache-hit");
+        let _ = renderer.render_frame(1_200); // second syllable now primary
+        assert_eq!(renderer.cold_renders, 2, "syllable boundary re-renders");
+        let _ = renderer.render_frame(1_900);
+        assert_eq!(renderer.cold_renders, 2, "steady again after boundary");
+    }
+
+    /// The storage size scales borders/blur/shadows, so changing it must
+    /// invalidate the cache even when the frame size is unchanged.
+    #[test]
+    fn storage_size_change_invalidates_cache() {
+        let Some(mut renderer) = renderer_with(test_util::HELLO_EVENT) else {
+            eprintln!("skipping: no known test font present on this machine");
+            return;
+        };
+        let _ = renderer.render_frame(1_000);
+        assert_eq!(renderer.cold_renders, 1);
+        renderer.set_storage_size(1280, 720);
+        let _ = renderer.render_frame(1_000);
+        assert_eq!(renderer.cold_renders, 2, "storage change must re-render");
+        renderer.set_storage_size(1280, 720);
+        let _ = renderer.render_frame(1_000);
+        assert_eq!(renderer.cold_renders, 2, "unchanged storage keeps cache");
     }
 
     /// transform_is_noop_initial_state: while \t interpolation is

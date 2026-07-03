@@ -227,7 +227,7 @@ pub(crate) mod unsupported {
 }
 
 /// Raw `\fad`/`\fade` parameters awaiting the event-duration fixup.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct FadeSpec {
     a1: i32,
     a2: i32,
@@ -240,12 +240,82 @@ struct FadeSpec {
 }
 
 /// `\move` parameters: from, to, and the time window (0,0 = whole event).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct MoveSpec {
     from: (f64, f64),
     to: (f64, f64),
     t1: i32,
     t2: i32,
+}
+
+/// The per-segment karaoke inputs — exactly the fields the karaoke flag
+/// evaluator reads. Captured from the real segment stream, NOT re-derived
+/// from tags: `split_words` spreads one run across several segments and
+/// only the first carries the timing snapshot, and `\kt` resets live on
+/// the segment too.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct KaraokeSeg {
+    run_start: bool,
+    kind: Option<KaraokeKind>,
+    reset: bool,
+    skip_ms: i64,
+    timing_ms: i64,
+}
+
+impl KaraokeSeg {
+    fn of(segment: &Segment) -> Self {
+        Self {
+            run_start: segment.run_start,
+            kind: segment.state.effect_kind,
+            reset: segment.karaoke_reset,
+            skip_ms: segment.karaoke_skip_ms,
+            timing_ms: segment.karaoke_timing_ms,
+        }
+    }
+}
+
+/// The time-dependent inputs of one rendered event. Everything else that
+/// reaches the rasterizer is frame-invariant for a given event (time enters
+/// layout only through `eval_move_anchor`, `fade_alpha` and the karaoke
+/// flags), so equal [`EventSamples`] imply byte-identical rendered nodes.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct EventDynamics {
+    fade: Option<FadeSpec>,
+    /// Only set when the movement actually drives the anchor (`\pos` wins).
+    movement: Option<MoveSpec>,
+    /// Per-segment karaoke snapshot; empty when no segment carries a
+    /// karaoke effect (the flags are then all-false at every timestamp).
+    karaoke: Vec<KaraokeSeg>,
+}
+
+/// Time-resolved values of [`EventDynamics`] at one timestamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EventSamples {
+    fade: Option<i32>,
+    /// `to_bits` of the interpolated anchor — exact-phase comparison, no
+    /// quantization (NaN/negative zero can only cause a conservative miss).
+    anchor_bits: Option<(u64, u64)>,
+    karaoke: Vec<(bool, bool)>,
+}
+
+impl EventDynamics {
+    /// Resolves the dynamic inputs at `now_rel` ms since event start. Uses
+    /// the same evaluators as the render path, so equal samples guarantee
+    /// an equal render.
+    pub(crate) fn sample(&self, now_rel: i64, duration_ms: i64) -> EventSamples {
+        EventSamples {
+            fade: self.fade.map(|f| fade_alpha(f, now_rel, duration_ms)),
+            anchor_bits: self.movement.map(|m| {
+                let (x, y) = eval_move_anchor(m, now_rel, duration_ms);
+                (x.to_bits(), y.to_bits())
+            }),
+            karaoke: if self.karaoke.is_empty() {
+                Vec::new()
+            } else {
+                karaoke_flags_from(&self.karaoke, now_rel)
+            },
+        }
+    }
 }
 
 /// Event-level results of the tag pass (first-wins rules live here).
@@ -256,7 +326,6 @@ struct EventOverrides {
     fade: Option<FadeSpec>,
     alignment: Option<i32>,
     clip: Option<(i32, i32, i32, i32, bool)>,
-    uses_time: bool,
     /// \org or \t seen: libass sets `detect_collisions = 0` for these too,
     /// even when the tag is otherwise a no-op (bare \t, \org without
     /// rotation).
@@ -309,8 +378,9 @@ enum SegmentKind {
 /// What one event rendered to, plus rendering metadata for the caller.
 pub(crate) struct EventRender {
     pub nodes: Vec<RenderedNode>,
-    /// The output depends on `now_ms` (disables the static-frame cache).
-    pub uses_time: bool,
+    /// Time-dependent inputs captured from the rendered segments; the
+    /// renderer keys its frame cache on their per-frame samples.
+    pub dynamics: EventDynamics,
     /// libass `detect_collisions`: false when \pos, \move, \org, or \t
     /// appeared, in which case the event skips collision stacking.
     pub detect_collisions: bool,
@@ -466,7 +536,8 @@ pub(crate) fn render_event(
     if segments.is_empty() {
         return EventRender {
             nodes: Vec::new(),
-            uses_time: overrides.uses_time,
+            // No segments -> no output at any timestamp: statically empty.
+            dynamics: EventDynamics::default(),
             detect_collisions,
             unsupported: overrides.unsupported,
         };
@@ -534,29 +605,7 @@ pub(crate) fn render_event(
     let now_rel = now_ms - event.start_ms;
     let anchor = match (overrides.pos, overrides.movement) {
         (Some((x, y)), _) => Some((x, y)),
-        (
-            None,
-            Some(MoveSpec {
-                from: (x1, y1),
-                to: (x2, y2),
-                t1,
-                t2,
-            }),
-        ) => {
-            let (mut t1, mut t2) = (i64::from(t1), i64::from(t2));
-            if t1 <= 0 && t2 <= 0 {
-                t1 = 0;
-                t2 = event.duration_ms;
-            }
-            let k = if now_rel <= t1 {
-                0.0
-            } else if now_rel >= t2 {
-                1.0
-            } else {
-                (now_rel - t1) as f64 / (t2 - t1).max(1) as f64
-            };
-            Some((x1 + k * (x2 - x1), y1 + k * (y2 - y1)))
-        }
+        (None, Some(spec)) => Some(eval_move_anchor(spec, now_rel, event.duration_ms)),
         _ => None,
     };
 
@@ -600,7 +649,8 @@ pub(crate) fn render_event(
     let fade = overrides
         .fade
         .map(|f| fade_alpha(f, now_rel, event.duration_ms));
-    let karaoke = karaoke_flags(&segments, now_rel);
+    let karaoke_view: Vec<KaraokeSeg> = segments.iter().map(KaraokeSeg::of).collect();
+    let karaoke = karaoke_flags_from(&karaoke_view, now_rel);
     let mut nodes: Vec<RenderedNode> = Vec::new();
     let mut shadows: Vec<RenderedNode> = Vec::new();
     let mut borders: Vec<RenderedNode> = Vec::new();
@@ -709,9 +759,24 @@ pub(crate) fn render_event(
     }
 
     nodes.retain(|node| !node.bitmap.is_empty() && (node.color & 0xFF) != 0xFF);
+    let dynamics = EventDynamics {
+        fade: overrides.fade,
+        // \pos wins over \move in the anchor selection above; a shadowed
+        // movement never influences the output.
+        movement: if overrides.pos.is_none() {
+            overrides.movement
+        } else {
+            None
+        },
+        karaoke: if karaoke_view.iter().any(|seg| seg.kind.is_some()) {
+            karaoke_view
+        } else {
+            Vec::new()
+        },
+    };
     EventRender {
         nodes,
-        uses_time: overrides.uses_time,
+        dynamics,
         detect_collisions,
         unsupported: overrides.unsupported,
     }
@@ -745,7 +810,10 @@ fn dtoi32_ms(centisec: f64) -> i64 {
 /// `(use_secondary, hide_outline)` per segment: before a syllable's start
 /// time the fill uses SecondaryColour, and `\ko` also hides the outline.
 /// The `\kf` sweep is approximated stepwise at the syllable midpoint.
-fn karaoke_flags(segments: &[Segment], tm_current: i64) -> Vec<(bool, bool)> {
+///
+/// Single evaluator shared by the render path and the cache sampler
+/// ([`EventDynamics::sample`]) so both resolve identical flags.
+fn karaoke_flags_from(segments: &[KaraokeSeg], tm_current: i64) -> Vec<(bool, bool)> {
     let mut out = vec![(false, false); segments.len()];
     let mut timing: i64 = 0;
     let mut i = 0;
@@ -755,12 +823,12 @@ fn karaoke_flags(segments: &[Segment], tm_current: i64) -> Vec<(bool, bool)> {
             j += 1;
         }
         let start = &segments[i];
-        if let Some(kind) = start.state.effect_kind {
-            if start.karaoke_reset {
+        if let Some(kind) = start.kind {
+            if start.reset {
                 timing = 0;
             }
-            let tm_start = timing + start.karaoke_skip_ms;
-            let tm_end = tm_start + start.karaoke_timing_ms;
+            let tm_start = timing + start.skip_ms;
+            let tm_end = tm_start + start.timing_ms;
             timing = tm_end;
             let boundary = match kind {
                 KaraokeKind::Fill => (tm_start + tm_end) / 2,
@@ -774,6 +842,30 @@ fn karaoke_flags(segments: &[Segment], tm_current: i64) -> Vec<(bool, bool)> {
         i = j;
     }
     out
+}
+
+/// `\move` anchor at `now_rel` ms since event start — shared by the layout
+/// pass and the cache sampler so both resolve bit-identical positions.
+fn eval_move_anchor(spec: MoveSpec, now_rel: i64, duration_ms: i64) -> (f64, f64) {
+    let MoveSpec {
+        from: (x1, y1),
+        to: (x2, y2),
+        t1,
+        t2,
+    } = spec;
+    let (mut t1, mut t2) = (i64::from(t1), i64::from(t2));
+    if t1 <= 0 && t2 <= 0 {
+        t1 = 0;
+        t2 = duration_ms;
+    }
+    let k = if now_rel <= t1 {
+        0.0
+    } else if now_rel >= t2 {
+        1.0
+    } else {
+        (now_rel - t1) as f64 / (t2 - t1).max(1) as f64
+    };
+    (x1 + k * (x2 - x1), y1 + k * (y2 - y1))
 }
 
 /// Applies one tag block to the state (libass `ass_parse_tags` application
@@ -929,7 +1021,6 @@ fn apply_tags(
                         t1,
                         t2,
                     });
-                    overrides.uses_time = true;
                 }
             }
             Tag::Fade {
@@ -953,7 +1044,6 @@ fn apply_tags(
                         t4,
                         two_arg,
                     });
-                    overrides.uses_time = true;
                 }
             }
             Tag::Org { .. } => {
@@ -1026,7 +1116,6 @@ fn apply_tags(
                 state.effect_skip_ms += state.effect_timing_ms;
                 state.effect_timing_ms = dtoi32_ms(centisec);
                 state.effect_kind = Some(kind);
-                overrides.uses_time = true;
                 if kind == KaraokeKind::Fill {
                     // The \kf sweep is approximated stepwise; keep warning.
                     overrides.unsupported |= unsupported::KARAOKE;
@@ -1037,7 +1126,6 @@ fn apply_tags(
                 state.effect_skip_ms = dtoi32_ms(centisec);
                 state.effect_timing_ms = 0;
                 state.effect_reset = true;
-                overrides.uses_time = true;
             }
             Tag::FontEncoding(_) => {} // font-matching hint; harmless to ignore
         }
