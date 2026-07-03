@@ -1,9 +1,13 @@
-use ez_ffmpeg::opengl::opengl_frame_filter::OpenGLFrameFilter;
-use ez_ffmpeg::{FfmpegContext, Output};
 use ez_ffmpeg::filter::frame_pipeline_builder::FramePipelineBuilder;
-use ez_ffmpeg::AVMediaType;
+use ez_ffmpeg::{AVMediaType, FfmpegContext, Output};
 
+// This example intentionally demonstrates the deprecated OpenGL filter path,
+// kept for users who still rely on the "opengl" feature. For the wgpu
+// successor of this exact effect, see examples/wgpu_effects (zoom_pulse).
+#[allow(deprecated)]
 fn main() {
+    use ez_ffmpeg::opengl::opengl_frame_filter::OpenGLFrameFilter;
+
     // Load the fragment shader code from the resource directory
     let fragment_shader = include_str!("../resource/fragment.glsl");
 
