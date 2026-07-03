@@ -7,7 +7,7 @@ use crate::core::scheduler::ffmpeg_scheduler::{
     frame_is_null, is_stopping, packet_is_null, set_scheduler_error, wait_until_not_paused, STATUS_ABORT,
 };
 use crate::hwaccel::hw_device_get_by_type;
-use crate::util::ffmpeg_utils::{av_err2str, hashmap_to_avdictionary};
+use crate::util::ffmpeg_utils::{av_err2str, hashmap_to_avdictionary, DictGuard};
 use crate::util::thread_synchronizer::{ThreadDoneGuard, ThreadSynchronizer};
 use crossbeam_channel::{Receiver, RecvTimeoutError, SendError, Sender};
 use ffmpeg_next::packet::Mut;
@@ -586,7 +586,7 @@ fn receive_frame(
 }
 
 fn set_encoder_opts(enc_stream: &EncoderStream, video_codec_opts: &Option<HashMap<CString, CString>>, audio_codec_opts: &Option<HashMap<CString, CString>>, subtitle_codec_opts: &Option<HashMap<CString, CString>>, enc_ctx_box: &CodecContext) -> crate::error::Result<()> {
-    let mut encoder_opts = if enc_stream.codec_type == AVMEDIA_TYPE_VIDEO {
+    let mut encoder_opts = DictGuard::new(if enc_stream.codec_type == AVMEDIA_TYPE_VIDEO {
         hashmap_to_avdictionary(video_codec_opts)
     } else if enc_stream.codec_type == AVMEDIA_TYPE_AUDIO {
         hashmap_to_avdictionary(audio_codec_opts)
@@ -594,12 +594,12 @@ fn set_encoder_opts(enc_stream: &EncoderStream, video_codec_opts: &Option<HashMa
         hashmap_to_avdictionary(subtitle_codec_opts)
     } else {
         null_mut()
-    };
-    if !encoder_opts.is_null() {
+    });
+    if !encoder_opts.as_ptr().is_null() {
         let ret = unsafe {
             av_opt_set_dict2(
                 enc_ctx_box.as_mut_ptr() as *mut libc::c_void,
-                &mut encoder_opts,
+                encoder_opts.as_double_ptr(),
                 AV_OPT_SEARCH_CHILDREN,
             )
         };
@@ -608,6 +608,15 @@ fn set_encoder_opts(enc_stream: &EncoderStream, video_codec_opts: &Option<HashMa
             return Err(OpenEncoder(
                 OpenEncoderOperationError::ContextAllocationError(OpenEncoderError::from(ret)),
             ));
+        }
+        // Entries no encoder option matched are user typos (fftools
+        // check_avoptions errors out; we surface them as warnings). The
+        // guard frees the leftovers, which previously leaked.
+        for key in encoder_opts.leftover_keys() {
+            warn!(
+                "Option '{key}' was not recognized by encoder for stream {}",
+                enc_stream.stream_index
+            );
         }
     }
     Ok(())

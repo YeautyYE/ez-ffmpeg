@@ -878,6 +878,7 @@ unsafe fn configure_filtergraph(
             } else {
                 let mut tmp_frame = unsafe { av_frame_alloc() };
                 if tmp_frame.is_null() {
+                    cleanup_filtergraph(graph, ifps, ofps);
                     return Err(Error::FilterGraph(
                         FilterGraphOperationError::BufferSourceAddFrameError(
                             FilterGraphError::OutOfMemory,
@@ -886,6 +887,8 @@ unsafe fn configure_filtergraph(
                 }
                 ret = av_frame_ref(tmp_frame, tmp_frame_box.frame.as_ptr());
                 if ret < 0 {
+                    av_frame_free(&mut tmp_frame);
+                    cleanup_filtergraph(graph, ifps, ofps);
                     return Err(Error::FilterGraph(
                         FilterGraphOperationError::BufferSourceAddFrameError(
                             FilterGraphError::from(ret),
@@ -893,18 +896,22 @@ unsafe fn configure_filtergraph(
                     ));
                 }
                 ret = av_buffersrc_add_frame(ifp.filter, tmp_frame);
+                // add_frame moves the data references out of tmp_frame but
+                // never owns the shell: free it on success and failure alike
+                // (the success path leaked one AVFrame per replayed frame).
+                av_frame_free(&mut tmp_frame);
                 if ret < 0 {
-                    av_frame_free(&mut tmp_frame);
+                    // Fail immediately: continuing the replay would silently
+                    // drop this frame and a later success overwrote `ret`.
+                    cleanup_filtergraph(graph, ifps, ofps);
+                    return Err(Error::FilterGraph(
+                        FilterGraphOperationError::BufferSourceAddFrameError(
+                            FilterGraphError::from(ret),
+                        ),
+                    ));
                 }
             }
         }
-    }
-
-    if ret < 0 {
-        cleanup_filtergraph(graph, ifps, ofps);
-        return Err(Error::FilterGraph(
-            FilterGraphOperationError::BufferSourceAddFrameError(FilterGraphError::from(ret)),
-        ));
     }
 
     let mut have_input_eof = false;

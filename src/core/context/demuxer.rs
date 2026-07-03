@@ -71,6 +71,18 @@ pub(crate) struct Demuxer {
 // frame_pipelines with Box<dyn FrameFilter> which only implements Send.
 unsafe impl Send for Demuxer {}
 
+impl Drop for Demuxer {
+    fn drop(&mut self) {
+        // Owns the input context until demux_init hands it to the demuxer
+        // thread (which nulls this field). A context that never started —
+        // build() succeeded but start() was never called or failed midway —
+        // was previously leaked. The helper no-ops on null and reclaims the
+        // custom-IO callback state.
+        crate::core::context::in_fmt_ctx_free(self.in_fmt_ctx, self.is_set_read_callback);
+        self.in_fmt_ctx = std::ptr::null_mut();
+    }
+}
+
 impl Demuxer {
     pub(crate) fn new(
         url: String,

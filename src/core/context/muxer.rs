@@ -153,6 +153,17 @@ pub(crate) struct Muxer {
 // frame_pipelines with Box<dyn FrameFilter> which only implements Send.
 unsafe impl Send for Muxer {}
 
+impl Drop for Muxer {
+    fn drop(&mut self) {
+        // Owns the output context until mux_init/ready_to_init_mux hands it
+        // to the muxer thread (which nulls this field). A context that never
+        // started was previously leaked together with its avio buffer and
+        // write-callback state. The helper no-ops on null.
+        crate::core::context::out_fmt_ctx_free(self.out_fmt_ctx, self.is_set_write_callback);
+        self.out_fmt_ctx = std::ptr::null_mut();
+    }
+}
+
 impl Muxer {
     pub(crate) fn new(
         url: String,
