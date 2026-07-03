@@ -962,7 +962,12 @@ fn apply_tags(
                 overrides.disable_collisions = true;
             }
             Tag::Transform => {
-                overrides.uses_time = true;
+                // transform_is_noop_initial_state: \t interpolation is
+                // unsupported — the event renders its initial state, so the
+                // output does NOT depend on time and must not poison the
+                // static-frame cache. Remove this special case when real \t
+                // interpolation lands. Collision disabling and the warn-once
+                // stay (libass disables collisions for bare \t too).
                 overrides.disable_collisions = true;
                 overrides.unsupported |= unsupported::ANIMATION;
             }
@@ -1534,31 +1539,31 @@ fn rasterize_segment(
     // Effects on the outermost shape: gaussian first, then \be, matching
     // libass ass_synth_blur. Sigma per axis is blur * blur_scale * the
     // 2/sqrt(log(256)) radius factor from ass_render.c.
-    let blur_sigma_factor = 2.0 / (256.0f64.ln()).sqrt();
-    let sigma_x = state.blur * ctx.blur_scale_x() * blur_sigma_factor;
-    let sigma_y = state.blur * ctx.blur_scale_y() * blur_sigma_factor;
-    let mut effect_target = if border_bitmap.is_empty() {
-        fill.clone()
-    } else {
-        border_bitmap.clone()
-    };
-    if state.blur > 0.0 {
-        gaussian_blur(&mut effect_target, sigma_x, sigma_y);
-    }
-    if state.be > 0 {
-        be_blur(&mut effect_target, state.be);
-    }
     let fill_color = state.colors[usize::from(karaoke_secondary)];
     let effects_applied = state.be > 0 || state.blur > 0.0;
     if effects_applied {
+        let blur_sigma_factor = 2.0 / (256.0f64.ln()).sqrt();
+        let sigma_x = state.blur * ctx.blur_scale_x() * blur_sigma_factor;
+        let sigma_y = state.blur * ctx.blur_scale_y() * blur_sigma_factor;
+        let mut effect_target = if border_bitmap.is_empty() {
+            fill.clone()
+        } else {
+            border_bitmap.clone()
+        };
+        if state.blur > 0.0 {
+            gaussian_blur(&mut effect_target, sigma_x, sigma_y);
+        }
+        if state.be > 0 {
+            be_blur(&mut effect_target, state.be);
+        }
         if border_bitmap.is_empty() {
             // No border: the blurred fill replaces the fill.
             fills.push(RenderedNode {
-                bitmap: effect_target.clone(),
+                bitmap: effect_target,
                 color: node_color(fill_color, fade),
             });
         } else {
-            border_bitmap = effect_target.clone();
+            border_bitmap = effect_target;
         }
     }
 
