@@ -2615,7 +2615,14 @@ fn ifilter_bind_ist(
         let ist = *(*demux.in_fmt_ctx).streams.add(stream_idx);
         let par = (*ist).codecpar;
         if (*par).codec_type == AVMEDIA_TYPE_VIDEO {
-            let framerate = av_guess_frame_rate(demux.in_fmt_ctx, ist, null_mut());
+            // A user-forced input framerate feeds the filtergraph directly;
+            // only guess from the container when none was forced
+            // (ffmpeg_demux.c ist_filter_add: ist->framerate ?: guess).
+            let framerate = if demux.framerate.num > 0 && demux.framerate.den > 0 {
+                demux.framerate
+            } else {
+                av_guess_frame_rate(demux.in_fmt_ctx, ist, null_mut())
+            };
             input_filter.opts.framerate = framerate;
         } else if (*par).codec_type == AVMEDIA_TYPE_SUBTITLE {
             input_filter.opts.sub2video_width = (*par).width;

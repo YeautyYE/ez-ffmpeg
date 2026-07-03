@@ -1119,6 +1119,7 @@ struct DecoderParameter {
     // override output video sample aspect ratio with this value
     sar_override: AVRational,
     framerate_in: AVRational,
+    framerate_forced: bool,
 
     apply_cropping: i32,
 
@@ -1182,6 +1183,7 @@ impl DecoderParameter {
 
             sar_override: unsafe { (*(*dec_stream.stream.inner).codecpar).sample_aspect_ratio },
             framerate_in: dec_stream.avg_framerate,
+            framerate_forced: dec_stream.framerate_forced,
             apply_cropping: 0,
             hwaccel_id: dec_stream.hwaccel_id,
             hwaccel_device_type: dec_stream.hwaccel_device_type,
@@ -1423,7 +1425,14 @@ unsafe fn video_frame_process(
 
     (*frame).pts = (*frame).best_effort_timestamp;
 
-    //TODO forced fixed framerate
+    // forced fixed framerate: drop container timestamps and stamp frames on
+    // the CFR grid (ffmpeg_dec.c:398-403); the extrapolation below assigns
+    // consecutive pts values in 1/framerate units
+    if dp.framerate_forced {
+        (*frame).pts = AV_NOPTS_VALUE;
+        (*frame).duration = 1;
+        (*frame).time_base = av_inv_q(dp.framerate_in);
+    }
 
     // no timestamp available - extrapolate from previous frame duration
     if (*frame).pts == AV_NOPTS_VALUE {
@@ -1480,8 +1489,9 @@ unsafe fn video_duration_estimate(dp: &MutexGuard<DecoderParameter>, frame: *mut
     // to 1 and the actual duration of the last frame is more than 2x larger
     let duration_unreliable = (*frame).duration == 1 && ts_diff > 2 * (*frame).duration;
 
-    // prefer frame duration for containers with timestamps
-    if (*frame).duration > 0 && !duration_unreliable {
+    // prefer frame duration for containers with timestamps; a forced
+    // framerate always wins (ffmpeg_dec.c:306-308 fr_forced)
+    if dp.framerate_forced || ((*frame).duration > 0 && !duration_unreliable) {
         return (*frame).duration;
     }
 

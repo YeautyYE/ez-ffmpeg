@@ -20,6 +20,10 @@ pub(crate) struct DecoderStream {
     pub(crate) duration: i64,
     pub(crate) time_base: AVRational,
     pub(crate) avg_framerate: AVRational,
+    /// Input::set_framerate forces a fixed framerate: the decoder stamps
+    /// frames on the CFR grid instead of trusting container timestamps
+    /// (fftools DECODER_FLAG_FRAMERATE_FORCED, ffmpeg_demux.c:1002-1006).
+    pub(crate) framerate_forced: bool,
     pub(crate) have_sub2video: bool,
 
     pub(crate) hwaccel_id: HWAccelID,
@@ -45,6 +49,7 @@ impl DecoderStream {
         duration: i64,
         time_base: AVRational,
         avg_framerate: AVRational,
+        framerate_forced: bool,
         hwaccel_id: HWAccelID,
         hwaccel_device_type: AVHWDeviceType,
         hwaccel_device: Option<String>,
@@ -61,6 +66,7 @@ impl DecoderStream {
             duration,
             time_base,
             avg_framerate,
+            framerate_forced,
             have_sub2video: false,
             hwaccel_id,
             hwaccel_device_type,

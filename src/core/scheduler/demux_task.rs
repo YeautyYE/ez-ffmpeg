@@ -146,8 +146,10 @@ pub(crate) fn demux_init(
                             #[cfg(not(windows))]
                             let should_skip_packet_send = false;
 
-                            // Selectively bypass packet sending based on platform and acceleration
-                            let mut ret = if should_skip_packet_send {
+                            // Assign the OUTER ret: a shadowing binding here
+                            // hid seek/flush failures from the error check
+                            // below, so a failed loop restart broke silently.
+                            ret = if should_skip_packet_send {
                                 // Skip sending the flush packet when using CUDA on Windows
                                 // This avoids the "cuvid decode callback error" issue that occurs during loop iterations
                                 // Testing showed that after the third loop iteration, avcodec_receive_frame would consistently
@@ -178,7 +180,10 @@ pub(crate) fn demux_init(
                             /* fallthrough to the error path */
                         }
 
-                        if ret != 0 {
+                        // AVERROR_EXIT is a normal stop (the scheduler asked
+                        // us to quit mid-send), never a task failure
+                        // (matches ffmpeg_demux.c:842 EOF/EXIT handling).
+                        if ret != 0 && ret != ffmpeg_sys_next::AVERROR_EXIT {
                             set_scheduler_error(
                                 &scheduler_status,
                                 &scheduler_result,
@@ -191,11 +196,6 @@ pub(crate) fn demux_init(
                         break;
                     }
 
-                    demux_parameter.end_pts = Timestamp {
-                        ts: (*packet.as_ptr()).pts,
-                        tb: (*packet.as_ptr()).time_base,
-                    };
-
                     if (*packet.as_ptr()).flags & AV_PKT_FLAG_CORRUPT != 0 {
                         if demux_parameter.exit_on_error {
                             error!(
@@ -203,7 +203,15 @@ pub(crate) fn demux_init(
                                 (*packet.as_ptr()).stream_index
                             );
                             packet_pool.release(packet);
-                            // ret = AVERROR_INVALIDDATA;
+                            // exit_on_error promises a failing result, not a
+                            // silent early stop (fftools aborts here).
+                            set_scheduler_error(
+                                &scheduler_status,
+                                &scheduler_result,
+                                Demuxing(DemuxingOperationError::ReadFrameError(
+                                    DemuxingError::from(ffmpeg_sys_next::AVERROR_INVALIDDATA),
+                                )),
+                            );
                             break;
                         } else {
                             warn!(
@@ -236,6 +244,14 @@ pub(crate) fn demux_init(
                     if ret < 0 {
                         break;
                     }
+
+                    // Captured after ts_fixup: the raw packet's time_base is
+                    // {0,1} and its pts is not wrap-corrected — using those
+                    // made every stream_loop duration computation garbage.
+                    demux_parameter.end_pts = Timestamp {
+                        ts: (*packet.as_ptr()).pts,
+                        tb: (*packet.as_ptr()).time_base,
+                    };
 
                     if let Some(readrate) = demux_parameter.readrate {
                         if readrate != 0.0 {
@@ -934,13 +950,17 @@ unsafe fn seek_to_start(
         return ret;
     }
 
-    if demux_parameter.end_pts.ts != AV_NOPTS_VALUE && demux_parameter.max_pts.ts == AV_NOPTS_VALUE
-        || av_compare_ts(
-            demux_parameter.max_pts.ts,
-            demux_parameter.max_pts.tb,
-            demux_parameter.end_pts.ts,
-            demux_parameter.end_pts.tb,
-        ) < 0
+    // A && (B || C): with the old (A && B) || C grouping an end_pts of
+    // AV_NOPTS_VALUE could overwrite a valid max_pts via the C arm
+    // (matches ffmpeg_demux.c:211-214).
+    if demux_parameter.end_pts.ts != AV_NOPTS_VALUE
+        && (demux_parameter.max_pts.ts == AV_NOPTS_VALUE
+            || av_compare_ts(
+                demux_parameter.max_pts.ts,
+                demux_parameter.max_pts.tb,
+                demux_parameter.end_pts.ts,
+                demux_parameter.end_pts.tb,
+            ) < 0)
     {
         demux_parameter.max_pts = demux_parameter.end_pts.clone();
     }

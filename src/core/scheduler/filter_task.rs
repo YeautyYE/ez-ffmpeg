@@ -399,6 +399,10 @@ struct OutputFilterParameter {
     sample_rate: i32,
 
     tb_out: AVRational,
+    // Once an output frame chose the timebase, a filtergraph reconfig must
+    // not change it: downstream timestamps are already scaled to it
+    // (ffmpeg_filter.c OutputFilterPriv.tb_out_locked).
+    tb_out_locked: bool,
 
     next_pts: i64,
 }
@@ -431,6 +435,7 @@ impl OutputFilterParameter {
             sample_aspect_ratio: AVRational { num: 0, den: 0 },
             sample_rate: 0,
             tb_out: AVRational { num: 0, den: 0 },
+            tb_out_locked: false,
             next_pts: 0,
         }
     }
@@ -531,12 +536,17 @@ unsafe fn fg_send_eof(
 
         let ifp = &ifps[input_filter_index];
         if ifp.format < 0 {
+            // Hard error, matching master ffmpeg_filter.c:3040: a stream
+            // that reached EOF without ever configuring its input leaves
+            // the graph silent — fail loudly instead.
             error!(
                 "Cannot determine format of input {} after EOF",
                 ifp.opts.name
             );
+            frame_pool.release(frame_box.frame);
             return Err(Error::FilterGraph(FilterGraphOperationError::InvalidData));
         }
+        frame_pool.release(frame_box.frame);
     }
 
     Ok(())
@@ -849,7 +859,11 @@ unsafe fn configure_filtergraph(
         ofp.color_space = av_buffersink_get_colorspace(ofp.filter);
         ofp.color_range = av_buffersink_get_color_range(ofp.filter);
 
-        ofp.tb_out = av_buffersink_get_time_base(ofp.filter);
+        // Tentative value only: once frames chose a timebase it is locked
+        // and a graph reconfig must not drift it (ffmpeg_filter.c:2158).
+        if !ofp.tb_out_locked {
+            ofp.tb_out = av_buffersink_get_time_base(ofp.filter);
+        }
 
         ofp.sample_aspect_ratio = av_buffersink_get_sample_aspect_ratio(ofp.filter);
 
@@ -1343,8 +1357,13 @@ unsafe fn fg_output_step(
         return 0;
     }
 
-    // Choose the output timebase the first time we get a frame.
-    choose_out_timebase(ofp, &frame);
+    // Choose the output timebase the first time we get a frame, then lock
+    // it: re-choosing after a reconfig would shift all downstream
+    // timestamps (ffmpeg_filter.c:2807 + choose_out_timebase:2441).
+    if !ofp.tb_out_locked {
+        choose_out_timebase(ofp, &frame);
+        ofp.tb_out_locked = true;
+    }
     (*frame.as_mut_ptr()).time_base = av_buffersink_get_time_base(ofp.filter);
 
     /*if !fgp.is_meta {
