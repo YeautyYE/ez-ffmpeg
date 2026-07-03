@@ -194,20 +194,38 @@ impl SubtitleFilter {
         let height = (*frame).height as usize;
 
         // Per-overlay alpha + converted color, computed once and shared by
-        // both workers.
+        // both workers. A tiny linear-probe cache dedups the f64 color
+        // conversion: dense frames carry ~100 nodes reusing a handful of
+        // colors (fill, outline, shadow), and each conversion is ~15 f64
+        // ops plus three float->int rounds.
         scratch.preps.clear();
         scratch.preps.reserve(images.len());
+        let mut colors = [(u32::MAX, [0u32; 3]); 8]; // key is 24-bit RGB: MAX never collides
+        let mut color_count = 0usize;
         for overlay in images {
             let alpha = spec.sample.alpha_fixed(overlay.opacity());
             if alpha == 0 {
                 scratch.preps.push(OverlayPrep { alpha, src: [0; 3] });
                 continue;
             }
-            let src = match spec.model {
-                ColorModel::Yuv => {
-                    blend::yuv_components(overlay.rgb(), matrix, range, spec.scale_bits)
+            let key = overlay.color >> 8; // RGB part; the conversion ignores alpha
+            let src = match colors[..color_count].iter().find(|(k, _)| *k == key) {
+                Some(&(_, hit)) => hit,
+                None => {
+                    let converted = match spec.model {
+                        ColorModel::Yuv => {
+                            blend::yuv_components(overlay.rgb(), matrix, range, spec.scale_bits)
+                        }
+                        ColorModel::Rgb => {
+                            blend::rgb_components(overlay.rgb(), range, spec.scale_bits)
+                        }
+                    };
+                    if color_count < colors.len() {
+                        colors[color_count] = (key, converted);
+                        color_count += 1;
+                    }
+                    converted
                 }
-                ColorModel::Rgb => blend::rgb_components(overlay.rgb(), range, spec.scale_bits),
             };
             scratch.preps.push(OverlayPrep { alpha, src });
         }
