@@ -36,12 +36,31 @@ pub(crate) struct PureRenderer {
     /// render. Specs live in script coordinates/milliseconds, so geometry
     /// changes don't stale them; the script is immutable after parse.
     dynamics: HashMap<usize, EventDynamics>,
+    /// Per-event rendered node templates (unshifted, pre-collision) keyed
+    /// by the samples they were rendered with. On a frame-cache miss,
+    /// events whose samples are unchanged reuse their template instead of
+    /// re-running layout/shaping/rasterization; collision stacking is
+    /// replayed over frame-local copies. Nodes are in output pixels, so
+    /// geometry setters clear this map; eviction keeps only the visible
+    /// set to bound memory.
+    templates: HashMap<usize, EventTemplate>,
     lazy_inited: bool,
     /// `unsupported::*` features already warned about (once per feature).
     warned_unsupported: u32,
-    /// Cold (cache-miss) render count, observable by cache tests.
+    /// Cold (frame-cache miss) render count, observable by cache tests.
     #[cfg(test)]
     cold_renders: u64,
+    /// `render_event` call count, observable by template-cache tests.
+    #[cfg(test)]
+    event_renders: u64,
+}
+
+/// One event's rendered output before collision stacking, reusable while
+/// its dynamic samples stay unchanged.
+struct EventTemplate {
+    samples: EventSamples,
+    nodes: Vec<RenderedNode>,
+    detect_collisions: bool,
 }
 
 /// Frame-cache identity: the visible event set, the output geometry, and
@@ -75,10 +94,13 @@ impl PureRenderer {
             nodes: Vec::new(),
             cache: None,
             dynamics: HashMap::new(),
+            templates: HashMap::new(),
             lazy_inited: false,
             warned_unsupported: 0,
             #[cfg(test)]
             cold_renders: 0,
+            #[cfg(test)]
+            event_renders: 0,
         }
     }
 
@@ -149,6 +171,7 @@ impl SubtitleRenderer for PureRenderer {
     fn set_frame_size(&mut self, width: i32, height: i32) {
         if (self.frame_w, self.frame_h) != (width, height) {
             self.cache = None;
+            self.templates.clear();
         }
         self.frame_w = width;
         self.frame_h = height;
@@ -157,6 +180,7 @@ impl SubtitleRenderer for PureRenderer {
     fn set_storage_size(&mut self, width: i32, height: i32) {
         if (self.storage_w, self.storage_h) != (width, height) {
             self.cache = None;
+            self.templates.clear();
         }
         self.storage_w = width;
         self.storage_h = height;
@@ -165,6 +189,7 @@ impl SubtitleRenderer for PureRenderer {
     fn set_pixel_aspect(&mut self, par: f64) {
         if self.par != par {
             self.cache = None;
+            self.templates.clear();
         }
         self.par = par;
     }
@@ -190,9 +215,10 @@ impl SubtitleRenderer for PureRenderer {
             },
         );
         // Resolve every visible event's dynamic samples. An event that was
-        // never rendered has no captured record yet and forces a miss — a
-        // made-up "static" sample could wrongly hit for a dynamic event.
-        let samples: Option<Vec<EventSamples>> = visible
+        // never rendered has no captured record yet (None) and forces a
+        // miss — a made-up "static" sample could wrongly hit for a dynamic
+        // event.
+        let samples: Vec<Option<EventSamples>> = visible
             .iter()
             .map(|&index| {
                 self.dynamics.get(&index).map(|dynamics| {
@@ -202,14 +228,19 @@ impl SubtitleRenderer for PureRenderer {
             })
             .collect();
 
-        let cache_valid = match (&self.cache, &samples) {
-            (Some(cache), Some(samples)) => {
+        let cache_valid = match &self.cache {
+            Some(cache) => {
                 cache.events == visible
                     && cache.frame == frame
                     && cache.storage == storage
-                    && &cache.samples == samples
+                    && cache.samples.len() == samples.len()
+                    && cache
+                        .samples
+                        .iter()
+                        .zip(&samples)
+                        .all(|(cached, now)| now.as_ref() == Some(cached))
             }
-            _ => false,
+            None => false,
         };
         if !cache_valid {
             #[cfg(test)]
@@ -230,33 +261,65 @@ impl SubtitleRenderer for PureRenderer {
             let mut all_nodes: Vec<RenderedNode> = Vec::new();
             let mut occupied: Vec<(i32, i32, i32, i32)> = Vec::new();
             let mut seen_unsupported = 0u32;
-            for &index in &visible {
+            for (order, &index) in visible.iter().enumerate() {
                 let event = &self.script.events[index];
-                let mut rendered = render_event(&ctx, event, now_ms, &mut self.face_cache);
-                seen_unsupported |= rendered.unsupported;
-                let detect_collisions = rendered.detect_collisions;
-                self.dynamics.insert(index, rendered.dynamics);
-                let nodes = &mut rendered.nodes;
+                // Reuse this event's template when its samples are
+                // unchanged: layout, shaping and rasterization are then
+                // skipped and only the bitmap copy + stacking replay run.
+                let sample_now = samples[order].as_ref();
+                let (mut nodes, detect_collisions) = match sample_now.and_then(|sample| {
+                    self.templates
+                        .get(&index)
+                        .filter(|template| &template.samples == sample)
+                }) {
+                    Some(template) => (template.nodes.clone(), template.detect_collisions),
+                    None => {
+                        #[cfg(test)]
+                        {
+                            self.event_renders += 1;
+                        }
+                        let rendered = render_event(&ctx, event, now_ms, &mut self.face_cache);
+                        seen_unsupported |= rendered.unsupported;
+                        self.dynamics.insert(index, rendered.dynamics);
+                        let samples = self.dynamics[&index]
+                            .sample(now_ms - event.start_ms, event.duration_ms);
+                        self.templates.insert(
+                            index,
+                            EventTemplate {
+                                samples,
+                                nodes: rendered.nodes.clone(),
+                                detect_collisions: rendered.detect_collisions,
+                            },
+                        );
+                        (rendered.nodes, rendered.detect_collisions)
+                    }
+                };
                 if nodes.is_empty() {
                     continue;
                 }
                 // Collision stacking for unpositioned events: shift the
                 // whole block off previously occupied rectangles.
                 if detect_collisions {
-                    stack_block(nodes, &mut occupied, &self.script, event, self.frame_h);
-                } else if let Some(bbox) = block_bbox(nodes) {
+                    stack_block(&mut nodes, &mut occupied, &self.script, event, self.frame_h);
+                } else if let Some(bbox) = block_bbox(&nodes) {
                     occupied.push(bbox);
                 }
-                all_nodes.append(nodes);
+                all_nodes.append(&mut nodes);
             }
             self.nodes = all_nodes;
+            // Bound template memory to the visible set (masks are the big
+            // allocation; dynamics records are tiny and stay).
+            self.templates.retain(|index, _| visible.contains(index));
             // Key the result by the samples the render actually used — the
-            // records are complete now, so re-resolve any that were missing.
+            // records are complete now, so resolve any that were missing.
             let samples = visible
                 .iter()
-                .map(|&index| {
-                    let event = &self.script.events[index];
-                    self.dynamics[&index].sample(now_ms - event.start_ms, event.duration_ms)
+                .zip(samples)
+                .map(|(&index, sample)| {
+                    sample.unwrap_or_else(|| {
+                        let event = &self.script.events[index];
+                        self.dynamics[&index].sample(now_ms - event.start_ms, event.duration_ms)
+                    })
                 })
                 .collect();
             self.cache = Some(CacheKey {
@@ -288,6 +351,7 @@ impl SubtitleRenderer for PureRenderer {
         self.face_cache.clear();
         self.cache = None;
         self.dynamics.clear();
+        self.templates.clear();
     }
 }
 
@@ -517,6 +581,60 @@ mod tests {
         assert_eq!(renderer.cold_renders, 2, "syllable boundary re-renders");
         let _ = renderer.render_frame(1_900);
         assert_eq!(renderer.cold_renders, 2, "steady again after boundary");
+    }
+
+    /// On a frame-cache miss caused by one animated event, static sibling
+    /// events must reuse their node templates instead of re-rendering.
+    #[test]
+    fn static_siblings_reuse_templates_next_to_animated_events() {
+        let events = "Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,Static line\n\
+                      Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\fad(2000,2000)}Fading\n";
+        let Some(mut renderer) = renderer_with(events) else {
+            eprintln!("skipping: no known test font present on this machine");
+            return;
+        };
+        let _ = renderer.render_frame(1_000);
+        assert_eq!(renderer.event_renders, 2, "first frame renders both");
+        let _ = renderer.render_frame(1_100); // fade sample moved
+        assert_eq!(renderer.cold_renders, 2, "interpolating fade misses");
+        assert_eq!(
+            renderer.event_renders, 3,
+            "only the fading event re-renders; the static line reuses its template"
+        );
+        // Template reuse must compose byte-identically to a cold render of
+        // the same timestamp.
+        let warmed: Vec<(i32, i32, usize, usize, u32, Vec<u8>)> = renderer
+            .render_frame(1_200)
+            .into_iter()
+            .map(|o| (o.dst_x, o.dst_y, o.w, o.h, o.color, o.bitmap.to_vec()))
+            .collect();
+        let mut fresh = renderer_with(events).expect("font probed above");
+        let cold: Vec<(i32, i32, usize, usize, u32, Vec<u8>)> = fresh
+            .render_frame(1_200)
+            .into_iter()
+            .map(|o| (o.dst_x, o.dst_y, o.w, o.h, o.color, o.bitmap.to_vec()))
+            .collect();
+        assert_eq!(warmed, cold, "template compose must match a cold render");
+    }
+
+    /// Templates are evicted once their event leaves the visible set.
+    #[test]
+    fn templates_are_evicted_with_visibility() {
+        let events = "Dialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,First\n\
+                      Dialogue: 0,0:00:03.00,0:00:05.00,Default,,0,0,0,,Second\n";
+        let Some(mut renderer) = renderer_with(events) else {
+            eprintln!("skipping: no known test font present on this machine");
+            return;
+        };
+        let _ = renderer.render_frame(1_000);
+        assert_eq!(renderer.templates.len(), 1);
+        let _ = renderer.render_frame(4_000);
+        assert_eq!(
+            renderer.templates.len(),
+            1,
+            "hidden event's template evicted"
+        );
+        assert!(renderer.templates.contains_key(&1));
     }
 
     /// The storage size scales borders/blur/shadows, so changing it must
