@@ -372,7 +372,6 @@ impl InputFilterParameter {
 unsafe impl Send for InputFilterParameter {}
 // SAFETY: InputFilterParameter is Sync because it is only accessed from a single filter
 // task thread. The crate's scheduler architecture ensures no concurrent access.
-unsafe impl Sync for InputFilterParameter {}
 
 #[derive(Default)]
 struct FilterGraphParameter {
@@ -453,7 +452,6 @@ impl OutputFilterParameter {
 unsafe impl Send for OutputFilterParameter {}
 // SAFETY: OutputFilterParameter is Sync because it is only accessed from a single filter
 // task thread. The crate's scheduler architecture ensures no concurrent access.
-unsafe impl Sync for OutputFilterParameter {}
 
 #[cfg(feature = "docs-rs")]
 unsafe fn fg_send_eof(

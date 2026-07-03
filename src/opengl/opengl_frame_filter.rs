@@ -68,6 +68,15 @@ pub struct OpenGLFrameFilter {
     to_original_scaler: Option<ffmpeg_next::software::scaling::Context>,
 }
 
+// SAFETY: the filter is constructed on the caller's thread but every GL
+// operation happens on the single frame-pipeline thread: the surfman context
+// is created without being made current (new_* -> init_surfman) and only
+// init() — which runs on the pipeline thread — calls make_context_current.
+// A context that was never current on the creating thread may be moved to
+// and used on another thread under EGL/CGL rules. Drop may run elsewhere;
+// surfman's destroy_context fails gracefully there (logged in Drop) rather
+// than invoking UB. No Sync is implemented: &self is never shared across
+// threads.
 unsafe impl Send for OpenGLFrameFilter {}
 
 impl OpenGLFrameFilter {
@@ -512,7 +521,7 @@ impl OpenGLFrameFilter {
         self.to_original_scaler = None;
     }
 
-    fn process_frame_through_texture(&self, frame: &Frame) -> Result<(), String> {
+    fn process_frame_through_texture(&self, frame: &mut Frame) -> Result<(), String> {
         self.upload_frame_to_texture(frame)?;
 
         let gl = self.gl.as_ref().unwrap();
@@ -536,7 +545,7 @@ impl OpenGLFrameFilter {
 
         unsafe {
             let linesize = (*frame.as_ptr()).linesize[0];
-            let data = frame_data_mut(frame.as_ptr(), 0)?;
+            let data = frame_data(frame.as_ptr(), 0)?;
 
             gl.bind_texture(glow::TEXTURE_2D, self.input_texture);
 
@@ -544,7 +553,7 @@ impl OpenGLFrameFilter {
             // FFmpeg rows carry padding and width*3 is rarely 4-aligned, so
             // uploading with the defaults shears the picture sideways.
             gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
-            match row_layout(linesize, self.width, 3) {
+            match row_layout(linesize, self.width, 3)? {
                 RowLayout::Tight => {
                     gl.tex_sub_image_2d(
                         glow::TEXTURE_2D,
@@ -599,19 +608,19 @@ impl OpenGLFrameFilter {
     }
 
     /// Reads the texture data from OpenGL and writes it to the specified AVFrame.
-    fn read_texture_to_frame(&self, frame: &Frame) -> Result<(), String> {
+    fn read_texture_to_frame(&self, frame: &mut Frame) -> Result<(), String> {
         let gl = self.gl.as_ref().unwrap();
 
         unsafe {
             let linesize = (*frame.as_ptr()).linesize[0];
-            let data = frame_data_mut(frame.as_ptr(), 0)?;
+            let data = frame_data_mut(frame.as_mut_ptr(), 0)?;
 
             gl.bind_texture(glow::TEXTURE_2D, self.output_texture);
 
             // Mirror of the upload path: readback must honor the frame's
             // row stride or the written picture is sheared.
             gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
-            match row_layout(linesize, self.width, 3) {
+            match row_layout(linesize, self.width, 3)? {
                 RowLayout::Tight => {
                     gl.get_tex_image(
                         glow::TEXTURE_2D,
@@ -857,22 +866,31 @@ enum RowLayout {
     PerRow,
 }
 
-fn row_layout(linesize: i32, width: i32, bytes_per_pixel: i32) -> RowLayout {
-    if linesize == width * bytes_per_pixel {
+fn row_layout(linesize: i32, width: i32, bytes_per_pixel: i32) -> Result<RowLayout, String> {
+    let row_bytes = width * bytes_per_pixel;
+    if linesize < row_bytes {
+        // A stride shorter than one row of pixels cannot hold the picture;
+        // slicing by it would run past the buffer end row by row.
+        return Err(format!(
+            "linesize {linesize} is shorter than a row of {width} pixels ({row_bytes} bytes)"
+        ));
+    }
+    Ok(if linesize == row_bytes {
         RowLayout::Tight
     } else if linesize % bytes_per_pixel == 0 {
         RowLayout::RowLength(linesize / bytes_per_pixel)
     } else {
         RowLayout::PerRow
-    }
+    })
 }
 
-pub unsafe fn frame_data_mut<'a>(
-    frame: *const AVFrame,
-    index: usize,
-) -> Result<&'a mut [u8], String> {
+/// Validate plane `index` of `frame` and return (data pointer, byte length).
+unsafe fn frame_plane(frame: *const AVFrame, index: usize) -> Result<(*mut u8, usize), String> {
     if frame.is_null() {
         return Err("Frame pointer is null".to_owned());
+    }
+    if index >= (*frame).data.len() {
+        return Err(format!("Plane index {} out of range", index));
     }
 
     let linesize = (*frame).linesize[index];
@@ -889,9 +907,36 @@ pub unsafe fn frame_data_mut<'a>(
         return Err(format!("Data pointer at index {} is null", index));
     }
 
-    let height = (*frame).height as usize;
+    let height = (*frame).height;
+    if height <= 0 {
+        return Err(format!("Invalid frame height {height}"));
+    }
 
-    Ok(std::slice::from_raw_parts_mut(data_ptr, linesize * height))
+    Ok((data_ptr, linesize * height as usize))
+}
+
+/// Shared view of a frame plane, for reading pixels (GL upload).
+///
+/// # Safety
+/// `frame` must point to a valid AVFrame whose plane buffers outlive the
+/// returned slice, with no concurrent writer.
+pub unsafe fn frame_data<'a>(frame: *const AVFrame, index: usize) -> Result<&'a [u8], String> {
+    let (data_ptr, len) = frame_plane(frame, index)?;
+    Ok(std::slice::from_raw_parts(data_ptr, len))
+}
+
+/// Exclusive view of a frame plane, for writing pixels (GL readback).
+///
+/// # Safety
+/// `frame` must point to a valid, writable AVFrame (`av_frame_make_writable`)
+/// with no other reference to the plane while the slice lives; taking
+/// `*mut AVFrame` keeps the exclusivity requirement visible at the call site.
+pub unsafe fn frame_data_mut<'a>(
+    frame: *mut AVFrame,
+    index: usize,
+) -> Result<&'a mut [u8], String> {
+    let (data_ptr, len) = frame_plane(frame, index)?;
+    Ok(std::slice::from_raw_parts_mut(data_ptr, len))
 }
 
 impl FrameFilter for OpenGLFrameFilter {
@@ -964,11 +1009,16 @@ impl FrameFilter for OpenGLFrameFilter {
         }
 
         if original_format == ffmpeg_sys_next::AVPixelFormat::AV_PIX_FMT_RGB24 {
-            self.process_frame_through_texture(&frame)?;
+            self.process_frame_through_texture(&mut frame)?;
         } else {
             self.convert_to_rgb(&frame)?;
 
-            self.process_frame_through_texture(self.rgb_frame.as_ref().unwrap())?;
+            // Take the scratch frame out so the exclusive borrow does not
+            // overlap &self; put it back before propagating any error.
+            let mut rgb_frame = self.rgb_frame.take().unwrap();
+            let result = self.process_frame_through_texture(&mut rgb_frame);
+            self.rgb_frame = Some(rgb_frame);
+            result?;
 
             self.convert_from_rgb(&mut frame)?;
         }
@@ -1021,21 +1071,29 @@ mod tests {
     #[test]
     fn row_layout_tight_rows_need_no_stride_handling() {
         // 320 * 3 == 960: no padding.
-        assert_eq!(row_layout(960, 320, 3), RowLayout::Tight);
+        assert_eq!(row_layout(960, 320, 3), Ok(RowLayout::Tight));
     }
 
     #[test]
     fn row_layout_padded_rows_map_to_row_length_pixels() {
         // 1918 * 3 == 5754, padded to 5760 by av_frame_get_buffer:
         // expressible as 1920 whole RGB pixels.
-        assert_eq!(row_layout(5760, 1918, 3), RowLayout::RowLength(1920));
+        assert_eq!(row_layout(5760, 1918, 3), Ok(RowLayout::RowLength(1920)));
     }
 
     #[test]
     fn row_layout_non_pixel_stride_falls_back_to_per_row() {
         // 100 * 3 == 300, padded to 320: not a multiple of 3, GL cannot
         // express this stride via ROW_LENGTH.
-        assert_eq!(row_layout(320, 100, 3), RowLayout::PerRow);
+        assert_eq!(row_layout(320, 100, 3), Ok(RowLayout::PerRow));
+    }
+
+    #[test]
+    fn row_layout_rejects_strides_shorter_than_a_row() {
+        // A malformed upstream FrameFilter could hand over linesize <
+        // width * 3; slicing rows by it would run out of bounds, so the
+        // layout classification itself must fail.
+        assert!(row_layout(300, 320, 3).is_err());
     }
 
     #[test]

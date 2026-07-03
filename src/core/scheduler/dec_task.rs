@@ -1156,7 +1156,6 @@ struct DecoderParameter {
 // 4. Raw pointers are only dereferenced within the decoder thread or FFmpeg callbacks
 //    which are invoked synchronously from the decoder thread
 unsafe impl Send for DecoderParameter {}
-unsafe impl Sync for DecoderParameter {}
 
 /*struct ViewMap {
     id: i32,

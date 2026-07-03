@@ -798,12 +798,11 @@ struct DemuxStreamParameter {
     dts: i64,
 }
 
-// SAFETY: DemuxStreamParameter contains a raw pointer (codec_desc) but is safe
-// to Send/Sync because:
-// 1. codec_desc points to static FFmpeg codec descriptor data (read-only)
-// 2. The demuxer thread has exclusive access during demuxing operations
+// SAFETY: codec_desc points to static FFmpeg codec descriptor data
+// (read-only), and the demuxer thread owns the value exclusively. Sync is
+// intentionally NOT implemented: nothing shares &DemuxStreamParameter
+// across threads.
 unsafe impl Send for DemuxStreamParameter {}
-unsafe impl Sync for DemuxStreamParameter {}
 impl DemuxStreamParameter {
     fn new(ds: &DecoderStream) -> Self {
         Self {
@@ -867,13 +866,10 @@ struct DemuxerParameter {
     dsts: Vec<(Sender<PacketBox>, usize, Option<usize>)>,
 }
 
-// SAFETY: DemuxerParameter is safe to Send/Sync because:
-// 1. All contained raw pointers are within DemuxStreamParameter (see its SAFETY comment)
-// 2. The Sender<PacketBox> channels are inherently Send/Sync (crossbeam-channel)
-// 3. The demuxer thread has exclusive ownership during demuxing operations
-// 4. No mutable aliasing occurs - the parameter is used by a single thread at a time
+// SAFETY: all raw pointers live in DemuxStreamParameter (see its SAFETY
+// comment) and the demuxer thread owns the value exclusively; the channel
+// senders are Send by themselves. Sync is intentionally NOT implemented.
 unsafe impl Send for DemuxerParameter {}
-unsafe impl Sync for DemuxerParameter {}
 impl DemuxerParameter {
     fn new(demux: &mut Demuxer) -> Self {
         let dsts = demux.take_dsts();
