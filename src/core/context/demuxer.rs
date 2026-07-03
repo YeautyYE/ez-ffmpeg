@@ -12,7 +12,7 @@ use ffmpeg_sys_next::AVPixelFormat::{
     AV_PIX_FMT_CUDA, AV_PIX_FMT_MEDIACODEC, AV_PIX_FMT_NONE, AV_PIX_FMT_QSV,
 };
 use ffmpeg_sys_next::{
-    av_channel_layout_default, av_codec_is_decoder, av_codec_iterate, av_get_pix_fmt, av_hwdevice_find_type_by_name, av_hwdevice_get_type_name, avcodec_descriptor_get, avcodec_descriptor_get_by_name, avcodec_find_decoder, avcodec_find_decoder_by_name, avcodec_get_hw_config, AVChannelOrder, AVCodecID, AVCodecParameters, AVFormatContext, AVHWDeviceType, AVMediaType, AVPixelFormat, AVRational, AVERROR, AVERROR_DECODER_NOT_FOUND, EINVAL
+    av_channel_layout_default, av_codec_is_decoder, av_codec_iterate, av_get_pix_fmt, av_hwdevice_find_type_by_name, av_hwdevice_get_type_name, avcodec_descriptor_get, avcodec_descriptor_get_by_name, avcodec_find_decoder, avcodec_find_decoder_by_name, avcodec_get_hw_config, AVChannelOrder, AVCodecID, AVCodecParameters, AVFormatContext, AVHWDeviceType, AVMediaType, AVPixelFormat, AVRational, AVERROR, EINVAL
 };
 use log::{debug, error, warn};
 use std::ffi::{CStr, CString};
@@ -323,7 +323,7 @@ fn choose_decoder(
 
             if codec.is_null() {
                 error!("Unknown decoder '{codec_name}'");
-                return Err(OpenInputError::from(AVERROR_DECODER_NOT_FOUND).into());
+                return Err(crate::error::DecoderError::NotFound(codec_name).into());
             }
 
             if (*codec).type_ != codec_type {

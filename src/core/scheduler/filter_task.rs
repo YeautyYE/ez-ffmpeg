@@ -175,8 +175,14 @@ pub(crate) fn filter_graph_init(
 
                 unsafe {
                     if ifps[input_index].media_type == AVMEDIA_TYPE_SUBTITLE {
-                        //TODO
-                        // sub2video_frame
+                        // sub2video (rendering subtitles as filtergraph video
+                        // input) is not implemented; binding rejects it up
+                        // front, so a frame here is a wiring bug.
+                        error!(
+                            "subtitle frames cannot feed filtergraph {fg_index}: \
+                             sub2video is not supported"
+                        );
+                        frame_pool.release(frame_box.frame);
                     } else if !frame_is_null(&frame_box.frame)
                         && !(*frame_box.frame.as_ptr()).buf[0].is_null()
                     {
@@ -887,8 +893,12 @@ unsafe fn configure_filtergraph(
             }
             let tmp_frame_box = option.unwrap();
             if ifp.media_type == AVMEDIA_TYPE_SUBTITLE {
-                //TODO
-                // sub2video_frame(ifp, tmp_frame_box);
+                // sub2video is not supported: drop the queued frame instead
+                // of silently keeping a dead branch.
+                error!(
+                    "subtitle frames cannot feed a filtergraph input: \
+                     sub2video is not supported"
+                );
             } else {
                 let mut tmp_frame = unsafe { av_frame_alloc() };
                 if tmp_frame.is_null() {
@@ -2490,11 +2500,6 @@ unsafe fn configure_input_video_filter(
     if par.is_null() {
         return AVERROR(ENOMEM);
     }
-
-    //TODO
-    /*if (ifp.type_src == AVMEDIA_TYPE_SUBTITLE){
-    sub2video_prepare(ifp);
-    }*/
 
     let mut sar = ifp.sample_aspect_ratio;
     if sar.den == 0 {

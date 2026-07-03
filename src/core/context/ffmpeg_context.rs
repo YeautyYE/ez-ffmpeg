@@ -2779,6 +2779,7 @@ fn fg_find_input_idx_by_linklabel(
     unsafe {
         let fmt_ctx = demux.in_fmt_ctx;
 
+        let mut subtitle_only_match = false;
         for (idx, _) in demux.get_streams().iter().enumerate() {
             let avstream = *(*fmt_ctx).streams.add(idx);
 
@@ -2788,7 +2789,24 @@ fn fg_find_input_idx_by_linklabel(
                 if codec_type == filter_media_type {
                     return Ok((file_idx, idx));
                 }
+                if codec_type == AVMEDIA_TYPE_SUBTITLE
+                    && filter_media_type == AVMEDIA_TYPE_VIDEO
+                {
+                    subtitle_only_match = true;
+                }
             }
+        }
+
+        if subtitle_only_match {
+            // The spec names a subtitle stream feeding a VIDEO pad: that is
+            // fftools' sub2video hack, which this crate does not implement.
+            // Fail with a specific message instead of "matches no streams".
+            error!(
+                "Stream specifier '{remainder}' in filtergraph description {desc} \
+                 matches a subtitle stream, but subtitle streams as filtergraph \
+                 inputs (sub2video) are not supported"
+            );
+            return Err(FilterGraphParseError::InvalidArgument.into());
         }
     }
 

@@ -89,10 +89,19 @@
 //! - **`async`**: Makes the [`FfmpegScheduler`] wait method asynchronous (you can `.await` it).
 //! - **`static`**: Uses static linking for FFmpeg libraries (via `ffmpeg-next/static`).
 //!
+//! ## Logging
+//!
+//! FFmpeg's own diagnostics (av_log) are redirected into the Rust `log`
+//! facade under the [`FFMPEG_LOG_TARGET`] target. Without a logger installed
+//! (env_logger, tracing-log, ...) all FFmpeg messages are silently dropped —
+//! including decoder errors that explain a failing job. Use
+//! [`set_ffmpeg_log_level`] to bound the forwarded verbosity and
+//! `Input::set_log_level_offset` to shift it per input.
+//!
 //! ## License Notice
 //!
-//! ez-ffmpeg is distributed under the WTFPL (Do What The F*ck You Want To Public License).
-//! You are free to use, modify, and distribute this software.
+//! ez-ffmpeg is licensed under your choice of MIT, Apache-2.0, or MPL-2.0
+//! (matching the `license` field in Cargo.toml).
 //!
 //! **Note:** FFmpeg itself is subject to its own licensing terms. When enabling features that incorporate FFmpeg components,
 //! please ensure that your usage complies with FFmpeg's license.

@@ -155,17 +155,32 @@ pub enum StreamError {
 }
 
 impl PartialEq for Error {
+    /// Structural equality for payload-less variants only. Variants carrying
+    /// an inner error compare unequal even to themselves — use matches! on
+    /// the variant when that is what you mean.
     fn eq(&self, other: &Self) -> bool {
+        use Error::*;
         match (self, other) {
-            (Error::EOF, Error::EOF) => true,
-            (Error::Exit, Error::Exit) => true,
-            (Error::Bug, Error::Bug) => true,
+            (NotStarted, NotStarted)
+            | (FilterDescUtf8, FilterDescUtf8)
+            | (FilterNameUtf8, FilterNameUtf8)
+            | (FilterZeroOutputs, FilterZeroOutputs)
+            | (ParseInteger, ParseInteger)
+            | (FrameFilterDstFinished, FrameFilterDstFinished)
+            | (FrameFilterSendOOM, FrameFilterSendOOM)
+            | (FrameFilterThreadExited, FrameFilterThreadExited)
+            | (EOF, EOF)
+            | (Exit, Exit)
+            | (Bug, Bug) => true,
+            #[cfg(feature = "rtmp")]
+            (RtmpCreateStream, RtmpCreateStream) | (RtmpThreadExited, RtmpThreadExited) => true,
             _ => false,
         }
     }
 }
 
-impl Eq for Error {}
+// No Eq impl: variants carrying payloads are not equal to themselves, so
+// the relation is not reflexive and claiming Eq would be a lie.
 
 #[derive(thiserror::Error, Debug)]
 pub enum DemuxingOperationError {
@@ -400,7 +415,7 @@ pub enum OpenInputError {
     #[error("The connection timed out while trying to open the stream")]
     Timeout,
 
-    #[error("An unknown error occurred. ret:{0}")]
+    #[error("{}. ret:{0}", crate::util::ffmpeg_utils::av_err2str(*.0))]
     UnknownError(i32),
 
     #[error("Invalid source provided")]
@@ -473,7 +488,7 @@ pub enum FindStreamError {
     #[error("No Stream found")]
     NoStreamFound,
 
-    #[error("An unknown error occurred. ret:{0}")]
+    #[error("{}. ret:{0}", crate::util::ffmpeg_utils::av_err2str(*.0))]
     UnknownError(i32),
 }
 
@@ -585,7 +600,7 @@ pub enum AllocOutputContextError {
     #[error("The connection timed out while trying to allocate the output context")]
     Timeout,
 
-    #[error("An unknown error occurred. ret:{0}")]
+    #[error("{}. ret:{0}", crate::util::ffmpeg_utils::av_err2str(*.0))]
     UnknownError(i32),
 }
 
@@ -657,7 +672,7 @@ pub enum OpenOutputError {
     #[error("Invalid file index {0} in input url: {1}")]
     InvalidFileIndexInIntput(usize, String),
 
-    #[error("An unknown error occurred. ret:{0}")]
+    #[error("{}. ret:{0}", crate::util::ffmpeg_utils::av_err2str(*.0))]
     UnknownError(i32),
 
     #[error("Invalid sink provided")]
@@ -720,7 +735,7 @@ pub enum FindDevicesError {
     NotImplemented,
     #[error("Bad file descriptor")]
     BadFileDescriptor,
-    #[error("An unknown error occurred. ret:{0}")]
+    #[error("{}. ret:{0}", crate::util::ffmpeg_utils::av_err2str(*.0))]
     UnknownError(i32),
 }
 
@@ -772,7 +787,7 @@ pub enum WriteHeaderError {
     #[error("The connection timed out while trying to write the header")]
     Timeout,
 
-    #[error("An unknown error occurred. ret:{0}")]
+    #[error("{}. ret:{0}", crate::util::ffmpeg_utils::av_err2str(*.0))]
     UnknownError(i32),
 }
 
@@ -924,7 +939,7 @@ pub enum MuxingError {
     #[error("Resource temporarily unavailable")]
     TryAgain,
 
-    #[error("An unknown error occurred. ret:{0}")]
+    #[error("{}. ret:{0}", crate::util::ffmpeg_utils::av_err2str(*.0))]
     UnknownError(i32),
 }
 
@@ -1176,8 +1191,8 @@ impl From<i32> for DecodingError {
 
 #[derive(thiserror::Error, Debug)]
 pub enum DecoderError {
-    #[error("not found.")]
-    NotFound,
+    #[error("decoder '{0}' not found")]
+    NotFound(String),
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -1209,7 +1224,7 @@ pub enum DemuxingError {
     #[error("Invalid data found when processing input")]
     InvalidData,
 
-    #[error("An unknown error occurred. ret:{0}")]
+    #[error("{}. ret:{0}", crate::util::ffmpeg_utils::av_err2str(*.0))]
     UnknownError(i32),
 }
 
