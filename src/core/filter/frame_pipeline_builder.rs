@@ -7,7 +7,7 @@ use ffmpeg_sys_next::AVMediaType;
 /// # Example
 /// ```rust,ignore
 /// let pipeline = FramePipelineBuilder::new(AVMediaType::AVMEDIA_TYPE_VIDEO)
-///     .filter("opengl", Box::new(OpenGLFrameFilter::new())) // Add an OpenGL filter
+///     .filter("effect", Box::new(WgpuFrameFilter::new_identity().unwrap())) // Add a wgpu filter (feature "wgpu")
 ///     .build();
 /// ```
 pub struct FramePipelineBuilder {
