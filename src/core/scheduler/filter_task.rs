@@ -667,12 +667,12 @@ unsafe fn fg_send_frame(
             av_bprint_init(&mut reason, 0, AV_BPRINT_SIZE_AUTOMATIC as u32);
 
             if need_reinit & AUDIO_CHANGED != 0 {
-                let fmt_str = CString::new("audio parameters changed to %d Hz, \0").unwrap();
+                let fmt_str = CString::new("audio parameters changed to %d Hz, ").unwrap();
                 let sample_format_name =
                     av_get_sample_fmt_name(std::mem::transmute((*frame).format));
                 av_bprintf(&mut reason, fmt_str.as_ptr(), (*frame).sample_rate);
                 av_channel_layout_describe_bprint(&(*frame).ch_layout, &mut reason);
-                let comma_str = CString::new(", %s, \0").unwrap();
+                let comma_str = CString::new(", %s, ").unwrap();
                 av_bprintf(
                     &mut reason,
                     comma_str.as_ptr(),
@@ -686,7 +686,7 @@ unsafe fn fg_send_frame(
                 let color_range_name = av_color_range_name((*frame).color_range);
 
                 let fmt_str =
-                    CString::new("video parameters changed to %s(%s, %s), %dx%d, \0").unwrap();
+                    CString::new("video parameters changed to %s(%s, %s), %dx%d, ").unwrap();
                 av_bprintf(
                     &mut reason,
                     fmt_str.as_ptr(),
@@ -699,12 +699,12 @@ unsafe fn fg_send_frame(
             }
 
             if need_reinit & MATRIX_CHANGED != 0 {
-                let matrix_changed_str = CString::new("display matrix changed, \0").unwrap();
+                let matrix_changed_str = CString::new("display matrix changed, ").unwrap();
                 av_bprintf(&mut reason, matrix_changed_str.as_ptr());
             }
 
             if need_reinit & HWACCEL_CHANGED != 0 {
-                let hwaccel_changed_str = CString::new("hwaccel changed, \0").unwrap();
+                let hwaccel_changed_str = CString::new("hwaccel changed, ").unwrap();
                 av_bprintf(&mut reason, hwaccel_changed_str.as_ptr());
             }
 
@@ -2811,7 +2811,7 @@ unsafe fn filter_opt_apply(f: *mut AVFilterContext, mut key: *mut c_char, val: *
             );
             return e;
         }
-        let (data, len) = result.unwrap();
+        let (mut data, len) = result.unwrap();
 
         ret = av_opt_set_bin(
             f as *mut libc::c_void,
@@ -2820,9 +2820,9 @@ unsafe fn filter_opt_apply(f: *mut AVFilterContext, mut key: *mut c_char, val: *
             len as i32,
             AV_OPT_SEARCH_CHILDREN,
         );
-        av_freep(data);
+        av_freep(&mut data as *mut _ as *mut c_void);
     } else {
-        let data = file_read(val);
+        let mut data = file_read(val);
         if data.is_null() {
             error!(
                 "Error loading value for option '{}' from file {}",
@@ -2833,7 +2833,7 @@ unsafe fn filter_opt_apply(f: *mut AVFilterContext, mut key: *mut c_char, val: *
         }
 
         ret = av_opt_set(f as *mut libc::c_void, key, data, AV_OPT_SEARCH_CHILDREN);
-        av_freep(data as *mut libc::c_void);
+        av_freep(&mut data as *mut _ as *mut c_void);
     }
     if ret < 0 {
         error!(
@@ -2850,10 +2850,14 @@ unsafe fn filter_opt_apply(f: *mut AVFilterContext, mut key: *mut c_char, val: *
     0
 }
 
+// Port of fftools read_file_to_string (cmdutils.c): load a filter option
+// value from a file for the `/opt=path` syntax.
 unsafe fn file_read(filename: *mut c_char) -> *mut c_char {
     let mut pb = null_mut();
     let mut ret = avio_open(&mut pb, filename, AVIO_FLAG_READ);
-    let bprint = null_mut();
+    // The AVBPrint lives on the stack like the C original; passing a null
+    // pointer to av_bprint_init would write through NULL.
+    let mut bprint: AVBPrint = std::mem::zeroed();
     let mut str = null_mut();
 
     if ret < 0 {
@@ -2866,14 +2870,14 @@ unsafe fn file_read(filename: *mut c_char) -> *mut c_char {
         return null_mut();
     }
 
-    av_bprint_init(bprint, 0, u32::MAX);
-    ret = avio_read_to_bprint(pb, bprint, usize::MAX);
+    av_bprint_init(&mut bprint, 0, u32::MAX);
+    ret = avio_read_to_bprint(pb, &mut bprint, usize::MAX);
     avio_closep(&mut pb);
     if ret < 0 {
-        av_bprint_finalize(bprint, null_mut());
+        av_bprint_finalize(&mut bprint, null_mut());
         return null_mut();
     }
-    ret = av_bprint_finalize(bprint, &mut str);
+    ret = av_bprint_finalize(&mut bprint, &mut str);
     if ret < 0 {
         return null_mut();
     }
