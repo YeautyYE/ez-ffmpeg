@@ -79,48 +79,9 @@ mod linux {
 
     pub type RawHandle = RawFd;
 
-    // epoll constants
-    const EPOLL_CTL_ADD: i32 = 1;
-    const EPOLL_CTL_DEL: i32 = 2;
-    const EPOLL_CTL_MOD: i32 = 3;
-
-    const EPOLLIN: u32 = 0x001;
-    const EPOLLOUT: u32 = 0x004;
-    const EPOLLERR: u32 = 0x008;
-    const EPOLLHUP: u32 = 0x010;
-    const EPOLLET: u32 = 1 << 31; // Edge-triggered
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    union EpollData {
-        ptr: *mut std::ffi::c_void,
-        fd: i32,
-        u32: u32,
-        u64: u64,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct EpollEvent {
-        events: u32,
-        data: EpollData,
-    }
-
-    // # Safety
-    //
-    // These FFI functions directly call Linux epoll system calls.
-    // Callers must ensure:
-    // - `epfd` is a valid epoll file descriptor created by `epoll_create1`
-    // - `fd` is a valid file descriptor
-    // - `event` points to a valid `EpollEvent` or is null (for `EPOLL_CTL_DEL`)
-    // - `events` points to a valid array with at least `maxevents` capacity
-    // - File descriptors are not closed while registered with epoll
-    extern "C" {
-        fn epoll_create1(flags: i32) -> i32;
-        fn epoll_ctl(epfd: i32, op: i32, fd: i32, event: *mut EpollEvent) -> i32;
-        fn epoll_wait(epfd: i32, events: *mut EpollEvent, maxevents: i32, timeout: i32) -> i32;
-        fn close(fd: i32) -> i32;
-    }
+    // libc provides the epoll bindings, including the arch-dependent packed
+    // layout of epoll_event (x86_64 packs it to 12 bytes; a plain #[repr(C)]
+    // struct would be 16 bytes and corrupt every event after the first).
 
     pub struct Poller {
         epfd: RawFd,
@@ -133,7 +94,7 @@ mod linux {
             // - Returns a new file descriptor or -1 on error
             // - Error is checked immediately after the call
             // Thread safety: Creating an epoll instance is thread-safe
-            let epfd = unsafe { epoll_create1(0) };
+            let epfd = unsafe { libc::epoll_create1(0) };
             if epfd < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -141,19 +102,18 @@ mod linux {
         }
 
         pub fn register(&mut self, fd: RawHandle, token: usize, interest: Interest) -> io::Result<()> {
-            let events = interest_to_epoll(interest) | EPOLLET;
-            let mut event = EpollEvent {
-                events,
-                data: EpollData { u64: token as u64 },
+            let mut event = libc::epoll_event {
+                events: interest_to_epoll(interest) | libc::EPOLLET as u32,
+                u64: token as u64,
             };
 
             // SAFETY: epoll_ctl with EPOLL_CTL_ADD requires:
             // - self.epfd is valid (created in new(), owned by self)
             // - fd is a valid file descriptor (caller's responsibility per API contract)
-            // - &mut event points to a valid, properly initialized EpollEvent on the stack
+            // - &mut event points to a valid, properly initialized epoll_event on the stack
             // Error is checked immediately; operation is atomic w.r.t. this epoll instance
             // Thread safety: Poller requires &mut self, ensuring exclusive access
-            let ret = unsafe { epoll_ctl(self.epfd, EPOLL_CTL_ADD, fd, &mut event) };
+            let ret = unsafe { libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_ADD, fd, &mut event) };
             if ret < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -161,19 +121,18 @@ mod linux {
         }
 
         pub fn modify(&mut self, fd: RawHandle, token: usize, interest: Interest) -> io::Result<()> {
-            let events = interest_to_epoll(interest) | EPOLLET;
-            let mut event = EpollEvent {
-                events,
-                data: EpollData { u64: token as u64 },
+            let mut event = libc::epoll_event {
+                events: interest_to_epoll(interest) | libc::EPOLLET as u32,
+                u64: token as u64,
             };
 
             // SAFETY: epoll_ctl with EPOLL_CTL_MOD requires:
             // - self.epfd is valid (created in new(), owned by self)
             // - fd was previously registered (caller's responsibility per API contract)
-            // - &mut event points to a valid, properly initialized EpollEvent on the stack
+            // - &mut event points to a valid, properly initialized epoll_event on the stack
             // Error is checked immediately; operation is atomic w.r.t. this epoll instance
             // Thread safety: Poller requires &mut self, ensuring exclusive access
-            let ret = unsafe { epoll_ctl(self.epfd, EPOLL_CTL_MOD, fd, &mut event) };
+            let ret = unsafe { libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_MOD, fd, &mut event) };
             if ret < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -187,7 +146,9 @@ mod linux {
             // - event pointer can be null for EPOLL_CTL_DEL (per Linux kernel 2.6.9+)
             // Error is checked immediately; operation is atomic w.r.t. this epoll instance
             // Thread safety: Poller requires &mut self, ensuring exclusive access
-            let ret = unsafe { epoll_ctl(self.epfd, EPOLL_CTL_DEL, fd, std::ptr::null_mut()) };
+            let ret = unsafe {
+                libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut())
+            };
             if ret < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -199,22 +160,22 @@ mod linux {
                 .map(|d| d.as_millis() as i32)
                 .unwrap_or(-1);
 
-            // SAFETY: std::mem::zeroed() for EpollEvent array is safe because:
-            // - EpollEvent is a POD type with no invalid bit patterns
+            // SAFETY: std::mem::zeroed() for an epoll_event array is safe:
+            // - epoll_event is a POD type with no invalid bit patterns
             // - All zero bytes represent valid (empty) events
             // - The array is immediately overwritten by epoll_wait
-            let mut events: [EpollEvent; 256] = unsafe { std::mem::zeroed() };
+            let mut events: [libc::epoll_event; 256] = unsafe { std::mem::zeroed() };
 
             loop {
                 // SAFETY: epoll_wait requires:
                 // - self.epfd is valid (created in new(), owned by self)
-                // - events.as_mut_ptr() points to valid, writable memory for 256 EpollEvents
+                // - events.as_mut_ptr() points to valid, writable memory for 256 events
                 // - events.len() correctly reports the array capacity
                 // - timeout_ms is a valid i32 (-1 for infinite, >=0 for milliseconds)
                 // Error (including EINTR) is checked immediately
                 // Thread safety: Poller requires &mut self, ensuring exclusive access
                 let ret = unsafe {
-                    epoll_wait(self.epfd, events.as_mut_ptr(), events.len() as i32, timeout_ms)
+                    libc::epoll_wait(self.epfd, events.as_mut_ptr(), events.len() as i32, timeout_ms)
                 };
 
                 if ret < 0 {
@@ -226,17 +187,17 @@ mod linux {
                 }
 
                 let mut result = Vec::with_capacity(ret as usize);
-                for i in 0..ret as usize {
-                    let ev = &events[i];
+                for ev in events.iter().take(ret as usize) {
+                    // Copy the fields out by value: epoll_event is packed on
+                    // x86_64, so no references into it may be created.
+                    let bits = ev.events;
+                    let token = ev.u64 as usize;
                     result.push(Event {
-                        // SAFETY: We always use the u64 field for token storage.
-                        // register() writes u64, poll() reads u64 - same field, same layout.
-                        // This is the standard pattern for epoll_data_t union in Rust FFI.
-                        token: unsafe { ev.data.u64 } as usize,
-                        readable: (ev.events & EPOLLIN) != 0,
-                        writable: (ev.events & EPOLLOUT) != 0,
-                        error: (ev.events & EPOLLERR) != 0,
-                        hangup: (ev.events & EPOLLHUP) != 0,
+                        token,
+                        readable: bits & libc::EPOLLIN as u32 != 0,
+                        writable: bits & libc::EPOLLOUT as u32 != 0,
+                        error: bits & libc::EPOLLERR as u32 != 0,
+                        hangup: bits & libc::EPOLLHUP as u32 != 0,
                     });
                 }
                 return Ok(result);
@@ -251,17 +212,17 @@ mod linux {
             // - This is the only place where epfd is closed (Drop is called once)
             // - After drop, self is deallocated so no double-close is possible
             // Thread safety: Drop takes &mut self, ensuring exclusive access
-            unsafe { close(self.epfd) };
+            unsafe { libc::close(self.epfd) };
         }
     }
 
     fn interest_to_epoll(interest: Interest) -> u32 {
         let mut events = 0;
         if interest.readable {
-            events |= EPOLLIN;
+            events |= libc::EPOLLIN as u32;
         }
         if interest.writable {
-            events |= EPOLLOUT;
+            events |= libc::EPOLLOUT as u32;
         }
         events
     }
@@ -899,6 +860,53 @@ mod tests {
             poller.deregister(client_fd).expect("Failed to deregister");
             poller.deregister(server_fd).expect("Failed to deregister");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn poll_reports_correct_tokens_for_multiple_ready_fds() {
+        use std::os::unix::io::AsRawFd;
+
+        let mut poller = Poller::new().expect("Failed to create poller");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to get address");
+
+        let _clients: Vec<TcpStream> = (0..3)
+            .map(|_| TcpStream::connect(addr).expect("Failed to connect"))
+            .collect();
+        let servers: Vec<TcpStream> = (0..3)
+            .map(|_| listener.accept().expect("Failed to accept").0)
+            .collect();
+
+        // All three sockets are immediately writable, so one poll returns
+        // several events at once. Every entry of the kernel's event array
+        // must round-trip its token — a struct layout mismatch (epoll_event
+        // is packed on x86_64) corrupts every entry after the first.
+        for (i, server) in servers.iter().enumerate() {
+            server
+                .set_nonblocking(true)
+                .expect("Failed to set nonblocking");
+            poller
+                .register(server.as_raw_fd(), (i + 1) * 10, Interest::WRITABLE)
+                .expect("Failed to register");
+        }
+
+        let events = poller
+            .poll(Some(Duration::from_millis(200)))
+            .expect("Failed to poll");
+        let mut tokens: Vec<usize> = events
+            .iter()
+            .filter(|e| e.is_writable())
+            .map(|e| e.token)
+            .collect();
+        tokens.sort_unstable();
+
+        assert_eq!(
+            tokens,
+            vec![10, 20, 30],
+            "every simultaneously-ready fd must report its own token"
+        );
     }
 
     #[test]

@@ -32,6 +32,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use crate::util::ffmpeg_utils::av_err2str;
+use crate::util::thread_synchronizer::{ThreadDoneGuard, ThreadSynchronizer};
 
 #[cfg(feature = "docs-rs")]
 pub(crate) fn dec_init(
@@ -41,6 +42,7 @@ pub(crate) fn dec_init(
     frame_pool: ObjPool<Frame>,
     packet_pool: ObjPool<Packet>,
     scheduler_status: Arc<AtomicUsize>,
+    thread_sync: ThreadSynchronizer,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
 ) -> crate::error::Result<()> {
     Ok(())
@@ -54,6 +56,7 @@ pub(crate) fn dec_init(
     frame_pool: ObjPool<Frame>,
     packet_pool: ObjPool<Packet>,
     scheduler_status: Arc<AtomicUsize>,
+    thread_sync: ThreadSynchronizer,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
 ) -> crate::error::Result<()> {
     let receiver = dec_stream.take_src();
@@ -92,15 +95,20 @@ pub(crate) fn dec_init(
 
 
     let dp_arc = dp_arc.clone();
+
+    // Slot claimed before spawn; the guard releases it on any exit path.
+    thread_sync.thread_start();
+    let thread_done_guard = ThreadDoneGuard::adopt(thread_sync.clone(), scheduler_status.clone());
+
     let result = std::thread::Builder::new()
         .name(format!(
             "decoder{}:{demux_idx}:{decoder_name}",
             dec_stream.stream_index,
         ))
         .spawn(move || {
+            let _thread_done = thread_done_guard;
             let dp_arc = dp_arc;
             let input_status = false;
-            let ret = 0;
             let mut err_exit = false;
 
             loop {
@@ -176,8 +184,8 @@ pub(crate) fn dec_init(
                             avcodec_flush_buffers(dp.dec_ctx.as_mut_ptr());
                         } else {
                             err_exit = true;
+                            error!("Error processing packet in decoder: {e}");
                             set_scheduler_error(&scheduler_status, &scheduler_result, e);
-                            error!("Error processing packet in decoder: {}", av_err2str(ret));
                             break;
                         }
                     }
@@ -186,29 +194,37 @@ pub(crate) fn dec_init(
 
             // on success send EOF timestamp to our downstreams
             if !err_exit {
-                let mut frame = frame_pool.get().unwrap();
-                unsafe {
-                    {
-                        let dp = dp_arc.clone();
-                        let dp = dp.lock().unwrap();
-                        (*frame.as_mut_ptr()).opaque =
-                            FrameOpaque::FrameOpaqueEof as i32 as *mut c_void;
-                        (*frame.as_mut_ptr()).pts = if dp.last_frame_pts == AV_NOPTS_VALUE {
-                            AV_NOPTS_VALUE
-                        } else {
-                            dp.last_frame_pts + dp.last_frame_duration_est
-                        };
-                        (*frame.as_mut_ptr()).time_base = dp.last_frame_tb;
-                    }
-                    let frame_box = dec_frame_to_box(dp_arc.clone(), frame);
-                    if let Err(e) = dec_send(frame_box, &frame_pool, &senders) {
-                        if e != Error::EOF {
-                            error!("Error signalling EOF: {e}");
-                            set_scheduler_error(&scheduler_status, &scheduler_result, e);
-                            return;
+                // Failures here must still fall through to dec_done below —
+                // skipping it starves downstream of the finish signal.
+                // Losing the EOF marker itself only costs the last-frame
+                // duration hint.
+                if let Ok(mut frame) = frame_pool.get() {
+                    unsafe {
+                        {
+                            let dp = dp_arc.clone();
+                            let dp = dp.lock().unwrap();
+                            (*frame.as_mut_ptr()).opaque =
+                                FrameOpaque::FrameOpaqueEof as i32 as *mut c_void;
+                            (*frame.as_mut_ptr()).pts = if dp.last_frame_pts == AV_NOPTS_VALUE {
+                                AV_NOPTS_VALUE
+                            } else {
+                                dp.last_frame_pts + dp.last_frame_duration_est
+                            };
+                            (*frame.as_mut_ptr()).time_base = dp.last_frame_tb;
+                        }
+                        let frame_box = dec_frame_to_box(dp_arc.clone(), frame);
+                        if let Err(e) = dec_send(frame_box, &frame_pool, &senders) {
+                            if e != Error::EOF {
+                                error!("Error signalling EOF: {e}");
+                                set_scheduler_error(&scheduler_status, &scheduler_result, e);
+                            }
                         }
                     }
+                } else {
+                    warn!("Failed to allocate the EOF marker frame, skipping EOF timestamp");
+                }
 
+                {
                     let dp = dp_arc.clone();
                     let dp = dp.lock().unwrap();
                     let err_rate = if dp.dec.frames_decoded != 0 || dp.dec.decode_errors != 0 {
@@ -219,8 +235,14 @@ pub(crate) fn dec_init(
                     };
                     let max_error_rate = 2.0 / 3.0;
                     if err_rate > max_error_rate {
+                        // Mirrors FFmpeg's -max_error_rate contract: exceeding the
+                        // rate must fail the task, not just log.
                         error!("Decoder error rate {err_rate} exceeds maximum {max_error_rate}");
-                        // ret = FFMPEG_ERROR_RATE_EXCEEDED;
+                        set_scheduler_error(
+                            &scheduler_status,
+                            &scheduler_result,
+                            Decoding(crate::error::DecodingOperationError::ErrorRateExceeded),
+                        );
                     } else if err_rate != 0.0 {
                         debug!("Decoder error rate {err_rate}");
                     }
@@ -308,8 +330,11 @@ unsafe fn transcode_subtitles(
         return Ok(());
     }
 
+    // Only EOF/flush sentinels (null packet or the demuxer's stream_index < 0
+    // flush marker) are replaced with an empty packet to drain the decoder;
+    // real packets must be decoded as-is (matches ffmpeg_dec.c's `!pkt`).
     let mut packet_is_eof = false;
-    if packet_is_null(&packet_box.packet) || (*packet_box.packet.as_ptr()).stream_index >= 0 {
+    if packet_is_null(&packet_box.packet) || (*packet_box.packet.as_ptr()).stream_index < 0 {
         let Ok(packet) = packet_pool.get() else {
             return Err(Decoding(DecodingOperationError::PacketAllocationError(
                 DecodingError::OutOfMemory,
@@ -644,8 +669,7 @@ unsafe fn dec_frame_to_box(dp_arc: Arc<Mutex<DecoderParameter>>, frame: Frame) -
             bits_per_raw_sample: (*dec_ctx).bits_per_raw_sample,
             input_stream_width: (*dec_ctx).width,
             input_stream_height: (*dec_ctx).height,
-            subtitle_header_size: (*dec_ctx).subtitle_header_size,
-            subtitle_header: (*dec_ctx).subtitle_header,
+            subtitle_header: dp.dec.subtitle_header.clone(),
             fg_input_index: usize::MAX,
         },
     }
@@ -679,6 +703,8 @@ fn dec_open(
                 OpenDecoderOperationError::ContextAllocationError(OpenDecoderError::OutOfMemory),
             ));
         }
+        // Per-input decoder log demotion (Input::set_log_level_offset).
+        (*dec_ctx).log_level_offset = dec_stream.log_level_offset;
 
         let mut ret = avcodec_parameters_to_context(
             dec_ctx,
@@ -771,8 +797,19 @@ fn dec_open(
         {
             let dp_arc_clone = dp_arc.clone();
             let mut dp = dp_arc_clone.lock().unwrap();
-            dp.dec.subtitle_header = (*dec_ctx).subtitle_header;
-            dp.dec.subtitle_header_size = (*dec_ctx).subtitle_header_size;
+            // Own a copy of the subtitle header: dec_ctx (and the buffer it
+            // points to) is freed when the decoder exits, while encoders read
+            // the header later (matches ffmpeg_dec.c owning its own copy).
+            dp.dec.subtitle_header = if (*dec_ctx).subtitle_header.is_null()
+                || (*dec_ctx).subtitle_header_size <= 0
+            {
+                None
+            } else {
+                Some(Arc::from(std::slice::from_raw_parts(
+                    (*dec_ctx).subtitle_header as *const u8,
+                    (*dec_ctx).subtitle_header_size as usize,
+                )))
+            };
         }
 
         if !param_out.is_null() {
@@ -917,8 +954,11 @@ fn hw_device_setup_for_decode(
             i += 1;
         }
 
+        // Only try creating a new device when no existing one matched;
+        // a failed creation attempt must not clobber a found device
+        // (ffmpeg_dec.c hw auto: `for (i = 0; !dev; i++)`).
         i = 0;
-        loop {
+        while dev.is_none() {
             let config = unsafe { avcodec_get_hw_config(codec, i) };
             if config.is_null() {
                 break;
@@ -1087,6 +1127,7 @@ struct DecoderParameter {
     // override output video sample aspect ratio with this value
     sar_override: AVRational,
     framerate_in: AVRational,
+    framerate_forced: bool,
 
     apply_cropping: i32,
 
@@ -1108,7 +1149,7 @@ struct DecoderParameter {
 
 }
 
-// SAFETY: DecoderParameter contains raw pointers (dec_ctx, subtitle_header) but is safe to
+// SAFETY: DecoderParameter contains a raw pointer (dec_ctx) but is safe to
 // Send/Sync because:
 // 1. The decoder thread has exclusive ownership of the AVCodecContext during decoding
 // 2. DecoderParameter is wrapped in Arc<Mutex<>> ensuring synchronized access
@@ -1117,7 +1158,6 @@ struct DecoderParameter {
 // 4. Raw pointers are only dereferenced within the decoder thread or FFmpeg callbacks
 //    which are invoked synchronously from the decoder thread
 unsafe impl Send for DecoderParameter {}
-unsafe impl Sync for DecoderParameter {}
 
 /*struct ViewMap {
     id: i32,
@@ -1141,8 +1181,7 @@ impl DecoderParameter {
         Self {
             dec: Decoder {
                 media_type: dec_stream.codec_type,
-                subtitle_header_size: 0,
-                subtitle_header: null_mut(),
+                subtitle_header: None,
                 frames_decoded: 0,
                 samples_decoded: 0,
                 decode_errors: 0,
@@ -1151,6 +1190,7 @@ impl DecoderParameter {
 
             sar_override: unsafe { (*(*dec_stream.stream.inner).codecpar).sample_aspect_ratio },
             framerate_in: dec_stream.avg_framerate,
+            framerate_forced: dec_stream.framerate_forced,
             apply_cropping: 0,
             hwaccel_id: dec_stream.hwaccel_id,
             hwaccel_device_type: dec_stream.hwaccel_device_type,
@@ -1172,8 +1212,9 @@ struct Decoder {
     #[allow(dead_code)]
     media_type: AVMediaType,
 
-    subtitle_header_size: i32,
-    subtitle_header: *mut u8,
+    /// Owned copy of dec_ctx.subtitle_header, captured right after
+    /// avcodec_open2; outlives the decoder context for downstream encoders.
+    subtitle_header: Option<Arc<[u8]>>,
 
     // number of frames/samples retrieved from the decoder
     frames_decoded: u64,
@@ -1391,7 +1432,14 @@ unsafe fn video_frame_process(
 
     (*frame).pts = (*frame).best_effort_timestamp;
 
-    //TODO forced fixed framerate
+    // forced fixed framerate: drop container timestamps and stamp frames on
+    // the CFR grid (ffmpeg_dec.c:398-403); the extrapolation below assigns
+    // consecutive pts values in 1/framerate units
+    if dp.framerate_forced {
+        (*frame).pts = AV_NOPTS_VALUE;
+        (*frame).duration = 1;
+        (*frame).time_base = av_inv_q(dp.framerate_in);
+    }
 
     // no timestamp available - extrapolate from previous frame duration
     if (*frame).pts == AV_NOPTS_VALUE {
@@ -1448,8 +1496,9 @@ unsafe fn video_duration_estimate(dp: &MutexGuard<DecoderParameter>, frame: *mut
     // to 1 and the actual duration of the last frame is more than 2x larger
     let duration_unreliable = (*frame).duration == 1 && ts_diff > 2 * (*frame).duration;
 
-    // prefer frame duration for containers with timestamps
-    if (*frame).duration > 0 && !duration_unreliable {
+    // prefer frame duration for containers with timestamps; a forced
+    // framerate always wins (ffmpeg_dec.c:306-308 fr_forced)
+    if dp.framerate_forced || ((*frame).duration > 0 && !duration_unreliable) {
         return (*frame).duration;
     }
 

@@ -12,7 +12,7 @@ use ffmpeg_sys_next::AVPixelFormat::{
     AV_PIX_FMT_CUDA, AV_PIX_FMT_MEDIACODEC, AV_PIX_FMT_NONE, AV_PIX_FMT_QSV,
 };
 use ffmpeg_sys_next::{
-    av_channel_layout_default, av_codec_is_decoder, av_codec_iterate, av_get_pix_fmt, av_hwdevice_find_type_by_name, av_hwdevice_get_type_name, avcodec_descriptor_get, avcodec_descriptor_get_by_name, avcodec_find_decoder, avcodec_find_decoder_by_name, avcodec_get_hw_config, AVChannelOrder, AVCodecID, AVCodecParameters, AVFormatContext, AVHWDeviceType, AVMediaType, AVPixelFormat, AVRational, AVERROR, AVERROR_DECODER_NOT_FOUND, EINVAL
+    av_channel_layout_default, av_codec_is_decoder, av_codec_iterate, av_get_pix_fmt, av_hwdevice_find_type_by_name, av_hwdevice_get_type_name, avcodec_descriptor_get, avcodec_descriptor_get_by_name, avcodec_find_decoder, avcodec_find_decoder_by_name, avcodec_get_hw_config, AVChannelOrder, AVCodecID, AVCodecParameters, AVFormatContext, AVHWDeviceType, AVMediaType, AVPixelFormat, AVRational, AVERROR, EINVAL
 };
 use log::{debug, error, warn};
 use std::ffi::{CStr, CString};
@@ -37,14 +37,14 @@ pub(crate) struct Demuxer {
     /// Default is true (enabled).
     ///
     /// FFmpeg CLI: `-autorotate 0/1`
-    /// FFmpeg source: `ffmpeg_demux.c:1319`, `ffmpeg_filter.c` (FFmpeg 7.x)
+    /// FFmpeg source: `ffmpeg_demux.c:1270`, `ffmpeg_filter.c:1744-1778` (FFmpeg 7.x)
     pub(crate) autorotate: bool,
 
     /// Timestamp scale factor for pts/dts values.
     /// Default is 1.0 (no scaling).
     ///
     /// FFmpeg CLI: `-itsscale <scale>`
-    /// FFmpeg source: `ffmpeg_demux.c:420-422` (FFmpeg 7.x)
+    /// FFmpeg source: `ffmpeg_demux.c:404-406` (FFmpeg 7.x)
     pub(crate) ts_scale: f64,
 
     /// Forced framerate for the input video stream.
@@ -71,6 +71,18 @@ pub(crate) struct Demuxer {
 // frame_pipelines with Box<dyn FrameFilter> which only implements Send.
 unsafe impl Send for Demuxer {}
 
+impl Drop for Demuxer {
+    fn drop(&mut self) {
+        // Owns the input context until demux_init hands it to the demuxer
+        // thread (which nulls this field). A context that never started —
+        // build() succeeded but start() was never called or failed midway —
+        // was previously leaked. The helper no-ops on null and reclaims the
+        // custom-IO callback state.
+        crate::core::context::in_fmt_ctx_free(self.in_fmt_ctx, self.is_set_read_callback);
+        self.in_fmt_ctx = std::ptr::null_mut();
+    }
+}
+
 impl Demuxer {
     pub(crate) fn new(
         url: String,
@@ -93,6 +105,7 @@ impl Demuxer {
         autorotate: bool,
         ts_scale: f64,
         framerate: AVRational,
+        log_level_offset: i32,
     ) -> crate::error::Result<Self> {
         let streams = Self::init_streams(
             in_fmt_ctx,
@@ -102,6 +115,8 @@ impl Demuxer {
             hwaccel.clone(),
             hwaccel_device,
             hwaccel_output_format,
+            framerate,
+            log_level_offset,
         )?;
 
         Ok(Self {
@@ -136,6 +151,8 @@ impl Demuxer {
         hwaccel: Option<String>,
         hwaccel_device: Option<String>,
         hwaccel_output_format: Option<String>,
+        forced_framerate: AVRational,
+        log_level_offset: i32,
     ) -> crate::error::Result<Vec<DecoderStream>> {
         unsafe {
             let stream_count = (*fmt_ctx).nb_streams;
@@ -146,7 +163,17 @@ impl Demuxer {
 
                 let duration = (*st).duration;
                 let time_base = (*st).time_base;
-                let avg_framerate = (*st).avg_frame_rate;
+                // A user-forced framerate replaces the container's average
+                // for video (ffmpeg_demux.c:1002-1006: forced -> flags |=
+                // FRAMERATE_FORCED, else framerate = avg_frame_rate).
+                let codec_type_early = (*(*st).codecpar).codec_type;
+                let framerate_forced = forced_framerate.num != 0
+                    && codec_type_early == AVMEDIA_TYPE_VIDEO;
+                let avg_framerate = if framerate_forced {
+                    forced_framerate
+                } else {
+                    (*st).avg_frame_rate
+                };
                 let codec_parameters = (*st).codecpar;
                 let codec_type = (*codec_parameters).codec_type;
 
@@ -191,10 +218,12 @@ impl Demuxer {
                     duration,
                     time_base,
                     avg_framerate,
+                    framerate_forced,
                     hwaccel_id,
                     hwaccel_device_type,
                     hwaccel_device,
                     hwaccel_output_format,
+                    log_level_offset,
                 );
                 streams.push(stream);
             }
@@ -294,7 +323,7 @@ fn choose_decoder(
 
             if codec.is_null() {
                 error!("Unknown decoder '{codec_name}'");
-                return Err(OpenInputError::from(AVERROR_DECODER_NOT_FOUND).into());
+                return Err(crate::error::DecoderError::NotFound(codec_name).into());
             }
 
             if (*codec).type_ != codec_type {

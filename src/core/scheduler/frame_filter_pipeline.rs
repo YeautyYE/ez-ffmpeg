@@ -8,11 +8,11 @@ use crate::error::Error::{
     FrameFilterStreamTypeNoMatched, FrameFilterThreadExited, FrameFilterTypeNoMatched,
 };
 use crate::filter::frame_pipeline::FramePipeline;
+use crate::util::thread_synchronizer::{ThreadDoneGuard, ThreadSynchronizer};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use ffmpeg_next::Frame;
 use ffmpeg_sys_next::{av_frame_copy_props, av_frame_ref};
 use log::{debug, error, info, warn};
-use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
@@ -24,6 +24,7 @@ pub(crate) fn input_pipeline_init(
     decoder_streams: &mut Vec<DecoderStream>,
     frame_pool: ObjPool<Frame>,
     scheduler_status: Arc<AtomicUsize>,
+    thread_sync: ThreadSynchronizer,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
 ) -> crate::error::Result<()> {
     if pipeline.filters.is_empty() {
@@ -44,6 +45,7 @@ pub(crate) fn input_pipeline_init(
         pipeline_frame_senders,
         frame_pool,
         scheduler_status,
+        thread_sync,
         scheduler_result,
     )
 }
@@ -53,6 +55,7 @@ pub(crate) fn output_pipeline_init(
     encoder_streams: &mut Vec<EncoderStream>,
     frame_pool: ObjPool<Frame>,
     scheduler_status: Arc<AtomicUsize>,
+    thread_sync: ThreadSynchronizer,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
 ) -> crate::error::Result<()> {
     if pipeline.filters.is_empty() {
@@ -73,6 +76,7 @@ pub(crate) fn output_pipeline_init(
         vec![(pipeline_frame_sender, usize::MAX, Arc::new([]))],
         frame_pool,
         scheduler_status,
+        thread_sync,
         scheduler_result,
     )
 }
@@ -210,6 +214,7 @@ fn pipeline_init(
     frame_senders: Vec<(Sender<FrameBox>, usize, Arc<[AtomicBool]>)>,
     frame_pool: ObjPool<Frame>,
     scheduler_status: Arc<AtomicUsize>,
+    thread_sync: ThreadSynchronizer,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
 ) -> crate::error::Result<()> {
     let pipeline_name = if is_input {
@@ -217,12 +222,18 @@ fn pipeline_init(
     } else {
         "output-frame-pipeline".to_string()
     };
+
+    // Slot claimed before spawn; the guard releases it on any exit path.
+    thread_sync.thread_start();
+    let thread_done_guard = ThreadDoneGuard::adopt(thread_sync.clone(), scheduler_status.clone());
+
     let result = std::thread::Builder::new()
         .name(format!(
             "{pipeline_name}:{}:{stream_index}:{demux_mux_idx}",
             type_to_symbol(pipeline.media_type),
         ))
         .spawn(move || {
+            let _thread_done = thread_done_guard;
             if let Err(e) = frame_filter_init(&mut pipeline) {
                 pipeline_uninit(&mut pipeline);
                 crate::core::scheduler::ffmpeg_scheduler::set_scheduler_error(
@@ -369,8 +380,7 @@ fn send_frame(
                 bits_per_raw_sample: 0,
                 input_stream_width: 0,
                 input_stream_height: 0,
-                subtitle_header_size: 0,
-                subtitle_header: null_mut(),
+                subtitle_header: None,
                 fg_input_index: usize::MAX,
             },
         };
@@ -437,8 +447,9 @@ fn send_frame(
             }
         }
 
-        // Indices were collected in ascending order; remove back-to-front so
-        // earlier removals do not shift the positions of later ones.
+        // Indices were collected in ascending order: remove from the back so
+        // earlier indices stay valid (forward removal shifts the vector and
+        // removes the wrong senders).
         for i in finished_senders.into_iter().rev() {
             frame_senders.remove(i);
         }

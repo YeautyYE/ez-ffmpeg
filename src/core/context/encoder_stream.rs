@@ -1,10 +1,10 @@
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use crate::core::context::output::VSyncMethod;
 use crate::core::context::{FrameBox, PacketBox, Stream};
 use crossbeam_channel::{Receiver, Sender};
 use ffmpeg_sys_next::{AVCodec, AVMediaType, AVStream};
 
+/// fftools: `OutputStream` + `MuxStream` (ffmpeg.h / ffmpeg_mux.h).
 #[derive(Clone)]
 pub(crate) struct EncoderStream {
     pub(crate) stream_index: usize,
@@ -16,7 +16,7 @@ pub(crate) struct EncoderStream {
     src: Option<Receiver<FrameBox>>,
     dst: Option<Sender<PacketBox>>,
     dst_pre: Option<Sender<PacketBox>>,
-    mux_started: Option<Arc<AtomicBool>>,
+    mux_start_gate: Option<Arc<crate::core::context::MuxStartGate>>,
 }
 
 impl EncoderStream {
@@ -30,7 +30,7 @@ impl EncoderStream {
         src: Receiver<FrameBox>,
         dst: Sender<PacketBox>,
         dst_pre: Sender<PacketBox>,
-        mux_started: Arc<AtomicBool>,
+        mux_start_gate: Arc<crate::core::context::MuxStartGate>,
     ) -> Self {
         Self {
             stream_index,
@@ -42,7 +42,7 @@ impl EncoderStream {
             src: Some(src),
             dst: Some(dst),
             dst_pre: Some(dst_pre),
-            mux_started: Some(mux_started),
+            mux_start_gate: Some(mux_start_gate),
         }
     }
 
@@ -58,8 +58,8 @@ impl EncoderStream {
         self.dst_pre.take().unwrap()
     }
 
-    pub(crate) fn take_mux_started(&mut self) -> Arc<AtomicBool> {
-        self.mux_started.take().unwrap()
+    pub(crate) fn take_mux_start_gate(&mut self) -> Arc<crate::core::context::MuxStartGate> {
+        self.mux_start_gate.take().unwrap()
     }
 
     pub fn replace_src(&mut self, new_src: Receiver<FrameBox>) -> Receiver<FrameBox> {

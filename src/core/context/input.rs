@@ -209,6 +209,10 @@ pub struct Input {
     /// select output format used with HW accelerated decoding
     pub(crate) hwaccel_output_format: Option<String>,
 
+    /// Log-level offset applied to this input's decoders
+    /// (`AVCodecContext.log_level_offset`).
+    pub(crate) log_level_offset: Option<i32>,
+
     /// Input options for avformat_open_input.
     ///
     /// This field stores options that are passed to FFmpeg's `avformat_open_input()` function.
@@ -256,8 +260,8 @@ pub struct Input {
     /// ```
     ///
     /// ## FFmpeg source reference (FFmpeg 7.x)
-    /// - Default value: `ffmpeg_demux.c:1319` (`ds->autorotate = 1`)
-    /// - Flag setting: `ffmpeg_demux.c:1137` (`IFILTER_FLAG_AUTOROTATE`)
+    /// - Default value: `ffmpeg_demux.c:1270` (`ds->autorotate = 1`)
+    /// - Flag setting: `ffmpeg_demux.c:1088` (`IFILTER_FLAG_AUTOROTATE`)
     /// - Filter insertion: `ffmpeg_filter.c:1744-1778`
     pub(crate) autorotate: Option<bool>,
 
@@ -279,8 +283,8 @@ pub struct Input {
     /// ```
     ///
     /// ## FFmpeg source reference (FFmpeg 7.x)
-    /// - Default value: `ffmpeg_demux.c:1316` (`ds->ts_scale = 1.0`)
-    /// - Application: `ffmpeg_demux.c:420-422` (applied after ts_offset)
+    /// - Default value: `ffmpeg_demux.c:1267` (`ds->ts_scale = 1.0`)
+    /// - Application: `ffmpeg_demux.c:404-406` (applied after ts_offset)
     pub(crate) ts_scale: Option<f64>,
 
     /// Forced framerate for the input video stream.
@@ -688,6 +692,34 @@ impl Input {
         self
     }
 
+    /// Sets a **log-level offset** for this input's decoders
+    /// (`AVCodecContext.log_level_offset`).
+    ///
+    /// FFmpeg shifts the effective level of every message a decoder emits by
+    /// this offset. Expected decoder noise — e.g. h264 `Missing reference
+    /// picture` / `decode_slice_header error` bursts right after seeking to a
+    /// non-keyframe (open GOP) — is logged at ERROR level; an offset of `8`
+    /// (one AV_LOG step) demotes those to WARNING for this input only,
+    /// without hiding errors from other inputs.
+    ///
+    /// # Arguments
+    /// * `offset` - Added to each message's log level; positive values make
+    ///   this input's decoders quieter, negative values make them louder.
+    ///
+    /// # Returns
+    /// * `Self` - allowing method chaining.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// // Screenshot after seek: demote expected h264 reference errors.
+    /// let input = Input::from("video.mp4")
+    ///     .set_log_level_offset(8);
+    /// ```
+    pub fn set_log_level_offset(mut self, offset: i32) -> Self {
+        self.log_level_offset = Some(offset);
+        self
+    }
+
     /// Sets the **start time** (in microseconds) from which to begin reading.
     ///
     /// FFmpeg will skip all data before this timestamp. This can be used to
@@ -962,6 +994,9 @@ impl Input {
     /// let input = Input::from("video.mp4")
     ///     .set_ts_scale(2.0);
     /// ```
+    ///
+    /// # Panics
+    /// Panics if `scale` is not a positive finite number.
     pub fn set_ts_scale(mut self, scale: f64) -> Self {
         assert!(scale.is_finite(), "ts_scale must be finite, got {scale}");
         assert!(scale > 0.0, "ts_scale must be positive, got {scale}");
@@ -999,6 +1034,9 @@ impl Input {
     /// let input = Input::from("video.mp4")
     ///     .set_framerate(24000, 1001);
     /// ```
+    ///
+    /// # Panics
+    /// Panics if `num` or `den` is not positive.
     pub fn set_framerate(mut self, num: i32, den: i32) -> Self {
         assert!(num > 0, "framerate numerator must be positive, got {num}");
         assert!(den > 0, "framerate denominator must be positive, got {den}");
@@ -1027,6 +1065,7 @@ impl From<Box<dyn FnMut(&mut [u8]) -> i32 + Send>> for Input {
             hwaccel: None,
             hwaccel_device: None,
             hwaccel_output_format: None,
+            log_level_offset: None,
             input_opts: None,
             autorotate: None,
             ts_scale: None,
@@ -1055,6 +1094,7 @@ impl From<String> for Input {
             hwaccel: None,
             hwaccel_device: None,
             hwaccel_output_format: None,
+            log_level_offset: None,
             input_opts: None,
             autorotate: None,
             ts_scale: None,

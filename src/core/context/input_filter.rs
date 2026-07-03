@@ -1,3 +1,7 @@
+//! Port of fftools `InputFilter`/`InputFilterOptions` (FFmpeg 7.x
+//! fftools/ffmpeg_filter.c): one input pad of a filtergraph plus the
+//! bind-time options, including the `IFILTER_FLAG_*` constants.
+
 use crate::core::context::null_frame;
 use ffmpeg_sys_next::{AVMediaType, AVRational};
 use ffmpeg_next::Frame;
@@ -7,6 +11,9 @@ pub(crate) struct InputFilter {
     pub(crate) media_type: AVMediaType,
     pub(crate) name: String,
     pub(crate) opts: InputFilterOptions,
+    /// Set when this pad was connected to another filtergraph's output;
+    /// such a pad must not additionally be bound to a demuxer stream.
+    pub(crate) bound: bool,
 }
 
 impl InputFilter {
@@ -16,6 +23,7 @@ impl InputFilter {
             media_type,
             name,
             opts: InputFilterOptions::new(fallback),
+            bound: false,
         }
     }
 }

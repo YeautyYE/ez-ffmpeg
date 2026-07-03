@@ -19,7 +19,7 @@ use ffmpeg_sys_next::AV_CODEC_PROP_FIELDS;
 use ffmpeg_sys_next::{
     av_compare_ts, av_gettime_relative, av_inv_q, av_mul_q, av_packet_ref, av_q2d, av_read_frame,
     av_rescale, av_rescale_q, av_stream_get_parser, av_usleep,
-    avformat_seek_file, AVCodecDescriptor, AVCodecParameters, AVFormatContext, AVMediaType,
+    avformat_seek_file, AVCodecDescriptor, AVFormatContext, AVMediaType,
     AVPacket, AVRational, AVStream, AVERROR, AVERROR_EOF, AVFMT_TS_DISCONT,
     AV_NOPTS_VALUE, AV_PKT_FLAG_CORRUPT, AV_TIME_BASE, AV_TIME_BASE_Q,
     EAGAIN,
@@ -31,6 +31,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use crate::core::scheduler::input_controller::SchNode;
 use crate::util::ffmpeg_utils::av_err2str;
+use crate::util::thread_synchronizer::{ThreadDoneGuard, ThreadSynchronizer};
 
 #[cfg(feature = "docs-rs")]
 pub(crate) fn demux_init(
@@ -40,6 +41,7 @@ pub(crate) fn demux_init(
     packet_pool: ObjPool<Packet>,
     demux_node: Arc<SchNode>,
     scheduler_status: Arc<AtomicUsize>,
+    thread_sync: ThreadSynchronizer,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
 ) -> crate::error::Result<()> {
     Ok(())
@@ -53,6 +55,7 @@ pub(crate) fn demux_init(
     packet_pool: ObjPool<Packet>,
     demux_node: Arc<SchNode>,
     scheduler_status: Arc<AtomicUsize>,
+    thread_sync: ThreadSynchronizer,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
 ) -> crate::error::Result<()> {
     if demux.destination_is_empty() {
@@ -75,11 +78,20 @@ pub(crate) fn demux_init(
 
     let format_name = unsafe { CStr::from_ptr((*(*in_fmt_ctx).iformat).name).to_str().unwrap_or("unknown") };
 
+    // Claim the thread slot before spawning so stop()/wait() can never
+    // observe a zero counter while this worker is about to run; the guard
+    // releases it on any exit path, including panic.
+    thread_sync.thread_start();
+    let thread_done_guard = ThreadDoneGuard::adopt(thread_sync.clone(), scheduler_status.clone());
+
     let result = std::thread::Builder::new()
         .name(format!("demuxer{demux_idx}:{format_name}"))
         .spawn(move || {
+            let _thread_done = thread_done_guard;
             let in_fmt_ctx_box = in_fmt_ctx_box;
             let mut is_started = false;
+            // Mirrors FFmpeg's Demuxer.nb_streams_warn: warn once per unexpected stream id.
+            let mut nb_streams_warn = demux_parameter.demux_streams.len();
             demux_parameter.wallclock_start = unsafe { av_gettime_relative() };
 
             loop {
@@ -134,8 +146,10 @@ pub(crate) fn demux_init(
                             #[cfg(not(windows))]
                             let should_skip_packet_send = false;
 
-                            // Selectively bypass packet sending based on platform and acceleration
-                            let mut ret = if should_skip_packet_send {
+                            // Assign the OUTER ret: a shadowing binding here
+                            // hid seek/flush failures from the error check
+                            // below, so a failed loop restart broke silently.
+                            ret = if should_skip_packet_send {
                                 // Skip sending the flush packet when using CUDA on Windows
                                 // This avoids the "cuvid decode callback error" issue that occurs during loop iterations
                                 // Testing showed that after the third loop iteration, avcodec_receive_frame would consistently
@@ -151,7 +165,6 @@ pub(crate) fn demux_init(
                                         codec_type: AVMediaType::AVMEDIA_TYPE_UNKNOWN,
                                         output_stream_index: 0,
                                         is_copy: false,
-                                        codecpar: null_mut(),
                                     },
                                 };
                                 demux_send(&mut demux_parameter, packet_box, &packet_pool, 0, &demux_node, &scheduler_status, independent_readrate)
@@ -167,7 +180,10 @@ pub(crate) fn demux_init(
                             /* fallthrough to the error path */
                         }
 
-                        if ret != 0 {
+                        // AVERROR_EXIT is a normal stop (the scheduler asked
+                        // us to quit mid-send), never a task failure
+                        // (matches ffmpeg_demux.c:780-781 EOF/EXIT handling).
+                        if ret != 0 && ret != ffmpeg_sys_next::AVERROR_EXIT {
                             set_scheduler_error(
                                 &scheduler_status,
                                 &scheduler_result,
@@ -180,10 +196,32 @@ pub(crate) fn demux_init(
                         break;
                     }
 
-                    demux_parameter.end_pts = Timestamp {
-                        ts: (*packet.as_ptr()).pts,
-                        tb: (*packet.as_ptr()).time_base,
-                    };
+                    if demux_parameter.demux_streams.len()
+                        <= (*packet.as_ptr()).stream_index as usize
+                    {
+                        let stream_index = (*packet.as_ptr()).stream_index as usize;
+                        if stream_index >= nb_streams_warn {
+                            warn!("Incorrect stream id:{stream_index}, ignoring its packets");
+                            nb_streams_warn = stream_index + 1;
+                        }
+                        packet_pool.release(packet);
+                        continue;
+                    }
+
+                    // Discarded and finished streams are dropped before the
+                    // corrupt check and any ts_fixup/readrate/send
+                    // bookkeeping, like the loop-top skip in fftools
+                    // (ffmpeg_demux.c:751 precedes the corrupt handling at
+                    // :756-766): a bad packet on a dead stream must not
+                    // fail streams that are still consuming.
+                    {
+                        let ds = &demux_parameter.demux_streams
+                            [(*packet.as_ptr()).stream_index as usize];
+                        if ds.discard || ds.finished {
+                            packet_pool.release(packet);
+                            continue;
+                        }
+                    }
 
                     if (*packet.as_ptr()).flags & AV_PKT_FLAG_CORRUPT != 0 {
                         if demux_parameter.exit_on_error {
@@ -192,7 +230,15 @@ pub(crate) fn demux_init(
                                 (*packet.as_ptr()).stream_index
                             );
                             packet_pool.release(packet);
-                            // ret = AVERROR_INVALIDDATA;
+                            // exit_on_error promises a failing result, not a
+                            // silent early stop (fftools aborts here).
+                            set_scheduler_error(
+                                &scheduler_status,
+                                &scheduler_result,
+                                Demuxing(DemuxingOperationError::ReadFrameError(
+                                    DemuxingError::from(ffmpeg_sys_next::AVERROR_INVALIDDATA),
+                                )),
+                            );
                             break;
                         } else {
                             warn!(
@@ -200,13 +246,6 @@ pub(crate) fn demux_init(
                                 (*packet.as_ptr()).stream_index
                             );
                         }
-                    }
-
-                    if demux_parameter.demux_streams.len()
-                        <= (*packet.as_ptr()).stream_index as usize
-                    {
-                        warn!("Incorrect stream id:{}", (*packet.as_ptr()).stream_index);
-                        continue;
                     }
 
                     is_started = true;
@@ -220,6 +259,14 @@ pub(crate) fn demux_init(
                     if ret < 0 {
                         break;
                     }
+
+                    // Captured after ts_fixup: the raw packet's time_base is
+                    // {0,1} and its pts is not wrap-corrected — using those
+                    // made every stream_loop duration computation garbage.
+                    demux_parameter.end_pts = Timestamp {
+                        ts: (*packet.as_ptr()).pts,
+                        tb: (*packet.as_ptr()).time_base,
+                    };
 
                     if let Some(readrate) = demux_parameter.readrate {
                         if readrate != 0.0 {
@@ -243,7 +290,6 @@ pub(crate) fn demux_init(
                                 codec_type: ds.codec_type,
                                 output_stream_index: 0,
                                 is_copy: false,
-                                codecpar: ds.codecpar,
                             },
                         };
                         ret = demux_send(&mut demux_parameter, packet_box, &packet_pool, send_flags, &demux_node, &scheduler_status, independent_readrate);
@@ -256,7 +302,7 @@ pub(crate) fn demux_init(
             }
 
             if is_started {
-                demux_done(&mut demux_parameter, &packet_pool, &scheduler_status);
+                demux_done(&mut demux_parameter, &packet_pool);
             }
 
             let node = demux_node.as_ref();
@@ -274,7 +320,7 @@ pub(crate) fn demux_init(
     Ok(())
 }
 
-fn demux_done(demux_parameter: &mut DemuxerParameter, packet_pool: &ObjPool<Packet>, scheduler_status: &Arc<AtomicUsize>) {
+fn demux_done(demux_parameter: &mut DemuxerParameter, packet_pool: &ObjPool<Packet>) {
     for ds in &demux_parameter.demux_streams {
         for (i, (packet_dst, input_stream_index, output_stream_index)) in
             demux_parameter.dsts.iter().enumerate()
@@ -300,7 +346,6 @@ fn demux_done(demux_parameter: &mut DemuxerParameter, packet_pool: &ObjPool<Pack
                     codec_type: ds.codec_type,
                     output_stream_index: 0,
                     is_copy: false,
-                    codecpar: ds.codecpar,
                 },
             };
 
@@ -311,11 +356,19 @@ fn demux_done(demux_parameter: &mut DemuxerParameter, packet_pool: &ObjPool<Pack
                     output_stream_index,
                     dst_finished,
                     0,
-                    scheduler_status,
                 )
             };
-            if ret < 0 {
-                warn!("demux_done: failed to send flush packet for stream {i}, ret={ret}");
+            if ret == AVERROR_EOF {
+                // Normal teardown: this destination already finished (max_frames /
+                // recording_time / downstream exit). FFmpeg's demux_done ignores
+                // AVERROR_EOF here as well (fftools/ffmpeg_sched.c).
+                debug!(
+                    "demux_done: dst {i} (input stream {input_stream_index}) already finished"
+                );
+            } else if ret < 0 {
+                warn!(
+                    "demux_done: failed to send flush packet for input stream {input_stream_index}, ret={ret}"
+                );
             }
         }
     }
@@ -438,7 +491,7 @@ unsafe fn ts_fixup(
     }
 
     // Apply timestamp scaling (after ts_offset, before duration)
-    // FFmpeg source: ffmpeg_demux.c:420-422 (FFmpeg 7.x)
+    // FFmpeg source: ffmpeg_demux.c:404-406 (FFmpeg 7.x)
     // Note: C's `int64_t *= double` truncates toward zero, Rust's `as i64` behaves the same.
     let ts_scale = demux_parameter.ts_scale;
     if ts_scale != 1.0 {
@@ -748,7 +801,6 @@ unsafe fn ts_discontinuity_detect(
 struct DemuxStreamParameter {
     codec_type: AVMediaType,
     stream_index: usize,
-    codecpar: *mut AVCodecParameters,
     codec_desc: *const AVCodecDescriptor,
 
     wrap_correction_done: bool,
@@ -759,29 +811,32 @@ struct DemuxStreamParameter {
     next_dts: i64,
     ///< dts of the last packet read for this stream (in AV_TIME_BASE units)
     dts: i64,
+
+    ///< no consumer is bound to this stream; its packets are dropped at the
+    ///< demux loop top (ffmpeg_demux.c:751, flipped on binding at :904-906)
+    discard: bool,
+    ///< all consumers of this stream saw EOF (ffmpeg_demux.c:523)
+    finished: bool,
 }
 
-// SAFETY: DemuxStreamParameter contains raw pointers (codecpar, codec_desc) but is safe to
-// Send/Sync because:
-// 1. codecpar points to AVCodecParameters owned by AVStream, which lives for the duration
-//    of the demuxer and is only read (not written) after initialization
-// 2. codec_desc points to static FFmpeg codec descriptor data (read-only)
-// 3. The demuxer thread has exclusive access during demuxing operations
-// 4. Data is passed to other threads via crossbeam channels (by value, not pointer)
+// SAFETY: codec_desc points to static FFmpeg codec descriptor data
+// (read-only), and the demuxer thread owns the value exclusively. Sync is
+// intentionally NOT implemented: nothing shares &DemuxStreamParameter
+// across threads.
 unsafe impl Send for DemuxStreamParameter {}
-unsafe impl Sync for DemuxStreamParameter {}
 impl DemuxStreamParameter {
     fn new(ds: &DecoderStream) -> Self {
         Self {
             codec_type: ds.codec_type,
             stream_index: ds.stream_index,
-            codecpar: ds.codec_parameters,
             codec_desc: ds.codec_desc,
             wrap_correction_done: false,
             saw_first_ts: false,
             first_dts: AV_NOPTS_VALUE,
             next_dts: AV_NOPTS_VALUE,
             dts: 0,
+            discard: true,
+            finished: false,
         }
     }
 }
@@ -809,7 +864,7 @@ struct DemuxerParameter {
     /// Applied after ts_offset addition. Default is 1.0.
     ///
     /// FFmpeg CLI: `-itsscale <scale>`
-    /// FFmpeg source: `ffmpeg_demux.c:420-422` (FFmpeg 7.x)
+    /// FFmpeg source: `ffmpeg_demux.c:404-406` (FFmpeg 7.x)
     ts_scale: f64,
 
     /// Forced framerate for the input video stream.
@@ -832,15 +887,17 @@ struct DemuxerParameter {
     demux_streams: Vec<DemuxStreamParameter>,
 
     dsts: Vec<(Sender<PacketBox>, usize, Option<usize>)>,
+
+    /// Streams with at least one bound consumer (ffmpeg_demux.c:906).
+    nb_streams_used: usize,
+    /// Streams whose consumers have all finished (ffmpeg_demux.c:525).
+    nb_streams_finished: usize,
 }
 
-// SAFETY: DemuxerParameter is safe to Send/Sync because:
-// 1. All contained raw pointers are within DemuxStreamParameter (see its SAFETY comment)
-// 2. The Sender<PacketBox> channels are inherently Send/Sync (crossbeam-channel)
-// 3. The demuxer thread has exclusive ownership during demuxing operations
-// 4. No mutable aliasing occurs - the parameter is used by a single thread at a time
+// SAFETY: all raw pointers live in DemuxStreamParameter (see its SAFETY
+// comment) and the demuxer thread owns the value exclusively; the channel
+// senders are Send by themselves. Sync is intentionally NOT implemented.
 unsafe impl Send for DemuxerParameter {}
-unsafe impl Sync for DemuxerParameter {}
 impl DemuxerParameter {
     fn new(demux: &mut Demuxer) -> Self {
         let dsts = demux.take_dsts();
@@ -859,6 +916,18 @@ impl DemuxerParameter {
         for i in 0..nb_streams {
             let stream = demux.get_stream(i as usize);
             demux_streams.push(DemuxStreamParameter::new(stream))
+        }
+
+        // fftools flips ds->discard when a consumer binds to the stream and
+        // counts it as used (ffmpeg_demux.c:904-906 ist_use).
+        let mut nb_streams_used = 0;
+        for ds in &mut demux_streams {
+            ds.discard = !dsts
+                .iter()
+                .any(|(_, input_stream_index, _)| *input_stream_index == ds.stream_index);
+            if !ds.discard {
+                nb_streams_used += 1;
+            }
         }
 
 
@@ -888,6 +957,8 @@ impl DemuxerParameter {
             max_pts: Default::default(),
             demux_streams,
             dsts,
+            nb_streams_used,
+            nb_streams_finished: 0,
         }
     }
 }
@@ -917,13 +988,17 @@ unsafe fn seek_to_start(
         return ret;
     }
 
-    if demux_parameter.end_pts.ts != AV_NOPTS_VALUE && demux_parameter.max_pts.ts == AV_NOPTS_VALUE
-        || av_compare_ts(
-            demux_parameter.max_pts.ts,
-            demux_parameter.max_pts.tb,
-            demux_parameter.end_pts.ts,
-            demux_parameter.end_pts.tb,
-        ) < 0
+    // A && (B || C): with the old (A && B) || C grouping an end_pts of
+    // AV_NOPTS_VALUE could overwrite a valid max_pts via the C arm
+    // (matches ffmpeg_demux.c:191-194).
+    if demux_parameter.end_pts.ts != AV_NOPTS_VALUE
+        && (demux_parameter.max_pts.ts == AV_NOPTS_VALUE
+            || av_compare_ts(
+                demux_parameter.max_pts.ts,
+                demux_parameter.max_pts.tb,
+                demux_parameter.end_pts.ts,
+                demux_parameter.end_pts.tb,
+            ) < 0)
     {
         demux_parameter.max_pts = demux_parameter.end_pts.clone();
     }
@@ -991,10 +1066,31 @@ unsafe fn demux_send(
     // flush the downstreams after seek
     if (*packet_box.packet.as_ptr()).stream_index == -1 {
         packet_pool.release(packet_box.packet);
-        return demux_flush(packet_pool, &demux_parameter.dsts);
+        return demux_flush(
+            packet_pool,
+            &demux_parameter.dsts,
+            &mut demux_parameter.dsts_finished,
+        );
     }
 
-    demux_send_for_stream(demux_parameter, packet_box, packet_pool, flags, scheduler_status)
+    let stream_index = (*packet_box.packet.as_ptr()).stream_index as usize;
+    let ret = demux_send_for_stream(demux_parameter, packet_box, packet_pool, flags);
+    if ret == AVERROR_EOF {
+        // One exhausted stream must not stop the demuxer while other streams
+        // still have consumers (ffmpeg_demux.c:511-530 do_send).
+        let ds = &mut demux_parameter.demux_streams[stream_index];
+        if !ds.finished {
+            debug!("All consumers of stream {stream_index} are done");
+            ds.finished = true;
+            demux_parameter.nb_streams_finished += 1;
+        }
+        if demux_parameter.nb_streams_finished == demux_parameter.nb_streams_used {
+            debug!("All consumers are done");
+            return AVERROR_EOF;
+        }
+        return 0;
+    }
+    ret
 }
 
 unsafe fn demux_send_for_stream(
@@ -1002,7 +1098,6 @@ unsafe fn demux_send_for_stream(
     packet_box: PacketBox,
     packet_pool: &ObjPool<Packet>,
     flags: usize,
-    scheduler_status: &Arc<AtomicUsize>
 ) -> i32 {
     let stream_index = (*packet_box.packet.as_ptr()).stream_index;
 
@@ -1016,6 +1111,14 @@ unsafe fn demux_send_for_stream(
             },
         )
         .collect::<Vec<_>>();
+
+    // Discarded streams are already skipped at the demux loop top
+    // (ffmpeg_demux.c:751); this backstop keeps an empty destination list
+    // from counting as "all consumers done".
+    if send_dsts.is_empty() {
+        packet_pool.release(packet_box.packet);
+        return 0;
+    }
 
     let mut nb_done = 0;
 
@@ -1045,7 +1148,6 @@ unsafe fn demux_send_for_stream(
                 output_stream_index,
                 dst_finished,
                 flags,
-                scheduler_status
             );
             if ret == AVERROR_EOF {
                 nb_done += 1;
@@ -1059,7 +1161,6 @@ unsafe fn demux_send_for_stream(
                 output_stream_index,
                 dst_finished,
                 flags,
-                scheduler_status
             );
             if ret == AVERROR_EOF {
                 nb_done += 1;
@@ -1070,7 +1171,12 @@ unsafe fn demux_send_for_stream(
         }
     }
 
-    if nb_done == demux_parameter.dsts.len() {
+    // EOF means THIS stream's consumers are all done: compare against this
+    // stream's destinations, not every destination of the demuxer — that
+    // never matched for multi-stream inputs, so a stream whose consumers had
+    // all finished kept the whole demuxer spinning
+    // (ffmpeg_sched.c demux_send_for_stream: nb_done == ds->nb_dst).
+    if nb_done == send_dsts.len() {
         AVERROR_EOF
     } else {
         0
@@ -1085,7 +1191,6 @@ unsafe fn demux_stream_send_to_dst(
     output_stream_index: &Option<usize>,
     dst_finished: &mut bool,
     flags: usize,
-    scheduler_status: &Arc<AtomicUsize>
 ) -> i32 {
     if *dst_finished {
         return AVERROR_EOF;
@@ -1111,18 +1216,16 @@ unsafe fn demux_stream_send_to_dst(
 
     if *dst_finished {
         if let Err(_) = packet_dst.send(packet_box) {
-            if !is_stopping(wait_until_not_paused(scheduler_status)) {
-                error!("Demuxer send packet failed, destination already finished");
-            }
+            // Receiver gone = downstream completed; a normal data-flow signal
+            // (FFmpeg returns AVERROR_EOF silently here).
+            debug!("Demuxer dst finished, stop sending");
         }
 
         return AVERROR_EOF;
     }
 
     if let Err(_) = packet_dst.send(packet_box) {
-        if !is_stopping(wait_until_not_paused(scheduler_status)) {
-            error!("Demuxer send packet failed, destination already finished");
-        }
+        debug!("Demuxer dst finished, stop sending");
 
         *dst_finished = true;
         return AVERROR_EOF;
@@ -1134,14 +1237,17 @@ unsafe fn demux_stream_send_to_dst(
 unsafe fn demux_flush(
     packet_pool: &ObjPool<Packet>,
     dsts: &Vec<(Sender<PacketBox>, usize, Option<usize>)>,
+    dsts_finished: &mut [bool],
 ) -> i32 {
     // let ts = AV_NOPTS_VALUE;
     // let tb = AVRational{ num: 0, den: 0 };
     // let max_end_ts = Timestamp { ts: AV_NOPTS_VALUE, tb: AVRational { num: 0, den: 0 } };
 
-    for (packet_dst, _input_stream_index, output_stream_index) in dsts {
-        //only send to decoder
-        if output_stream_index.is_some() {
+    for (i, (packet_dst, _input_stream_index, output_stream_index)) in dsts.iter().enumerate() {
+        // Finished and non-decoder destinations are skipped, like the
+        // fftools flush loop (ffmpeg_sched.c:1979-1980): a consumer that
+        // completed in an earlier pass must not fail the next loop.
+        if dsts_finished[i] || output_stream_index.is_some() {
             continue;
         }
 
@@ -1157,13 +1263,12 @@ unsafe fn demux_flush(
                 codec_type: AVMediaType::AVMEDIA_TYPE_UNKNOWN,
                 output_stream_index: 0,
                 is_copy: false,
-                codecpar: null_mut(),
             },
         };
 
         if let Err(_) = packet_dst.send(packet_box) {
-            error!("Demuxer send packet failed, destination already finished");
-            return AVERROR_EOF;
+            debug!("Demuxer dst finished, skipping flush packet");
+            dsts_finished[i] = true;
         }
 
         //TODO max_end_ts

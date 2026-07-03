@@ -78,7 +78,7 @@ pub fn get_metadata(input: impl Into<String>) -> Result<Vec<(String, String)>, f
 
 /// Gets the metadata of a specific chapter in a media file.
 ///
-/// FFmpeg reference: AVChapter->metadata in libavformat/avformat.h:1253
+/// FFmpeg reference: AVChapter->metadata in libavformat/avformat.h:1252
 /// Accesses chapter metadata dictionary similar to AVFormatContext->metadata
 ///
 /// # Arguments
@@ -114,7 +114,7 @@ pub fn get_chapter_metadata(
         .ok_or(ffmpeg_next::Error::InvalidData)?;
 
     // Get the chapter metadata and convert it to a vector of key-value pairs
-    // FFmpeg reference: AVChapter->metadata (AVDictionary) in avformat.h:1253
+    // FFmpeg reference: AVChapter->metadata (AVDictionary) in avformat.h:1252
     Ok(chapter
         .metadata()
         .iter()
@@ -124,7 +124,7 @@ pub fn get_chapter_metadata(
 
 /// Gets the metadata of a specific stream in a media file.
 ///
-/// FFmpeg reference: AVStream->metadata in libavformat/avformat.h:1310
+/// FFmpeg reference: AVStream->metadata in libavformat/avformat.h:830
 /// Accesses stream metadata dictionary similar to AVFormatContext->metadata
 ///
 /// # Arguments
@@ -151,13 +151,13 @@ pub fn get_stream_metadata(
     let format_context = format::input(&input.into())?;
 
     // Get the stream at the specified index
-    // FFmpeg reference: AVFormatContext->streams[stream_index] in avformat.h:1476
+    // FFmpeg reference: AVFormatContext->streams[stream_index] in avformat.h:1357
     let stream = format_context
         .stream(stream_index)
         .ok_or(ffmpeg_next::Error::StreamNotFound)?;
 
     // Get the stream metadata and convert it to a vector of key-value pairs
-    // FFmpeg reference: AVStream->metadata (AVDictionary) in avformat.h:1310
+    // FFmpeg reference: AVStream->metadata (AVDictionary) in avformat.h:830
     Ok(stream
         .metadata()
         .iter()

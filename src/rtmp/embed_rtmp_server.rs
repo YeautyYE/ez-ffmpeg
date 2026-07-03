@@ -180,6 +180,14 @@ impl EmbedRtmpServer<Initialization> {
             .name("rtmp-server-io".to_string())
             .spawn(move || {
             for stream in listener.incoming() {
+                // Check the stop flag on every iteration, not only when the
+                // listener runs dry: under a steady stream of incoming
+                // connections the WouldBlock branch is never taken and
+                // stop() would otherwise never terminate this thread.
+                if status.load(Ordering::Acquire) == STATUS_END {
+                    info!("Embed rtmp server stopped.");
+                    break;
+                }
                 match stream {
                     Ok(stream) => {
                         // Use try_send to apply backpressure when channel is full
@@ -201,10 +209,12 @@ impl EmbedRtmpServer<Initialization> {
                     }
                     Err(e) => {
                         if e.kind() == std::io::ErrorKind::WouldBlock {
-                            if status.load(Ordering::Acquire) == STATUS_END {
-                                info!("Embed rtmp server stopped.");
-                                break;
-                            }
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        } else if is_fd_exhaustion(&e) {
+                            // Accepting again immediately would fail the same
+                            // way and spin the CPU; back off and let existing
+                            // connections close first.
+                            warn!("Accept failed, file descriptors exhausted: {e}");
                             std::thread::sleep(std::time::Duration::from_millis(100));
                         } else {
                             debug!("Rtmp connection error: {:?}", e);
@@ -301,7 +311,10 @@ impl EmbedRtmpServer<Running> {
         let mut serializer = ChunkSerializer::new();
         let write_callback: Box<dyn FnMut(&[u8]) -> i32 + Send> = Box::new(move |buf: &[u8]| -> i32 {
             flv_buffer.write_data(buf);
-            if let Some(mut flv_tag) = flv_buffer.get_flv_tag() {
+            // One AVIO write can carry many FLV tags (the muxer hands over
+            // 64KB blocks): drain every complete tag now, or the backlog
+            // grows and the final tags of the stream are never sent.
+            while let Some(mut flv_tag) = flv_buffer.get_flv_tag() {
                 flv_tag.header.stream_id = 1;
                 match serializer.serialize(&flv_tag_to_message_payload(flv_tag), false, true) {
                     Ok(packet) => {
@@ -500,6 +513,26 @@ impl EmbedRtmpServer<Running> {
 /// - Uses epoll/kqueue/WSAPoll for IO multiplexing
 /// - Write queue with backpressure management
 /// - Strict drain until WouldBlock semantics
+/// Whether an accept error means the process (EMFILE) or system (ENFILE) ran
+/// out of file descriptors. `io::ErrorKind` has no stable variant for these,
+/// so match on the raw OS error code.
+fn is_fd_exhaustion(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(e.raw_os_error(), Some(code) if code == libc::EMFILE || code == libc::ENFILE)
+    }
+    #[cfg(windows)]
+    {
+        // WSAEMFILE: too many open sockets.
+        e.raw_os_error() == Some(10024)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = e;
+        false
+    }
+}
+
 fn handle_connections(
     connection_receiver: crossbeam_channel::Receiver<TcpStream>,
     publisher_receiver: crossbeam_channel::Receiver<(String, crossbeam_channel::Receiver<Vec<u8>>)>,

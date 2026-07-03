@@ -5,6 +5,7 @@ use crate::core::filter::frame_pipeline::FramePipeline;
 use crate::core::scheduler::input_controller::SchNode;
 use crate::error::OpenOutputError;
 use crossbeam_channel::{Receiver, Sender};
+use log::error;
 use ffmpeg_sys_next::{
     avformat_new_stream, AVCodec, AVFormatContext, AVMediaType, AVRational, AVSampleFormat,
     AVStream, AVFMT_NOTIMESTAMPS, AVFMT_VARIABLE_FPS,
@@ -90,6 +91,7 @@ pub(crate) struct Muxer {
     pub(crate) start_time_us: Option<i64>,
     pub(crate) recording_time_us: Option<i64>,
     pub(crate) framerate: Option<AVRational>,
+    pub(crate) framerate_max: Option<AVRational>,
     pub(crate) vsync_method: VSyncMethod,
     pub(crate) bits_per_raw_sample: Option<i32>,
     pub(crate) audio_sample_rate: Option<i32>,
@@ -132,7 +134,15 @@ pub(crate) struct Muxer {
     streams: Vec<EncoderStream>,
     queue: Option<(Sender<PacketBox>, Receiver<PacketBox>)>,
     src_pre_receivers: Vec<Receiver<PacketBox>>,
-    is_started: Arc<AtomicBool>,
+    mux_start_gate: Arc<crate::core::context::MuxStartGate>,
+
+    // Join handles of this muxer's encoder threads, delivered by enc_init.
+    // The muxer joins them before freeing its AVFormatContext: the encoders
+    // write into AVStreams owned by that context.
+    enc_handles: (
+        Sender<std::thread::JoinHandle<()>>,
+        Receiver<std::thread::JoinHandle<()>>,
+    ),
 
     pub(crate) nb_streams: usize,
     pub(crate) nb_streams_ready: Arc<AtomicUsize>,
@@ -144,6 +154,17 @@ pub(crate) struct Muxer {
 // accessed from the owning thread. Note: Muxer is NOT Sync because it contains
 // frame_pipelines with Box<dyn FrameFilter> which only implements Send.
 unsafe impl Send for Muxer {}
+
+impl Drop for Muxer {
+    fn drop(&mut self) {
+        // Owns the output context until mux_init/ready_to_init_mux hands it
+        // to the muxer thread (which nulls this field). A context that never
+        // started was previously leaked together with its avio buffer and
+        // write-callback state. The helper no-ops on null.
+        crate::core::context::out_fmt_ctx_free(self.out_fmt_ctx, self.is_set_write_callback);
+        self.out_fmt_ctx = std::ptr::null_mut();
+    }
+}
 
 impl Muxer {
     pub(crate) fn new(
@@ -159,6 +180,7 @@ impl Muxer {
         start_time_us: Option<i64>,
         recording_time_us: Option<i64>,
         framerate: Option<AVRational>,
+        framerate_max: Option<AVRational>,
         vsync_method: VSyncMethod,
         bits_per_raw_sample: Option<i32>,
         audio_sample_rate: Option<i32>,
@@ -199,6 +221,7 @@ impl Muxer {
             start_time_us,
             recording_time_us,
             framerate,
+            framerate_max,
             vsync_method,
             bits_per_raw_sample,
             audio_sample_rate,
@@ -217,7 +240,8 @@ impl Muxer {
             streams: vec![],
             queue: None,
             src_pre_receivers: vec![],
-            is_started: Arc::new(Default::default()),
+            mux_start_gate: Arc::new(crate::core::context::MuxStartGate::new()),
+            enc_handles: crossbeam_channel::unbounded(),
             nb_streams: 0,
             nb_streams_ready: Arc::new(Default::default()),
             is_set_write_callback,
@@ -265,6 +289,7 @@ impl Muxer {
         media_type: AVMediaType,
         enc: *const AVCodec,
         src_node: Arc<SchNode>,
+        single_stream_direct_input: bool,
     ) -> crate::error::Result<(Sender<FrameBox>, usize)> {
         let (packet_sender, st, stream_index) = self.new_stream(src_node)?;
         let (frame_sender, frame_receiver) = crossbeam_channel::bounded(8);
@@ -274,9 +299,11 @@ impl Muxer {
                 determine_vsync_method(
                     self.vsync_method,
                     self.framerate,
+                    self.framerate_max,
                     self.out_fmt_ctx,
                     self.copy_ts,
-                )
+                    single_stream_direct_input,
+                )?
             })
         } else {
             None
@@ -303,7 +330,7 @@ impl Muxer {
             frame_receiver,
             packet_sender,
             pre_packet_sender,
-            self.is_started.clone(),
+            self.mux_start_gate.clone(),
         );
         self.streams.push(stream);
         Ok((frame_sender, stream_index))
@@ -378,8 +405,16 @@ impl Muxer {
         std::mem::take(&mut self.streams)
     }
 
-    pub(crate) fn get_is_started(&self) -> Arc<AtomicBool> {
-        self.is_started.clone()
+    pub(crate) fn mux_start_gate(&self) -> Arc<crate::core::context::MuxStartGate> {
+        self.mux_start_gate.clone()
+    }
+
+    pub(crate) fn enc_handle_sender(&self) -> Sender<std::thread::JoinHandle<()>> {
+        self.enc_handles.0.clone()
+    }
+
+    pub(crate) fn enc_handle_receiver(&self) -> Receiver<std::thread::JoinHandle<()>> {
+        self.enc_handles.1.clone()
     }
 }
 
@@ -408,15 +443,37 @@ mod tests {
 unsafe fn determine_vsync_method(
     vsync_method: VSyncMethod,
     framerate: Option<AVRational>,
+    framerate_max: Option<AVRational>,
     out_fmt_ctx: *mut AVFormatContext,
     copy_ts: bool,
-) -> VSyncMethod {
-    if vsync_method != VSyncMethod::VsyncAuto {
-        return vsync_method;
+    single_stream_direct_input: bool,
+) -> crate::error::Result<VSyncMethod> {
+    // A frame rate or cap only acts through CFR-style conversion; combining
+    // one with an explicit non-CFR mode is contradictory
+    // (ffmpeg_mux_init.c:798-804).
+    if (framerate.is_some_and(|fr| fr.num != 0) || framerate_max.is_some_and(|fr| fr.num != 0))
+        && !matches!(
+            vsync_method,
+            VSyncMethod::VsyncAuto | VSyncMethod::VsyncCfr | VSyncMethod::VsyncVscfr
+        )
+    {
+        error!(
+            "One of framerate/framerate_max was specified together a non-CFR \
+             vsync method. This is contradictory."
+        );
+        return Err(crate::error::Error::OpenOutput(
+            OpenOutputError::InvalidArgument,
+        ));
     }
 
-    // 1. Check if frame rate is set
-    let mut vsync_method = if framerate.is_some_and(|fr| fr.num != 0) {
+    if vsync_method != VSyncMethod::VsyncAuto {
+        return Ok(vsync_method);
+    }
+
+    // 1. -r or -fpsmax both force CFR (ffmpeg_mux_init.c:807-808)
+    let mut vsync_method = if framerate.is_some_and(|fr| fr.num != 0)
+        || framerate_max.is_some_and(|fr| fr.num != 0)
+    {
         VSyncMethod::VsyncCfr
     }
     // 2. If output format is "avi", set VSYNC_VFR
@@ -440,10 +497,17 @@ unsafe fn determine_vsync_method(
         }
     };
 
-    // 4. If input stream exists and VSYNC_CFR is selected, check additional conditions
+    // 4. A stream fed directly by a single-stream input keeps its original
+    // grid (ffmpeg_mux_init.c:817-822; input_ts_offset is always 0 here
+    // since -itsoffset is not supported).
+    if vsync_method == VSyncMethod::VsyncCfr && single_stream_direct_input {
+        vsync_method = VSyncMethod::VsyncVscfr;
+    }
+
+    // 5. If input stream exists and VSYNC_CFR is selected, check additional conditions
     if vsync_method == VSyncMethod::VsyncCfr && copy_ts {
         vsync_method = VSyncMethod::VsyncVscfr;
     }
 
-    vsync_method
+    Ok(vsync_method)
 }

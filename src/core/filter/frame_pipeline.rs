@@ -36,6 +36,9 @@ impl FramePipeline {
     }
 
     /// Adds a filter to the pipeline. No dynamic removal is provided in this simplified approach.
+    ///
+    /// # Panics
+    /// Panics if the filter's media type differs from the pipeline's.
     pub fn add_filter(&mut self, name: impl Into<String>, filter: Box<dyn FrameFilter>) {
         assert_eq!(self.media_type, filter.media_type());
         self.filters.push(FilterHolder {
