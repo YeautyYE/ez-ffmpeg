@@ -339,16 +339,20 @@ fn test_rejects_unsupported_and_hw_formats() {
         };
         assert!(err.contains("format=yuv420p"), "unexpected error: {err}");
 
-        // Allocate as YUV420P (so data pointers are non-null) and then
-        // relabel as a hardware format: the format check must fire before
-        // anything dereferences the (now misdescribed) planes.
+        // Allocate as YUV420P (so buf[0] is non-null) and then relabel as a
+        // hardware format: hardware frames now take the download path, and
+        // this fake frame has no hw_frames_ctx, so the download must fail
+        // cleanly without anything dereferencing the misdescribed planes.
         let mut hw = make_yuv420p_frame(64, 64);
         (*hw.as_mut_ptr()).format = AVPixelFormat::AV_PIX_FMT_CUDA as i32;
         let err = match filter.filter_frame(hw, &ctx) {
             Err(e) => e,
-            Ok(_) => panic!("hardware-format input must be rejected"),
+            Ok(_) => panic!("a fake hardware frame must fail the download"),
         };
-        assert!(err.contains("hardware frame"), "unexpected error: {err}");
+        assert!(
+            err.contains("download hardware frame"),
+            "unexpected error: {err}"
+        );
     }
 }
 
@@ -414,4 +418,239 @@ fn test_bad_shader_fails_at_init_with_diagnostics() {
         ),
         Ok(()) => panic!("init must fail for invalid WGSL"),
     }
+}
+
+/// Pass-through filter counting every frame it sees; stands in for a
+/// downstream filter that must receive drained frames via `run_filters_from`.
+struct CountingFilter {
+    seen: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl FrameFilter for CountingFilter {
+    fn media_type(&self) -> ffmpeg_sys_next::AVMediaType {
+        ffmpeg_sys_next::AVMediaType::AVMEDIA_TYPE_VIDEO
+    }
+
+    fn filter_frame(
+        &mut self,
+        frame: Frame,
+        _ctx: &FrameFilterContext,
+    ) -> Result<Option<Frame>, String> {
+        self.seen
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(Some(frame))
+    }
+}
+
+/// Emulates `run_pipeline` (`src/core/scheduler/frame_filter_pipeline.rs`)
+/// against a real `FramePipeline`: `run_filters` per input, then per-filter
+/// `request_frame` polling that feeds `run_filters_from(i + 1, ..)`, and
+/// continued polling after the source is exhausted. A downstream filter must
+/// see every drained frame exactly once, in arrival order, marker last.
+#[test]
+fn test_frame_pipeline_driver_semantics() {
+    use crate::filter::frame_pipeline::FramePipeline;
+    use ffmpeg_sys_next::AVMediaType::AVMEDIA_TYPE_VIDEO;
+
+    fn poll_all(pipeline: &mut FramePipeline, out: &mut Vec<Frame>) {
+        for i in 0..pipeline.filter_len() {
+            loop {
+                match pipeline.request_frame(i).expect("request_frame") {
+                    Some(f) => {
+                        if let Some(f) =
+                            pipeline.run_filters_from(i + 1, f).expect("run_filters_from")
+                        {
+                            out.push(f);
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+
+    let filter = WgpuFrameFilter::builder()
+        .shader_wgsl(shaders::IDENTITY_FS)
+        .build()
+        .expect("builder");
+    let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut pipeline = FramePipeline::new(AVMEDIA_TYPE_VIDEO, None);
+    pipeline.add_filter("wgpu", Box::new(filter));
+    pipeline.add_filter(
+        "count",
+        Box::new(CountingFilter {
+            seen: std::sync::Arc::clone(&seen),
+        }),
+    );
+    match pipeline.init_filters() {
+        Ok(()) => {}
+        Err(e) if e.contains("adapter") || e.contains("device") => {
+            eprintln!("skipping wgpu test (no GPU): {e}");
+            return;
+        }
+        Err(e) => panic!("init failed: {e}"),
+    }
+
+    let n_real = 4usize;
+    let mut inputs: Vec<Frame> = (0..n_real)
+        .map(|i| {
+            make_planar_frame(
+                64,
+                48,
+                AVPixelFormat::AV_PIX_FMT_YUV420P,
+                Some((40 + 40 * i) as u8),
+                i as i64,
+            )
+        })
+        .collect();
+    inputs.push(make_marker_frame(n_real as i64));
+    let expected = n_real + 1;
+
+    let mut out = Vec::new();
+    for frame in inputs {
+        if let Some(f) = pipeline.run_filters(frame).expect("run_filters") {
+            out.push(f);
+        }
+        poll_all(&mut pipeline, &mut out);
+    }
+    for _ in 0..2000 {
+        poll_all(&mut pipeline, &mut out);
+        if out.len() >= expected {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    pipeline.uninit_filters();
+
+    assert_eq!(out.len(), expected, "all frames must drain through the chain");
+    for (i, f) in out.iter().enumerate() {
+        assert_eq!(unsafe { (*f.as_ptr()).pts }, i as i64, "arrival order");
+    }
+    // SAFETY: reading a pointer field of a live frame.
+    unsafe {
+        assert!(
+            (*out.last().unwrap().as_ptr()).buf[0].is_null(),
+            "marker must exit last and stay props-only"
+        );
+    }
+    assert_eq!(
+        seen.load(std::sync::atomic::Ordering::Relaxed),
+        expected,
+        "downstream filter must see every drained frame"
+    );
+}
+
+/// A source that ends without any EOF marker (e.g. an upstream abort closes
+/// the channel) must not lose real frames: everything already submitted
+/// drains through `request_frame` polling alone.
+#[test]
+fn test_drain_without_marker() {
+    let mut filter = WgpuFrameFilter::builder()
+        .shader_wgsl(shaders::IDENTITY_FS)
+        .build()
+        .expect("builder");
+    if !init_filter(&mut filter) {
+        return;
+    }
+    let inputs: Vec<Frame> = (0..4)
+        .map(|i| {
+            make_planar_frame(
+                64,
+                48,
+                AVPixelFormat::AV_PIX_FMT_YUV420P,
+                Some((40 + 40 * i) as u8),
+                i as i64,
+            )
+        })
+        .collect();
+    let out = drive(&mut filter, inputs, 4);
+    for (i, f) in out.iter().enumerate() {
+        assert_eq!(unsafe { (*f.as_ptr()).pts }, i as i64, "arrival order");
+    }
+    let mut map = HashMap::new();
+    let ctx = make_ctx(&mut map);
+    filter.uninit(&ctx);
+}
+
+/// Zero-copy readback: output planes point into the mapped staging buffer.
+/// Verifies pixel correctness, that dropping frames recycles buffers back to
+/// the filter (drained on the next filter_frame), and ordering across many
+/// frames with only `frames_in_flight` submissions outstanding.
+#[test]
+fn test_zero_copy_readback_roundtrip_and_recycle() {
+    let mut filter = WgpuFrameFilter::builder()
+        .shader_wgsl(shaders::IDENTITY_FS)
+        .zero_copy_readback(true)
+        .build()
+        .expect("builder");
+    if !init_filter(&mut filter) {
+        return;
+    }
+
+    let (w, h) = (322, 182); // odd-ish sizes exercise stride/tail paths
+    let expected = make_yuv420p_frame(w, h);
+
+    let n = 12usize;
+    let mut map = HashMap::new();
+    let ctx = make_ctx(&mut map);
+    let mut seen = 0usize;
+    for i in 0..n {
+        let mut frame = make_yuv420p_frame(w, h);
+        unsafe { (*frame.as_mut_ptr()).pts = i as i64 };
+        // Frames are dropped right after checking, exercising the recycle
+        // path: later iterations must reuse returned buffers instead of
+        // growing GPU memory without bound.
+        if let Some(out) = filter.filter_frame(frame, &ctx).expect("filter_frame") {
+            assert_eq!(unsafe { (*out.as_ptr()).pts }, seen as i64, "order");
+            let diff = max_luma_diff(&out, &expected, w as usize, h as usize);
+            assert!(diff <= 3, "luma diff too large at frame {seen}: {diff}");
+            seen += 1;
+        }
+        while let Some(out) = filter.request_frame(&ctx).expect("request_frame") {
+            assert_eq!(unsafe { (*out.as_ptr()).pts }, seen as i64, "order");
+            seen += 1;
+        }
+    }
+    for _ in 0..2000 {
+        while let Some(out) = filter.request_frame(&ctx).expect("request_frame") {
+            assert_eq!(unsafe { (*out.as_ptr()).pts }, seen as i64, "order");
+            seen += 1;
+        }
+        if seen >= n {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(seen, n, "all zero-copy frames must drain");
+    filter.uninit(&ctx);
+}
+
+/// Zero-copy frames must survive their filter: uninit while a frame is still
+/// alive downstream, then read the frame afterwards. The AVBuffer free
+/// callback silently drops the buffer when the recycle channel is gone.
+#[test]
+fn test_zero_copy_frame_outlives_filter() {
+    let mut filter = WgpuFrameFilter::builder()
+        .shader_wgsl(shaders::IDENTITY_FS)
+        .zero_copy_readback(true)
+        .frames_in_flight(1)
+        .build()
+        .expect("builder");
+    if !init_filter(&mut filter) {
+        return;
+    }
+    let (w, h) = (64, 48);
+    let expected = make_yuv420p_frame(w, h);
+    let out = drive(&mut filter, vec![make_yuv420p_frame(w, h)], 1)
+        .pop()
+        .unwrap();
+
+    let mut map = HashMap::new();
+    let ctx = make_ctx(&mut map);
+    filter.uninit(&ctx);
+    drop(filter);
+
+    // The staging buffer behind `out` must still be mapped and readable.
+    let diff = max_luma_diff(&out, &expected, w as usize, h as usize);
+    assert!(diff <= 3, "luma diff too large after filter drop: {diff}");
 }

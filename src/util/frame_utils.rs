@@ -35,6 +35,20 @@ pub(crate) fn ensure_software_format(format: i32) -> Result<AVPixelFormat, Strin
     Ok(pix_fmt)
 }
 
+/// Returns whether a raw `AVFrame.format` value refers to a hardware pixel
+/// format (frame data lives in GPU memory handles, not CPU planes).
+#[cfg_attr(not(feature = "wgpu"), allow(dead_code))]
+pub(crate) fn is_hw_format(format: i32) -> bool {
+    if format < 0 || format >= AVPixelFormat::AV_PIX_FMT_NB as i32 {
+        return false;
+    }
+    // SAFETY: range-checked discriminant, same as ensure_software_format.
+    let pix_fmt: AVPixelFormat = unsafe { std::mem::transmute(format) };
+    let desc = unsafe { av_pix_fmt_desc_get(pix_fmt) };
+    !desc.is_null()
+        && unsafe { (*desc).flags } & (ffmpeg_sys_next::AV_PIX_FMT_FLAG_HWACCEL as u64) != 0
+}
+
 /// Copies a plane between buffers with independent row strides.
 /// Both buffers must hold at least `(rows - 1) * stride + width_bytes` bytes.
 #[cfg_attr(not(feature = "wgpu"), allow(dead_code))]
@@ -46,6 +60,16 @@ pub(crate) fn copy_plane(
     width_bytes: usize,
     rows: usize,
 ) {
+    if rows == 0 {
+        return;
+    }
+    if src_stride == dst_stride {
+        // Equal strides: one contiguous copy. Row padding travels along, which
+        // is harmless and stays within the documented minimum buffer size.
+        let len = (rows - 1) * src_stride + width_bytes;
+        dst[..len].copy_from_slice(&src[..len]);
+        return;
+    }
     for row in 0..rows {
         let s = row * src_stride;
         let d = row * dst_stride;
@@ -73,5 +97,18 @@ mod tests {
         let mut dst = [0xFFu8; 8]; // stride 4
         copy_plane(&src, 5, &mut dst, 4, 3, 2);
         assert_eq!(dst, [1, 2, 3, 0xFF, 4, 5, 6, 0xFF]);
+    }
+
+    #[test]
+    fn test_copy_plane_equal_strides_fast_path() {
+        let src = [1u8, 2, 3, 9, 4, 5, 6, 9]; // 2 rows, stride 4, width 3
+        let mut dst = [0xFFu8; 8];
+        copy_plane(&src, 4, &mut dst, 4, 3, 2);
+        // Row 0 padding is copied along; the byte past the last row's width is not.
+        assert_eq!(dst, [1, 2, 3, 9, 4, 5, 6, 0xFF]);
+
+        let mut empty = [0xFFu8; 4];
+        copy_plane(&[], 4, &mut empty, 4, 3, 0);
+        assert_eq!(empty, [0xFF; 4]);
     }
 }

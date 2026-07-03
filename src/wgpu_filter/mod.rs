@@ -42,8 +42,11 @@
 //! **Feature flag**: only available with the `wgpu` feature.
 //!
 //! **Input formats**: YUV420P, YUV422P, YUV444P (plus their full-range J
-//! variants) and NV12 CPU frames. Hardware frames are rejected with
-//! guidance; other formats need a `format=yuv420p` conversion in
+//! variants) and NV12 CPU frames. Hardware frames (e.g.
+//! `set_hwaccel_output_format("vaapi")`) are downloaded to system memory
+//! automatically, or imported zero-copy over DRM PRIME dmabufs when
+//! `WgpuFrameFilterBuilder::hw_zero_copy_input` is enabled (Linux/Vulkan,
+//! experimental). Other formats need a `format=yuv420p` conversion in
 //! `filter_desc` first. Output is always YUV420P (4:2:2/4:4:4 inputs are
 //! chroma-downsampled on the GPU).
 
@@ -51,6 +54,7 @@ pub mod wgpu_frame_filter;
 
 mod frame_io;
 mod gpu_state;
+mod hw_interop;
 mod params;
 pub(crate) mod shaders;
 #[cfg(test)]
