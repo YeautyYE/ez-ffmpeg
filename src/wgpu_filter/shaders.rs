@@ -155,6 +155,16 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
+    // Load the 8x2 block once (edge-clamped, exactly load_px semantics);
+    // both the luma words and the chroma averages read these registers, so
+    // no texel is fetched twice.
+    var rgb: array<array<vec3<f32>, 8>, 2>;
+    for (var row = 0u; row < 2u; row = row + 1u) {
+        for (var col = 0u; col < 8u; col = col + 1u) {
+            rgb[row][col] = load_px(x0 + col, y0 + row);
+        }
+    }
+
     // Luma: two rows, two u32 words (4 pixels each) per row.
     for (var row = 0u; row < 2u; row = row + 1u) {
         let yy = y0 + row;
@@ -173,7 +183,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let xx = word_x0 + b;
                 var val = 0u;
                 if (xx < pu.width) {
-                    val = quantize(rgb_to_yuv(load_px(xx, yy)).x);
+                    val = quantize(rgb_to_yuv(rgb[row][w * 4u + b]).x);
                 }
                 word = word | (val << (b * 8u));
             }
@@ -181,7 +191,9 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    // Chroma: one row per block, one u32 word of 4 subsampled samples.
+    // Chroma: one row per block, one u32 word of 4 subsampled samples. The
+    // 2x2 sources are the same block pixels loaded above (edge clamping
+    // included, since load_px clamped them at load time).
     let cw = (pu.width + 1u) / 2u;
     let ch = (pu.height + 1u) / 2u;
     let cy = by;
@@ -199,10 +211,8 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         var uval = 0u;
         var vval = 0u;
         if (cx < cw) {
-            let avg = (load_px(cx * 2u, cy * 2u)
-                + load_px(cx * 2u + 1u, cy * 2u)
-                + load_px(cx * 2u, cy * 2u + 1u)
-                + load_px(cx * 2u + 1u, cy * 2u + 1u)) * 0.25;
+            let avg = (rgb[0][b * 2u] + rgb[0][b * 2u + 1u]
+                + rgb[1][b * 2u] + rgb[1][b * 2u + 1u]) * 0.25;
             let yuv = rgb_to_yuv(avg);
             uval = quantize(yuv.y);
             vval = quantize(yuv.z);

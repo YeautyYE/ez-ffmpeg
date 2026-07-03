@@ -602,7 +602,7 @@ impl FrameFilter for WgpuFrameFilter {
             let geo = res.geometry();
             let staging = match res.staging_pool.pop() {
                 Some(buffer) => buffer,
-                None => create_staging(&gpu.device, geo.buf_size),
+                None => create_staging(&gpu.device, geo.buf_size, gpu.direct_pack),
             };
             (staging, geo)
         };

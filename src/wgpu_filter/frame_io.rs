@@ -379,16 +379,28 @@ pub(crate) fn encode_and_submit(
         pass.set_bind_group(1, &res.effect_bind1, &[]);
         pass.draw(0..3, 0..1);
     }
+    // Direct-pack mode (unified memory): the pack pass writes the mappable
+    // staging buffer itself, so there is no storage buffer and no copy. The
+    // bind group is transient because staging rotates per frame.
+    let direct_pack_bind = gpu
+        .direct_pack
+        .then(|| gpu.pack_bind_for(&res.out_view, staging));
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("ez_pack_pass"),
             timestamp_writes: None,
         });
         pass.set_pipeline(&gpu.pack_pipeline);
-        pass.set_bind_group(0, &res.pack_bind, &[]);
+        let pack_bind = direct_pack_bind
+            .as_ref()
+            .or(res.pack_bind.as_ref())
+            .expect("copy-path resources always carry a cached pack bind");
+        pass.set_bind_group(0, pack_bind, &[]);
         pass.dispatch_workgroups(res.out_w.div_ceil(64), res.out_h.div_ceil(16), 1);
     }
-    encoder.copy_buffer_to_buffer(&res.storage, 0, staging, 0, res.buf_size);
+    if let Some(storage) = &res.storage {
+        encoder.copy_buffer_to_buffer(storage, 0, staging, 0, res.buf_size);
+    }
 
     let submission = gpu.queue.submit(Some(encoder.finish()));
 
