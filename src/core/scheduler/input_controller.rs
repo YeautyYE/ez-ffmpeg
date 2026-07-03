@@ -1,3 +1,11 @@
+//! Port of the fftools scheduler's balancing pass (FFmpeg 7.x
+//! fftools/ffmpeg_sched.c `schedule_update_locked` / `unchoke_for_stream`
+//! / `trailing_dts` / `SCHEDULE_TOLERANCE`): chokes demuxers whose output
+//! streams run too far ahead of the trailing stream. `SchNode` mirrors
+//! `SchedulerNode`; `InputController` owns what fftools hangs off the
+//! `Scheduler` struct itself. Like 7.x (and unlike master), only demuxers
+//! are choked — decoders/filtergraphs are paced by bounded channels.
+
 use crate::core::scheduler::ffmpeg_scheduler::is_stopping;
 use crate::util::sch_waiter::SchWaiter;
 use ffmpeg_sys_next::AV_NOPTS_VALUE;

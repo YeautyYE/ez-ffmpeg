@@ -89,6 +89,23 @@
 //! - **`async`**: Makes the [`FfmpegScheduler`] wait method asynchronous (you can `.await` it).
 //! - **`static`**: Uses static linking for FFmpeg libraries (via `ffmpeg-next/static`).
 //!
+//! ## Relationship to the FFmpeg CLI
+//!
+//! The transcoding pipeline (demux -> decode -> filter -> encode -> mux) is
+//! ported from the FFmpeg CLI sources, `fftools/ffmpeg` of **FFmpeg 7.x**:
+//! function names, timestamp handling and scheduling semantics follow that
+//! release, and code comments cite the corresponding fftools file and line.
+//! If you know `ffmpeg_demux.c` or `ffmpeg_filter.c`, grepping this crate
+//! for the same function names (`ts_fixup`, `video_sync_process`,
+//! `enc_open`, `mux_fixup_ts`, ...) lands in the equivalent Rust.
+//!
+//! Not every CLI feature is implemented. Notable gaps: progress/stats
+//! reporting (`-progress`), sub2video (rendering bitmap subtitles into
+//! video), `-shortest` cross-stream sync, bitstream filters (`-bsf`),
+//! keyframe forcing (`-force_key_frames`), `-fix_sub_duration`, two-pass
+//! encoding, and attachments. Unsupported paths fail with explicit errors
+//! rather than approximations.
+//!
 //! ## Logging
 //!
 //! FFmpeg's own diagnostics (av_log) are redirected into the Rust `log`

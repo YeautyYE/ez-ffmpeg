@@ -4,6 +4,7 @@ use crate::core::context::{FrameBox, PacketBox, Stream};
 use crossbeam_channel::{Receiver, Sender};
 use ffmpeg_sys_next::{AVCodec, AVMediaType, AVStream};
 
+/// fftools: `OutputStream` + `MuxStream` (ffmpeg.h / ffmpeg_mux.h).
 #[derive(Clone)]
 pub(crate) struct EncoderStream {
     pub(crate) stream_index: usize,

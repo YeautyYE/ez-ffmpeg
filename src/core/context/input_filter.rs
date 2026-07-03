@@ -1,3 +1,7 @@
+//! Port of fftools `InputFilter`/`InputFilterOptions` (FFmpeg 7.x
+//! fftools/ffmpeg_filter.c): one input pad of a filtergraph plus the
+//! bind-time options, including the `IFILTER_FLAG_*` constants.
+
 use crate::core::context::null_frame;
 use ffmpeg_sys_next::{AVMediaType, AVRational};
 use ffmpeg_next::Frame;

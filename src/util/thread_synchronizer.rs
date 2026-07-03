@@ -1,3 +1,8 @@
+//! Join-all bookkeeping for scheduler workers. fftools joins each
+//! `SchTask` pthread directly in `sch_stop` (ffmpeg_sched.c); ez counts
+//! live workers behind a condvar instead, because threads are detached
+//! `std::thread` spawns whose handles the scheduler does not keep.
+
 use std::sync::{Arc, Condvar, Mutex};
 
 #[derive(Clone)]

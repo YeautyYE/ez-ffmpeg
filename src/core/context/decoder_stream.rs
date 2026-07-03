@@ -9,6 +9,7 @@ use ffmpeg_sys_next::{
     AVPixelFormat, AVRational, AVStream,
 };
 
+/// fftools: `InputStream` + `DemuxStream` (ffmpeg.h / ffmpeg_demux.c).
 #[derive(Clone)]
 pub(crate) struct DecoderStream {
     pub(crate) stream_index: usize,
