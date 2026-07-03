@@ -115,6 +115,7 @@ impl Demuxer {
             hwaccel.clone(),
             hwaccel_device,
             hwaccel_output_format,
+            framerate,
             log_level_offset,
         )?;
 
@@ -150,6 +151,7 @@ impl Demuxer {
         hwaccel: Option<String>,
         hwaccel_device: Option<String>,
         hwaccel_output_format: Option<String>,
+        forced_framerate: AVRational,
         log_level_offset: i32,
     ) -> crate::error::Result<Vec<DecoderStream>> {
         unsafe {
@@ -161,7 +163,17 @@ impl Demuxer {
 
                 let duration = (*st).duration;
                 let time_base = (*st).time_base;
-                let avg_framerate = (*st).avg_frame_rate;
+                // A user-forced framerate replaces the container's average
+                // for video (ffmpeg_demux.c:1002-1006: forced -> flags |=
+                // FRAMERATE_FORCED, else framerate = avg_frame_rate).
+                let codec_type_early = (*(*st).codecpar).codec_type;
+                let framerate_forced = forced_framerate.num != 0
+                    && codec_type_early == AVMEDIA_TYPE_VIDEO;
+                let avg_framerate = if framerate_forced {
+                    forced_framerate
+                } else {
+                    (*st).avg_frame_rate
+                };
                 let codec_parameters = (*st).codecpar;
                 let codec_type = (*codec_parameters).codec_type;
 
@@ -206,6 +218,7 @@ impl Demuxer {
                     duration,
                     time_base,
                     avg_framerate,
+                    framerate_forced,
                     hwaccel_id,
                     hwaccel_device_type,
                     hwaccel_device,
