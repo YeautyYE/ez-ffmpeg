@@ -9,12 +9,13 @@
 
 use super::fonts::{FaceRequest, FontStore, LoadedFace};
 use super::raster::{
-    be_blur, border_path, drawing_commands, fill_path, gaussian_blur, CoverageBitmap, OutlinePath,
+    be_blur, border_path, drawing_commands, fill_path, fix_outline, gaussian_blur, CoverageBitmap,
+    OutlinePath,
 };
 use super::shape::{bidi_runs, shape_complex, shape_simple};
 use crate::subtitle::ass::{
-    self, numpad2align, parse_drawing, parse_tag_block, Color, Event, FontSizeArg, Script, Tag,
-    VALIGN_CENTER, VALIGN_SUB, VALIGN_TOP,
+    self, numpad2align, parse_drawing, parse_tag_block, Color, Event, FontSizeArg, KaraokeKind,
+    Script, Tag, VALIGN_CENTER, VALIGN_SUB, VALIGN_TOP,
 };
 use std::collections::HashMap;
 
@@ -63,6 +64,10 @@ pub(crate) struct FrameContext<'a> {
     pub fonts: &'a FontStore,
     pub frame_w: i32,
     pub frame_h: i32,
+    /// `ass_set_storage_size` — libass `ass_layout_res` resolves to this
+    /// (vf_subtitles always sets it: original_size or the frame size).
+    pub storage_w: i32,
+    pub storage_h: i32,
     /// Pixel-aspect compensation (libass `ass_set_pixel_aspect`).
     pub par: f64,
     pub opts: &'a RenderOptions,
@@ -77,13 +82,32 @@ impl FrameContext<'_> {
         f64::from(self.frame_h) / f64::from(self.script.play_res_y.max(1))
     }
 
-    /// Border/shadow scale: screen scale when ScaledBorderAndShadow, else
-    /// script pixels are frame pixels.
-    fn border_scale(&self) -> f64 {
+    /// libass `blur_scale_*`: frame over layout resolution (the storage
+    /// size in the vf_subtitles wiring).
+    fn blur_scale_x(&self) -> f64 {
+        f64::from(self.frame_w) / f64::from(self.storage_w.max(1))
+    }
+
+    fn blur_scale_y(&self) -> f64 {
+        f64::from(self.frame_h) / f64::from(self.storage_h.max(1))
+    }
+
+    /// Border/shadow scales (libass `init_font_scale`): the screen scale
+    /// under ScaledBorderAndShadow, else the blur scale (script border
+    /// values are storage pixels).
+    fn border_scale_x(&self) -> f64 {
+        if self.script.scaled_border_and_shadow {
+            self.scale_x()
+        } else {
+            self.blur_scale_x()
+        }
+    }
+
+    fn border_scale_y(&self) -> f64 {
         if self.script.scaled_border_and_shadow {
             self.scale_y()
         } else {
-            1.0
+            self.blur_scale_y()
         }
     }
 
@@ -128,6 +152,13 @@ struct State {
     drawing_scale: i32,
     pbo: f64,
     style_index: usize,
+    /// Karaoke registers (libass `effect_*`): sticky effect kind plus the
+    /// pending syllable duration / skip offset, snapshotted into each
+    /// produced segment and then cleared — exactly like GlyphInfo capture.
+    effect_kind: Option<KaraokeKind>,
+    effect_timing_ms: i64,
+    effect_skip_ms: i64,
+    effect_reset: bool,
 }
 
 impl State {
@@ -160,6 +191,10 @@ impl State {
             drawing_scale: 0,
             pbo: 0.0,
             style_index,
+            effect_kind: None,
+            effect_timing_ms: 0,
+            effect_skip_ms: 0,
+            effect_reset: false,
         }
     }
 }
@@ -220,6 +255,10 @@ struct EventOverrides {
     alignment: Option<i32>,
     clip: Option<(i32, i32, i32, i32, bool)>,
     uses_time: bool,
+    /// \org or \t seen: libass sets `detect_collisions = 0` for these too,
+    /// even when the tag is otherwise a no-op (bare \t, \org without
+    /// rotation).
+    disable_collisions: bool,
     /// `unsupported::*` flags seen while parsing this event's tags.
     unsupported: u32,
 }
@@ -234,6 +273,15 @@ struct Segment {
     descent: f64,
     /// True when this segment may be dropped at a line edge (whitespace).
     is_space: bool,
+    /// First segment of a style run (a `push_text` batch or a drawing) —
+    /// the karaoke grouping boundary, like libass `starts_new_run`.
+    run_start: bool,
+    /// Karaoke snapshot (libass GlyphInfo effect capture): the syllable
+    /// duration/offset land on the first segment produced after a karaoke
+    /// tag.
+    karaoke_timing_ms: i64,
+    karaoke_skip_ms: i64,
+    karaoke_reset: bool,
 }
 
 enum SegmentKind {
@@ -261,6 +309,9 @@ pub(crate) struct EventRender {
     pub nodes: Vec<RenderedNode>,
     /// The output depends on `now_ms` (disables the static-frame cache).
     pub uses_time: bool,
+    /// libass `detect_collisions`: false when \pos, \move, \org, or \t
+    /// appeared, in which case the event skips collision stacking.
+    pub detect_collisions: bool,
     /// `unsupported::*` features this event asked for.
     pub unsupported: u32,
 }
@@ -292,7 +343,7 @@ pub(crate) fn render_event(
     let mut pending_text = String::new();
 
     let push_text = |text: &mut String,
-                     state: &State,
+                     state: &mut State,
                      segments: &mut Vec<Segment>,
                      face_cache: &mut HashMap<
         (String, u16, bool),
@@ -311,7 +362,7 @@ pub(crate) fn render_event(
         if bytes[i] == b'{' {
             if let Some(close) = event.text[i..].find('}') {
                 // Tag block: flush pending text under the current state.
-                push_text(&mut pending_text, &state, &mut segments, face_cache);
+                push_text(&mut pending_text, &mut state, &mut segments, face_cache);
                 let block = &event.text[i + 1..i + close];
                 apply_tags(
                     script,
@@ -319,6 +370,7 @@ pub(crate) fn render_event(
                     &mut overrides,
                     parse_tag_block(block),
                     base_wrap,
+                    event.style,
                 );
                 i += close + 1;
                 continue;
@@ -330,8 +382,8 @@ pub(crate) fn render_event(
             let rest = &event.text[i..];
             let end = rest.find('{').unwrap_or(rest.len());
             let drawing_text = &rest[..end];
-            push_text(&mut pending_text, &state, &mut segments, face_cache);
-            build_drawing_segment(ctx, &state, drawing_text, &mut segments);
+            push_text(&mut pending_text, &mut state, &mut segments, face_cache);
+            build_drawing_segment(ctx, &mut state, drawing_text, &mut segments);
             i += end;
             continue;
         }
@@ -341,14 +393,14 @@ pub(crate) fn render_event(
             let mut chars = stripped.chars();
             match chars.next() {
                 Some('N') => {
-                    push_text(&mut pending_text, &state, &mut segments, face_cache);
+                    push_text(&mut pending_text, &mut state, &mut segments, face_cache);
                     hard_breaks.push(segments.len());
                     i += 2;
                     continue;
                 }
                 Some('n') => {
                     if state.wrap_style == 2 {
-                        push_text(&mut pending_text, &state, &mut segments, face_cache);
+                        push_text(&mut pending_text, &mut state, &mut segments, face_cache);
                         hard_breaks.push(segments.len());
                     } else {
                         pending_text.push(' ');
@@ -373,12 +425,16 @@ pub(crate) fn render_event(
         pending_text.push(if ch == '\t' { ' ' } else { ch });
         i += ch.len_utf8();
     }
-    push_text(&mut pending_text, &state, &mut segments, face_cache);
+    push_text(&mut pending_text, &mut state, &mut segments, face_cache);
+
+    let detect_collisions =
+        overrides.pos.is_none() && overrides.movement.is_none() && !overrides.disable_collisions;
 
     if segments.is_empty() {
         return EventRender {
             nodes: Vec::new(),
             uses_time: overrides.uses_time,
+            detect_collisions,
             unsupported: overrides.unsupported,
         };
     }
@@ -403,7 +459,7 @@ pub(crate) fn render_event(
     let wrap = wrap_lines(&segments, &hard_breaks, max_width, state.wrap_style);
 
     // ---- pass 3: position the block ----
-    let line_metrics: Vec<(f64, f64, f64)> = wrap
+    let mut line_metrics: Vec<(f64, f64, f64)> = wrap
         .iter()
         .map(|line| {
             let width: f64 = line.iter().map(|&s| segments[s].width).sum();
@@ -418,6 +474,21 @@ pub(crate) fn render_event(
             (width, ascent, descent)
         })
         .collect();
+    // Empty lines (repeated \N) keep the height of the nearest text line
+    // (libass measures the trimmed empty line with the current font).
+    let fallback_metric = line_metrics
+        .iter()
+        .find(|(_, a, d)| a + d > 0.0)
+        .map(|&(_, a, d)| (a, d))
+        .unwrap_or((0.0, 0.0));
+    let mut last_metric = fallback_metric;
+    for metric in &mut line_metrics {
+        if metric.1 + metric.2 <= 0.0 {
+            (metric.1, metric.2) = last_metric;
+        } else {
+            last_metric = (metric.1, metric.2);
+        }
+    }
     let block_h: f64 = line_metrics.iter().map(|(_, a, d)| a + d).sum();
     let block_w: f64 = line_metrics
         .iter()
@@ -496,6 +567,7 @@ pub(crate) fn render_event(
     let fade = overrides
         .fade
         .map(|f| fade_alpha(f, now_rel, event.duration_ms));
+    let karaoke = karaoke_flags(&segments, now_rel);
     let mut nodes: Vec<RenderedNode> = Vec::new();
     let mut shadows: Vec<RenderedNode> = Vec::new();
     let mut borders: Vec<RenderedNode> = Vec::new();
@@ -518,6 +590,7 @@ pub(crate) fn render_event(
                 x_cursor,
                 baseline,
                 fade,
+                karaoke[seg_index],
                 &mut shadows,
                 &mut borders,
                 &mut fills,
@@ -525,6 +598,67 @@ pub(crate) fn render_event(
             x_cursor += segment.width;
         }
         y_cursor += line_asc + line_desc;
+    }
+    // BorderStyle 4 (libass add_background): one BackColour rectangle
+    // behind the whole event, expanded by positive scaled \shad values and
+    // clamped to the frame; per-glyph shadows were suppressed above.
+    let border_style_4 = segments
+        .iter()
+        .any(|segment| segment.state.border_style == 4);
+    if border_style_4 {
+        let boxes: Vec<(i32, i32, i32, i32)> = shadows
+            .iter()
+            .chain(borders.iter())
+            .chain(fills.iter())
+            .filter(|node| !node.bitmap.is_empty())
+            .map(|node| {
+                let b = &node.bitmap;
+                (b.x, b.y, b.x + b.w as i32, b.y + b.h as i32)
+            })
+            .collect();
+        if let Some(&(first_x, first_y, first_r, first_b)) = boxes.first() {
+            let (mut left, mut top, mut right, mut bottom) = (first_x, first_y, first_r, first_b);
+            for &(x0, y0, x1, y1) in &boxes[1..] {
+                left = left.min(x0);
+                top = top.min(y0);
+                right = right.max(x1);
+                bottom = bottom.max(y1);
+            }
+            let back_segment = segments
+                .iter()
+                .find(|segment| segment.state.border_style == 4)
+                .expect("border_style_4 implies a matching segment");
+            let back = back_segment.state.colors[3];
+            let back_shadow_x = back_segment.state.shadow_x;
+            let back_shadow_y = back_segment.state.shadow_y;
+            let size_x = if back_shadow_x > 0.0 {
+                (back_shadow_x * ctx.border_scale_x()).round() as i32
+            } else {
+                0
+            };
+            let size_y = if back_shadow_y > 0.0 {
+                (back_shadow_y * ctx.border_scale_y()).round() as i32
+            } else {
+                0
+            };
+            let left = (left - size_x).clamp(0, ctx.frame_w);
+            let top = (top - size_y).clamp(0, ctx.frame_h);
+            let right = (right + size_x).clamp(0, ctx.frame_w);
+            let bottom = (bottom + size_y).clamp(0, ctx.frame_h);
+            let (w, h) = ((right - left) as usize, (bottom - top) as usize);
+            if w > 0 && h > 0 {
+                nodes.push(RenderedNode {
+                    bitmap: CoverageBitmap {
+                        w,
+                        h,
+                        x: left,
+                        y: top,
+                        data: vec![0xFF; w * h],
+                    },
+                    color: node_color(back, fade),
+                });
+            }
+        }
     }
     nodes.append(&mut shadows);
     nodes.append(&mut borders);
@@ -545,6 +679,7 @@ pub(crate) fn render_event(
     EventRender {
         nodes,
         uses_time: overrides.uses_time,
+        detect_collisions,
         unsupported: overrides.unsupported,
     }
 }
@@ -558,6 +693,56 @@ fn pick_margin(event_margin: i32, style_margin: i32) -> i32 {
     }
 }
 
+/// libass `dtoi32(val * 10)`: karaoke centiseconds to milliseconds with a
+/// saturating double-to-int32 conversion.
+fn dtoi32_ms(centisec: f64) -> i64 {
+    let ms = centisec * 10.0;
+    if ms >= f64::from(i32::MAX) {
+        i64::from(i32::MAX)
+    } else if ms <= f64::from(i32::MIN) {
+        i64::from(i32::MIN)
+    } else {
+        ms as i64
+    }
+}
+
+/// Per-segment karaoke decision, ported from libass
+/// `ass_process_karaoke_effects` at run granularity (`run_start` marks the
+/// same boundaries karaoke tags induce). Returns
+/// `(use_secondary, hide_outline)` per segment: before a syllable's start
+/// time the fill uses SecondaryColour, and `\ko` also hides the outline.
+/// The `\kf` sweep is approximated stepwise at the syllable midpoint.
+fn karaoke_flags(segments: &[Segment], tm_current: i64) -> Vec<(bool, bool)> {
+    let mut out = vec![(false, false); segments.len()];
+    let mut timing: i64 = 0;
+    let mut i = 0;
+    while i < segments.len() {
+        let mut j = i + 1;
+        while j < segments.len() && !segments[j].run_start {
+            j += 1;
+        }
+        let start = &segments[i];
+        if let Some(kind) = start.state.effect_kind {
+            if start.karaoke_reset {
+                timing = 0;
+            }
+            let tm_start = timing + start.karaoke_skip_ms;
+            let tm_end = tm_start + start.karaoke_timing_ms;
+            timing = tm_end;
+            let boundary = match kind {
+                KaraokeKind::Fill => (tm_start + tm_end) / 2,
+                _ => tm_start,
+            };
+            let not_reached = tm_current < boundary;
+            for flags in &mut out[i..j] {
+                *flags = (not_reached, not_reached && kind == KaraokeKind::Outline);
+            }
+        }
+        i = j;
+    }
+    out
+}
+
 /// Applies one tag block to the state (libass `ass_parse_tags` application
 /// side, minus animation).
 fn apply_tags(
@@ -566,6 +751,7 @@ fn apply_tags(
     overrides: &mut EventOverrides,
     tags: Vec<Tag<'_>>,
     base_wrap: i32,
+    base_style: usize,
 ) {
     let style = |s: &State| script.styles[s.style_index.min(script.styles.len() - 1)].clone();
     for tag in tags {
@@ -737,9 +923,14 @@ fn apply_tags(
                     overrides.uses_time = true;
                 }
             }
-            Tag::Org { .. } => {} // only meaningful with rotation; covered by ROTATION
+            Tag::Org { .. } => {
+                // Rotation origin is only visible with rotation (covered by
+                // ROTATION), but libass still disables collision stacking.
+                overrides.disable_collisions = true;
+            }
             Tag::Transform => {
                 overrides.uses_time = true;
+                overrides.disable_collisions = true;
                 overrides.unsupported |= unsupported::ANIMATION;
             }
             Tag::ClipRect {
@@ -753,12 +944,25 @@ fn apply_tags(
             }
             Tag::ClipVector { .. } => overrides.unsupported |= unsupported::VECTOR_CLIP,
             Tag::Reset(style_name) => {
+                // ass_reset_render_context(state, NULL) falls back to the
+                // EVENT's declared style — not whatever a previous \r<name>
+                // switched to. A bare \r and an unknown style name both
+                // return there. Karaoke registers survive \r (libass resets
+                // them only in init_render_context).
                 let index = match style_name {
-                    Some(name) => lookup_style_strict(script, name).unwrap_or(state.style_index),
-                    None => state.style_index,
+                    Some(name) => lookup_style_strict(script, name).unwrap_or(base_style),
+                    None => base_style,
                 };
                 let wrap = state.wrap_style;
+                let effect_kind = state.effect_kind;
+                let effect_timing_ms = state.effect_timing_ms;
+                let effect_skip_ms = state.effect_skip_ms;
+                let effect_reset = state.effect_reset;
                 *state = State::from_style(script, index, wrap);
+                state.effect_kind = effect_kind;
+                state.effect_timing_ms = effect_timing_ms;
+                state.effect_skip_ms = effect_skip_ms;
+                state.effect_reset = effect_reset;
             }
             Tag::WrapStyle(v) => {
                 state.wrap_style = v.filter(|v| (0..=3).contains(v)).unwrap_or(base_wrap);
@@ -778,7 +982,25 @@ fn apply_tags(
                     overrides.unsupported |= unsupported::SHEAR;
                 }
             }
-            Tag::Karaoke => overrides.unsupported |= unsupported::KARAOKE,
+            Tag::Karaoke { kind, centisec } => {
+                // parse_tags: skip += previous timing, timing = val*10;
+                // the segment builder snapshots and clears these.
+                state.effect_skip_ms += state.effect_timing_ms;
+                state.effect_timing_ms = dtoi32_ms(centisec);
+                state.effect_kind = Some(kind);
+                overrides.uses_time = true;
+                if kind == KaraokeKind::Fill {
+                    // The \kf sweep is approximated stepwise; keep warning.
+                    overrides.unsupported |= unsupported::KARAOKE;
+                }
+            }
+            Tag::KaraokeSet(centisec) => {
+                // \kt: absolute start offset; resets accumulated timing.
+                state.effect_skip_ms = dtoi32_ms(centisec);
+                state.effect_timing_ms = 0;
+                state.effect_reset = true;
+                overrides.uses_time = true;
+            }
             Tag::FontEncoding(_) => {} // font-matching hint; harmless to ignore
         }
     }
@@ -840,9 +1062,11 @@ fn node_color(color: Color, fade: Option<i32>) -> u32 {
 }
 
 /// Splits `text` into word/space segments under one state, shaping each.
+/// The karaoke registers are snapshotted into the FIRST segment produced
+/// and cleared (libass captures them into GlyphInfo and zeroes the state).
 fn build_text_segments(
     ctx: &FrameContext<'_>,
-    state: &State,
+    state: &mut State,
     text: &str,
     segments: &mut Vec<Segment>,
     face_cache: &mut HashMap<(String, u16, bool), Option<std::sync::Arc<LoadedFace>>>,
@@ -862,10 +1086,23 @@ fn build_text_segments(
     };
 
     // Pixel scales: REAL_DIM sizing — the requested size is the full
-    // ascender-to-descender height (ass_face_set_size).
+    // ascender-to-descender height (ass_face_set_size). The metrics follow
+    // GDI like libass set_font_metrics: OS/2 usWin values when non-zero,
+    // else the face's hhea/typo values.
     let metrics_face = face.face();
-    let asc = f64::from(metrics_face.ascender());
-    let desc = f64::from(-metrics_face.descender());
+    let win_metrics = metrics_face.tables().os2.and_then(|os2| {
+        let asc = i32::from(os2.windows_ascender());
+        // ttf-parser negates usWinDescent; undo that — like libass, `desc`
+        // here is the positive usWinDescent distance.
+        let desc = -i32::from(os2.windows_descender());
+        (asc + desc != 0).then_some((f64::from(asc), f64::from(desc)))
+    });
+    let (asc, desc) = win_metrics.unwrap_or_else(|| {
+        (
+            f64::from(metrics_face.ascender()),
+            f64::from(-metrics_face.descender()),
+        )
+    });
     let extent = (asc + desc).max(1.0);
     let pixel_size = state.font_size * ctx.scale_y() * ctx.opts.font_scale;
     let unit_scale = pixel_size / extent;
@@ -883,6 +1120,7 @@ fn build_text_segments(
     // also split, so the wrapper can break there.
     let break_after = break_opportunities(text, ctx.opts.wrap_unicode);
     let mut start = 0usize;
+    let mut first = true;
     for piece in split_words(text, &break_after) {
         let piece_text = &text[start..start + piece.len()];
         let is_space = piece_text.chars().all(|c| c == ' ');
@@ -905,7 +1143,15 @@ fn build_text_segments(
             ascent: ascent_px,
             descent: descent_px,
             is_space,
+            run_start: first,
+            karaoke_timing_ms: state.effect_timing_ms,
+            karaoke_skip_ms: state.effect_skip_ms,
+            karaoke_reset: state.effect_reset,
         });
+        first = false;
+        state.effect_timing_ms = 0;
+        state.effect_skip_ms = 0;
+        state.effect_reset = false;
         start = end;
     }
 }
@@ -965,7 +1211,7 @@ fn break_opportunities(text: &str, wrap_unicode: bool) -> std::collections::Hash
 
 fn build_drawing_segment(
     ctx: &FrameContext<'_>,
-    state: &State,
+    state: &mut State,
     drawing_text: &str,
     segments: &mut Vec<Segment>,
 ) {
@@ -975,7 +1221,11 @@ fn build_drawing_segment(
     };
     // \p scale: coordinates are divided by 2^(scale-1).
     let power = f64::from(1u32 << (state.drawing_scale.max(1) - 1) as u32);
-    let aspect = ctx.scale_x() / ctx.scale_y() * ctx.par;
+    // Drawings scale by the PlayRes aspect WITHOUT par: libass divides the
+    // drawing scale by par_scale_x (get_outline_glyph) and multiplies it
+    // back during compositing, so par cancels for drawings (it applies to
+    // font glyphs only).
+    let aspect = ctx.scale_x() / ctx.scale_y();
     let x_scale = (ctx.scale_y() * ctx.opts.font_scale * state.scale_x * aspect / power) as f32;
     let y_scale = (ctx.scale_y() * ctx.opts.font_scale * state.scale_y / power) as f32;
     let width = f64::from(max.x - min.x) / 64.0 * f64::from(x_scale);
@@ -993,11 +1243,20 @@ fn build_drawing_segment(
         ascent: height,
         descent: 0.0,
         is_space: false,
+        run_start: true,
+        karaoke_timing_ms: state.effect_timing_ms,
+        karaoke_skip_ms: state.effect_skip_ms,
+        karaoke_reset: state.effect_reset,
     });
+    state.effect_timing_ms = 0;
+    state.effect_skip_ms = 0;
+    state.effect_reset = false;
 }
 
 /// Greedy wrap with hard breaks; WrapStyle 2 disables soft wrapping;
 /// styles 0/3 get a balancing pass (libass smart wrapping approximation).
+/// Every hard break opens a new line unconditionally (libass FORCEBREAK),
+/// so repeated `\N` produce empty lines that keep their vertical space.
 fn wrap_lines(
     segments: &[Segment],
     hard_breaks: &[usize],
@@ -1006,8 +1265,9 @@ fn wrap_lines(
 ) -> Vec<Vec<usize>> {
     let mut lines: Vec<Vec<usize>> = vec![Vec::new()];
     let mut width = 0.0f64;
+    let breaks_at = |index: usize| hard_breaks.iter().filter(|&&b| b == index).count();
     for (index, segment) in segments.iter().enumerate() {
-        if hard_breaks.contains(&index) && !lines.last().expect("non-empty").is_empty() {
+        for _ in 0..breaks_at(index) {
             lines.push(Vec::new());
             width = 0.0;
         }
@@ -1033,6 +1293,10 @@ fn wrap_lines(
         line.push(index);
         width += segment.width;
     }
+    // Trailing hard breaks (e.g. "text\N") still add empty lines.
+    for _ in 0..breaks_at(segments.len()) {
+        lines.push(Vec::new());
+    }
     // Trailing spaces of the final line.
     while lines
         .last()
@@ -1041,10 +1305,6 @@ fn wrap_lines(
         .is_some_and(|&s| segments[s].is_space)
     {
         lines.last_mut().expect("non-empty").pop();
-    }
-    lines.retain(|line| !line.is_empty());
-    if lines.is_empty() {
-        lines.push(Vec::new());
     }
 
     // Balancing pass for smart wrap styles: move the last word of a wider
@@ -1122,10 +1382,12 @@ fn rasterize_segment(
     x: f64,
     baseline: f64,
     fade: Option<i32>,
+    karaoke: (bool, bool),
     shadows: &mut Vec<RenderedNode>,
     borders: &mut Vec<RenderedNode>,
     fills: &mut Vec<RenderedNode>,
 ) {
+    let (karaoke_secondary, karaoke_hide_outline) = karaoke;
     let state = &segment.state;
     let commands = match &segment.kind {
         SegmentKind::Text {
@@ -1198,18 +1460,21 @@ fn rasterize_segment(
             drawing_commands(drawing, *x_scale, *y_scale, dx as f32, dy as f32)
         }
     };
-    if commands.is_empty() {
+    if commands.is_empty() && !(state.border_style == 3 && segment.width > 0.0) {
         return;
     }
 
     let fill = fill_path(&commands);
-    if fill.is_empty() {
+    // BorderStyle 3 opaque boxes cover glyphless segments too — libass
+    // builds an OUTLINE_BOX for every advance, spaces included.
+    if fill.is_empty() && !(state.border_style == 3 && segment.width > 0.0) {
         return;
     }
-    let border_scale = ctx.border_scale();
-    let border_px = (state.border_x.max(state.border_y) * border_scale) as f32;
-    let shadow_dx = state.shadow_x * border_scale;
-    let shadow_dy = state.shadow_y * border_scale;
+    let border_px_x = (state.border_x * ctx.border_scale_x()) as f32;
+    let border_px_y = (state.border_y * ctx.border_scale_y()) as f32;
+    let border_px = border_px_x.max(border_px_y);
+    let shadow_dx = state.shadow_x * ctx.border_scale_x();
+    let shadow_dy = state.shadow_y * ctx.border_scale_y();
 
     let mut border_bitmap = CoverageBitmap::default();
     if state.border_style == 3 {
@@ -1217,59 +1482,83 @@ fn rasterize_segment(
         let mut rect = Vec::new();
         push_rect(
             &mut rect,
-            x - f64::from(border_px),
-            baseline - segment.ascent - f64::from(border_px),
-            segment.width + 2.0 * f64::from(border_px),
-            segment.ascent + segment.descent + 2.0 * f64::from(border_px),
+            x - f64::from(border_px_x),
+            baseline - segment.ascent - f64::from(border_px_y),
+            segment.width + 2.0 * f64::from(border_px_x),
+            segment.ascent + segment.descent + 2.0 * f64::from(border_px_y),
         );
         border_bitmap = fill_path(&rect);
     } else if border_px > 0.0 {
-        border_bitmap = border_path(&commands, &fill, border_px);
+        border_bitmap = border_path(&commands, &fill, border_px_x, border_px_y);
     }
 
-    // Effects: \be then \blur, applied to the outermost shape (border when
-    // present, else the fill), like libass.
+    // Effects on the outermost shape: gaussian first, then \be, matching
+    // libass ass_synth_blur. Sigma per axis is blur * blur_scale * the
+    // 2/sqrt(log(256)) radius factor from ass_render.c.
+    let blur_sigma_factor = 2.0 / (256.0f64.ln()).sqrt();
+    let sigma_x = state.blur * ctx.blur_scale_x() * blur_sigma_factor;
+    let sigma_y = state.blur * ctx.blur_scale_y() * blur_sigma_factor;
     let mut effect_target = if border_bitmap.is_empty() {
         fill.clone()
     } else {
         border_bitmap.clone()
     };
+    if state.blur > 0.0 {
+        gaussian_blur(&mut effect_target, sigma_x, sigma_y);
+    }
     if state.be > 0 {
         be_blur(&mut effect_target, state.be);
     }
-    if state.blur > 0.0 {
-        gaussian_blur(&mut effect_target, state.blur * border_scale);
-    }
+    let fill_color = state.colors[usize::from(karaoke_secondary)];
     let effects_applied = state.be > 0 || state.blur > 0.0;
     if effects_applied {
         if border_bitmap.is_empty() {
             // No border: the blurred fill replaces the fill.
             fills.push(RenderedNode {
                 bitmap: effect_target.clone(),
-                color: node_color(state.colors[0], fade),
+                color: node_color(fill_color, fade),
             });
         } else {
             border_bitmap = effect_target.clone();
         }
     }
 
-    // Shadow: the outermost shape offset, in the back color.
-    if (shadow_dx != 0.0 || shadow_dy != 0.0) && state.shadow_x.max(state.shadow_y) > 0.0 {
-        let source = if border_bitmap.is_empty() {
-            &fill
+    // libass FILTER_FILL_IN_BORDER / FILTER_FILL_IN_SHADOW: the border
+    // keeps the fill only under a fully opaque, unfaded primary+secondary
+    // (or BorderStyle 3); the shadow keeps it while the fill is visible at
+    // all. When neither wants the fill, ass_fix_outline hollows the border.
+    let has_shadow = shadow_dx != 0.0 || shadow_dy != 0.0;
+    let fade_active = fade.is_some_and(|f| f != 0);
+    let fill_in_border = state.border_style == 3
+        || (state.colors[0].t == 0 && state.colors[1].t == 0 && !fade_active);
+    let fill_in_shadow = has_shadow && (state.colors[0].t != 0xFF || state.border_style == 3);
+
+    // Shadow: the outermost shape offset by the scaled \shad values in the
+    // back color. libass keeps signed offsets (26.6, floored to pixels).
+    // BorderStyle 4 suppresses per-glyph shadows (render_text skips bm_s);
+    // the event-level background rectangle replaces them.
+    if has_shadow && state.border_style != 4 {
+        let mut shadow = if border_bitmap.is_empty() {
+            fill.clone()
         } else {
-            &border_bitmap
+            border_bitmap.clone()
         };
-        let mut shadow = source.clone();
-        shadow.x += shadow_dx as i32;
-        shadow.y += shadow_dy as i32;
+        if !border_bitmap.is_empty() && fill_in_border && !fill_in_shadow {
+            fix_outline(&fill, &mut shadow);
+        }
+        shadow.x += shadow_dx.floor() as i32;
+        shadow.y += shadow_dy.floor() as i32;
         shadows.push(RenderedNode {
             bitmap: shadow,
             color: node_color(state.colors[3], fade),
         });
     }
 
-    if !border_bitmap.is_empty() {
+    if !border_bitmap.is_empty() && !fill_in_border && !fill_in_shadow {
+        fix_outline(&fill, &mut border_bitmap);
+    }
+
+    if !border_bitmap.is_empty() && !karaoke_hide_outline {
         borders.push(RenderedNode {
             bitmap: border_bitmap,
             color: node_color(state.colors[2], fade),
@@ -1278,7 +1567,7 @@ fn rasterize_segment(
     if !(effects_applied && border_px <= 0.0 && state.border_style != 3) {
         fills.push(RenderedNode {
             bitmap: fill,
-            color: node_color(state.colors[0], fade),
+            color: node_color(fill_color, fade),
         });
     }
 }

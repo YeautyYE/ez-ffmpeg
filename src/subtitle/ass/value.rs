@@ -111,10 +111,13 @@ pub(crate) fn parse_bool(s: &str) -> bool {
 }
 
 /// `ass_strtod` (the classic Tcl strtod): C whitespace, optional sign,
-/// decimal digits with one optional dot, optional exponent (backtracked when
-/// it has no digits). No hex floats, no inf/nan. Returns the value and the
-/// total consumed length (including leading whitespace), or `None` when
-/// nothing was consumed — the `mystrtod` success condition.
+/// decimal digits with one optional dot, optional exponent. Unlike C
+/// `strtod`, a digitless exponent is NOT backtracked: `1e`, `1e+`, `1e-`
+/// consume the marker (and sign) and evaluate to the mantissa — ass_strtod
+/// advances past them unconditionally and never rolls back. No hex floats,
+/// no inf/nan. Returns the value and the total consumed length (including
+/// leading whitespace), or `None` when nothing was consumed — the
+/// `mystrtod` success condition.
 pub(crate) fn parse_f64_prefix(s: &str) -> Option<(f64, usize)> {
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -141,20 +144,25 @@ pub(crate) fn parse_f64_prefix(s: &str) -> Option<(f64, usize)> {
         return None;
     }
     let mut end = i;
+    let mut value_end = i;
     if matches!(bytes.get(i), Some(b'e' | b'E')) {
         let mut j = i + 1;
         if matches!(bytes.get(j), Some(b'+' | b'-')) {
             j += 1;
         }
-        if bytes.get(j).is_some_and(u8::is_ascii_digit) {
-            while bytes.get(j).is_some_and(u8::is_ascii_digit) {
-                j += 1;
-            }
-            end = j;
+        let digits_start = j;
+        while bytes.get(j).is_some_and(u8::is_ascii_digit) {
+            j += 1;
+        }
+        // ass_strtod consumes the marker and sign even when no digits
+        // follow (exponent stays 0); only the value parse excludes them.
+        end = j;
+        if j > digits_start {
+            value_end = j;
         }
     }
-    // Only ASCII bytes were stepped over, so start/end are char boundaries.
-    Some((s[start..end].parse().unwrap_or(0.0), end))
+    // Only ASCII bytes were stepped over, so offsets are char boundaries.
+    Some((s[start..value_end].parse().unwrap_or(0.0), end))
 }
 
 /// `ass_atof`: [`parse_f64_prefix`] with the libass convention that invalid
@@ -437,12 +445,25 @@ mod tests {
         assert_eq!(parse_f64("5."), 5.0);
         assert_eq!(parse_f64("1e3"), 1000.0);
         assert_eq!(parse_f64("1.5E+2"), 150.0);
-        assert_eq!(parse_f64("1e"), 1.0); // exponent without digits backtracks
+        assert_eq!(parse_f64("1e"), 1.0); // digitless exponent: mantissa value
         assert_eq!(parse_f64("1e+"), 1.0);
         assert_eq!(parse_f64("."), 0.0);
         assert_eq!(parse_f64("+."), 0.0);
         assert_eq!(parse_f64("abc"), 0.0);
         assert_eq!(parse_f64("0x10"), 0.0); // no hex floats: parses the "0"
+    }
+
+    #[test]
+    fn parse_f64_prefix_consumes_digitless_exponent_like_ass_strtod() {
+        // ass_strtod advances past `e`/`e+`/`e-` even when no exponent
+        // digits follow — it never backtracks, unlike C strtod. The value
+        // is the mantissa (exponent 0), and endPtr lands after the sign.
+        assert_eq!(parse_f64_prefix("1e"), Some((1.0, 2)));
+        assert_eq!(parse_f64_prefix("1e+"), Some((1.0, 3)));
+        assert_eq!(parse_f64_prefix("1e-,rest"), Some((1.0, 3)));
+        assert_eq!(parse_f64_prefix("1ex"), Some((1.0, 2)));
+        assert_eq!(parse_f64_prefix("2.5E-1)"), Some((0.25, 6)));
+        assert_eq!(parse_f64_prefix(" 12,"), Some((12.0, 3)));
     }
 
     #[test]

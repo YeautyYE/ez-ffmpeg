@@ -102,73 +102,229 @@ pub(crate) fn fill_path(commands: &[Command]) -> CoverageBitmap {
 /// Rasterizes the ASS border of a path: a stroke of width `2 * border`
 /// merged with the fill (the stroke is centered on the contour, so it
 /// extends `border` pixels outward; the union removes the inner half).
+/// Like libass `ass_outline_stroke(xbord, ybord)`, the pen is an ellipse:
+/// asymmetric radii stroke a circular pen in a Y-squeezed space and
+/// resample the coverage back.
 pub(crate) fn border_path(
     commands: &[Command],
     fill: &CoverageBitmap,
-    border: f32,
+    border_x: f32,
+    border_y: f32,
 ) -> CoverageBitmap {
-    if commands.is_empty() || border <= 0.0 {
+    if commands.is_empty() || (border_x <= 0.0 && border_y <= 0.0) {
         return CoverageBitmap::default();
     }
-    let mut stroke = Stroke::new(2.0 * border);
+    let rx = border_x.max(1.0 / 64.0);
+    let ry = border_y.max(1.0 / 64.0);
+    if (rx - ry).abs() <= rx.max(ry) * 1e-3 {
+        let mut stroke = Stroke::new(2.0 * rx.max(ry));
+        stroke.cap(Cap::Round).join(Join::Round);
+        let (data, placement) = Mask::new(commands).style(Style::Stroke(stroke)).render();
+        return CoverageBitmap::from_mask(data, placement).max_with(fill);
+    }
+    // Anisotropic pen: squeeze Y so the (rx, ry) ellipse becomes a circle
+    // of radius rx, stroke there, then resample rows back. The squeeze is
+    // capped — beyond 32:1 the ellipse is visually a horizontal slit.
+    let squeeze = (rx / ry).clamp(1.0 / 32.0, 32.0);
+    let squeezed: Vec<Command> = commands
+        .iter()
+        .map(|c| transform_y(*c, f64::from(squeeze)))
+        .collect();
+    let mut stroke = Stroke::new(2.0 * rx);
     stroke.cap(Cap::Round).join(Join::Round);
-    let (data, placement) = Mask::new(commands).style(Style::Stroke(stroke)).render();
-    CoverageBitmap::from_mask(data, placement).max_with(fill)
+    let (data, placement) = Mask::new(&squeezed).style(Style::Stroke(stroke)).render();
+    let squeezed_bitmap = CoverageBitmap::from_mask(data, placement);
+    resample_rows(&squeezed_bitmap, f64::from(squeeze)).max_with(fill)
 }
 
-/// `\be`: the VSFilter "blur edges" effect — `passes` iterations of a
-/// 3x3 box kernel with the exact libass weighting (corner 1, edge 2,
-/// center 4, /16). The bitmap grows by one pixel per pass.
-pub(crate) fn be_blur(bitmap: &mut CoverageBitmap, passes: i32) {
-    for _ in 0..passes.clamp(0, 127) {
-        if bitmap.is_empty() {
-            return;
-        }
-        pad(bitmap, 1);
-        let w = bitmap.w;
-        let h = bitmap.h;
-        let src = bitmap.data.clone();
-        let at = |x: i32, y: i32| -> u32 {
-            if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
-                0
-            } else {
-                u32::from(src[y as usize * w + x as usize])
-            }
-        };
-        for y in 0..h as i32 {
-            for x in 0..w as i32 {
-                let sum = at(x - 1, y - 1)
-                    + at(x + 1, y - 1)
-                    + at(x - 1, y + 1)
-                    + at(x + 1, y + 1)
-                    + 2 * (at(x, y - 1) + at(x, y + 1) + at(x - 1, y) + at(x + 1, y))
-                    + 4 * at(x, y);
-                bitmap.data[y as usize * w + x as usize] = (sum >> 4) as u8;
-            }
-        }
+fn transform_y(command: Command, sy: f64) -> Command {
+    let map = |p: Vector| Vector::new(p.x, (f64::from(p.y) * sy) as f32);
+    match command {
+        Command::MoveTo(p) => Command::MoveTo(map(p)),
+        Command::LineTo(p) => Command::LineTo(map(p)),
+        Command::QuadTo(c, p) => Command::QuadTo(map(c), map(p)),
+        Command::CurveTo(c1, c2, p) => Command::CurveTo(map(c1), map(c2), map(p)),
+        Command::Close => Command::Close,
     }
 }
 
-/// `\blur`: gaussian with radius `r`, approximated by three box-blur
-/// passes (the standard Kovesi construction, indistinguishable at ASS
-/// blur radii).
-pub(crate) fn gaussian_blur(bitmap: &mut CoverageBitmap, radius: f64) {
-    if bitmap.is_empty() || radius <= 0.0 {
+/// Box-resamples a bitmap rendered in a Y-scaled space (y' = y * sy) back
+/// to frame rows, preserving coverage.
+fn resample_rows(src: &CoverageBitmap, sy: f64) -> CoverageBitmap {
+    if src.is_empty() {
+        return CoverageBitmap::default();
+    }
+    let y0 = (f64::from(src.y) / sy).floor() as i32;
+    let y1 = ((f64::from(src.y) + src.h as f64) / sy).ceil() as i32;
+    let h = (y1 - y0).max(1) as usize;
+    let mut data = vec![0u8; src.w * h];
+    for row in 0..h {
+        // Frame row `row` covers source rows [a, b) in the squeezed space.
+        let a = (f64::from(y0 + row as i32)) * sy - f64::from(src.y);
+        let b = a + sy;
+        let (a0, b0) = (a.max(0.0), b.min(src.h as f64));
+        if b0 <= a0 {
+            continue;
+        }
+        for col in 0..src.w {
+            let mut acc = 0.0f64;
+            let mut sr = a0.floor() as usize;
+            while (sr as f64) < b0 {
+                let cover = (b0.min(sr as f64 + 1.0) - a0.max(sr as f64)).max(0.0);
+                acc += cover * f64::from(src.data[sr * src.w + col]);
+                sr += 1;
+            }
+            data[row * src.w + col] = ((acc / (b0 - a0)) + 0.5) as u8;
+        }
+    }
+    CoverageBitmap {
+        w: src.w,
+        h,
+        x: src.x,
+        y: y0,
+        data,
+    }
+}
+
+/// libass `ass_fix_outline`: subtracts (half of) the glyph coverage from
+/// the border coverage so translucent fills do not sit on border color.
+pub(crate) fn fix_outline(glyph: &CoverageBitmap, outline: &mut CoverageBitmap) {
+    if glyph.is_empty() || outline.is_empty() {
         return;
     }
-    let radius = radius.min(100.0);
-    // Box length per pass for an equivalent gaussian sigma == radius.
-    let boxes = boxes_for_gauss(radius, 3);
-    pad(bitmap, (radius.ceil() as usize + 1) * 2);
+    let l = outline.x.max(glyph.x);
+    let t = outline.y.max(glyph.y);
+    let r = (outline.x + outline.w as i32).min(glyph.x + glyph.w as i32);
+    let b = (outline.y + outline.h as i32).min(glyph.y + glyph.h as i32);
+    for y in t..b {
+        for x in l..r {
+            let g = glyph.data[(y - glyph.y) as usize * glyph.w + (x - glyph.x) as usize];
+            let o =
+                &mut outline.data[(y - outline.y) as usize * outline.w + (x - outline.x) as usize];
+            *o = if *o > g { *o - g / 2 } else { 0 };
+        }
+    }
+}
+
+/// libass `ass_be_padding`: the fixed margin budget the \be blur may
+/// spread into (the kernel itself clamps at edges and never grows).
+fn be_padding(be: i32) -> usize {
+    match be {
+        b if b <= 3 => b.max(0) as usize,
+        b if b <= 7 => 4,
+        _ => 5,
+    }
+}
+
+/// `\be`: the VSFilter "blur edges" effect, ported from libass
+/// `ass_synth_blur`/`ass_be_blur_c`: the bitmap is padded ONCE by
+/// `ass_be_padding(be)`, then blurred in place with a [1 2 1]²/16 kernel
+/// whose borders repeat the edge samples; multi-pass runs are rescaled to
+/// a 0..64 working range first (`be_blur_pre`/`be_blur_post`).
+pub(crate) fn be_blur(bitmap: &mut CoverageBitmap, passes: i32) {
+    let mut be = passes.clamp(0, 127);
+    if be <= 0 || bitmap.is_empty() {
+        return;
+    }
+    pad(bitmap, be_padding(be));
+    let w = bitmap.w;
+    let h = bitmap.h;
+    if w < 2 || h < 2 {
+        return;
+    }
+    if be > 1 {
+        // be_blur_pre: (v*64 + 127) / 255, kept in 8 bits.
+        for v in bitmap.data.iter_mut() {
+            *v = ((*v >> 1) + 1) >> 1;
+        }
+        while be > 1 {
+            be_blur_pass(&mut bitmap.data, w, h);
+            be -= 1;
+        }
+        // be_blur_post: (v*255 + 32) / 64 == (v << 2) - (v > 32).
+        for v in bitmap.data.iter_mut() {
+            *v = ((i32::from(*v) << 2) - i32::from(*v > 32)) as u8;
+        }
+    }
+    be_blur_pass(&mut bitmap.data, w, h);
+}
+
+/// Horizontal [1 2 1] sums of one row with repeated edges — the inner
+/// recurrence of libass `ass_be_blur_c`.
+fn be_row_sums(src: &[u8], out: &mut [u16]) {
+    let w = src.len();
+    let mut old_pix = u16::from(src[0]);
+    let mut old_sum = old_pix;
+    for x in 1..w {
+        let cur = u16::from(src[x]);
+        let pair = old_pix + cur;
+        old_pix = cur;
+        out[x - 1] = old_sum + pair;
+        old_sum = pair;
+    }
+    out[w - 1] = old_sum + old_pix;
+}
+
+/// One in-place VSFilter box-blur pass (libass `ass_be_blur_c`): separable
+/// [1 2 1] in both axes, /16, edges repeated, output shifted to (x-1, y-1)
+/// exactly like the reference implementation.
+fn be_blur_pass(buf: &mut [u8], w: usize, h: usize) {
+    let mut col_pix = vec![0u16; w];
+    let mut col_sum = vec![0u16; w];
+    let mut horiz = vec![0u16; w];
+
+    // First row primes the column accumulators without output.
+    be_row_sums(&buf[..w], &mut horiz);
+    col_pix.copy_from_slice(&horiz);
+    col_sum.copy_from_slice(&horiz);
+
+    for y in 1..h {
+        let src = buf[y * w..(y + 1) * w].to_vec();
+        be_row_sums(&src, &mut horiz);
+        let dst = &mut buf[(y - 1) * w..y * w];
+        for x in 0..w {
+            let vert = col_pix[x] + horiz[x];
+            col_pix[x] = horiz[x];
+            dst[x] = ((col_sum[x] + vert) >> 4) as u8;
+            col_sum[x] = vert;
+        }
+    }
+    // Final row: vertical tail repeats the last horizontal sums.
+    let dst = &mut buf[(h - 1) * w..h * w];
+    for x in 0..w {
+        dst[x] = ((col_sum[x] + col_pix[x]) >> 4) as u8;
+    }
+}
+
+/// `\blur`: gaussian with per-axis standard deviations, approximated by
+/// three box-blur passes per axis (Kovesi construction). libass computes
+/// sigma as `blur * blur_scale_axis * 2/sqrt(log(256))` and hands
+/// `ass_gaussian_blur` the squared values; callers pass the sigmas here.
+pub(crate) fn gaussian_blur(bitmap: &mut CoverageBitmap, sigma_x: f64, sigma_y: f64) {
+    if bitmap.is_empty() || (sigma_x <= 0.0 && sigma_y <= 0.0) {
+        return;
+    }
+    let boxes_x = boxes_for_gauss(sigma_x.max(0.0), 3);
+    let boxes_y = boxes_for_gauss(sigma_y.max(0.0), 3);
+    pad_xy(
+        bitmap,
+        (sigma_x.max(0.0).ceil() as usize + 1) * 2,
+        (sigma_y.max(0.0).ceil() as usize + 1) * 2,
+    );
     let mut tmp = bitmap.data.clone();
     let w = bitmap.w;
     let h = bitmap.h;
-    for r in boxes {
-        if r == 0 {
-            continue;
+    for (rx, ry) in boxes_x.into_iter().zip(boxes_y) {
+        if rx > 0 {
+            box_blur_h(&bitmap.data, &mut tmp, w, h, rx);
+        } else {
+            tmp.copy_from_slice(&bitmap.data);
         }
-        box_blur_h(&bitmap.data, &mut tmp, w, h, r);
-        box_blur_v(&tmp, &mut bitmap.data, w, h, r);
+        if ry > 0 {
+            box_blur_v(&tmp, &mut bitmap.data, w, h, ry);
+        } else {
+            bitmap.data.copy_from_slice(&tmp);
+        }
     }
 }
 
@@ -234,18 +390,26 @@ fn box_blur_v(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize) {
 
 /// Grows the bitmap by `margin` pixels on every side (blur needs room).
 fn pad(bitmap: &mut CoverageBitmap, margin: usize) {
-    let w = bitmap.w + margin * 2;
-    let h = bitmap.h + margin * 2;
+    pad_xy(bitmap, margin, margin);
+}
+
+/// Grows the bitmap by independent horizontal/vertical margins.
+fn pad_xy(bitmap: &mut CoverageBitmap, margin_x: usize, margin_y: usize) {
+    if margin_x == 0 && margin_y == 0 {
+        return;
+    }
+    let w = bitmap.w + margin_x * 2;
+    let h = bitmap.h + margin_y * 2;
     let mut data = vec![0u8; w * h];
     for row in 0..bitmap.h {
-        let dst = (row + margin) * w + margin;
+        let dst = (row + margin_y) * w + margin_x;
         data[dst..dst + bitmap.w]
             .copy_from_slice(&bitmap.data[row * bitmap.w..(row + 1) * bitmap.w]);
     }
     bitmap.w = w;
     bitmap.h = h;
-    bitmap.x -= margin as i32;
-    bitmap.y -= margin as i32;
+    bitmap.x -= margin_x as i32;
+    bitmap.y -= margin_y as i32;
     bitmap.data = data;
 }
 
@@ -361,7 +525,7 @@ mod tests {
     #[test]
     fn border_extends_beyond_fill() {
         let fill = fill_path(&square(20.0));
-        let border = border_path(&square(20.0), &fill, 3.0);
+        let border = border_path(&square(20.0), &fill, 3.0, 3.0);
         assert!(border.w >= fill.w + 4, "stroke must widen the bitmap");
         assert!(border.x <= fill.x - 2);
         // Border contains the fill (union semantics).
@@ -371,20 +535,57 @@ mod tests {
     }
 
     #[test]
-    fn be_blur_spreads_coverage() {
+    fn asymmetric_border_extends_per_axis() {
+        // \xbord8\ybord1: the ring must be ~8px wider horizontally but only
+        // ~1px taller vertically (libass strokes a true ellipse).
+        let fill = fill_path(&square(20.0));
+        let border = border_path(&square(20.0), &fill, 8.0, 1.0);
+        let grow_x = (fill.x - border.x).min(border.x + border.w as i32 - fill.x - fill.w as i32);
+        let grow_y = (fill.y - border.y).min(border.y + border.h as i32 - fill.y - fill.h as i32);
+        assert!(grow_x >= 7, "horizontal growth {grow_x} must be ~8px");
+        assert!(grow_y <= 3, "vertical growth {grow_y} must be ~1px");
+        // Still contains the fill.
+        let cx = (fill.x - border.x) as usize + fill.w / 2;
+        let cy = (fill.y - border.y) as usize + fill.h / 2;
+        assert_eq!(border.data[cy * border.w + cx], 255);
+    }
+
+    #[test]
+    fn be_blur_pads_once_by_libass_budget() {
+        // ass_be_padding: be for be<=3, 4 for be<=7, capped at 5 beyond.
         let mut bitmap = fill_path(&square(8.0));
         let before_w = bitmap.w;
         be_blur(&mut bitmap, 2);
-        assert_eq!(bitmap.w, before_w + 4, "one pixel of padding per pass");
-        // Blur must strictly reduce the peak of a small solid square's edge.
+        assert_eq!(bitmap.w, before_w + 4, "be=2 pads by 2 per side");
         assert!(bitmap.data.iter().any(|&v| v > 0 && v < 255));
+
+        let mut big = fill_path(&square(8.0));
+        let before_w = big.w;
+        be_blur(&mut big, 20);
+        assert_eq!(big.w, before_w + 10, "be=20 pads by the 5px cap");
+    }
+
+    #[test]
+    fn fix_outline_hollows_border_under_fill() {
+        let fill = fill_path(&square(20.0));
+        let mut border = border_path(&square(20.0), &fill, 3.0, 3.0);
+        fix_outline(&fill, &mut border);
+        // Center (opaque fill): o > g never holds, so coverage drops to 0.
+        let cx = (fill.x - border.x) as usize + fill.w / 2;
+        let cy = (fill.y - border.y) as usize + fill.h / 2;
+        assert_eq!(border.data[cy * border.w + cx], 0);
+        // The outer ring is untouched.
+        assert_eq!(
+            border.data[border.w / 2],
+            border_path(&square(20.0), &fill, 3.0, 3.0).data[border.w / 2]
+        );
     }
 
     #[test]
     fn gaussian_blur_preserves_total_energy_roughly() {
         let mut bitmap = fill_path(&square(10.0));
         let sum_before: u64 = bitmap.data.iter().map(|&v| u64::from(v)).sum();
-        gaussian_blur(&mut bitmap, 2.0);
+        gaussian_blur(&mut bitmap, 2.0, 2.0);
         let sum_after: u64 = bitmap.data.iter().map(|&v| u64::from(v)).sum();
         let ratio = sum_after as f64 / sum_before as f64;
         assert!((0.85..=1.15).contains(&ratio), "energy ratio {ratio}");
