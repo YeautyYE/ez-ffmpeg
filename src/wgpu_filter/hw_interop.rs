@@ -36,6 +36,10 @@ pub(crate) struct HwVulkanInterop {
     ash_device: ash::Device,
     physical_device: vk::PhysicalDevice,
     memfd: khr::external_memory_fd::Device,
+    /// (format, modifier) pairs already proven importable, so steady-state
+    /// frames skip the two per-plane driver queries. Never invalidated:
+    /// physical-device format support cannot change at runtime.
+    supported_modifiers: std::sync::Mutex<std::collections::HashSet<(i32, u64)>>,
 }
 
 /// One plane of a DRM PRIME NV12 frame.
@@ -127,6 +131,7 @@ pub(crate) unsafe fn parse_drm_nv12(
 /// the plain `request_device` path.
 pub(crate) fn try_open_dmabuf_device(
     adapter: &wgpu::Adapter,
+    device_desc: &wgpu::DeviceDescriptor,
 ) -> Option<(wgpu::Device, wgpu::Queue, HwVulkanInterop)> {
     if adapter.get_info().backend != wgpu::Backend::Vulkan {
         info!("hw zero-copy input: unavailable (non-Vulkan backend)");
@@ -154,8 +159,8 @@ pub(crate) fn try_open_dmabuf_device(
             }
             hal_adapter
                 .open_with_callback(
-                    wgpu::Features::empty(),
-                    &wgpu::MemoryHints::default(),
+                    device_desc.required_features,
+                    &device_desc.memory_hints,
                     Some(Box::new(|args| {
                         args.extensions.extend_from_slice(&EXTENSIONS);
                     })),
@@ -165,10 +170,7 @@ pub(crate) fn try_open_dmabuf_device(
         };
         let ash_device = open_device.device.raw_device().clone();
         let (device, queue) = adapter
-            .create_device_from_hal::<wgpu::hal::api::Vulkan>(
-                open_device,
-                &wgpu::DeviceDescriptor::default(),
-            )
+            .create_device_from_hal::<wgpu::hal::api::Vulkan>(open_device, device_desc)
             .map_err(|e| info!("hw zero-copy input: device wrap failed: {e}"))
             .ok()?;
         let (ash_instance, physical_device) = {
@@ -188,6 +190,7 @@ pub(crate) fn try_open_dmabuf_device(
                 ash_device,
                 physical_device,
                 memfd,
+                supported_modifiers: std::sync::Mutex::new(std::collections::HashSet::new()),
             },
         ))
     }
@@ -250,6 +253,17 @@ impl HwVulkanInterop {
     /// unsupported modifier is undefined behavior, not a clean error, so this
     /// check is mandatory before every create (cheap CPU-side query).
     fn check_modifier_support(&self, format: vk::Format, modifier: u64) -> Result<(), String> {
+        let cache_key = (format.as_raw(), modifier);
+        {
+            let cache = self
+                .supported_modifiers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if cache.contains(&cache_key) {
+                return Ok(());
+            }
+        }
+
         let mut modifier_info = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
             .drm_format_modifier(modifier)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
@@ -287,6 +301,10 @@ impl HwVulkanInterop {
                 "{format:?} with modifier 0x{modifier:016x} is not importable"
             ));
         }
+        self.supported_modifiers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(cache_key);
         Ok(())
     }
 

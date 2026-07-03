@@ -43,6 +43,10 @@ pub(crate) struct GpuState {
     /// Raw Vulkan handles for dmabuf import; present only when the device
     /// was opened with the external-memory extensions (hw zero-copy input).
     pub(crate) hw_interop: Option<HwVulkanInterop>,
+    /// Unified-memory fast path: the pack pass writes the mappable staging
+    /// buffer directly (MAPPABLE_PRIMARY_BUFFERS), skipping the storage
+    /// buffer and its per-frame copy.
+    pub(crate) direct_pack: bool,
 }
 
 /// Size/format-dependent resources, recreated when the input geometry changes.
@@ -60,8 +64,12 @@ pub(crate) struct FrameResources {
     pub(crate) convert_bind: wgpu::BindGroup,
     pub(crate) effect_bind0: wgpu::BindGroup,
     pub(crate) effect_bind1: wgpu::BindGroup,
-    pub(crate) pack_bind: wgpu::BindGroup,
-    pub(crate) storage: wgpu::Buffer,
+    /// Cached pack bind group targeting `storage`; `None` in direct-pack
+    /// mode, where a transient bind group targets the frame's staging buffer.
+    pub(crate) pack_bind: Option<wgpu::BindGroup>,
+    /// Intermediate packed-YUV buffer copied into staging per frame; `None`
+    /// in direct-pack mode (the pack pass writes staging directly).
+    pub(crate) storage: Option<wgpu::Buffer>,
     /// Idle MAP_READ staging buffers; one is taken per in-flight frame and
     /// returned (or dropped, after a geometry change) on completion.
     ///
@@ -94,12 +102,24 @@ fn align4(v: u32) -> u32 {
     v.div_ceil(ALIGN_WORD) * ALIGN_WORD
 }
 
-/// Creates one MAP_READ readback staging buffer of `buf_size` bytes.
-pub(crate) fn create_staging(device: &wgpu::Device, buf_size: u64) -> wgpu::Buffer {
+/// Creates one MAP_READ readback staging buffer of `buf_size` bytes. With
+/// `direct_pack` the pack compute pass writes it directly (STORAGE), else it
+/// is the destination of the storage-buffer copy (COPY_DST).
+pub(crate) fn create_staging(
+    device: &wgpu::Device,
+    buf_size: u64,
+    direct_pack: bool,
+) -> wgpu::Buffer {
+    let usage = wgpu::BufferUsages::MAP_READ
+        | if direct_pack {
+            wgpu::BufferUsages::STORAGE
+        } else {
+            wgpu::BufferUsages::COPY_DST
+        };
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("ez_staging"),
         size: buf_size,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        usage,
         mapped_at_creation: false,
     })
 }
@@ -177,13 +197,26 @@ impl GpuState {
         params_len: usize,
         hw_input: bool,
     ) -> Result<Self, String> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        // Prefer the primary backends: probing GL/EGL costs ~30-40ms of init
+        // and spams warnings on headless boxes. Fall back to the full set so
+        // GL-only machines keep working exactly as before.
+        let mut instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY,
+            ..Default::default()
+        });
+        let request = wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             force_fallback_adapter: false,
             compatible_surface: None,
-        }))
-        .map_err(|e| format!("No suitable GPU adapter found: {e}"))?;
+        };
+        let adapter = match pollster::block_on(instance.request_adapter(&request)) {
+            Ok(adapter) => adapter,
+            Err(_) => {
+                instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+                pollster::block_on(instance.request_adapter(&request))
+                    .map_err(|e| format!("No suitable GPU adapter found: {e}"))?
+            }
+        };
 
         let adapter_info = adapter.get_info();
         info!(
@@ -191,25 +224,44 @@ impl GpuState {
             adapter_info.name, adapter_info.backend, adapter_info.device_type
         );
 
+        // On unified-memory GPUs the pack pass can write straight into the
+        // mappable readback buffer, skipping a full copy of the packed frame.
+        // Discrete GPUs keep the copy: mappable memory is slow to write over
+        // PCIe there. EZ_WGPU_DISABLE_DIRECT_PACK=1 forces the copy path
+        // (internal A/B and fallback-coverage knob).
+        let direct_pack = adapter_info.device_type == wgpu::DeviceType::IntegratedGpu
+            && adapter
+                .features()
+                .contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS)
+            && std::env::var("EZ_WGPU_DISABLE_DIRECT_PACK").as_deref() != Ok("1");
+        let device_desc = wgpu::DeviceDescriptor {
+            required_features: if direct_pack {
+                wgpu::Features::MAPPABLE_PRIMARY_BUFFERS
+            } else {
+                wgpu::Features::empty()
+            },
+            ..Default::default()
+        };
+        if direct_pack {
+            info!("WgpuFrameFilter: direct pack readback enabled (unified memory)");
+        }
+
         // Zero-copy hardware input needs the device opened with dmabuf-import
         // extensions; when that is not possible the filter still works, hw
         // frames just take the download path.
         let (device, queue, hw_interop) = match hw_input {
-            true => match hw_interop::try_open_dmabuf_device(&adapter) {
+            true => match hw_interop::try_open_dmabuf_device(&adapter, &device_desc) {
                 Some((device, queue, interop)) => (device, queue, Some(interop)),
                 None => {
-                    let (device, queue) = pollster::block_on(
-                        adapter.request_device(&wgpu::DeviceDescriptor::default()),
-                    )
-                    .map_err(|e| format!("Failed to create wgpu device: {e}"))?;
+                    let (device, queue) =
+                        pollster::block_on(adapter.request_device(&device_desc))
+                            .map_err(|e| format!("Failed to create wgpu device: {e}"))?;
                     (device, queue, None)
                 }
             },
             false => {
-                let (device, queue) = pollster::block_on(
-                    adapter.request_device(&wgpu::DeviceDescriptor::default()),
-                )
-                .map_err(|e| format!("Failed to create wgpu device: {e}"))?;
+                let (device, queue) = pollster::block_on(adapter.request_device(&device_desc))
+                    .map_err(|e| format!("Failed to create wgpu device: {e}"))?;
                 (device, queue, None)
             }
         };
@@ -413,6 +465,7 @@ impl GpuState {
             pack_uniforms,
             resources: None,
             hw_interop,
+            direct_pack,
         })
     }
 
@@ -421,6 +474,33 @@ impl GpuState {
             PlaneLayout::Planar { .. } => &self.convert_pipeline_planar,
             PlaneLayout::Nv12 => &self.convert_pipeline_nv12,
         }
+    }
+
+    /// Builds a pack bind group targeting `out_buf` (the cached storage
+    /// buffer, or a frame's staging buffer in direct-pack mode).
+    pub(crate) fn pack_bind_for(
+        &self,
+        out_view: &wgpu::TextureView,
+        out_buf: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ez_pack_bind"),
+            layout: &self.pack_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(out_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.pack_uniforms.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: out_buf.as_entire_binding(),
+                },
+            ],
+        })
     }
 
     /// Builds an NV12 convert bind group for a pair of imported hardware
@@ -534,14 +614,16 @@ impl GpuState {
         let total_words = y_words + 2 * c_words;
         let buf_size = (total_words * 4) as u64;
 
-        let storage = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("ez_pack_storage"),
-            size: buf_size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
+        let storage = (!self.direct_pack).then(|| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("ez_pack_storage"),
+                size: buf_size,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })
         });
         let staging_pool: Vec<wgpu::Buffer> = (0..staging_count)
-            .map(|_| create_staging(device, buf_size))
+            .map(|_| create_staging(device, buf_size, self.direct_pack))
             .collect();
 
         let view = |t: &wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor::default());
@@ -630,24 +712,9 @@ impl GpuState {
                 resource: self.params_buf.as_entire_binding(),
             }],
         });
-        let pack_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("ez_pack_bind"),
-            layout: &self.pack_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&out_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: self.pack_uniforms.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: storage.as_entire_binding(),
-                },
-            ],
-        });
+        let pack_bind = storage
+            .as_ref()
+            .map(|storage| self.pack_bind_for(&out_view, storage));
 
         self.resources = Some(FrameResources {
             in_w,
