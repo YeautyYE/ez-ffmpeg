@@ -740,18 +740,29 @@ pub(crate) fn blend_pooled_from_sums(
 }
 
 /// Route choice for subsampled chroma pairs in `filter::blend_images`
-/// (measured in `bench_kernels.rs`, dense 1080p chroma pair): pooling each
-/// node once and applying per component beats the fused per-component path
-/// for 8-bit always (scalar 372us vs 544us fused). For 16-bit the scalar
-/// routes were a wash (487us vs 516us), so it kept the fused path — but
-/// the AVX2 apply kernels put two-phase far ahead (125us vs 454us), so
-/// 16-bit takes it exactly when the AVX2 kernels are live. Both routes are
-/// byte-identical (lab parity tests).
+/// (measured in `bench_kernels.rs`, dense 1080p): pooling each node once
+/// and applying per component beats the fused per-component path for 8-bit
+/// always (372us vs 544us). For 16-bit the scalar fused path used to win
+/// (516us vs 487us was within noise), but the AVX2 apply kernels flip the
+/// two-phase route well ahead — so 16-bit takes it exactly when the AVX2
+/// kernels are live. Both routes are byte-identical (lab parity tests).
 pub(crate) fn two_phase_pooled_preferred(sample: SampleFormat) -> bool {
     match sample {
         SampleFormat::U8 => true,
         SampleFormat::U16Le => avx2_available(),
     }
+}
+
+/// Number of mask pixels of `image` that intersect a `grid_w x grid_h`
+/// frame: the work-size estimate behind the parallel-blend gate.
+pub(crate) fn clipped_area(grid_w: usize, grid_h: usize, image: &OverlayImage<'_>) -> usize {
+    let Some((_, _, w)) = clip_interval(grid_w, image.dst_x, image.w) else {
+        return 0;
+    };
+    let Some((_, _, h)) = clip_interval(grid_h, image.dst_y, image.h) else {
+        return 0;
+    };
+    w * h
 }
 
 fn apply_sums<S: Sample>(
