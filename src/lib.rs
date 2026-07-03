@@ -35,6 +35,11 @@
 //! - **`flv`** (feature `"flv"`): Provides data structures and helpers for handling FLV
 //!   containers, useful if you’re working with RTMP or other FLV-based workflows.
 //!
+//! - **`subtitle`** (feature `"subtitle"`): Burns ASS/SRT subtitles onto video frames inside
+//!   the frame pipeline with a pure-Rust renderer — independent of whether the linked FFmpeg
+//!   was built with `--enable-libass`. Accepts subtitle files or in-memory scripts and
+//!   explicit font files.
+//!
 //! ## Basic Usage
 //!
 //! For a simple pipeline, you typically do the following:
@@ -86,6 +91,8 @@
 //!   native epoll/kqueue/WSAPoll IO (edge-triggered on Linux/macOS), zero-copy GOP, and in-process ingest
 //!   that avoids TCP between FFmpeg and server.
 //! - **`flv`**: Adds FLV container parsing and handling.
+//! - **`subtitle`**: Native ASS/SRT subtitle burn-in rendered in pure Rust — no system
+//!   libraries beyond FFmpeg itself (see the `subtitle` module docs).
 //! - **`async`**: Makes the [`FfmpegScheduler`] wait method asynchronous (you can `.await` it).
 //! - **`static`**: Uses static linking for FFmpeg libraries (via `ffmpeg-next/static`).
 //!
@@ -130,3 +137,6 @@ pub mod rtmp;
 
 #[cfg(feature = "flv")]
 pub mod flv;
+
+#[cfg(feature = "subtitle")]
+pub mod subtitle;

@@ -40,6 +40,12 @@ rml_rtmp = { version = "0.8", optional = true }
 slab = { version = "0.4", optional = true }
 dashmap = { version = "6", optional = true }
 byteorder = { version = "1.5", optional = true }
+fontdb = { version = "0.23.0", optional = true }
+ttf-parser = { version = "0.25.1", optional = true }
+rustybuzz = { version = "0.20.1", optional = true }
+zeno = { version = "0.3.3", optional = true }
+unicode-bidi = { version = "0.3.18", optional = true }
+unicode-linebreak = { version = "0.1.5", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2"
@@ -51,8 +57,16 @@ async = []
 opengl = ["dep:surfman", "dep:glow", "dep:bytemuck"]
 rtmp = ["dep:rml_rtmp", "dep:slab", "dep:dashmap", "flv"]
 flv = ["dep:bytes", "dep:byteorder"]
+subtitle = [
+    "dep:fontdb",
+    "dep:ttf-parser",
+    "dep:rustybuzz",
+    "dep:zeno",
+    "dep:unicode-bidi",
+    "dep:unicode-linebreak",
+]
 static = ["ffmpeg-next/static"]
-docs-rs = ["async", "opengl", "rtmp", "flv"]
+docs-rs = ["async", "opengl", "rtmp", "flv", "subtitle"]
 
 [package.metadata.docs.rs]
 features = ["docs-rs"]
