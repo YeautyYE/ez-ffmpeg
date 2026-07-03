@@ -209,6 +209,7 @@ pub(crate) mod unsupported {
     pub(crate) const KARAOKE: u32 = 1 << 3;
     pub(crate) const VECTOR_CLIP: u32 = 1 << 4;
     pub(crate) const SCROLL_EFFECT: u32 = 1 << 5;
+    pub(crate) const VERTICAL_TEXT: u32 = 1 << 6;
 
     /// One human-readable line per flag, for the once-per-feature warning.
     pub(crate) fn describe(flag: u32) -> &'static str {
@@ -216,9 +217,10 @@ pub(crate) mod unsupported {
             ROTATION => "\\frx/\\fry/\\frz rotation (and style Angle) is not applied yet; text renders unrotated",
             SHEAR => "\\fax/\\fay shear is not applied yet; text renders unsheared",
             ANIMATION => "\\t animation is not applied yet; events render in their initial state",
-            KARAOKE => "\\k/\\kf/\\ko karaoke sweep is not applied yet; text renders fully filled",
+            KARAOKE => "\\kf/\\K karaoke sweep is approximated stepwise (switches at the syllable midpoint)",
             VECTOR_CLIP => "vector \\clip/\\iclip is not applied yet; only rectangular clips work",
             SCROLL_EFFECT => "Banner/Scroll transition effects are not applied yet; the event renders statically",
+            VERTICAL_TEXT => "@-prefixed vertical layout is not applied yet; text renders horizontally",
             _ => "unknown unsupported feature",
         }
     }
@@ -344,6 +346,7 @@ pub(crate) fn render_event(
 
     let push_text = |text: &mut String,
                      state: &mut State,
+                     overrides: &mut EventOverrides,
                      segments: &mut Vec<Segment>,
                      face_cache: &mut HashMap<
         (String, u16, bool),
@@ -352,7 +355,7 @@ pub(crate) fn render_event(
         if text.is_empty() {
             return;
         }
-        build_text_segments(ctx, state, text, segments, face_cache);
+        overrides.unsupported |= build_text_segments(ctx, state, text, segments, face_cache);
         text.clear();
     };
 
@@ -362,7 +365,13 @@ pub(crate) fn render_event(
         if bytes[i] == b'{' {
             if let Some(close) = event.text[i..].find('}') {
                 // Tag block: flush pending text under the current state.
-                push_text(&mut pending_text, &mut state, &mut segments, face_cache);
+                push_text(
+                    &mut pending_text,
+                    &mut state,
+                    &mut overrides,
+                    &mut segments,
+                    face_cache,
+                );
                 let block = &event.text[i + 1..i + close];
                 apply_tags(
                     script,
@@ -382,7 +391,13 @@ pub(crate) fn render_event(
             let rest = &event.text[i..];
             let end = rest.find('{').unwrap_or(rest.len());
             let drawing_text = &rest[..end];
-            push_text(&mut pending_text, &mut state, &mut segments, face_cache);
+            push_text(
+                &mut pending_text,
+                &mut state,
+                &mut overrides,
+                &mut segments,
+                face_cache,
+            );
             build_drawing_segment(ctx, &mut state, drawing_text, &mut segments);
             i += end;
             continue;
@@ -393,14 +408,26 @@ pub(crate) fn render_event(
             let mut chars = stripped.chars();
             match chars.next() {
                 Some('N') => {
-                    push_text(&mut pending_text, &mut state, &mut segments, face_cache);
+                    push_text(
+                        &mut pending_text,
+                        &mut state,
+                        &mut overrides,
+                        &mut segments,
+                        face_cache,
+                    );
                     hard_breaks.push(segments.len());
                     i += 2;
                     continue;
                 }
                 Some('n') => {
                     if state.wrap_style == 2 {
-                        push_text(&mut pending_text, &mut state, &mut segments, face_cache);
+                        push_text(
+                            &mut pending_text,
+                            &mut state,
+                            &mut overrides,
+                            &mut segments,
+                            face_cache,
+                        );
                         hard_breaks.push(segments.len());
                     } else {
                         pending_text.push(' ');
@@ -425,7 +452,13 @@ pub(crate) fn render_event(
         pending_text.push(if ch == '\t' { ' ' } else { ch });
         i += ch.len_utf8();
     }
-    push_text(&mut pending_text, &mut state, &mut segments, face_cache);
+    push_text(
+        &mut pending_text,
+        &mut state,
+        &mut overrides,
+        &mut segments,
+        face_cache,
+    );
 
     let detect_collisions =
         overrides.pos.is_none() && overrides.movement.is_none() && !overrides.disable_collisions;
@@ -1070,19 +1103,24 @@ fn build_text_segments(
     text: &str,
     segments: &mut Vec<Segment>,
     face_cache: &mut HashMap<(String, u16, bool), Option<std::sync::Arc<LoadedFace>>>,
-) {
+) -> u32 {
+    // libass ass_update_font: a leading '@' selects vertical layout and is
+    // stripped before font matching. Vertical layout itself is not
+    // implemented; strip the marker so the family still resolves, and
+    // surface the gap.
+    let (family, unsupported_flags) = match state.family.strip_prefix('@') {
+        Some(stripped) => (stripped.to_string(), unsupported::VERTICAL_TEXT),
+        None => (state.family.clone(), 0),
+    };
     let request = FaceRequest::from_ass(state.bold, state.italic);
-    let key = (state.family.clone(), request.weight, request.italic);
+    let key = (family.clone(), request.weight, request.italic);
     let entry = face_cache.entry(key).or_insert_with(|| {
-        let face_ref = ctx.fonts.select(&state.family, request)?;
+        let face_ref = ctx.fonts.select(&family, request)?;
         ctx.fonts.load(&face_ref).map(std::sync::Arc::new)
     });
     let Some(face) = entry.clone() else {
-        log::warn!(
-            "subtitle render: no usable font for family '{}'; text dropped",
-            state.family
-        );
-        return;
+        log::warn!("subtitle render: no usable font for family '{family}'; text dropped");
+        return unsupported_flags;
     };
 
     // Pixel scales: REAL_DIM sizing — the requested size is the full
@@ -1154,6 +1192,7 @@ fn build_text_segments(
         state.effect_reset = false;
         start = end;
     }
+    unsupported_flags
 }
 
 fn shape_piece(
