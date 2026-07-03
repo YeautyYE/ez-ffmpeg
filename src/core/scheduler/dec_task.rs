@@ -32,6 +32,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use crate::util::ffmpeg_utils::av_err2str;
+use crate::util::thread_synchronizer::{ThreadDoneGuard, ThreadSynchronizer};
 
 #[cfg(feature = "docs-rs")]
 pub(crate) fn dec_init(
@@ -41,6 +42,7 @@ pub(crate) fn dec_init(
     frame_pool: ObjPool<Frame>,
     packet_pool: ObjPool<Packet>,
     scheduler_status: Arc<AtomicUsize>,
+    thread_sync: ThreadSynchronizer,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
 ) -> crate::error::Result<()> {
     Ok(())
@@ -54,6 +56,7 @@ pub(crate) fn dec_init(
     frame_pool: ObjPool<Frame>,
     packet_pool: ObjPool<Packet>,
     scheduler_status: Arc<AtomicUsize>,
+    thread_sync: ThreadSynchronizer,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
 ) -> crate::error::Result<()> {
     let receiver = dec_stream.take_src();
@@ -92,12 +95,18 @@ pub(crate) fn dec_init(
 
 
     let dp_arc = dp_arc.clone();
+
+    // Slot claimed before spawn; the guard releases it on any exit path.
+    thread_sync.thread_start();
+    let thread_done_guard = ThreadDoneGuard::adopt(thread_sync.clone(), scheduler_status.clone());
+
     let result = std::thread::Builder::new()
         .name(format!(
             "decoder{}:{demux_idx}:{decoder_name}",
             dec_stream.stream_index,
         ))
         .spawn(move || {
+            let _thread_done = thread_done_guard;
             let dp_arc = dp_arc;
             let input_status = false;
             let mut err_exit = false;

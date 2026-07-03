@@ -8,6 +8,7 @@ use crate::core::scheduler::ffmpeg_scheduler::{
 };
 use crate::hwaccel::hw_device_get_by_type;
 use crate::util::ffmpeg_utils::{av_err2str, hashmap_to_avdictionary};
+use crate::util::thread_synchronizer::{ThreadDoneGuard, ThreadSynchronizer};
 use crossbeam_channel::{Receiver, RecvTimeoutError, SendError, Sender};
 use ffmpeg_next::packet::Mut;
 use ffmpeg_next::{Frame, Packet};
@@ -31,7 +32,7 @@ use log::{debug, error, info, trace, warn};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString};
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::Duration;
@@ -54,6 +55,8 @@ pub(crate) fn enc_init(
     frame_pool: ObjPool<Frame>,
     packet_pool: ObjPool<Packet>,
     scheduler_status: Arc<AtomicUsize>,
+    thread_sync: ThreadSynchronizer,
+    enc_handle_sender: Sender<std::thread::JoinHandle<()>>,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
 ) -> crate::error::Result<()> {
     Ok(())
@@ -77,6 +80,8 @@ pub(crate) fn enc_init(
     frame_pool: ObjPool<Frame>,
     packet_pool: ObjPool<Packet>,
     scheduler_status: Arc<AtomicUsize>,
+    thread_sync: ThreadSynchronizer,
+    enc_handle_sender: Sender<std::thread::JoinHandle<()>>,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
 ) -> crate::error::Result<()> {
     let enc_ctx = unsafe { avcodec_alloc_context3(enc_stream.encoder) };
@@ -107,14 +112,19 @@ pub(crate) fn enc_init(
     let receiver = enc_stream.take_src();
     let pkt_sender = enc_stream.take_dst();
     let pre_pkt_sender = enc_stream.take_dst_pre();
-    let mux_started = enc_stream.take_mux_started();
+    let mux_start_gate = enc_stream.take_mux_start_gate();
 
     let stream_box = enc_stream.stream;
     let stream_index = enc_stream.stream_index;
 
     let encoder_name = unsafe { CStr::from_ptr((*enc_stream.encoder).name).to_str().unwrap_or("unknown") };
 
+    // Slot claimed before spawn; the guard releases it on any exit path.
+    thread_sync.thread_start();
+    let thread_done_guard = ThreadDoneGuard::adopt(thread_sync.clone(), scheduler_status.clone());
+
     let result = std::thread::Builder::new().name(format!("encoder{stream_index}:{mux_idx}:{encoder_name}")).spawn(move || unsafe {
+        let _thread_done = thread_done_guard;
         let enc_ctx_box = enc_ctx_box;
         let stream_box = stream_box;
 
@@ -149,7 +159,7 @@ pub(crate) fn enc_init(
                 recording_time_us,
                 &pkt_sender,
                 &pre_pkt_sender,
-                &mux_started,
+                &mux_start_gate,
                 stream_box.inner,
                 &packet_pool,
             );
@@ -273,9 +283,8 @@ pub(crate) fn enc_init(
                                 codec_type: (*enc_ctx).codec_type,
                                 output_stream_index: (*stream).index,
                                 is_copy: false,
-                                codecpar: (*stream).codecpar,
                             },
-                        }, &pkt_sender, &pre_pkt_sender, &mux_started) {
+                        }, &pkt_sender, &pre_pkt_sender, &mux_start_gate) {
                             debug!("send flushed packet failed, mux already finished");
                             break;
                         }
@@ -308,9 +317,8 @@ pub(crate) fn enc_init(
                     codec_type: (*enc_ctx).codec_type,
                     output_stream_index: (*stream).index,
                     is_copy: false,
-                    codecpar: (*stream).codecpar,
                 },
-            }, &pkt_sender, &pre_pkt_sender, &mux_started) {
+            }, &pkt_sender, &pre_pkt_sender, &mux_start_gate) {
                 if is_stopping(scheduler_status.load(Ordering::Acquire)) {
                     // Normal shutdown ordering: muxer exits before the encoder's
                     // end-of-stream marker; not an error and not a task failure.
@@ -328,9 +336,17 @@ pub(crate) fn enc_init(
 
         debug!("Encoder finished.");
     });
-    if let Err(e) = result {
-        error!("Encoder thread exited with error: {e}");
-        return Err(OpenEncoderOperationError::ThreadExited.into())
+    match result {
+        Err(e) => {
+            error!("Encoder thread exited with error: {e}");
+            return Err(OpenEncoderOperationError::ThreadExited.into());
+        }
+        Ok(handle) => {
+            // Hand the join handle to this stream's muxer: the muxer joins
+            // its encoders before freeing the output AVFormatContext, so an
+            // encoder can never outlive the streams it references.
+            let _ = enc_handle_sender.send(handle);
+        }
     }
 
     Ok(())
@@ -1100,7 +1116,7 @@ fn frame_encode(
     recording_time_us: Option<i64>,
     pkt_sender: &Sender<PacketBox>,
     pre_pkt_sender: &Sender<PacketBox>,
-    mux_started: &Arc<AtomicBool>,
+    mux_start_gate: &Arc<crate::core::context::MuxStartGate>,
     stream: *mut AVStream,
     packet_pool: &ObjPool<Packet>,
 ) -> crate::error::Result<EncodeStatus> {
@@ -1120,7 +1136,7 @@ fn frame_encode(
                     recording_time_us,
                     pkt_sender,
                     pre_pkt_sender,
-                    mux_started,
+                    mux_start_gate,
                     stream,
                 )
             } else {
@@ -1152,7 +1168,7 @@ fn frame_encode(
                 return Ok(EncodeStatus::Continue);
             }
         }
-        encode_frame(enc_ctx, frame, pkt_sender,  pre_pkt_sender, mux_started, stream, packet_pool)
+        encode_frame(enc_ctx, frame, pkt_sender,  pre_pkt_sender, mux_start_gate, stream, packet_pool)
             .map(|eof| if eof { EncodeStatus::Eof } else { EncodeStatus::Continue })
     }
 }
@@ -1165,7 +1181,7 @@ unsafe fn do_subtitle_out(
     recording_time_us: Option<i64>,
     pkt_sender: &Sender<PacketBox>,
     pre_pkt_sender: &Sender<PacketBox>,
-    mux_started: &Arc<AtomicBool>,
+    mux_start_gate: &Arc<crate::core::context::MuxStartGate>,
     stream: *mut AVStream,
 ) -> crate::error::Result<EncodeStatus> {
     let subtitle_out_max_size = 1024 * 1024;
@@ -1267,9 +1283,8 @@ unsafe fn do_subtitle_out(
                 codec_type: (*enc_ctx).codec_type,
                 output_stream_index: (*stream).index,
                 is_copy: false,
-                codecpar: (*stream).codecpar,
             },
-        }, pkt_sender, pre_pkt_sender, mux_started) {
+        }, pkt_sender, pre_pkt_sender, mux_start_gate) {
             debug!("send subtitle packet failed, mux already finished");
             return Err(Encoding(EncodingOperationError::MuxerFinished));
         }
@@ -1284,7 +1299,7 @@ unsafe fn encode_frame(
     frame: *mut AVFrame,
     pkt_sender: &Sender<PacketBox>,
     pre_pkt_sender: &Sender<PacketBox>,
-    mux_started: &Arc<AtomicBool>,
+    mux_start_gate: &Arc<crate::core::context::MuxStartGate>,
     stream: *mut AVStream,
     packet_pool: &ObjPool<Packet>,
 ) -> crate::error::Result<bool> {
@@ -1338,9 +1353,8 @@ unsafe fn encode_frame(
                 codec_type: (*enc_ctx).codec_type,
                 output_stream_index: (*stream).index,
                 is_copy: false,
-                codecpar: (*stream).codecpar,
             },
-        }, pkt_sender, pre_pkt_sender, mux_started) {
+        }, pkt_sender, pre_pkt_sender, mux_start_gate) {
             debug!("send packet failed, mux already finished");
             return Err(Encoding(EncodingOperationError::MuxerFinished));
         }
@@ -1348,19 +1362,33 @@ unsafe fn encode_frame(
 }
 
 
-fn send_to_mux(packet_box: PacketBox, pkt_sender: &Sender<PacketBox>, pre_pkt_sender: &Sender<PacketBox>, mux_started:&Arc<AtomicBool>) -> Result<(), SendError<PacketBox>> {
-    if mux_started.load(Ordering::Acquire) {
-        pkt_sender.send(packet_box)
-    } else {
-        if let Err(e) = pre_pkt_sender.send(packet_box) {
-            for _ in 0..64 {
-                if mux_started.load(Ordering::Acquire) {
-                    return pkt_sender.send(e.0);
-                }
-                sleep(Duration::from_millis(100));
-            }
-            return Err(e);
-        }
-        Ok(())
+fn send_to_mux(
+    packet_box: PacketBox,
+    pkt_sender: &Sender<PacketBox>,
+    pre_pkt_sender: &Sender<PacketBox>,
+    mux_start_gate: &Arc<crate::core::context::MuxStartGate>,
+) -> Result<(), SendError<PacketBox>> {
+    use crate::core::context::PreSendOutcome;
+
+    if mux_start_gate.is_started() {
+        return pkt_sender.send(packet_box);
     }
+
+    // The gate serializes "started?" with the pre-queue send: without it a
+    // packet parked between the muxer's drain and its gate flip would never
+    // be delivered.
+    let mut packet_box = packet_box;
+    for _ in 0..640 {
+        packet_box = match mux_start_gate.send_pre(pre_pkt_sender, packet_box) {
+            PreSendOutcome::Sent => return Ok(()),
+            PreSendOutcome::Started(pb) => return pkt_sender.send(pb),
+            PreSendOutcome::Full(pb) => {
+                // Pre-queue full: wait for the muxer to start and drain it.
+                sleep(Duration::from_millis(10));
+                pb
+            }
+            PreSendOutcome::Disconnected(pb) => return Err(SendError(pb)),
+        };
+    }
+    Err(SendError(packet_box))
 }

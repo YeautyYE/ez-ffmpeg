@@ -19,7 +19,7 @@ use ffmpeg_sys_next::AV_CODEC_PROP_FIELDS;
 use ffmpeg_sys_next::{
     av_compare_ts, av_gettime_relative, av_inv_q, av_mul_q, av_packet_ref, av_q2d, av_read_frame,
     av_rescale, av_rescale_q, av_stream_get_parser, av_usleep,
-    avformat_seek_file, AVCodecDescriptor, AVCodecParameters, AVFormatContext, AVMediaType,
+    avformat_seek_file, AVCodecDescriptor, AVFormatContext, AVMediaType,
     AVPacket, AVRational, AVStream, AVERROR, AVERROR_EOF, AVFMT_TS_DISCONT,
     AV_NOPTS_VALUE, AV_PKT_FLAG_CORRUPT, AV_TIME_BASE, AV_TIME_BASE_Q,
     EAGAIN,
@@ -31,6 +31,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use crate::core::scheduler::input_controller::SchNode;
 use crate::util::ffmpeg_utils::av_err2str;
+use crate::util::thread_synchronizer::{ThreadDoneGuard, ThreadSynchronizer};
 
 #[cfg(feature = "docs-rs")]
 pub(crate) fn demux_init(
@@ -40,6 +41,7 @@ pub(crate) fn demux_init(
     packet_pool: ObjPool<Packet>,
     demux_node: Arc<SchNode>,
     scheduler_status: Arc<AtomicUsize>,
+    thread_sync: ThreadSynchronizer,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
 ) -> crate::error::Result<()> {
     Ok(())
@@ -53,6 +55,7 @@ pub(crate) fn demux_init(
     packet_pool: ObjPool<Packet>,
     demux_node: Arc<SchNode>,
     scheduler_status: Arc<AtomicUsize>,
+    thread_sync: ThreadSynchronizer,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
 ) -> crate::error::Result<()> {
     if demux.destination_is_empty() {
@@ -75,9 +78,16 @@ pub(crate) fn demux_init(
 
     let format_name = unsafe { CStr::from_ptr((*(*in_fmt_ctx).iformat).name).to_str().unwrap_or("unknown") };
 
+    // Claim the thread slot before spawning so stop()/wait() can never
+    // observe a zero counter while this worker is about to run; the guard
+    // releases it on any exit path, including panic.
+    thread_sync.thread_start();
+    let thread_done_guard = ThreadDoneGuard::adopt(thread_sync.clone(), scheduler_status.clone());
+
     let result = std::thread::Builder::new()
         .name(format!("demuxer{demux_idx}:{format_name}"))
         .spawn(move || {
+            let _thread_done = thread_done_guard;
             let in_fmt_ctx_box = in_fmt_ctx_box;
             let mut is_started = false;
             // Mirrors FFmpeg's Demuxer.nb_streams_warn: warn once per unexpected stream id.
@@ -153,7 +163,6 @@ pub(crate) fn demux_init(
                                         codec_type: AVMediaType::AVMEDIA_TYPE_UNKNOWN,
                                         output_stream_index: 0,
                                         is_copy: false,
-                                        codecpar: null_mut(),
                                     },
                                 };
                                 demux_send(&mut demux_parameter, packet_box, &packet_pool, 0, &demux_node, &scheduler_status, independent_readrate)
@@ -250,7 +259,6 @@ pub(crate) fn demux_init(
                                 codec_type: ds.codec_type,
                                 output_stream_index: 0,
                                 is_copy: false,
-                                codecpar: ds.codecpar,
                             },
                         };
                         ret = demux_send(&mut demux_parameter, packet_box, &packet_pool, send_flags, &demux_node, &scheduler_status, independent_readrate);
@@ -307,7 +315,6 @@ fn demux_done(demux_parameter: &mut DemuxerParameter, packet_pool: &ObjPool<Pack
                     codec_type: ds.codec_type,
                     output_stream_index: 0,
                     is_copy: false,
-                    codecpar: ds.codecpar,
                 },
             };
 
@@ -763,7 +770,6 @@ unsafe fn ts_discontinuity_detect(
 struct DemuxStreamParameter {
     codec_type: AVMediaType,
     stream_index: usize,
-    codecpar: *mut AVCodecParameters,
     codec_desc: *const AVCodecDescriptor,
 
     wrap_correction_done: bool,
@@ -776,13 +782,10 @@ struct DemuxStreamParameter {
     dts: i64,
 }
 
-// SAFETY: DemuxStreamParameter contains raw pointers (codecpar, codec_desc) but is safe to
-// Send/Sync because:
-// 1. codecpar points to AVCodecParameters owned by AVStream, which lives for the duration
-//    of the demuxer and is only read (not written) after initialization
-// 2. codec_desc points to static FFmpeg codec descriptor data (read-only)
-// 3. The demuxer thread has exclusive access during demuxing operations
-// 4. Data is passed to other threads via crossbeam channels (by value, not pointer)
+// SAFETY: DemuxStreamParameter contains a raw pointer (codec_desc) but is safe
+// to Send/Sync because:
+// 1. codec_desc points to static FFmpeg codec descriptor data (read-only)
+// 2. The demuxer thread has exclusive access during demuxing operations
 unsafe impl Send for DemuxStreamParameter {}
 unsafe impl Sync for DemuxStreamParameter {}
 impl DemuxStreamParameter {
@@ -790,7 +793,6 @@ impl DemuxStreamParameter {
         Self {
             codec_type: ds.codec_type,
             stream_index: ds.stream_index,
-            codecpar: ds.codec_parameters,
             codec_desc: ds.codec_desc,
             wrap_correction_done: false,
             saw_first_ts: false,
@@ -1166,7 +1168,6 @@ unsafe fn demux_flush(
                 codec_type: AVMediaType::AVMEDIA_TYPE_UNKNOWN,
                 output_stream_index: 0,
                 is_copy: false,
-                codecpar: null_mut(),
             },
         };
 

@@ -58,13 +58,15 @@ impl SchWaiter {
     }
 
     pub(crate) fn wait_with_scheduler_status(&self, scheduler_status: &Arc<AtomicUsize>, cal_wait_time: bool) -> i64 {
+        use crate::core::scheduler::ffmpeg_scheduler::is_stopping;
+
         // early return
         if !self.choked.load(Ordering::Acquire) {
             return 0;
         }
-        if scheduler_status.load(Ordering::Acquire)
-            == crate::core::scheduler::ffmpeg_scheduler::STATUS_END
-        {
+        // Both terminal states release the waiter: abort() publishes
+        // STATUS_ABORT, not STATUS_END.
+        if is_stopping(scheduler_status.load(Ordering::Acquire)) {
             return 0;
         }
 
@@ -76,8 +78,7 @@ impl SchWaiter {
         let mut guard = self.lock.lock().unwrap();
         // avoid spurious wakeup
         while self.choked.load(Ordering::Acquire)
-            && scheduler_status.load(Ordering::Acquire)
-                != crate::core::scheduler::ffmpeg_scheduler::STATUS_END
+            && !is_stopping(scheduler_status.load(Ordering::Acquire))
         {
             guard = self.cond.wait(guard).unwrap();
         }
@@ -167,6 +168,35 @@ mod tests {
         waiter.set(false);
 
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn wait_with_scheduler_status_releases_on_abort() {
+        use crate::core::scheduler::ffmpeg_scheduler::{STATUS_ABORT, STATUS_RUN};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::mpsc;
+
+        let waiter = Arc::new(SchWaiter::new());
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        waiter.set(true);
+
+        let (tx, rx) = mpsc::channel();
+        let waiter_clone = Arc::clone(&waiter);
+        let status_clone = Arc::clone(&status);
+        thread::spawn(move || {
+            waiter_clone.wait_with_scheduler_status(&status_clone, false);
+            let _ = tx.send(());
+        });
+
+        thread::sleep(Duration::from_millis(100));
+
+        // abort() publishes STATUS_ABORT (not STATUS_END) and then notifies:
+        // a choked demuxer must be released by either stopping state.
+        status.store(STATUS_ABORT, Ordering::Release);
+        waiter.set(true); // notify while still choked: only the status can release
+
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("a choked waiter must be released when the scheduler aborts");
     }
 
     #[test]
