@@ -298,6 +298,38 @@ pub(crate) struct EventSamples {
     karaoke: Vec<(bool, bool)>,
 }
 
+/// The mask-affecting subset of [`EventSamples`]: nodes are rendered with
+/// unfaded colors and the fade VALUE is applied at emission, so masks (and
+/// stacking) depend on the fade only through two booleans — whether it is
+/// active (`fill_in_border`/`fill_in_shadow` gating) and whether it is
+/// saturated at 255 (every node goes fully transparent and is dropped
+/// before stacking).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MaskSamples {
+    fade: Option<(bool, bool)>,
+    anchor_bits: Option<(u64, u64)>,
+    karaoke: Vec<(bool, bool)>,
+}
+
+impl EventSamples {
+    /// The mask-identity view of these samples (see [`MaskSamples`]).
+    pub(crate) fn mask_key(&self) -> MaskSamples {
+        MaskSamples {
+            // Saturation means the post-clamp multiplier is 255 (every
+            // node fully transparent), so >= — raw \fade alphas can
+            // overshoot the byte range.
+            fade: self.fade.map(|f| (f != 0, f >= 255)),
+            anchor_bits: self.anchor_bits,
+            karaoke: self.karaoke.clone(),
+        }
+    }
+
+    /// The emission-only fade multiplier at this timestamp.
+    pub(crate) fn fade(&self) -> Option<i32> {
+        self.fade
+    }
+}
+
 impl EventDynamics {
     /// Resolves the dynamic inputs at `now_rel` ms since event start. Uses
     /// the same evaluators as the render path, so equal samples guarantee
@@ -646,9 +678,12 @@ pub(crate) fn render_event(
     };
 
     // ---- pass 4: rasterize lines ----
-    let fade = overrides
+    // Only the fade's mask-affecting bit is resolved here; the fade VALUE
+    // is applied at emission (renderer) so cached nodes survive fading.
+    let fade_active = overrides
         .fade
-        .map(|f| fade_alpha(f, now_rel, event.duration_ms));
+        .map(|f| fade_alpha(f, now_rel, event.duration_ms))
+        .is_some_and(|f| f != 0);
     let karaoke_view: Vec<KaraokeSeg> = segments.iter().map(KaraokeSeg::of).collect();
     let karaoke = karaoke_flags_from(&karaoke_view, now_rel);
     let mut nodes: Vec<RenderedNode> = Vec::new();
@@ -672,7 +707,7 @@ pub(crate) fn render_event(
                 segment,
                 x_cursor,
                 baseline,
-                fade,
+                fade_active,
                 karaoke[seg_index],
                 &mut shadows,
                 &mut borders,
@@ -738,7 +773,7 @@ pub(crate) fn render_event(
                         y: top,
                         data: vec![0xFF; w * h],
                     },
-                    color: node_color(back, fade),
+                    color: node_color(back),
                 });
             }
         }
@@ -1176,15 +1211,25 @@ fn mult_alpha(a: u32, b: u32) -> u32 {
     a - (a * b + 0x7F) / 0xFF + b
 }
 
-fn node_color(color: Color, fade: Option<i32>) -> u32 {
-    let mut t = u32::from(color.t);
-    if let Some(fade) = fade {
-        // VSFilter compatibility: apply fade only when positive.
-        if fade > 0 {
-            t = mult_alpha(t, fade.clamp(0, 255) as u32).min(255);
-        }
+/// Packs an UNFADED node color; the per-frame fade multiplier is applied
+/// at emission by [`apply_fade`] so fading frames can reuse cached nodes.
+fn node_color(color: Color) -> u32 {
+    u32::from(color.r) << 24
+        | u32::from(color.g) << 16
+        | u32::from(color.b) << 8
+        | u32::from(color.t)
+}
+
+/// Applies the fade multiplier to a packed node color — bit-identical to
+/// the transparency math `node_color` used to inline (VSFilter
+/// compatibility: fade applies only when positive).
+pub(crate) fn apply_fade(color: u32, fade: Option<i32>) -> u32 {
+    let Some(fade) = fade else { return color };
+    if fade <= 0 {
+        return color;
     }
-    u32::from(color.r) << 24 | u32::from(color.g) << 16 | u32::from(color.b) << 8 | t
+    let t = mult_alpha(color & 0xFF, fade.clamp(0, 255) as u32).min(255);
+    (color & !0xFF) | t
 }
 
 /// Splits `text` into word/space segments under one state, shaping each.
@@ -1513,7 +1558,7 @@ fn rasterize_segment(
     segment: &Segment,
     x: f64,
     baseline: f64,
-    fade: Option<i32>,
+    fade_active: bool,
     karaoke: (bool, bool),
     shadows: &mut Vec<RenderedNode>,
     borders: &mut Vec<RenderedNode>,
@@ -1648,7 +1693,7 @@ fn rasterize_segment(
             // No border: the blurred fill replaces the fill.
             fills.push(RenderedNode {
                 bitmap: effect_target,
-                color: node_color(fill_color, fade),
+                color: node_color(fill_color),
             });
         } else {
             border_bitmap = effect_target;
@@ -1660,7 +1705,6 @@ fn rasterize_segment(
     // (or BorderStyle 3); the shadow keeps it while the fill is visible at
     // all. When neither wants the fill, ass_fix_outline hollows the border.
     let has_shadow = shadow_dx != 0.0 || shadow_dy != 0.0;
-    let fade_active = fade.is_some_and(|f| f != 0);
     let fill_in_border = state.border_style == 3
         || (state.colors[0].t == 0 && state.colors[1].t == 0 && !fade_active);
     let fill_in_shadow = has_shadow && (state.colors[0].t != 0xFF || state.border_style == 3);
@@ -1682,7 +1726,7 @@ fn rasterize_segment(
         shadow.y += shadow_dy.floor() as i32;
         shadows.push(RenderedNode {
             bitmap: shadow,
-            color: node_color(state.colors[3], fade),
+            color: node_color(state.colors[3]),
         });
     }
 
@@ -1693,13 +1737,13 @@ fn rasterize_segment(
     if !border_bitmap.is_empty() && !karaoke_hide_outline {
         borders.push(RenderedNode {
             bitmap: border_bitmap,
-            color: node_color(state.colors[2], fade),
+            color: node_color(state.colors[2]),
         });
     }
     if !(effects_applied && border_px <= 0.0 && state.border_style != 3) {
         fills.push(RenderedNode {
             bitmap: fill,
-            color: node_color(fill_color, fade),
+            color: node_color(fill_color),
         });
     }
 }
