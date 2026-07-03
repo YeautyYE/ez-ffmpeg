@@ -191,13 +191,16 @@ fn wgpu_job(input: &str, shader: Option<&str>, null_out: bool) -> Result<(), Str
 
     // EZ_BENCH_WGPU_FIF=1 forces synchronous readback for A/B comparison
     // against the default overlapped mode (2 frames in flight).
+    // EZ_BENCH_WGPU_ZEROCOPY=1 enables the experimental zero-copy readback.
     let frames_in_flight: usize = std::env::var("EZ_BENCH_WGPU_FIF")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(2);
+    let zero_copy = std::env::var("EZ_BENCH_WGPU_ZEROCOPY").as_deref() == Ok("1");
     let filter = WgpuFrameFilter::builder()
         .shader_wgsl(shader.unwrap_or(IDENTITY_WGSL))
         .frames_in_flight(frames_in_flight)
+        .zero_copy_readback(zero_copy)
         .build()
         .map_err(|e| format!("wgpu init: {e}"))?;
     let stats = filter.stats_handle();
@@ -223,8 +226,9 @@ fn wgpu_job(input: &str, shader: Option<&str>, null_out: bool) -> Result<(), Str
         if s.frames > 0 {
             let per = |v: f64| v * 1e3 / s.frames as f64;
             println!(
-                "  wgpu-stats[fif={}]: frames={} upload={:.2}ms gpu_wait={:.2}ms download={:.2}ms per frame",
+                "  wgpu-stats[fif={}{}]: frames={} upload={:.2}ms gpu_wait={:.2}ms download={:.2}ms per frame",
                 frames_in_flight,
+                if zero_copy { ",zc" } else { "" },
                 s.frames,
                 per(s.upload_secs),
                 per(s.gpu_secs),
