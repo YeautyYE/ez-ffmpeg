@@ -5,6 +5,7 @@ use crate::core::filter::frame_pipeline::FramePipeline;
 use crate::core::scheduler::input_controller::SchNode;
 use crate::error::OpenOutputError;
 use crossbeam_channel::{Receiver, Sender};
+use log::error;
 use ffmpeg_sys_next::{
     avformat_new_stream, AVCodec, AVFormatContext, AVMediaType, AVRational, AVSampleFormat,
     AVStream, AVFMT_NOTIMESTAMPS, AVFMT_VARIABLE_FPS,
@@ -302,7 +303,7 @@ impl Muxer {
                     self.out_fmt_ctx,
                     self.copy_ts,
                     single_stream_direct_input,
-                )
+                )?
             })
         } else {
             None
@@ -446,9 +447,27 @@ unsafe fn determine_vsync_method(
     out_fmt_ctx: *mut AVFormatContext,
     copy_ts: bool,
     single_stream_direct_input: bool,
-) -> VSyncMethod {
+) -> crate::error::Result<VSyncMethod> {
+    // A frame rate or cap only acts through CFR-style conversion; combining
+    // one with an explicit non-CFR mode is contradictory
+    // (ffmpeg_mux_init.c:798-804).
+    if (framerate.is_some_and(|fr| fr.num != 0) || framerate_max.is_some_and(|fr| fr.num != 0))
+        && !matches!(
+            vsync_method,
+            VSyncMethod::VsyncAuto | VSyncMethod::VsyncCfr | VSyncMethod::VsyncVscfr
+        )
+    {
+        error!(
+            "One of framerate/framerate_max was specified together a non-CFR \
+             vsync method. This is contradictory."
+        );
+        return Err(crate::error::Error::OpenOutput(
+            OpenOutputError::InvalidArgument,
+        ));
+    }
+
     if vsync_method != VSyncMethod::VsyncAuto {
-        return vsync_method;
+        return Ok(vsync_method);
     }
 
     // 1. -r or -fpsmax both force CFR (ffmpeg_mux_init.c:755-757)
@@ -490,5 +509,5 @@ unsafe fn determine_vsync_method(
         vsync_method = VSyncMethod::VsyncVscfr;
     }
 
-    vsync_method
+    Ok(vsync_method)
 }

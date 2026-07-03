@@ -219,3 +219,24 @@ fn vscfr_fills_gaps_but_keeps_initial_offset() {
         other => panic!("expected video stream info, got {other:?}"),
     }
 }
+
+#[test]
+fn fpsmax_with_an_explicit_non_cfr_vsync_is_rejected() {
+    // fftools refuses -r/-fpsmax together with an explicit non-CFR fps mode
+    // (ffmpeg_mux_init.c:798-804 "This is contradictory"); silently ignoring
+    // the cap under VFR would betray the caller instead.
+    let out = tmp_path("fpsmax_vfr_reject.mp4");
+    let result = FfmpegContext::builder()
+        .input(Input::from("color=c=black:s=320x240:r=60").set_format("lavfi"))
+        .output(
+            Output::from(out.as_str())
+                .set_video_codec("mpeg4")
+                .set_framerate_max(AVRational { num: 30, den: 1 })
+                .set_vsync_method(VSyncMethod::VsyncVfr),
+        )
+        .build();
+    assert!(
+        result.is_err(),
+        "framerate_max with an explicit VFR vsync must be rejected"
+    );
+}
