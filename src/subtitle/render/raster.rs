@@ -134,7 +134,7 @@ pub(crate) fn border_path(
     stroke.cap(Cap::Round).join(Join::Round);
     let (data, placement) = Mask::new(&squeezed).style(Style::Stroke(stroke)).render();
     let squeezed_bitmap = CoverageBitmap::from_mask(data, placement);
-    resample_rows(&squeezed_bitmap, f64::from(squeeze)).max_with(fill)
+    resample_rows_union(&squeezed_bitmap, f64::from(squeeze), fill)
 }
 
 fn transform_y(command: Command, sy: f64) -> Command {
@@ -148,17 +148,30 @@ fn transform_y(command: Command, sy: f64) -> Command {
     }
 }
 
-/// Box-resamples a bitmap rendered in a Y-scaled space (y' = y * sy) back
-/// to frame rows, preserving coverage.
-fn resample_rows(src: &CoverageBitmap, sy: f64) -> CoverageBitmap {
-    if src.is_empty() {
-        return CoverageBitmap::default();
-    }
+/// The frame-row extent a Y-scaled bitmap (y' = y * sy) resamples to: the top
+/// frame row and the row count. Pure function of `src.y`, `src.h`, `sy`, so it
+/// may be recomputed cheaply anywhere the same value is needed.
+fn resample_extent(src: &CoverageBitmap, sy: f64) -> (i32, usize) {
     let y0 = (f64::from(src.y) / sy).floor() as i32;
     let y1 = ((f64::from(src.y) + src.h as f64) / sy).ceil() as i32;
-    let h = (y1 - y0).max(1) as usize;
-    let mut data = vec![0u8; src.w * h];
-    for row in 0..h {
+    (y0, (y1 - y0).max(1) as usize)
+}
+
+/// Box-resamples `src` (Y-scaled by `sy`) into `dst` (row stride `dst_w`),
+/// placing the resampled block at (`off_x`, `off_y`). Rows whose coverage
+/// window is empty are left untouched (callers zero-fill `dst`). Splitting the
+/// core out lets both `resample_rows` and `resample_rows_union` share the exact
+/// same per-pixel arithmetic.
+fn resample_into(
+    src: &CoverageBitmap,
+    sy: f64,
+    dst: &mut [u8],
+    dst_w: usize,
+    off_x: usize,
+    off_y: usize,
+) {
+    let (y0, rh) = resample_extent(src, sy);
+    for row in 0..rh {
         // Frame row `row` covers source rows [a, b) in the squeezed space.
         let a = (f64::from(y0 + row as i32)) * sy - f64::from(src.y);
         let b = a + sy;
@@ -166,6 +179,7 @@ fn resample_rows(src: &CoverageBitmap, sy: f64) -> CoverageBitmap {
         if b0 <= a0 {
             continue;
         }
+        let base = (off_y + row) * dst_w + off_x;
         for col in 0..src.w {
             let mut acc = 0.0f64;
             let mut sr = a0.floor() as usize;
@@ -174,13 +188,82 @@ fn resample_rows(src: &CoverageBitmap, sy: f64) -> CoverageBitmap {
                 acc += cover * f64::from(src.data[sr * src.w + col]);
                 sr += 1;
             }
-            data[row * src.w + col] = ((acc / (b0 - a0)) + 0.5) as u8;
+            dst[base + col] = ((acc / (b0 - a0)) + 0.5) as u8;
         }
     }
+}
+
+/// Box-resamples a bitmap rendered in a Y-scaled space (y' = y * sy) back
+/// to frame rows, preserving coverage.
+fn resample_rows(src: &CoverageBitmap, sy: f64) -> CoverageBitmap {
+    if src.is_empty() {
+        return CoverageBitmap::default();
+    }
+    let (y0, h) = resample_extent(src, sy);
+    let mut data = vec![0u8; src.w * h];
+    resample_into(src, sy, &mut data, src.w, 0, 0);
     CoverageBitmap {
         w: src.w,
         h,
         x: src.x,
+        y: y0,
+        data,
+    }
+}
+
+/// Fused resample-and-union for the anisotropic border: resamples `squeezed`
+/// back to frame rows AND unions it with `fill` (per-pixel max) into a single
+/// allocation. Byte-identical to `resample_rows(squeezed, sy).max_with(fill)`,
+/// but writes the resampled rows straight into the union buffer instead of
+/// materializing an intermediate bitmap and rescanning it.
+fn resample_rows_union(
+    squeezed: &CoverageBitmap,
+    sy: f64,
+    fill: &CoverageBitmap,
+) -> CoverageBitmap {
+    // Empty edges mirror `resample_rows(..).max_with(fill)` exactly.
+    if squeezed.is_empty() {
+        return fill.clone();
+    }
+    if fill.is_empty() {
+        return resample_rows(squeezed, sy);
+    }
+    let (ry0, rh) = resample_extent(squeezed, sy);
+    let rx = squeezed.x;
+    let rw = squeezed.w as i32;
+    // Union bounding box — identical to CoverageBitmap::max_with.
+    let x0 = rx.min(fill.x);
+    let y0 = ry0.min(fill.y);
+    let x1 = (rx + rw).max(fill.x + fill.w as i32);
+    let y1 = (ry0 + rh as i32).max(fill.y + fill.h as i32);
+    let w = (x1 - x0) as usize;
+    let h = (y1 - y0) as usize;
+    let mut data = vec![0u8; w * h];
+    // Resampled coverage straight into the union buffer at its offset (the zero
+    // fill above stands in for max_with's first source pass over empty rows).
+    resample_into(
+        squeezed,
+        sy,
+        &mut data,
+        w,
+        (rx - x0) as usize,
+        (ry0 - y0) as usize,
+    );
+    // Max the fill on top — mirrors max_with's second source pass.
+    let fox = (fill.x - x0) as usize;
+    let foy = (fill.y - y0) as usize;
+    for row in 0..fill.h {
+        let base = (foy + row) * w + fox;
+        let dst_row = &mut data[base..base + fill.w];
+        let src_row = &fill.data[row * fill.w..(row + 1) * fill.w];
+        for (d, &s) in dst_row.iter_mut().zip(src_row) {
+            *d = (*d).max(s);
+        }
+    }
+    CoverageBitmap {
+        w,
+        h,
+        x: x0,
         y: y0,
         data,
     }
@@ -232,13 +315,26 @@ pub(crate) fn be_blur(bitmap: &mut CoverageBitmap, passes: i32) {
     if w < 2 || h < 2 {
         return;
     }
+    // Scratch reused across every pass — allocated once here instead of three
+    // Vecs per pass inside be_blur_pass. Each pass fully rewrites all three
+    // before reading, so no stale state carries over.
+    let mut col_pix = vec![0u16; w];
+    let mut col_sum = vec![0u16; w];
+    let mut horiz = vec![0u16; w];
     if be > 1 {
         // be_blur_pre: (v*64 + 127) / 255, kept in 8 bits.
         for v in bitmap.data.iter_mut() {
             *v = ((*v >> 1) + 1) >> 1;
         }
         while be > 1 {
-            be_blur_pass(&mut bitmap.data, w, h);
+            be_blur_pass(
+                &mut bitmap.data,
+                w,
+                h,
+                &mut col_pix,
+                &mut col_sum,
+                &mut horiz,
+            );
             be -= 1;
         }
         // be_blur_post: (v*255 + 32) / 64 == (v << 2) - (v > 32).
@@ -246,7 +342,14 @@ pub(crate) fn be_blur(bitmap: &mut CoverageBitmap, passes: i32) {
             *v = ((i32::from(*v) << 2) - i32::from(*v > 32)) as u8;
         }
     }
-    be_blur_pass(&mut bitmap.data, w, h);
+    be_blur_pass(
+        &mut bitmap.data,
+        w,
+        h,
+        &mut col_pix,
+        &mut col_sum,
+        &mut horiz,
+    );
 }
 
 /// Horizontal [1 2 1] sums of one row with repeated edges — the inner
@@ -267,20 +370,26 @@ fn be_row_sums(src: &[u8], out: &mut [u16]) {
 
 /// One in-place VSFilter box-blur pass (libass `ass_be_blur_c`): separable
 /// [1 2 1] in both axes, /16, edges repeated, output shifted to (x-1, y-1)
-/// exactly like the reference implementation.
-fn be_blur_pass(buf: &mut [u8], w: usize, h: usize) {
-    let mut col_pix = vec![0u16; w];
-    let mut col_sum = vec![0u16; w];
-    let mut horiz = vec![0u16; w];
-
+/// exactly like the reference implementation. `col_pix`/`col_sum`/`horiz` are
+/// caller-owned scratch of length `w`, reused across passes.
+fn be_blur_pass(
+    buf: &mut [u8],
+    w: usize,
+    h: usize,
+    col_pix: &mut [u16],
+    col_sum: &mut [u16],
+    horiz: &mut [u16],
+) {
     // First row primes the column accumulators without output.
-    be_row_sums(&buf[..w], &mut horiz);
-    col_pix.copy_from_slice(&horiz);
-    col_sum.copy_from_slice(&horiz);
+    be_row_sums(&buf[..w], horiz);
+    col_pix.copy_from_slice(horiz);
+    col_sum.copy_from_slice(horiz);
 
     for y in 1..h {
-        let src = buf[y * w..(y + 1) * w].to_vec();
-        be_row_sums(&src, &mut horiz);
+        // Source row y and destination row y-1 never overlap, and be_row_sums
+        // lands row y fully into `horiz` before the destination is written, so
+        // reading straight from `buf` (no per-row copy) is safe.
+        be_row_sums(&buf[y * w..(y + 1) * w], horiz);
         let dst = &mut buf[(y - 1) * w..y * w];
         for x in 0..w {
             let vert = col_pix[x] + horiz[x];
@@ -304,8 +413,8 @@ pub(crate) fn gaussian_blur(bitmap: &mut CoverageBitmap, sigma_x: f64, sigma_y: 
     if bitmap.is_empty() || (sigma_x <= 0.0 && sigma_y <= 0.0) {
         return;
     }
-    let boxes_x = boxes_for_gauss(sigma_x.max(0.0), 3);
-    let boxes_y = boxes_for_gauss(sigma_y.max(0.0), 3);
+    let boxes_x = boxes_for_gauss(sigma_x.max(0.0));
+    let boxes_y = boxes_for_gauss(sigma_y.max(0.0));
     pad_xy(
         bitmap,
         (sigma_x.max(0.0).ceil() as usize + 1) * 2,
@@ -314,6 +423,8 @@ pub(crate) fn gaussian_blur(bitmap: &mut CoverageBitmap, sigma_x: f64, sigma_y: 
     let mut tmp = bitmap.data.clone();
     let w = bitmap.w;
     let h = bitmap.h;
+    // Per-column accumulators for box_blur_v, reused across the three passes.
+    let mut col_acc = vec![0u32; w];
     for (rx, ry) in boxes_x.into_iter().zip(boxes_y) {
         if rx > 0 {
             box_blur_h(&bitmap.data, &mut tmp, w, h, rx);
@@ -321,32 +432,33 @@ pub(crate) fn gaussian_blur(bitmap: &mut CoverageBitmap, sigma_x: f64, sigma_y: 
             tmp.copy_from_slice(&bitmap.data);
         }
         if ry > 0 {
-            box_blur_v(&tmp, &mut bitmap.data, w, h, ry);
+            box_blur_v(&tmp, &mut bitmap.data, w, h, ry, &mut col_acc);
         } else {
             bitmap.data.copy_from_slice(&tmp);
         }
     }
 }
 
-fn boxes_for_gauss(sigma: f64, n: usize) -> Vec<usize> {
-    let w_ideal = (12.0 * sigma * sigma / n as f64 + 1.0).sqrt();
+/// Kovesi's three-box approximation of a gaussian: the per-pass box radii.
+/// `n` is fixed at 3 (the pass count), so the result is a fixed-size array.
+fn boxes_for_gauss(sigma: f64) -> [usize; 3] {
+    const N: f64 = 3.0;
+    let w_ideal = (12.0 * sigma * sigma / N + 1.0).sqrt();
     let mut wl = w_ideal.floor() as i64;
     if wl % 2 == 0 {
         wl -= 1;
     }
     let wu = wl + 2;
-    let m_ideal = (12.0 * sigma * sigma
-        - (n as f64) * (wl as f64) * (wl as f64)
-        - 4.0 * n as f64 * wl as f64
-        - 3.0 * n as f64)
-        / (-4.0 * wl as f64 - 4.0);
+    let m_ideal =
+        (12.0 * sigma * sigma - N * (wl as f64) * (wl as f64) - 4.0 * N * wl as f64 - 3.0 * N)
+            / (-4.0 * wl as f64 - 4.0);
     let m = m_ideal.round() as i64;
-    (0..n as i64)
-        .map(|i| {
-            let width = if i < m { wl } else { wu };
-            (width.max(1) as usize - 1) / 2
-        })
-        .collect()
+    let mut boxes = [0usize; 3];
+    for (i, b) in boxes.iter_mut().enumerate() {
+        let width = if (i as i64) < m { wl } else { wu };
+        *b = (width.max(1) as usize - 1) / 2;
+    }
+    boxes
 }
 
 fn box_blur_h(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize) {
@@ -369,20 +481,32 @@ fn box_blur_h(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize) {
     }
 }
 
-fn box_blur_v(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize) {
+/// Vertical box blur, walked row-major so every memory access is contiguous.
+/// `acc` is caller-owned per-column scratch of length `w`, reset here. The
+/// per-column arithmetic (u32 sliding window, /norm truncating, u8 cast) is
+/// identical to a per-column walk — only the traversal order changes.
+fn box_blur_v(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize, acc: &mut [u32]) {
     let norm = (2 * r + 1) as u32;
-    for x in 0..w {
-        let mut acc: u32 = 0;
-        for y in 0..=r.min(h.saturating_sub(1)) {
-            acc += u32::from(src[y * w + x]);
+    acc.fill(0);
+    // Prime each column with its initial window [0, min(r, h-1)].
+    let last = r.min(h.saturating_sub(1));
+    for yy in 0..=last {
+        for (a, &s) in acc.iter_mut().zip(&src[yy * w..(yy + 1) * w]) {
+            *a += u32::from(s);
         }
-        for y in 0..h {
-            dst[y * w + x] = (acc / norm) as u8;
-            if y + r + 1 < h {
-                acc += u32::from(src[(y + r + 1) * w + x]);
+    }
+    for y in 0..h {
+        for (d, &a) in dst[y * w..(y + 1) * w].iter_mut().zip(acc.iter()) {
+            *d = (a / norm) as u8;
+        }
+        if y + r + 1 < h {
+            for (a, &s) in acc.iter_mut().zip(&src[(y + r + 1) * w..(y + r + 2) * w]) {
+                *a += u32::from(s);
             }
-            if y >= r {
-                acc -= u32::from(src[(y - r) * w + x]);
+        }
+        if y >= r {
+            for (a, &s) in acc.iter_mut().zip(&src[(y - r) * w..(y - r + 1) * w]) {
+                *a -= u32::from(s);
             }
         }
     }
@@ -624,5 +748,565 @@ mod tests {
         let union = a.max_with(&b);
         assert_eq!((union.w, union.h, union.x, union.y), (4, 1, 0, 0));
         assert_eq!(union.data, vec![10, 20, 0, 30]);
+    }
+
+    // ---- Parity harness for the optimized blur/border kernels ----------------
+    //
+    // The optimized kernels must be byte-identical to the pre-optimization code
+    // (libass parity is contractual). Two independent oracles guard this:
+    //   1. `golden_hashes_match`: FNV-1a hashes captured from the ORIGINAL
+    //      production kernels (regenerate with the ignored `dump_goldens`).
+    //   2. `*_matches_reference`: direct comparison against verbatim copies of
+    //      the original kernels (`reference_*`) over a deterministic mask set.
+
+    fn fnv1a(bytes: &[u8]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    /// Folds geometry (w/h/x/y) and coverage into one hash so a placement drift
+    /// is caught, not just data drift.
+    fn bitmap_hash(b: &CoverageBitmap) -> u64 {
+        let mut bytes = Vec::with_capacity(32 + b.data.len());
+        bytes.extend_from_slice(&(b.w as u64).to_le_bytes());
+        bytes.extend_from_slice(&(b.h as u64).to_le_bytes());
+        bytes.extend_from_slice(&b.x.to_le_bytes());
+        bytes.extend_from_slice(&b.y.to_le_bytes());
+        bytes.extend_from_slice(&b.data);
+        fnv1a(&bytes)
+    }
+
+    fn det_mask(w: usize, h: usize, f: impl Fn(usize, usize) -> u8) -> CoverageBitmap {
+        let mut data = vec![0u8; w * h];
+        for (i, px) in data.iter_mut().enumerate() {
+            *px = f(i % w, i / w);
+        }
+        // Non-zero placement so x/y bookkeeping is exercised through pad/resample.
+        CoverageBitmap {
+            w,
+            h,
+            x: 5,
+            y: 7,
+            data,
+        }
+    }
+
+    /// The representative mask set: three sizes on a non-trivial coverage
+    /// pattern, plus an all-opaque and a sparse mask.
+    fn masks() -> Vec<(&'static str, CoverageBitmap)> {
+        let pat = |x: usize, y: usize| ((x * 31 + y * 17) % 256) as u8;
+        vec![
+            ("16x32", det_mask(16, 32, pat)),
+            ("128x24", det_mask(128, 24, pat)),
+            ("24x128", det_mask(24, 128, pat)),
+            ("all255_32x32", det_mask(32, 32, |_, _| 255)),
+            (
+                "sparse_40x40",
+                det_mask(
+                    40,
+                    40,
+                    |x, y| if (x * 7 + y * 3) % 29 == 0 { 180 } else { 0 },
+                ),
+            ),
+        ]
+    }
+
+    /// The representative set plus two large masks that exceed cache — the
+    /// regime where box_blur_v's strided-vs-row-major traversal actually shows
+    /// up (small masks fit in cache after padding and are traversal-neutral).
+    fn bench_masks() -> Vec<(&'static str, CoverageBitmap)> {
+        let pat = |x: usize, y: usize| ((x * 31 + y * 17) % 256) as u8;
+        let mut v = masks();
+        v.push(("512x512", det_mask(512, 512, pat)));
+        v.push(("1024x256", det_mask(1024, 256, pat)));
+        v
+    }
+
+    /// A closed glyph-like contour (line + quad + cubic) for the border path.
+    fn glyph_like() -> Vec<Command> {
+        vec![
+            Command::MoveTo(Vector::new(2.0, 2.0)),
+            Command::LineTo(Vector::new(18.0, 4.0)),
+            Command::QuadTo(Vector::new(24.0, 10.0), Vector::new(20.0, 22.0)),
+            Command::LineTo(Vector::new(6.0, 18.0)),
+            Command::CurveTo(
+                Vector::new(3.0, 14.0),
+                Vector::new(1.0, 9.0),
+                Vector::new(2.0, 2.0),
+            ),
+            Command::Close,
+        ]
+    }
+
+    const BE_PASSES: [i32; 4] = [1, 2, 5, 20];
+    const GAUSS_SIGMAS: [(f64, f64); 4] = [(0.5, 0.5), (2.0, 2.0), (5.0, 1.0), (0.0, 3.0)];
+    const BORDER_ANISO: [(f32, f32); 2] = [(3.0, 1.5), (1.0, 4.0)];
+
+    /// Regenerate the `golden_hashes_match` constants: run with
+    /// `cargo test --release --features subtitle dump_goldens -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "prints golden hashes for the parity constants"]
+    fn dump_goldens() {
+        for (name, mask) in masks() {
+            for passes in BE_PASSES {
+                let mut b = mask.clone();
+                be_blur(&mut b, passes);
+                println!(
+                    "be_blur   {name:<14} {passes:<3} => {:#018x}",
+                    bitmap_hash(&b)
+                );
+            }
+        }
+        for (name, mask) in masks() {
+            for (sx, sy) in GAUSS_SIGMAS {
+                let mut b = mask.clone();
+                gaussian_blur(&mut b, sx, sy);
+                println!(
+                    "gaussian  {name:<14} {sx},{sy} => {:#018x}",
+                    bitmap_hash(&b)
+                );
+            }
+        }
+        let fill = fill_path(&glyph_like());
+        for (bx, by) in BORDER_ANISO {
+            let b = border_path(&glyph_like(), &fill, bx, by);
+            println!("border    {bx},{by} => {:#018x}", bitmap_hash(&b));
+        }
+    }
+
+    // Hashes captured from the ORIGINAL kernels (pre-optimization). Any change
+    // here means the optimized output diverged — regenerate only with a
+    // deliberate, reviewed semantics change. Order matches the loops below.
+    #[rustfmt::skip]
+    const BE_GOLDENS: [u64; 20] = [
+        0xd803_8531_e1bf_58f1, 0x6b9b_baf9_cba0_cd9c, 0xa4c8_97f5_4ae6_d86b, 0xe2a2_b89d_364f_5ee5,
+        0xbf02_2691_b2a6_8151, 0x4b5a_e950_a4dd_10c9, 0x4e22_f94f_7eb4_573a, 0x3b77_5636_6cd3_ebde,
+        0xc192_95e4_b0d9_b6a5, 0x8bfa_1295_4771_4068, 0x4aae_83be_92e2_3f4f, 0xf177_4dc9_d811_4556,
+        0xc08f_1b96_b3fa_04b3, 0x61fd_6cd3_7e0f_3a9f, 0x4575_4522_d745_3a67, 0x54b2_a781_61fe_55e3,
+        0x1198_c1c5_06b9_3135, 0x84de_fae0_6796_87b9, 0x9b0e_fed0_2429_7baf, 0xa7ed_8ca1_ef98_e917,
+    ];
+    #[rustfmt::skip]
+    const GAUSS_GOLDENS: [u64; 20] = [
+        0x83b1_cce7_4655_6c87, 0xabf2_d2c0_f06b_721a, 0xd9e4_7912_af7d_6728, 0x6ade_2182_5cee_d5ee,
+        0x726d_3a16_e645_a43f, 0x8676_eb28_98d4_3dd2, 0x3bb4_da75_45dd_754f, 0xde06_8d27_3355_6dc2,
+        0x4b75_aff0_f679_8cff, 0xaf8d_4273_9e70_be94, 0xe4ee_eb46_9c16_3bbb, 0xf7c9_85cb_c5d4_3ce5,
+        0xb46c_035f_4007_9657, 0x771a_5b64_408b_2214, 0x5507_dd2e_c82d_6050, 0x38fe_e6e7_6247_3c8e,
+        0xeaf2_a6d6_566b_745f, 0x136f_8e4d_1fdc_67dc, 0x8388_a4b7_367c_44ac, 0x6ec0_d23c_5ee6_091c,
+    ];
+    const BORDER_GOLDENS: [u64; 2] = [0xff22_7254_d918_c628, 0x1dce_d946_2715_012a];
+
+    #[test]
+    fn golden_hashes_match() {
+        let mut i = 0;
+        for (name, mask) in masks() {
+            for passes in BE_PASSES {
+                let mut b = mask.clone();
+                be_blur(&mut b, passes);
+                assert_eq!(
+                    bitmap_hash(&b),
+                    BE_GOLDENS[i],
+                    "be_blur {name} passes={passes} diverged from golden"
+                );
+                i += 1;
+            }
+        }
+        let mut j = 0;
+        for (name, mask) in masks() {
+            for (sx, sy) in GAUSS_SIGMAS {
+                let mut b = mask.clone();
+                gaussian_blur(&mut b, sx, sy);
+                assert_eq!(
+                    bitmap_hash(&b),
+                    GAUSS_GOLDENS[j],
+                    "gaussian_blur {name} sigma=({sx},{sy}) diverged from golden"
+                );
+                j += 1;
+            }
+        }
+        let fill = fill_path(&glyph_like());
+        for (k, (bx, by)) in BORDER_ANISO.into_iter().enumerate() {
+            let b = border_path(&glyph_like(), &fill, bx, by);
+            assert_eq!(
+                bitmap_hash(&b),
+                BORDER_GOLDENS[k],
+                "border_path aniso ({bx},{by}) diverged from golden"
+            );
+        }
+    }
+
+    fn assert_bitmap_eq(a: &CoverageBitmap, b: &CoverageBitmap, ctx: &str) {
+        assert_eq!(
+            (a.w, a.h, a.x, a.y),
+            (b.w, b.h, b.x, b.y),
+            "{ctx}: geometry"
+        );
+        assert_eq!(a.data, b.data, "{ctx}: coverage data");
+    }
+
+    // ---- Verbatim copies of the pre-optimization kernels (parity oracles) ----
+    // Do NOT "tidy" these: they must reproduce the original arithmetic exactly.
+    // They reuse the unchanged helpers (pad, be_row_sums, box_blur_h, transform_y,
+    // max_with) so only the optimized code paths differ from production.
+
+    fn reference_be_blur_pass(buf: &mut [u8], w: usize, h: usize) {
+        let mut col_pix = vec![0u16; w];
+        let mut col_sum = vec![0u16; w];
+        let mut horiz = vec![0u16; w];
+
+        be_row_sums(&buf[..w], &mut horiz);
+        col_pix.copy_from_slice(&horiz);
+        col_sum.copy_from_slice(&horiz);
+
+        for y in 1..h {
+            let src = buf[y * w..(y + 1) * w].to_vec();
+            be_row_sums(&src, &mut horiz);
+            let dst = &mut buf[(y - 1) * w..y * w];
+            for x in 0..w {
+                let vert = col_pix[x] + horiz[x];
+                col_pix[x] = horiz[x];
+                dst[x] = ((col_sum[x] + vert) >> 4) as u8;
+                col_sum[x] = vert;
+            }
+        }
+        let dst = &mut buf[(h - 1) * w..h * w];
+        for x in 0..w {
+            dst[x] = ((col_sum[x] + col_pix[x]) >> 4) as u8;
+        }
+    }
+
+    fn reference_be_blur(bitmap: &mut CoverageBitmap, passes: i32) {
+        let mut be = passes.clamp(0, 127);
+        if be <= 0 || bitmap.is_empty() {
+            return;
+        }
+        pad(bitmap, be_padding(be));
+        let w = bitmap.w;
+        let h = bitmap.h;
+        if w < 2 || h < 2 {
+            return;
+        }
+        if be > 1 {
+            for v in bitmap.data.iter_mut() {
+                *v = ((*v >> 1) + 1) >> 1;
+            }
+            while be > 1 {
+                reference_be_blur_pass(&mut bitmap.data, w, h);
+                be -= 1;
+            }
+            for v in bitmap.data.iter_mut() {
+                *v = ((i32::from(*v) << 2) - i32::from(*v > 32)) as u8;
+            }
+        }
+        reference_be_blur_pass(&mut bitmap.data, w, h);
+    }
+
+    fn reference_boxes_for_gauss(sigma: f64, n: usize) -> Vec<usize> {
+        let w_ideal = (12.0 * sigma * sigma / n as f64 + 1.0).sqrt();
+        let mut wl = w_ideal.floor() as i64;
+        if wl % 2 == 0 {
+            wl -= 1;
+        }
+        let wu = wl + 2;
+        let m_ideal = (12.0 * sigma * sigma
+            - (n as f64) * (wl as f64) * (wl as f64)
+            - 4.0 * n as f64 * wl as f64
+            - 3.0 * n as f64)
+            / (-4.0 * wl as f64 - 4.0);
+        let m = m_ideal.round() as i64;
+        (0..n as i64)
+            .map(|i| {
+                let width = if i < m { wl } else { wu };
+                (width.max(1) as usize - 1) / 2
+            })
+            .collect()
+    }
+
+    fn reference_box_blur_v(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize) {
+        let norm = (2 * r + 1) as u32;
+        for x in 0..w {
+            let mut acc: u32 = 0;
+            for y in 0..=r.min(h.saturating_sub(1)) {
+                acc += u32::from(src[y * w + x]);
+            }
+            for y in 0..h {
+                dst[y * w + x] = (acc / norm) as u8;
+                if y + r + 1 < h {
+                    acc += u32::from(src[(y + r + 1) * w + x]);
+                }
+                if y >= r {
+                    acc -= u32::from(src[(y - r) * w + x]);
+                }
+            }
+        }
+    }
+
+    fn reference_gaussian_blur(bitmap: &mut CoverageBitmap, sigma_x: f64, sigma_y: f64) {
+        if bitmap.is_empty() || (sigma_x <= 0.0 && sigma_y <= 0.0) {
+            return;
+        }
+        let boxes_x = reference_boxes_for_gauss(sigma_x.max(0.0), 3);
+        let boxes_y = reference_boxes_for_gauss(sigma_y.max(0.0), 3);
+        pad_xy(
+            bitmap,
+            (sigma_x.max(0.0).ceil() as usize + 1) * 2,
+            (sigma_y.max(0.0).ceil() as usize + 1) * 2,
+        );
+        let mut tmp = bitmap.data.clone();
+        let w = bitmap.w;
+        let h = bitmap.h;
+        for (rx, ry) in boxes_x.into_iter().zip(boxes_y) {
+            if rx > 0 {
+                box_blur_h(&bitmap.data, &mut tmp, w, h, rx);
+            } else {
+                tmp.copy_from_slice(&bitmap.data);
+            }
+            if ry > 0 {
+                reference_box_blur_v(&tmp, &mut bitmap.data, w, h, ry);
+            } else {
+                bitmap.data.copy_from_slice(&tmp);
+            }
+        }
+    }
+
+    fn reference_resample_rows(src: &CoverageBitmap, sy: f64) -> CoverageBitmap {
+        if src.is_empty() {
+            return CoverageBitmap::default();
+        }
+        let y0 = (f64::from(src.y) / sy).floor() as i32;
+        let y1 = ((f64::from(src.y) + src.h as f64) / sy).ceil() as i32;
+        let h = (y1 - y0).max(1) as usize;
+        let mut data = vec![0u8; src.w * h];
+        for row in 0..h {
+            let a = (f64::from(y0 + row as i32)) * sy - f64::from(src.y);
+            let b = a + sy;
+            let (a0, b0) = (a.max(0.0), b.min(src.h as f64));
+            if b0 <= a0 {
+                continue;
+            }
+            for col in 0..src.w {
+                let mut acc = 0.0f64;
+                let mut sr = a0.floor() as usize;
+                while (sr as f64) < b0 {
+                    let cover = (b0.min(sr as f64 + 1.0) - a0.max(sr as f64)).max(0.0);
+                    acc += cover * f64::from(src.data[sr * src.w + col]);
+                    sr += 1;
+                }
+                data[row * src.w + col] = ((acc / (b0 - a0)) + 0.5) as u8;
+            }
+        }
+        CoverageBitmap {
+            w: src.w,
+            h,
+            x: src.x,
+            y: y0,
+            data,
+        }
+    }
+
+    /// Reproduces the original anisotropic border path (resample then max_with).
+    fn reference_border_path_aniso(
+        commands: &[Command],
+        fill: &CoverageBitmap,
+        border_x: f32,
+        border_y: f32,
+    ) -> CoverageBitmap {
+        let rx = border_x.max(1.0 / 64.0);
+        let ry = border_y.max(1.0 / 64.0);
+        let squeeze = (rx / ry).clamp(1.0 / 32.0, 32.0);
+        let squeezed: Vec<Command> = commands
+            .iter()
+            .map(|c| transform_y(*c, f64::from(squeeze)))
+            .collect();
+        let mut stroke = Stroke::new(2.0 * rx);
+        stroke.cap(Cap::Round).join(Join::Round);
+        let (data, placement) = Mask::new(&squeezed).style(Style::Stroke(stroke)).render();
+        let squeezed_bitmap = CoverageBitmap::from_mask(data, placement);
+        reference_resample_rows(&squeezed_bitmap, f64::from(squeeze)).max_with(fill)
+    }
+
+    #[test]
+    fn be_blur_matches_reference() {
+        for (name, mask) in masks() {
+            for passes in BE_PASSES {
+                let mut new = mask.clone();
+                let mut old = mask.clone();
+                be_blur(&mut new, passes);
+                reference_be_blur(&mut old, passes);
+                assert_bitmap_eq(&new, &old, &format!("be_blur {name} passes={passes}"));
+            }
+        }
+    }
+
+    #[test]
+    fn gaussian_blur_matches_reference() {
+        for (name, mask) in masks() {
+            for (sx, sy) in GAUSS_SIGMAS {
+                let mut new = mask.clone();
+                let mut old = mask.clone();
+                gaussian_blur(&mut new, sx, sy);
+                reference_gaussian_blur(&mut old, sx, sy);
+                assert_bitmap_eq(&new, &old, &format!("gaussian {name} ({sx},{sy})"));
+            }
+        }
+    }
+
+    #[test]
+    fn box_blur_v_matches_reference() {
+        for (name, mask) in masks() {
+            let (w, h) = (mask.w, mask.h);
+            // r=0 is never routed to box_blur_v (gaussian copies instead); r>=h
+            // exercises the edge-clamp path.
+            for r in [1usize, 2, 3, 5, 9, 50] {
+                let mut new_dst = vec![0u8; w * h];
+                let mut old_dst = vec![0u8; w * h];
+                let mut acc = vec![0u32; w];
+                box_blur_v(&mask.data, &mut new_dst, w, h, r, &mut acc);
+                reference_box_blur_v(&mask.data, &mut old_dst, w, h, r);
+                assert_eq!(new_dst, old_dst, "box_blur_v {name} r={r}");
+            }
+        }
+    }
+
+    #[test]
+    fn boxes_for_gauss_matches_reference() {
+        for sigma in [0.0, 0.3, 0.5, 1.0, 2.0, 3.7, 5.0, 12.5, 40.0] {
+            let new = boxes_for_gauss(sigma);
+            let old = reference_boxes_for_gauss(sigma, 3);
+            assert_eq!(new.to_vec(), old, "boxes_for_gauss sigma={sigma}");
+        }
+    }
+
+    #[test]
+    fn resample_rows_matches_reference() {
+        // Squeezed bitmaps from real stroke renders, both squeeze directions.
+        for (bx, by) in BORDER_ANISO {
+            let rx = bx.max(1.0 / 64.0);
+            let ry = by.max(1.0 / 64.0);
+            let squeeze = (rx / ry).clamp(1.0 / 32.0, 32.0);
+            let squeezed: Vec<Command> = glyph_like()
+                .iter()
+                .map(|c| transform_y(*c, f64::from(squeeze)))
+                .collect();
+            let mut stroke = Stroke::new(2.0 * rx);
+            stroke.cap(Cap::Round).join(Join::Round);
+            let (data, placement) = Mask::new(&squeezed).style(Style::Stroke(stroke)).render();
+            let sb = CoverageBitmap::from_mask(data, placement);
+            let new = resample_rows(&sb, f64::from(squeeze));
+            let old = reference_resample_rows(&sb, f64::from(squeeze));
+            assert_bitmap_eq(&new, &old, &format!("resample_rows squeeze={squeeze}"));
+        }
+    }
+
+    #[test]
+    fn border_path_aniso_matches_reference() {
+        let fill = fill_path(&glyph_like());
+        for (bx, by) in BORDER_ANISO {
+            let new = border_path(&glyph_like(), &fill, bx, by);
+            let old = reference_border_path_aniso(&glyph_like(), &fill, bx, by);
+            assert_bitmap_eq(&new, &old, &format!("border_path aniso ({bx},{by})"));
+        }
+        // Empty-fill edge: fused path must fall back to the bare resample
+        // (mirrors R.max_with(empty) == R).
+        let empty = CoverageBitmap::default();
+        for (bx, by) in BORDER_ANISO {
+            let new = border_path(&glyph_like(), &empty, bx, by);
+            let old = reference_border_path_aniso(&glyph_like(), &empty, bx, by);
+            assert_bitmap_eq(
+                &new,
+                &old,
+                &format!("border_path aniso empty-fill ({bx},{by})"),
+            );
+        }
+        // Empty-squeezed edge: union with an empty resample == fill.clone().
+        let sb_empty = CoverageBitmap::default();
+        assert_bitmap_eq(
+            &resample_rows_union(&sb_empty, 2.0, &fill),
+            &fill,
+            "resample_rows_union empty-squeezed",
+        );
+    }
+
+    /// Best per-call nanoseconds over three batches (mirrors bench_kernels::measure).
+    fn bench_measure(mut run: impl FnMut()) -> f64 {
+        run(); // warmup / page-in
+        let start = std::time::Instant::now();
+        run();
+        let once = start.elapsed().as_nanos().max(1);
+        let iters = (50_000_000 / once).clamp(20, 10_000) as usize;
+        let mut best = f64::INFINITY;
+        for _ in 0..3 {
+            let start = std::time::Instant::now();
+            for _ in 0..iters {
+                run();
+            }
+            best = best.min(start.elapsed().as_nanos() as f64 / iters as f64);
+        }
+        best
+    }
+
+    /// `cargo test --release --features subtitle bench_be_blur -- --ignored --nocapture`.
+    /// Numbers are clone-subtracted (each call clones the input mask first, since
+    /// be_blur mutates and pads in place); the reported figure is kernel-only.
+    #[test]
+    #[ignore = "manual micro-benchmark; run in release with --ignored --nocapture"]
+    fn bench_be_blur() {
+        println!("be_blur kernel ns/call (best-of-3, clone-subtracted):");
+        for (name, mask) in bench_masks() {
+            let clone_ns = bench_measure(|| {
+                let b = mask.clone();
+                std::hint::black_box(b.data.first().copied());
+            });
+            for passes in [2, 5, 20] {
+                let old = bench_measure(|| {
+                    let mut b = mask.clone();
+                    reference_be_blur(&mut b, passes);
+                    std::hint::black_box(b.data.first().copied());
+                });
+                let new = bench_measure(|| {
+                    let mut b = mask.clone();
+                    be_blur(&mut b, passes);
+                    std::hint::black_box(b.data.first().copied());
+                });
+                let (o, n) = ((old - clone_ns).max(0.0), (new - clone_ns).max(0.0));
+                println!(
+                    "  {name:<14} passes={passes:<2}  old {o:>9.0}  new {n:>9.0}  {:>4.2}x",
+                    o / n.max(1.0)
+                );
+            }
+        }
+    }
+
+    /// `cargo test --release --features subtitle bench_gaussian_blur -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "manual micro-benchmark; run in release with --ignored --nocapture"]
+    fn bench_gaussian_blur() {
+        println!("gaussian_blur kernel ns/call (best-of-3, clone-subtracted):");
+        for (name, mask) in bench_masks() {
+            let clone_ns = bench_measure(|| {
+                let b = mask.clone();
+                std::hint::black_box(b.data.first().copied());
+            });
+            for (sx, sy) in [(2.0, 2.0), (5.0, 1.0), (5.0, 5.0)] {
+                let old = bench_measure(|| {
+                    let mut b = mask.clone();
+                    reference_gaussian_blur(&mut b, sx, sy);
+                    std::hint::black_box(b.data.first().copied());
+                });
+                let new = bench_measure(|| {
+                    let mut b = mask.clone();
+                    gaussian_blur(&mut b, sx, sy);
+                    std::hint::black_box(b.data.first().copied());
+                });
+                let (o, n) = ((old - clone_ns).max(0.0), (new - clone_ns).max(0.0));
+                println!(
+                    "  {name:<14} sigma=({sx},{sy})  old {o:>9.0}  new {n:>9.0}  {:>4.2}x",
+                    o / n.max(1.0)
+                );
+            }
+        }
     }
 }
