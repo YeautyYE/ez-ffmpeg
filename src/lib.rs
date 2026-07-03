@@ -98,10 +98,37 @@
 //! - **`async`**: Makes the [`FfmpegScheduler`] wait method asynchronous (you can `.await` it).
 //! - **`static`**: Uses static linking for FFmpeg libraries (via `ffmpeg-next/static`).
 //!
+//! ## Relationship to the FFmpeg CLI
+//!
+//! The transcoding pipeline (demux -> decode -> filter -> encode -> mux) is
+//! ported from the FFmpeg CLI sources, `fftools/ffmpeg` of **FFmpeg 7.x**:
+//! function names, timestamp handling and scheduling semantics follow that
+//! release, and code comments cite the corresponding fftools file and line
+//! (line numbers refer to the FFmpeg `n7.1` tag).
+//! If you know `ffmpeg_demux.c` or `ffmpeg_filter.c`, grepping this crate
+//! for the same function names (`ts_fixup`, `video_sync_process`,
+//! `enc_open`, `mux_fixup_ts`, ...) lands in the equivalent Rust.
+//!
+//! Not every CLI feature is implemented. Notable gaps: progress/stats
+//! reporting (`-progress`), sub2video (rendering bitmap subtitles into
+//! video), `-shortest` cross-stream sync, bitstream filters (`-bsf`),
+//! keyframe forcing (`-force_key_frames`), `-fix_sub_duration`, two-pass
+//! encoding, and attachments. Unsupported paths fail with explicit errors
+//! rather than approximations.
+//!
+//! ## Logging
+//!
+//! FFmpeg's own diagnostics (av_log) are redirected into the Rust `log`
+//! facade under the [`FFMPEG_LOG_TARGET`] target. Without a logger installed
+//! (env_logger, tracing-log, ...) all FFmpeg messages are silently dropped —
+//! including decoder errors that explain a failing job. Use
+//! [`set_ffmpeg_log_level`] to bound the forwarded verbosity and
+//! `Input::set_log_level_offset` to shift it per input.
+//!
 //! ## License Notice
 //!
-//! ez-ffmpeg is distributed under the WTFPL (Do What The F*ck You Want To Public License).
-//! You are free to use, modify, and distribute this software.
+//! ez-ffmpeg is licensed under your choice of MIT, Apache-2.0, or MPL-2.0
+//! (matching the `license` field in Cargo.toml).
 //!
 //! **Note:** FFmpeg itself is subject to its own licensing terms. When enabling features that incorporate FFmpeg components,
 //! please ensure that your usage complies with FFmpeg's license.
@@ -116,6 +143,7 @@ pub use self::core::context::output::Output;
 pub use self::core::scheduler::ffmpeg_scheduler::FfmpegScheduler;
 pub use self::core::container_info;
 pub use self::core::stream_info;
+pub use self::core::{set_ffmpeg_log_level, FfmpegLogLevel, FFMPEG_LOG_TARGET};
 pub use self::core::packet_scanner;
 pub use self::core::device;
 pub use self::core::hwaccel;

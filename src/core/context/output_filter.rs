@@ -1,3 +1,8 @@
+//! Port of fftools `OutputFilter`/`OutputFilterOptions` (FFmpeg 7.x
+//! fftools/ffmpeg_filter.c): one output pad of a filtergraph plus the
+//! encoder-facing constraints (`OFILTER_FLAG_*`, allowed format lists)
+//! gathered by `ofilter_bind_ost`.
+
 use crate::core::context::output::VSyncMethod;
 use crate::core::context::FrameBox;
 use crossbeam_channel::Sender;
@@ -59,6 +64,7 @@ pub(crate) struct OutputFilterOptions {
     pub(crate) audio_format: AVSampleFormat,
     pub(crate) audio_formats: Option<Vec<AVSampleFormat>>,
     pub(crate) framerate: AVRational,
+    pub(crate) framerate_max: AVRational,
     pub(crate) framerates: Option<Vec<AVRational>>,
     #[allow(dead_code)]
     pub(crate) color_space: AVColorSpace,
@@ -78,8 +84,10 @@ pub(crate) struct OutputFilterOptions {
     pub(crate) ts_offset: Option<i64>,
     pub(crate) flags: u32,
 }
+// SAFETY: enc points at FFmpeg's static codec registry (read-only,
+// process lifetime); everything else is owned data. Sync is intentionally
+// NOT implemented.
 unsafe impl Send for OutputFilterOptions {}
-unsafe impl Sync for OutputFilterOptions {}
 
 impl OutputFilterOptions {
     pub(crate) fn new() -> Self {
@@ -91,6 +99,7 @@ impl OutputFilterOptions {
             audio_format: AVSampleFormat::AV_SAMPLE_FMT_NONE,
             audio_formats: None,
             framerate: AVRational { num: 0, den: 0 },
+            framerate_max: AVRational { num: 0, den: 0 },
             framerates: None,
             color_space: AVColorSpace::AVCOL_SPC_UNSPECIFIED,
             color_spaces: None,

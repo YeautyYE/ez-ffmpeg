@@ -1,5 +1,6 @@
 use crate::core::context::filter_graph::FilterGraph;
 use crate::core::context::input_filter::{InputFilterOptions, IFILTER_FLAG_AUTOROTATE};
+use crate::core::display::get_rotation;
 use crate::core::context::obj_pool::ObjPool;
 use crate::core::context::output::VSyncMethod;
 use crate::core::context::output::VSyncMethod::{VsyncCfr, VsyncVscfr};
@@ -42,7 +43,7 @@ use ffmpeg_sys_next::{
     AVFilterInOut, AVFrame, AVMediaType, AVPixelFormat, AVRational, AVSampleFormat, AVERROR,
     AVERROR_BUG, AVERROR_EOF, AVERROR_OPTION_NOT_FOUND, AVIO_FLAG_READ, AV_BPRINT_SIZE_AUTOMATIC,
     AV_BUFFERSINK_FLAG_NO_REQUEST, AV_BUFFERSRC_FLAG_PUSH, AV_NOPTS_VALUE, AV_OPT_SEARCH_CHILDREN,
-    AV_PIX_FMT_FLAG_HWACCEL, AV_TIME_BASE_Q, EAGAIN, EIO, ENOMEM,
+    AV_PIX_FMT_FLAG_HWACCEL, AV_TIME_BASE_Q, EAGAIN, EINVAL, EIO, ENOMEM,
 };
 #[cfg(not(feature = "docs-rs"))]
 use ffmpeg_sys_next::{
@@ -56,13 +57,13 @@ use ffmpeg_sys_next::{
 };
 use log::{debug, error, info, trace, warn};
 use std::collections::VecDeque;
-use std::f64::consts::PI;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use crate::util::ffmpeg_utils::av_err2str;
+use crate::util::thread_synchronizer::{ThreadDoneGuard, ThreadSynchronizer};
 
 pub(crate) fn filter_graph_init(
     fg_index: usize,
@@ -71,6 +72,7 @@ pub(crate) fn filter_graph_init(
     input_controller: Arc<InputController>,
     filter_node: Arc<SchNode>,
     scheduler_status: Arc<AtomicUsize>,
+    thread_sync: ThreadSynchronizer,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
 ) -> crate::error::Result<()> {
     if let Some(hw_device) = &filter_graph.hw_device {
@@ -116,9 +118,14 @@ pub(crate) fn filter_graph_init(
         ofps.push(output_filter_parameter);
     }
 
+    // Slot claimed before spawn; the guard releases it on any exit path.
+    thread_sync.thread_start();
+    let thread_done_guard = ThreadDoneGuard::adopt(thread_sync.clone(), scheduler_status.clone());
+
     let result = std::thread::Builder::new()
         .name(format!("filtergraph{fg_index}"))
         .spawn(move || {
+            let _thread_done = thread_done_guard;
             let mut graph: *mut AVFilterGraph = null_mut();
             let mut fgp = FilterGraphParameter::default();
             let node = filter_node.as_ref();
@@ -168,8 +175,14 @@ pub(crate) fn filter_graph_init(
 
                 unsafe {
                     if ifps[input_index].media_type == AVMEDIA_TYPE_SUBTITLE {
-                        //TODO
-                        // sub2video_frame
+                        // sub2video (rendering subtitles as filtergraph video
+                        // input) is not implemented; binding rejects it up
+                        // front, so a frame here is a wiring bug.
+                        error!(
+                            "subtitle frames cannot feed filtergraph {fg_index}: \
+                             sub2video is not supported"
+                        );
+                        frame_pool.release(frame_box.frame);
                     } else if !frame_is_null(&frame_box.frame)
                         && !(*frame_box.frame.as_ptr()).buf[0].is_null()
                     {
@@ -360,7 +373,6 @@ impl InputFilterParameter {
 unsafe impl Send for InputFilterParameter {}
 // SAFETY: InputFilterParameter is Sync because it is only accessed from a single filter
 // task thread. The crate's scheduler architecture ensures no concurrent access.
-unsafe impl Sync for InputFilterParameter {}
 
 #[derive(Default)]
 struct FilterGraphParameter {
@@ -393,6 +405,10 @@ struct OutputFilterParameter {
     sample_rate: i32,
 
     tb_out: AVRational,
+    // Once an output frame chose the timebase, a filtergraph reconfig must
+    // not change it: downstream timestamps are already scaled to it
+    // (ffmpeg_filter.c OutputFilterPriv.tb_out_locked).
+    tb_out_locked: bool,
 
     next_pts: i64,
 }
@@ -407,6 +423,7 @@ impl OutputFilterParameter {
     ) -> Self {
         let mut fpsconv_context = FPSConvContext::default();
         fpsconv_context.framerate = opts.framerate;
+        fpsconv_context.framerate_max = opts.framerate_max;
         Self {
             media_type,
             dst,
@@ -425,6 +442,7 @@ impl OutputFilterParameter {
             sample_aspect_ratio: AVRational { num: 0, den: 0 },
             sample_rate: 0,
             tb_out: AVRational { num: 0, den: 0 },
+            tb_out_locked: false,
             next_pts: 0,
         }
     }
@@ -435,7 +453,6 @@ impl OutputFilterParameter {
 unsafe impl Send for OutputFilterParameter {}
 // SAFETY: OutputFilterParameter is Sync because it is only accessed from a single filter
 // task thread. The crate's scheduler architecture ensures no concurrent access.
-unsafe impl Sync for OutputFilterParameter {}
 
 #[cfg(feature = "docs-rs")]
 unsafe fn fg_send_eof(
@@ -525,12 +542,17 @@ unsafe fn fg_send_eof(
 
         let ifp = &ifps[input_filter_index];
         if ifp.format < 0 {
+            // Hard error, matching ffmpeg_filter.c:2746: a stream
+            // that reached EOF without ever configuring its input leaves
+            // the graph silent — fail loudly instead.
             error!(
                 "Cannot determine format of input {} after EOF",
                 ifp.opts.name
             );
+            frame_pool.release(frame_box.frame);
             return Err(Error::FilterGraph(FilterGraphOperationError::InvalidData));
         }
+        frame_pool.release(frame_box.frame);
     }
 
     Ok(())
@@ -645,12 +667,12 @@ unsafe fn fg_send_frame(
             av_bprint_init(&mut reason, 0, AV_BPRINT_SIZE_AUTOMATIC as u32);
 
             if need_reinit & AUDIO_CHANGED != 0 {
-                let fmt_str = CString::new("audio parameters changed to %d Hz, \0").unwrap();
+                let fmt_str = CString::new("audio parameters changed to %d Hz, ").unwrap();
                 let sample_format_name =
                     av_get_sample_fmt_name(std::mem::transmute((*frame).format));
                 av_bprintf(&mut reason, fmt_str.as_ptr(), (*frame).sample_rate);
                 av_channel_layout_describe_bprint(&(*frame).ch_layout, &mut reason);
-                let comma_str = CString::new(", %s, \0").unwrap();
+                let comma_str = CString::new(", %s, ").unwrap();
                 av_bprintf(
                     &mut reason,
                     comma_str.as_ptr(),
@@ -664,7 +686,7 @@ unsafe fn fg_send_frame(
                 let color_range_name = av_color_range_name((*frame).color_range);
 
                 let fmt_str =
-                    CString::new("video parameters changed to %s(%s, %s), %dx%d, \0").unwrap();
+                    CString::new("video parameters changed to %s(%s, %s), %dx%d, ").unwrap();
                 av_bprintf(
                     &mut reason,
                     fmt_str.as_ptr(),
@@ -677,12 +699,12 @@ unsafe fn fg_send_frame(
             }
 
             if need_reinit & MATRIX_CHANGED != 0 {
-                let matrix_changed_str = CString::new("display matrix changed, \0").unwrap();
+                let matrix_changed_str = CString::new("display matrix changed, ").unwrap();
                 av_bprintf(&mut reason, matrix_changed_str.as_ptr());
             }
 
             if need_reinit & HWACCEL_CHANGED != 0 {
-                let hwaccel_changed_str = CString::new("hwaccel changed, \0").unwrap();
+                let hwaccel_changed_str = CString::new("hwaccel changed, ").unwrap();
                 av_bprintf(&mut reason, hwaccel_changed_str.as_ptr());
             }
 
@@ -843,7 +865,11 @@ unsafe fn configure_filtergraph(
         ofp.color_space = av_buffersink_get_colorspace(ofp.filter);
         ofp.color_range = av_buffersink_get_color_range(ofp.filter);
 
-        ofp.tb_out = av_buffersink_get_time_base(ofp.filter);
+        // Tentative value only: once frames chose a timebase it is locked
+        // and a graph reconfig must not drift it (ffmpeg_filter.c:1973-1975).
+        if !ofp.tb_out_locked {
+            ofp.tb_out = av_buffersink_get_time_base(ofp.filter);
+        }
 
         ofp.sample_aspect_ratio = av_buffersink_get_sample_aspect_ratio(ofp.filter);
 
@@ -867,11 +893,16 @@ unsafe fn configure_filtergraph(
             }
             let tmp_frame_box = option.unwrap();
             if ifp.media_type == AVMEDIA_TYPE_SUBTITLE {
-                //TODO
-                // sub2video_frame(ifp, tmp_frame_box);
+                // sub2video is not supported: drop the queued frame instead
+                // of silently keeping a dead branch.
+                error!(
+                    "subtitle frames cannot feed a filtergraph input: \
+                     sub2video is not supported"
+                );
             } else {
                 let mut tmp_frame = unsafe { av_frame_alloc() };
                 if tmp_frame.is_null() {
+                    cleanup_filtergraph(graph, ifps, ofps);
                     return Err(Error::FilterGraph(
                         FilterGraphOperationError::BufferSourceAddFrameError(
                             FilterGraphError::OutOfMemory,
@@ -880,6 +911,8 @@ unsafe fn configure_filtergraph(
                 }
                 ret = av_frame_ref(tmp_frame, tmp_frame_box.frame.as_ptr());
                 if ret < 0 {
+                    av_frame_free(&mut tmp_frame);
+                    cleanup_filtergraph(graph, ifps, ofps);
                     return Err(Error::FilterGraph(
                         FilterGraphOperationError::BufferSourceAddFrameError(
                             FilterGraphError::from(ret),
@@ -887,18 +920,22 @@ unsafe fn configure_filtergraph(
                     ));
                 }
                 ret = av_buffersrc_add_frame(ifp.filter, tmp_frame);
+                // add_frame moves the data references out of tmp_frame but
+                // never owns the shell: free it on success and failure alike
+                // (the success path leaked one AVFrame per replayed frame).
+                av_frame_free(&mut tmp_frame);
                 if ret < 0 {
-                    av_frame_free(&mut tmp_frame);
+                    // Fail immediately: continuing the replay would silently
+                    // drop this frame and a later success overwrote `ret`.
+                    cleanup_filtergraph(graph, ifps, ofps);
+                    return Err(Error::FilterGraph(
+                        FilterGraphOperationError::BufferSourceAddFrameError(
+                            FilterGraphError::from(ret),
+                        ),
+                    ));
                 }
             }
         }
-    }
-
-    if ret < 0 {
-        cleanup_filtergraph(graph, ifps, ofps);
-        return Err(Error::FilterGraph(
-            FilterGraphOperationError::BufferSourceAddFrameError(FilterGraphError::from(ret)),
-        ));
     }
 
     let mut have_input_eof = false;
@@ -1137,7 +1174,9 @@ fn insert_trim(
             return ffmpeg_sys_next::AVERROR_FILTER_NOT_FOUND;
         }
 
-        let filter_name_cstring = CString::new(filter_name).unwrap();
+        let Ok(filter_name_cstring) = CString::new(filter_name) else {
+            return AVERROR(EINVAL);
+        };
         let ctx =
             ffmpeg_sys_next::avfilter_graph_alloc_filter(graph, trim, filter_name_cstring.as_ptr());
         if ctx.is_null() {
@@ -1224,7 +1263,9 @@ fn free_input_filter_resources(ifps: &mut Vec<InputFilterParameter>) {
         if !input_filter_parameter.hw_frames_ctx.is_null() {
             unsafe { av_buffer_unref(&mut input_filter_parameter.hw_frames_ctx) };
         }
-        // Custom channel layouts allocated by av_channel_layout_copy.
+        // Custom channel layouts allocated by av_channel_layout_copy. The
+        // field itself is gated the same way (docs-rs builds stub it out).
+        #[cfg(not(feature = "docs-rs"))]
         unsafe {
             ffmpeg_sys_next::av_channel_layout_uninit(&mut input_filter_parameter.ch_layout)
         };
@@ -1351,8 +1392,13 @@ unsafe fn fg_output_step(
         return 0;
     }
 
-    // Choose the output timebase the first time we get a frame.
-    choose_out_timebase(ofp, &frame);
+    // Choose the output timebase the first time we get a frame, then lock
+    // it: re-choosing after a reconfig would shift all downstream
+    // timestamps (ffmpeg_filter.c:2527-2528; locked at :2190).
+    if !ofp.tb_out_locked {
+        choose_out_timebase(ofp, &frame);
+        ofp.tb_out_locked = true;
+    }
     (*frame.as_mut_ptr()).time_base = av_buffersink_get_time_base(ofp.filter);
 
     /*if !fgp.is_meta {
@@ -1407,8 +1453,11 @@ unsafe fn choose_out_timebase(ofp: &mut OutputFilterParameter, frame: &Frame) {
                 );
             }
 
+            // Cap only when the rate exceeds the bound or is invalid:
+            // `fr.den != 0` here was a mistranslation of fftools `!fr.den`
+            // and made the cap unconditional (ffmpeg_filter.c:2165-2168).
             if ofp.fpsconv_context.framerate_max.num != 0
-                && (av_q2d(fr) > av_q2d(ofp.fpsconv_context.framerate_max) || fr.den != 0)
+                && (av_q2d(fr) > av_q2d(ofp.fpsconv_context.framerate_max) || fr.den == 0)
             {
                 fr = ofp.fpsconv_context.framerate_max;
             }
@@ -1535,8 +1584,7 @@ unsafe fn fg_output_frame(
                     bits_per_raw_sample: 0,
                     input_stream_width: 0,
                     input_stream_height: 0,
-                    subtitle_header_size: 0,
-                    subtitle_header: null_mut(),
+                    subtitle_header: None,
                     fg_input_index: ofp.fg_input_index,
                 },
             };
@@ -1609,9 +1657,13 @@ unsafe fn close_output(
         (*frame.as_mut_ptr()).sample_rate = ofp.sample_rate;
 
         if ofp.opts.ch_layout.nb_channels != 0 {
+            // Copy from the output filter's negotiated layout; copying the
+            // frame's own (empty) layout onto itself left the dummy audio
+            // frame without channels (ffmpeg_filter.c close_output copies
+            // from ofp->ch_layout).
             let ret = av_channel_layout_copy(
                 &mut (*frame.as_mut_ptr()).ch_layout,
-                &(*frame.as_mut_ptr()).ch_layout,
+                &ofp.opts.ch_layout,
             );
             if ret < 0 {
                 return ret;
@@ -1634,8 +1686,7 @@ unsafe fn close_output(
                     bits_per_raw_sample: 0,
                     input_stream_width: 0,
                     input_stream_height: 0,
-                    subtitle_header_size: 0,
-                    subtitle_header: null_mut(),
+                    subtitle_header: None,
                     fg_input_index: ofp.fg_input_index,
                 },
             };
@@ -1656,8 +1707,7 @@ unsafe fn close_output(
                 bits_per_raw_sample: 0,
                 input_stream_width: 0,
                 input_stream_height: 0,
-                subtitle_header_size: 0,
-                subtitle_header: null_mut(),
+                subtitle_header: None,
                 fg_input_index: ofp.fg_input_index,
             },
         };
@@ -1717,6 +1767,15 @@ unsafe fn video_sync_process(
             );
         }
 
+        // Same duplication cap as the live path below: the flush replays the
+        // history median, which must not emit absurd counts either
+        // (ffmpeg_filter.c:2340-2344 runs for flush and live alike).
+        if *nb_frames > 3_240_000 {
+            error!("{} frame duplication too large, skipping", *nb_frames - 1);
+            *nb_frames = 0;
+            return;
+        }
+
         fps.last_dropped = (nb_frames == nb_frames_prev && !frame.is_null()) as i32;
 
         if fps.last_dropped != 0 && (*frame).flags & AV_FRAME_FLAG_KEY != 0 {
@@ -1732,7 +1791,7 @@ unsafe fn video_sync_process(
     /* delta0 is the "drift" between the input frame and
      * where it would fall in the output. */
     let mut delta0 = sync_ipts - ofp.next_pts as f64;
-    let delta = delta0 + duration;
+    let mut delta = delta0 + duration;
 
     // tracks the number of times the PREVIOUS frame should be duplicated,
     // mostly for variable framerate (VFR)
@@ -1752,15 +1811,19 @@ unsafe fn video_sync_process(
     }
 
     match vsync_method {
-        VSyncMethod::VsyncVscfr => {
-            if fps.frame_number == 0 && delta0 >= 0.5 {
-                log::debug!("Not duplicating {} initial frames", delta0 as i32);
-                // delta = duration;
-                // delta0 = 0.0;
+        // VSCFR is CFR that keeps the first frame's original timestamp: its
+        // prologue suppresses the initial padding, then FALLS THROUGH into
+        // the CFR drop/duplicate logic (ffmpeg_filter.c:2288-2295).
+        VSyncMethod::VsyncVscfr | VSyncMethod::VsyncCfr => {
+            if vsync_method == VSyncMethod::VsyncVscfr
+                && fps.frame_number == 0
+                && delta0 >= 0.5
+            {
+                debug!("Not duplicating {} initial frames", delta0.round() as i32);
+                delta = duration;
+                delta0 = 0.0;
                 ofp.next_pts = sync_ipts.round() as i64;
             }
-        }
-        VSyncMethod::VsyncCfr => {
             if delta < -1.1 {
                 *nb_frames = 0;
             } else if delta > 1.1 {
@@ -1796,6 +1859,15 @@ unsafe fn video_sync_process(
             fps.frame_number,
             (*fps.last_frame.as_ptr()).pts
         );
+    }
+
+    // dts_error_threshold (3600*30) * 30: duplication this large means
+    // broken timestamps; skip the frame instead of emitting millions of
+    // duplicates (ffmpeg_filter.c:2340-2344, after the history update).
+    if *nb_frames > 3_240_000 {
+        error!("{} frame duplication too large, skipping", *nb_frames - 1);
+        *nb_frames = 0;
+        return;
     }
 
     fps.last_dropped = (nb_frames == nb_frames_prev) as i32;
@@ -1891,7 +1963,7 @@ struct FPSConvContext {
     dropped_keyframe: bool,
 
     framerate: AVRational,
-    //TODO
+    // -fpsmax upper bound (ffmpeg_mux_init.c ms->max_frame_rate)
     framerate_max: AVRational,
 }
 
@@ -2457,11 +2529,6 @@ unsafe fn configure_input_video_filter(
         return AVERROR(ENOMEM);
     }
 
-    //TODO
-    /*if (ifp.type_src == AVMEDIA_TYPE_SUBTITLE){
-    sub2video_prepare(ifp);
-    }*/
-
     let mut sar = ifp.sample_aspect_ratio;
     if sar.den == 0 {
         sar = AVRational { num: 0, den: 1 };
@@ -2496,7 +2563,10 @@ unsafe fn configure_input_video_filter(
     }
     let name = result.unwrap();
 
-    let args_cstr = CString::new(args).unwrap();
+    let Ok(args_cstr) = CString::new(args) else {
+        av_freep(&mut par as *mut _ as *mut c_void);
+        return AVERROR(EINVAL);
+    };
     let mut ret = avfilter_graph_create_filter(
         &mut ifp.filter,
         buffer_filter,
@@ -2603,20 +2673,24 @@ fn insert_filter(
     args: Option<&str>,
 ) -> i32 {
     let graph = unsafe { (*(*last_filter)).graph };
-    let filter_name_cstr = CString::new(filter_name).unwrap();
+    let Ok(filter_name_cstr) = CString::new(filter_name) else {
+        return AVERROR(EINVAL);
+    };
     let filter = unsafe { avfilter_get_by_name(filter_name_cstr.as_ptr()) };
     if filter.is_null() {
         return AVERROR_BUG;
     }
 
     let mut ctx = std::ptr::null_mut();
-    let args_cstr = args.map(|a| CString::new(a).unwrap());
+    let args_cstr = match args.map(CString::new).transpose() {
+        Ok(args_cstr) => args_cstr,
+        Err(_) => return AVERROR(EINVAL),
+    };
     let args_ptr = args_cstr
         .as_ref()
         .map_or(std::ptr::null(), |cstr| cstr.as_ptr());
 
     let ret = unsafe {
-        let filter_name_cstr = CString::new(filter_name).unwrap();
         avfilter_graph_create_filter(
             &mut ctx,
             filter,
@@ -2640,51 +2714,6 @@ fn insert_filter(
     0
 }
 
-fn get_rotation(displaymatrix: &[i32; 9]) -> f64 {
-    let mut theta = -round(display_rotation_get(displaymatrix));
-
-    theta -= 360.0 * (theta / 360.0 + 0.9 / 360.0).floor();
-
-    if (theta - 90.0 * (theta / 90.0).round()).abs() > 2.0 {
-        warn!(
-            "Odd rotation angle.\n\
-            If you want to help, upload a sample \
-            of this file to https://streams.videolan.org/upload/ \
-            and contact the ffmpeg-devel mailing list. (ffmpeg-devel@ffmpeg.org)"
-        );
-    }
-
-    theta
-}
-
-fn display_rotation_get(matrix: &[i32; 9]) -> f64 {
-    let mut scale = [0.0; 2];
-
-    scale[0] = hypot(conv_fp(matrix[0]), conv_fp(matrix[3]));
-    scale[1] = hypot(conv_fp(matrix[1]), conv_fp(matrix[4]));
-
-    if scale[0] == 0.0 || scale[1] == 0.0 {
-        return f64::NAN;
-    }
-
-    let rotation =
-        (conv_fp(matrix[1]) / scale[1]).atan2(conv_fp(matrix[0]) / scale[0]) * 180.0 / PI;
-
-    -rotation
-}
-
-fn hypot(x: f64, y: f64) -> f64 {
-    (x.powi(2) + y.powi(2)).sqrt()
-}
-
-fn conv_fp(value: i32) -> f64 {
-    value as f64 / 1_073_741_824.0 // CONV_FP converts fixed-point values
-}
-
-fn round(value: f64) -> f64 {
-    value.round()
-}
-
 #[cfg(feature = "docs-rs")]
 unsafe fn graph_parse(
     graph: *mut AVFilterGraph,
@@ -2704,7 +2733,10 @@ unsafe fn graph_parse(
     outputs: *mut *mut AVFilterInOut,
     hw_device: Option<HWDevice>,
 ) -> i32 {
-    let desc = CString::new(graph_desc).expect("CString::new failed");
+    let Ok(desc) = CString::new(graph_desc) else {
+        error!("Filter graph description contains an interior NUL byte");
+        return AVERROR(EINVAL);
+    };
     let mut seg = null_mut();
     *inputs = null_mut();
     *outputs = null_mut();
@@ -2817,7 +2849,7 @@ unsafe fn filter_opt_apply(f: *mut AVFilterContext, mut key: *mut c_char, val: *
             );
             return e;
         }
-        let (data, len) = result.unwrap();
+        let (mut data, len) = result.unwrap();
 
         ret = av_opt_set_bin(
             f as *mut libc::c_void,
@@ -2826,9 +2858,9 @@ unsafe fn filter_opt_apply(f: *mut AVFilterContext, mut key: *mut c_char, val: *
             len as i32,
             AV_OPT_SEARCH_CHILDREN,
         );
-        av_freep(data);
+        av_freep(&mut data as *mut _ as *mut c_void);
     } else {
-        let data = file_read(val);
+        let mut data = file_read(val);
         if data.is_null() {
             error!(
                 "Error loading value for option '{}' from file {}",
@@ -2839,7 +2871,7 @@ unsafe fn filter_opt_apply(f: *mut AVFilterContext, mut key: *mut c_char, val: *
         }
 
         ret = av_opt_set(f as *mut libc::c_void, key, data, AV_OPT_SEARCH_CHILDREN);
-        av_freep(data as *mut libc::c_void);
+        av_freep(&mut data as *mut _ as *mut c_void);
     }
     if ret < 0 {
         error!(
@@ -2856,10 +2888,14 @@ unsafe fn filter_opt_apply(f: *mut AVFilterContext, mut key: *mut c_char, val: *
     0
 }
 
+// Port of fftools read_file_to_string (cmdutils.c): load a filter option
+// value from a file for the `/opt=path` syntax.
 unsafe fn file_read(filename: *mut c_char) -> *mut c_char {
     let mut pb = null_mut();
     let mut ret = avio_open(&mut pb, filename, AVIO_FLAG_READ);
-    let bprint = null_mut();
+    // The AVBPrint lives on the stack like the C original; passing a null
+    // pointer to av_bprint_init would write through NULL.
+    let mut bprint: AVBPrint = std::mem::zeroed();
     let mut str = null_mut();
 
     if ret < 0 {
@@ -2872,14 +2908,14 @@ unsafe fn file_read(filename: *mut c_char) -> *mut c_char {
         return null_mut();
     }
 
-    av_bprint_init(bprint, 0, u32::MAX);
-    ret = avio_read_to_bprint(pb, bprint, usize::MAX);
+    av_bprint_init(&mut bprint, 0, u32::MAX);
+    ret = avio_read_to_bprint(pb, &mut bprint, usize::MAX);
     avio_closep(&mut pb);
     if ret < 0 {
-        av_bprint_finalize(bprint, null_mut());
+        av_bprint_finalize(&mut bprint, null_mut());
         return null_mut();
     }
-    ret = av_bprint_finalize(bprint, &mut str);
+    ret = av_bprint_finalize(&mut bprint, &mut str);
     if ret < 0 {
         return null_mut();
     }
@@ -2909,7 +2945,7 @@ unsafe fn read_binary(path: *mut c_char) -> crate::error::Result<(*mut c_void, i
         return Err(AVERROR(EIO));
     }
 
-    let data = av_malloc(fsize as usize);
+    let mut data = av_malloc(fsize as usize);
     if data.is_null() {
         avio_close(io);
         return Err(AVERROR(ENOMEM));
@@ -2921,7 +2957,10 @@ unsafe fn read_binary(path: *mut c_char) -> crate::error::Result<(*mut c_void, i
             "Error reading file '{}'. read_size:{read_size}",
             CStr::from_ptr(path).to_str().unwrap_or("[unknow path]")
         );
-        av_freep(data);
+        // av_freep takes the address of the pointer; passing the buffer
+        // itself freed whatever its first bytes happened to contain
+        // (ffmpeg_filter.c:470, where data is already a uint8_t**).
+        av_freep(&mut data as *mut _ as *mut c_void);
         avio_close(io);
         return Err(if read_size < 0 {
             read_size

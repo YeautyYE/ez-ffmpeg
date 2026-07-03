@@ -10,6 +10,15 @@ use rml_rtmp::time::RtmpTimestamp;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+// Caps for the currently-writing GOP. A stream that never sends a keyframe
+// (broken encoder, screen shares with huge GOPs, video-less inputs fed
+// through the video path) would otherwise grow `current` without bound.
+// Replaying a keyframe-less cache would only produce corrupted pictures, so
+// on overflow the cache is dropped outright; sequence headers are stored
+// separately and audio frames are independently decodable.
+const MAX_CURRENT_GOP_FRAMES: usize = 4096;
+const MAX_CURRENT_GOP_BYTES: usize = 64 * 1024 * 1024;
+
 /// Frame data - Structure unchanged
 /// ⚠️ Note: Keyframe detection is caller's responsibility, not implemented here
 #[derive(Clone)]
@@ -64,6 +73,7 @@ impl FrozenGop {
 pub struct Gops {
     frozen: VecDeque<FrozenGop>,
     current: Vec<FrameData>,
+    current_bytes: usize,
     max_gops: usize,
 }
 
@@ -78,8 +88,15 @@ impl Clone for Gops {
         Self {
             frozen: self.frozen.clone(), // FrozenGop clone is O(1)
             current: self.current.clone(),
+            current_bytes: self.current_bytes,
             max_gops: self.max_gops,
         }
+    }
+}
+
+fn frame_len(frame: &FrameData) -> usize {
+    match frame {
+        FrameData::Video { data, .. } | FrameData::Audio { data, .. } => data.len(),
     }
 }
 
@@ -88,6 +105,7 @@ impl Gops {
         Self {
             frozen: VecDeque::with_capacity(max_gops),
             current: Vec::with_capacity(256),
+            current_bytes: 0,
             max_gops,
         }
     }
@@ -108,6 +126,7 @@ impl Gops {
         if is_key_frame && !self.current.is_empty() {
             // Take current frames and create frozen GOP
             let frames = std::mem::take(&mut self.current);
+            self.current_bytes = 0;
             let frozen = FrozenGop::new(frames);
 
             // If limit exceeded, remove oldest GOP
@@ -120,7 +139,21 @@ impl Gops {
             self.current.reserve(256);
         }
 
+        self.current_bytes += frame_len(&data);
         self.current.push(data);
+
+        if self.current.len() > MAX_CURRENT_GOP_FRAMES
+            || self.current_bytes > MAX_CURRENT_GOP_BYTES
+        {
+            log::warn!(
+                "current GOP exceeded {} frames / {} bytes without a keyframe; \
+                 dropping the cached frames",
+                self.current.len(),
+                self.current_bytes
+            );
+            self.current.clear();
+            self.current_bytes = 0;
+        }
     }
 
     /// Get reference iterator for all frozen GOPs (test only)
@@ -273,6 +306,62 @@ mod tests {
         // Should not save any frames when disabled
         assert_eq!(gops.frozen_count(), 0);
         assert!(!gops.is_enabled());
+    }
+
+    #[test]
+    fn current_gop_frame_cap_clears_stale_cache() {
+        let mut gops = Gops::new(1);
+
+        // A stream that never sends a keyframe (or audio-only fed through the
+        // video path) must not grow the current GOP unboundedly.
+        for i in 0..=(MAX_CURRENT_GOP_FRAMES as u32) {
+            gops.save_frame_data(make_video_frame(i, b"p"), false);
+        }
+
+        assert_eq!(
+            gops.current_frame_count(),
+            0,
+            "exceeding the frame cap must clear the keyframe-less cache"
+        );
+    }
+
+    #[test]
+    fn current_gop_byte_cap_clears_stale_cache() {
+        let mut gops = Gops::new(1);
+        let big = vec![0u8; 1024 * 1024];
+
+        // 65 x 1MiB without a keyframe exceeds the 64MiB byte cap.
+        for i in 0..65 {
+            gops.save_frame_data(make_video_frame(i, &big), false);
+        }
+
+        assert_eq!(
+            gops.current_frame_count(),
+            0,
+            "exceeding the byte cap must clear the keyframe-less cache"
+        );
+    }
+
+    #[test]
+    fn keyframed_gops_are_not_cleared_by_the_caps() {
+        let mut gops = Gops::new(4);
+        let big = vec![0u8; 1024 * 1024];
+
+        // 40MiB per GOP, keyframe boundaries in between: the byte counter
+        // must reset at every freeze, so no clear ever triggers.
+        for gop in 0..3u32 {
+            gops.save_frame_data(make_video_frame(gop * 100, b"k"), true);
+            for i in 0..40 {
+                gops.save_frame_data(make_video_frame(gop * 100 + i + 1, &big), false);
+            }
+        }
+
+        assert_eq!(gops.frozen_count(), 2);
+        assert_eq!(
+            gops.current_frame_count(),
+            41,
+            "healthy keyframed GOPs must be unaffected by the caps"
+        );
     }
 
     #[test]

@@ -1,3 +1,8 @@
+//! Port of fftools `ObjPool` (FFmpeg 7.x fftools/objpool.c): recycles
+//! AVFrame/AVPacket shells between pipeline stages. The C fixed-size ring
+//! is replaced by an unbounded lock-free `SegQueue`, so `get` never fails
+//! on pool exhaustion — only on allocation failure.
+
 use crossbeam::queue::SegQueue;
 use std::sync::Arc;
 pub(crate) struct ObjPool<T> {

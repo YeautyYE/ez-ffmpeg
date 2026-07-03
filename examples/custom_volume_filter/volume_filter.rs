@@ -101,14 +101,10 @@ impl FrameFilter for VolumeFilter {
             }
         };
 
-        // Apply volume adjustment on both channels
-        let input_channel_0 = plane(&frame, 0);
-        let output_channel_0 = plane_mut(&frame, 0);
-        adjust_volume_f32(output_channel_0, input_channel_0, self.volume);
-
-        let input_channel_1 = plane(&frame, 1);
-        let output_channel_1 = plane_mut(&frame, 1);
-        adjust_volume_f32(output_channel_1, input_channel_1, self.volume);
+        // Apply volume adjustment on both channels (in place)
+        let mut frame = frame;
+        adjust_volume_in_place_f32(plane_mut(&mut frame, 0), self.volume);
+        adjust_volume_in_place_f32(plane_mut(&mut frame, 1), self.volume);
 
         Ok(Some(frame)) // Return the processed frame
     }
@@ -119,6 +115,15 @@ use std::arch::aarch64::*;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use std::arch::x86_64::*;
 use ez_ffmpeg::util::ffmpeg_utils::av_err2str;
+
+// In-place variant: source and destination are the same channel plane. A
+// snapshot copy keeps the SIMD kernel's in/out slices non-aliasing (Rust
+// forbids a &mut and a & to the same buffer).
+#[inline]
+pub fn adjust_volume_in_place_f32(samples: &mut [f32], gain: f32) {
+    let input = samples.to_vec();
+    adjust_volume_f32(samples, &input, gain);
+}
 
 // SIMD-based volume adjustment
 #[inline]
@@ -202,16 +207,13 @@ fn calculate_simd_params(len: usize) -> (usize, usize) {
     (simd_len, remainder)
 }
 
-// Helper function to extract a specific audio channel's data
+// Helper function to get mutable access to a specific audio channel's data.
+// Takes &mut Frame: handing out &mut [f32] from a shared reference would let
+// two aliasing mutable slices coexist.
 #[inline]
-pub fn plane(frame: &Frame, channel: usize) -> &[f32] {
+pub fn plane_mut(frame: &mut Frame, channel: usize) -> &mut [f32] {
     let num_samples = unsafe { (*frame.as_ptr()).nb_samples } as usize;
-    unsafe { std::slice::from_raw_parts((*frame.as_ptr()).data[channel] as *mut f32, num_samples) }
-}
-
-// Helper function to get mutable access to a specific audio channel's data
-#[inline]
-pub fn plane_mut(frame: &Frame, channel: usize) -> &mut [f32] {
-    let num_samples = unsafe { (*frame.as_ptr()).nb_samples } as usize;
-    unsafe { std::slice::from_raw_parts_mut((*frame.as_ptr()).data[channel] as *mut f32, num_samples) }
+    unsafe {
+        std::slice::from_raw_parts_mut((*frame.as_mut_ptr()).data[channel] as *mut f32, num_samples)
+    }
 }

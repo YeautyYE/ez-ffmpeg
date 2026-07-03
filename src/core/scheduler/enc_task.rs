@@ -7,7 +7,8 @@ use crate::core::scheduler::ffmpeg_scheduler::{
     frame_is_null, is_stopping, packet_is_null, set_scheduler_error, wait_until_not_paused, STATUS_ABORT,
 };
 use crate::hwaccel::hw_device_get_by_type;
-use crate::util::ffmpeg_utils::{av_err2str, hashmap_to_avdictionary};
+use crate::util::ffmpeg_utils::{av_err2str, hashmap_to_avdictionary, DictGuard};
+use crate::util::thread_synchronizer::{ThreadDoneGuard, ThreadSynchronizer};
 use crossbeam_channel::{Receiver, RecvTimeoutError, SendError, Sender};
 use ffmpeg_next::packet::Mut;
 use ffmpeg_next::{Frame, Packet};
@@ -31,7 +32,7 @@ use log::{debug, error, info, trace, warn};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString};
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::Duration;
@@ -54,6 +55,8 @@ pub(crate) fn enc_init(
     frame_pool: ObjPool<Frame>,
     packet_pool: ObjPool<Packet>,
     scheduler_status: Arc<AtomicUsize>,
+    thread_sync: ThreadSynchronizer,
+    enc_handle_sender: Sender<std::thread::JoinHandle<()>>,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
 ) -> crate::error::Result<()> {
     Ok(())
@@ -77,6 +80,8 @@ pub(crate) fn enc_init(
     frame_pool: ObjPool<Frame>,
     packet_pool: ObjPool<Packet>,
     scheduler_status: Arc<AtomicUsize>,
+    thread_sync: ThreadSynchronizer,
+    enc_handle_sender: Sender<std::thread::JoinHandle<()>>,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
 ) -> crate::error::Result<()> {
     let enc_ctx = unsafe { avcodec_alloc_context3(enc_stream.encoder) };
@@ -107,14 +112,19 @@ pub(crate) fn enc_init(
     let receiver = enc_stream.take_src();
     let pkt_sender = enc_stream.take_dst();
     let pre_pkt_sender = enc_stream.take_dst_pre();
-    let mux_started = enc_stream.take_mux_started();
+    let mux_start_gate = enc_stream.take_mux_start_gate();
 
     let stream_box = enc_stream.stream;
     let stream_index = enc_stream.stream_index;
 
     let encoder_name = unsafe { CStr::from_ptr((*enc_stream.encoder).name).to_str().unwrap_or("unknown") };
 
+    // Slot claimed before spawn; the guard releases it on any exit path.
+    thread_sync.thread_start();
+    let thread_done_guard = ThreadDoneGuard::adopt(thread_sync.clone(), scheduler_status.clone());
+
     let result = std::thread::Builder::new().name(format!("encoder{stream_index}:{mux_idx}:{encoder_name}")).spawn(move || unsafe {
+        let _thread_done = thread_done_guard;
         let enc_ctx_box = enc_ctx_box;
         let stream_box = stream_box;
 
@@ -149,33 +159,55 @@ pub(crate) fn enc_init(
                 recording_time_us,
                 &pkt_sender,
                 &pre_pkt_sender,
-                &mux_started,
+                &mux_start_gate,
                 stream_box.inner,
                 &packet_pool,
             );
             frame_pool.release(receive_frame_box.frame);
-            if let Err(e) = result {
-                error!("Error encoding a frame: {}", e);
-                set_scheduler_error(&scheduler_status, &scheduler_result, e);
-                break;
+            let status = match result {
+                Err(e) => {
+                    if is_stopping(scheduler_status.load(Ordering::Acquire))
+                        && matches!(e, Encoding(EncodingOperationError::MuxerFinished))
+                    {
+                        // stop()/abort(): the muxer legitimately exited first; a
+                        // user-requested shutdown must not be recorded as a failure.
+                        debug!("Encoder stopping: muxer already finished");
+                    } else {
+                        error!("Error encoding a frame: {}", e);
+                        set_scheduler_error(&scheduler_status, &scheduler_result, e);
+                    }
+                    break;
+                }
+                Ok(status) => status,
+            };
+
+            match status {
+                EncodeStatus::Eof => {
+                    trace!("Encoder returned EOF, finishing");
+                    finished = true;
+                    break;
+                }
+                EncodeStatus::LimitReached => {
+                    // recording_time hit: stop feeding the encoder, but frames
+                    // already sent may still sit in its reorder buffer — leave
+                    // `finished` false so the flush below drains them.
+                    debug!("sq: {stream_index} recording_time reached");
+                    break;
+                }
+                EncodeStatus::Continue => {}
             }
 
             if let Some(max_frames) = max_frames.as_ref() {
                 if frames_sent >= *max_frames {
+                    // Same as LimitReached: the last frames sent are still
+                    // buffered inside the encoder; do not skip the flush.
                     debug!("sq: {stream_index} frames_max {max_frames} reached");
-                    finished = true;
                     break;
                 }
             }
-
-            finished = result.unwrap();
-            if finished {
-                trace!("Encoder returned EOF, finishing");
-                break;
-            }
         }
 
-        // Encoder flush logic - handles two different exit scenarios:
+        // Encoder flush logic - handles three different exit scenarios:
         //
         // SCENARIO 1: finished=true (normal completion)
         //   - Encoder received NULL frame from upstream (frame_encode() processed it)
@@ -183,13 +215,24 @@ pub(crate) fn enc_init(
         //   - All buffered packets (B-frames, etc.) have been drained via receive_packet() loop
         //   - Encoder is completely flushed, no additional flush needed
         //
-        // SCENARIO 2: finished=false (early exit: abort or disconnect)
+        // SCENARIO 2: finished=false, limit reached (max_frames / recording_time)
+        //   - Every accepted frame is within the limit, but the last ones may
+        //     still sit in the encoder's reorder buffer (B-frame lookahead)
+        //   - Flush, or the tail of the output is silently dropped; drained
+        //     packets only cover frames sent before the limit, so the limit
+        //     still holds (fftools flushes after its encode loop the same way)
+        //
+        // SCENARIO 3: finished=false (early exit: abort or disconnect)
         //   - Encoder did NOT receive NULL frame (thread exited early via abort() or Disconnected)
         //   - Encoder buffer may still contain unencoded frames (B-frames waiting for future frames)
         //   - If NOT abort: actively flush encoder to drain buffered frames
         //   - If abort: skip flush (user doesn't care about incomplete output)
         //
-        if !finished {
+        // Subtitle encoders buffer nothing (avcodec_encode_subtitle is
+        // stateless) and do not implement the send_frame API: flushing one
+        // would only produce a spurious EINVAL — fftools' frame_encode notes
+        // "no flushing for subtitles".
+        if !finished && opened && (*enc_ctx_box.as_mut_ptr()).codec_type != AVMEDIA_TYPE_SUBTITLE {
             let status = scheduler_status.load(Ordering::Acquire);
 
             if status != STATUS_ABORT {
@@ -240,10 +283,9 @@ pub(crate) fn enc_init(
                                 codec_type: (*enc_ctx).codec_type,
                                 output_stream_index: (*stream).index,
                                 is_copy: false,
-                                codecpar: (*stream).codecpar,
                             },
-                        }, &pkt_sender, &pre_pkt_sender, &mux_started) {
-                            error!("send flushed packet failed, mux already finished");
+                        }, &pkt_sender, &pre_pkt_sender, &mux_start_gate) {
+                            debug!("send flushed packet failed, mux already finished");
                             break;
                         }
                     }
@@ -275,26 +317,50 @@ pub(crate) fn enc_init(
                     codec_type: (*enc_ctx).codec_type,
                     output_stream_index: (*stream).index,
                     is_copy: false,
-                    codecpar: (*stream).codecpar,
                 },
-            }, &pkt_sender, &pre_pkt_sender, &mux_started) {
-                error!("Error sending end packet: {}", e);
-                set_scheduler_error(
-                    &scheduler_status,
-                    &scheduler_result,
-                    Encoding(EncodingOperationError::MuxerFinished),
-                );
+            }, &pkt_sender, &pre_pkt_sender, &mux_start_gate) {
+                if is_stopping(scheduler_status.load(Ordering::Acquire)) {
+                    // Normal shutdown ordering: muxer exits before the encoder's
+                    // end-of-stream marker; not an error and not a task failure.
+                    debug!("end packet not delivered, muxer already finished: {e}");
+                } else {
+                    error!("Error sending end packet: {}", e);
+                    set_scheduler_error(
+                        &scheduler_status,
+                        &scheduler_result,
+                        Encoding(EncodingOperationError::MuxerFinished),
+                    );
+                }
             }
         }
 
         debug!("Encoder finished.");
     });
-    if let Err(e) = result {
-        error!("Encoder thread exited with error: {e}");
-        return Err(OpenEncoderOperationError::ThreadExited.into())
+    match result {
+        Err(e) => {
+            error!("Encoder thread exited with error: {e}");
+            return Err(OpenEncoderOperationError::ThreadExited.into());
+        }
+        Ok(handle) => {
+            // Hand the join handle to this stream's muxer: the muxer joins
+            // its encoders before freeing the output AVFormatContext, so an
+            // encoder can never outlive the streams it references.
+            let _ = enc_handle_sender.send(handle);
+        }
     }
 
     Ok(())
+}
+
+/// Outcome of pushing one frame through the encoder.
+enum EncodeStatus {
+    /// Frame consumed; more may follow.
+    Continue,
+    /// recording_time boundary hit before this frame: stop encoding. Frames
+    /// already sent may still sit in the encoder and must be flushed.
+    LimitReached,
+    /// EOF fully processed: the encoder has been drained, nothing to flush.
+    Eof,
 }
 
 enum SyncFrame {
@@ -409,7 +475,16 @@ fn receive_frame(
 
         if frame_is_null(&frame_box.frame) {
             frame_pool.release(frame_box.frame);
-            error!("Receive frame is null on open encoder");
+            // EOF before the first frame: nothing was decoded for this stream,
+            // the encoder never opened and the muxer can never become ready.
+            // Record a real error so wait() does not report a false success.
+            let output_stream_index = unsafe { (*stream).index };
+            error!("No frames were received for output stream {output_stream_index}; encoder never opened");
+            set_scheduler_error(
+                scheduler_status,
+                scheduler_result,
+                OpenEncoder(OpenEncoderOperationError::NoFramesReceived),
+            );
             return SyncFrame::Break;
         }
 
@@ -425,6 +500,18 @@ fn receive_frame(
                 *frame_samples = (*enc_ctx).frame_size;
                 *align_mask = av_cpu_max_align() - 1;
             }
+        }
+
+        // A data-less frame is a dummy carrying only encoder init parameters:
+        // the filtergraph sends one when a stream produced no frames at all
+        // (close_output), so the encoder can open and the muxer become ready.
+        // Mirror fftools ffmpeg_sched.c send_to_enc(): open with it, then
+        // discard it — there is nothing to encode.
+        // SAFETY: the frame pointer is non-null — the frame_is_null early
+        // return above already handled the null (EOF marker) case.
+        if unsafe { (*frame_box.frame.as_ptr()).buf[0].is_null() } {
+            frame_pool.release(frame_box.frame);
+            return SyncFrame::Continue;
         }
 
         frame_box
@@ -499,7 +586,7 @@ fn receive_frame(
 }
 
 fn set_encoder_opts(enc_stream: &EncoderStream, video_codec_opts: &Option<HashMap<CString, CString>>, audio_codec_opts: &Option<HashMap<CString, CString>>, subtitle_codec_opts: &Option<HashMap<CString, CString>>, enc_ctx_box: &CodecContext) -> crate::error::Result<()> {
-    let mut encoder_opts = if enc_stream.codec_type == AVMEDIA_TYPE_VIDEO {
+    let mut encoder_opts = DictGuard::new(if enc_stream.codec_type == AVMEDIA_TYPE_VIDEO {
         hashmap_to_avdictionary(video_codec_opts)
     } else if enc_stream.codec_type == AVMEDIA_TYPE_AUDIO {
         hashmap_to_avdictionary(audio_codec_opts)
@@ -507,12 +594,12 @@ fn set_encoder_opts(enc_stream: &EncoderStream, video_codec_opts: &Option<HashMa
         hashmap_to_avdictionary(subtitle_codec_opts)
     } else {
         null_mut()
-    };
-    if !encoder_opts.is_null() {
+    });
+    if !encoder_opts.as_ptr().is_null() {
         let ret = unsafe {
             av_opt_set_dict2(
                 enc_ctx_box.as_mut_ptr() as *mut libc::c_void,
-                &mut encoder_opts,
+                encoder_opts.as_double_ptr(),
                 AV_OPT_SEARCH_CHILDREN,
             )
         };
@@ -521,6 +608,15 @@ fn set_encoder_opts(enc_stream: &EncoderStream, video_codec_opts: &Option<HashMa
             return Err(OpenEncoder(
                 OpenEncoderOperationError::ContextAllocationError(OpenEncoderError::from(ret)),
             ));
+        }
+        // Entries no encoder option matched are user typos (fftools
+        // check_avoptions errors out; we surface them as warnings). The
+        // guard frees the leftovers, which previously leaked.
+        for key in encoder_opts.leftover_keys() {
+            warn!(
+                "Option '{key}' was not recognized by encoder for stream {}",
+                enc_stream.stream_index
+            );
         }
     }
     Ok(())
@@ -721,13 +817,13 @@ fn enc_open(
 
         match (*enc_ctx).codec_type {
             AVMEDIA_TYPE_AUDIO => {
-                assert!(
-                    (*frame).format != AV_SAMPLE_FMT_NONE as i32
-                        && (*frame).sample_rate > 0
-                        && (*frame).ch_layout.nb_channels > 0
-                );
-
-                if (*frame).format == -1 {
+                // A malformed init frame must fail the task with a clear
+                // error, not abort the process (the old assert! shadowed the
+                // graceful branch below it).
+                if (*frame).format == AV_SAMPLE_FMT_NONE as i32
+                    || (*frame).sample_rate <= 0
+                    || (*frame).ch_layout.nb_channels <= 0
+                {
                     return Err(OpenOutputError::UnknownFrameFormat.into());
                 }
                 (*enc_ctx).sample_fmt = std::mem::transmute((*frame).format);
@@ -751,20 +847,18 @@ fn enc_open(
                 }
             }
             AVMEDIA_TYPE_VIDEO => {
-                assert!(
-                    (*frame).format != AV_SAMPLE_FMT_NONE as i32
-                        && (*frame).width > 0
-                        && (*frame).height > 0
-                );
+                if (*frame).format == AV_PIX_FMT_NONE as i32
+                    || (*frame).width <= 0
+                    || (*frame).height <= 0
+                {
+                    return Err(OpenOutputError::UnknownFrameFormat.into());
+                }
 
                 (*enc_ctx).width = (*frame).width;
                 (*enc_ctx).height = (*frame).height;
                 (*enc_ctx).sample_aspect_ratio = (*frame).sample_aspect_ratio;
                 (*stream).sample_aspect_ratio = (*frame).sample_aspect_ratio;
 
-                if (*frame).format == -1 {
-                    return Err(OpenEncoder(OpenEncoderOperationError::UnknownFrameFormat));
-                }
                 (*enc_ctx).pix_fmt = std::mem::transmute((*frame).format);
 
                 if let Some(bits_per_raw_sample) = bits_per_raw_sample {
@@ -814,27 +908,25 @@ fn enc_open(
                     (*enc_ctx).height = frame_box.frame_data.input_stream_height;
                 }
 
-                if !frame_box.frame_data.subtitle_header.is_null() {
+                if let Some(header) = frame_box.frame_data.subtitle_header.as_deref() {
                     /* ASS code assumes this buffer is null terminated so add extra byte. */
-                    let size = (frame_box.frame_data.subtitle_header_size + 1) as usize;
-                    let subtitle_header = av_mallocz(size) as *mut u8;
-                    (*enc_ctx).subtitle_header = subtitle_header;
-                    if (*enc_ctx).subtitle_header.is_null() {
+                    let subtitle_header = av_mallocz(header.len() + 1) as *mut u8;
+                    if subtitle_header.is_null() {
                         return Err(OpenEncoder(
                             OpenEncoderOperationError::SettingSubtitleError(
                                 OpenEncoderError::OutOfMemory,
                             ),
                         ));
                     }
-                    std::ptr::copy_nonoverlapping(
-                        frame_box.frame_data.subtitle_header as *const u8,
-                        (*enc_ctx).subtitle_header,
-                        frame_box.frame_data.subtitle_header_size as usize,
-                    );
-                    (*enc_ctx).subtitle_header_size = frame_box.frame_data.subtitle_header_size;
+                    std::ptr::copy_nonoverlapping(header.as_ptr(), subtitle_header, header.len());
+                    (*enc_ctx).subtitle_header = subtitle_header;
+                    (*enc_ctx).subtitle_header_size = header.len() as i32;
                 }
             }
-            _ => panic!("Unsupported codec type"),
+            // fftools av_assert0(0) (ffmpeg_enc.c:303): the mapping layer
+            // never routes DATA/ATTACHMENT into an encoder, but a library
+            // fails the task instead of aborting on the broken invariant.
+            _ => return Err(OpenEncoder(OpenEncoderOperationError::UnsupportedMediaType)),
         }
 
         if (*enc).capabilities as u32 & AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE != 0 {
@@ -1036,10 +1128,10 @@ fn frame_encode(
     recording_time_us: Option<i64>,
     pkt_sender: &Sender<PacketBox>,
     pre_pkt_sender: &Sender<PacketBox>,
-    mux_started: &Arc<AtomicBool>,
+    mux_start_gate: &Arc<crate::core::context::MuxStartGate>,
     stream: *mut AVStream,
     packet_pool: &ObjPool<Packet>,
-) -> crate::error::Result<bool> {
+) -> crate::error::Result<EncodeStatus> {
     unsafe {
         if (*enc_ctx).codec_type == AVMEDIA_TYPE_SUBTITLE {
             let subtitle = if !frame.is_null() && !(*frame).buf[0].is_null() {
@@ -1056,11 +1148,11 @@ fn frame_encode(
                     recording_time_us,
                     pkt_sender,
                     pre_pkt_sender,
-                    mux_started,
+                    mux_start_gate,
                     stream,
                 )
             } else {
-                Ok(false)
+                Ok(EncodeStatus::Continue)
             };
         }
 
@@ -1074,7 +1166,7 @@ fn frame_encode(
                 ) >= 0
                 {
                     debug!("Reached the target time: {recording_time_us} us, frame time: {} us. Ending the recording.", (*frame).pts);
-                    return Ok(true);
+                    return Ok(EncodeStatus::LimitReached);
                 }
             }
 
@@ -1085,10 +1177,11 @@ fn frame_encode(
                 && (*enc_ctx).ch_layout.nb_channels != (*frame).ch_layout.nb_channels
             {
                 error!("Audio channel count changed and encoder does not support parameter changes");
-                return Ok(false);
+                return Ok(EncodeStatus::Continue);
             }
         }
-        encode_frame(enc_ctx, frame, pkt_sender,  pre_pkt_sender, mux_started, stream, packet_pool)
+        encode_frame(enc_ctx, frame, pkt_sender,  pre_pkt_sender, mux_start_gate, stream, packet_pool)
+            .map(|eof| if eof { EncodeStatus::Eof } else { EncodeStatus::Continue })
     }
 }
 
@@ -1100,16 +1193,16 @@ unsafe fn do_subtitle_out(
     recording_time_us: Option<i64>,
     pkt_sender: &Sender<PacketBox>,
     pre_pkt_sender: &Sender<PacketBox>,
-    mux_started: &Arc<AtomicBool>,
+    mux_start_gate: &Arc<crate::core::context::MuxStartGate>,
     stream: *mut AVStream,
-) -> crate::error::Result<bool> {
+) -> crate::error::Result<EncodeStatus> {
     let subtitle_out_max_size = 1024 * 1024;
     if (*sub).pts == AV_NOPTS_VALUE {
         return Err(Encoding(EncodingOperationError::SubtitleNotPts));
     }
     if let Some(start_time_us) = start_time_us {
         if (*sub).pts < start_time_us {
-            return Ok(false);
+            return Ok(EncodeStatus::Continue);
         }
     }
 
@@ -1129,7 +1222,7 @@ unsafe fn do_subtitle_out(
         let mut local_sub = *sub;
         if let Some(recording_time_us) = recording_time_us {
             if av_compare_ts(pts, AV_TIME_BASE_Q, recording_time_us, AV_TIME_BASE_Q) >= 0 {
-                return Ok(true);
+                return Ok(EncodeStatus::LimitReached);
             }
         }
 
@@ -1202,15 +1295,14 @@ unsafe fn do_subtitle_out(
                 codec_type: (*enc_ctx).codec_type,
                 output_stream_index: (*stream).index,
                 is_copy: false,
-                codecpar: (*stream).codecpar,
             },
-        }, pkt_sender, pre_pkt_sender, mux_started) {
-            error!("send subtitle packet failed, mux already finished");
+        }, pkt_sender, pre_pkt_sender, mux_start_gate) {
+            debug!("send subtitle packet failed, mux already finished");
             return Err(Encoding(EncodingOperationError::MuxerFinished));
         }
     }
 
-    Ok(false)
+    Ok(EncodeStatus::Continue)
 }
 
 #[cfg(not(feature = "docs-rs"))]
@@ -1219,7 +1311,7 @@ unsafe fn encode_frame(
     frame: *mut AVFrame,
     pkt_sender: &Sender<PacketBox>,
     pre_pkt_sender: &Sender<PacketBox>,
-    mux_started: &Arc<AtomicBool>,
+    mux_start_gate: &Arc<crate::core::context::MuxStartGate>,
     stream: *mut AVStream,
     packet_pool: &ObjPool<Packet>,
 ) -> crate::error::Result<bool> {
@@ -1273,29 +1365,42 @@ unsafe fn encode_frame(
                 codec_type: (*enc_ctx).codec_type,
                 output_stream_index: (*stream).index,
                 is_copy: false,
-                codecpar: (*stream).codecpar,
             },
-        }, pkt_sender, pre_pkt_sender, mux_started) {
-            error!("send packet failed, mux already finished");
+        }, pkt_sender, pre_pkt_sender, mux_start_gate) {
+            debug!("send packet failed, mux already finished");
             return Err(Encoding(EncodingOperationError::MuxerFinished));
         }
     }
 }
 
 
-fn send_to_mux(packet_box: PacketBox, pkt_sender: &Sender<PacketBox>, pre_pkt_sender: &Sender<PacketBox>, mux_started:&Arc<AtomicBool>) -> Result<(), SendError<PacketBox>> {
-    if mux_started.load(Ordering::Acquire) {
-        pkt_sender.send(packet_box)
-    } else {
-        if let Err(e) = pre_pkt_sender.send(packet_box) {
-            for _ in 0..64 {
-                if mux_started.load(Ordering::Acquire) {
-                    return pkt_sender.send(e.0);
-                }
-                sleep(Duration::from_millis(100));
-            }
-            return Err(e);
-        }
-        Ok(())
+fn send_to_mux(
+    packet_box: PacketBox,
+    pkt_sender: &Sender<PacketBox>,
+    pre_pkt_sender: &Sender<PacketBox>,
+    mux_start_gate: &Arc<crate::core::context::MuxStartGate>,
+) -> Result<(), SendError<PacketBox>> {
+    use crate::core::context::PreSendOutcome;
+
+    if mux_start_gate.is_started() {
+        return pkt_sender.send(packet_box);
     }
+
+    // The gate serializes "started?" with the pre-queue send: without it a
+    // packet parked between the muxer's drain and its gate flip would never
+    // be delivered.
+    let mut packet_box = packet_box;
+    for _ in 0..640 {
+        packet_box = match mux_start_gate.send_pre(pre_pkt_sender, packet_box) {
+            PreSendOutcome::Sent => return Ok(()),
+            PreSendOutcome::Started(pb) => return pkt_sender.send(pb),
+            PreSendOutcome::Full(pb) => {
+                // Pre-queue full: wait for the muxer to start and drain it.
+                sleep(Duration::from_millis(10));
+                pb
+            }
+            PreSendOutcome::Disconnected(pb) => return Err(SendError(pb)),
+        };
+    }
+    Err(SendError(packet_box))
 }

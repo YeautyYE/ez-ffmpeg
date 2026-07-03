@@ -9,6 +9,7 @@ use ffmpeg_sys_next::{
     AVPixelFormat, AVRational, AVStream,
 };
 
+/// fftools: `InputStream` + `DemuxStream` (ffmpeg.h / ffmpeg_demux.c).
 #[derive(Clone)]
 pub(crate) struct DecoderStream {
     pub(crate) stream_index: usize,
@@ -20,12 +21,19 @@ pub(crate) struct DecoderStream {
     pub(crate) duration: i64,
     pub(crate) time_base: AVRational,
     pub(crate) avg_framerate: AVRational,
+    /// Input::set_framerate forces a fixed framerate: the decoder stamps
+    /// frames on the CFR grid instead of trusting container timestamps
+    /// (fftools DECODER_FLAG_FRAMERATE_FORCED, ffmpeg_demux.c:924-925).
+    pub(crate) framerate_forced: bool,
     pub(crate) have_sub2video: bool,
 
     pub(crate) hwaccel_id: HWAccelID,
     pub(crate) hwaccel_device_type: AVHWDeviceType,
     pub(crate) hwaccel_device: Option<String>,
     pub(crate) hwaccel_output_format: AVPixelFormat,
+
+    /// Applied to `AVCodecContext.log_level_offset` when the decoder opens.
+    pub(crate) log_level_offset: i32,
 
     src: Option<Receiver<PacketBox>>,
     dsts: Vec<(Sender<FrameBox>, usize, Arc<[AtomicBool]>)>,
@@ -42,10 +50,12 @@ impl DecoderStream {
         duration: i64,
         time_base: AVRational,
         avg_framerate: AVRational,
+        framerate_forced: bool,
         hwaccel_id: HWAccelID,
         hwaccel_device_type: AVHWDeviceType,
         hwaccel_device: Option<String>,
         hwaccel_output_format: AVPixelFormat,
+        log_level_offset: i32,
     ) -> Self {
         Self {
             stream_index,
@@ -57,11 +67,13 @@ impl DecoderStream {
             duration,
             time_base,
             avg_framerate,
+            framerate_forced,
             have_sub2video: false,
             hwaccel_id,
             hwaccel_device_type,
             hwaccel_device,
             hwaccel_output_format,
+            log_level_offset,
             src: None,
             dsts: vec![],
         }
