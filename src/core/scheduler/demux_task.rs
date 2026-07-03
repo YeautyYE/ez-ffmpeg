@@ -1053,6 +1053,14 @@ unsafe fn demux_send_for_stream(
         )
         .collect::<Vec<_>>();
 
+    // A stream nobody consumes is discarded, not finished: fftools never
+    // sends its packets at all (ffmpeg_demux.c ist->discard skip), so an
+    // empty destination list must not count as "all consumers done".
+    if send_dsts.is_empty() {
+        packet_pool.release(packet_box.packet);
+        return 0;
+    }
+
     let mut nb_done = 0;
 
     for (i, (dst_i, (packet_dst, _, output_stream_index))) in send_dsts.iter().enumerate() {

@@ -288,6 +288,7 @@ impl Muxer {
         media_type: AVMediaType,
         enc: *const AVCodec,
         src_node: Arc<SchNode>,
+        single_stream_direct_input: bool,
     ) -> crate::error::Result<(Sender<FrameBox>, usize)> {
         let (packet_sender, st, stream_index) = self.new_stream(src_node)?;
         let (frame_sender, frame_receiver) = crossbeam_channel::bounded(8);
@@ -300,6 +301,7 @@ impl Muxer {
                     self.framerate_max,
                     self.out_fmt_ctx,
                     self.copy_ts,
+                    single_stream_direct_input,
                 )
             })
         } else {
@@ -443,6 +445,7 @@ unsafe fn determine_vsync_method(
     framerate_max: Option<AVRational>,
     out_fmt_ctx: *mut AVFormatContext,
     copy_ts: bool,
+    single_stream_direct_input: bool,
 ) -> VSyncMethod {
     if vsync_method != VSyncMethod::VsyncAuto {
         return vsync_method;
@@ -475,7 +478,14 @@ unsafe fn determine_vsync_method(
         }
     };
 
-    // 4. If input stream exists and VSYNC_CFR is selected, check additional conditions
+    // 4. A stream fed directly by a single-stream input keeps its original
+    // grid (ffmpeg_mux_init.c:765-773; input_ts_offset is always 0 here
+    // since -itsoffset is not supported).
+    if vsync_method == VSyncMethod::VsyncCfr && single_stream_direct_input {
+        vsync_method = VSyncMethod::VsyncVscfr;
+    }
+
+    // 5. If input stream exists and VSYNC_CFR is selected, check additional conditions
     if vsync_method == VSyncMethod::VsyncCfr && copy_ts {
         vsync_method = VSyncMethod::VsyncVscfr;
     }
