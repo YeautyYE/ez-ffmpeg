@@ -1,0 +1,9 @@
+[package]
+name = "subtitle_burn_in"
+version = "0.1.0"
+edition = "2021"
+authors = ["Yeauty <YeautyYE@gmail.com>"]
+publish = false
+
+[dependencies]
+ez-ffmpeg = { path = "../..", features = ["subtitle"] }
