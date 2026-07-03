@@ -9,8 +9,9 @@ use std::ptr::{null, null_mut};
 pub(crate) struct Codec {
     inner: *const ffmpeg_sys_next::AVCodec,
 }
+// SAFETY: inner points at FFmpeg's static, immutable codec registry
+// (avcodec_find_*): valid for the process lifetime, never written.
 unsafe impl Send for Codec {}
-unsafe impl Sync for Codec {}
 
 impl Codec {
     pub(crate) fn null() -> Self {

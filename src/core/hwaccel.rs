@@ -85,8 +85,10 @@ pub(crate) struct HWDevice {
     pub(crate) device_ref: *mut AVBufferRef,
 }
 
+// SAFETY: device_ref is an owned AVBufferRef handed between threads as a
+// whole; clones share the same ref and every copy is released exactly once
+// through hw_device_free_all. Sync is intentionally NOT implemented.
 unsafe impl Send for HWDevice {}
-unsafe impl Sync for HWDevice {}
 
 pub(crate) unsafe fn hw_device_free_all() {
     // The filter device slot holds only a name; the device it refers to is

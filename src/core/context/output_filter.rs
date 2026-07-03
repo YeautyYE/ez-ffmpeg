@@ -79,8 +79,10 @@ pub(crate) struct OutputFilterOptions {
     pub(crate) ts_offset: Option<i64>,
     pub(crate) flags: u32,
 }
+// SAFETY: enc points at FFmpeg's static codec registry (read-only,
+// process lifetime); everything else is owned data. Sync is intentionally
+// NOT implemented.
 unsafe impl Send for OutputFilterOptions {}
-unsafe impl Sync for OutputFilterOptions {}
 
 impl OutputFilterOptions {
     pub(crate) fn new() -> Self {
