@@ -424,9 +424,10 @@ pub mod codec;
 ///
 /// # More Advanced Filters
 ///
-/// For a more complex, GPU-accelerated example, see the **OpenGL**-based filters in the
-/// [`opengl` module](crate::opengl). There, you can use custom GLSL shaders to apply
-/// sophisticated transformations or visual effects on video frames.
+/// For a more complex, GPU-accelerated example, see the wgpu-based filters in the
+/// `wgpu_filter` module (feature `"wgpu"`). There, you can use custom WGSL fragment
+/// shaders to apply sophisticated transformations or visual effects on video frames.
+/// (The former `opengl` module remains available but is deprecated.)
 ///
 /// # Trait Overview
 ///
