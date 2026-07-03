@@ -1,3 +1,9 @@
+//! Port of fftools `SchWaiter` (FFmpeg 7.x fftools/ffmpeg_sched.c): the
+//! choke/unchoke gate the scheduler uses to pace demuxers. Field names
+//! (`choked`, `choked_prev`, `choked_next`) and the wait/set pair mirror
+//! `waiter_wait`/`waiter_set`; the bounded `wait_timeout` loop is an ez
+//! addition so a worker that dies without notifying cannot strand a waiter.
+
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use ffmpeg_sys_next::av_gettime_relative;

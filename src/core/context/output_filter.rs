@@ -1,3 +1,8 @@
+//! Port of fftools `OutputFilter`/`OutputFilterOptions` (FFmpeg 7.x
+//! fftools/ffmpeg_filter.c): one output pad of a filtergraph plus the
+//! encoder-facing constraints (`OFILTER_FLAG_*`, allowed format lists)
+//! gathered by `ofilter_bind_ost`.
+
 use crate::core::context::output::VSyncMethod;
 use crate::core::context::FrameBox;
 use crossbeam_channel::Sender;

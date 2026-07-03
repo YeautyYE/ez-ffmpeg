@@ -85,7 +85,8 @@ pub(crate) unsafe extern "C" fn output_interrupt_cb(opaque: *mut c_void) -> libc
     state.should_interrupt_output() as libc::c_int
 }
 
-/// Gate for the muxer's deferred start (fftools mux_ready_lock semantics).
+/// Gate for the muxer's deferred start. fftools: `SchMux.mux_started` +
+/// `PreMuxQueue` under `Scheduler.mux_ready_lock` (ffmpeg_sched.c).
 ///
 /// Until the muxer thread is running, encoders park packets in a bounded
 /// pre-queue; at start the muxer drains that queue and flips `started`.
