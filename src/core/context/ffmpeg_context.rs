@@ -770,8 +770,17 @@ fn map_manual(
                         return Err(OpenOutputError::InvalidArgument.into());
                     }
                     Some((codec_id, enc)) => {
-                        return ofilter_bind_ost(index, mux, filter_graph, i, codec_id, enc, None)
-                            .map(|_| ());
+                        return ofilter_bind_ost(
+                            index,
+                            mux,
+                            filter_graph,
+                            i,
+                            codec_id,
+                            enc,
+                            None,
+                            false,
+                        )
+                        .map(|_| ());
                     }
                 }
             }
@@ -895,7 +904,7 @@ fn map_manual(
                 )?;
             } else {
                 let (frame_sender, output_stream_index) =
-                    mux.add_enc_stream(media_type, enc, demux_node)?;
+                    mux.add_enc_stream(media_type, enc, demux_node, false)?;
                 let input_stream = demux.get_stream_mut(stream_index);
                 input_stream.add_dst(frame_sender);
                 demux.connect_stream(stream_index);
@@ -1360,7 +1369,7 @@ unsafe fn map_auto_subtitle(
             let option = choose_encoder(mux, AVMEDIA_TYPE_SUBTITLE)?;
             if let Some((_codec_id, enc)) = option {
                 let (frame_sender, output_stream_index) =
-                    mux.add_enc_stream(AVMEDIA_TYPE_SUBTITLE, enc, demux.node.clone())?;
+                    mux.add_enc_stream(AVMEDIA_TYPE_SUBTITLE, enc, demux.node.clone(), false)?;
                 demux.get_stream_mut(stream_index).add_dst(frame_sender);
                 demux.connect_stream(stream_index);
                 mux.register_stream_source(output_stream_index, demux_idx, stream_index, true);
@@ -1567,7 +1576,7 @@ unsafe fn map_auto_stream(
             )?;
         } else {
             let (frame_sender, output_stream_index) =
-                mux.add_enc_stream(media_type, enc, demux.node.clone())?;
+                mux.add_enc_stream(media_type, enc, demux.node.clone(), false)?;
             demux.get_stream_mut(stream_index).add_dst(frame_sender);
             demux.connect_stream(stream_index);
             mux.register_stream_source(output_stream_index, input_file_idx, stream_index, true);
@@ -1719,6 +1728,9 @@ fn init_simple_filtergraph(
     // filter_graph.outputs[0].media_type = codec_type;
 
     ifilter_bind_ist(&mut filter_graph, 0, stream_index, demux)?;
+    // fftools ost->ist rule: fed directly by a single-stream input
+    // (ffmpeg_mux_init.c:765-773).
+    let single_stream_direct_input = demux.get_streams().len() == 1;
     ofilter_bind_ost(
         mux_index,
         mux,
@@ -1727,6 +1739,7 @@ fn init_simple_filtergraph(
         codec_id,
         enc,
         Some((input_file_idx, stream_index)),
+        single_stream_direct_input,
     )?;
 
     filter_graphs.push(filter_graph);
@@ -1917,7 +1930,7 @@ fn output_bind_by_unlabeled_filter(
                 }
                 Some((codec_id, enc)) => {
                     *auto_disable |= 1 << media_type as i32;
-                    ofilter_bind_ost(index, mux, filter_graph, i, codec_id, enc, None)?;
+                    ofilter_bind_ost(index, mux, filter_graph, i, codec_id, enc, None, false)?;
                 }
             }
         }
@@ -1934,10 +1947,15 @@ fn ofilter_bind_ost(
     codec_id: AVCodecID,
     enc: *const AVCodec,
     stream_source: Option<(usize, usize)>,
+    single_stream_direct_input: bool,
 ) -> Result<usize> {
     let output_filter = &mut filter_graph.outputs[output_filter_index];
-    let (frame_sender, output_stream_index) =
-        mux.add_enc_stream(output_filter.media_type, enc, filter_graph.node.clone())?;
+    let (frame_sender, output_stream_index) = mux.add_enc_stream(
+        output_filter.media_type,
+        enc,
+        filter_graph.node.clone(),
+        single_stream_direct_input,
+    )?;
     output_filter.set_dst(frame_sender);
 
     if let Some((file_idx, stream_idx)) = stream_source {
