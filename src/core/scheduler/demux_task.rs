@@ -233,6 +233,18 @@ pub(crate) fn demux_init(
                         continue;
                     }
 
+                    // Discarded and finished streams are dropped before
+                    // ts_fixup/readrate/send bookkeeping, like the loop-top
+                    // skip in fftools (ffmpeg_demux.c:751).
+                    {
+                        let ds = &demux_parameter.demux_streams
+                            [(*packet.as_ptr()).stream_index as usize];
+                        if ds.discard || ds.finished {
+                            packet_pool.release(packet);
+                            continue;
+                        }
+                    }
+
                     is_started = true;
                     ret = input_packet_process(
                         &mut demux_parameter,
@@ -796,6 +808,12 @@ struct DemuxStreamParameter {
     next_dts: i64,
     ///< dts of the last packet read for this stream (in AV_TIME_BASE units)
     dts: i64,
+
+    ///< no consumer is bound to this stream; its packets are dropped at the
+    ///< demux loop top (ffmpeg_demux.c:751, flipped on binding at :904-906)
+    discard: bool,
+    ///< all consumers of this stream saw EOF (ffmpeg_demux.c:523)
+    finished: bool,
 }
 
 // SAFETY: codec_desc points to static FFmpeg codec descriptor data
@@ -814,6 +832,8 @@ impl DemuxStreamParameter {
             first_dts: AV_NOPTS_VALUE,
             next_dts: AV_NOPTS_VALUE,
             dts: 0,
+            discard: true,
+            finished: false,
         }
     }
 }
@@ -864,6 +884,11 @@ struct DemuxerParameter {
     demux_streams: Vec<DemuxStreamParameter>,
 
     dsts: Vec<(Sender<PacketBox>, usize, Option<usize>)>,
+
+    /// Streams with at least one bound consumer (ffmpeg_demux.c:906).
+    nb_streams_used: usize,
+    /// Streams whose consumers have all finished (ffmpeg_demux.c:525).
+    nb_streams_finished: usize,
 }
 
 // SAFETY: all raw pointers live in DemuxStreamParameter (see its SAFETY
@@ -888,6 +913,18 @@ impl DemuxerParameter {
         for i in 0..nb_streams {
             let stream = demux.get_stream(i as usize);
             demux_streams.push(DemuxStreamParameter::new(stream))
+        }
+
+        // fftools flips ds->discard when a consumer binds to the stream and
+        // counts it as used (ffmpeg_demux.c:904-906 ist_use).
+        let mut nb_streams_used = 0;
+        for ds in &mut demux_streams {
+            ds.discard = !dsts
+                .iter()
+                .any(|(_, input_stream_index, _)| *input_stream_index == ds.stream_index);
+            if !ds.discard {
+                nb_streams_used += 1;
+            }
         }
 
 
@@ -917,6 +954,8 @@ impl DemuxerParameter {
             max_pts: Default::default(),
             demux_streams,
             dsts,
+            nb_streams_used,
+            nb_streams_finished: 0,
         }
     }
 }
@@ -1027,7 +1066,24 @@ unsafe fn demux_send(
         return demux_flush(packet_pool, &demux_parameter.dsts);
     }
 
-    demux_send_for_stream(demux_parameter, packet_box, packet_pool, flags)
+    let stream_index = (*packet_box.packet.as_ptr()).stream_index as usize;
+    let ret = demux_send_for_stream(demux_parameter, packet_box, packet_pool, flags);
+    if ret == AVERROR_EOF {
+        // One exhausted stream must not stop the demuxer while other streams
+        // still have consumers (ffmpeg_demux.c:511-530 do_send).
+        let ds = &mut demux_parameter.demux_streams[stream_index];
+        if !ds.finished {
+            debug!("All consumers of stream {stream_index} are done");
+            ds.finished = true;
+            demux_parameter.nb_streams_finished += 1;
+        }
+        if demux_parameter.nb_streams_finished == demux_parameter.nb_streams_used {
+            debug!("All consumers are done");
+            return AVERROR_EOF;
+        }
+        return 0;
+    }
+    ret
 }
 
 unsafe fn demux_send_for_stream(
@@ -1049,9 +1105,9 @@ unsafe fn demux_send_for_stream(
         )
         .collect::<Vec<_>>();
 
-    // A stream nobody consumes is discarded, not finished: fftools never
-    // sends its packets at all (ffmpeg_demux.c ist->discard skip), so an
-    // empty destination list must not count as "all consumers done".
+    // Discarded streams are already skipped at the demux loop top
+    // (ffmpeg_demux.c:751); this backstop keeps an empty destination list
+    // from counting as "all consumers done".
     if send_dsts.is_empty() {
         packet_pool.release(packet_box.packet);
         return 0;
