@@ -470,7 +470,7 @@ unsafe fn determine_vsync_method(
         return Ok(vsync_method);
     }
 
-    // 1. -r or -fpsmax both force CFR (ffmpeg_mux_init.c:755-757)
+    // 1. -r or -fpsmax both force CFR (ffmpeg_mux_init.c:807-808)
     let mut vsync_method = if framerate.is_some_and(|fr| fr.num != 0)
         || framerate_max.is_some_and(|fr| fr.num != 0)
     {
@@ -498,7 +498,7 @@ unsafe fn determine_vsync_method(
     };
 
     // 4. A stream fed directly by a single-stream input keeps its original
-    // grid (ffmpeg_mux_init.c:765-773; input_ts_offset is always 0 here
+    // grid (ffmpeg_mux_init.c:817-822; input_ts_offset is always 0 here
     // since -itsoffset is not supported).
     if vsync_method == VSyncMethod::VsyncCfr && single_stream_direct_input {
         vsync_method = VSyncMethod::VsyncVscfr;

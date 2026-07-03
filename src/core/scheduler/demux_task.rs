@@ -182,7 +182,7 @@ pub(crate) fn demux_init(
 
                         // AVERROR_EXIT is a normal stop (the scheduler asked
                         // us to quit mid-send), never a task failure
-                        // (matches ffmpeg_demux.c:842 EOF/EXIT handling).
+                        // (matches ffmpeg_demux.c:780-781 EOF/EXIT handling).
                         if ret != 0 && ret != ffmpeg_sys_next::AVERROR_EXIT {
                             set_scheduler_error(
                                 &scheduler_status,
@@ -488,7 +488,7 @@ unsafe fn ts_fixup(
     }
 
     // Apply timestamp scaling (after ts_offset, before duration)
-    // FFmpeg source: ffmpeg_demux.c:420-422 (FFmpeg 7.x)
+    // FFmpeg source: ffmpeg_demux.c:404-406 (FFmpeg 7.x)
     // Note: C's `int64_t *= double` truncates toward zero, Rust's `as i64` behaves the same.
     let ts_scale = demux_parameter.ts_scale;
     if ts_scale != 1.0 {
@@ -861,7 +861,7 @@ struct DemuxerParameter {
     /// Applied after ts_offset addition. Default is 1.0.
     ///
     /// FFmpeg CLI: `-itsscale <scale>`
-    /// FFmpeg source: `ffmpeg_demux.c:420-422` (FFmpeg 7.x)
+    /// FFmpeg source: `ffmpeg_demux.c:404-406` (FFmpeg 7.x)
     ts_scale: f64,
 
     /// Forced framerate for the input video stream.
@@ -987,7 +987,7 @@ unsafe fn seek_to_start(
 
     // A && (B || C): with the old (A && B) || C grouping an end_pts of
     // AV_NOPTS_VALUE could overwrite a valid max_pts via the C arm
-    // (matches ffmpeg_demux.c:211-214).
+    // (matches ffmpeg_demux.c:191-194).
     if demux_parameter.end_pts.ts != AV_NOPTS_VALUE
         && (demux_parameter.max_pts.ts == AV_NOPTS_VALUE
             || av_compare_ts(

@@ -541,7 +541,7 @@ unsafe fn fg_send_eof(
 
         let ifp = &ifps[input_filter_index];
         if ifp.format < 0 {
-            // Hard error, matching master ffmpeg_filter.c:3040: a stream
+            // Hard error, matching ffmpeg_filter.c:2746: a stream
             // that reached EOF without ever configuring its input leaves
             // the graph silent — fail loudly instead.
             error!(
@@ -865,7 +865,7 @@ unsafe fn configure_filtergraph(
         ofp.color_range = av_buffersink_get_color_range(ofp.filter);
 
         // Tentative value only: once frames chose a timebase it is locked
-        // and a graph reconfig must not drift it (ffmpeg_filter.c:2158).
+        // and a graph reconfig must not drift it (ffmpeg_filter.c:1973-1975).
         if !ofp.tb_out_locked {
             ofp.tb_out = av_buffersink_get_time_base(ofp.filter);
         }
@@ -1370,7 +1370,7 @@ unsafe fn fg_output_step(
 
     // Choose the output timebase the first time we get a frame, then lock
     // it: re-choosing after a reconfig would shift all downstream
-    // timestamps (ffmpeg_filter.c:2807 + choose_out_timebase:2441).
+    // timestamps (ffmpeg_filter.c:2527-2528; locked at :2190).
     if !ofp.tb_out_locked {
         choose_out_timebase(ofp, &frame);
         ofp.tb_out_locked = true;
@@ -1431,7 +1431,7 @@ unsafe fn choose_out_timebase(ofp: &mut OutputFilterParameter, frame: &Frame) {
 
             // Cap only when the rate exceeds the bound or is invalid:
             // `fr.den != 0` here was a mistranslation of fftools `!fr.den`
-            // and made the cap unconditional (ffmpeg_filter.c:2416-2419).
+            // and made the cap unconditional (ffmpeg_filter.c:2165-2168).
             if ofp.fpsconv_context.framerate_max.num != 0
                 && (av_q2d(fr) > av_q2d(ofp.fpsconv_context.framerate_max) || fr.den == 0)
             {
@@ -1745,7 +1745,7 @@ unsafe fn video_sync_process(
 
         // Same duplication cap as the live path below: the flush replays the
         // history median, which must not emit absurd counts either
-        // (ffmpeg_filter.c:2601-2610 shares one finish tail for both).
+        // (ffmpeg_filter.c:2340-2344 runs for flush and live alike).
         if *nb_frames > 3_240_000 {
             error!("{} frame duplication too large, skipping", *nb_frames - 1);
             *nb_frames = 0;
@@ -1789,7 +1789,7 @@ unsafe fn video_sync_process(
     match vsync_method {
         // VSCFR is CFR that keeps the first frame's original timestamp: its
         // prologue suppresses the initial padding, then FALLS THROUGH into
-        // the CFR drop/duplicate logic (ffmpeg_filter.c:2554-2570).
+        // the CFR drop/duplicate logic (ffmpeg_filter.c:2288-2295).
         VSyncMethod::VsyncVscfr | VSyncMethod::VsyncCfr => {
             if vsync_method == VSyncMethod::VsyncVscfr
                 && fps.frame_number == 0
@@ -1839,7 +1839,7 @@ unsafe fn video_sync_process(
 
     // dts_error_threshold (3600*30) * 30: duplication this large means
     // broken timestamps; skip the frame instead of emitting millions of
-    // duplicates (ffmpeg_filter.c:2601-2610, after the history update).
+    // duplicates (ffmpeg_filter.c:2340-2344, after the history update).
     if *nb_frames > 3_240_000 {
         error!("{} frame duplication too large, skipping", *nb_frames - 1);
         *nb_frames = 0;

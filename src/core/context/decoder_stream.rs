@@ -23,7 +23,7 @@ pub(crate) struct DecoderStream {
     pub(crate) avg_framerate: AVRational,
     /// Input::set_framerate forces a fixed framerate: the decoder stamps
     /// frames on the CFR grid instead of trusting container timestamps
-    /// (fftools DECODER_FLAG_FRAMERATE_FORCED, ffmpeg_demux.c:1002-1006).
+    /// (fftools DECODER_FLAG_FRAMERATE_FORCED, ffmpeg_demux.c:924-925).
     pub(crate) framerate_forced: bool,
     pub(crate) have_sub2video: bool,
 

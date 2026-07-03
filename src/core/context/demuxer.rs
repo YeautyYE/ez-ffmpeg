@@ -37,14 +37,14 @@ pub(crate) struct Demuxer {
     /// Default is true (enabled).
     ///
     /// FFmpeg CLI: `-autorotate 0/1`
-    /// FFmpeg source: `ffmpeg_demux.c:1319`, `ffmpeg_filter.c` (FFmpeg 7.x)
+    /// FFmpeg source: `ffmpeg_demux.c:1270`, `ffmpeg_filter.c:1744-1778` (FFmpeg 7.x)
     pub(crate) autorotate: bool,
 
     /// Timestamp scale factor for pts/dts values.
     /// Default is 1.0 (no scaling).
     ///
     /// FFmpeg CLI: `-itsscale <scale>`
-    /// FFmpeg source: `ffmpeg_demux.c:420-422` (FFmpeg 7.x)
+    /// FFmpeg source: `ffmpeg_demux.c:404-406` (FFmpeg 7.x)
     pub(crate) ts_scale: f64,
 
     /// Forced framerate for the input video stream.

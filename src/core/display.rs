@@ -1,5 +1,5 @@
 //! Display matrix helpers ported from libavutil/display.c and the fftools
-//! `get_rotation` normalization (cmdutils.c:1553-1568).
+//! `get_rotation` normalization (cmdutils.c:1475-1490).
 
 use ffmpeg_sys_next::AVPacketSideData;
 use ffmpeg_sys_next::AVPacketSideDataType::AV_PKT_DATA_DISPLAYMATRIX;
@@ -36,7 +36,7 @@ pub(crate) fn rotation_from_side_data(side_data: &[AVPacketSideData]) -> Option<
     Some(theta.round() as i32)
 }
 
-/// fftools get_rotation (cmdutils.c:1553-1568): negate the counterclockwise
+/// fftools get_rotation (cmdutils.c:1475-1490): negate the counterclockwise
 /// matrix angle and normalize into [0, 360) with a 0.9 degree tolerance.
 pub(crate) fn get_rotation(displaymatrix: &[i32; 9]) -> f64 {
     let mut theta = -round(display_rotation_get(displaymatrix));

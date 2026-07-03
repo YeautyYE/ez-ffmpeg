@@ -445,7 +445,7 @@ fn _mux_init(
         // Unblock any encoder still sending into the packet queue, then join
         // this muxer's encoders BEFORE the AVFormatContextBox drop frees the
         // output streams they write into (FFmpeg joins encoder tasks before
-        // muxer cleanup in sch_stop, ffmpeg_sched.c:2801-2877).
+        // muxer cleanup in sch_stop, ffmpeg_sched.c:2535-2604).
         drop(pkt_receiver);
         while let Ok(handle) = enc_handle_receiver.try_recv() {
             let _ = handle.join();

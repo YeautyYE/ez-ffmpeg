@@ -260,8 +260,8 @@ pub struct Input {
     /// ```
     ///
     /// ## FFmpeg source reference (FFmpeg 7.x)
-    /// - Default value: `ffmpeg_demux.c:1319` (`ds->autorotate = 1`)
-    /// - Flag setting: `ffmpeg_demux.c:1137` (`IFILTER_FLAG_AUTOROTATE`)
+    /// - Default value: `ffmpeg_demux.c:1270` (`ds->autorotate = 1`)
+    /// - Flag setting: `ffmpeg_demux.c:1088` (`IFILTER_FLAG_AUTOROTATE`)
     /// - Filter insertion: `ffmpeg_filter.c:1744-1778`
     pub(crate) autorotate: Option<bool>,
 
@@ -283,8 +283,8 @@ pub struct Input {
     /// ```
     ///
     /// ## FFmpeg source reference (FFmpeg 7.x)
-    /// - Default value: `ffmpeg_demux.c:1316` (`ds->ts_scale = 1.0`)
-    /// - Application: `ffmpeg_demux.c:420-422` (applied after ts_offset)
+    /// - Default value: `ffmpeg_demux.c:1267` (`ds->ts_scale = 1.0`)
+    /// - Application: `ffmpeg_demux.c:404-406` (applied after ts_offset)
     pub(crate) ts_scale: Option<f64>,
 
     /// Forced framerate for the input video stream.

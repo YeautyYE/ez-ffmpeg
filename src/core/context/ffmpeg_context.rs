@@ -393,7 +393,7 @@ fn check_output_streams(muxs: &Vec<Muxer>) -> Result<()> {
 
 /// Process metadata for output file
 ///
-/// Mirrors FFmpeg's `copy_meta()` flow (ffmpeg_mux_init.c:3050-3070):
+/// Mirrors FFmpeg's `copy_meta()` flow (ffmpeg_mux_init.c:2913-2983):
 /// 1. Metadata mappings (`copy_metadata`)
 /// 2. Chapter auto-copy (`copy_chapters`)
 /// 3. Default auto-copy (`copy_metadata_default`)
@@ -415,7 +415,7 @@ unsafe fn process_metadata(mux: &Muxer, demuxs: &Vec<Demuxer>) -> Result<()> {
     let mut metadata_chapters_manual = false;
 
     // Step 1: Process explicit metadata mappings from user (-map_metadata option)
-    // FFmpeg: ffmpeg_mux_init.c:3052-3058
+    // FFmpeg: ffmpeg_mux_init.c:2923-2937
     let mut mark_manual = |meta_type: &MetadataType| -> () {
         match meta_type {
             MetadataType::Global => metadata_global_manual = true,
@@ -468,7 +468,7 @@ unsafe fn process_metadata(mux: &Muxer, demuxs: &Vec<Demuxer>) -> Result<()> {
     }
 
     // Step 3: Apply FFmpeg's automatic metadata copying (if not disabled by user)
-    // FFmpeg: ffmpeg_mux_init.c:3064-3067
+    // FFmpeg: ffmpeg_mux_init.c:2962-2983
     let stream_input_mapping = mux.stream_input_mapping();
     let encoding_streams = mux.encoding_streams();
 
@@ -489,7 +489,7 @@ unsafe fn process_metadata(mux: &Muxer, demuxs: &Vec<Demuxer>) -> Result<()> {
     }
 
     // Step 4: Apply user-specified metadata values (-metadata option)
-    // FFmpeg: ffmpeg_mux_init.c:3060-3062 (invoked after copy_meta in original flow)
+    // FFmpeg: of_add_metadata runs right after copy_meta (ffmpeg_mux_init.c:3344,3356)
     if let Err(e) = of_add_metadata(
         mux.out_fmt_ctx,
         &mux.global_metadata,
@@ -1075,7 +1075,7 @@ fn configure_output_filter_opts(
             }
 
             // -fpsmax: only one of -r/-fpsmax may be set per stream
-            // (ffmpeg_mux_init.c:572-575).
+            // (ffmpeg_mux_init.c:618-621).
             if let Some(framerate_max) = mux.framerate_max {
                 if mux.framerate.is_some() {
                     error!("Only one of framerate and framerate_max can be set for an output");
@@ -1319,7 +1319,7 @@ unsafe fn map_auto_subtitle(
 
     // An explicit user codec (including "copy") must not be gated on the
     // container's default subtitle encoder being available
-    // (matches ffmpeg_mux_init.c:1698 `!avcodec_find_encoder(...) && !subtitle_codec_name`).
+    // (matches ffmpeg_mux_init.c:1660 `!avcodec_find_encoder(...) && !subtitle_codec_name`).
     let output_codec = avcodec_find_encoder((*oformat).subtitle_codec);
     if output_codec.is_null() && mux.subtitle_codec.is_none() {
         return Ok(());
@@ -1354,7 +1354,7 @@ unsafe fn map_auto_subtitle(
             }
 
             // A user-chosen codec short-circuits the text/bitmap check
-            // (matches ffmpeg_mux_init.c:1717 `subtitle_codec_name || ...`).
+            // (matches ffmpeg_mux_init.c:1679 `subtitle_codec_name || ...`).
             let compatible = mux.subtitle_codec.is_some()
                 || input_props & output_props != 0
                 // Map dvb teletext which has neither property to any output subtitle encoder
@@ -1729,7 +1729,7 @@ fn init_simple_filtergraph(
 
     ifilter_bind_ist(&mut filter_graph, 0, stream_index, demux)?;
     // fftools ost->ist rule: fed directly by a single-stream input
-    // (ffmpeg_mux_init.c:765-773).
+    // (ffmpeg_mux_init.c:817-822).
     let single_stream_direct_input = demux.get_streams().len() == 1;
     ofilter_bind_ost(
         mux_index,
@@ -1811,7 +1811,7 @@ fn streamcopy_init(
         (*(*output_stream).codecpar).codec_tag = codec_tag;
 
         // Match FFmpeg CLI: framerate only applies to video streams.
-        // In CLI, ist->framerate is only set for video (ffmpeg_demux.c:1428, case AVMEDIA_TYPE_VIDEO)
+        // In CLI, ist->framerate is only set for video (ffmpeg_demux.c:1429-1432, case AVMEDIA_TYPE_VIDEO)
         // and ost->frame_rate is only set in new_stream_video() (ffmpeg_mux_init.c:607).
         // Since ez-ffmpeg stores framerate per-file (not per-stream), we need an explicit guard
         // to prevent applying framerate to audio/subtitle streams in streamcopy mode.
