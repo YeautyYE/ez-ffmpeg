@@ -29,7 +29,7 @@ use std::hint::black_box;
 use std::time::Instant;
 
 /// A copy of one rendered overlay node that outlives the renderer.
-struct OwnedImage {
+pub(crate) struct OwnedImage {
     w: usize,
     h: usize,
     stride: usize,
@@ -40,7 +40,7 @@ struct OwnedImage {
 }
 
 impl OwnedImage {
-    fn as_view(&self) -> OverlayImage<'_> {
+    pub(crate) fn as_view(&self) -> OverlayImage<'_> {
         OverlayImage {
             w: self.w,
             h: self.h,
@@ -101,20 +101,20 @@ fn ass_1080(events: &str) -> String {
     )
 }
 
-fn dense_events() -> &'static str {
+pub(crate) fn dense_events() -> &'static str {
     "Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,The quick brown fox jumps over the lazy dog while 0123456789 encoders race across the finish line tonight.\n\
      Dialogue: 0,0:00:00.00,0:00:05.00,Top,,0,0,0,,SPEAKER ONE: This dense scenario exercises many simultaneous glyph runs.\n\
      Dialogue: 0,0:00:00.00,0:00:05.00,Side,,0,0,0,,1080p dense coverage\n\
      Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\an5}(crowd cheering loudly)\n"
 }
 
-fn sparse_events() -> &'static str {
+pub(crate) fn sparse_events() -> &'static str {
     "Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,Hello world.\n"
 }
 
 /// Renders `events` at t=1s on a 1920x1080 canvas and copies every visible
 /// node out of the renderer-owned list.
-fn capture(events: &str) -> Option<Vec<OwnedImage>> {
+pub(crate) fn capture(events: &str) -> Option<Vec<OwnedImage>> {
     let font = test_util::test_font()?;
     let script = super::ass::parse(&ass_1080(events)).expect("parse benchmark script");
     let mut fonts = FontStore::new(false);
@@ -185,7 +185,7 @@ fn stats(images: &[OwnedImage]) -> (usize, usize, usize, f64) {
 
 /// Times one full composite (all nodes onto the plane) and returns the best
 /// per-composite nanoseconds over three batches.
-fn measure(mut composite: impl FnMut()) -> f64 {
+pub(crate) fn measure(mut composite: impl FnMut()) -> f64 {
     composite(); // warmup / page-in
     let start = Instant::now();
     composite();
@@ -285,11 +285,14 @@ fn time_pooled_pair(
 
 /// Times the two-phase route used by `blend_images` for chroma pairs: pool
 /// each node's mask once, apply to both components from the sums.
+/// `force_scalar` times the scalar kernels; otherwise the shipping dispatch
+/// (AVX2 where available) runs.
 fn time_pooled_pair_two_phase(
     images: &[OwnedImage],
     preps: &[Prep],
     step: usize,
     sample: SampleFormat,
+    force_scalar: bool,
 ) -> f64 {
     let (plane_w, plane_h) = (FRAME_W / 2, FRAME_H / 2);
     let linesize = plane_w * step;
@@ -301,9 +304,13 @@ fn time_pooled_pair_two_phase(
             if prep.alpha == 0 {
                 continue;
             }
-            let Some(rect) =
-                blend::pool_sums_h2(FRAME_W, FRAME_H, &image.as_view(), 1, &mut scratch)
-            else {
+            let view = image.as_view();
+            let rect = if force_scalar {
+                lab::pool_sums_h2_scalar(FRAME_W, FRAME_H, &view, 1, &mut scratch)
+            } else {
+                blend::pool_sums_h2(FRAME_W, FRAME_H, &view, 1, &mut scratch)
+            };
+            let Some(rect) = rect else {
                 continue;
             };
             for (data, comp) in [(&mut u_plane, 1usize), (&mut v_plane, 2usize)] {
@@ -312,14 +319,25 @@ fn time_pooled_pair_two_phase(
                     linesize,
                     pixel_step: step,
                 };
-                blend::blend_pooled_from_sums(
-                    &mut plane,
-                    &scratch,
-                    rect,
-                    prep.src[comp],
-                    prep.alpha,
-                    sample,
-                );
+                if force_scalar {
+                    lab::blend_pooled_from_sums_scalar(
+                        &mut plane,
+                        &scratch,
+                        rect,
+                        prep.src[comp],
+                        prep.alpha,
+                        sample,
+                    );
+                } else {
+                    blend::blend_pooled_from_sums(
+                        &mut plane,
+                        &scratch,
+                        rect,
+                        prep.src[comp],
+                        prep.alpha,
+                        sample,
+                    );
+                }
             }
         }
         black_box(&mut u_plane);
@@ -349,12 +367,19 @@ fn print_pooled_table(
         shipping,
         reference / shipping
     );
-    let two_phase = time_pooled_pair_two_phase(images, preps, step, sample);
+    let two_phase = time_pooled_pair_two_phase(images, preps, step, sample, true);
     println!(
         "    {:<16} {:>12.0} ns/frame   {:>5.2}x",
         "TwoPhase",
         two_phase,
         reference / two_phase
+    );
+    let two_phase_simd = time_pooled_pair_two_phase(images, preps, step, sample, false);
+    println!(
+        "    {:<16} {:>12.0} ns/frame   {:>5.2}x",
+        "TwoPhaseSimd",
+        two_phase_simd,
+        reference / two_phase_simd
     );
 }
 
@@ -378,6 +403,125 @@ fn print_direct_table(
             ns,
             baseline / ns
         );
+    }
+}
+
+/// Parity gate on real rendered masks (not synthetic): the AVX2 direct
+/// kernels and the SIMD two-phase pooled route must be byte-identical to
+/// the scalar kernels on dense/sparse captured scenes and the solid worst
+/// case, at both sample widths. Not ignored — it runs on every test pass;
+/// without AVX2 the variants fall back to scalar and pass trivially.
+#[test]
+fn avx2_variants_match_scalar_on_captured_masks() {
+    let scenarios: Vec<(&str, Vec<OwnedImage>)> = {
+        let Some(dense) = capture(dense_events()) else {
+            eprintln!("skipping: no known test font present on this machine");
+            return;
+        };
+        let sparse = capture(sparse_events()).expect("font present per the check above");
+        vec![
+            ("dense", dense),
+            ("sparse", sparse),
+            ("solid", solid_images()),
+        ]
+    };
+
+    for (name, images) in &scenarios {
+        for (sample, step, scale_bits) in [
+            (SampleFormat::U8, 1usize, 8u32),
+            (SampleFormat::U16Le, 2, 10),
+        ] {
+            let preps = prepare(images, sample, scale_bits);
+
+            // Direct 1:1 kernels on a full-frame plane.
+            let linesize = FRAME_W * step;
+            let base: Vec<u8> = (0..linesize * FRAME_H).map(|i| (i * 131) as u8).collect();
+            let mut expected = base.clone();
+            let mut got = base;
+            for (data, kernel) in [
+                (&mut expected, DirectKernel::Shipping),
+                (&mut got, DirectKernel::Avx2),
+            ] {
+                for (image, prep) in images.iter().zip(&preps) {
+                    if prep.alpha == 0 {
+                        continue;
+                    }
+                    let mut plane = PlaneView {
+                        data: data.as_mut_slice(),
+                        linesize,
+                        pixel_step: step,
+                    };
+                    lab::blend_direct_variant(
+                        kernel,
+                        &mut plane,
+                        FRAME_W,
+                        FRAME_H,
+                        &image.as_view(),
+                        prep.src[0],
+                        prep.alpha,
+                        sample,
+                    );
+                }
+            }
+            assert_eq!(got, expected, "{name}: direct {sample:?}");
+
+            // Two-phase pooled chroma pair (4:2:0): scalar route vs the
+            // shipping dispatch.
+            let chroma_linesize = (FRAME_W / 2) * step;
+            let chroma_base = vec![0x80u8; chroma_linesize * (FRAME_H / 2)];
+            let mut planes = [
+                chroma_base.clone(), // scalar U
+                chroma_base.clone(), // scalar V
+                chroma_base.clone(), // simd U
+                chroma_base,         // simd V
+            ];
+            let (scalar_planes, simd_planes) = planes.split_at_mut(2);
+            let mut scratch: Vec<u16> = Vec::new();
+            for (targets, force_scalar) in [(scalar_planes, true), (simd_planes, false)] {
+                for (image, prep) in images.iter().zip(&preps) {
+                    if prep.alpha == 0 {
+                        continue;
+                    }
+                    let view = image.as_view();
+                    let rect = if force_scalar {
+                        lab::pool_sums_h2_scalar(FRAME_W, FRAME_H, &view, 1, &mut scratch)
+                    } else {
+                        blend::pool_sums_h2(FRAME_W, FRAME_H, &view, 1, &mut scratch)
+                    };
+                    let Some(rect) = rect else {
+                        continue;
+                    };
+                    for (data, comp) in targets.iter_mut().zip([1usize, 2]) {
+                        let mut plane = PlaneView {
+                            data: data.as_mut_slice(),
+                            linesize: chroma_linesize,
+                            pixel_step: step,
+                        };
+                        if force_scalar {
+                            lab::blend_pooled_from_sums_scalar(
+                                &mut plane,
+                                &scratch,
+                                rect,
+                                prep.src[comp],
+                                prep.alpha,
+                                sample,
+                            );
+                        } else {
+                            blend::blend_pooled_from_sums(
+                                &mut plane,
+                                &scratch,
+                                rect,
+                                prep.src[comp],
+                                prep.alpha,
+                                sample,
+                            );
+                        }
+                    }
+                }
+            }
+            assert_eq!(planes[0], planes[2], "{name}: pooled U {sample:?}");
+            assert_eq!(planes[1], planes[3], "{name}: pooled V {sample:?}");
+        }
     }
 }
 
