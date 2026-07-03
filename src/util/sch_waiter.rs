@@ -76,11 +76,19 @@ impl SchWaiter {
             0
         };
         let mut guard = self.lock.lock().unwrap();
-        // avoid spurious wakeup
+        // Bounded waits instead of a pure condvar sleep: a worker that
+        // fails publishes the terminal status via set_scheduler_error but
+        // has no handle to notify this waiter — a pure wait would sleep
+        // through the shutdown and deadlock the join. 100ms matches the
+        // polling cadence of every other worker loop.
         while self.choked.load(Ordering::Acquire)
             && !is_stopping(scheduler_status.load(Ordering::Acquire))
         {
-            guard = self.cond.wait(guard).unwrap();
+            let (g, _timeout) = self
+                .cond
+                .wait_timeout(guard, std::time::Duration::from_millis(100))
+                .unwrap();
+            guard = g;
         }
 
         if cal_wait_time {
