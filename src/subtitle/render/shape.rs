@@ -50,7 +50,6 @@ pub(crate) fn bidi_runs(text: &str) -> Vec<(std::ops::Range<usize>, bool)> {
 /// Shapes one run with rustybuzz (complex path: ligatures, marks, script
 /// shaping — the equivalent of libass's HarfBuzz shaper).
 pub(crate) fn shape_complex(face: &LoadedFace, text: &str, rtl: bool) -> Vec<ShapedGlyph> {
-    let shaper_face = rustybuzz::Face::from_face(face.face().clone());
     let mut buffer = rustybuzz::UnicodeBuffer::new();
     buffer.push_str(text);
     buffer.set_direction(if rtl {
@@ -58,7 +57,7 @@ pub(crate) fn shape_complex(face: &LoadedFace, text: &str, rtl: bool) -> Vec<Sha
     } else {
         rustybuzz::Direction::LeftToRight
     });
-    let output = rustybuzz::shape(&shaper_face, &[], buffer);
+    let output = rustybuzz::shape(face.shaper(), &[], buffer);
     output
         .glyph_infos()
         .iter()

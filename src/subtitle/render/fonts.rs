@@ -20,13 +20,15 @@ pub(crate) struct FaceRef {
 /// A parsed face bundled with the shared bytes that back it.
 ///
 /// Self-referential by construction: `data` keeps the bytes alive for
-/// exactly as long as the parsed `ttf_parser::Face` that borrows them.
-/// Only `face()` hands out the borrow, tied to `&self`.
+/// exactly as long as the parsed face that borrows them. The face is
+/// stored in its rustybuzz form (which derefs to `ttf_parser::Face`) so
+/// the OpenType shaping tables are parsed once per face, not once per
+/// shaped text run.
 pub(crate) struct LoadedFace {
     _data: Arc<Vec<u8>>,
     // SAFETY invariant: `face` borrows from `_data`'s heap allocation,
     // which is stable (Arc) and dropped after `face` (field order).
-    face: ttf_parser::Face<'static>,
+    face: rustybuzz::Face<'static>,
 }
 
 impl LoadedFace {
@@ -37,10 +39,17 @@ impl LoadedFace {
         // only exposed re-borrowed to the struct's own lifetime.
         let bytes: &'static [u8] = unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
         let face = ttf_parser::Face::parse(bytes, face_ref.index).ok()?;
-        Some(Self { _data: data, face })
+        Some(Self {
+            _data: data,
+            face: rustybuzz::Face::from_face(face),
+        })
     }
 
     pub(crate) fn face(&self) -> &ttf_parser::Face<'_> {
+        &self.face
+    }
+
+    pub(crate) fn shaper(&self) -> &rustybuzz::Face<'_> {
         &self.face
     }
 }

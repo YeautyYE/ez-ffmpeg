@@ -164,6 +164,31 @@ impl State {
     }
 }
 
+/// Features the renderer does not implement yet. Collected per event as a
+/// bitmask so the renderer can warn exactly once per feature (silent
+/// degradation would hide fidelity gaps from users).
+pub(crate) mod unsupported {
+    pub(crate) const ROTATION: u32 = 1 << 0;
+    pub(crate) const SHEAR: u32 = 1 << 1;
+    pub(crate) const ANIMATION: u32 = 1 << 2;
+    pub(crate) const KARAOKE: u32 = 1 << 3;
+    pub(crate) const VECTOR_CLIP: u32 = 1 << 4;
+    pub(crate) const SCROLL_EFFECT: u32 = 1 << 5;
+
+    /// One human-readable line per flag, for the once-per-feature warning.
+    pub(crate) fn describe(flag: u32) -> &'static str {
+        match flag {
+            ROTATION => "\\frx/\\fry/\\frz rotation (and style Angle) is not applied yet; text renders unrotated",
+            SHEAR => "\\fax/\\fay shear is not applied yet; text renders unsheared",
+            ANIMATION => "\\t animation is not applied yet; events render in their initial state",
+            KARAOKE => "\\k/\\kf/\\ko karaoke sweep is not applied yet; text renders fully filled",
+            VECTOR_CLIP => "vector \\clip/\\iclip is not applied yet; only rectangular clips work",
+            SCROLL_EFFECT => "Banner/Scroll transition effects are not applied yet; the event renders statically",
+            _ => "unknown unsupported feature",
+        }
+    }
+}
+
 /// Raw `\fad`/`\fade` parameters awaiting the event-duration fixup.
 #[derive(Debug, Clone, Copy)]
 struct FadeSpec {
@@ -195,6 +220,8 @@ struct EventOverrides {
     alignment: Option<i32>,
     clip: Option<(i32, i32, i32, i32, bool)>,
     uses_time: bool,
+    /// `unsupported::*` flags seen while parsing this event's tags.
+    unsupported: u32,
 }
 
 /// One shaped-and-styled piece of one display line.
@@ -211,7 +238,7 @@ struct Segment {
 
 enum SegmentKind {
     Text {
-        face: super::fonts::FaceRef,
+        face: std::sync::Arc<LoadedFace>,
         glyphs: Vec<super::shape::ShapedGlyph>,
         /// Font-units -> pixel scales for this segment.
         x_scale: f32,
@@ -229,18 +256,35 @@ enum SegmentKind {
     },
 }
 
+/// What one event rendered to, plus rendering metadata for the caller.
+pub(crate) struct EventRender {
+    pub nodes: Vec<RenderedNode>,
+    /// The output depends on `now_ms` (disables the static-frame cache).
+    pub uses_time: bool,
+    /// `unsupported::*` features this event asked for.
+    pub unsupported: u32,
+}
+
 /// Renders one event at `now_ms` into positioned nodes.
-/// Returns the nodes plus whether the event's output depends on time.
 pub(crate) fn render_event(
     ctx: &FrameContext<'_>,
     event: &Event,
     now_ms: i64,
     face_cache: &mut HashMap<(String, u16, bool), Option<std::sync::Arc<LoadedFace>>>,
-) -> (Vec<RenderedNode>, bool) {
+) -> EventRender {
     let script = ctx.script;
     let base_wrap = script.wrap_style;
     let mut state = State::from_style(script, event.style, base_wrap);
     let mut overrides = EventOverrides::default();
+    if script.styles[event.style.min(script.styles.len() - 1)].angle != 0.0 {
+        overrides.unsupported |= unsupported::ROTATION;
+    }
+    if event.effect.starts_with("Banner;")
+        || event.effect.starts_with("Scroll up;")
+        || event.effect.starts_with("Scroll down;")
+    {
+        overrides.unsupported |= unsupported::SCROLL_EFFECT;
+    }
 
     // ---- pass 1: chunk the text, applying tags ----
     let mut segments: Vec<Segment> = Vec::new();
@@ -332,7 +376,11 @@ pub(crate) fn render_event(
     push_text(&mut pending_text, &state, &mut segments, face_cache);
 
     if segments.is_empty() {
-        return (Vec::new(), overrides.uses_time);
+        return EventRender {
+            nodes: Vec::new(),
+            uses_time: overrides.uses_time,
+            unsupported: overrides.unsupported,
+        };
     }
 
     // ---- pass 2: wrap into lines ----
@@ -494,7 +542,11 @@ pub(crate) fn render_event(
     }
 
     nodes.retain(|node| !node.bitmap.is_empty() && (node.color & 0xFF) != 0xFF);
-    (nodes, overrides.uses_time)
+    EventRender {
+        nodes,
+        uses_time: overrides.uses_time,
+        unsupported: overrides.unsupported,
+    }
 }
 
 /// Non-zero event margins override the style margins (libass `halign` use).
@@ -685,8 +737,11 @@ fn apply_tags(
                     overrides.uses_time = true;
                 }
             }
-            Tag::Org { .. } => {} // rotation origin: rotation not applied in M1
-            Tag::Transform => overrides.uses_time = true,
+            Tag::Org { .. } => {} // only meaningful with rotation; covered by ROTATION
+            Tag::Transform => {
+                overrides.uses_time = true;
+                overrides.unsupported |= unsupported::ANIMATION;
+            }
             Tag::ClipRect {
                 inverse,
                 x0,
@@ -696,7 +751,7 @@ fn apply_tags(
             } => {
                 overrides.clip = Some((x0, y0, x1, y1, inverse));
             }
-            Tag::ClipVector { .. } => {} // vector clips ignored in M1
+            Tag::ClipVector { .. } => overrides.unsupported |= unsupported::VECTOR_CLIP,
             Tag::Reset(style_name) => {
                 let index = match style_name {
                     Some(name) => lookup_style_strict(script, name).unwrap_or(state.style_index),
@@ -710,9 +765,21 @@ fn apply_tags(
             }
             Tag::DrawScale(v) => state.drawing_scale = v,
             Tag::DrawBaselineOffset(v) => state.pbo = v,
-            Tag::RotX(_) | Tag::RotY(_) | Tag::RotZ(_) | Tag::ShearX(_) | Tag::ShearY(_) => {}
-            Tag::Karaoke => {}
-            Tag::FontEncoding(_) => {}
+            Tag::RotX(v) | Tag::RotY(v) | Tag::RotZ(v) => {
+                // A bare reset (or explicit 0) with a zero style angle is a
+                // true no-op; anything else would rotate.
+                let effective = v.unwrap_or(style(state).angle);
+                if effective != 0.0 {
+                    overrides.unsupported |= unsupported::ROTATION;
+                }
+            }
+            Tag::ShearX(v) | Tag::ShearY(v) => {
+                if v.unwrap_or(0.0) != 0.0 {
+                    overrides.unsupported |= unsupported::SHEAR;
+                }
+            }
+            Tag::Karaoke => overrides.unsupported |= unsupported::KARAOKE,
+            Tag::FontEncoding(_) => {} // font-matching hint; harmless to ignore
         }
     }
 }
@@ -793,10 +860,6 @@ fn build_text_segments(
         );
         return;
     };
-    let face_ref = match ctx.fonts.select(&state.family, request) {
-        Some(face_ref) => face_ref,
-        None => return,
-    };
 
     // Pixel scales: REAL_DIM sizing — the requested size is the full
     // ascender-to-descender height (ass_face_set_size).
@@ -830,7 +893,7 @@ fn build_text_segments(
         segments.push(Segment {
             state: state.clone(),
             kind: SegmentKind::Text {
-                face: face_ref.clone(),
+                face: std::sync::Arc::clone(&face),
                 glyphs,
                 x_scale,
                 y_scale,
@@ -1064,15 +1127,12 @@ fn rasterize_segment(
     let state = &segment.state;
     let commands = match &segment.kind {
         SegmentKind::Text {
-            face,
+            face: loaded,
             glyphs,
             x_scale,
             y_scale,
             letter_spacing,
         } => {
-            let Some(loaded) = ctx.fonts.load(face) else {
-                return;
-            };
             let mut all = Vec::new();
             let mut pen_x = x;
             for glyph in glyphs {
