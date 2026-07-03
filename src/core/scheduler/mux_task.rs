@@ -16,7 +16,7 @@ use log::{debug, error, info, trace, warn};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -43,7 +43,8 @@ pub(crate) fn mux_init(
         mux.stream_count(),
         mux.format_opts.clone(),
         mux.take_src_pre_recvs(),
-        mux.get_is_started(),
+        mux.mux_start_gate(),
+        mux.enc_handle_receiver(),
         packet_pool,
         input_controller,
         mux_stream_nodes,
@@ -71,7 +72,8 @@ pub(crate) fn ready_to_init_mux(
         let is_set_write_callback = mux.is_set_write_callback;
         let queue = mux.take_queue();
         let src_pre_recvs = mux.take_src_pre_recvs();
-        let is_started = mux.get_is_started();
+        let mux_start_gate = mux.mux_start_gate();
+        let enc_handle_receiver = mux.enc_handle_receiver();
         let start_time_us = mux.start_time_us;
         let recording_time_us = mux.recording_time_us;
         let stream_count = mux.stream_count();
@@ -87,17 +89,21 @@ pub(crate) fn ready_to_init_mux(
                 let result = receiver.recv_timeout(Duration::from_millis(100));
 
                 if is_stopping(wait_until_not_paused(&scheduler_status)) {
-                    thread_sync.thread_done();
+                    thread_sync.thread_done_with(|| {
+                        scheduler_status.store(STATUS_END, Ordering::Release);
+                    });
                     info!("Init muxer receiver end command, finishing.");
                     break;
                 }
 
                 if let Err(e) = result {
                     if e == RecvTimeoutError::Disconnected {
-                        thread_sync.thread_done();
-                        if thread_sync.is_all_threads_done() {
+                        // Publish the terminal state BEFORE waking waiters
+                        // (a woken wait() must observe it; the async waker
+                        // is consumed by the wake).
+                        thread_sync.thread_done_with(|| {
                             scheduler_status.store(STATUS_END, Ordering::Release);
-                        }
+                        });
                         warn!(
                             "mux init aborted: encoder(s) exited before all {stream_count} streams became ready ({} ready)",
                             nb_streams_ready.load(Ordering::Acquire)
@@ -123,7 +129,8 @@ pub(crate) fn ready_to_init_mux(
                         stream_count,
                         format_opts,
                         src_pre_recvs,
-                        is_started,
+                        mux_start_gate,
+                        enc_handle_receiver,
                         packet_pool,
                         input_controller,
                         mux_stream_nodes,
@@ -158,7 +165,8 @@ fn mux_task_start(mux_idx: usize,
                   stream_count: usize,
                   format_opts: Option<HashMap<CString, CString>>,
                   src_pre_receivers: Vec<Receiver<PacketBox>>,
-                  is_started: Arc<AtomicBool>,
+                  mux_start_gate: Arc<crate::core::context::MuxStartGate>,
+                  enc_handle_receiver: Receiver<std::thread::JoinHandle<()>>,
                   packet_pool: ObjPool<Packet>,
                   input_controller: Arc<InputController>,
                   mux_stream_nodes: Vec<Arc<SchNode>>,
@@ -172,18 +180,17 @@ fn mux_task_start(mux_idx: usize,
 
     let (queue_sender, queue_receiver) = queue.unwrap();
 
-    _mux_init(mux_idx, out_fmt_ctx, is_set_write_callback, queue_receiver, start_time_us, recording_time_us, stream_count, format_opts, packet_pool,input_controller, mux_stream_nodes, scheduler_status, thread_sync, scheduler_result)?;
+    _mux_init(mux_idx, out_fmt_ctx, is_set_write_callback, queue_receiver, start_time_us, recording_time_us, stream_count, format_opts, enc_handle_receiver, packet_pool, input_controller, mux_stream_nodes, scheduler_status, thread_sync, scheduler_result)?;
 
-    for src_pre_receiver in src_pre_receivers {
-        {
-            let src_pre_receiver = src_pre_receiver;
+    // Drain the pre-queues and open the gate atomically: an encoder that
+    // saw the gate closed cannot park a packet after this drain ran.
+    mux_start_gate.start_with(|| {
+        for src_pre_receiver in &src_pre_receivers {
             while let Ok(packet_box) = src_pre_receiver.try_recv() {
                 let _ = queue_sender.send(packet_box);
             }
         }
-    }
-
-    is_started.store(true, Ordering::Release);
+    });
     Ok(())
 }
 
@@ -196,6 +203,7 @@ fn _mux_init(
     recording_time_us: Option<i64>,
     stream_count: usize,
     format_opts: Option<HashMap<CString, CString>>,
+    enc_handle_receiver: Receiver<std::thread::JoinHandle<()>>,
     packet_pool: ObjPool<Packet>,
     input_controller: Arc<InputController>,
     mux_stream_nodes: Vec<Arc<SchNode>>,
@@ -219,7 +227,9 @@ fn _mux_init(
             &scheduler_result,
             Muxing(MuxingOperationError::WriteHeader(WriteHeaderError::from(ret))),
         );
-        thread_sync.thread_done();
+        thread_sync.thread_done_with(|| {
+            scheduler_status.store(STATUS_END, Ordering::Release);
+        });
         return Err(Muxing(MuxingOperationError::WriteHeader(
             WriteHeaderError::from(ret),
         )));
@@ -425,11 +435,21 @@ fn _mux_init(
         }
 
         debug!("Muxer finished.");
-        thread_sync.thread_done();
 
-        if thread_sync.is_all_threads_done() {
-            scheduler_status.store(STATUS_END, Ordering::Release);
+        // Unblock any encoder still sending into the packet queue, then join
+        // this muxer's encoders BEFORE the AVFormatContextBox drop frees the
+        // output streams they write into (FFmpeg joins encoder tasks before
+        // muxer cleanup in sch_stop, ffmpeg_sched.c:2801-2877).
+        drop(pkt_receiver);
+        while let Ok(handle) = enc_handle_receiver.try_recv() {
+            let _ = handle.join();
         }
+
+        // Publish the terminal state BEFORE waking waiters (a woken wait()
+        // must observe it; the async waker is consumed by the wake).
+        thread_sync.thread_done_with(|| {
+            scheduler_status.store(STATUS_END, Ordering::Release);
+        });
     });
     if let Err(e) = result {
         error!("Muxer thread exited with error: {e}");
@@ -542,9 +562,13 @@ unsafe fn mux_fixup_ts(
     let stream_index = packet_data.output_stream_index;
 
     if packet_data.codec_type == AVMEDIA_TYPE_AUDIO && packet_data.is_copy {
-        let mut duration = av_get_audio_frame_duration2(packet_data.codecpar, (*pkt).size);
+        // Read the muxer's own output stream parameters (ost->st->codecpar
+        // in ffmpeg_mux.c): the packet must not carry a pointer into another
+        // thread's context.
+        let codecpar = (**(*out_fmt_ctx).streams.add(stream_index as usize)).codecpar;
+        let mut duration = av_get_audio_frame_duration2(codecpar, (*pkt).size);
         if duration == 0 {
-            duration = (*packet_data.codecpar).frame_size;
+            duration = (*codecpar).frame_size;
         }
 
         st_rescale_delta_last_map.entry(stream_index).or_insert(0);
@@ -555,7 +579,7 @@ unsafe fn mux_fixup_ts(
             (*pkt).dts,
             AVRational {
                 num: 1,
-                den: (*packet_data.codecpar).sample_rate,
+                den: (*codecpar).sample_rate,
             },
             duration,
             ts_rescale_delta_last,

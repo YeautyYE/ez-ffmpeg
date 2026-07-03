@@ -4,13 +4,151 @@ use ffmpeg_sys_next::AVMediaType::{
     AVMEDIA_TYPE_VIDEO,
 };
 use ffmpeg_sys_next::{
-    av_freep, avcodec_free_context, avformat_close_input, avformat_free_context, avio_closep,
-    avio_context_free, AVCodecContext, AVCodecParameters, AVFormatContext, AVIOContext,
-    AVMediaType, AVRational, AVStream, AVFMT_NOFILE,
+    av_freep, av_gettime_relative, avcodec_free_context, avformat_close_input,
+    avformat_free_context, avio_closep, avio_context_free, AVCodecContext, AVFormatContext,
+    AVIOContext, AVMediaType, AVRational, AVStream, AVFMT_NOFILE,
 };
 use std::ffi::c_void;
 use std::ptr::null_mut;
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
+
+/// How long output I/O may continue after STATUS_END before the interrupt
+/// callback cuts it: long enough for a healthy muxer to finish its trailer,
+/// short enough that stop() on a dead network peer returns within a second.
+const OUTPUT_END_GRACE_US: i64 = 500_000;
+
+/// Shared state behind the AVIO interrupt callbacks (fftools installs
+/// decode_interrupt_cb on inputs and outputs, ffmpeg_mux_init.c:3326,3371).
+///
+/// Inputs are interrupted as soon as the scheduler is stopping: nothing
+/// meaningful is read after that. Outputs distinguish the terminal states:
+/// STATUS_ABORT cuts I/O immediately (the caller gave up on the files), while
+/// STATUS_END grants a grace window so trailers still get written — only an
+/// output that stays blocked past the window (dead network peer) is cut.
+pub(crate) struct InterruptState {
+    scheduler_status: Arc<AtomicUsize>,
+    // Microsecond timestamp of the first output callback that observed
+    // STATUS_END; 0 = not observed yet.
+    end_grace_start_us: AtomicI64,
+}
+
+impl InterruptState {
+    pub(crate) fn new(scheduler_status: Arc<AtomicUsize>) -> Self {
+        Self {
+            scheduler_status,
+            end_grace_start_us: AtomicI64::new(0),
+        }
+    }
+
+    fn should_interrupt_input(&self) -> bool {
+        crate::core::scheduler::ffmpeg_scheduler::is_stopping(
+            self.scheduler_status.load(Ordering::Acquire),
+        )
+    }
+
+    fn should_interrupt_output(&self) -> bool {
+        let status = self.scheduler_status.load(Ordering::Acquire);
+        if status == crate::core::scheduler::ffmpeg_scheduler::STATUS_ABORT {
+            return true;
+        }
+        if status != crate::core::scheduler::ffmpeg_scheduler::STATUS_END {
+            return false;
+        }
+        let now = unsafe { av_gettime_relative() };
+        let start = match self.end_grace_start_us.compare_exchange(
+            0,
+            now,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => now,
+            Err(previous) => previous,
+        };
+        now - start > OUTPUT_END_GRACE_US
+    }
+}
+
+/// # Safety
+/// `opaque` must point to an `InterruptState` that outlives every
+/// AVFormatContext carrying this callback (the owning FfmpegContext holds the
+/// Arc and outlives all worker threads).
+pub(crate) unsafe extern "C" fn input_interrupt_cb(opaque: *mut c_void) -> libc::c_int {
+    let state = &*(opaque as *const InterruptState);
+    state.should_interrupt_input() as libc::c_int
+}
+
+/// # Safety
+/// Same contract as [`input_interrupt_cb`].
+pub(crate) unsafe extern "C" fn output_interrupt_cb(opaque: *mut c_void) -> libc::c_int {
+    let state = &*(opaque as *const InterruptState);
+    state.should_interrupt_output() as libc::c_int
+}
+
+/// Gate for the muxer's deferred start (fftools mux_ready_lock semantics).
+///
+/// Until the muxer thread is running, encoders park packets in a bounded
+/// pre-queue; at start the muxer drains that queue and flips `started`.
+/// Without a lock the flip races the send: an encoder that read
+/// `started == false` can enqueue into the pre-queue AFTER the drain
+/// finished, and that packet is never delivered. Pre-queue sends therefore
+/// happen under the same lock as the drain-and-flip.
+pub(crate) struct MuxStartGate {
+    started: std::sync::atomic::AtomicBool,
+    lock: std::sync::Mutex<()>,
+}
+
+/// What a gated pre-queue send resolved to.
+pub(crate) enum PreSendOutcome {
+    /// Parked in the pre-queue; the drain will deliver it.
+    Sent,
+    /// The gate opened first: send to the live queue instead.
+    Started(PacketBox),
+    /// Pre-queue full: back off and retry (the lock must not be held across
+    /// a blocking send, or the drain could never run).
+    Full(PacketBox),
+    /// Pre-queue receiver is gone (muxer never started).
+    Disconnected(PacketBox),
+}
+
+impl MuxStartGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            started: std::sync::atomic::AtomicBool::new(false),
+            lock: std::sync::Mutex::new(()),
+        }
+    }
+
+    pub(crate) fn is_started(&self) -> bool {
+        self.started.load(Ordering::Acquire)
+    }
+
+    /// Runs the pre-queue drain and opens the gate as one atomic step.
+    pub(crate) fn start_with(&self, drain: impl FnOnce()) {
+        let _guard = self.lock.lock().unwrap();
+        drain();
+        self.started.store(true, Ordering::Release);
+    }
+
+    /// Attempts a pre-queue send while the gate is verifiably closed.
+    pub(crate) fn send_pre(
+        &self,
+        pre_sender: &crossbeam_channel::Sender<PacketBox>,
+        packet_box: PacketBox,
+    ) -> PreSendOutcome {
+        let _guard = self.lock.lock().unwrap();
+        if self.started.load(Ordering::Acquire) {
+            return PreSendOutcome::Started(packet_box);
+        }
+        match pre_sender.try_send(packet_box) {
+            Ok(()) => PreSendOutcome::Sent,
+            Err(crossbeam_channel::TrySendError::Full(pb)) => PreSendOutcome::Full(pb),
+            Err(crossbeam_channel::TrySendError::Disconnected(pb)) => {
+                PreSendOutcome::Disconnected(pb)
+            }
+        }
+    }
+}
 
 use ffmpeg_context::{InputOpaque, OutputOpaque};
 
@@ -306,15 +444,11 @@ pub(crate) struct PacketData {
     pub(crate) codec_type: AVMediaType,
     pub(crate) output_stream_index: i32,
     pub(crate) is_copy: bool,
-    pub(crate) codecpar: *mut AVCodecParameters,
 }
 
-// SAFETY: PacketData can be sent to another thread. The codecpar pointer references
-// data owned by the parent stream/context and is only read, not mutated.
-unsafe impl Send for PacketData {}
-// SAFETY: PacketData is Sync because the codecpar pointer is only used for reading
-// codec parameters, and concurrent reads are safe.
-unsafe impl Sync for PacketData {}
+// Send + Sync are auto-derived: every field is plain owned data. The muxer
+// reads codec parameters from its own output streams instead of carrying a
+// cross-thread pointer here.
 
 pub(crate) struct AVFormatContextBox {
     pub(crate) fmt_ctx: *mut AVFormatContext,

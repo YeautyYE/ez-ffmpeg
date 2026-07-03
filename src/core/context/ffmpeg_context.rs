@@ -58,7 +58,7 @@ use ffmpeg_sys_next::{
     avfilter_pad_get_name, avfilter_pad_get_type, avformat_alloc_context,
     avformat_alloc_output_context2, avformat_close_input, avformat_find_stream_info,
     avformat_flush, avformat_free_context, avformat_open_input, avio_alloc_context,
-    avio_context_free, avio_open, AVCodec, AVCodecID, AVColorRange, AVColorSpace, AVFilterContext,
+    avio_context_free, avio_open2, AVCodec, AVCodecID, AVColorRange, AVColorSpace, AVFilterContext,
     AVFilterInOut, AVFilterPad, AVFormatContext, AVMediaType, AVOutputFormat, AVPixelFormat,
     AVRational, AVSampleFormat, AVStream, AVERROR_ENCODER_NOT_FOUND, AVFMT_FLAG_CUSTOM_IO,
     AVFMT_GLOBALHEADER, AVFMT_NOBINSEARCH, AVFMT_NOFILE, AVFMT_NOGENSEARCH, AVFMT_NOSTREAMS,
@@ -82,6 +82,10 @@ pub struct FfmpegContext {
     pub(crate) demuxs: Vec<Demuxer>,
     pub(crate) filter_graphs: Vec<FilterGraph>,
     pub(crate) muxs: Vec<Muxer>,
+    // Created at build time so the AVIO interrupt callbacks installed on the
+    // input/output contexts observe the same atomic the scheduler drives.
+    pub(crate) scheduler_status: Arc<std::sync::atomic::AtomicUsize>,
+    pub(crate) interrupt_state: Arc<crate::core::context::InterruptState>,
 }
 
 // SAFETY: FfmpegContext can be sent to another thread because all its fields
@@ -158,7 +162,17 @@ impl FfmpegContext {
 
         crate::core::initialize_ffmpeg();
 
-        let mut demuxs = open_input_files(&mut inputs, copy_ts)?;
+        // The status atomic exists before any context is opened so every
+        // input/output AVFormatContext can carry an interrupt callback bound
+        // to it (fftools installs decode_interrupt_cb the same way).
+        let scheduler_status = Arc::new(std::sync::atomic::AtomicUsize::new(
+            crate::core::scheduler::ffmpeg_scheduler::STATUS_INIT,
+        ));
+        let interrupt_state = Arc::new(crate::core::context::InterruptState::new(
+            scheduler_status.clone(),
+        ));
+
+        let mut demuxs = open_input_files(&mut inputs, copy_ts, &interrupt_state)?;
 
         if demuxs.len() <= 1 {
             independent_readrate = false;
@@ -172,7 +186,7 @@ impl FfmpegContext {
             Vec::new()
         };
 
-        let mut muxs = open_output_files(&mut outputs, copy_ts)?;
+        let mut muxs = open_output_files(&mut outputs, copy_ts, &interrupt_state)?;
 
         outputs_bind(&mut muxs, &mut filter_graphs, &mut demuxs)?;
 
@@ -212,6 +226,8 @@ impl FfmpegContext {
             demuxs,
             filter_graphs,
             muxs,
+            scheduler_status,
+            interrupt_state,
         })
     }
 }
@@ -2018,12 +2034,16 @@ fn check_duplicate_inputs_outputs(inputs: &[Input], outputs: &[Output]) -> Resul
     Ok(())
 }
 
-fn open_output_files(outputs: &mut Vec<Output>, copy_ts: bool) -> Result<Vec<Muxer>> {
+fn open_output_files(
+    outputs: &mut Vec<Output>,
+    copy_ts: bool,
+    interrupt_state: &Arc<crate::core::context::InterruptState>,
+) -> Result<Vec<Muxer>> {
     let mut muxs = Vec::new();
 
     for (i, output) in outputs.iter_mut().enumerate() {
         unsafe {
-            let result = open_output_file(i, output, copy_ts);
+            let result = open_output_file(i, output, copy_ts, interrupt_state);
             if let Err(e) = result {
                 free_output_av_format_context(muxs);
                 return Err(e);
@@ -2042,12 +2062,22 @@ unsafe fn free_output_av_format_context(muxs: Vec<Muxer>) {
 }
 
 #[cfg(feature = "docs-rs")]
-unsafe fn open_output_file(index: usize, output: &mut Output, copy_ts: bool) -> Result<Muxer> {
+unsafe fn open_output_file(
+    index: usize,
+    output: &mut Output,
+    copy_ts: bool,
+    interrupt_state: &Arc<crate::core::context::InterruptState>,
+) -> Result<Muxer> {
     Err(Error::Bug)
 }
 
 #[cfg(not(feature = "docs-rs"))]
-unsafe fn open_output_file(index: usize, output: &mut Output, copy_ts: bool) -> Result<Muxer> {
+unsafe fn open_output_file(
+    index: usize,
+    output: &mut Output,
+    copy_ts: bool,
+    interrupt_state: &Arc<crate::core::context::InterruptState>,
+) -> Result<Muxer> {
     let mut out_fmt_ctx = null_mut();
     let format = get_format(&output.format)?;
     match &output.url {
@@ -2122,9 +2152,23 @@ unsafe fn open_output_file(index: usize, output: &mut Output, copy_ts: bool) -> 
                 return Err(AllocOutputContextError::from(ret).into());
             }
 
+            // Interrupt callback before avio_open: stop()/abort() can break
+            // a blocking network open and any later write on this output
+            // (matches ffmpeg_mux_init.c:3326,3371).
+            (*out_fmt_ctx).interrupt_callback = ffmpeg_sys_next::AVIOInterruptCB {
+                callback: Some(crate::core::context::output_interrupt_cb),
+                opaque: Arc::as_ptr(interrupt_state) as *mut c_void,
+            };
+
             let output_format = (*out_fmt_ctx).oformat;
             if (*output_format).flags & AVFMT_NOFILE == 0 {
-                let ret = avio_open(&mut (*out_fmt_ctx).pb, url_cstr.as_ptr(), AVIO_FLAG_WRITE);
+                let ret = avio_open2(
+                    &mut (*out_fmt_ctx).pb,
+                    url_cstr.as_ptr(),
+                    AVIO_FLAG_WRITE,
+                    &(*out_fmt_ctx).interrupt_callback,
+                    null_mut(),
+                );
                 if ret < 0 {
                     warn!("Error opening output {url}");
                     return Err(OpenOutputError::from(ret).into());
@@ -2979,11 +3023,15 @@ unsafe fn describe_filter_link(
     Ok(name)
 }
 
-fn open_input_files(inputs: &mut Vec<Input>, copy_ts: bool) -> Result<Vec<Demuxer>> {
+fn open_input_files(
+    inputs: &mut Vec<Input>,
+    copy_ts: bool,
+    interrupt_state: &Arc<crate::core::context::InterruptState>,
+) -> Result<Vec<Demuxer>> {
     let mut demuxs = Vec::new();
     for (i, input) in inputs.iter_mut().enumerate() {
         unsafe {
-            let result = open_input_file(i, input, copy_ts);
+            let result = open_input_file(i, input, copy_ts, interrupt_state);
             if let Err(e) = result {
                 free_input_av_format_context(demuxs);
                 return Err(e);
@@ -3002,16 +3050,33 @@ unsafe fn free_input_av_format_context(demuxs: Vec<Demuxer>) {
 }
 
 #[cfg(feature = "docs-rs")]
-unsafe fn open_input_file(index: usize, input: &mut Input, copy_ts: bool) -> Result<Demuxer> {
+unsafe fn open_input_file(
+    index: usize,
+    input: &mut Input,
+    copy_ts: bool,
+    interrupt_state: &Arc<crate::core::context::InterruptState>,
+) -> Result<Demuxer> {
     Err(Error::Bug)
 }
 
 #[cfg(not(feature = "docs-rs"))]
-unsafe fn open_input_file(index: usize, input: &mut Input, copy_ts: bool) -> Result<Demuxer> {
+unsafe fn open_input_file(
+    index: usize,
+    input: &mut Input,
+    copy_ts: bool,
+    interrupt_state: &Arc<crate::core::context::InterruptState>,
+) -> Result<Demuxer> {
     let mut in_fmt_ctx = avformat_alloc_context();
     if in_fmt_ctx.is_null() {
         return Err(OpenInputError::OutOfMemory.into());
     }
+
+    // Interrupt callback: lets stop()/abort() break a blocking open, read or
+    // find_stream_info on this input (fftools decode_interrupt_cb).
+    (*in_fmt_ctx).interrupt_callback = ffmpeg_sys_next::AVIOInterruptCB {
+        callback: Some(crate::core::context::input_interrupt_cb),
+        opaque: Arc::as_ptr(interrupt_state) as *mut c_void,
+    };
 
     let recording_time_us = match input.stop_time_us {
         None => input.recording_time_us,

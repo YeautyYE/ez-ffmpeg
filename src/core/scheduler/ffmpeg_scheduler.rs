@@ -39,6 +39,14 @@ pub struct Ended;
 struct RunningGuard {
     status: Arc<AtomicUsize>,
     thread_sync: ThreadSynchronizer,
+    // Demuxer choke waiters: a stopping scheduler must notify them or a
+    // choked demuxer sleeps through the shutdown and joining hangs.
+    demux_waiters: Vec<Arc<crate::util::sch_waiter::SchWaiter>>,
+    // Keeps the interrupt-callback state alive until every worker thread has
+    // exited: FfmpegScheduler's ffmpeg_context field (the other Arc holder)
+    // drops BEFORE this guard, while threads may still be inside blocking
+    // I/O whose AVIOInterruptCB points into this allocation.
+    _interrupt_state: Arc<crate::core::context::InterruptState>,
 }
 
 impl Drop for RunningGuard {
@@ -49,6 +57,13 @@ impl Drop for RunningGuard {
         if !is_stopping(self.status.load(Ordering::Acquire)) {
             log::debug!("Drop called, setting STATUS_END");
             self.status.store(STATUS_END, Ordering::Release);
+        }
+
+        // Wake choked demuxers AFTER publishing the terminal state: the
+        // waiter re-checks the status and exits (matches FFmpeg sch_stop,
+        // which unchokes every demuxer after setting terminate).
+        for waiter in &self.demux_waiters {
+            waiter.set(false);
         }
 
         // Always wait for all threads to complete
@@ -69,8 +84,15 @@ pub struct FfmpegScheduler<S> {
     // Guard for Running state - Some only when in Running state
     _guard: Option<RunningGuard>,
 }
-unsafe impl<S> Send for FfmpegScheduler<S> {}
-unsafe impl<S> Sync for FfmpegScheduler<S> {}
+// Send is auto-derived: every field is Send (FfmpegContext is Send, the rest
+// are Arc/atomic/channel types) and the state markers are unit structs.
+//
+// Sync is deliberately NOT implemented. FfmpegContext is not Sync (it owns
+// Box<dyn FrameFilter> values that are only Send, plus raw FFmpeg pointers);
+// a blanket `unsafe impl Sync` here would launder that through shared
+// references — the same hole FfmpegContext itself closed in 0.10.0. Nothing
+// in the public API needs &FfmpegScheduler from multiple threads: waiting
+// consumes self, and the async Future only requires Send.
 
 pub(crate) const STATUS_INIT: usize = 0;
 pub(crate) const STATUS_RUN: usize = 1;
@@ -121,6 +143,20 @@ impl<S: 'static> FfmpegScheduler<S> {
     /// Calling code is responsible for deciding whether to wait or not.
     fn signal_stop(&self) {
         self.status.store(STATUS_END, Ordering::Release);
+        self.wake_demux_waiters();
+    }
+
+    /// Notifies every demuxer choke waiter so it re-checks the (already
+    /// published) terminal status. Must run AFTER the status store.
+    fn wake_demux_waiters(&self) {
+        for demux in &self.ffmpeg_context.demuxs {
+            let crate::core::scheduler::input_controller::SchNode::Demux { waiter, .. } =
+                demux.node.as_ref()
+            else {
+                continue;
+            };
+            waiter.set(false);
+        }
     }
 
     /// Checks whether the FFmpeg job has ended. The job can end because it
@@ -152,11 +188,15 @@ impl FfmpegScheduler<Initialization> {
     /// // At this point, no actual FFmpeg threads are running; call `start()` to begin.
     /// ```
     pub fn new(ffmpeg_context: FfmpegContext) -> FfmpegScheduler<Initialization> {
+        // Reuse the context's status atomic: the AVIO interrupt callbacks
+        // installed at build time are bound to it, so stop()/abort() can
+        // break blocking I/O on the already-opened contexts.
+        let status = ffmpeg_context.scheduler_status.clone();
         FfmpegScheduler {
             ffmpeg_context,
             state: Default::default(),
             thread_sync: ThreadSynchronizer::new(),
-            status: Arc::new(AtomicUsize::new(STATUS_INIT)),
+            status,
             result: Arc::new(Mutex::new(None)),
             _guard: None,
         }
@@ -235,6 +275,7 @@ impl FfmpegScheduler<Initialization> {
                         mux.get_streams_mut(),
                         frame_pool.clone(),
                         scheduler_status.clone(),
+                        thread_sync.clone(),
                         scheduler_result.clone(),
                     ) {
                         Self::cleanup(&scheduler_status, ffmpeg_context);
@@ -281,6 +322,8 @@ impl FfmpegScheduler<Initialization> {
                     frame_pool.clone(),
                     packet_pool.clone(),
                     scheduler_status.clone(),
+                    thread_sync.clone(),
+                    mux.enc_handle_sender(),
                     scheduler_result.clone(),
                 ) {
                     Self::cleanup(&scheduler_status, ffmpeg_context);
@@ -299,6 +342,7 @@ impl FfmpegScheduler<Initialization> {
                 input_controller.clone(),
                 filter_graph.node.clone(),
                 scheduler_status.clone(),
+                thread_sync.clone(),
                 scheduler_result.clone(),
             ) {
                 Self::cleanup(&scheduler_status, ffmpeg_context);
@@ -317,6 +361,7 @@ impl FfmpegScheduler<Initialization> {
                         demux.get_streams_mut(),
                         frame_pool.clone(),
                         scheduler_status.clone(),
+                        thread_sync.clone(),
                         scheduler_result.clone(),
                     ) {
                         Self::cleanup(&scheduler_status, ffmpeg_context);
@@ -338,6 +383,7 @@ impl FfmpegScheduler<Initialization> {
                     frame_pool.clone(),
                     packet_pool.clone(),
                     scheduler_status.clone(),
+                    thread_sync.clone(),
                     scheduler_result.clone(),
                 ) {
                     Self::cleanup(&scheduler_status, ffmpeg_context);
@@ -355,6 +401,7 @@ impl FfmpegScheduler<Initialization> {
                 packet_pool.clone(),
                 demux.node.clone(),
                 scheduler_status.clone(),
+                thread_sync.clone(),
                 scheduler_result.clone(),
             ) {
                 Self::cleanup(&scheduler_status, ffmpeg_context);
@@ -366,9 +413,24 @@ impl FfmpegScheduler<Initialization> {
 
         // Create Running state with guard for Drop implementation
         let mut running_scheduler = self.into_state::<Running>();
+        let demux_waiters = running_scheduler
+            .ffmpeg_context
+            .demuxs
+            .iter()
+            .filter_map(|demux| {
+                let crate::core::scheduler::input_controller::SchNode::Demux { waiter, .. } =
+                    demux.node.as_ref()
+                else {
+                    return None;
+                };
+                Some(waiter.clone())
+            })
+            .collect();
         running_scheduler._guard = Some(RunningGuard {
             status: running_scheduler.status.clone(),
             thread_sync: running_scheduler.thread_sync.clone(),
+            demux_waiters,
+            _interrupt_state: running_scheduler.ffmpeg_context.interrupt_state.clone(),
         });
 
         Ok(running_scheduler)
@@ -483,6 +545,7 @@ impl FfmpegScheduler<Running> {
     /// ```
     pub fn abort(self) {
         self.status.store(STATUS_ABORT, Ordering::Release);
+        self.wake_demux_waiters();
     }
 
     /// Gracefully stops the FFmpeg job and waits for all threads to complete.
@@ -550,10 +613,10 @@ impl std::future::Future for FfmpegScheduler<Running> {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        let this = self.get_mut();
-
-        if is_stopping(this.status.load(Ordering::Acquire)) {
-            let option = this.result.lock().unwrap().take();
+        fn ready(
+            result: &Arc<Mutex<Option<crate::error::Result<()>>>>,
+        ) -> std::task::Poll<crate::error::Result<()>> {
+            let option = result.lock().unwrap().take();
             std::task::Poll::Ready(match option {
                 None => {
                     log::info!("FFmpeg task succeeded.");
@@ -564,12 +627,27 @@ impl std::future::Future for FfmpegScheduler<Running> {
                     result
                 }
             })
-        } else {
-            let thread_sync = this.thread_sync.clone();
-            let waker = cx.waker().clone();
-            thread_sync.set_waker(waker);
-            std::task::Poll::Pending
         }
+
+        let this = self.get_mut();
+
+        if is_stopping(this.status.load(Ordering::Acquire)) {
+            return ready(&this.result);
+        }
+
+        let thread_sync = this.thread_sync.clone();
+        let waker = cx.waker().clone();
+        thread_sync.set_waker(waker);
+
+        // Re-check after registering the waker: the last thread may have
+        // published the terminal state and consumed a previous waker between
+        // the check above and set_waker, in which case no further wake ever
+        // comes for the waker just installed.
+        if is_stopping(this.status.load(Ordering::Acquire)) {
+            return ready(&this.result);
+        }
+
+        std::task::Poll::Pending
     }
 }
 
@@ -609,7 +687,8 @@ impl FfmpegScheduler<Paused> {
     /// paused_scheduler.abort();
     /// ```
     pub fn abort(self) {
-        self.status.store(STATUS_ABORT, Ordering::Release)
+        self.status.store(STATUS_ABORT, Ordering::Release);
+        self.wake_demux_waiters();
     }
 }
 

@@ -132,7 +132,15 @@ pub(crate) struct Muxer {
     streams: Vec<EncoderStream>,
     queue: Option<(Sender<PacketBox>, Receiver<PacketBox>)>,
     src_pre_receivers: Vec<Receiver<PacketBox>>,
-    is_started: Arc<AtomicBool>,
+    mux_start_gate: Arc<crate::core::context::MuxStartGate>,
+
+    // Join handles of this muxer's encoder threads, delivered by enc_init.
+    // The muxer joins them before freeing its AVFormatContext: the encoders
+    // write into AVStreams owned by that context.
+    enc_handles: (
+        Sender<std::thread::JoinHandle<()>>,
+        Receiver<std::thread::JoinHandle<()>>,
+    ),
 
     pub(crate) nb_streams: usize,
     pub(crate) nb_streams_ready: Arc<AtomicUsize>,
@@ -217,7 +225,8 @@ impl Muxer {
             streams: vec![],
             queue: None,
             src_pre_receivers: vec![],
-            is_started: Arc::new(Default::default()),
+            mux_start_gate: Arc::new(crate::core::context::MuxStartGate::new()),
+            enc_handles: crossbeam_channel::unbounded(),
             nb_streams: 0,
             nb_streams_ready: Arc::new(Default::default()),
             is_set_write_callback,
@@ -303,7 +312,7 @@ impl Muxer {
             frame_receiver,
             packet_sender,
             pre_packet_sender,
-            self.is_started.clone(),
+            self.mux_start_gate.clone(),
         );
         self.streams.push(stream);
         Ok((frame_sender, stream_index))
@@ -378,8 +387,16 @@ impl Muxer {
         std::mem::take(&mut self.streams)
     }
 
-    pub(crate) fn get_is_started(&self) -> Arc<AtomicBool> {
-        self.is_started.clone()
+    pub(crate) fn mux_start_gate(&self) -> Arc<crate::core::context::MuxStartGate> {
+        self.mux_start_gate.clone()
+    }
+
+    pub(crate) fn enc_handle_sender(&self) -> Sender<std::thread::JoinHandle<()>> {
+        self.enc_handles.0.clone()
+    }
+
+    pub(crate) fn enc_handle_receiver(&self) -> Receiver<std::thread::JoinHandle<()>> {
+        self.enc_handles.1.clone()
     }
 }
 

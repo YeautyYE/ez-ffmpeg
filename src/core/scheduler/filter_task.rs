@@ -63,6 +63,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use crate::util::ffmpeg_utils::av_err2str;
+use crate::util::thread_synchronizer::{ThreadDoneGuard, ThreadSynchronizer};
 
 pub(crate) fn filter_graph_init(
     fg_index: usize,
@@ -71,6 +72,7 @@ pub(crate) fn filter_graph_init(
     input_controller: Arc<InputController>,
     filter_node: Arc<SchNode>,
     scheduler_status: Arc<AtomicUsize>,
+    thread_sync: ThreadSynchronizer,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
 ) -> crate::error::Result<()> {
     if let Some(hw_device) = &filter_graph.hw_device {
@@ -116,9 +118,14 @@ pub(crate) fn filter_graph_init(
         ofps.push(output_filter_parameter);
     }
 
+    // Slot claimed before spawn; the guard releases it on any exit path.
+    thread_sync.thread_start();
+    let thread_done_guard = ThreadDoneGuard::adopt(thread_sync.clone(), scheduler_status.clone());
+
     let result = std::thread::Builder::new()
         .name(format!("filtergraph{fg_index}"))
         .spawn(move || {
+            let _thread_done = thread_done_guard;
             let mut graph: *mut AVFilterGraph = null_mut();
             let mut fgp = FilterGraphParameter::default();
             let node = filter_node.as_ref();
