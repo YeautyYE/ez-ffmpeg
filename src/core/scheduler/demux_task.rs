@@ -1104,7 +1104,12 @@ unsafe fn demux_send_for_stream(
         }
     }
 
-    if nb_done == demux_parameter.dsts.len() {
+    // EOF means THIS stream's consumers are all done: compare against this
+    // stream's destinations, not every destination of the demuxer — that
+    // never matched for multi-stream inputs, so a stream whose consumers had
+    // all finished kept the whole demuxer spinning
+    // (ffmpeg_sched.c demux_send_for_stream: nb_done == ds->nb_dst).
+    if nb_done == send_dsts.len() {
         AVERROR_EOF
     } else {
         0

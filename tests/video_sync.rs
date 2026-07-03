@@ -43,6 +43,113 @@ fn wait_with_watchdog(
 }
 
 #[test]
+fn fpsmax_caps_only_framerates_above_the_cap() {
+    // CLI parity for -fpsmax (ffmpeg_filter.c choose_out_timebase): a 20fps
+    // input with fpsmax 30 keeps its native 20fps — the cap applies only
+    // when the rate exceeds it (or is unknown), never unconditionally.
+    let fixture = tmp_path("fpsmax_20_fixture.mp4");
+    let result = wait_with_watchdog(
+        FfmpegContext::builder()
+            .input(Input::from("color=c=black:s=320x240:r=20").set_format("lavfi"))
+            .output(
+                Output::from(fixture.as_str())
+                    .set_video_codec("mpeg4")
+                    .set_max_video_frames(30),
+            )
+            .build()
+            .unwrap()
+            .start()
+            .unwrap(),
+        60,
+        "fpsmax fixture 20fps",
+    );
+    assert!(result.is_ok(), "fixture task failed: {result:?}");
+
+    let out = tmp_path("fpsmax_20_out.mp4");
+    let result = wait_with_watchdog(
+        FfmpegContext::builder()
+            .input(Input::from(fixture.as_str()))
+            .output(
+                Output::from(out.as_str())
+                    .set_video_codec("mpeg4")
+                    .set_framerate_max(AVRational { num: 30, den: 1 }),
+            )
+            .build()
+            .unwrap()
+            .start()
+            .unwrap(),
+        60,
+        "fpsmax below cap",
+    );
+    assert!(result.is_ok(), "fpsmax task failed: {result:?}");
+
+    match find_video_stream_info(&out)
+        .expect("failed to probe output")
+        .expect("output has no video stream")
+    {
+        StreamInfo::Video { avg_frame_rate, .. } => {
+            let fps = avg_frame_rate.num as f64 / avg_frame_rate.den as f64;
+            assert!(
+                (fps - 20.0).abs() < 0.5,
+                "a 20fps input under fpsmax 30 must stay 20fps, got {fps}"
+            );
+        }
+        other => panic!("expected video stream info, got {other:?}"),
+    }
+
+    // And a 60fps input IS capped to 30fps.
+    let fixture = tmp_path("fpsmax_60_fixture.mp4");
+    let result = wait_with_watchdog(
+        FfmpegContext::builder()
+            .input(Input::from("color=c=black:s=320x240:r=60").set_format("lavfi"))
+            .output(
+                Output::from(fixture.as_str())
+                    .set_video_codec("mpeg4")
+                    .set_max_video_frames(60),
+            )
+            .build()
+            .unwrap()
+            .start()
+            .unwrap(),
+        60,
+        "fpsmax fixture 60fps",
+    );
+    assert!(result.is_ok(), "fixture task failed: {result:?}");
+
+    let out = tmp_path("fpsmax_60_out.mp4");
+    let result = wait_with_watchdog(
+        FfmpegContext::builder()
+            .input(Input::from(fixture.as_str()))
+            .output(
+                Output::from(out.as_str())
+                    .set_video_codec("mpeg4")
+                    .set_framerate_max(AVRational { num: 30, den: 1 }),
+            )
+            .build()
+            .unwrap()
+            .start()
+            .unwrap(),
+        60,
+        "fpsmax above cap",
+    );
+    assert!(result.is_ok(), "fpsmax task failed: {result:?}");
+
+    match find_video_stream_info(&out)
+        .expect("failed to probe output")
+        .expect("output has no video stream")
+    {
+        StreamInfo::Video { avg_frame_rate, .. } => {
+            let fps = avg_frame_rate.num as f64 / avg_frame_rate.den as f64;
+            assert!(
+                (fps - 30.0).abs() < 0.5,
+                "a 60fps input under fpsmax 30 must be capped to 30fps, got {fps}"
+            );
+        }
+        other => panic!("expected video stream info, got {other:?}"),
+    }
+}
+
+#[test]
 fn vscfr_fills_gaps_but_keeps_initial_offset() {
     // Fixture: exactly 30 frames at 30fps.
     let fixture = tmp_path("vscfr_fixture.mp4");

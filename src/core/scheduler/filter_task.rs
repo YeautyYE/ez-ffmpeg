@@ -423,6 +423,7 @@ impl OutputFilterParameter {
     ) -> Self {
         let mut fpsconv_context = FPSConvContext::default();
         fpsconv_context.framerate = opts.framerate;
+        fpsconv_context.framerate_max = opts.framerate_max;
         Self {
             media_type,
             dst,
@@ -1428,8 +1429,11 @@ unsafe fn choose_out_timebase(ofp: &mut OutputFilterParameter, frame: &Frame) {
                 );
             }
 
+            // Cap only when the rate exceeds the bound or is invalid:
+            // `fr.den != 0` here was a mistranslation of fftools `!fr.den`
+            // and made the cap unconditional (ffmpeg_filter.c:2416-2419).
             if ofp.fpsconv_context.framerate_max.num != 0
-                && (av_q2d(fr) > av_q2d(ofp.fpsconv_context.framerate_max) || fr.den != 0)
+                && (av_q2d(fr) > av_q2d(ofp.fpsconv_context.framerate_max) || fr.den == 0)
             {
                 fr = ofp.fpsconv_context.framerate_max;
             }
@@ -1935,7 +1939,7 @@ struct FPSConvContext {
     dropped_keyframe: bool,
 
     framerate: AVRational,
-    //TODO
+    // -fpsmax upper bound (ffmpeg_mux_init.c ms->max_frame_rate)
     framerate_max: AVRational,
 }
 

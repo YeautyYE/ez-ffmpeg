@@ -201,6 +201,10 @@ pub struct Output {
     pub(crate) recording_time_us: Option<i64>,
     pub(crate) stop_time_us: Option<i64>,
     pub(crate) framerate: Option<AVRational>,
+    /// Maximum output frame rate cap (`-fpsmax`): the native rate is kept and
+    /// only clamped when it exceeds the cap or is unknown
+    /// (ffmpeg_mux_init.c ms->max_frame_rate).
+    pub(crate) framerate_max: Option<AVRational>,
     pub(crate) vsync_method: VSyncMethod,
     pub(crate) bits_per_raw_sample: Option<i32>,
     pub(crate) audio_sample_rate: Option<i32>,
@@ -800,6 +804,31 @@ impl Output {
     /// ```
     pub fn set_framerate(mut self, framerate: AVRational) -> Self {
         self.framerate = Some(framerate);
+        self
+    }
+
+    /// Sets a **maximum frame rate** cap for output encoding (`-fpsmax`).
+    ///
+    /// Unlike [`set_framerate`](Self::set_framerate), this does not force a
+    /// rate: the output keeps its native frame rate and is only clamped when
+    /// that rate exceeds the cap or cannot be determined
+    /// (ffmpeg_filter.c choose_out_timebase).
+    ///
+    /// # Parameters
+    /// * `framerate_max` - An `AVRational` upper bound (e.g.,
+    ///   `AVRational { num: 30, den: 1 }` for 30fps).
+    ///
+    /// # Returns
+    /// * `Self` - The modified `Output`, allowing method chaining.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// use ffmpeg_sys_next::AVRational;
+    /// let output = Output::from("output.mp4")
+    ///     .set_framerate_max(AVRational { num: 30, den: 1 });
+    /// ```
+    pub fn set_framerate_max(mut self, framerate_max: AVRational) -> Self {
+        self.framerate_max = Some(framerate_max);
         self
     }
 
@@ -1753,6 +1782,7 @@ impl From<Box<dyn FnMut(&[u8]) -> i32 + Send>> for Output {
             recording_time_us: None,
             stop_time_us: None,
             framerate: None,
+            framerate_max: None,
             vsync_method: VSyncMethod::VsyncAuto,
             bits_per_raw_sample: None,
             audio_sample_rate: None,
@@ -1801,6 +1831,7 @@ impl From<String> for Output {
             recording_time_us: None,
             stop_time_us: None,
             framerate: None,
+            framerate_max: None,
             vsync_method: VSyncMethod::VsyncAuto,
             bits_per_raw_sample: None,
             audio_sample_rate: None,

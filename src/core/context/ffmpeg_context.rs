@@ -1065,6 +1065,16 @@ fn configure_output_filter_opts(
                 output_filter.opts.framerate = framerate;
             }
 
+            // -fpsmax: only one of -r/-fpsmax may be set per stream
+            // (ffmpeg_mux_init.c:572-575).
+            if let Some(framerate_max) = mux.framerate_max {
+                if mux.framerate.is_some() {
+                    error!("Only one of framerate and framerate_max can be set for an output");
+                    return Err(Error::OpenOutput(OpenOutputError::InvalidArgument));
+                }
+                output_filter.opts.framerate_max = framerate_max;
+            }
+
             // Set user-requested pixel format (equivalent to -pix_fmt in FFmpeg)
             // FFmpeg reference: fftools/ffmpeg_filter.c - ofilter_bind_ost sets format from OptionsContext
             if let Some(pix_fmt) = mux.pix_fmt {
@@ -2231,6 +2241,7 @@ unsafe fn open_output_file(
         output.start_time_us,
         recording_time_us,
         output.framerate,
+        output.framerate_max,
         output.vsync_method,
         output.bits_per_raw_sample,
         output.audio_sample_rate,

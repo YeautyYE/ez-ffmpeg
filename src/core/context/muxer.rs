@@ -90,6 +90,7 @@ pub(crate) struct Muxer {
     pub(crate) start_time_us: Option<i64>,
     pub(crate) recording_time_us: Option<i64>,
     pub(crate) framerate: Option<AVRational>,
+    pub(crate) framerate_max: Option<AVRational>,
     pub(crate) vsync_method: VSyncMethod,
     pub(crate) bits_per_raw_sample: Option<i32>,
     pub(crate) audio_sample_rate: Option<i32>,
@@ -178,6 +179,7 @@ impl Muxer {
         start_time_us: Option<i64>,
         recording_time_us: Option<i64>,
         framerate: Option<AVRational>,
+        framerate_max: Option<AVRational>,
         vsync_method: VSyncMethod,
         bits_per_raw_sample: Option<i32>,
         audio_sample_rate: Option<i32>,
@@ -218,6 +220,7 @@ impl Muxer {
             start_time_us,
             recording_time_us,
             framerate,
+            framerate_max,
             vsync_method,
             bits_per_raw_sample,
             audio_sample_rate,
@@ -294,6 +297,7 @@ impl Muxer {
                 determine_vsync_method(
                     self.vsync_method,
                     self.framerate,
+                    self.framerate_max,
                     self.out_fmt_ctx,
                     self.copy_ts,
                 )
@@ -436,6 +440,7 @@ mod tests {
 unsafe fn determine_vsync_method(
     vsync_method: VSyncMethod,
     framerate: Option<AVRational>,
+    framerate_max: Option<AVRational>,
     out_fmt_ctx: *mut AVFormatContext,
     copy_ts: bool,
 ) -> VSyncMethod {
@@ -443,8 +448,10 @@ unsafe fn determine_vsync_method(
         return vsync_method;
     }
 
-    // 1. Check if frame rate is set
-    let mut vsync_method = if framerate.is_some_and(|fr| fr.num != 0) {
+    // 1. -r or -fpsmax both force CFR (ffmpeg_mux_init.c:755-757)
+    let mut vsync_method = if framerate.is_some_and(|fr| fr.num != 0)
+        || framerate_max.is_some_and(|fr| fr.num != 0)
+    {
         VSyncMethod::VsyncCfr
     }
     // 2. If output format is "avi", set VSYNC_VFR
