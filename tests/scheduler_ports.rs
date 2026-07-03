@@ -219,3 +219,63 @@ fn stream_loop_doubles_frames_with_monotonic_timestamps() {
         other => panic!("expected video stream info, got {other:?}"),
     }
 }
+
+#[test]
+fn one_finished_stream_does_not_stop_the_demuxer() {
+    // A 20s two-stream source where the video consumer finishes after a
+    // single frame while the audio consumer still needs ~2.3s of content —
+    // too much for the choked channels to have buffered ahead. fftools marks
+    // only the exhausted stream finished and keeps demuxing until every used
+    // stream is done (ffmpeg_demux.c:751 loop-top skip, :511-530 do_send
+    // bookkeeping); bubbling the first per-stream AVERROR_EOF out of the
+    // demux loop truncates the audio stream instead.
+    let out = tmp_path("finished_stream.mp4");
+    let result = wait_with_watchdog(
+        FfmpegContext::builder()
+            .input(
+                Input::from(
+                    "testsrc=size=320x240:rate=30:duration=20[out0];\
+                     sine=frequency=440:sample_rate=44100:duration=20[out1]",
+                )
+                .set_format("lavfi"),
+            )
+            .output(
+                Output::from(out.as_str())
+                    .set_video_codec("mpeg4")
+                    .set_audio_codec("aac")
+                    .set_max_video_frames(1)
+                    .set_max_audio_frames(100),
+            )
+            .build()
+            .unwrap()
+            .start()
+            .unwrap(),
+        60,
+        "one finished stream",
+    );
+    assert!(result.is_ok(), "two-stream transcode failed: {result:?}");
+
+    match find_video_stream_info(&out)
+        .expect("failed to probe output")
+        .expect("output has no video stream")
+    {
+        StreamInfo::Video { nb_frames, .. } => {
+            assert_eq!(nb_frames, 1, "video stream must respect its frame limit");
+        }
+        other => panic!("expected video stream info, got {other:?}"),
+    }
+
+    match find_audio_stream_info(&out)
+        .expect("failed to probe output")
+        .expect("output has no audio stream")
+    {
+        StreamInfo::Audio { nb_frames, .. } => {
+            // 100 encoded frames + the AAC priming packet (CLI parity).
+            assert_eq!(
+                nb_frames, 101,
+                "audio must keep flowing after the video stream finished"
+            );
+        }
+        other => panic!("expected audio stream info, got {other:?}"),
+    }
+}
