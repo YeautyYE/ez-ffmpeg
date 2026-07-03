@@ -34,7 +34,7 @@ mod value;
 
 pub(crate) use drawing::{parse_drawing, DrawCmd, Drawing, Point6};
 pub(crate) use parser::{apply_force_style, parse, ScriptParser};
-pub(crate) use tags::{parse_tag_block, FontSizeArg, Tag};
+pub(crate) use tags::{parse_tag_block, FontSizeArg, KaraokeKind, Tag};
 pub(crate) use types::{Event, Script};
 pub(crate) use value::{numpad2align, Color};
 pub(crate) use value::{VALIGN_CENTER, VALIGN_SUB, VALIGN_TOP};

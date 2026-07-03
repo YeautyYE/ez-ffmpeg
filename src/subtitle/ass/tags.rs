@@ -33,6 +33,17 @@ pub(crate) enum FontSizeArg {
 /// One parsed override tag. `None` arguments mean "no argument given":
 /// applying them resets the field to its style value (or to 0 for the
 /// shear/blur family), exactly like libass.
+/// Which karaoke effect a syllable uses (libass `Effect` enum).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KaraokeKind {
+    /// `\k`: primary color from the syllable start (EF_KARAOKE).
+    Plain,
+    /// `\kf`/`\K`: sweeping fill (EF_KARAOKE_KF), approximated stepwise.
+    Fill,
+    /// `\ko`: like `\k` plus no outline before the start (EF_KARAOKE_KO).
+    Outline,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Tag<'a> {
     XBord(Option<f64>),
@@ -114,9 +125,16 @@ pub(crate) enum Tag<'a> {
     Italic(Option<i32>),
     Underline(Option<i32>),
     Strike(Option<i32>),
-    /// `\kt`/`\kf`/`\K`/`\ko`/`\k`: recognized, not yet rendered (karaoke
-    /// text displays without the sweep effect).
-    Karaoke,
+    /// `\k`/`\kf`/`\K`/`\ko`: karaoke syllable of `centisec` duration
+    /// (default 100 like libass). `\kf`/`\K` sweep visuals are approximated
+    /// stepwise by the renderer.
+    Karaoke {
+        kind: KaraokeKind,
+        centisec: f64,
+    },
+    /// `\kt` (v4++): sets the absolute karaoke start offset and resets the
+    /// accumulated timing.
+    KaraokeSet(f64),
     /// `\p`; the argument is read unconditionally (a bare `\p` is scale 0,
     /// i.e. "exit drawing mode") and clamped to >= 0 like libass.
     DrawScale(i32),
@@ -413,13 +431,24 @@ fn match_tag<'a>(name: &'a str, mut args: Vec<&'a str>) -> Option<Tag<'a>> {
         Some(Tag::Bold(a.first().map(|_| first_i32(a))))
     } else if tag(name, "i", a, full) {
         Some(Tag::Italic(a.first().map(|_| first_i32(a))))
-    } else if tag(name, "kt", a, full)
-        || tag(name, "kf", a, full)
-        || tag(name, "K", a, full)
-        || tag(name, "ko", a, full)
-        || tag(name, "k", a, full)
-    {
-        Some(Tag::Karaoke)
+    } else if tag(name, "kt", a, full) {
+        // libass: val = argtod(*args) * 10 with default 0.
+        Some(Tag::KaraokeSet(first(a).unwrap_or(0.0)))
+    } else if tag(name, "kf", a, full) || tag(name, "K", a, full) {
+        Some(Tag::Karaoke {
+            kind: KaraokeKind::Fill,
+            centisec: first(a).unwrap_or(100.0),
+        })
+    } else if tag(name, "ko", a, full) {
+        Some(Tag::Karaoke {
+            kind: KaraokeKind::Outline,
+            centisec: first(a).unwrap_or(100.0),
+        })
+    } else if tag(name, "k", a, full) {
+        Some(Tag::Karaoke {
+            kind: KaraokeKind::Plain,
+            centisec: first(a).unwrap_or(100.0),
+        })
     } else if tag(name, "shad", a, full) {
         Some(Tag::Shad(first(a)))
     } else if tag(name, "s", a, full) {
@@ -524,8 +553,36 @@ mod tests {
             )
         );
         assert_eq!(one(r"\4a&H80&"), Tag::Alpha(3, Some(0x80)));
-        assert_eq!(one(r"\K50"), Tag::Karaoke);
-        assert_eq!(one(r"\kf50"), Tag::Karaoke);
+        assert_eq!(
+            one(r"\K50"),
+            Tag::Karaoke {
+                kind: KaraokeKind::Fill,
+                centisec: 50.0
+            }
+        );
+        assert_eq!(
+            one(r"\kf50"),
+            Tag::Karaoke {
+                kind: KaraokeKind::Fill,
+                centisec: 50.0
+            }
+        );
+        assert_eq!(
+            one(r"\k"),
+            Tag::Karaoke {
+                kind: KaraokeKind::Plain,
+                centisec: 100.0
+            }
+        );
+        assert_eq!(
+            one(r"\ko25"),
+            Tag::Karaoke {
+                kind: KaraokeKind::Outline,
+                centisec: 25.0
+            }
+        );
+        assert_eq!(one(r"\kt150"), Tag::KaraokeSet(150.0));
+        assert_eq!(one(r"\kt"), Tag::KaraokeSet(0.0));
     }
 
     #[test]

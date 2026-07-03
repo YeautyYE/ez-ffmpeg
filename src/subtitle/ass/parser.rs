@@ -71,6 +71,13 @@ pub(crate) struct ScriptParser {
     fontdata: Vec<u8>,
     /// `ass_new_track` enables ReadOrder duplicate elimination by default.
     seen_read_orders: std::collections::HashSet<i32>,
+    /// Mirrors libass's lazily created read-order bitmap: it is built on the
+    /// first `ass_process_chunk` call that arrives when events already
+    /// exist. Before that, duplicate detection scans stored (successfully
+    /// parsed) events only, so a malformed chunk does not reserve its
+    /// ReadOrder; after that, the check is test-and-set and reserves the
+    /// ReadOrder even when the rest of the chunk fails to parse.
+    read_order_bitmap_active: bool,
 }
 
 fn starts_ci(s: &str, prefix: &str) -> bool {
@@ -94,6 +101,7 @@ impl ScriptParser {
             fontname: None,
             fontdata: Vec::new(),
             seen_read_orders: std::collections::HashSet::new(),
+            read_order_bitmap_active: false,
         }
     }
 
@@ -150,13 +158,29 @@ impl ScriptParser {
         };
         let body = body.split('\0').next().unwrap_or("");
 
+        if !self.read_order_bitmap_active && !self.script.events.is_empty() {
+            self.read_order_bitmap_active = true;
+            for event in &self.script.events {
+                self.seen_read_orders.insert(event.read_order);
+            }
+        }
+
         let mut values = Cursor::new(body);
         let Some(read_order_token) = values.next_token() else {
             return;
         };
         // libass uses atoi here (saturating i32).
         let read_order = parse_i32_saturating(read_order_token, 10);
-        if !self.seen_read_orders.insert(read_order) {
+        if self.read_order_bitmap_active {
+            if !self.seen_read_orders.insert(read_order) {
+                return;
+            }
+        } else if self
+            .script
+            .events
+            .iter()
+            .any(|event| event.read_order == read_order)
+        {
             return;
         }
         let Some(layer_token) = values.next_token() else {
@@ -817,6 +841,39 @@ mod tests {
         let script = parser.into_script();
         assert_eq!(script.events.len(), 1);
         assert_eq!(script.events[0].text, "text");
+    }
+
+    #[test]
+    fn malformed_chunk_reserves_read_order_only_after_first_event() {
+        // libass builds its read-order bitmap lazily: on the first chunk
+        // call that arrives with events already stored. Before that, a
+        // malformed chunk (parse failure rolls the event back) leaves no
+        // trace, so a later valid chunk may reuse its ReadOrder. After the
+        // bitmap exists, the duplicate check is test-and-set and reserves
+        // the ReadOrder even when the tail fails to parse.
+        let header = "[Events]\n\
+             Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n";
+
+        // Empty track: malformed `5` (no Layer, no tail) is discarded
+        // without reserving ReadOrder 5 — the retry renders.
+        let mut parser = ScriptParser::new();
+        parser.process_codec_private(header);
+        parser.process_chunk("5", 0, 1_000);
+        parser.process_chunk("5,0,Default,,0,0,0,,Visible", 0, 1_000);
+        let script = parser.into_script();
+        assert_eq!(script.events.len(), 1);
+        assert_eq!(script.events[0].text, "Visible");
+
+        // After one stored event the bitmap is active: a malformed chunk
+        // now reserves its ReadOrder and the retry is dropped.
+        let mut parser = ScriptParser::new();
+        parser.process_codec_private(header);
+        parser.process_chunk("1,0,Default,,0,0,0,,First", 0, 1_000);
+        parser.process_chunk("7", 0, 1_000);
+        parser.process_chunk("7,0,Default,,0,0,0,,Late", 0, 1_000);
+        let script = parser.into_script();
+        assert_eq!(script.events.len(), 1);
+        assert_eq!(script.events[0].text, "First");
     }
 
     #[test]

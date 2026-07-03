@@ -53,6 +53,10 @@ pub struct SubtitleFilter {
     pool_scratch: Vec<u16>,
     warned_missing_time: bool,
     warned_colorspace: bool,
+    /// Matrix/range locked on the first timed frame (vf_subtitles wires
+    /// ff_draw once in config_input; per-frame drift is ignored). `None`
+    /// range = unspecified, resolved by the format default at blend time.
+    locked_color: Option<(ColorMatrix, Option<ColorRange>)>,
 }
 
 impl std::fmt::Debug for SubtitleFilter {
@@ -86,6 +90,7 @@ impl SubtitleFilter {
             pool_scratch: Vec::new(),
             warned_missing_time: false,
             warned_colorspace: false,
+            locked_color: None,
         }
     }
 
@@ -110,35 +115,51 @@ impl SubtitleFilter {
         }
     }
 
-    /// Maps the frame's colorspace/range to the subtitle color conversion,
-    /// with FFmpeg's fallbacks (UNSPECIFIED → BT.601, non-JPEG → limited).
+    /// Maps colorspace/range to the subtitle color conversion with
+    /// FFmpeg's semantics: the matrix set covers `av_csp_luma_coeffs`
+    /// entries; UNSPECIFIED falls back to BT.601; the range stays
+    /// undecided here (`None`) so the per-format default can resolve it
+    /// like `ff_draw_init2` (yuvj/RGB default to full, else limited).
+    /// Like vf_subtitles' config_input, the choice is LOCKED on first use —
+    /// later frames reuse it even if their metadata drifts.
     fn frame_color(
         &mut self,
         colorspace: AVColorSpace,
         color_range: AVColorRange,
-    ) -> (ColorMatrix, ColorRange) {
+    ) -> (ColorMatrix, Option<ColorRange>) {
+        if let Some(locked) = self.locked_color {
+            return locked;
+        }
         let matrix = match colorspace {
             AVColorSpace::AVCOL_SPC_BT709 => ColorMatrix::Bt709,
             AVColorSpace::AVCOL_SPC_SMPTE170M | AVColorSpace::AVCOL_SPC_BT470BG => {
                 ColorMatrix::Bt601
             }
-            AVColorSpace::AVCOL_SPC_BT2020_NCL => ColorMatrix::Bt2020,
+            AVColorSpace::AVCOL_SPC_BT2020_NCL | AVColorSpace::AVCOL_SPC_BT2020_CL => {
+                ColorMatrix::Bt2020
+            }
+            AVColorSpace::AVCOL_SPC_FCC => ColorMatrix::Fcc,
+            AVColorSpace::AVCOL_SPC_SMPTE240M => ColorMatrix::Smpte240m,
+            AVColorSpace::AVCOL_SPC_YCGCO => ColorMatrix::YCoCg,
             AVColorSpace::AVCOL_SPC_UNSPECIFIED => ColorMatrix::Bt601,
             other => {
                 if !self.warned_colorspace {
                     self.warned_colorspace = true;
                     log::warn!(
                         "subtitle filter: colorspace {other:?} not supported for subtitle \
-                         color conversion, falling back to BT.601 (logged once)"
+                         color conversion, falling back to BT.601 (logged once; FFmpeg's \
+                         subtitles filter leaves its draw context uninitialized here)"
                     );
                 }
                 ColorMatrix::Bt601
             }
         };
         let range = match color_range {
-            AVColorRange::AVCOL_RANGE_JPEG => ColorRange::Full,
-            _ => ColorRange::Limited,
+            AVColorRange::AVCOL_RANGE_JPEG => Some(ColorRange::Full),
+            AVColorRange::AVCOL_RANGE_MPEG => Some(ColorRange::Limited),
+            _ => None,
         };
+        self.locked_color = Some((matrix, range));
         (matrix, range)
     }
 
@@ -153,12 +174,17 @@ impl SubtitleFilter {
         images: &[OverlayImage<'_>],
         spec: &FormatSpec,
         matrix: ColorMatrix,
-        mut range: ColorRange,
+        range: Option<ColorRange>,
         scratch: &mut Vec<u16>,
     ) {
-        if spec.force_full_range {
-            range = ColorRange::Full;
-        }
+        // ff_draw_init2: an EXPLICIT range is honored; only an unspecified
+        // one falls back to the format default (yuvj/RGB full, else
+        // limited).
+        let range = range.unwrap_or(if spec.force_full_range {
+            ColorRange::Full
+        } else {
+            ColorRange::Limited
+        });
         let width = (*frame).width as usize;
         let height = (*frame).height as usize;
 
@@ -227,7 +253,7 @@ impl SubtitleFilter {
                 ColorModel::Yuv => {
                     blend::yuv_components(overlay.rgb(), matrix, range, spec.scale_bits)
                 }
-                ColorModel::Rgb => blend::rgb_components(overlay.rgb(), spec.scale_bits),
+                ColorModel::Rgb => blend::rgb_components(overlay.rgb(), range, spec.scale_bits),
             };
 
             if share_pooling {

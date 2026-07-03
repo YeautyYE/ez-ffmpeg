@@ -64,11 +64,18 @@ pub(crate) struct PlaneView<'a> {
 }
 
 /// Color matrix used to convert subtitle RGB into the frame's YUV.
+/// Variants mirror the entries of FFmpeg's `av_csp_luma_coeffs_from_avcsp`
+/// table that `ff_draw_init2` accepts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ColorMatrix {
     Bt601,
     Bt709,
     Bt2020,
+    Fcc,
+    Smpte240m,
+    /// FFmpeg quirk preserved: YCoCg gets the standard luma-coefficient
+    /// formula with (0.25, 0.5, 0.25), not a real YCoCg transform.
+    YCoCg,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,6 +175,9 @@ pub(crate) fn yuv_components(
         ColorMatrix::Bt601 => (0.299, 0.114),
         ColorMatrix::Bt709 => (0.2126, 0.0722),
         ColorMatrix::Bt2020 => (0.2627, 0.0593),
+        ColorMatrix::Fcc => (0.30, 0.11),
+        ColorMatrix::Smpte240m => (0.212, 0.087),
+        ColorMatrix::YCoCg => (0.25, 0.25),
     };
     let kg = 1.0 - kr - kb;
     let r = f64::from(rgb[0]) / 255.0;
@@ -191,14 +201,19 @@ pub(crate) fn yuv_components(
     ]
 }
 
-/// RGB-model frames take the color as-is, scaled to the component depth
-/// (identity for the 8-bit packed formats in the layout table).
-pub(crate) fn rgb_components(rgb: [u8; 3], scale_bits: u32) -> [u32; 3] {
-    [
-        scale_component(f64::from(rgb[0]) / 255.0, scale_bits),
-        scale_component(f64::from(rgb[1]) / 255.0, scale_bits),
-        scale_component(f64::from(rgb[2]) / 255.0, scale_bits),
-    ]
+/// RGB-model frames take the color scaled to the component depth. Like
+/// `ff_draw_color`, an explicit limited range applies the luma scale and
+/// offset to every RGB channel (`chroma` is false for RGB components).
+pub(crate) fn rgb_components(rgb: [u8; 3], range: ColorRange, scale_bits: u32) -> [u32; 3] {
+    let map = |component: u8| -> u32 {
+        let normalized = f64::from(component) / 255.0;
+        let ranged = match range {
+            ColorRange::Limited => normalized * (219.0 / 255.0) + 16.0 / 255.0,
+            ColorRange::Full => normalized,
+        };
+        scale_component(ranged, scale_bits)
+    };
+    [map(rgb[0]), map(rgb[1]), map(rgb[2])]
 }
 
 fn scale_component(normalized: f64, scale_bits: u32) -> u32 {
@@ -1378,8 +1393,16 @@ mod tests {
             yuv_components([255, 255, 255], ColorMatrix::Bt601, ColorRange::Limited, 16)[0],
             60395
         );
-        // RGB identity at 8 bit.
-        assert_eq!(rgb_components([12, 200, 255], 8), [12, 200, 255]);
+        // RGB identity at 8 bit (full range), limited-range compression like
+        // ff_draw_color (chroma=false for every RGB component).
+        assert_eq!(
+            rgb_components([12, 200, 255], ColorRange::Full, 8),
+            [12, 200, 255]
+        );
+        assert_eq!(
+            rgb_components([0, 128, 255], ColorRange::Limited, 8),
+            [16, 126, 235]
+        );
     }
 
     #[test]

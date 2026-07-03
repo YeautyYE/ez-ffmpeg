@@ -161,6 +161,16 @@ impl SubtitleRenderer for PureRenderer {
                 fonts: &self.fonts,
                 frame_w: self.frame_w,
                 frame_h: self.frame_h,
+                storage_w: if self.storage_w > 0 {
+                    self.storage_w
+                } else {
+                    self.frame_w
+                },
+                storage_h: if self.storage_h > 0 {
+                    self.storage_h
+                } else {
+                    self.frame_h
+                },
                 par: self.par,
                 opts: &self.opts,
             };
@@ -174,14 +184,14 @@ impl SubtitleRenderer for PureRenderer {
                 let mut rendered = render_event(&ctx, event, now_ms, &mut self.face_cache);
                 time_dependent |= rendered.uses_time;
                 seen_unsupported |= rendered.unsupported;
+                let detect_collisions = rendered.detect_collisions;
                 let nodes = &mut rendered.nodes;
                 if nodes.is_empty() {
                     continue;
                 }
                 // Collision stacking for unpositioned events: shift the
                 // whole block off previously occupied rectangles.
-                let positioned = uses_time_or_positioned(event);
-                if !positioned {
+                if detect_collisions {
                     stack_block(nodes, &mut occupied, &self.script, event, self.frame_h);
                 } else if let Some(bbox) = block_bbox(nodes) {
                     occupied.push(bbox);
@@ -213,13 +223,6 @@ impl SubtitleRenderer for PureRenderer {
         self.face_cache.clear();
         self.cache = None;
     }
-}
-
-/// Events positioned by \pos/\move skip collision handling (libass sets
-/// `detect_collisions = 0`); a cheap text scan avoids re-parsing tags.
-fn uses_time_or_positioned(event: &crate::subtitle::ass::Event) -> bool {
-    let text = &event.text;
-    text.contains("\\pos") || text.contains("\\move")
 }
 
 fn block_bbox(nodes: &[RenderedNode]) -> Option<(i32, i32, i32, i32)> {
@@ -435,7 +438,7 @@ mod tests {
     #[test]
     fn unsupported_features_warn_once_per_renderer() {
         let events = "Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\frz45}Rotated\n\
-                      Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\k50}Kara{\\k50}oke\n\
+                      Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\kf50}Kara{\\kf50}oke\n\
                       Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\t(0,500,\\fs30)}Anim\n";
         let Some(mut renderer) = renderer_with(events) else {
             eprintln!("skipping: no known test font present on this machine");
@@ -445,12 +448,17 @@ mod tests {
         let _ = renderer.render_frame(1_000);
         let flags = renderer.warned_unsupported;
         assert!(flags & unsupported::ROTATION != 0, "\\frz must be flagged");
-        assert!(flags & unsupported::KARAOKE != 0, "\\k must be flagged");
+        assert!(
+            flags & unsupported::KARAOKE != 0,
+            "\\kf sweep approximation must be flagged"
+        );
         assert!(flags & unsupported::ANIMATION != 0, "\\t must be flagged");
-        // Supported-only scripts stay silent.
-        let mut clean = renderer_with(test_util::HELLO_EVENT).expect("font probed above");
+        // Supported-only scripts stay silent — including plain \k karaoke,
+        // whose stepwise coloring is exact.
+        let plain_k = "Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\k50}Kara{\\k50}oke\n";
+        let mut clean = renderer_with(plain_k).expect("font probed above");
         let _ = clean.render_frame(1_000);
-        assert_eq!(clean.warned_unsupported, 0, "plain text must not warn");
+        assert_eq!(clean.warned_unsupported, 0, "\\k must not warn");
         // A bare \frz reset with zero style angle is a genuine no-op.
         let noop = "Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\frz}Reset\n";
         let mut noop_renderer = renderer_with(noop).expect("font probed above");
@@ -458,6 +466,64 @@ mod tests {
         assert_eq!(
             noop_renderer.warned_unsupported, 0,
             "\\frz reset-to-0 must not warn"
+        );
+    }
+
+    #[test]
+    fn karaoke_steps_secondary_to_primary_at_syllable_start() {
+        // {\k100}A{\k100}B: at t=0.5s libass paints A primary and B
+        // secondary; at t=1.5s both are primary. Karaoke also disables the
+        // static-frame cache (time-dependent).
+        let events = "Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\k100}A{\\k100}B\n";
+        let Some(mut renderer) = renderer_with(events) else {
+            eprintln!("skipping: no known test font present on this machine");
+            return;
+        };
+        let count_secondary = |renderer: &mut PureRenderer, ms: i64| -> usize {
+            renderer
+                .render_frame(ms)
+                .iter()
+                // Default style: primary white (FFFFFF), secondary red (FF0000
+                // in RGB — libass default secondary_colour is 0x00FFFF00 BGR).
+                .filter(|image| image.color >> 8 == 0xFF0000)
+                .count()
+        };
+        assert!(
+            count_secondary(&mut renderer, 500) > 0,
+            "unsung syllable must use SecondaryColour"
+        );
+        assert_eq!(
+            count_secondary(&mut renderer, 1_500),
+            0,
+            "after its start every syllable is primary"
+        );
+    }
+
+    #[test]
+    fn repeated_hard_breaks_keep_empty_lines() {
+        // libass FORCEBREAK: A\N\NB spans three lines — the empty middle
+        // line keeps its height, pushing A higher than in A\NB.
+        let double = "Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,A\\N\\NB\n";
+        let single = "Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,A\\NB\n";
+        let (Some(mut with_gap), Some(mut without_gap)) =
+            (renderer_with(double), renderer_with(single))
+        else {
+            eprintln!("skipping: no known test font present on this machine");
+            return;
+        };
+        let top = |renderer: &mut PureRenderer| {
+            renderer
+                .render_frame(1_000)
+                .iter()
+                .map(|o| o.dst_y)
+                .min()
+                .expect("some overlay")
+        };
+        let gap_top = top(&mut with_gap);
+        let plain_top = top(&mut without_gap);
+        assert!(
+            gap_top < plain_top,
+            "empty line must add height: {gap_top} !< {plain_top}"
         );
     }
 
