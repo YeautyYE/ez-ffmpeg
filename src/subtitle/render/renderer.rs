@@ -570,6 +570,36 @@ mod tests {
         assert!(renderer.render_frame(20_000).is_empty());
     }
 
+    /// Hostile numeric override values must not panic the renderer (debug
+    /// builds trap integer overflow; release would silently wrap or, for
+    /// unbounded allocations, OOM). Covers the border/blur allocation clamps
+    /// and the widened \p-scale shift, drawing cbox, \fade time, and margin
+    /// arithmetic. All render frames must complete.
+    #[test]
+    fn hostile_numeric_overrides_do_not_panic() {
+        let events = concat!(
+            // Huge outline: stroke-mask allocation is clamped to the frame.
+            "Dialogue: 0,0:00:00.00,0:00:10.00,Default,,0,0,0,,{\\bord100000}A\n",
+            // \p99: drawing-scale shift was `1u32 << 98`.
+            "Dialogue: 0,0:00:00.00,0:00:10.00,Default,,0,0,0,,{\\p99}m 0 0 l 5 5{\\p0}\n",
+            // Extreme drawing coordinates: cbox subtraction is widened.
+            "Dialogue: 0,0:00:00.00,0:00:10.00,Default,,0,0,0,,{\\p1}m -2000000000 0 l 2000000000 0 2000000000 5{\\p0}\n",
+            // Extreme \fade times, plus a negative alpha (mask-active bit).
+            "Dialogue: 0,0:00:00.00,0:00:10.00,Default,,0,0,0,,{\\fade(255,0,255,-2000000000,2000000000,0,10)}B\n",
+            "Dialogue: 0,0:00:00.00,0:00:10.00,Default,,0,0,0,,{\\fade(-5,0,0,0,100,9000,10000)\\bord4}C\n",
+            // Extreme margins: wrap-width arithmetic is widened.
+            "Dialogue: 0,0:00:00.00,0:00:10.00,Default,,-2000000000,2000000000,0,,D E F G H\n",
+        );
+        let Some(mut renderer) = renderer_with(events) else {
+            eprintln!("skipping: no known test font present on this machine");
+            return;
+        };
+        // Timestamps across the fade interpolation branches.
+        for ms in [0, 50, 500, 1_000, 5_000, 9_999] {
+            let _ = renderer.render_frame(ms);
+        }
+    }
+
     #[test]
     fn renders_drawing_event_at_position() {
         let Some(mut renderer) = renderer_with(test_util::DRAWING_EVENT) else {
