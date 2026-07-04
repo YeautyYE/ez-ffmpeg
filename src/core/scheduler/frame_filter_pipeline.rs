@@ -325,6 +325,7 @@ fn run_pipeline(
         }
 
         // request frame
+        let mut produced_frame = false;
         for i in 0..pipeline.filter_len() {
             loop {
                 let result = pipeline.request_frame(i);
@@ -340,6 +341,7 @@ fn run_pipeline(
                 if tmp_frame.is_none() {
                     break;
                 }
+                produced_frame = true;
 
                 match pipeline.run_filters_from(i + 1, tmp_frame.unwrap()) {
                     Ok(tmp_frame) => send_frame(
@@ -361,6 +363,20 @@ fn run_pipeline(
 
         if frame_senders.is_empty() {
             debug!("All frame sender finished, finishing.");
+            return Ok(());
+        }
+
+        // The source (decoder/filtergraph) has disconnected and this pass
+        // drained the filters dry: the EOF frame was already forwarded
+        // downstream and nothing more will ever be produced. Exit now.
+        // Otherwise the thread spins forever and the scheduler's join-all
+        // (`ThreadSynchronizer`, added by the pipeline-correctness rework)
+        // never completes -- `frame_senders` only shrinks on a *failed* send,
+        // which never happens once there is nothing left to send. Returning
+        // drops `frame_senders`, disconnecting any still-live destination as a
+        // final EOF signal.
+        if src_finished_flag && !produced_frame {
+            debug!("Source finished and filters drained, finishing.");
             return Ok(());
         }
     }
