@@ -1085,6 +1085,18 @@ mod tests {
 
         let scheduler = FfmpegScheduler::new(context);
         let scheduler = scheduler.start().unwrap();
+        // Watchdog instead of a bare `wait()`: the regression this test
+        // guards against is a pipeline thread that never exits, and `wait()`
+        // would turn that into a silent test-suite hang (the integration
+        // suites use wait_with_watchdog for the same reason).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !scheduler.is_ended() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "output frame pipeline did not terminate within 60s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         scheduler.wait().unwrap();
         let _ = std::fs::remove_file(&out_path);
     }
