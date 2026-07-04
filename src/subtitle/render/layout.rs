@@ -1665,8 +1665,7 @@ fn rasterize_segment(
     let shadow_dx = state.shadow_x * ctx.border_scale_x();
     let shadow_dy = state.shadow_y * ctx.border_scale_y();
 
-    let mut border_bitmap = CoverageBitmap::default();
-    if state.border_style == 3 {
+    let mut border_bitmap = if state.border_style == 3 {
         // Opaque box: the segment's bounding rectangle in the outline color.
         let mut rect = Vec::new();
         push_rect(
@@ -1676,10 +1675,12 @@ fn rasterize_segment(
             segment.width + 2.0 * f64::from(border_px_x),
             segment.ascent + segment.descent + 2.0 * f64::from(border_px_y),
         );
-        border_bitmap = fill_path(&rect);
+        fill_path(&rect)
     } else if border_px > 0.0 {
-        border_bitmap = border_path(&commands, &fill, border_px_x, border_px_y);
-    }
+        border_path(&commands, &fill, border_px_x, border_px_y)
+    } else {
+        CoverageBitmap::default()
+    };
 
     // Effects on the outermost shape: gaussian first, then \be, matching
     // libass ass_synth_blur. Sigma per axis is blur * blur_scale * the
@@ -1725,13 +1726,18 @@ fn rasterize_segment(
     // back color. libass keeps signed offsets (26.6, floored to pixels).
     // BorderStyle 4 suppresses per-glyph shadows (render_text skips bm_s);
     // the event-level background rectangle replaces them.
-    if has_shadow && state.border_style != 4 {
+    let wants_shadow = has_shadow && state.border_style != 4;
+    // Only when the shadow drops the fill does ass_fix_outline hollow it
+    // (or, below, the border), making the two diverge — the shadow needs
+    // its own buffer. Otherwise it is a byte-identical copy of the border
+    // (or fill) node and can alias that payload; only the offset differs.
+    if wants_shadow && !fill_in_shadow {
         let mut shadow = if border_bitmap.is_empty() {
             fill.clone()
         } else {
             border_bitmap.clone()
         };
-        if !border_bitmap.is_empty() && fill_in_border && !fill_in_shadow {
+        if !border_bitmap.is_empty() && fill_in_border {
             fix_outline(&fill, &mut shadow);
         }
         shadow.x += shadow_dx.floor() as i32;
@@ -1746,15 +1752,31 @@ fn rasterize_segment(
         fix_outline(&fill, &mut border_bitmap);
     }
 
-    if !border_bitmap.is_empty() && !karaoke_hide_outline {
+    let border_shared: SharedBitmap = border_bitmap.into();
+    let fill_shared: SharedBitmap = fill.into();
+    if wants_shadow && fill_in_shadow {
+        let mut shadow = if border_shared.is_empty() {
+            fill_shared.clone()
+        } else {
+            border_shared.clone()
+        };
+        shadow.x += shadow_dx.floor() as i32;
+        shadow.y += shadow_dy.floor() as i32;
+        shadows.push(RenderedNode {
+            bitmap: shadow,
+            color: node_color(state.colors[3]),
+        });
+    }
+
+    if !border_shared.is_empty() && !karaoke_hide_outline {
         borders.push(RenderedNode {
-            bitmap: border_bitmap.into(),
+            bitmap: border_shared,
             color: node_color(state.colors[2]),
         });
     }
     if !(effects_applied && border_px <= 0.0 && state.border_style != 3) {
         fills.push(RenderedNode {
-            bitmap: fill.into(),
+            bitmap: fill_shared,
             color: node_color(fill_color),
         });
     }
