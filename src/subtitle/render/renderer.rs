@@ -301,7 +301,10 @@ impl SubtitleRenderer for PureRenderer {
                         let rendered = render_event(&ctx, event, now_ms, &mut self.face_cache);
                         seen_unsupported |= rendered.unsupported;
                         self.dynamics.insert(index, rendered.dynamics);
-                        let full = self.dynamics[&index]
+                        let full = self
+                            .dynamics
+                            .get(&index)
+                            .expect("dynamics recorded just above")
                             .sample(now_ms - event.start_ms, event.duration_ms);
                         // First render of this event: the pre-loop fade was
                         // None (no record yet); emission needs the real one.
@@ -350,7 +353,9 @@ impl SubtitleRenderer for PureRenderer {
                 .map(|(&index, mask)| {
                     mask.unwrap_or_else(|| {
                         let event = &self.script.events[index];
-                        self.dynamics[&index]
+                        self.dynamics
+                            .get(&index)
+                            .expect("dynamics recorded during this render pass")
                             .sample(now_ms - event.start_ms, event.duration_ms)
                             .mask_key()
                     })

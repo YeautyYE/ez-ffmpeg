@@ -117,6 +117,14 @@ impl SampleFormat {
             SampleFormat::U16Le => (0x101 * u32::from(opacity) + 0x2) >> 8,
         }
     }
+
+    /// Bytes per sample at this width.
+    pub(crate) fn bytes(self) -> usize {
+        match self {
+            SampleFormat::U8 => 1,
+            SampleFormat::U16Le => 2,
+        }
+    }
 }
 
 /// Static sample codec: load/store one sample and the FFmpeg blend at that

@@ -247,7 +247,11 @@ impl SubtitleFilter {
             tasks.push(CompTask {
                 plane: placement.plane,
                 data: data.add(placement.offset),
-                len: plane_bytes - placement.offset,
+                // The view ends at the component's LAST SAMPLE: the
+                // trailing interleave bytes after it belong to sibling
+                // components (or don't exist on tight buffers), and the
+                // kernels never touch them since the row_len fix.
+                len: plane_bytes - placement.offset - (placement.pixel_step - spec.sample.bytes()),
                 linesize,
                 pixel_step: placement.pixel_step,
                 source: *source,
@@ -308,8 +312,9 @@ struct CompTask {
     plane: usize,
     /// First byte of this component (plane base + component offset).
     data: *mut u8,
-    /// Addressable bytes from `data` (same bound the serial views used:
-    /// `linesize * (plane_h - 1) + plane_w * pixel_step - offset`).
+    /// Addressable bytes from `data`, ending at the component's LAST
+    /// SAMPLE: `linesize * (plane_h - 1) + (plane_w - 1) * pixel_step +
+    /// sample_bytes` (view-relative).
     len: usize,
     linesize: usize,
     pixel_step: usize,
@@ -942,10 +947,9 @@ mod tests {
         // Three overlays: dense structured (overhanging top-left),
         // translucent red, and a solid overhanging the bottom — different
         // colors and opacities so every source component and the
-        // compositing order matter. None touches the exact right plane
-        // edge: interleaved components (NV12 V, P010 V, RGB G/B) have a
-        // pre-existing 1-byte view overrun there (predates this test and
-        // is identical on both paths compared here).
+        // compositing order matter. (Right-edge interleaved geometry is
+        // covered separately by right_edge_offset_component_stays_in_bounds
+        // since the row_len fix.)
         let mask_a = {
             let mut mask = lcg_bytes(220 * 130, &mut seed);
             for (i, byte) in mask.iter_mut().enumerate() {
