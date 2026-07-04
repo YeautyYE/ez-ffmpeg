@@ -142,6 +142,9 @@ pub enum Error {
     Exit,
     #[error("Bug")]
     Bug,
+
+    #[error("Invalid recipe argument: {0}")]
+    InvalidRecipeArg(String),
 }
 
 /// Error type for RTMP streaming operations using StreamBuilder

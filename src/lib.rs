@@ -156,6 +156,8 @@ pub use self::core::device;
 pub use self::core::hwaccel;
 pub use self::core::codec;
 pub use self::core::filter;
+pub use self::core::analysis;
+pub use self::core::recipes;
 
 pub use ffmpeg_sys_next::AVRational;
 pub use ffmpeg_sys_next::AVMediaType;

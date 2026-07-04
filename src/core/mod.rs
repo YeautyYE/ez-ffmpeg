@@ -464,6 +464,17 @@ pub mod filter;
 /// ```
 pub(crate) mod metadata;
 
+/// The **analysis** module surfaces the results of FFmpeg detector/measurement
+/// filters (`blackdetect`, `silencedetect`, `scdet`, `cropdetect`, `ebur128`)
+/// as typed Rust events and a folded report, instead of only FFmpeg logs.
+pub mod analysis;
+
+/// The **recipes** module provides one-shot helpers for common workflows
+/// (thumbnails/sprite sheets, animated GIF export, HLS ABR ladders) built on
+/// top of the ez-ffmpeg builder. The raw `filter_desc` escape hatch remains
+/// available for anything these do not cover.
+pub mod recipes;
+
 static INIT_FFMPEG: std::sync::Once = std::sync::Once::new();
 
 extern "C" fn cleanup() {
