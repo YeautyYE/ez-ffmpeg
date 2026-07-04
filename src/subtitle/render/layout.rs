@@ -9,7 +9,8 @@
 
 use super::fonts::{FaceRequest, FontStore, LoadedFace};
 use super::raster::{
-    be_blur, border_path, drawing_commands, fill_path, fix_outline, gaussian_blur, CoverageBitmap,
+    be_blur, border_path, drawing_commands, fill_path, fix_outline, gaussian_blur, path_extent,
+    CoverageBitmap,
     OutlinePath, SharedBitmap,
 };
 use super::shape::{bidi_runs, shape_complex, shape_simple};
@@ -675,17 +676,20 @@ pub(crate) fn render_event(
             (x, y)
         }
         None => {
-            let left = f64::from(rect_x + margin_l);
-            let right = f64::from(rect_x + rect_w - margin_r);
+            // Same hazard as `max_width` above: margins are untrusted (as
+            // extreme as i32::MIN), so widen to f64 BEFORE combining — the
+            // i32 add/sub here overflowed on hostile MarginR/MarginV.
+            let left = f64::from(rect_x) + f64::from(margin_l);
+            let right = f64::from(rect_x) + f64::from(rect_w) - f64::from(margin_r);
             let x = match halign {
                 1 => left,
                 3 => right - block_w,
                 _ => (left + right - block_w) / 2.0,
             };
             let mut y = match valign {
-                VALIGN_TOP => f64::from(rect_y + margin_v),
+                VALIGN_TOP => f64::from(rect_y) + f64::from(margin_v),
                 VALIGN_CENTER => f64::from(rect_y) + (f64::from(rect_h) - block_h) / 2.0,
-                _ => f64::from(rect_y + rect_h - margin_v) - block_h,
+                _ => f64::from(rect_y) + f64::from(rect_h) - f64::from(margin_v) - block_h,
             };
             if valign == VALIGN_SUB && ctx.opts.line_position > 0.0 {
                 y -= ctx.opts.line_position / 100.0 * f64::from(ctx.frame_h);
@@ -1684,6 +1688,19 @@ fn rasterize_segment(
         return;
     }
 
+    // Hostile-input guard, mirroring the drawing segment builder: a run
+    // whose scaled outline dwarfs the frame (`\fs` / `\fscx` / `\fscy` /
+    // `\fsp` in the tens of thousands, degenerate PlayRes) would make the
+    // rasterizer allocate an enormous mask or overflow its u32 size math.
+    // Skip it like an empty segment. The bound is generous — real
+    // subtitles fit within the frame.
+    let max_extent = f64::from(ctx.frame_w.max(ctx.frame_h)) * 8.0;
+    if let Some((path_w, path_h)) = path_extent(&commands) {
+        if !(path_w <= max_extent && path_h <= max_extent) {
+            return;
+        }
+    }
+
     let fill = fill_path(&commands);
     // BorderStyle 3 opaque boxes cover glyphless segments too — libass
     // builds an OUTLINE_BOX for every advance, spaces included.
@@ -1702,6 +1719,15 @@ fn rasterize_segment(
     let shadow_dy = state.shadow_y * ctx.border_scale_y();
 
     let mut border_bitmap = if state.border_style == 3 {
+        // Glyphless runs (spaces only) carry no outline for the guard above
+        // to measure, yet still get an opaque box; bound the box the same
+        // way — `\fsp` and hostile font sizes inflate the segment metrics
+        // without producing a single path point.
+        let box_w = segment.width + 2.0 * f64::from(border_px_x);
+        let box_h = segment.ascent + segment.descent + 2.0 * f64::from(border_px_y);
+        if !(box_w <= max_extent && box_h <= max_extent) {
+            return;
+        }
         // Opaque box: the segment's bounding rectangle in the outline color.
         let mut rect = Vec::new();
         push_rect(

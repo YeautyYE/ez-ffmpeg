@@ -1,7 +1,9 @@
 //! CPU alpha-blend of rendered subtitle overlays onto video frame planes.
 //!
-//! Entirely safe code: the renderer produces [`OverlayImage`] views over its
-//! coverage bitmaps and the filter hands plane slices in as [`PlaneView`]s.
+//! Safe code except for the runtime-dispatched AVX2 kernels (`blend/avx2.rs`;
+//! every call site is gated on `avx2::enabled()` and carries its own SAFETY
+//! note): the renderer produces [`OverlayImage`] views over its coverage
+//! bitmaps and the filter hands plane slices in as [`PlaneView`]s.
 //!
 //! The math matches FFmpeg's `ff_blend_mask()`/`blend_pixel()`/
 //! `blend_pixel16()` and `ff_draw_color()` (drawutils.c, verified against tag

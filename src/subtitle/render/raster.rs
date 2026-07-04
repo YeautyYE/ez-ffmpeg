@@ -136,9 +136,77 @@ impl From<CoverageBitmap> for SharedBitmap {
     }
 }
 
+/// Bounding-box size `(w, h)` of a command list in its own coordinate
+/// space, `None` for an empty list. Control points count toward the box
+/// (conservative: never smaller than the true curve extent). Any non-finite
+/// coordinate poisons the result to infinity so callers reject the path —
+/// hostile scripts can inject NaN/inf through extreme scale factors, and
+/// NaN would otherwise slip past a min/max fold.
+pub(crate) fn path_extent(commands: &[Command]) -> Option<(f64, f64)> {
+    let mut min = (f64::INFINITY, f64::INFINITY);
+    let mut max = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+    let mut any = false;
+    let mut poisoned = false;
+    let mut visit = |p: &Vector| {
+        any = true;
+        let (x, y) = (f64::from(p.x), f64::from(p.y));
+        if !(x.is_finite() && y.is_finite()) {
+            poisoned = true;
+            return;
+        }
+        min.0 = min.0.min(x);
+        min.1 = min.1.min(y);
+        max.0 = max.0.max(x);
+        max.1 = max.1.max(y);
+    };
+    for command in commands {
+        match command {
+            Command::MoveTo(p) | Command::LineTo(p) => visit(p),
+            Command::QuadTo(c, p) => {
+                visit(c);
+                visit(p);
+            }
+            Command::CurveTo(c1, c2, p) => {
+                visit(c1);
+                visit(c2);
+                visit(p);
+            }
+            Command::Close => {}
+        }
+    }
+    if !any {
+        return None;
+    }
+    if poisoned {
+        return Some((f64::INFINITY, f64::INFINITY));
+    }
+    Some((max.0 - min.0, max.1 - min.1))
+}
+
+/// Whether rasterizing `commands` (padded by `pad` on every side for a
+/// stroke radius) stays clear of zeno's u32 mask sizing: zeno computes the
+/// mask buffer as `width * height` in u32 (zeno mask.rs), which a huge path
+/// wraps. The layout-level extent guard is frame-RELATIVE (8x the frame),
+/// so on 8K-class frames a path it admits — especially once a border
+/// stroke widens it — can still reach 2^32 pixels; this absolute check is
+/// the rasterizer's own line of defense. The +4.0 covers zeno's rounding
+/// and anti-aliasing slack per axis.
+fn raster_area_safe(commands: &[Command], pad: f64) -> bool {
+    match path_extent(commands) {
+        None => true,
+        Some((w, h)) => {
+            let side_w = w + 2.0 * pad + 4.0;
+            let side_h = h + 2.0 * pad + 4.0;
+            side_w.is_finite()
+                && side_h.is_finite()
+                && side_w * side_h < f64::from(u32::MAX)
+        }
+    }
+}
+
 /// Rasterizes a filled path (non-zero rule, like FreeType/VSFilter).
 pub(crate) fn fill_path(commands: &[Command]) -> CoverageBitmap {
-    if commands.is_empty() {
+    if commands.is_empty() || !raster_area_safe(commands, 0.0) {
         return CoverageBitmap::default();
     }
     let (data, placement) = Mask::new(commands)
@@ -165,6 +233,9 @@ pub(crate) fn border_path(
     let rx = border_x.max(1.0 / 64.0);
     let ry = border_y.max(1.0 / 64.0);
     if (rx - ry).abs() <= rx.max(ry) * 1e-3 {
+        if !raster_area_safe(commands, f64::from(rx.max(ry))) {
+            return fill.clone();
+        }
         let mut stroke = Stroke::new(2.0 * rx.max(ry));
         stroke.cap(Cap::Round).join(Join::Round);
         let (data, placement) = Mask::new(commands).style(Style::Stroke(stroke)).render();
@@ -178,6 +249,9 @@ pub(crate) fn border_path(
         .iter()
         .map(|c| transform_y(*c, f64::from(squeeze)))
         .collect();
+    if !raster_area_safe(&squeezed, f64::from(rx)) {
+        return fill.clone();
+    }
     let mut stroke = Stroke::new(2.0 * rx);
     stroke.cap(Cap::Round).join(Join::Round);
     let (data, placement) = Mask::new(&squeezed).style(Style::Stroke(stroke)).render();
@@ -704,6 +778,24 @@ mod tests {
         let cx = border.w / 2;
         let cy = border.h / 2;
         assert_eq!(border.data[cy * border.w + cx], 255);
+    }
+
+    /// A path within the layout guard's frame-relative bound can still
+    /// exceed zeno's absolute `u32` mask sizing on 8K-class frames — the
+    /// rasterizer must degrade (empty mask / fill-only border), never
+    /// overflow. 70000^2 and the stroked (61440 + 2*7680)^2 both pass
+    /// `2^32` pixels.
+    #[test]
+    fn oversized_paths_degrade_instead_of_overflowing_mask_sizing() {
+        assert!(fill_path(&square(70_000.0)).is_empty());
+
+        let fill = fill_path(&square(20.0));
+        let bordered = border_path(&square(61_440.0), &fill, 7_680.0, 7_680.0);
+        assert_eq!(bordered, fill, "unsafe stroke must fall back to the fill");
+        // The anisotropic pen route has its own mask sizing on the squeezed
+        // path; it must degrade the same way.
+        let aniso = border_path(&square(61_440.0), &fill, 7_680.0, 240.0);
+        assert_eq!(aniso, fill, "unsafe aniso stroke must fall back to the fill");
     }
 
     #[test]
