@@ -324,9 +324,6 @@ pub(crate) struct CodecContext {
 // is only accessed from the thread that owns the CodecContext, and the crate ensures
 // single-threaded access to codec operations.
 unsafe impl Send for CodecContext {}
-// SAFETY: CodecContext can be shared across threads because the crate's architecture
-// ensures that codec operations are synchronized at the scheduler level. Direct
-// concurrent access to AVCodecContext is prevented by the ownership model.
 
 impl CodecContext {
     pub(crate) fn new(avcodec_context: *mut AVCodecContext) -> Self {
@@ -376,9 +373,6 @@ pub(crate) struct Stream {
 // by the parent AVFormatContext, and the crate ensures the format context outlives
 // all Stream references.
 unsafe impl Send for Stream {}
-// SAFETY: Stream is Copy and contains only a raw pointer. Concurrent read access to
-// AVStream metadata is safe. The crate architecture ensures no concurrent mutations
-// to the underlying AVStream occur during stream processing.
 
 pub(crate) struct FrameBox {
     pub(crate) frame: ffmpeg_next::Frame,
@@ -389,8 +383,6 @@ pub(crate) struct FrameBox {
 // SAFETY: FrameBox can be sent to another thread. It contains an ffmpeg_next::Frame
 // (which wraps AVFrame) and FrameData, both of which are only accessed from the owning thread.
 unsafe impl Send for FrameBox {}
-// SAFETY: FrameBox is Sync because the scheduler ensures frames are processed sequentially
-// within their pipeline. No concurrent access occurs to the underlying AVFrame data.
 
 pub fn frame_alloc() -> crate::error::Result<ffmpeg_next::Frame> {
     unsafe {
@@ -429,8 +421,6 @@ pub(crate) struct PacketBox {
 // SAFETY: PacketBox can be sent to another thread. It contains an ffmpeg_next::Packet
 // and PacketData, both only accessed from the owning thread.
 unsafe impl Send for PacketBox {}
-// SAFETY: PacketBox is Sync because the scheduler ensures packets are processed sequentially.
-// No concurrent access occurs to the underlying AVPacket data.
 
 // optionally attached as opaque_ref to decoded AVFrames
 #[derive(Clone)]
@@ -455,8 +445,6 @@ pub(crate) struct AVFormatContextBox {
 // SAFETY: AVFormatContextBox can be sent to another thread. The fmt_ctx pointer is only
 // accessed from the thread that owns the box, and the crate ensures proper cleanup.
 unsafe impl Send for AVFormatContextBox {}
-// SAFETY: AVFormatContextBox is Sync because the crate architecture ensures the format
-// context is only accessed from its owning demuxer/muxer thread during processing.
 
 impl AVFormatContextBox {
     pub(crate) fn new(

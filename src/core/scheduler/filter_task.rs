@@ -371,8 +371,6 @@ impl InputFilterParameter {
 // SAFETY: InputFilterParameter can be sent to another thread. The raw FFmpeg pointers
 // (filter, hw_frames_ctx) are only accessed from the filter task's owning thread.
 unsafe impl Send for InputFilterParameter {}
-// SAFETY: InputFilterParameter is Sync because it is only accessed from a single filter
-// task thread. The crate's scheduler architecture ensures no concurrent access.
 
 #[derive(Default)]
 struct FilterGraphParameter {
@@ -451,8 +449,6 @@ impl OutputFilterParameter {
 // SAFETY: OutputFilterParameter can be sent to another thread. The raw AVFilterContext
 // pointer is only accessed from the filter task's owning thread.
 unsafe impl Send for OutputFilterParameter {}
-// SAFETY: OutputFilterParameter is Sync because it is only accessed from a single filter
-// task thread. The crate's scheduler architecture ensures no concurrent access.
 
 #[cfg(feature = "docs-rs")]
 unsafe fn fg_send_eof(
