@@ -313,6 +313,15 @@ pub(crate) struct MaskSamples {
 
 impl EventSamples {
     /// The mask-identity view of these samples (see [`MaskSamples`]).
+    ///
+    /// Known narrow divergence from the pre-split renderer: a node whose
+    /// unfaded transparency saturates to 255 mid-fade (near-transparent
+    /// colors, `(255 - t) * (255 - fade) <= 127`) used to be dropped
+    /// before collision stacking, shrinking the occupied box for that
+    /// frame; it now keeps its bbox (pixels are identical — emission
+    /// alpha 0 is skipped by the blend). The new behavior is stable
+    /// across the fade and matches libass, whose collision handling is
+    /// computed from layout geometry and never varies with fade.
     pub(crate) fn mask_key(&self) -> MaskSamples {
         MaskSamples {
             // Saturation means the post-clamp multiplier is 255 (every
