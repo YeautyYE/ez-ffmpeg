@@ -43,6 +43,17 @@ pub trait FrameFilter: Send {
     /// - `Ok(Some(frame))` if the filter produces a new frame.
     /// - `Ok(None)` if no frame is produced.
     /// - `Err(String)` if there is an error during processing.
+    ///
+    /// # End of stream
+    /// The last frame a pipeline delivers may be a props-only marker (no
+    /// data buffers, carrying e.g. the EOF timestamp). Shortly after, the
+    /// source disconnects and the pipeline runs one final [`request_frame`]
+    /// sweep before shutting down — output still pending after that sweep
+    /// is discarded. A filter that holds frames back (asynchronous or
+    /// GPU-based) must therefore release ALL remaining output, blocking if
+    /// necessary, when it sees such a marker.
+    ///
+    /// [`request_frame`]: FrameFilter::request_frame
     fn filter_frame(
         &mut self,
         _frame: Frame,
