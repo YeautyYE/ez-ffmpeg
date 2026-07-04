@@ -328,8 +328,9 @@ pub mod hwaccel;
 ///
 /// # Notes
 ///
-/// - The underlying [`Codec`] struct is for internal usage only, bridging to
-///   the raw FFmpeg APIs. In most cases, you only need the higher-level [`CodecInfo`](codec::CodecInfo)
+/// - The underlying `Codec` struct is for internal usage only (`pub(crate)`,
+///   not part of the documented API), bridging to the raw FFmpeg APIs. In most
+///   cases, you only need the higher-level [`CodecInfo`](codec::CodecInfo)
 ///   data from the public functions above.
 /// - The available encoders/decoders can vary depending on your FFmpeg build
 ///   and any external libraries installed on the system.

@@ -290,7 +290,7 @@ pub(super) mod output_filter;
 /// that discards all data while supporting seeking.
 ///
 /// It exposes the [`create_null_output`](null_output::create_null_output) function, which returns an
-/// [`Output`](ez_ffmpeg::Output) object configured to:
+/// [`Output`](crate::Output) object configured to:
 /// - Discard all written data, behaving like `/dev/null`.
 /// - Maintain a seekable position state using atomic operations for thread-safe, high-performance access.
 /// - Support scenarios such as testing or processing streaming inputs (e.g., RTMP) where no output file is needed.
