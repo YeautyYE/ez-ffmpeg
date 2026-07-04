@@ -1057,7 +1057,11 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    #[ignore]
+    // Regression: an output frame pipeline must let the scheduler terminate.
+    // Before the run_pipeline EOF-exit fix, the pipeline thread never returned
+    // after the source disconnected, so the scheduler join-all (`wait()`)
+    // deadlocked. This test used to be `#[ignore]`d, which is why the
+    // regression shipped unnoticed.
     #[test]
     fn test_pipeline() {
         let _ = env_logger::builder()
@@ -1065,9 +1069,11 @@ mod tests {
             .is_test(true)
             .try_init();
 
-        let output: Output = "output.mp4".into();
+        let out_path = std::env::temp_dir().join("ez_test_pipeline_out.mp4");
+        let output: Output = out_path.to_str().unwrap().into();
         let frame_pipeline_builder: FramePipelineBuilder = AVMediaType::AVMEDIA_TYPE_VIDEO.into();
-        let frame_pipeline_builder = frame_pipeline_builder.filter("test", Box::new(NoopFilter::new(AVMediaType::AVMEDIA_TYPE_VIDEO)));
+        let frame_pipeline_builder = frame_pipeline_builder
+            .filter("test", Box::new(NoopFilter::new(AVMediaType::AVMEDIA_TYPE_VIDEO)));
         let output = output.add_frame_pipeline(frame_pipeline_builder);
 
         let context = FfmpegContext::builder()
@@ -1080,6 +1086,7 @@ mod tests {
         let scheduler = FfmpegScheduler::new(context);
         let scheduler = scheduler.start().unwrap();
         scheduler.wait().unwrap();
+        let _ = std::fs::remove_file(&out_path);
     }
 
     #[test]
