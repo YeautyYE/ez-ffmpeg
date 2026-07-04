@@ -25,10 +25,12 @@ pub(crate) struct FaceRef {
 /// the OpenType shaping tables are parsed once per face, not once per
 /// shaped text run.
 pub(crate) struct LoadedFace {
-    _data: Arc<Vec<u8>>,
-    // SAFETY invariant: `face` borrows from `_data`'s heap allocation,
-    // which is stable (Arc) and dropped after `face` (field order).
+    // SAFETY invariant: `face` borrows from `_data`'s heap allocation. It is
+    // declared BEFORE `_data` so it is dropped FIRST (struct fields drop in
+    // declaration order); the Arc-backed bytes therefore outlive the borrow
+    // for the whole life of the face, and are never mutated while it lives.
     face: rustybuzz::Face<'static>,
+    _data: Arc<Vec<u8>>,
 }
 
 impl LoadedFace {
@@ -40,8 +42,8 @@ impl LoadedFace {
         let bytes: &'static [u8] = unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
         let face = ttf_parser::Face::parse(bytes, face_ref.index).ok()?;
         Some(Self {
-            _data: data,
             face: rustybuzz::Face::from_face(face),
+            _data: data,
         })
     }
 
