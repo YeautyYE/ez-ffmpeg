@@ -98,6 +98,7 @@ More examples can be found [here][examples].
 
 - **opengl:** Enables GPU-accelerated OpenGL filters for high-performance video processing.
 - **rtmp:** High-performance embedded RTMP server with native epoll/kqueue, O(1) GOP sharing, and 10,000+ concurrent connections on Linux/macOS (8,000 on Windows). In-process ingest with no TCP between FFmpeg and server.
+- **subtitle:** Native ASS/SRT subtitle burn-in rendered by a pure-Rust engine inside the frame pipeline — independent of FFmpeg build flags (no `--enable-libass` needed, no system libass), with in-memory script input and explicit font-file control.
 - **flv:** Provides support for FLV container parsing and handling.
 - **async:** Adds asynchronous functionality (allowing you to `.await` operations).
 - **static:** Enables static linking for FFmpeg libraries (via `ffmpeg-next/static`).
