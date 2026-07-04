@@ -87,7 +87,12 @@ fn tokenize(text: &str) -> Vec<Token> {
                 }
                 spline_start = None;
             }
-        } else if is_set < 2 {
+        } else if is_set < 2 && bytes[p] < 0x80 {
+            // A number never starts with a non-ASCII byte. Guarding on
+            // `bytes[p] < 0x80` also keeps `p` on a char boundary for the
+            // slice below: an ASCII byte is a single-byte char, never a
+            // UTF-8 continuation byte, so `&text[p..]` cannot split a
+            // multibyte character (which would panic).
             if let Some((value, len)) = parse_f64_prefix(&text[p..]) {
                 if is_set == 0 {
                     point.x = double_to_d6(value);
@@ -257,6 +262,19 @@ mod tests {
 
     fn d6(v: i32) -> i32 {
         v * 64
+    }
+
+    #[test]
+    fn non_ascii_bytes_are_skipped_without_panic() {
+        // A non-ASCII char inside a drawing must be skipped like any other
+        // unknown byte, not panic on a non-char-boundary str slice. The
+        // result equals the same drawing with the char removed.
+        let with = parse_drawing("m 0 0 你 l 10 10");
+        let without = parse_drawing("m 0 0 l 10 10");
+        assert_eq!(with, without);
+        // Emoji (4-byte) and a bare continuation-heavy string must also be safe.
+        let _ = parse_drawing("m 0 0 🎬 l 5 5");
+        let _ = parse_drawing("日本語のテスト");
     }
 
     #[test]

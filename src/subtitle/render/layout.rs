@@ -181,7 +181,10 @@ impl State {
             shadow_x: style.shadow,
             shadow_y: style.shadow,
             border_style: style.border_style,
-            blur: style.blur,
+            // Match the inline \blur clamp (apply_tags): a force-style or
+            // nonstandard style Blur is otherwise unbounded and drives the
+            // gaussian padding allocation.
+            blur: style.blur.clamp(0.0, 100.0),
             be: 0,
             colors: [
                 style.primary_colour,
@@ -326,10 +329,10 @@ impl EventSamples {
     /// computed from layout geometry and never varies with fade.
     pub(crate) fn mask_key(&self) -> MaskSamples {
         MaskSamples {
-            // Saturation means the post-clamp multiplier is 255 (every
-            // node fully transparent), so >= — raw \fade alphas can
-            // overshoot the byte range.
-            fade: self.fade.map(|f| (f != 0, f >= 255)),
+            // The mask-active bit must match apply_fade (fade > 0 dims the
+            // fill; <= 0 is a no-op). Saturation means the post-clamp
+            // multiplier is 255 (every node fully transparent), so >=.
+            fade: self.fade.map(|f| (f > 0, f >= 255)),
             anchor_bits: self.anchor_bits,
             karaoke: self.karaoke.clone(),
         }
@@ -601,7 +604,10 @@ pub(crate) fn render_event(
         // Positioned events never wrap against the margins (VSFilter).
         f64::from(rect_w.max(ctx.frame_w))
     } else {
-        f64::from((rect_w - margin_l - margin_r).max(1))
+        // Widen before subtracting: margins come from untrusted fields (wrapping
+        // i32, so as extreme as i32::MIN), and `rect_w - margin` in i32 can
+        // overflow. f64 is exact here for normal margins.
+        (f64::from(rect_w) - f64::from(margin_l) - f64::from(margin_r)).max(1.0)
     };
     let wrap = wrap_lines(&segments, &hard_breaks, max_width, state.wrap_style);
 
@@ -691,10 +697,14 @@ pub(crate) fn render_event(
     // ---- pass 4: rasterize lines ----
     // Only the fade's mask-affecting bit is resolved here; the fade VALUE
     // is applied at emission (renderer) so cached nodes survive fading.
+    // Only a positive fade multiplier actually dims the fill (apply_fade is a
+    // no-op for `fade <= 0`), so a non-positive sample must NOT mark the mask
+    // active — otherwise a negative \fade alpha would hollow the border under
+    // a still-opaque fill.
     let fade_active = overrides
         .fade
         .map(|f| fade_alpha(f, now_rel, event.duration_ms))
-        .is_some_and(|f| f != 0);
+        .is_some_and(|f| f > 0);
     let karaoke_view: Vec<KaraokeSeg> = segments.iter().map(KaraokeSeg::of).collect();
     let karaoke = karaoke_flags_from(&karaoke_view, now_rel);
     let mut nodes: Vec<RenderedNode> = Vec::new();
@@ -1197,21 +1207,24 @@ fn fade_alpha(spec: FadeSpec, now: i64, duration: i64) -> i32 {
         t4,
         two_arg,
     } = spec;
+    // All time math in i64: t1..t4 are attacker-controlled i32 fade times, so
+    // differences like `now - t1` and `t2 - t1` overflow i32 on extreme
+    // inputs. Widening is exact for normal fades (results unchanged).
     let (t1, t4, t3) = if two_arg && t1 == -1 && t4 == -1 {
-        (0, duration as i32, duration as i32 - t3)
+        (0i64, duration, duration - i64::from(t3))
     } else {
-        (t1, t4, t3)
+        (i64::from(t1), i64::from(t4), i64::from(t3))
     };
-    let now = now as i32;
+    let t2 = i64::from(t2);
     if now < t1 {
         a1
     } else if now < t2 {
-        let cf = f64::from(now - t1) / f64::from((t2 - t1).max(1));
+        let cf = (now - t1) as f64 / (t2 - t1).max(1) as f64;
         (f64::from(a1) * (1.0 - cf) + f64::from(a2) * cf) as i32
     } else if now < t3 {
         a2
     } else if now < t4 {
-        let cf = f64::from(now - t3) / f64::from((t4 - t3).max(1));
+        let cf = (now - t3) as f64 / (t4 - t3).max(1) as f64;
         (f64::from(a2) * (1.0 - cf) + f64::from(a3) * cf) as i32
     } else {
         a3
@@ -1408,8 +1421,11 @@ fn build_drawing_segment(
     let Some((min, max)) = drawing.cbox else {
         return;
     };
-    // \p scale: coordinates are divided by 2^(scale-1).
-    let power = f64::from(1u32 << (state.drawing_scale.max(1) - 1) as u32);
+    // \p scale: coordinates are divided by 2^(scale-1). Clamp the shift into
+    // a valid u32 range so a hostile \p (e.g. \p99) cannot overflow the shift
+    // (real drawings use scale 1-4).
+    let shift = (state.drawing_scale.max(1) - 1).clamp(0, 31) as u32;
+    let power = f64::from(1u32 << shift);
     // Drawings scale by the PlayRes aspect WITHOUT par: libass divides the
     // drawing scale by par_scale_x (get_outline_glyph) and multiplies it
     // back during compositing, so par cancels for drawings (it applies to
@@ -1417,8 +1433,23 @@ fn build_drawing_segment(
     let aspect = ctx.scale_x() / ctx.scale_y();
     let x_scale = (ctx.scale_y() * ctx.opts.font_scale * state.scale_x * aspect / power) as f32;
     let y_scale = (ctx.scale_y() * ctx.opts.font_scale * state.scale_y / power) as f32;
-    let width = f64::from(max.x - min.x) / 64.0 * f64::from(x_scale);
-    let height = f64::from(max.y - min.y) / 64.0 * f64::from(y_scale);
+    // Widen before subtracting: coordinates are individually clamped to i32,
+    // so `max - min` in i32 can overflow on extreme drawings. f64 is exact
+    // for the difference of two i32s, so normal drawings are unaffected.
+    let width = (f64::from(max.x) - f64::from(min.x)) / 64.0 * f64::from(x_scale);
+    let height = (f64::from(max.y) - f64::from(min.y)) / 64.0 * f64::from(y_scale);
+    // A drawing whose scaled extent dwarfs the frame is hostile or degenerate
+    // (coordinates near i32::MAX, NaN scales): rasterizing it would allocate
+    // an enormous bitmap or overflow the rasterizer. Skip it like an empty
+    // drawing. The bound is generous — real drawings fit within the frame.
+    let max_extent = f64::from(ctx.frame_w.max(ctx.frame_h)) * 8.0;
+    if !width.is_finite()
+        || !height.is_finite()
+        || width.abs() > max_extent
+        || height.abs() > max_extent
+    {
+        return;
+    }
     let baseline_offset = state.pbo * ctx.scale_y() * state.scale_y;
     segments.push(Segment {
         state: state.clone(),
@@ -1659,8 +1690,13 @@ fn rasterize_segment(
     if fill.is_empty() && !(state.border_style == 3 && segment.width > 0.0) {
         return;
     }
-    let border_px_x = (state.border_x * ctx.border_scale_x()) as f32;
-    let border_px_y = (state.border_y * ctx.border_scale_y()) as f32;
+    // A border cannot sanely exceed the frame extent (a wider stroke paints
+    // the whole frame anyway); clamping here bounds the stroke-mask
+    // allocation for hostile \bord / \xbord / \ybord / Outline values, which
+    // are otherwise only lower-clamped to 0. No real subtitle is affected.
+    let max_border = f64::from(ctx.frame_w.max(ctx.frame_h));
+    let border_px_x = (state.border_x * ctx.border_scale_x()).min(max_border) as f32;
+    let border_px_y = (state.border_y * ctx.border_scale_y()).min(max_border) as f32;
     let border_px = border_px_x.max(border_px_y);
     let shadow_dx = state.shadow_x * ctx.border_scale_x();
     let shadow_dy = state.shadow_y * ctx.border_scale_y();
