@@ -300,7 +300,6 @@ impl FfmpegContextBuilder {
     /// # Errors
     /// Returns an error if any configuration issues are found (e.g., invalid URL syntax,
     /// conflicting filter settings, etc.).
-    /// (The actual validation depends on how [`FfmpegContext::new_with_independent_readrate`](FfmpegContext::new_with_independent_readrate) is implemented.)
     ///
     /// # Example
     /// ```rust,ignore

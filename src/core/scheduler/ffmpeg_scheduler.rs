@@ -688,7 +688,7 @@ impl FfmpegScheduler<Paused> {
     /// - **Files will NOT be seekable or playable** in most media players
     /// - Only use this when you **do not need the output files at all**
     ///
-    /// **The ONLY way to get valid files is to use [`stop()`](Running::stop) instead of `abort()`.**
+    /// **The ONLY way to get valid files is to use [`stop()`](FfmpegScheduler::stop) instead of `abort()`.**
     ///
     /// See [`FfmpegScheduler<Running>::abort()`] for complete documentation.
     ///
