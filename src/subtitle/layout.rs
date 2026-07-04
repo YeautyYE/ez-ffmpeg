@@ -201,29 +201,33 @@ pub(crate) const SUPPORTED_LIST: &str = "yuv420p, yuvj420p, yuv422p, yuvj422p, y
      yuv420p10le, yuv422p10le, yuv444p10le, yuv420p12le, p010le \
      (big-endian and alpha-plane formats are not supported)";
 
-pub(crate) fn format_spec(format: AVPixelFormat) -> Option<&'static FormatSpec> {
+/// Looks up the layout for a raw `AVFrame.format` id. Takes an `i32` (not
+/// `AVPixelFormat`) so a frame carrying an unlisted format id is rejected by
+/// value comparison, never by constructing an out-of-range enum (which would
+/// be UB).
+pub(crate) fn format_spec(format: i32) -> Option<&'static FormatSpec> {
     use AVPixelFormat::*;
     Some(match format {
-        AV_PIX_FMT_YUV420P => &YUV420P,
-        AV_PIX_FMT_YUVJ420P => &YUVJ420P,
-        AV_PIX_FMT_YUV422P => &YUV422P,
-        AV_PIX_FMT_YUVJ422P => &YUVJ422P,
-        AV_PIX_FMT_YUV444P => &YUV444P,
-        AV_PIX_FMT_YUVJ444P => &YUVJ444P,
-        AV_PIX_FMT_NV12 => &NV12,
-        AV_PIX_FMT_NV21 => &NV21,
-        AV_PIX_FMT_RGB24 => &RGB24,
-        AV_PIX_FMT_BGR24 => &BGR24,
-        AV_PIX_FMT_RGBA => &RGBA,
-        AV_PIX_FMT_BGRA => &BGRA,
-        AV_PIX_FMT_ARGB => &ARGB,
-        AV_PIX_FMT_ABGR => &ABGR,
-        AV_PIX_FMT_GRAY8 => &GRAY8,
-        AV_PIX_FMT_YUV420P10LE => &YUV420P10,
-        AV_PIX_FMT_YUV422P10LE => &YUV422P10,
-        AV_PIX_FMT_YUV444P10LE => &YUV444P10,
-        AV_PIX_FMT_YUV420P12LE => &YUV420P12,
-        AV_PIX_FMT_P010LE => &P010,
+        f if f == AV_PIX_FMT_YUV420P as i32 => &YUV420P,
+        f if f == AV_PIX_FMT_YUVJ420P as i32 => &YUVJ420P,
+        f if f == AV_PIX_FMT_YUV422P as i32 => &YUV422P,
+        f if f == AV_PIX_FMT_YUVJ422P as i32 => &YUVJ422P,
+        f if f == AV_PIX_FMT_YUV444P as i32 => &YUV444P,
+        f if f == AV_PIX_FMT_YUVJ444P as i32 => &YUVJ444P,
+        f if f == AV_PIX_FMT_NV12 as i32 => &NV12,
+        f if f == AV_PIX_FMT_NV21 as i32 => &NV21,
+        f if f == AV_PIX_FMT_RGB24 as i32 => &RGB24,
+        f if f == AV_PIX_FMT_BGR24 as i32 => &BGR24,
+        f if f == AV_PIX_FMT_RGBA as i32 => &RGBA,
+        f if f == AV_PIX_FMT_BGRA as i32 => &BGRA,
+        f if f == AV_PIX_FMT_ARGB as i32 => &ARGB,
+        f if f == AV_PIX_FMT_ABGR as i32 => &ABGR,
+        f if f == AV_PIX_FMT_GRAY8 as i32 => &GRAY8,
+        f if f == AV_PIX_FMT_YUV420P10LE as i32 => &YUV420P10,
+        f if f == AV_PIX_FMT_YUV422P10LE as i32 => &YUV422P10,
+        f if f == AV_PIX_FMT_YUV444P10LE as i32 => &YUV444P10,
+        f if f == AV_PIX_FMT_YUV420P12LE as i32 => &YUV420P12,
+        f if f == AV_PIX_FMT_P010LE as i32 => &P010,
         _ => return None,
     })
 }
@@ -231,7 +235,23 @@ pub(crate) fn format_spec(format: AVPixelFormat) -> Option<&'static FormatSpec> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ffmpeg_sys_next::AVPixelFormat;
     use ffmpeg_sys_next::AVPixelFormat::*;
+
+    /// Test shim: the production `format_spec` takes a raw `i32` format id;
+    /// these tests exercise it with typed `AVPixelFormat` variants.
+    fn format_spec(format: AVPixelFormat) -> Option<&'static FormatSpec> {
+        super::format_spec(format as i32)
+    }
+
+    #[test]
+    fn rejects_out_of_range_format_ids_without_ub() {
+        // A raw format id that is not a valid AVPixelFormat discriminant must
+        // be rejected by value, never transmuted into an out-of-range enum.
+        assert!(super::format_spec(999_999).is_none());
+        assert!(super::format_spec(-7).is_none());
+        assert!(super::format_spec(i32::MAX).is_none());
+    }
 
     #[test]
     fn covers_expected_formats_and_rejects_others() {

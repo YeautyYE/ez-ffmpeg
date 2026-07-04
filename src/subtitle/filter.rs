@@ -184,8 +184,11 @@ impl SubtitleFilter {
     ) {
         // ff_draw_init2: an EXPLICIT range is honored; only an unspecified
         // one falls back to the format default (yuvj/RGB full, else
-        // limited).
-        let range = range.unwrap_or(if spec.force_full_range {
+        // limited). RGB is inherently full-range in ff_draw, so an
+        // unspecified-range RGB frame must not compress the overlay to
+        // limited (that dimmed burned-in subtitles).
+        let default_full = spec.force_full_range || matches!(spec.model, ColorModel::Rgb);
+        let range = range.unwrap_or(if default_full {
             ColorRange::Full
         } else {
             ColorRange::Limited
@@ -243,15 +246,19 @@ impl SubtitleFilter {
                 continue;
             }
             let linesize = linesize as usize;
-            let plane_bytes = linesize * (plane_h - 1) + plane_w * placement.pixel_step;
             tasks.push(CompTask {
                 plane: placement.plane,
                 data: data.add(placement.offset),
-                // The view ends at the component's LAST SAMPLE: the
-                // trailing interleave bytes after it belong to sibling
-                // components (or don't exist on tight buffers), and the
-                // kernels never touch them since the row_len fix.
-                len: plane_bytes - placement.offset - (placement.pixel_step - spec.sample.bytes()),
+                // View length relative to the offset-advanced pointer, ending
+                // at the component's LAST SAMPLE:
+                //   linesize*(plane_h-1) + (plane_w-1)*pixel_step + sample_bytes.
+                // The trailing interleave bytes after that sample belong to
+                // sibling components (or don't exist on tight buffers); the
+                // kernels never touch them (`row_len` ends at the last sample
+                // too). `plane_w`/`plane_h` are >= 1 past the guard above.
+                len: linesize * (plane_h - 1)
+                    + (plane_w - 1) * placement.pixel_step
+                    + spec.sample.bytes(),
                 linesize,
                 pixel_step: placement.pixel_step,
                 source: *source,
@@ -518,10 +525,11 @@ impl FrameFilter for SubtitleFilter {
                     .to_string(),
             );
         }
-        // SAFETY: the value was written into the AVFrame by FFmpeg, so it is
-        // a valid AVPixelFormat discriminant (or -1 = NONE).
-        let format_enum = unsafe { std::mem::transmute::<i32, AVPixelFormat>(format) };
-        let Some(spec) = layout::format_spec(format_enum) else {
+        // `format` is a raw C int; matching it against known `AV_PIX_FMT_*`
+        // constants (in `format_spec`) avoids constructing an out-of-range
+        // AVPixelFormat enum value, which would be UB for a frame carrying an
+        // unlisted format id.
+        let Some(spec) = layout::format_spec(format) else {
             return Err(format!(
                 "SubtitleFilter: unsupported pixel format {}; convert first, e.g. \
                  .filter_desc(\"format=yuv420p\") or Output::set_pix_fmt(\"yuv420p\"). \
@@ -638,16 +646,20 @@ fn any_visible_image(
 }
 
 fn pix_fmt_name(format: i32) -> String {
-    // SAFETY: `format` originates from an AVFrame written by FFmpeg, so it is
-    // a valid AVPixelFormat discriminant (or -1 = NONE).
-    unsafe {
-        let name = av_get_pix_fmt_name(std::mem::transmute::<i32, AVPixelFormat>(format));
-        if name.is_null() {
-            format!("#{format}")
-        } else {
-            CStr::from_ptr(name).to_string_lossy().into_owned()
+    // Only ask FFmpeg to name `format` when it is a real AVPixelFormat
+    // discriminant (0..NB); an unlisted id is printed raw rather than
+    // transmuted into an out-of-range enum value (which would be UB).
+    if (0..AVPixelFormat::AV_PIX_FMT_NB as i32).contains(&format) {
+        // SAFETY: `format` is in the valid discriminant range checked above.
+        let name =
+            unsafe { av_get_pix_fmt_name(std::mem::transmute::<i32, AVPixelFormat>(format)) };
+        if !name.is_null() {
+            return unsafe { CStr::from_ptr(name) }
+                .to_string_lossy()
+                .into_owned();
         }
     }
+    format!("#{format}")
 }
 
 #[cfg(test)]
@@ -1000,7 +1012,7 @@ mod tests {
             AV_PIX_FMT_RGB24,
             AV_PIX_FMT_GRAY8,
         ] {
-            let spec = layout::format_spec(format).expect("supported format");
+            let spec = layout::format_spec(format as i32).expect("supported format");
             let fill_seed = 0x5EED_0000 ^ format as u64;
             // SAFETY: frames allocated and freed here; blend_images gets a
             // writable, exclusively-owned software frame matching `spec`.
@@ -1049,6 +1061,130 @@ mod tests {
         }
     }
 
+    /// A subtitle overlay reaching the bottom-right corner must stay in
+    /// bounds for components whose byte offset is nonzero (packed RGB
+    /// green/blue, NV12/NV21/P010 interleaved chroma). Regression for the
+    /// component view length that subtracted `offset` a second time and left
+    /// the view `offset` bytes short of the last sample — a full-cover
+    /// overlay used to panic (slice OOB) on the last row. Odd dimensions
+    /// also stress the subsampled right/bottom edges.
+    #[test]
+    fn right_edge_offset_component_stays_in_bounds() {
+        use ffmpeg_sys_next::AVPixelFormat::*;
+        let (w, h) = (17i32, 9i32);
+        for format in [
+            AV_PIX_FMT_RGB24,
+            AV_PIX_FMT_BGR24,
+            AV_PIX_FMT_RGBA,
+            AV_PIX_FMT_BGRA,
+            AV_PIX_FMT_ARGB,
+            AV_PIX_FMT_ABGR,
+            AV_PIX_FMT_NV12,
+            AV_PIX_FMT_NV21,
+            AV_PIX_FMT_P010LE,
+            AV_PIX_FMT_YUV420P,
+        ] {
+            let spec = layout::format_spec(format as i32).expect("supported format");
+            // Opaque white overlay covering the WHOLE frame incl. the corner.
+            let mask = vec![255u8; (w * h) as usize];
+            let images = [OverlayImage {
+                w: w as usize,
+                h: h as usize,
+                stride: w as usize,
+                bitmap: &mask,
+                color: 0xFFFFFF00,
+                dst_x: 0,
+                dst_y: 0,
+            }];
+            // SAFETY: frame allocated and freed here; blend_images gets a
+            // writable, exclusively-owned software frame matching `spec`.
+            unsafe {
+                let frame = filled_frame(w, h, format, spec, 0xC0DE ^ format as u64);
+                let before = plane_bytes(frame, spec, h as usize);
+                let mut scratch = BlendScratch::default();
+                // Would panic (slice OOB) before the view-length fix.
+                SubtitleFilter::blend_images(
+                    frame,
+                    &images,
+                    spec,
+                    ColorMatrix::Bt601,
+                    Some(ColorRange::Limited),
+                    &mut scratch,
+                    false,
+                );
+                let after = plane_bytes(frame, spec, h as usize);
+                assert_ne!(
+                    before, after,
+                    "{format:?}: full-cover blend must alter the frame"
+                );
+                let mut frame = frame;
+                av_frame_free(&mut frame);
+            }
+        }
+    }
+
+    /// An RGB frame with UNSPECIFIED color range must burn subtitles at full
+    /// range (white = 255), matching FFmpeg ff_draw — not limited (235).
+    #[test]
+    fn rgb_unspecified_range_is_full() {
+        use ffmpeg_sys_next::AVPixelFormat::AV_PIX_FMT_RGB24;
+        let (w, h) = (4i32, 2i32);
+        let spec = layout::format_spec(AV_PIX_FMT_RGB24 as i32).expect("rgb24");
+        let mask = vec![255u8; (w * h) as usize];
+        let images = [OverlayImage {
+            w: w as usize,
+            h: h as usize,
+            stride: w as usize,
+            bitmap: &mask,
+            color: 0xFFFFFF00,
+            dst_x: 0,
+            dst_y: 0,
+        }];
+        // SAFETY: frame allocated and freed here; blend_images gets a
+        // writable, exclusively-owned software frame matching `spec`.
+        unsafe {
+            let frame = filled_frame(w, h, AV_PIX_FMT_RGB24, spec, 0x1);
+            let mut scratch = BlendScratch::default();
+            // range = None => unspecified => must default to full for RGB.
+            SubtitleFilter::blend_images(
+                frame,
+                &images,
+                spec,
+                ColorMatrix::Bt601,
+                None,
+                &mut scratch,
+                false,
+            );
+            let r = *(*frame).data[0];
+            assert!(
+                r > 240,
+                "unspecified-range RGB white must be full-range (got {r}, limited=235)"
+            );
+            let mut frame = frame;
+            av_frame_free(&mut frame);
+        }
+    }
+
+    /// A hostile force-style `Blur` must be clamped like inline `\blur` so it
+    /// cannot drive an unbounded gaussian-padding allocation.
+    #[test]
+    fn force_style_blur_is_bounded() {
+        let Some(font) = test_util::test_font() else {
+            eprintln!("skipping: no known test font present on this machine");
+            return;
+        };
+        let mut filter = SubtitleFilter::builder()
+            .ass_content(quarter_box_script("0:00:00.00", "0:00:10.00"))
+            .force_style("Blur=100000")
+            .default_font_file(font)
+            .font_provider(FontProvider::None)
+            .build()
+            .expect("build subtitle filter");
+        filter.configure_renderer(W as i32, H as i32);
+        // Must complete without OOM/panic; the huge Blur is clamped.
+        let _ = filter.renderer_mut().render_frame(1_000);
+    }
+
     /// End-to-end `blend_images` timing, serial vs plane-parallel, on the
     /// captured dense/sparse scenes (real rendered masks). Deliberately NOT
     /// named `bench_blend...` so it never times concurrently with the
@@ -1079,7 +1215,7 @@ mod tests {
                 (AV_PIX_FMT_YUV420P, "yuv420p"),
                 (AV_PIX_FMT_YUV420P10LE, "yuv420p10le"),
             ] {
-                let spec = layout::format_spec(format).expect("supported format");
+                let spec = layout::format_spec(format as i32).expect("supported format");
                 // SAFETY: frame allocated and freed here; blend_images gets
                 // a writable, exclusively-owned software frame matching
                 // `spec`. Repeated composites only change dst values, not
