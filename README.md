@@ -23,6 +23,7 @@ This library:
 - Provides an intuitive and user-friendly API for media processing
 - Supports custom Rust filters and flexible input/output handling
 - Offers optional GPU-accelerated custom filters (wgpu) and a high-performance embedded RTMP server
+- Ships one-shot recipes (thumbnails/sprite sheets, animated GIF, HLS ABR ladders) and a detection/measurement API (black/silence/scene/crop/EBU R128 loudness) that returns typed Rust results instead of only FFmpeg logs
 
 By abstracting the complexity of the raw C API, `ez-ffmpeg` simplifies configuring media pipelines, performing transcoding and filtering, and inspecting media streams.
 
