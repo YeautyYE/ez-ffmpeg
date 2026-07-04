@@ -239,9 +239,14 @@ unsafe fn load_impl(
                 // Lenient like FFmpeg: a bad cue is skipped, not fatal.
                 log::warn!("subtitle decode error (event skipped): {}", av_err2str(ret));
             } else if got != 0 {
-                let start_ms =
+                // start/end_display_time are millisecond offsets from sub.pts
+                // (FFmpeg vf_subtitles semantics): the cue starts at
+                // pts + start_display_time and lasts end - start.
+                let pts_ms =
                     av_rescale_q(sub.pts, AV_TIME_BASE_Q, AVRational { num: 1, den: 1000 });
-                let duration_ms = i64::from(sub.end_display_time);
+                let start_ms = pts_ms + i64::from(sub.start_display_time);
+                let duration_ms =
+                    (i64::from(sub.end_display_time) - i64::from(sub.start_display_time)).max(0);
                 for i in 0..sub.num_rects as usize {
                     let rect = *sub.rects.add(i);
                     let line = (*rect).ass;
