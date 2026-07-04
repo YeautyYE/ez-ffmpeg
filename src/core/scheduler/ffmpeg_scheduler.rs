@@ -1088,7 +1088,11 @@ mod tests {
         // Watchdog instead of a bare `wait()`: the regression this test
         // guards against is a pipeline thread that never exits, and `wait()`
         // would turn that into a silent test-suite hang (the integration
-        // suites use wait_with_watchdog for the same reason).
+        // suites use wait_with_watchdog for the same reason). `is_ended()`
+        // also turns true on error/abort — in those states the `wait()`
+        // below surfaces the stored error as a red panic, so every terminal
+        // state fails loudly: success green, error/abort red, deadlock red
+        // at the deadline.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while !scheduler.is_ended() {
             assert!(
