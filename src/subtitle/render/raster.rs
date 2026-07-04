@@ -88,6 +88,54 @@ impl CoverageBitmap {
     }
 }
 
+/// A rendered node's pixel payload: geometry is per-instance (collision
+/// stacking shifts placements), the coverage data is refcounted so
+/// template stores and replays clone nodes without copying pixels.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SharedBitmap {
+    pub w: usize,
+    pub h: usize,
+    /// Top-left placement in frame coordinates.
+    pub x: i32,
+    pub y: i32,
+    /// Row-major, stride == w.
+    pub data: std::sync::Arc<Vec<u8>>,
+}
+
+impl SharedBitmap {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.w == 0 || self.h == 0
+    }
+
+    /// See [`CoverageBitmap::clip_rect`]. Payloads are still uniquely owned
+    /// when clipping runs (fresh render, before any template share), so
+    /// `make_mut` mutates in place; a shared payload would copy — correct
+    /// either way.
+    pub(crate) fn clip_rect(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, inverse: bool) {
+        let mut work = CoverageBitmap {
+            w: self.w,
+            h: self.h,
+            x: self.x,
+            y: self.y,
+            data: std::mem::take(std::sync::Arc::make_mut(&mut self.data)),
+        };
+        work.clip_rect(x0, y0, x1, y1, inverse);
+        *self = work.into();
+    }
+}
+
+impl From<CoverageBitmap> for SharedBitmap {
+    fn from(bitmap: CoverageBitmap) -> Self {
+        Self {
+            w: bitmap.w,
+            h: bitmap.h,
+            x: bitmap.x,
+            y: bitmap.y,
+            data: std::sync::Arc::new(bitmap.data),
+        }
+    }
+}
+
 /// Rasterizes a filled path (non-zero rule, like FreeType/VSFilter).
 pub(crate) fn fill_path(commands: &[Command]) -> CoverageBitmap {
     if commands.is_empty() {
