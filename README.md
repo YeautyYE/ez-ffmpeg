@@ -22,7 +22,7 @@ This library:
 - Keeps the execution logic and parameter conventions as close to FFmpeg as possible
 - Provides an intuitive and user-friendly API for media processing
 - Supports custom Rust filters and flexible input/output handling
-- Offers optional GPU-accelerated OpenGL filters and high-performance embedded RTMP server
+- Offers optional GPU-accelerated custom filters (wgpu) and a high-performance embedded RTMP server
 
 By abstracting the complexity of the raw C API, `ez-ffmpeg` simplifies configuring media pipelines, performing transcoding and filtering, and inspecting media streams.
 
@@ -100,7 +100,8 @@ More examples can be found [here][examples].
 
 **ez-ffmpeg** offers several optional features that can be enabled in your `Cargo.toml` as needed:
 
-- **opengl:** Enables GPU-accelerated OpenGL filters for high-performance video processing.
+- **wgpu:** GPU-accelerated custom video filters written in WGSL, running headless over Vulkan/Metal/DX12/GL — YUV↔RGB conversion on the GPU with the correct color matrix, GPU work overlapped with CPU work while preserving output order, and experimental zero-copy hardware-frame input (Linux/Vulkan). Successor to the deprecated `opengl` feature.
+- **opengl:** *(deprecated, superseded by `wgpu`)* GPU-accelerated OpenGL filters. Requires a display connection and converts colors on the CPU; kept functional for existing users — see the `opengl` module docs for migration.
 - **rtmp:** High-performance embedded RTMP server with native epoll/kqueue, O(1) GOP sharing, and 10,000+ concurrent connections on Linux/macOS (8,000 on Windows). In-process ingest with no TCP between FFmpeg and server.
 - **subtitle:** Native ASS/SRT subtitle burn-in rendered by a pure-Rust engine inside the frame pipeline — independent of FFmpeg build flags (no `--enable-libass` needed, no system libass), with in-memory script input and explicit font-file control.
 - **flv:** Provides support for FLV container parsing and handling.

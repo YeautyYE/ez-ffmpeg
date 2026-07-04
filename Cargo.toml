@@ -74,7 +74,7 @@ subtitle = [
     "dep:unicode-linebreak",
 ]
 static = ["ffmpeg-next/static"]
-docs-rs = ["async", "opengl", "rtmp", "flv", "subtitle"]
+docs-rs = ["async", "opengl", "rtmp", "flv", "subtitle", "wgpu"]
 
 [package.metadata.docs.rs]
 features = ["docs-rs"]
