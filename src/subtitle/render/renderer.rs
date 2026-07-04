@@ -8,14 +8,18 @@
 
 use super::fonts::{FontStore, LoadedFace};
 use super::layout::{
-    apply_fade, render_event, unsupported, EventDynamics, EventSamples, FrameContext, MaskSamples,
-    RenderOptions, RenderedNode,
+    apply_fade, render_event, unsupported, EventDynamics, EventRender, EventSamples, FrameContext,
+    MaskSamples, RenderOptions, RenderedNode,
 };
 use crate::subtitle::ass::{Script, VALIGN_CENTER, VALIGN_TOP};
 use crate::subtitle::backend::SubtitleRenderer;
 use crate::subtitle::blend::OverlayImage;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Memoized face lookups: values are `Arc`s, so per-worker clones during
+/// parallel event rendering share the parsed faces.
+type FaceCache = HashMap<(String, u16, bool), Option<Arc<LoadedFace>>>;
 
 pub(crate) struct PureRenderer {
     script: Script,
@@ -27,7 +31,7 @@ pub(crate) struct PureRenderer {
     storage_h: i32,
     par: f64,
     /// Face cache shared across frames (font selection is stable).
-    face_cache: HashMap<(String, u16, bool), Option<Arc<LoadedFace>>>,
+    face_cache: FaceCache,
     /// Nodes of the last rendered frame (backing store for the borrows).
     /// Colors are UNFADED; emission applies the per-frame fade, so fading
     /// frames reuse these nodes byte-for-byte.
@@ -277,30 +281,96 @@ impl SubtitleRenderer for PureRenderer {
                 opts: &self.opts,
             };
 
+            // Reuse each event's template when its mask samples are
+            // unchanged: layout, shaping and rasterization are then
+            // skipped and only the node copy + stacking replay run.
+            let mut prepared: Vec<Option<(Vec<RenderedNode>, bool)>> = visible
+                .iter()
+                .enumerate()
+                .map(|(order, &index)| {
+                    mask_samples[order]
+                        .as_ref()
+                        .and_then(|sample| {
+                            self.templates
+                                .get(&index)
+                                .filter(|template| &template.samples == sample)
+                        })
+                        .map(|template| (template.nodes.clone(), template.detect_collisions))
+                })
+                .collect();
+            let misses: Vec<usize> = (0..visible.len())
+                .filter(|&order| prepared[order].is_none())
+                .collect();
+            #[cfg(test)]
+            {
+                self.event_renders += misses.len() as u64;
+            }
+            // Render the misses — in parallel when there is more than one:
+            // event renders are independent (results merge in visible
+            // order below, so the output is bit-identical to a sequential
+            // pass); each worker gets its own face-cache clone (values are
+            // `Arc`s) merged back afterwards.
+            let mut rendered: Vec<Option<EventRender>> = (0..visible.len()).map(|_| None).collect();
+            if misses.len() > 1 {
+                let workers = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
+                    .min(misses.len());
+                let per_worker = misses.len().div_ceil(workers);
+                let results: Vec<(Vec<(usize, EventRender)>, FaceCache)> =
+                    std::thread::scope(|scope| {
+                        let ctx = &ctx;
+                        let visible = &visible;
+                        let handles: Vec<_> = misses
+                            .chunks(per_worker)
+                            .map(|orders| {
+                                let mut face_cache = self.face_cache.clone();
+                                scope.spawn(move || {
+                                    let renders: Vec<(usize, EventRender)> = orders
+                                        .iter()
+                                        .map(|&order| {
+                                            let event = &ctx.script.events[visible[order]];
+                                            let render =
+                                                render_event(ctx, event, now_ms, &mut face_cache);
+                                            (order, render)
+                                        })
+                                        .collect();
+                                    (renders, face_cache)
+                                })
+                            })
+                            .collect();
+                        handles
+                            .into_iter()
+                            .map(|handle| handle.join().expect("event render worker panicked"))
+                            .collect()
+                    });
+                for (renders, face_cache) in results {
+                    for (order, render) in renders {
+                        rendered[order] = Some(render);
+                    }
+                    for (key, face) in face_cache {
+                        self.face_cache.entry(key).or_insert(face);
+                    }
+                }
+            } else if let Some(&order) = misses.first() {
+                let event = &self.script.events[visible[order]];
+                rendered[order] = Some(render_event(&ctx, event, now_ms, &mut self.face_cache));
+            }
+
             let mut all_nodes: Vec<RenderedNode> = Vec::new();
             let mut node_orders: Vec<u32> = Vec::new();
             let mut occupied: Vec<(i32, i32, i32, i32)> = Vec::new();
             let mut seen_unsupported = 0u32;
             for (order, &index) in visible.iter().enumerate() {
                 let event = &self.script.events[index];
-                // Reuse this event's template when its mask samples are
-                // unchanged: layout, shaping and rasterization are then
-                // skipped and only the bitmap copy + stacking replay run.
-                let sample_now = mask_samples[order].as_ref();
-                let (mut nodes, detect_collisions) = match sample_now.and_then(|sample| {
-                    self.templates
-                        .get(&index)
-                        .filter(|template| &template.samples == sample)
-                }) {
-                    Some(template) => (template.nodes.clone(), template.detect_collisions),
+                let (mut nodes, detect_collisions) = match prepared[order].take() {
+                    Some(hit) => hit,
                     None => {
-                        #[cfg(test)]
-                        {
-                            self.event_renders += 1;
-                        }
-                        let rendered = render_event(&ctx, event, now_ms, &mut self.face_cache);
-                        seen_unsupported |= rendered.unsupported;
-                        self.dynamics.insert(index, rendered.dynamics);
+                        let render = rendered[order]
+                            .take()
+                            .expect("every template miss was rendered above");
+                        seen_unsupported |= render.unsupported;
+                        self.dynamics.insert(index, render.dynamics);
                         let full = self
                             .dynamics
                             .get(&index)
@@ -313,11 +383,11 @@ impl SubtitleRenderer for PureRenderer {
                             index,
                             EventTemplate {
                                 samples: full.mask_key(),
-                                nodes: rendered.nodes.clone(),
-                                detect_collisions: rendered.detect_collisions,
+                                nodes: render.nodes.clone(),
+                                detect_collisions: render.detect_collisions,
                             },
                         );
-                        (rendered.nodes, rendered.detect_collisions)
+                        (render.nodes, render.detect_collisions)
                     }
                 };
                 // A saturated fade (>= 255 pre-clamp) turns every node
