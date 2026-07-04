@@ -573,8 +573,9 @@ mod tests {
     /// Hostile numeric override values must not panic the renderer (debug
     /// builds trap integer overflow; release would silently wrap or, for
     /// unbounded allocations, OOM). Covers the border/blur allocation clamps
-    /// and the widened \p-scale shift, drawing cbox, \fade time, and margin
-    /// arithmetic. All render frames must complete.
+    /// and the widened \p-scale shift, drawing cbox, \fade time, margin
+    /// arithmetic, and the glyph-outline extent guard. All render frames
+    /// must complete.
     #[test]
     fn hostile_numeric_overrides_do_not_panic() {
         let events = concat!(
@@ -589,6 +590,18 @@ mod tests {
             "Dialogue: 0,0:00:00.00,0:00:10.00,Default,,0,0,0,,{\\fade(-5,0,0,0,100,9000,10000)\\bord4}C\n",
             // Extreme margins: wrap-width arithmetic is widened.
             "Dialogue: 0,0:00:00.00,0:00:10.00,Default,,-2000000000,2000000000,0,,D E F G H\n",
+            // Huge font size: the glyph outline would overflow the
+            // rasterizer's u32 mask sizing (zeno computes `w * h` in u32);
+            // the extent guard must skip the run instead.
+            "Dialogue: 0,0:00:00.00,0:00:10.00,Default,,0,0,0,,{\\fs100000}A\n",
+            // Same sink through the scale overrides at a sane font size.
+            "Dialogue: 0,0:00:00.00,0:00:10.00,Default,,0,0,0,,{\\fscx4000000\\fscy4000000}B\n",
+            // Huge letter spacing stretches the run bbox without any single
+            // glyph being oversized.
+            "Dialogue: 0,0:00:00.00,0:00:10.00,Default,,0,0,0,,{\\fsp2000000000}CD\n",
+            // i32::MIN margins: block placement subtracts MarginR/MarginV
+            // from the frame rect and must widen to f64 first.
+            "Dialogue: 0,0:00:00.00,0:00:10.00,Default,,0,-2147483648,-2147483648,,I J\n",
         );
         let Some(mut renderer) = renderer_with(events) else {
             eprintln!("skipping: no known test font present on this machine");

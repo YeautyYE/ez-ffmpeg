@@ -170,9 +170,11 @@ impl SubtitleFilter {
     ///
     /// # Safety
     /// `frame` must be a writable software frame whose pixel format matches
-    /// `spec`, with positive linesizes, exclusively owned by the caller for
-    /// the duration of the call (`filter_frame` guarantees this after
-    /// `av_frame_make_writable`).
+    /// `spec`, with positive linesizes no smaller than each component's row
+    /// byte width (`(plane_w - 1) * pixel_step + sample_bytes` — true of any
+    /// FFmpeg-allocated frame; the component views are sized assuming it),
+    /// exclusively owned by the caller for the duration of the call
+    /// (`filter_frame` guarantees this after `av_frame_make_writable`).
     unsafe fn blend_images(
         frame: *mut AVFrame,
         images: &[OverlayImage<'_>],
