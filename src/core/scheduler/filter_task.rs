@@ -2932,24 +2932,17 @@ unsafe fn read_binary(path: *mut c_char) -> crate::error::Result<(*mut c_void, i
     }
 
     let fsize = avio_size(io);
-    if !(0..=i64::MAX).contains(&fsize) {
+    // fftools read_binary (ffmpeg_filter.c, n7.1) rejects negative sizes
+    // and sizes over INT_MAX in one combined check with AVERROR(EIO): the
+    // avio_read below takes an i32 length, so a larger file would silently
+    // truncate both the read and the resulting option value.
+    if !(0..=i64::from(i32::MAX)).contains(&fsize) {
         error!(
             "Cannot obtain size of file '{}'",
             CStr::from_ptr(path).to_str().unwrap_or("[unknow path]")
         );
         avio_close(io);
         return Err(AVERROR(EIO));
-    }
-    // fftools read_binary rejects sizes over INT_MAX (ffmpeg_filter.c): the
-    // avio_read below takes an i32 length, so a larger file would silently
-    // truncate both the read and the resulting option value.
-    if fsize > i64::from(i32::MAX) {
-        error!(
-            "File '{}' too large",
-            CStr::from_ptr(path).to_str().unwrap_or("[unknow path]")
-        );
-        avio_close(io);
-        return Err(AVERROR(EINVAL));
     }
 
     let mut data = av_malloc(fsize as usize);
