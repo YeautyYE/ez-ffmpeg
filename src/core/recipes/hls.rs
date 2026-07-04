@@ -277,10 +277,13 @@ impl HlsLadder {
                 .set_format_opt("hls_segment_filename", segment_template);
 
             // Closed GOP (scenecut disabled, open-gop off) so each segment is
-            // independently decodable. Only libx264 understands `x264-params`;
-            // unknown keys would only warn, but scope it to avoid noise.
+            // independently decodable. libx264/libx265 take their `*-params`
+            // here; for other encoders the fixed GOP above still applies but
+            // closed-GOP/scenecut can't be guaranteed (documented limitation).
             if video_codec.eq_ignore_ascii_case("libx264") {
                 output = output.set_video_codec_opt("x264-params", "scenecut=0:open-gop=0");
+            } else if video_codec.eq_ignore_ascii_case("libx265") {
+                output = output.set_video_codec_opt("x265-params", "scenecut=0:open-gop=0");
             }
 
             builder = builder.output(output);
@@ -334,6 +337,16 @@ impl HlsLadder {
         // it must be a safe single segment just like the rendition names.
         validate_path_segment(&self.master_name, "master playlist name")?;
 
+        // A CODECS override is written verbatim inside a quoted playlist
+        // attribute; reject characters that would break out of or inject into it.
+        if let Some(codecs) = &self.master_codecs {
+            if codecs.chars().any(|c| c == '"' || c.is_control()) {
+                return Err(Error::InvalidRecipeArg(
+                    "codecs must not contain quotes or control characters".to_string(),
+                ));
+            }
+        }
+
         if !self.segment_duration_s.is_finite() || self.segment_duration_s <= 0.0 {
             return Err(Error::InvalidRecipeArg(format!(
                 "segment_duration must be finite and positive, got {}",
@@ -351,7 +364,7 @@ impl HlsLadder {
         // Segment boundaries only land on keyframes when the segment is an
         // integer multiple of the GOP length.
         let ratio = self.segment_duration_s / gop;
-        if !ratio.is_finite() || ratio.round() < 1.0 || (ratio - ratio.round()).abs() > 1e-6 {
+        if !ratio.is_finite() || ratio.round() < 1.0 || (ratio - ratio.round()).abs() > 1e-9 {
             return Err(Error::InvalidRecipeArg(format!(
                 "segment_duration ({}) must be a positive integer multiple of gop_seconds ({gop})",
                 self.segment_duration_s
@@ -391,6 +404,16 @@ impl HlsLadder {
                     "duplicate rendition name '{name}'"
                 )));
             }
+        }
+
+        // The master is written into `out_dir`; a name equal to a rendition
+        // directory would make `fs::write` target a directory and fail only
+        // after a successful transcode.
+        if names.contains(&self.master_name) {
+            return Err(Error::InvalidRecipeArg(format!(
+                "master playlist name '{}' collides with a rendition directory name",
+                self.master_name
+            )));
         }
 
         Ok(())
@@ -489,7 +512,7 @@ fn build_split_desc(renditions: &[Rendition]) -> String {
     }
     for (i, rendition) in renditions.iter().enumerate() {
         desc.push_str(&format!(
-            ";[s{i}]scale={}:{},format=yuv420p[v{i}]",
+            ";[s{i}]scale={}:{},setsar=1,format=yuv420p[v{i}]",
             rendition.width, rendition.height
         ));
     }
@@ -515,8 +538,10 @@ fn compute_gop_frames(fps_num: i64, fps_den: i64, dur_us: i64) -> u64 {
 
 /// Reported peak `BANDWIDTH` (bps): video + optional audio plus muxing overhead.
 fn compute_bandwidth(video_bps: u64, audio_bps: Option<u64>) -> u64 {
-    let base = video_bps.saturating_add(audio_bps.unwrap_or(0));
-    base.saturating_mul(BANDWIDTH_OVERHEAD_NUM) / BANDWIDTH_OVERHEAD_DEN
+    // Widen to u128 so the overhead multiply can't wrap, then saturate to u64.
+    let base = u128::from(video_bps.saturating_add(audio_bps.unwrap_or(0)));
+    let scaled = base * u128::from(BANDWIDTH_OVERHEAD_NUM) / u128::from(BANDWIDTH_OVERHEAD_DEN);
+    u64::try_from(scaled).unwrap_or(u64::MAX)
 }
 
 /// Parses an FFmpeg-style bitrate (`"5000k"`, `"5M"`, `"800000"`) into bits/sec.
@@ -571,6 +596,11 @@ fn validate_path_segment(name: &str, what: &str) -> Result<()> {
     if name.chars().any(char::is_control) {
         return Err(Error::InvalidRecipeArg(format!(
             "{what} must not contain control characters"
+        )));
+    }
+    if name.starts_with('#') {
+        return Err(Error::InvalidRecipeArg(format!(
+            "{what} '{name}' must not start with '#' (it would break the HLS playlist URI line)"
         )));
     }
     if Path::new(name).is_absolute() {
@@ -628,7 +658,7 @@ mod tests {
         let renditions = vec![Rendition::new(640, 360, "800k")];
         assert_eq!(
             build_split_desc(&renditions),
-            "[0:v]split=1[s0];[s0]scale=640:360,format=yuv420p[v0]"
+            "[0:v]split=1[s0];[s0]scale=640:360,setsar=1,format=yuv420p[v0]"
         );
     }
 
@@ -642,9 +672,9 @@ mod tests {
         assert_eq!(
             build_split_desc(&renditions),
             "[0:v]split=3[s0][s1][s2];\
-             [s0]scale=1920:1080,format=yuv420p[v0];\
-             [s1]scale=1280:720,format=yuv420p[v1];\
-             [s2]scale=640:360,format=yuv420p[v2]"
+             [s0]scale=1920:1080,setsar=1,format=yuv420p[v0];\
+             [s1]scale=1280:720,setsar=1,format=yuv420p[v1];\
+             [s2]scale=640:360,setsar=1,format=yuv420p[v2]"
         );
     }
 
@@ -805,9 +835,9 @@ mod tests {
 
     #[test]
     fn compute_bandwidth_saturates_on_overflow() {
-        // Hostile bitrates must not panic (debug) or wrap to a tiny value
-        // (release), which would make clients mis-select the variant.
-        assert!(compute_bandwidth(u64::MAX, Some(128_000)) > 0);
+        // Hostile bitrates saturate to u64::MAX rather than wrapping or
+        // compressing below the input, which would mis-select the variant.
+        assert_eq!(compute_bandwidth(u64::MAX, Some(128_000)), u64::MAX);
     }
 
     #[test]
@@ -815,7 +845,16 @@ mod tests {
         assert!(validate_path_segment("../../etc", "x").is_err());
         assert!(validate_path_segment("a\nBANDWIDTH=9", "x").is_err());
         assert!(validate_path_segment("a/b", "x").is_err());
+        assert!(validate_path_segment("#low", "x").is_err()); // would break the URI line
         assert!(validate_path_segment("master.m3u8", "x").is_ok());
         assert!(validate_path_segment("720p", "x").is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_codecs_injection_and_master_collision() {
+        assert!(ladder().codecs("avc1.640028\"\n#EXT").validate().is_err());
+        // "720p" is the default dir name of the 1280x720 rendition.
+        assert!(ladder().master("720p").validate().is_err());
+        assert!(ladder().validate().is_ok());
     }
 }

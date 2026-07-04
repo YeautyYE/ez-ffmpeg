@@ -161,6 +161,7 @@ pub(crate) struct ParseState {
     pending_black_start: Option<i64>,
     pending_silence: Vec<(Option<usize>, i64)>,
     last_ts: Option<Timestamp>,
+    last_end_ts: Option<Timestamp>,
     last_integrated: Option<f64>,
     last_lra: Option<f64>,
     last_true_peak: Option<f64>,
@@ -172,7 +173,10 @@ impl ParseState {
     /// seen). Called from the filter's `uninit`.
     pub(crate) fn flush(&mut self, media: AVMediaType) -> Vec<MetadataEvent> {
         let mut out = Vec::new();
-        if let Some(at) = self.last_ts {
+        // Close unterminated regions at the true end of stream (the last frame's
+        // pts + duration, recorded by the filter) rather than at the last
+        // frame's start pts, which would under-report the tail by one frame.
+        if let Some(at) = self.last_end_ts.or(self.last_ts) {
             out.push(MetadataEvent::StreamEnd { media, at });
         }
         if self.last_integrated.is_some() || self.last_lra.is_some() || self.last_true_peak.is_some()
@@ -184,6 +188,13 @@ impl ParseState {
             });
         }
         out
+    }
+
+    /// Records the end timestamp (pts + duration) of the most recent frame, so
+    /// [`flush`](Self::flush) can close unterminated black/silence regions at
+    /// the true end of stream. Called by the filter, which owns the raw frame.
+    pub(crate) fn record_frame_end(&mut self, end: Timestamp) {
+        self.last_end_ts = Some(end);
     }
 }
 
@@ -227,7 +238,7 @@ fn parse_black(md: &DictionaryRef<'_>, out: &mut Vec<MetadataEvent>, state: &mut
         let duration_us = state
             .pending_black_start
             .take()
-            .map_or(0, |start| at.time_us - start);
+            .map_or(0, |start| at.time_us.saturating_sub(start));
         out.push(MetadataEvent::BlackEnd { at, duration_us });
     }
 }
@@ -253,7 +264,7 @@ fn parse_silence(md: &DictionaryRef<'_>, out: &mut Vec<MetadataEvent>, state: &m
                     .get(&format!("{SILENCE_DURATION}{suffix}"))
                     .and_then(parse_f64)
                     .and_then(secs_to_us)
-                    .or_else(|| removed.map(|start| at.time_us - start))
+                    .or_else(|| removed.map(|start| at.time_us.saturating_sub(start)))
                     .unwrap_or(0);
                 out.push(MetadataEvent::SilenceEnd {
                     at,
