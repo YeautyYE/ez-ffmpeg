@@ -420,7 +420,7 @@ impl StreamSpecifier {
             }
 
             StreamListType::Program => {
-                if fmt_ctx_ref.nb_programs <= 0 || fmt_ctx_ref.programs.is_null() {
+                if fmt_ctx_ref.nb_programs == 0 || fmt_ctx_ref.programs.is_null() {
                     log::warn!("No program table present, stream specifier can never match");
                     return false;
                 }
@@ -449,7 +449,7 @@ impl StreamSpecifier {
             }
 
             StreamListType::GroupId => {
-                if fmt_ctx_ref.nb_stream_groups <= 0 || fmt_ctx_ref.stream_groups.is_null() {
+                if fmt_ctx_ref.nb_stream_groups == 0 || fmt_ctx_ref.stream_groups.is_null() {
                     log::warn!("No stream groups present, stream specifier can never match",);
                     return false;
                 }
@@ -478,7 +478,7 @@ impl StreamSpecifier {
             }
 
             StreamListType::GroupIdx => {
-                if fmt_ctx_ref.nb_stream_groups <= 0 || fmt_ctx_ref.stream_groups.is_null() {
+                if fmt_ctx_ref.nb_stream_groups == 0 || fmt_ctx_ref.stream_groups.is_null() {
                     log::warn!("No stream groups present, stream specifier can never match",);
                     return false;
                 }
