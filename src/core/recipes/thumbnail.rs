@@ -486,6 +486,19 @@ pub(crate) fn validate_grid_cell(cols: u32, rows: u32, cell_w: u32, cell_h: u32)
             "sprite cell size must be > 0 in both dimensions, got {cell_w}x{cell_h}"
         )));
     }
+    // The rendered sheet is `cols*cell_w` by `rows*cell_h`; keep it within
+    // FFmpeg's per-dimension limit so an absurd grid fails here, not deep in the
+    // muxer with an out-of-memory allocation.
+    let out_w = u64::from(cols).checked_mul(u64::from(cell_w));
+    let out_h = u64::from(rows).checked_mul(u64::from(cell_h));
+    match (out_w, out_h) {
+        (Some(w), Some(h)) if w <= 65_535 && h <= 65_535 => {}
+        _ => {
+            return Err(Error::InvalidRecipeArg(format!(
+                "sprite sheet size ({cols}*{cell_w}) x ({rows}*{cell_h}) exceeds the 65535x65535 limit"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -696,6 +709,20 @@ mod tests {
             grid: (0, 5),
             every: Every::Frames(10),
             cell: (160, 90),
+            quality: 2,
+        };
+        assert!(matches!(
+            sprite_sheet("x.mp4", "o.jpg", opts),
+            Err(Error::InvalidRecipeArg(_))
+        ));
+    }
+
+    #[test]
+    fn sprite_rejects_oversized_sheet() {
+        let opts = SpriteSheetOptions {
+            grid: (65_536, 65_536),
+            every: Every::Frames(10),
+            cell: (1, 1),
             quality: 2,
         };
         assert!(matches!(

@@ -216,7 +216,7 @@ pub fn animated_gif(
     opts: GifOptions,
 ) -> Result<()> {
     validate(&opts)?;
-    check_capabilities()?;
+    check_capabilities(opts.width.is_some())?;
 
     let filter_desc = build_gif_desc(&opts);
 
@@ -292,8 +292,11 @@ fn loop_option_value(gif_loop: GifLoop) -> String {
 /// Validates [`GifOptions`], returning [`Error::InvalidRecipeArg`] on the first
 /// offending field.
 fn validate(opts: &GifOptions) -> Result<()> {
-    if opts.fps == 0 {
-        return Err(Error::InvalidRecipeArg("fps must be greater than 0".to_string()));
+    if opts.fps == 0 || opts.fps > 1000 {
+        return Err(Error::InvalidRecipeArg(format!(
+            "fps must be in the range 1..=1000, got {}",
+            opts.fps
+        )));
     }
 
     if opts.width == Some(0) {
@@ -358,14 +361,18 @@ fn validate(opts: &GifOptions) -> Result<()> {
 /// component up front instead of as an opaque failure deep inside `start()`.
 /// The lookups query FFmpeg's static registries and do not require a fully
 /// initialised context.
-fn check_capabilities() -> Result<()> {
-    const REQUIRED_FILTERS: [&str; 5] = ["fps", "scale", "split", "palettegen", "paletteuse"];
+fn check_capabilities(needs_scale: bool) -> Result<()> {
+    // `scale` is only present in the filtergraph when a target width is set.
+    let mut required = vec!["fps", "split", "palettegen", "paletteuse"];
+    if needs_scale {
+        required.push("scale");
+    }
 
     // SAFETY: each lookup receives a valid NUL-terminated CString pointer and
     // only reads FFmpeg's static registries (no context/lifetime concerns);
     // the returned pointers are used solely for null checks, never dereferenced.
     unsafe {
-        for name in REQUIRED_FILTERS {
+        for name in required {
             let c_name = CString::new(name).map_err(|_| {
                 Error::InvalidRecipeArg(format!("invalid filter name {name:?}"))
             })?;
@@ -543,6 +550,15 @@ mod tests {
     fn validate_rejects_zero_fps() {
         let opts = GifOptions {
             fps: 0,
+            ..GifOptions::default()
+        };
+        assert!(matches!(validate(&opts), Err(Error::InvalidRecipeArg(_))));
+    }
+
+    #[test]
+    fn validate_rejects_excessive_fps() {
+        let opts = GifOptions {
+            fps: 1_000_000,
             ..GifOptions::default()
         };
         assert!(matches!(validate(&opts), Err(Error::InvalidRecipeArg(_))));
