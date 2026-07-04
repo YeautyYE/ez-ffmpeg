@@ -163,7 +163,7 @@ pub(crate) fn fold(events: Vec<MetadataEvent>, cfg: &FoldConfig) -> AnalysisRepo
 }
 
 fn keep_tail(start_us: i64, end_us: i64, min_duration_us: Option<i64>) -> bool {
-    let duration = end_us - start_us;
+    let duration = end_us.saturating_sub(start_us);
     duration >= 0 && min_duration_us.is_none_or(|min| duration >= min)
 }
 

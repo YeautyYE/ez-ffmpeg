@@ -86,16 +86,16 @@ impl VideoDetector {
         }
     }
 
-    /// Rejects non-finite (`NaN`/`inf`) threshold values up front, so they
-    /// surface as a clean [`Error::InvalidRecipeArg`] instead of an opaque
+    /// Rejects values outside each detector's documented range up front, so
+    /// they surface as a clean [`Error::InvalidRecipeArg`] instead of an opaque
     /// FFmpeg graph-parse failure.
     pub(crate) fn validate(&self) -> Result<()> {
-        let finite = |v: f64, what: &str| -> Result<()> {
-            if v.is_finite() {
+        let in_range = |v: f64, lo: f64, hi: f64, what: &str| -> Result<()> {
+            if v.is_finite() && v >= lo && v <= hi {
                 Ok(())
             } else {
                 Err(Error::InvalidRecipeArg(format!(
-                    "{what} must be a finite number, got {v}"
+                    "{what} must be in {lo}..={hi}, got {v}"
                 )))
             }
         };
@@ -105,14 +105,37 @@ impl VideoDetector {
                 pixel_th,
                 picture_th,
             } => {
-                finite(min_duration_s, "blackdetect min_duration_s")?;
-                finite(pixel_th, "blackdetect pixel_th")?;
-                finite(picture_th, "blackdetect picture_th")?;
+                if !min_duration_s.is_finite() || min_duration_s < 0.0 {
+                    return Err(Error::InvalidRecipeArg(format!(
+                        "blackdetect min_duration_s must be finite and >= 0, got {min_duration_s}"
+                    )));
+                }
+                in_range(pixel_th, 0.0, 1.0, "blackdetect pixel_th")?;
+                in_range(picture_th, 0.0, 1.0, "blackdetect picture_th")?;
             }
             VideoDetector::Scene { threshold_pct } => {
-                finite(threshold_pct, "scene threshold_pct")?;
+                in_range(threshold_pct, 0.0, 100.0, "scene threshold_pct")?;
             }
-            VideoDetector::Crop { .. } => {}
+            VideoDetector::Crop {
+                limit,
+                round,
+                reset,
+            } => {
+                // cropdetect maps these onto FFmpeg int AVOptions; values above
+                // i32::MAX would overflow into a late graph error.
+                for (v, what) in [
+                    (limit, "cropdetect limit"),
+                    (round, "cropdetect round"),
+                    (reset, "cropdetect reset"),
+                ] {
+                    if v > i32::MAX as u32 {
+                        return Err(Error::InvalidRecipeArg(format!(
+                            "{what} must be <= {}, got {v}",
+                            i32::MAX
+                        )));
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -159,15 +182,15 @@ impl AudioDetector {
             ..
         } = *self
         {
-            for (v, what) in [
-                (noise_db, "silencedetect noise_db"),
-                (min_duration_s, "silencedetect min_duration_s"),
-            ] {
-                if !v.is_finite() {
-                    return Err(Error::InvalidRecipeArg(format!(
-                        "{what} must be a finite number, got {v}"
-                    )));
-                }
+            if !noise_db.is_finite() {
+                return Err(Error::InvalidRecipeArg(format!(
+                    "silencedetect noise_db must be finite, got {noise_db}"
+                )));
+            }
+            if !min_duration_s.is_finite() || min_duration_s < 0.0 {
+                return Err(Error::InvalidRecipeArg(format!(
+                    "silencedetect min_duration_s must be finite and >= 0, got {min_duration_s}"
+                )));
             }
         }
         Ok(())
@@ -254,6 +277,22 @@ mod tests {
             noise_db: f64::NAN,
             min_duration_s: 0.5,
             mono: false,
+        }
+        .validate()
+        .is_err());
+        // Out-of-documented-range values are rejected too.
+        assert!(VideoDetector::Scene { threshold_pct: 101.0 }.validate().is_err());
+        assert!(VideoDetector::Black {
+            min_duration_s: -1.0,
+            pixel_th: 0.1,
+            picture_th: 0.98,
+        }
+        .validate()
+        .is_err());
+        assert!(VideoDetector::Black {
+            min_duration_s: 0.1,
+            pixel_th: 1.5,
+            picture_th: 0.98,
         }
         .validate()
         .is_err());

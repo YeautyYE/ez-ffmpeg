@@ -162,15 +162,25 @@ impl FrameFilter for MetadataEventFilter {
         }
 
         // Per-frame r128/cropdetect events need a precise timestamp from the
-        // raw frame; metadata-derived events (black/silence/scd) do not.
+        // raw frame; metadata-derived events (black/silence/scd) do not. We also
+        // derive the frame's END (pts + duration) so end-of-stream regions are
+        // closed at the true stream end, not the last frame's start.
         // SAFETY: `p` is non-null here; fields are plain integers.
-        let frame_ts = unsafe {
+        let (frame_ts, frame_end_ts) = unsafe {
             let pts = (*p).pts;
             let tb = (*p).time_base;
             if pts == AV_NOPTS_VALUE || tb.den == 0 {
-                None
+                (None, None)
             } else {
-                Some(Timestamp::from_pts(pts, (tb.num, tb.den)))
+                let tb = (tb.num, tb.den);
+                let start = Timestamp::from_pts(pts, tb);
+                let dur = (*p).duration;
+                let end = if dur > 0 {
+                    Timestamp::from_pts(pts.saturating_add(dur), tb)
+                } else {
+                    start
+                };
+                (Some(start), Some(end))
             }
         };
 
@@ -178,6 +188,9 @@ impl FrameFilter for MetadataEventFilter {
         {
             let md = frame.metadata();
             parse_frame_metadata(&md, frame_ts, self.media_type, &mut events, &mut self.state);
+        }
+        if let Some(end) = frame_end_ts {
+            self.state.record_frame_end(end);
         }
         for ev in events {
             self.dispatch(ev)?;
