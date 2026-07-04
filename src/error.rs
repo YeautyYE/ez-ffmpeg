@@ -129,6 +129,10 @@ pub enum Error {
     #[error("Rtmp server thread exited")]
     RtmpThreadExited,
 
+    #[cfg(feature = "subtitle")]
+    #[error("Subtitle error: {0}")]
+    Subtitle(#[from] crate::subtitle::SubtitleError),
+
     #[error("IO error:{0}")]
     IO(#[from] io::Error),
 
