@@ -10,7 +10,7 @@
 use super::fonts::{FaceRequest, FontStore, LoadedFace};
 use super::raster::{
     be_blur, border_path, drawing_commands, fill_path, fix_outline, gaussian_blur, CoverageBitmap,
-    OutlinePath,
+    OutlinePath, SharedBitmap,
 };
 use super::shape::{bidi_runs, shape_complex, shape_simple};
 use crate::subtitle::ass::{
@@ -50,10 +50,12 @@ impl Default for RenderOptions {
 }
 
 /// One positioned, colored coverage bitmap — owned storage behind the
-/// borrowed `OverlayImage` list the backend trait hands out.
+/// borrowed `OverlayImage` list the backend trait hands out. The pixel
+/// payload is refcounted (`SharedBitmap`) so template stores and replays
+/// clone nodes without copying coverage data.
 #[derive(Debug, Clone)]
 pub(crate) struct RenderedNode {
-    pub bitmap: CoverageBitmap,
+    pub bitmap: SharedBitmap,
     /// 0xRRGGBBAA with AA = ASS transparency (0 opaque, 255 invisible).
     pub color: u32,
 }
@@ -781,7 +783,8 @@ pub(crate) fn render_event(
                         x: left,
                         y: top,
                         data: vec![0xFF; w * h],
-                    },
+                    }
+                    .into(),
                     color: node_color(back),
                 });
             }
@@ -1701,7 +1704,7 @@ fn rasterize_segment(
         if border_bitmap.is_empty() {
             // No border: the blurred fill replaces the fill.
             fills.push(RenderedNode {
-                bitmap: effect_target,
+                bitmap: effect_target.into(),
                 color: node_color(fill_color),
             });
         } else {
@@ -1734,7 +1737,7 @@ fn rasterize_segment(
         shadow.x += shadow_dx.floor() as i32;
         shadow.y += shadow_dy.floor() as i32;
         shadows.push(RenderedNode {
-            bitmap: shadow,
+            bitmap: shadow.into(),
             color: node_color(state.colors[3]),
         });
     }
@@ -1745,13 +1748,13 @@ fn rasterize_segment(
 
     if !border_bitmap.is_empty() && !karaoke_hide_outline {
         borders.push(RenderedNode {
-            bitmap: border_bitmap,
+            bitmap: border_bitmap.into(),
             color: node_color(state.colors[2]),
         });
     }
     if !(effects_applied && border_px <= 0.0 && state.border_style != 3) {
         fills.push(RenderedNode {
-            bitmap: fill,
+            bitmap: fill.into(),
             color: node_color(fill_color),
         });
     }
