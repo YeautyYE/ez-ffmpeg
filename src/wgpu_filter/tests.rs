@@ -209,6 +209,59 @@ fn test_async_ordering_and_eof_flush() {
     }
 }
 
+/// Regression: the scheduler's pipeline loop (`run_pipeline`) stops after
+/// its first request_frame sweep that yields nothing once the source has
+/// disconnected, then `uninit` discards whatever is still pending. The EOF
+/// marker is the last thing a source sends, so `filter_frame(marker)` must
+/// resolve every in-flight readback before returning — unlike `drive`,
+/// this driver grants the filter no grace polling at all.
+#[test]
+fn test_eof_marker_drains_in_flight_without_polling() {
+    let mut filter = WgpuFrameFilter::new_identity().unwrap(); // 2 in flight
+    if !init_filter(&mut filter) {
+        return;
+    }
+    let mut map = HashMap::new();
+    let ctx = make_ctx(&mut map);
+    let mut out = Vec::new();
+    for i in 0..3i64 {
+        let frame = make_planar_frame(
+            1280,
+            720,
+            AVPixelFormat::AV_PIX_FMT_YUV420P,
+            Some(40 + 40 * i as u8),
+            i,
+        );
+        if let Some(f) = filter.filter_frame(frame, &ctx).expect("filter_frame") {
+            out.push(f);
+        }
+    }
+    // The marker is the last send before the source drops its channel.
+    if let Some(f) = filter
+        .filter_frame(make_marker_frame(100), &ctx)
+        .expect("marker filter_frame")
+    {
+        out.push(f);
+    }
+    // Exactly one non-blocking sweep, like run_pipeline's final pass.
+    while let Some(f) = filter.request_frame(&ctx).expect("request_frame") {
+        out.push(f);
+    }
+    assert_eq!(
+        out.len(),
+        4,
+        "in-flight frames or the EOF marker were dropped at EOF"
+    );
+    unsafe {
+        for (i, frame) in out.iter().enumerate().take(3) {
+            assert_eq!((*frame.as_ptr()).pts, i as i64, "order broken at {i}");
+        }
+        let marker = out[3].as_ptr();
+        assert_eq!((*marker).pts, 100);
+        assert!((*marker).data[0].is_null(), "marker must stay props-only");
+    }
+}
+
 #[test]
 fn test_size_change_midstream() {
     let mut filter = WgpuFrameFilter::new_identity().unwrap();

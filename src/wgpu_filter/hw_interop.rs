@@ -471,8 +471,9 @@ impl HwVulkanInterop {
     }
 }
 
-/// Warns once per process about a hw import failure; later failures are
-/// logged at debug level by the caller's fallback path.
+/// Warns once per process about a hw import failure; later failures fall
+/// back silently (the download path takes over, and per-frame logging would
+/// only repeat the same reason).
 pub(crate) fn warn_import_failed_once(reason: &str) {
     use std::sync::Once;
     static ONCE: Once = Once::new();

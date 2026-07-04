@@ -398,7 +398,11 @@ impl WgpuFrameFilter {
 /// non-blocking drain polls enforce it, so a wedged device surfaces as a
 /// filter error instead of a silent hang; the scheduler cannot interrupt a
 /// thread that is inside a filter call, and the completed work a healthy
-/// device delivers on the next poll is never affected.
+/// device delivers on the next poll is never affected. The blocking path
+/// checks the deadline between polls, and a single `device.poll(Wait…)` can
+/// itself block for wgpu-core's internal 60 s cleanup timeout — so on a
+/// wedged device the error may surface after up to two of those waits,
+/// later than this constant but still bounded.
 const GPU_COMPLETION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Waits (or polls) for a staging buffer map to complete. Returns `Ok(false)`
@@ -493,6 +497,17 @@ impl FrameFilter for WgpuFrameFilter {
             // Props-only frames (e.g. the EOF timestamp marker decoders send
             // through pipelines) pass through untouched. They are queued so
             // they leave in arrival order behind any in-flight GPU frames.
+            //
+            // A marker also announces that nothing will be submitted behind
+            // it, so resolve every in-flight readback NOW: after the source
+            // disconnects, the pipeline loop (`run_pipeline`) exits on its
+            // first request_frame sweep that produces nothing, and `uninit`
+            // would then discard whatever is still pending. A non-blocking
+            // sweep cannot be relied on to pick these up in time — the GPU
+            // may need far longer than the loop's exit window.
+            while self.gpu_pending_count() > 0 {
+                self.complete_oldest_gpu(true)?;
+            }
             self.pending.push_back(PendingOutput::Done(frame));
             return self.next_output(false);
         }
