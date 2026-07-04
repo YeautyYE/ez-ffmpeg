@@ -183,14 +183,21 @@ pub(crate) fn path_extent(commands: &[Command]) -> Option<(f64, f64)> {
     Some((max.0 - min.0, max.1 - min.1))
 }
 
+/// Upper bound on a single coverage mask, in pixels (= bytes: masks are
+/// 8-bit alpha). 2^28 = 256 MiB — 8x the area of a full 8K frame, far
+/// beyond any displayable glyph, drawing or opaque box, and two orders of
+/// magnitude inside zeno's u32 `width * height` sizing limit.
+const MAX_MASK_AREA_PX: f64 = (1u64 << 28) as f64;
+
 /// Whether rasterizing `commands` (padded by `pad` on every side for a
-/// stroke radius) stays clear of zeno's u32 mask sizing: zeno computes the
-/// mask buffer as `width * height` in u32 (zeno mask.rs), which a huge path
-/// wraps. The layout-level extent guard is frame-RELATIVE (8x the frame),
-/// so on 8K-class frames a path it admits — especially once a border
-/// stroke widens it — can still reach 2^32 pixels; this absolute check is
-/// the rasterizer's own line of defense. The +4.0 covers zeno's rounding
-/// and anti-aliasing slack per axis.
+/// stroke radius) stays within [`MAX_MASK_AREA_PX`]. Two guards cooperate:
+/// the layout-level extent guard is frame-RELATIVE (8x the frame per side,
+/// i.e. 64x the frame area), which alone scales badly — on an 8K frame it
+/// admits ~3.8 GiB masks and, once a border stroke widens the box, even
+/// overflows zeno's u32 `width * height` sizing (zeno mask.rs). This
+/// absolute wing keeps any admitted mask allocation bounded regardless of
+/// frame size; together they act as min(64x frame area, 2^28). The +4.0
+/// covers zeno's rounding and anti-aliasing slack per axis.
 fn raster_area_safe(commands: &[Command], pad: f64) -> bool {
     match path_extent(commands) {
         None => true,
@@ -199,7 +206,7 @@ fn raster_area_safe(commands: &[Command], pad: f64) -> bool {
             let side_h = h + 2.0 * pad + 4.0;
             side_w.is_finite()
                 && side_h.is_finite()
-                && side_w * side_h < f64::from(u32::MAX)
+                && side_w * side_h <= MAX_MASK_AREA_PX
         }
     }
 }
@@ -781,13 +788,18 @@ mod tests {
     }
 
     /// A path within the layout guard's frame-relative bound can still
-    /// exceed zeno's absolute `u32` mask sizing on 8K-class frames — the
-    /// rasterizer must degrade (empty mask / fill-only border), never
-    /// overflow. 70000^2 and the stroked (61440 + 2*7680)^2 both pass
-    /// `2^32` pixels.
+    /// dwarf [`MAX_MASK_AREA_PX`] on 8K-class frames (61440^2 ≈ 3.8 GiB of
+    /// alpha, and the stroked (61440 + 2*7680)^2 even passes zeno's `2^32`
+    /// u32 sizing) — the rasterizer must degrade (empty mask / fill-only
+    /// border), never allocate gigabytes or overflow.
     #[test]
     fn oversized_paths_degrade_instead_of_overflowing_mask_sizing() {
         assert!(fill_path(&square(70_000.0)).is_empty());
+        // Passes the old u32-overflow wing (3.8e9 < 2^32) but not the
+        // absolute area cap; before the cap this was a ~3.8 GiB allocation.
+        assert!(fill_path(&square(61_440.0)).is_empty());
+        // Positive control: a full-8K-frame-sized square (59M px) renders.
+        assert!(!fill_path(&square(7_680.0)).is_empty());
 
         let fill = fill_path(&square(20.0));
         let bordered = border_path(&square(61_440.0), &fill, 7_680.0, 7_680.0);
