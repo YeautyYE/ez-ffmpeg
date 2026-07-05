@@ -83,6 +83,64 @@ impl FormatContext {
         }
     }
 
+    /// Take ownership of an already-opened **input** context that uses a custom
+    /// read/seek AVIO callback (`AVFMT_FLAG_CUSTOM_IO`).
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be non-null, opened with a custom `AVIOContext` already wired
+    /// into `(*ptr).pb`, whose `opaque` is a `Box`-allocated callback state owned
+    /// by this context. On drop the AVIO context, its buffer, and that `Box` are
+    /// reclaimed (via `in_fmt_ctx_free(ptr, true)`). Ownership transfers to the
+    /// returned value; the caller must not free `ptr` (or its `pb`) again.
+    // Wired in PR-B (Demuxer/input custom-IO migration).
+    #[allow(dead_code)]
+    pub(crate) unsafe fn from_input_custom_io(ptr: *mut AVFormatContext) -> Self {
+        Self {
+            ptr,
+            mode: Mode::InputCustomIo,
+        }
+    }
+
+    /// Take ownership of an already-allocated **output** context written to a
+    /// file/URL (no custom AVIO).
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be non-null and returned by a successful
+    /// `avformat_alloc_output_context2`. On drop, a file-backed `pb` is closed
+    /// (`avio_closep`, unless `AVFMT_NOFILE`) and the context freed
+    /// (`out_fmt_ctx_free(ptr, false)` → `avformat_free_context`). Ownership
+    /// transfers to the returned value; the caller must not free `ptr` again.
+    // Wired in PR-C (Muxer/output migration).
+    #[allow(dead_code)]
+    pub(crate) unsafe fn from_output(ptr: *mut AVFormatContext) -> Self {
+        Self {
+            ptr,
+            mode: Mode::Output,
+        }
+    }
+
+    /// Take ownership of an already-allocated **output** context that uses a
+    /// custom write/seek AVIO callback (`AVFMT_FLAG_CUSTOM_IO`).
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be non-null with a custom `AVIOContext` already wired into
+    /// `(*ptr).pb` (its `opaque` a `Box`-allocated callback state owned by this
+    /// context). Constructing this **before** `pb` is wired would leak the AVIO +
+    /// `Box` on drop, since teardown reads `(*ptr).pb`. On drop the AVIO context,
+    /// its buffer, and the `Box` are reclaimed then the context is freed
+    /// (`out_fmt_ctx_free(ptr, true)`). Ownership transfers to the returned value.
+    // Wired in PR-C (Muxer/output custom-IO migration).
+    #[allow(dead_code)]
+    pub(crate) unsafe fn from_output_custom_io(ptr: *mut AVFormatContext) -> Self {
+        Self {
+            ptr,
+            mode: Mode::OutputCustomIo,
+        }
+    }
+
     /// Borrow the raw pointer for FFI that reads or advances the context
     /// (`av_read_frame`, `avformat_seek_file`, `av_find_best_stream`, field reads).
     ///
@@ -120,11 +178,19 @@ mod tests {
 
     #[test]
     fn drop_of_null_is_a_noop() {
-        // A null pointer must be a pure no-op on drop (no free call). This is a
-        // plain-Rust check with no FFI, so it also compiles under `--cfg docsrs`.
-        let _ = FormatContext {
-            ptr: null_mut(),
-            mode: Mode::Input,
-        };
+        // A null pointer must be a pure no-op on drop (no free call) for EVERY
+        // variant. Plain-Rust check with no FFI, so it also compiles under
+        // `--cfg docsrs`.
+        for mode in [
+            Mode::Input,
+            Mode::InputCustomIo,
+            Mode::Output,
+            Mode::OutputCustomIo,
+        ] {
+            let _ = FormatContext {
+                ptr: null_mut(),
+                mode,
+            };
+        }
     }
 }
