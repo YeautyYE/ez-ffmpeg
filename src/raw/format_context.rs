@@ -108,8 +108,9 @@ impl FormatContext {
     /// (`avio_closep`, unless `AVFMT_NOFILE`) and the context freed
     /// (`out_fmt_ctx_free(ptr, false)` → `avformat_free_context`). Ownership
     /// transfers to the returned value; the caller must not free `ptr` again.
-    // Wired in PR-C (Muxer/output migration).
-    #[allow(dead_code)]
+    // Dead only under docsrs, where the output open path (its sole caller) is
+    // `#[cfg(not(docsrs))]`; the normal build wires it, so suppress there only.
+    #[cfg_attr(docsrs, allow(dead_code))]
     pub(crate) unsafe fn from_output(ptr: *mut AVFormatContext) -> Self {
         Self {
             ptr,
@@ -128,8 +129,9 @@ impl FormatContext {
     /// `Box` on drop, since teardown reads `(*ptr).pb`. On drop the AVIO context,
     /// its buffer, and the `Box` are reclaimed then the context is freed
     /// (`out_fmt_ctx_free(ptr, true)`). Ownership transfers to the returned value.
-    // Wired in PR-C (Muxer/output custom-IO migration).
-    #[allow(dead_code)]
+    // Dead only under docsrs, where the output open path (its sole caller) is
+    // `#[cfg(not(docsrs))]`; the normal build wires it, so suppress there only.
+    #[cfg_attr(docsrs, allow(dead_code))]
     pub(crate) unsafe fn from_output_custom_io(ptr: *mut AVFormatContext) -> Self {
         Self {
             ptr,
