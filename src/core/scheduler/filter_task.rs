@@ -37,7 +37,7 @@ use ffmpeg_sys_next::{
     av_inv_q, av_log2, av_malloc, av_opt_find, av_opt_set, av_opt_set_bin, av_opt_set_int,
     av_q2d, av_rescale_q, avfilter_get_by_name,
     avfilter_graph_config, avfilter_graph_create_filter,
-    avfilter_graph_request_oldest, avfilter_inout_free, avfilter_link, avfilter_pad_get_type,
+    avfilter_graph_request_oldest, avfilter_link, avfilter_pad_get_type,
     avio_close, avio_closep, avio_open, avio_open2, avio_read, avio_read_to_bprint, avio_size,
     AVBPrint, AVBufferRef, AVColorRange, AVColorSpace, AVFilterContext, AVFilterGraph,
     AVFilterInOut, AVFrame, AVMediaType, AVPixelFormat, AVRational, AVSampleFormat, AVERROR,
@@ -792,9 +792,21 @@ unsafe fn configure_filtergraph(
 
     let hw_device = hw_device_for_filter();
 
-    let mut inputs = null_mut();
-    let mut outputs = null_mut();
-    let mut ret = graph_parse(graph_ptr, graph_desc, &mut inputs, &mut outputs, hw_device);
+    // The AVFilterInOut lists are FFmpeg-allocated out-params the caller must
+    // free; owning them in `raw::FilterInOut` frees each exactly once on every
+    // path (including every error return below and an unwind), so there is no
+    // manual `avfilter_inout_free` and no `?`/early-return leak. The lists are
+    // only walked here (never node-consumed by linking), so holding them until
+    // scope end — rather than freeing mid-function — is equivalent.
+    let mut inputs = crate::raw::FilterInOut::empty();
+    let mut outputs = crate::raw::FilterInOut::empty();
+    let mut ret = graph_parse(
+        graph_ptr,
+        graph_desc,
+        inputs.as_out_ptr(),
+        outputs.as_out_ptr(),
+        hw_device,
+    );
     if ret < 0 {
         cleanup_filtergraph(graph, ifps, ofps);
         return Err(Error::FilterGraph(FilterGraphOperationError::ParseError(
@@ -802,7 +814,7 @@ unsafe fn configure_filtergraph(
         )));
     }
 
-    let mut cur = inputs;
+    let mut cur = inputs.as_ptr();
     let mut i = 0;
     loop {
         if cur.is_null() {
@@ -817,8 +829,6 @@ unsafe fn configure_filtergraph(
 
         let ret = configure_input_filter(fg_index, graph_ptr, ifp.unwrap(), cur);
         if ret < 0 {
-            avfilter_inout_free(&mut inputs);
-            avfilter_inout_free(&mut outputs);
             cleanup_filtergraph(graph, ifps, ofps);
             return Err(Error::FilterGraph(FilterGraphOperationError::ParseError(
                 FilterGraphParseError::from(ret),
@@ -828,9 +838,8 @@ unsafe fn configure_filtergraph(
         cur = (*cur).next;
         i += 1;
     }
-    avfilter_inout_free(&mut inputs);
 
-    cur = outputs;
+    cur = outputs.as_ptr();
     i = 0;
     loop {
         if cur.is_null() {
@@ -845,7 +854,6 @@ unsafe fn configure_filtergraph(
 
         let ret = configure_output_filter(graph_ptr, ofp.unwrap(), cur);
         if ret < 0 {
-            avfilter_inout_free(&mut outputs);
             cleanup_filtergraph(graph, ifps, ofps);
             return Err(Error::FilterGraph(FilterGraphOperationError::ParseError(
                 FilterGraphParseError::from(ret),
@@ -855,7 +863,6 @@ unsafe fn configure_filtergraph(
         cur = (*cur).next;
         i += 1;
     }
-    avfilter_inout_free(&mut outputs);
 
     //TODO disable_conversions
 
