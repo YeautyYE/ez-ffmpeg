@@ -54,7 +54,7 @@ use ffmpeg_sys_next::{
     av_inv_q, av_malloc, av_rescale_q, av_seek_frame, avcodec_alloc_context3,
     avcodec_descriptor_get, avcodec_descriptor_get_by_name, avcodec_find_encoder,
     avcodec_find_encoder_by_name, avcodec_get_name, avcodec_parameters_from_context,
-    avcodec_parameters_to_context, avfilter_graph_alloc, avfilter_graph_free, avfilter_inout_free,
+    avcodec_parameters_to_context, avfilter_inout_free,
     avfilter_pad_get_name, avfilter_pad_get_type, avformat_alloc_context,
     avformat_alloc_output_context2, avformat_close_input, avformat_find_stream_info,
     avformat_flush, avformat_free_context, avformat_open_input, avio_alloc_context,
@@ -2931,24 +2931,21 @@ fn init_filter_graph(
     unsafe {
         /* this graph is only used for determining the kinds of inputs
         and outputs we have, and is discarded on exit from this function */
-        let mut graph = avfilter_graph_alloc();
-        // avfilter_graph_alloc() returns null on allocation failure (OOM);
-        // deref without this check is undefined behavior.
-        if graph.is_null() {
-            return Err(FilterGraphParseError::OutOfMemory.into());
-        }
-        (*graph).nb_threads = 1;
+        // Owned handle: `raw::FilterGraph`'s Drop frees the graph (and every
+        // filter context it holds) on every return path below — including the
+        // two `inouts_to_*_filters(..)?` early returns, which the hand-balanced
+        // `avfilter_graph_free` calls used to miss, leaking the graph.
+        let graph = crate::raw::FilterGraph::alloc().ok_or(FilterGraphParseError::OutOfMemory)?;
+        (*graph.as_ptr()).nb_threads = 1;
 
         let mut seg = null_mut();
-        let mut ret = avfilter_graph_segment_parse(graph, desc_cstr.as_ptr(), 0, &mut seg);
+        let mut ret = avfilter_graph_segment_parse(graph.as_ptr(), desc_cstr.as_ptr(), 0, &mut seg);
         if ret < 0 {
-            avfilter_graph_free(&mut graph);
             return Err(FilterGraphParseError::from(ret).into());
         }
 
         ret = avfilter_graph_segment_create_filters(seg, 0);
         if ret < 0 {
-            avfilter_graph_free(&mut graph);
             avfilter_graph_segment_free(&mut seg);
             return Err(FilterGraphParseError::from(ret).into());
         }
@@ -2959,7 +2956,6 @@ fn init_filter_graph(
         }
         if ret < 0 {
             avfilter_graph_segment_free(&mut seg);
-            avfilter_graph_free(&mut graph);
             return Err(FilterGraphParseError::from(ret).into());
         }
 
@@ -2971,17 +2967,18 @@ fn init_filter_graph(
         if ret < 0 {
             avfilter_inout_free(&mut inputs);
             avfilter_inout_free(&mut outputs);
-            avfilter_graph_free(&mut graph);
             return Err(FilterGraphParseError::from(ret).into());
         }
 
+        // NOTE: on these two `?` early returns `inputs`/`outputs` (AVFilterInOut)
+        // still leak — that owner gets its own RAII wrapper in the follow-up
+        // AVFilterInOut PR; the graph itself is now leak-free on every path.
         let input_filters = inouts_to_input_filters(fg_index, inputs)?;
         let output_filters = inouts_to_output_filters(outputs)?;
 
         if output_filters.is_empty() {
             avfilter_inout_free(&mut inputs);
             avfilter_inout_free(&mut outputs);
-            avfilter_graph_free(&mut graph);
             return Err(FilterZeroOutputs);
         }
 
@@ -2994,7 +2991,6 @@ fn init_filter_graph(
 
         avfilter_inout_free(&mut inputs);
         avfilter_inout_free(&mut outputs);
-        avfilter_graph_free(&mut graph);
 
         Ok(filter_graph)
     }
@@ -3593,9 +3589,7 @@ mod tests {
     use std::ptr::null_mut;
 
     use crate::core::context::ffmpeg_context::{strtol, FfmpegContext, Output};
-    use ffmpeg_sys_next::{
-        avfilter_graph_alloc, avfilter_graph_free, avfilter_graph_parse_ptr, avfilter_inout_free,
-    };
+    use ffmpeg_sys_next::{avfilter_graph_parse_ptr, avfilter_inout_free};
 
     use crate::core::context::ffmpeg_context::{bind_fg_inputs_by_fg, fg_complex_bind_input};
     use crate::core::context::filter_graph::FilterGraph;
@@ -3715,12 +3709,12 @@ mod tests {
         // let desc_cstr = CString::new("fps=15").unwrap();
 
         unsafe {
-            let mut graph = avfilter_graph_alloc();
+            let graph = crate::raw::FilterGraph::alloc().unwrap();
             let mut inputs = null_mut();
             let mut outputs = null_mut();
 
             let ret = avfilter_graph_parse_ptr(
-                graph,
+                graph.as_ptr(),
                 desc_cstr.as_ptr(),
                 &mut inputs,
                 &mut outputs,
@@ -3729,7 +3723,6 @@ mod tests {
             if ret < 0 {
                 avfilter_inout_free(&mut inputs);
                 avfilter_inout_free(&mut outputs);
-                avfilter_graph_free(&mut graph);
                 println!("err ret:{}", crate::util::ffmpeg_utils::av_err2str(ret));
                 return;
             }
