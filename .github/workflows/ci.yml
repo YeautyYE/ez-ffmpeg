@@ -10,14 +10,14 @@
 # zlib), NOT FFmpeg itself. The first build compiles FFmpeg (~10-20 min); the
 # cache makes subsequent runs fast.
 #
-# GPU-dependent tests: with `--all-features` the `opengl`/`wgpu` frame-filter
-# tests need a real GPU/display (they fail headless with "Failed to create
-# Surfman connection: ConnectionFailed"), so `test` stays non-blocking until
-# those are gated or the runner has a GPU. The macOS-only `videotoolbox`
-# scheduler tests are `#[cfg(target_os = "macos")]`, so they do not false-fail on
-# Linux.
+# GPU-dependent code: the `opengl`/`wgpu` frame filters need a real GPU/display
+# and their tests fail headless ("Failed to create Surfman connection"). The
+# `build` job still compiles them (via `--all-features`) so they stay type-checked;
+# the `test` job omits those two features so the suite runs green on a GPU-less
+# runner (everything else — 465 tests — passes). The macOS-only `videotoolbox`
+# scheduler tests are `#[cfg(target_os = "macos")]`, so they do not run on Linux.
 #
-# `build` + `clippy` are the enforced safety gates.
+# `build` + `clippy` + `test` are all enforced gates.
 
 name: CI
 
@@ -69,13 +69,11 @@ jobs:
         run: cargo clippy --all-features $FFMPEG_FEATURES --lib
 
   test:
-    name: Test (non-blocking)
+    name: Test
     runs-on: ubuntu-latest
-    # Non-blocking: with --all-features the opengl/wgpu frame-filter tests need a
-    # GPU/display and fail headless. Promote to a required gate once those are
-    # gated (or the runner has a GPU). The macOS-only videotoolbox tests are
-    # already #[cfg(target_os = "macos")]. Media assets are committed as test.mp4.
-    continue-on-error: true
+    # Runs the full library suite MINUS the opengl/wgpu features, whose tests
+    # need a GPU/display. Everything else passes headless. Media assets are
+    # committed as test.mp4.
     steps:
       - uses: actions/checkout@v4
 
@@ -97,4 +95,4 @@ jobs:
           key: ${{ runner.os }}-cargo-buildffmpeg-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Test
-        run: cargo test --all-features $FFMPEG_FEATURES --lib
+        run: cargo test --lib --features async,rtmp,flv,subtitle $FFMPEG_FEATURES
