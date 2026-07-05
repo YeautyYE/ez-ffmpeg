@@ -332,17 +332,6 @@ impl CodecContext {
         }
     }
 
-    pub(crate) fn replace(&mut self, avcodec_context: *mut AVCodecContext) -> *mut AVCodecContext {
-        let mut tmp = self.inner;
-        if !tmp.is_null() {
-            unsafe {
-                avcodec_free_context(&mut tmp);
-            }
-        }
-        self.inner = avcodec_context;
-        tmp
-    }
-
     pub(crate) fn null() -> Self {
         Self { inner: null_mut() }
     }

@@ -24,7 +24,7 @@ use ffmpeg_sys_next::AVRounding::AV_ROUND_UP;
 use ffmpeg_sys_next::AVSubtitleType::SUBTITLE_BITMAP;
 #[cfg(not(docsrs))]
 use ffmpeg_sys_next::{av_channel_layout_copy, AV_CODEC_FLAG_COPY_OPAQUE};
-use ffmpeg_sys_next::{av_buffer_create, av_buffer_ref, av_calloc, av_dict_set, av_frame_apply_cropping, av_frame_copy_props, av_frame_move_ref, av_frame_ref, av_frame_unref, av_free, av_freep, av_gcd, av_hwdevice_get_type_name, av_hwframe_transfer_data, av_inv_q, av_mallocz, av_memdup, av_mul_q, av_opt_set_dict2, av_pix_fmt_desc_get, av_rescale_delta, av_rescale_q, av_strdup, avcodec_alloc_context3, avcodec_decode_subtitle2, avcodec_default_get_buffer2, avcodec_flush_buffers, avcodec_free_context, avcodec_get_hw_config, avcodec_open2, avcodec_parameters_to_context, avcodec_receive_frame, avcodec_send_packet, avsubtitle_free, AVCodec, AVCodecContext, AVDictionary, AVFrame, AVHWDeviceType, AVMediaType, AVPixelFormat, AVRational, AVSubtitle, AVSubtitleRect, AVERROR, AVERROR_EOF, AVPALETTE_SIZE, AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX, AV_FRAME_CROP_UNALIGNED, AV_FRAME_FLAG_CORRUPT, AV_NOPTS_VALUE, AV_PIX_FMT_FLAG_HWACCEL, AV_TIME_BASE_Q, EAGAIN, EINVAL, ENOMEM};
+use ffmpeg_sys_next::{av_buffer_create, av_buffer_ref, av_calloc, av_dict_free, av_dict_set, av_frame_apply_cropping, av_frame_copy_props, av_frame_move_ref, av_frame_ref, av_frame_unref, av_free, av_freep, av_gcd, av_hwdevice_get_type_name, av_hwframe_transfer_data, av_inv_q, av_mallocz, av_memdup, av_mul_q, av_opt_set_dict2, av_pix_fmt_desc_get, av_rescale_delta, av_rescale_q, av_strdup, avcodec_alloc_context3, avcodec_decode_subtitle2, avcodec_default_get_buffer2, avcodec_flush_buffers, avcodec_get_hw_config, avcodec_open2, avcodec_parameters_to_context, avcodec_receive_frame, avcodec_send_packet, avsubtitle_free, AVCodec, AVCodecContext, AVDictionary, AVFrame, AVHWDeviceType, AVMediaType, AVPixelFormat, AVRational, AVSubtitle, AVSubtitleRect, AVERROR, AVERROR_EOF, AVPALETTE_SIZE, AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX, AV_FRAME_CROP_UNALIGNED, AV_FRAME_FLAG_CORRUPT, AV_NOPTS_VALUE, AV_PIX_FMT_FLAG_HWACCEL, AV_TIME_BASE_Q, EAGAIN, EINVAL, ENOMEM};
 use log::{debug, error, info, trace, warn};
 use std::ffi::{c_void, CStr, CString};
 use std::ptr::{null, null_mut};
@@ -687,6 +687,52 @@ fn dec_open(
     Ok(())
 }
 
+/// Reclaims the `Arc<Mutex<DecoderParameter>>` refcount stashed in an
+/// `AVCodecContext.opaque` if `dec_open` fails after installing it.
+///
+/// The `opaque` back-reference (an `Arc::into_raw`) is installed **before**
+/// `avcodec_open2`, because some hardware decoders call `get_format` during
+/// open and that callback both needs a live `opaque` and records
+/// `hwaccel_pix_fmt` as a side effect. If any step after the install fails and
+/// returns early, that refcount would otherwise leak (the normal reclaim,
+/// `drop_opaque_ptr`, runs only once the context reaches its long-lived owner).
+/// This guard reclaims it via `Arc::from_raw` on drop; a successful handoff
+/// calls [`disarm`](Self::disarm) so the live decoder owns the reference and
+/// `drop_opaque_ptr` releases it at shutdown instead.
+#[cfg(not(docsrs))]
+struct OpaqueGuard {
+    dec_ctx: *mut AVCodecContext,
+}
+
+#[cfg(not(docsrs))]
+impl OpaqueGuard {
+    /// Give up responsibility for the `opaque` Arc: the context handed off
+    /// successfully and the live decoder now owns the refcount.
+    fn disarm(mut self) {
+        self.dec_ctx = null_mut();
+    }
+}
+
+#[cfg(not(docsrs))]
+impl Drop for OpaqueGuard {
+    fn drop(&mut self) {
+        if self.dec_ctx.is_null() {
+            return;
+        }
+        // SAFETY: armed only after `(*dec_ctx).opaque = Arc::into_raw(...)`, so
+        // `opaque` is a live `Arc<Mutex<DecoderParameter>>` pointer here. Reclaim
+        // that one refcount exactly once (mirrors `drop_opaque_ptr`), then null
+        // the field so nothing else treats it as live.
+        unsafe {
+            let dp_ptr = (*self.dec_ctx).opaque as *const Mutex<DecoderParameter>;
+            if !dp_ptr.is_null() {
+                let _ = Arc::from_raw(dp_ptr);
+                (*self.dec_ctx).opaque = null_mut();
+            }
+        }
+    }
+}
+
 #[cfg(not(docsrs))]
 fn dec_open(
     dp_arc: Arc<Mutex<DecoderParameter>>,
@@ -694,12 +740,19 @@ fn dec_open(
     param_out: *mut AVFrame,
 ) -> crate::error::Result<()> {
     unsafe {
-        let mut dec_ctx = avcodec_alloc_context3(dec_stream.codec.as_ptr());
+        let dec_ctx = avcodec_alloc_context3(dec_stream.codec.as_ptr());
         if dec_ctx.is_null() {
             return Err(OpenDecoder(
                 OpenDecoderOperationError::ContextAllocationError(OpenDecoderError::OutOfMemory),
             ));
         }
+        // Take ownership of the freshly-allocated context immediately. `dec_ctx`
+        // stays as a raw alias for FFI reads/calls below, but every early return
+        // from here on frees the context via this owner's `Drop` — no manual
+        // `avcodec_free_context` on the fallible paths, and no leak if a step
+        // past `avcodec_open2` (e.g. the channel-layout copy) fails.
+        let dec_ctx_owner = CodecContext::new(dec_ctx);
+
         // Per-input decoder log demotion (Input::set_log_level_offset).
         (*dec_ctx).log_level_offset = dec_stream.log_level_offset;
 
@@ -708,39 +761,36 @@ fn dec_open(
             (*dec_stream.stream.inner).codecpar,
         );
         if ret < 0 {
-            avcodec_free_context(&mut dec_ctx);
             error!("Error initializing the decoder context.");
             return Err(OpenDecoder(
                 OpenDecoderOperationError::ParameterApplicationError(OpenDecoderError::from(ret)),
             ));
         }
 
-        // SAFETY: Store Arc<Mutex<DecoderParameter>> as raw pointer in FFmpeg's opaque field.
-        // This follows the C FFI pattern used by FFmpeg (see ffmpeg_dec.c:1568).
-        // Invariants:
-        // 1. Arc::into_raw does not decrement the reference count
-        // 2. The pointer remains valid until drop_opaque_ptr() is called
-        // 3. FFmpeg callbacks (get_format, get_buffer2) must reconstruct the Arc via
-        //    Arc::from_raw, clone it, and store back via Arc::into_raw to maintain refcount
-        // 4. drop_opaque_ptr() calls Arc::from_raw exactly once to drop the Arc
-        let dp_ptr = Arc::into_raw(dp_arc.clone());
-        (*dec_ctx).opaque = dp_ptr as *mut libc::c_void;
-
-        (*dec_ctx).get_format = Some(get_format_callback);
-        (*dec_ctx).get_buffer2 = Some(get_buffer_callback);
         (*dec_ctx).pkt_timebase = dec_stream.time_base;
 
-        let mut dec_opts: *mut AVDictionary = std::ptr::null_mut();
-        let opt_key = CString::new("threads".to_string()).unwrap();
-        let opt_val = CString::new("auto".to_string()).unwrap();
-        av_dict_set(&mut dec_opts, opt_key.as_ptr(), opt_val.as_ptr(), 0);
+        // Install the decode-time callbacks and the decoder-parameter
+        // back-reference BEFORE `avcodec_open2`: some hardware decoders invoke
+        // `get_format` during open, and that callback needs a live `opaque` and
+        // records `hwaccel_pix_fmt` as a side effect used later by the frame
+        // path — deferring it past open would silently drop that side effect.
+        //
+        // SAFETY: `Arc::into_raw` preserves the refcount; `opaque` stays a live
+        // pointer until reclaimed exactly once. On success that reclaim is
+        // `drop_opaque_ptr` at decoder shutdown; on any early return below it is
+        // `opaque_guard`'s Drop (armed on the next line). `get_format` clones and
+        // restores the Arc to keep the count balanced.
+        (*dec_ctx).get_format = Some(get_format_callback);
+        (*dec_ctx).get_buffer2 = Some(get_buffer_callback);
+        let dp_ptr = Arc::into_raw(dp_arc.clone());
+        (*dec_ctx).opaque = dp_ptr as *mut libc::c_void;
+        let opaque_guard = OpaqueGuard { dec_ctx };
 
         {
             let dp_arc_clone = dp_arc.clone();
             let mut dp = dp_arc_clone.lock().unwrap();
             ret = hw_device_setup_for_decode(&mut dp, dec_stream.codec.as_ptr(), dec_ctx);
             if ret < 0 {
-                avcodec_free_context(&mut dec_ctx);
                 error!("Hardware device setup failed for decoder: {}", av_err2str(ret));
                 return Err(OpenDecoder(OpenDecoderOperationError::HwSetupError(
                     OpenDecoderError::from(ret),
@@ -748,9 +798,17 @@ fn dec_open(
             }
         }
 
+        // Allocate the options dict only after hw setup (so the failure path
+        // above can never leak it) and free it unconditionally right after use.
+        // `av_opt_set_dict2` consumes the entries it applies; `av_dict_free`
+        // reclaims any leftover (and is a no-op on the null it usually leaves).
+        let mut dec_opts: *mut AVDictionary = null_mut();
+        let opt_key = CString::new("threads".to_string()).unwrap();
+        let opt_val = CString::new("auto".to_string()).unwrap();
+        av_dict_set(&mut dec_opts, opt_key.as_ptr(), opt_val.as_ptr(), 0);
         ret = av_opt_set_dict2(dec_ctx as *mut c_void, &mut dec_opts, ffmpeg_sys_next::AV_OPT_SEARCH_CHILDREN);
+        av_dict_free(&mut dec_opts);
         if ret < 0 {
-            avcodec_free_context(&mut dec_ctx);
             error!("Error applying decoder options: {}", av_err2str(ret));
             return Err(OpenDecoder(
                 OpenDecoderOperationError::ParameterApplicationError(OpenDecoderError::from(ret)),
@@ -768,7 +826,6 @@ fn dec_open(
 
         ret = avcodec_open2(dec_ctx, dec_stream.codec.as_ptr(), null_mut());
         if ret < 0 {
-            avcodec_free_context(&mut dec_ctx);
             error!("Error while opening decoder: {}", av_err2str(ret));
             return Err(OpenDecoder(OpenDecoderOperationError::DecoderOpenError(
                 OpenDecoderError::from(ret),
@@ -835,8 +892,15 @@ fn dec_open(
             (*param_out).time_base = (*dec_ctx).pkt_timebase;
         }
 
-        let mut dp = dp_arc.lock().unwrap();
-        dp.dec_ctx.replace(dec_ctx);
+        // All fallible setup has succeeded. Hand the context to its long-lived
+        // owner first, then give up the guard: from here the live decoder owns
+        // the `opaque` Arc refcount, released exactly once by `drop_opaque_ptr()`
+        // at shutdown. `dec_ctx_owner` is MOVED into `dp.dec_ctx` (the prior null
+        // owner there drops as a no-op), so the context is freed exactly once.
+        // Parking the owner before `disarm` keeps a single custodian of the
+        // context across the hand-off even if a panic were to intervene.
+        dp_arc.lock().unwrap().dec_ctx = dec_ctx_owner;
+        opaque_guard.disarm();
     }
 
     Ok(())
