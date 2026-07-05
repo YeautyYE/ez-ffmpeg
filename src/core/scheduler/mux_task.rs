@@ -1,6 +1,7 @@
 use crate::core::context::muxer::Muxer;
 use crate::core::context::obj_pool::ObjPool;
-use crate::core::context::{AVFormatContextBox, PacketBox, PacketData};
+use crate::core::context::{PacketBox, PacketData};
+use crate::raw::FormatContext;
 use crate::core::scheduler::ffmpeg_scheduler::{is_stopping, packet_is_null, set_scheduler_error, wait_until_not_paused, STATUS_ABORT, STATUS_END};
 use crate::core::scheduler::input_controller::{InputController, SchNode};
 use crate::error::Error::Muxing;
@@ -15,7 +16,6 @@ use ffmpeg_sys_next::{av_get_audio_frame_duration2, av_interleaved_write_frame, 
 use log::{debug, error, info, trace, warn};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
-use std::ptr::null_mut;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -30,13 +30,16 @@ pub(crate) fn mux_init(
     thread_sync: ThreadSynchronizer,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
 ) -> crate::error::Result<()> {
-    let out_fmt_ctx = mux.out_fmt_ctx;
-
-    mux.out_fmt_ctx = null_mut();
+    // Take sole ownership of the output context out of the Muxer; move it by
+    // value through the handoff. The move is the ownership transfer — no
+    // null-the-source dance.
+    let out_fmt_ctx = mux
+        .out_fmt_ctx
+        .take()
+        .expect("mux_init called without an output context");
     mux_task_start(
         mux_idx,
         out_fmt_ctx,
-        mux.is_set_write_callback,
         mux.take_queue(),
         mux.start_time_us,
         mux.recording_time_us,
@@ -66,10 +69,14 @@ pub(crate) fn ready_to_init_mux(
     if !mux.is_ready() {
         let (sender, receiver) = crossbeam_channel::bounded(1);
 
-        let out_fmt_ctx = mux.out_fmt_ctx;
+        // Take sole ownership of the output context out of the Muxer. It is moved
+        // into the waiter thread below; if streams never become ready the waiter
+        // drops it (freeing once) — the RAII net the old box#1 provided.
+        let out_fmt_ctx = mux
+            .out_fmt_ctx
+            .take()
+            .expect("ready_to_init_mux called without an output context");
         let mux_stream_nodes = mux.mux_stream_nodes.clone();
-        mux.out_fmt_ctx = null_mut();
-        let is_set_write_callback = mux.is_set_write_callback;
         let queue = mux.take_queue();
         let src_pre_recvs = mux.take_src_pre_recvs();
         let mux_start_gate = mux.mux_start_gate();
@@ -80,11 +87,10 @@ pub(crate) fn ready_to_init_mux(
         let nb_streams_ready = mux.nb_streams_ready.clone();
         let format_opts = mux.format_opts.clone();
 
-        let out_fmt_ctx_box =
-            AVFormatContextBox::new(out_fmt_ctx, false, is_set_write_callback);
-
         let result = std::thread::Builder::new().name(format!("ready-to-init-muxer{mux_idx}")).spawn(move || {
-            let mut out_fmt_ctx_box = out_fmt_ctx_box;
+            // Owns the context until streams are ready; drops (frees) if the loop
+            // exits early. Handed to mux_task_start on the all-ready branch.
+            let mut out_fmt_ctx = Some(out_fmt_ctx);
             loop {
                 let result = receiver.recv_timeout(Duration::from_millis(100));
 
@@ -117,12 +123,14 @@ pub(crate) fn ready_to_init_mux(
                 debug!("output_stream: {stream_index} is readied");
                 let nb_streams_ready = nb_streams_ready.fetch_add(1, Ordering::Release);
                 if nb_streams_ready + 1 == stream_count {
-                    let out_fmt_ctx = out_fmt_ctx_box.fmt_ctx;
-                    out_fmt_ctx_box.fmt_ctx = null_mut();
+                    // Move the context out to the terminal init; a later drop of
+                    // the (now `None`) local is a no-op.
+                    let out_fmt_ctx = out_fmt_ctx
+                        .take()
+                        .expect("mux waiter reached all-ready without a context");
                     if let Err(e) = mux_task_start(
                         mux_idx,
                         out_fmt_ctx,
-                        is_set_write_callback,
                         queue,
                         start_time_us,
                         recording_time_us,
@@ -157,8 +165,7 @@ pub(crate) fn ready_to_init_mux(
 }
 
 fn mux_task_start(mux_idx: usize,
-                  out_fmt_ctx: *mut AVFormatContext,
-                  is_set_write_callback: bool,
+                  out_fmt_ctx: FormatContext,
                   queue: Option<(Sender<PacketBox>, Receiver<PacketBox>)>,
                   start_time_us: Option<i64>,
                   recording_time_us: Option<i64>,
@@ -175,12 +182,14 @@ fn mux_task_start(mux_idx: usize,
                   scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,) -> crate::error::Result<()> {
 
     if queue.is_none() {
+        // `out_fmt_ctx` is owned here: this early return drops it, freeing the
+        // context. Previously the raw pointer was leaked on this zero-stream path.
         return Ok(());
     }
 
     let (queue_sender, queue_receiver) = queue.unwrap();
 
-    _mux_init(mux_idx, out_fmt_ctx, is_set_write_callback, queue_receiver, start_time_us, recording_time_us, stream_count, format_opts, enc_handle_receiver, packet_pool, input_controller, mux_stream_nodes, scheduler_status, thread_sync, scheduler_result)?;
+    _mux_init(mux_idx, out_fmt_ctx, queue_receiver, start_time_us, recording_time_us, stream_count, format_opts, enc_handle_receiver, packet_pool, input_controller, mux_stream_nodes, scheduler_status, thread_sync, scheduler_result)?;
 
     // Drain the pre-queues and open the gate atomically: an encoder that
     // saw the gate closed cannot park a packet after this drain ran.
@@ -196,8 +205,7 @@ fn mux_task_start(mux_idx: usize,
 
 fn _mux_init(
     mux_idx: usize,
-    out_fmt_ctx: *mut AVFormatContext,
-    is_set_write_callback: bool,
+    out_fmt_ctx: FormatContext,
     pkt_receiver: Receiver<PacketBox>,
     start_time_us: Option<i64>,
     recording_time_us: Option<i64>,
@@ -211,13 +219,17 @@ fn _mux_init(
     thread_sync: ThreadSynchronizer,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
 ) -> crate::error::Result<()> {
-    let out_fmt_ctx_box = AVFormatContextBox::new(out_fmt_ctx, false, is_set_write_callback);
+    // `out_fmt_ctx` (a FormatContext) is the sole owner here; it Drops — freeing
+    // the context — on the write_header error return below, and is moved into the
+    // muxer worker thread on success. `as_ptr()` borrows it for the FFI calls.
+    // SAFETY: as_ptr yields the live output context pointer.
+    let out_fmt_ctx_ptr = unsafe { out_fmt_ctx.as_ptr() };
 
     // Guard owns the dict on every path: write_header leaves unrecognized
     // entries behind, which leaked (and were silently swallowed) before.
     let mut opts = DictGuard::new(hashmap_to_avdictionary(&format_opts));
 
-    let ret = unsafe { avformat_write_header(out_fmt_ctx, opts.as_double_ptr()) };
+    let ret = unsafe { avformat_write_header(out_fmt_ctx_ptr, opts.as_double_ptr()) };
     if ret < 0 {
         error!("Could not write header (incorrect codec parameters ?): {}", av_err2str(ret));
         // Record the failure BEFORE releasing this muxer's thread slot, so
@@ -232,6 +244,7 @@ fn _mux_init(
         thread_sync.thread_done_with(|| {
             scheduler_status.store(STATUS_END, Ordering::Release);
         });
+        // `out_fmt_ctx` drops here, freeing the context.
         return Err(Muxing(MuxingOperationError::WriteHeader(
             WriteHeaderError::from(ret),
         )));
@@ -242,14 +255,16 @@ fn _mux_init(
     }
 
     let oformat_flags = unsafe {
-        let oformat = (*out_fmt_ctx).oformat;
+        let oformat = (*out_fmt_ctx_ptr).oformat;
         (*oformat).flags
     };
 
-    let format_name = unsafe { CStr::from_ptr((*(*out_fmt_ctx).oformat).name).to_str().unwrap_or("unknown") };
+    let format_name = unsafe { CStr::from_ptr((*(*out_fmt_ctx_ptr).oformat).name).to_str().unwrap_or("unknown") };
 
     let result = std::thread::Builder::new().name(format!("muxer{mux_idx}:{format_name}")).spawn(move || {
-        let out_fmt_ctx_box = out_fmt_ctx_box;
+        // Move the FormatContext into the worker; it Drops (frees the output
+        // context, custom-IO-aware) when this closure ends — the terminal free.
+        let out_fmt_ctx = out_fmt_ctx;
         let mut stream_started: Vec<bool> = vec![false; stream_count];
         let mut stream_eof: Vec<bool> = vec![false; stream_count];
         let mut st_rescale_delta_last_map = HashMap::new();
@@ -394,7 +409,7 @@ fn _mux_init(
                         &mut st_rescale_delta_last_map,
                         oformat_flags,
                         &mut st_last_dts_map,
-                        &out_fmt_ctx_box,
+                        &out_fmt_ctx,
                         &mut packet_box,
                     );
                     packet_pool.release(packet_box.packet);
@@ -424,7 +439,7 @@ fn _mux_init(
         let final_status = scheduler_status.load(Ordering::Acquire);
         if final_status != STATUS_ABORT {
             unsafe {
-                let ret = av_write_trailer(out_fmt_ctx_box.fmt_ctx);
+                let ret = av_write_trailer(out_fmt_ctx.as_ptr());
                 if ret < 0 {
                     error!("Error writing trailer: {}", av_err2str(ret));
                     set_scheduler_error(
@@ -443,7 +458,7 @@ fn _mux_init(
         debug!("Muxer finished.");
 
         // Unblock any encoder still sending into the packet queue, then join
-        // this muxer's encoders BEFORE the AVFormatContextBox drop frees the
+        // this muxer's encoders BEFORE the FormatContext drop frees the
         // output streams they write into (FFmpeg joins encoder tasks before
         // muxer cleanup in sch_stop, ffmpeg_sched.c:2535-2604).
         drop(pkt_receiver);
@@ -539,7 +554,7 @@ unsafe fn write_packet(
     st_rescale_delta_last_map: &mut HashMap<i32, i64>,
     oformat_flags: i32,
     st_last_dts_map: &mut HashMap<i32, i64>,
-    out_fmt_ctx_box: &AVFormatContextBox,
+    out_fmt_ctx: &FormatContext,
     sq_packet_box: &mut PacketBox,
 ) -> i32 {
     mux_fixup_ts(
@@ -547,13 +562,13 @@ unsafe fn write_packet(
         oformat_flags,
         st_last_dts_map,
         sq_packet_box,
-        out_fmt_ctx_box.fmt_ctx,
+        out_fmt_ctx.as_ptr(),
     );
 
     (*sq_packet_box.packet.as_mut_ptr()).stream_index =
         sq_packet_box.packet_data.output_stream_index;
-    
-    av_interleaved_write_frame(out_fmt_ctx_box.fmt_ctx, sq_packet_box.packet.as_mut_ptr())
+
+    av_interleaved_write_frame(out_fmt_ctx.as_ptr(), sq_packet_box.packet.as_mut_ptr())
 }
 
 unsafe fn mux_fixup_ts(
