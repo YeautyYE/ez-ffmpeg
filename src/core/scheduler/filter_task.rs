@@ -15,7 +15,7 @@ use crate::hwaccel::{hw_device_for_filter, init_filter_hw_device, HWDevice};
 use crate::util::ffmpeg_utils::av_rescale_q_rnd;
 use crossbeam_channel::{RecvTimeoutError, Sender};
 use ffmpeg_next::Frame;
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 use ffmpeg_sys_next::AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC;
 use ffmpeg_sys_next::AVColorRange::AVCOL_RANGE_UNSPECIFIED;
 use ffmpeg_sys_next::AVColorSpace::AVCOL_SPC_UNSPECIFIED;
@@ -45,7 +45,7 @@ use ffmpeg_sys_next::{
     AV_BUFFERSINK_FLAG_NO_REQUEST, AV_BUFFERSRC_FLAG_PUSH, AV_NOPTS_VALUE, AV_OPT_SEARCH_CHILDREN,
     AV_PIX_FMT_FLAG_HWACCEL, AV_TIME_BASE_Q, EAGAIN, EINVAL, EIO, ENOMEM,
 };
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 use ffmpeg_sys_next::{
     av_buffer_replace, av_buffersink_get_ch_layout, av_buffersink_get_color_range,
     av_buffersink_get_colorspace, av_buffersink_get_format, av_channel_layout_check,
@@ -318,7 +318,7 @@ struct InputFilterParameter {
     color_space: AVColorSpace,
     color_range: AVColorRange,
     sample_rate: i32,
-    #[cfg(not(feature = "docs-rs"))]
+    #[cfg(not(docsrs))]
     ch_layout: AVChannelLayout,
     displaymatrix_present: bool,
     displaymatrix_applied: bool,
@@ -351,7 +351,7 @@ impl InputFilterParameter {
             color_space: AVColorSpace::AVCOL_SPC_UNSPECIFIED,
             color_range: AVColorRange::AVCOL_RANGE_UNSPECIFIED,
             sample_rate: 0,
-            #[cfg(not(feature = "docs-rs"))]
+            #[cfg(not(docsrs))]
             ch_layout: AVChannelLayout {
                 order: AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC,
                 nb_channels: 0,
@@ -450,7 +450,7 @@ impl OutputFilterParameter {
 // pointer is only accessed from the filter task's owning thread.
 unsafe impl Send for OutputFilterParameter {}
 
-#[cfg(feature = "docs-rs")]
+#[cfg(docsrs)]
 unsafe fn fg_send_eof(
     fg_index: usize,
     graph: *mut *mut AVFilterGraph,
@@ -465,7 +465,7 @@ unsafe fn fg_send_eof(
     Ok(())
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 unsafe fn fg_send_eof(
     fg_index: usize,
     graph: *mut *mut AVFilterGraph,
@@ -558,7 +558,7 @@ const VIDEO_CHANGED: i32 = 1 << 0;
 const AUDIO_CHANGED: i32 = 1 << 1;
 const MATRIX_CHANGED: i32 = 1 << 2;
 const HWACCEL_CHANGED: i32 = 1 << 3;
-#[cfg(feature = "docs-rs")]
+#[cfg(docsrs)]
 unsafe fn fg_send_frame(
     fg_index: usize,
     graph: *mut *mut AVFilterGraph,
@@ -573,7 +573,7 @@ unsafe fn fg_send_frame(
     Ok(())
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 unsafe fn fg_send_frame(
     fg_index: usize,
     graph: *mut *mut AVFilterGraph,
@@ -755,7 +755,7 @@ unsafe fn fg_send_frame(
     Ok(())
 }
 
-#[cfg(feature = "docs-rs")]
+#[cfg(docsrs)]
 unsafe fn configure_filtergraph(
     fg_index: usize,
     mut graph: *mut *mut AVFilterGraph,
@@ -767,7 +767,7 @@ unsafe fn configure_filtergraph(
     Ok(())
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 unsafe fn configure_filtergraph(
     fg_index: usize,
     graph: *mut *mut AVFilterGraph,
@@ -986,7 +986,7 @@ unsafe fn configure_filtergraph(
     Ok(())
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 unsafe fn graph_is_meta(graph: *mut AVFilterGraph) -> bool {
     for i in 0..(*graph).nb_filters {
         unsafe {
@@ -1029,7 +1029,7 @@ unsafe fn configure_output_filter(
     }
 }
 
-#[cfg(feature = "docs-rs")]
+#[cfg(docsrs)]
 unsafe fn configure_output_audio_filter(
     graph: *mut AVFilterGraph,
     ofp: &mut OutputFilterParameter,
@@ -1038,7 +1038,7 @@ unsafe fn configure_output_audio_filter(
     0
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 unsafe fn configure_output_audio_filter(
     graph: *mut AVFilterGraph,
     ofp: &mut OutputFilterParameter,
@@ -1281,8 +1281,8 @@ fn free_input_filter_resources(ifps: &mut Vec<InputFilterParameter>) {
             unsafe { av_buffer_unref(&mut input_filter_parameter.hw_frames_ctx) };
         }
         // Custom channel layouts allocated by av_channel_layout_copy. The
-        // field itself is gated the same way (docs-rs builds stub it out).
-        #[cfg(not(feature = "docs-rs"))]
+        // field itself is gated the same way (docs.rs builds stub it out).
+        #[cfg(not(docsrs))]
         unsafe {
             ffmpeg_sys_next::av_channel_layout_uninit(&mut input_filter_parameter.ch_layout)
         };
@@ -1367,7 +1367,7 @@ fn choose_input(ifps: &Vec<InputFilterParameter>) -> usize {
     best_input as usize
 }
 
-#[cfg(feature = "docs-rs")]
+#[cfg(docsrs)]
 unsafe fn fg_output_step(
     fgp: &mut FilterGraphParameter,
     ofp: &mut OutputFilterParameter,
@@ -1376,7 +1376,7 @@ unsafe fn fg_output_step(
     0
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 unsafe fn fg_output_step(
     fgp: &mut FilterGraphParameter,
     ofp: &mut OutputFilterParameter,
@@ -1493,7 +1493,7 @@ unsafe fn choose_out_timebase(ofp: &mut OutputFilterParameter, frame: &Frame) {
     ofp.tb_out = tb;
 }
 
-#[cfg(feature = "docs-rs")]
+#[cfg(docsrs)]
 unsafe fn fg_output_frame(
     fgp: &mut FilterGraphParameter,
     ofp: &mut OutputFilterParameter,
@@ -1503,7 +1503,7 @@ unsafe fn fg_output_frame(
     0
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 unsafe fn fg_output_frame(
     fgp: &mut FilterGraphParameter,
     ofp: &mut OutputFilterParameter,
@@ -1641,7 +1641,7 @@ unsafe fn fg_output_frame(
     0
 }
 
-#[cfg(feature = "docs-rs")]
+#[cfg(docsrs)]
 unsafe fn close_output(
     ofp: &mut OutputFilterParameter,
     fgp: &mut FilterGraphParameter,
@@ -1650,7 +1650,7 @@ unsafe fn close_output(
     0
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 unsafe fn close_output(
     ofp: &mut OutputFilterParameter,
     fgp: &mut FilterGraphParameter,
@@ -1739,7 +1739,7 @@ unsafe fn close_output(
     0
 }
 
-#[cfg(feature = "docs-rs")]
+#[cfg(docsrs)]
 unsafe fn video_sync_process(
     ofp: &mut OutputFilterParameter,
     frame: *mut AVFrame,
@@ -1748,7 +1748,7 @@ unsafe fn video_sync_process(
 ) {
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 unsafe fn video_sync_process(
     ofp: &mut OutputFilterParameter,
     frame: *mut AVFrame,
@@ -1896,7 +1896,7 @@ unsafe fn video_sync_process(
     }
 }
 
-#[cfg(feature = "docs-rs")]
+#[cfg(docsrs)]
 unsafe fn adjust_frame_pts_to_encoder_tb(
     frame: *mut AVFrame,
     tb_dst: AVRational,
@@ -1905,7 +1905,7 @@ unsafe fn adjust_frame_pts_to_encoder_tb(
     0.0
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 unsafe fn adjust_frame_pts_to_encoder_tb(
     frame: *mut AVFrame,
     tb_dst: AVRational,
@@ -2005,7 +2005,7 @@ impl Default for FPSConvContext {
     }
 }
 
-#[cfg(feature = "docs-rs")]
+#[cfg(docsrs)]
 fn ifilter_parameters_from_frame(
     ifp: &mut InputFilterParameter,
     frame: *const AVFrame,
@@ -2014,7 +2014,7 @@ fn ifilter_parameters_from_frame(
     Ok(())
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 fn ifilter_parameters_from_frame(
     ifp: &mut InputFilterParameter,
     frame: *const AVFrame,
@@ -2118,10 +2118,10 @@ fn choose_sample_fmts(
     }
 }
 
-#[cfg(feature = "docs-rs")]
+#[cfg(docsrs)]
 fn choose_sample_rates(bprint: &mut AVBPrint, rate: i32, rates: Option<Vec<i32>>) {}
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 fn choose_sample_rates(bprint: &mut AVBPrint, rate: i32, rates: Option<Vec<i32>>) {
     if rate == 0
         && (rates.is_none() || rates.as_ref().unwrap().is_empty()) {
@@ -2153,7 +2153,7 @@ fn choose_sample_rates(bprint: &mut AVBPrint, rate: i32, rates: Option<Vec<i32>>
     }
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 fn choose_channel_layouts(
     bprint: &mut AVBPrint,
     layout: AVChannelLayout,
@@ -2440,7 +2440,7 @@ unsafe fn configure_input_filter(
     }
 }
 
-#[cfg(feature = "docs-rs")]
+#[cfg(docsrs)]
 unsafe fn configure_input_audio_filter(
     fg_index: usize,
     graph: *mut AVFilterGraph,
@@ -2450,7 +2450,7 @@ unsafe fn configure_input_audio_filter(
     0
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 unsafe fn configure_input_audio_filter(
     fg_index: usize,
     graph: *mut AVFilterGraph,
@@ -2747,7 +2747,7 @@ fn insert_filter(
     0
 }
 
-#[cfg(feature = "docs-rs")]
+#[cfg(docsrs)]
 unsafe fn graph_parse(
     graph: *mut AVFilterGraph,
     graph_desc: &str,
@@ -2758,7 +2758,7 @@ unsafe fn graph_parse(
     0
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 unsafe fn graph_parse(
     graph: *mut AVFilterGraph,
     graph_desc: &str,
@@ -2811,7 +2811,7 @@ unsafe fn graph_parse(
     ret
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 pub(crate) unsafe fn graph_opts_apply(seg: *mut AVFilterGraphSegment) -> i32 {
     for i in 0..(*seg).nb_chains {
         let ch = *(*seg).chains.add(i);

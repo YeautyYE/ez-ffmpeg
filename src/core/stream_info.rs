@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::ptr::{null, null_mut};
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 use ffmpeg_sys_next::AVChannelOrder;
 use ffmpeg_sys_next::AVMediaType::{
     AVMEDIA_TYPE_ATTACHMENT, AVMEDIA_TYPE_AUDIO, AVMEDIA_TYPE_DATA, AVMEDIA_TYPE_SUBTITLE,
@@ -113,7 +113,7 @@ pub enum StreamInfo {
         sample_rate: i32,
 
         /// Channel order used in this layout.
-        #[cfg(not(feature = "docs-rs"))]
+        #[cfg(not(docsrs))]
         order: AVChannelOrder,
 
         /// Number of channels in this layout.
@@ -333,7 +333,7 @@ unsafe fn extract_stream_info_from_stream(raw_stream: *mut ffmpeg_sys_next::AVSt
         }
         AVMEDIA_TYPE_AUDIO => {
             let sample_rate = codecpar.sample_rate;
-            #[cfg(not(feature = "docs-rs"))]
+            #[cfg(not(docsrs))]
             let ch_layout = codecpar.ch_layout;
             let sample_format = codecpar.format;
             let frame_size = codecpar.frame_size;
@@ -350,11 +350,11 @@ unsafe fn extract_stream_info_from_stream(raw_stream: *mut ffmpeg_sys_next::AVSt
                 codec_id,
                 codec_name,
                 sample_rate,
-                #[cfg(not(feature = "docs-rs"))]
+                #[cfg(not(docsrs))]
                 order: ch_layout.order,
-                #[cfg(feature = "docs-rs")]
+                #[cfg(docsrs)]
                 nb_channels: 0,
-                #[cfg(not(feature = "docs-rs"))]
+                #[cfg(not(docsrs))]
                 nb_channels: ch_layout.nb_channels,
                 bit_rate,
                 sample_format,
@@ -658,10 +658,10 @@ pub(crate) fn init_format_context(url: impl Into<String>) -> Result<AVFormatCont
             );
         };
 
-        #[cfg(not(feature = "docs-rs"))]
+        #[cfg(not(docsrs))]
         let mut ret =
             { avformat_open_input(&mut in_fmt_ctx, url_cstr.as_ptr(), null(), &mut format_opts) };
-        #[cfg(feature = "docs-rs")]
+        #[cfg(docsrs)]
         let mut ret = 0;
 
         // Free leftover options not consumed by avformat_open_input.
@@ -843,7 +843,7 @@ mod tests {
             start_time: 0, duration: 100, nb_frames: 0,
             avg_frame_rate: AVRational { num: 0, den: 1 },
             sample_rate: 44100,
-            #[cfg(not(feature = "docs-rs"))]
+            #[cfg(not(docsrs))]
             order: AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC,
             nb_channels: 2, bit_rate: 128000, sample_format: 0, frame_size: 1024,
             codec_id: AVCodecID::AV_CODEC_ID_AAC,

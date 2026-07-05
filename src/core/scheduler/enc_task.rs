@@ -22,9 +22,9 @@ use ffmpeg_sys_next::AVMediaType::{AVMEDIA_TYPE_AUDIO, AVMEDIA_TYPE_SUBTITLE, AV
 use ffmpeg_sys_next::AVPictureType::AV_PICTURE_TYPE_NONE;
 use ffmpeg_sys_next::AVPixelFormat::AV_PIX_FMT_NONE;
 use ffmpeg_sys_next::AVSampleFormat::AV_SAMPLE_FMT_NONE;
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 use ffmpeg_sys_next::AVSideDataProps::AV_SIDE_DATA_PROP_GLOBAL;
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 use ffmpeg_sys_next::{av_channel_layout_copy, av_frame_side_data_clone, av_frame_side_data_desc, AV_CODEC_FLAG_COPY_OPAQUE, AV_CODEC_FLAG_FRAME_DURATION, AV_FRAME_FLAG_INTERLACED, AV_FRAME_FLAG_TOP_FIELD_FIRST, AV_FRAME_SIDE_DATA_FLAG_UNIQUE};
 use ffmpeg_sys_next::{av_add_q, av_buffer_ref, av_compare_ts, av_cpu_max_align, av_frame_copy_props, av_frame_get_buffer, av_frame_ref, av_get_bytes_per_sample, av_get_pix_fmt_name, av_opt_set_dict2, av_rescale_q, av_sample_fmt_is_planar, av_samples_copy, av_shrink_packet, avcodec_alloc_context3, avcodec_encode_subtitle, avcodec_get_hw_config, avcodec_open2, avcodec_parameters_from_context, avcodec_receive_packet, avcodec_send_frame, AVBufferRef, AVCodecContext, AVFrame, AVHWFramesContext, AVMediaType, AVRational, AVStream, AVSubtitle, AVERROR, AVERROR_EOF, AVERROR_EXPERIMENTAL, AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE, AV_CODEC_CAP_PARAM_CHANGE, AV_CODEC_FLAG_INTERLACED_DCT, AV_CODEC_FLAG_INTERLACED_ME, AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX, AV_CODEC_HW_CONFIG_METHOD_HW_FRAMES_CTX, AV_NOPTS_VALUE, AV_OPT_SEARCH_CHILDREN, AV_PKT_FLAG_TRUSTED, AV_TIME_BASE_Q, EAGAIN};
 use ffmpeg_sys_next::av_mallocz;
@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::Duration;
 
-#[cfg(feature = "docs-rs")]
+#[cfg(docsrs)]
 pub(crate) fn enc_init(
     mux_idx: usize,
     mut enc_stream: EncoderStream,
@@ -62,7 +62,7 @@ pub(crate) fn enc_init(
     Ok(())
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 pub(crate) fn enc_init(
     mux_idx: usize,
     mut enc_stream: EncoderStream,
@@ -634,7 +634,7 @@ fn get_max_frames(codec_type: AVMediaType, max_video_frames: Option<i64>, max_au
     }
 }
 
-#[cfg(feature = "docs-rs")]
+#[cfg(docsrs)]
 unsafe fn receive_samples(
     samples_queued: &mut i32,
     audio_frame_queue: &mut VecDeque<FrameBox>,
@@ -645,7 +645,7 @@ unsafe fn receive_samples(
     Err(ffmpeg_sys_next::AVERROR_BUG)
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 unsafe fn receive_samples(
     samples_queued: &mut i32,
     audio_frame_queue: &mut VecDeque<FrameBox>,
@@ -763,7 +763,7 @@ unsafe fn receive_samples(
     })
 }
 
-#[cfg(feature = "docs-rs")]
+#[cfg(docsrs)]
 fn enc_open(
     enc_ctx: *mut AVCodecContext,
     stream: *mut AVStream,
@@ -774,7 +774,7 @@ fn enc_open(
     Ok(())
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 fn enc_open(
     enc_ctx: *mut AVCodecContext,
     stream: *mut AVStream,
@@ -1067,7 +1067,7 @@ unsafe fn hw_device_setup_for_encode(
     0
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 unsafe fn offset_audio(f: *mut AVFrame, nb_samples: i32) {
     // A decoded audio frame always carries a valid sample format; guard the
     // conversion anyway so an out-of-range value is a safe no-op (leave the
@@ -1140,7 +1140,7 @@ unsafe fn frame_is_aligned(align_mask: usize, frame: *const AVFrame) -> bool {
     false
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 fn frame_encode(
     enc_ctx: *mut AVCodecContext,
     frame: *mut AVFrame,
@@ -1205,7 +1205,7 @@ fn frame_encode(
     }
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 unsafe fn do_subtitle_out(
     enc_ctx: *mut AVCodecContext,
     sub: *const AVSubtitle,
@@ -1325,7 +1325,7 @@ unsafe fn do_subtitle_out(
     Ok(EncodeStatus::Continue)
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 unsafe fn encode_frame(
     enc_ctx: *mut AVCodecContext,
     frame: *mut AVFrame,

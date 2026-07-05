@@ -22,7 +22,7 @@ use ffmpeg_sys_next::AVHWDeviceType::AV_HWDEVICE_TYPE_QSV;
 use ffmpeg_sys_next::AVMediaType::{AVMEDIA_TYPE_AUDIO, AVMEDIA_TYPE_SUBTITLE, AVMEDIA_TYPE_VIDEO};
 use ffmpeg_sys_next::AVRounding::AV_ROUND_UP;
 use ffmpeg_sys_next::AVSubtitleType::SUBTITLE_BITMAP;
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 use ffmpeg_sys_next::{av_channel_layout_copy, AV_CODEC_FLAG_COPY_OPAQUE};
 use ffmpeg_sys_next::{av_buffer_create, av_buffer_ref, av_calloc, av_dict_set, av_frame_apply_cropping, av_frame_copy_props, av_frame_move_ref, av_frame_ref, av_frame_unref, av_free, av_freep, av_gcd, av_hwdevice_get_type_name, av_hwframe_transfer_data, av_inv_q, av_mallocz, av_memdup, av_mul_q, av_opt_set_dict2, av_pix_fmt_desc_get, av_rescale_delta, av_rescale_q, av_strdup, avcodec_alloc_context3, avcodec_decode_subtitle2, avcodec_default_get_buffer2, avcodec_flush_buffers, avcodec_free_context, avcodec_get_hw_config, avcodec_open2, avcodec_parameters_to_context, avcodec_receive_frame, avcodec_send_packet, avsubtitle_free, AVCodec, AVCodecContext, AVDictionary, AVFrame, AVHWDeviceType, AVMediaType, AVPixelFormat, AVRational, AVSubtitle, AVSubtitleRect, AVERROR, AVERROR_EOF, AVPALETTE_SIZE, AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX, AV_FRAME_CROP_UNALIGNED, AV_FRAME_FLAG_CORRUPT, AV_NOPTS_VALUE, AV_PIX_FMT_FLAG_HWACCEL, AV_TIME_BASE_Q, EAGAIN, EINVAL, ENOMEM};
 use log::{debug, error, info, trace, warn};
@@ -34,7 +34,7 @@ use std::time::Duration;
 use crate::util::ffmpeg_utils::av_err2str;
 use crate::util::thread_synchronizer::{ThreadDoneGuard, ThreadSynchronizer};
 
-#[cfg(feature = "docs-rs")]
+#[cfg(docsrs)]
 pub(crate) fn dec_init(
     demux_idx: usize,
     dec_stream: &mut DecoderStream,
@@ -48,7 +48,7 @@ pub(crate) fn dec_init(
     Ok(())
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 pub(crate) fn dec_init(
     demux_idx: usize,
     dec_stream: &mut DecoderStream,
@@ -262,7 +262,7 @@ pub(crate) fn dec_init(
     Ok(())
 }
 
-#[cfg(feature = "docs-rs")]
+#[cfg(docsrs)]
 unsafe fn transcode_subtitles(
     dp_arc: Arc<Mutex<DecoderParameter>>,
     exit_on_error: bool,
@@ -274,7 +274,7 @@ unsafe fn transcode_subtitles(
     Ok(())
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 unsafe fn transcode_subtitles(
     dp_arc: Arc<Mutex<DecoderParameter>>,
     exit_on_error: bool,
@@ -437,7 +437,7 @@ unsafe fn process_subtitle(
     }
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 fn subtitle_wrap_frame(
     frame: *mut AVFrame,
     subtitle: *mut AVSubtitle,
@@ -681,7 +681,7 @@ enum PacketOpaque {
     PktOpaqueFixSubDuration,
 }
 
-#[cfg(feature = "docs-rs")]
+#[cfg(docsrs)]
 fn dec_open(
     dp_arc: Arc<Mutex<DecoderParameter>>,
     dec_stream: &DecoderStream,
@@ -690,7 +690,7 @@ fn dec_open(
     Ok(())
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 fn dec_open(
     dp_arc: Arc<Mutex<DecoderParameter>>,
     dec_stream: &DecoderStream,
@@ -1255,7 +1255,7 @@ enum FrameOpaque {
     FrameOpaqueSendCommand,
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 unsafe fn packet_decode(
     dp_arc: &Arc<Mutex<DecoderParameter>>,
     exit_on_error: bool,
@@ -1412,7 +1412,7 @@ unsafe fn packet_decode(
     }
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 unsafe fn video_frame_process(
     dp_arc: Arc<Mutex<DecoderParameter>>,
     frame: *mut AVFrame,
@@ -1476,7 +1476,7 @@ unsafe fn video_frame_process(
     Ok(())
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 unsafe fn video_duration_estimate(dp: &MutexGuard<DecoderParameter>, frame: *mut AVFrame) -> i64 {
     let mut codec_duration = 0;
     // difference between this and last frame's timestamps
@@ -1575,7 +1575,7 @@ unsafe fn hwaccel_retrieve_data(
     0
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 unsafe fn audio_ts_process(mut dp: MutexGuard<DecoderParameter>, frame: *mut AVFrame) {
     let tb_filter = AVRational {
         num: 1,
@@ -1620,7 +1620,7 @@ unsafe fn audio_ts_process(mut dp: MutexGuard<DecoderParameter>, frame: *mut AVF
     (*frame).time_base = tb_filter;
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 unsafe fn audio_samplerate_update(
     dp: &mut MutexGuard<DecoderParameter>,
     frame: *mut AVFrame,
