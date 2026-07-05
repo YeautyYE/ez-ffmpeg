@@ -346,18 +346,15 @@ unsafe fn transcode_subtitles(
 
     let dp = dp_arc.clone();
     let mut dp = dp.lock().unwrap();
-    let mut subtitle = AVSubtitle {
-        format: 0,
-        start_display_time: 0,
-        end_display_time: 0,
-        num_rects: 0,
-        rects: null_mut(),
-        pts: 0,
-    };
+    // `raw::Subtitle` owns the decoded AVSubtitle: avcodec_decode_subtitle2 fills
+    // its rects, and Drop frees them exactly once on every path below — the
+    // frame-pool-exhaustion and wrap-failure early returns included — so there is
+    // no manual avsubtitle_free and no `?`/early-return leak.
+    let mut subtitle = crate::raw::Subtitle::zeroed();
     let mut got_output: libc::c_int = 0;
     let ret = avcodec_decode_subtitle2(
         dp.dec_ctx.as_mut_ptr(),
-        &mut subtitle,
+        subtitle.as_mut_ptr(),
         &mut got_output,
         packet_box.packet.as_mut_ptr(),
     );
@@ -391,10 +388,10 @@ unsafe fn transcode_subtitles(
     // on AVFrames, so we wrap AVSubtitle in an AVBufferRef and put that
     // inside the frame
     // eventually, subtitles should be switched to use AVFrames natively
-    if let Err(e) = subtitle_wrap_frame(frame.as_mut_ptr(), &mut subtitle, false) {
-        avsubtitle_free(&mut subtitle);
-        return Err(e);
-    }
+    // On success (copy = false) subtitle_wrap_frame moves the contents into the
+    // frame buffer and zeroes our struct, so this owner's later Drop is a no-op;
+    // on failure `?` returns and Drop frees the still-owned rects.
+    subtitle_wrap_frame(frame.as_mut_ptr(), subtitle.as_mut_ptr(), false)?;
 
     (*frame.as_mut_ptr()).width = (*dp.dec_ctx.as_ptr()).width;
     (*frame.as_mut_ptr()).height = (*dp.dec_ctx.as_ptr()).height;
