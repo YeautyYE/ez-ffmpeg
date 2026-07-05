@@ -2101,6 +2101,9 @@ unsafe fn open_output_file(
     interrupt_state: &Arc<crate::core::context::InterruptState>,
 ) -> Result<Muxer> {
     let mut out_fmt_ctx = null_mut();
+    // Frees out_fmt_ctx (and, for custom IO, its AVIO + callback box) on any
+    // early return until the Muxer takes ownership below.
+    let mut ctx_guard = crate::core::context::OutFmtCtxGuard::disarmed();
     let format = get_format(&output.format)?;
     match &output.url {
         None => {
@@ -2161,6 +2164,7 @@ unsafe fn open_output_file(
 
             (*out_fmt_ctx).pb = avio_ctx;
             (*out_fmt_ctx).flags |= AVFMT_FLAG_CUSTOM_IO;
+            ctx_guard.arm(out_fmt_ctx, true);
         }
         Some(url) => {
             let url_cstr = if url == "-" {
@@ -2174,6 +2178,7 @@ unsafe fn open_output_file(
                 warn!("Error initializing the muxer for {url}");
                 return Err(AllocOutputContextError::from(ret).into());
             }
+            ctx_guard.arm(out_fmt_ctx, false);
 
             // Interrupt callback before avio_open: stop()/abort() can break
             // a blocking network open and any later write on this output
@@ -2246,6 +2251,9 @@ unsafe fn open_output_file(
         None => None,
     };
 
+    // Ownership of out_fmt_ctx transfers to the Muxer; stop the guard from
+    // freeing it.
+    ctx_guard.release();
     let mux = Muxer::new(
         url,
         output.url.is_none(),
@@ -2913,6 +2921,11 @@ fn init_filter_graph(
         /* this graph is only used for determining the kinds of inputs
         and outputs we have, and is discarded on exit from this function */
         let mut graph = avfilter_graph_alloc();
+        // avfilter_graph_alloc() returns null on allocation failure (OOM);
+        // deref without this check is undefined behavior.
+        if graph.is_null() {
+            return Err(FilterGraphParseError::OutOfMemory.into());
+        }
         (*graph).nb_threads = 1;
 
         let mut seg = null_mut();
@@ -3117,6 +3130,10 @@ unsafe fn open_input_file(
     if in_fmt_ctx.is_null() {
         return Err(OpenInputError::OutOfMemory.into());
     }
+    // Frees in_fmt_ctx on early returns in the pre-open window (before the
+    // branches' own close_input paths take over). Disarmed at each handoff.
+    let mut ctx_guard = crate::core::context::InFmtCtxGuard::disarmed();
+    ctx_guard.arm(in_fmt_ctx, false);
 
     // Interrupt callback: lets stop()/abort() break a blocking open, read or
     // find_stream_info on this input (fftools decode_interrupt_cb).
@@ -3157,10 +3174,13 @@ unsafe fn open_input_file(
     let mut input_opts = DictGuard::new(hashmap_to_avdictionary(&input_opts));
 
     let mut injected_scan_all_pmts = false;
+    // The branches below own their cleanup on error; release before entering.
+    ctx_guard.release();
     match &input.url {
         None => {
             if input.read_callback.is_none() {
                 error!("input url and read_callback is none.");
+                avformat_close_input(&mut in_fmt_ctx);
                 return Err(OpenInputError::InvalidSource.into());
             }
 
@@ -3227,6 +3247,9 @@ unsafe fn open_input_file(
             }
         }
         Some(url) => {
+            // Guard the pre-open window (CString/dict `?`); released before the
+            // manual close_input paths below take over.
+            ctx_guard.arm(in_fmt_ctx, false);
             let url_cstr = CString::new(url.as_str())?;
 
             let scan_all_pmts_key = CString::new("scan_all_pmts")?;
@@ -3249,6 +3272,8 @@ unsafe fn open_input_file(
             };
             (*in_fmt_ctx).flags |= ffmpeg_sys_next::AVFMT_FLAG_NONBLOCK;
 
+            // From here the manual close_input paths below own cleanup.
+            ctx_guard.release();
             let mut ret = avformat_open_input(
                 &mut in_fmt_ctx,
                 url_cstr.as_ptr(),
@@ -3267,6 +3292,13 @@ unsafe fn open_input_file(
             }
         }
     }
+
+    // Open succeeded, but the tail below (option cleanup, seek, Demuxer::new)
+    // still has fallible steps. Re-arm the guard — released only once
+    // Demuxer::new takes ownership — so any early return here frees in_fmt_ctx
+    // (and, for custom IO, its AVIO + callback box). `is_read_callback` mirrors
+    // the custom-IO branch: no url == the read_callback path.
+    ctx_guard.arm(in_fmt_ctx, input.url.is_none());
 
     // Options no demuxer consumed are user typos; report them instead of
     // silently swallowing (fftools check_avoptions aborts here — we warn).
@@ -3352,6 +3384,9 @@ unsafe fn open_input_file(
         input.log_level_offset.unwrap_or(0),
     )?;
 
+    // Demuxer::new succeeded and now owns in_fmt_ctx (its Drop frees it);
+    // disarm the guard to avoid a double-free.
+    ctx_guard.release();
     Ok(demux)
 }
 

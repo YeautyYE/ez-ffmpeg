@@ -26,7 +26,7 @@ use ffmpeg_sys_next::AVSampleFormat::AV_SAMPLE_FMT_NONE;
 use ffmpeg_sys_next::AVSideDataProps::AV_SIDE_DATA_PROP_GLOBAL;
 #[cfg(not(feature = "docs-rs"))]
 use ffmpeg_sys_next::{av_channel_layout_copy, av_frame_side_data_clone, av_frame_side_data_desc, AV_CODEC_FLAG_COPY_OPAQUE, AV_CODEC_FLAG_FRAME_DURATION, AV_FRAME_FLAG_INTERLACED, AV_FRAME_FLAG_TOP_FIELD_FIRST, AV_FRAME_SIDE_DATA_FLAG_UNIQUE};
-use ffmpeg_sys_next::{av_add_q, av_buffer_ref, av_compare_ts, av_cpu_max_align, av_frame_copy_props, av_frame_get_buffer, av_frame_ref, av_get_bytes_per_sample, av_get_pix_fmt_name, av_opt_set_dict2, av_pix_fmt_desc_get, av_rescale_q, av_sample_fmt_is_planar, av_samples_copy, av_shrink_packet, avcodec_alloc_context3, avcodec_encode_subtitle, avcodec_get_hw_config, avcodec_open2, avcodec_parameters_from_context, avcodec_receive_packet, avcodec_send_frame, AVBufferRef, AVCodecContext, AVFrame, AVHWFramesContext, AVMediaType, AVRational, AVStream, AVSubtitle, AVERROR, AVERROR_EOF, AVERROR_EXPERIMENTAL, AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE, AV_CODEC_CAP_PARAM_CHANGE, AV_CODEC_FLAG_INTERLACED_DCT, AV_CODEC_FLAG_INTERLACED_ME, AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX, AV_CODEC_HW_CONFIG_METHOD_HW_FRAMES_CTX, AV_NOPTS_VALUE, AV_OPT_SEARCH_CHILDREN, AV_PKT_FLAG_TRUSTED, AV_TIME_BASE_Q, EAGAIN};
+use ffmpeg_sys_next::{av_add_q, av_buffer_ref, av_compare_ts, av_cpu_max_align, av_frame_copy_props, av_frame_get_buffer, av_frame_ref, av_get_bytes_per_sample, av_get_pix_fmt_name, av_opt_set_dict2, av_rescale_q, av_sample_fmt_is_planar, av_samples_copy, av_shrink_packet, avcodec_alloc_context3, avcodec_encode_subtitle, avcodec_get_hw_config, avcodec_open2, avcodec_parameters_from_context, avcodec_receive_packet, avcodec_send_frame, AVBufferRef, AVCodecContext, AVFrame, AVHWFramesContext, AVMediaType, AVRational, AVStream, AVSubtitle, AVERROR, AVERROR_EOF, AVERROR_EXPERIMENTAL, AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE, AV_CODEC_CAP_PARAM_CHANGE, AV_CODEC_FLAG_INTERLACED_DCT, AV_CODEC_FLAG_INTERLACED_ME, AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX, AV_CODEC_HW_CONFIG_METHOD_HW_FRAMES_CTX, AV_NOPTS_VALUE, AV_OPT_SEARCH_CHILDREN, AV_PKT_FLAG_TRUSTED, AV_TIME_BASE_Q, EAGAIN};
 use ffmpeg_sys_next::av_mallocz;
 use log::{debug, error, info, trace, warn};
 use std::collections::{HashMap, VecDeque};
@@ -725,6 +725,9 @@ unsafe fn receive_samples(
             (*src.as_ptr()).nb_samples,
         );
 
+        let dst_sample_fmt =
+            crate::util::format_convert::sample_fmt_from_raw((*dst.as_ptr()).format)
+                .ok_or(AVERROR(ffmpeg_sys_next::EINVAL))?;
         av_samples_copy(
             (*dst.as_ptr()).extended_data,
             (*src.as_ptr()).extended_data,
@@ -732,7 +735,7 @@ unsafe fn receive_samples(
             0,
             to_copy,
             (*dst.as_ptr()).ch_layout.nb_channels,
-            std::mem::transmute((*dst.as_ptr()).format),
+            dst_sample_fmt,
         );
 
         if to_copy < (*src.as_ptr()).nb_samples {
@@ -826,7 +829,9 @@ fn enc_open(
                 {
                     return Err(OpenOutputError::UnknownFrameFormat.into());
                 }
-                (*enc_ctx).sample_fmt = std::mem::transmute((*frame).format);
+                (*enc_ctx).sample_fmt =
+                    crate::util::format_convert::sample_fmt_from_raw((*frame).format)
+                        .ok_or(OpenOutputError::UnknownFrameFormat)?;
                 (*enc_ctx).sample_rate = (*frame).sample_rate;
                 let ret = av_channel_layout_copy(&mut (*enc_ctx).ch_layout, &(*frame).ch_layout);
                 if ret < 0 {
@@ -859,15 +864,23 @@ fn enc_open(
                 (*enc_ctx).sample_aspect_ratio = (*frame).sample_aspect_ratio;
                 (*stream).sample_aspect_ratio = (*frame).sample_aspect_ratio;
 
-                (*enc_ctx).pix_fmt = std::mem::transmute((*frame).format);
+                (*enc_ctx).pix_fmt =
+                    crate::util::format_convert::pix_fmt_from_raw((*frame).format)
+                        .ok_or(OpenOutputError::UnknownFrameFormat)?;
 
                 if let Some(bits_per_raw_sample) = bits_per_raw_sample {
                     (*enc_ctx).bits_per_raw_sample = bits_per_raw_sample;
                 } else {
-                    (*enc_ctx).bits_per_raw_sample = std::cmp::min(
-                        frame_box.frame_data.bits_per_raw_sample,
-                        (*av_pix_fmt_desc_get((*enc_ctx).pix_fmt)).comp[0].depth,
-                    );
+                    // Checked descriptor lookup: a null descriptor (invalid /
+                    // unknown pix_fmt) must not be dereferenced.
+                    let depth = crate::util::format_convert::pix_fmt_desc_from_raw(
+                        (*frame).format,
+                    )
+                    .ok_or(OpenOutputError::UnknownFrameFormat)?
+                    .comp[0]
+                        .depth;
+                    (*enc_ctx).bits_per_raw_sample =
+                        std::cmp::min(frame_box.frame_data.bits_per_raw_sample, depth);
                 }
 
                 (*enc_ctx).color_range = (*frame).color_range;
@@ -1056,13 +1069,20 @@ unsafe fn hw_device_setup_for_encode(
 
 #[cfg(not(feature = "docs-rs"))]
 unsafe fn offset_audio(f: *mut AVFrame, nb_samples: i32) {
-    let planar = av_sample_fmt_is_planar(std::mem::transmute((*f).format));
+    // A decoded audio frame always carries a valid sample format; guard the
+    // conversion anyway so an out-of-range value is a safe no-op (leave the
+    // frame untouched) instead of transmuting into an invalid enum (UB) or
+    // reaching the `bps > 0` assert below with bps == 0.
+    let Some(sample_fmt) = crate::util::format_convert::sample_fmt_from_raw((*f).format) else {
+        return;
+    };
+    let planar = av_sample_fmt_is_planar(sample_fmt);
     let planes = if planar != 0 {
         (*f).ch_layout.nb_channels
     } else {
         1
     };
-    let bps = av_get_bytes_per_sample(std::mem::transmute((*f).format));
+    let bps = av_get_bytes_per_sample(sample_fmt);
     let offset = (nb_samples
         * bps
         * if planar != 0 {
