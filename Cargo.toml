@@ -74,10 +74,15 @@ subtitle = [
     "dep:unicode-linebreak",
 ]
 static = ["ffmpeg-next/static"]
-docs-rs = ["async", "opengl", "rtmp", "flv", "subtitle", "wgpu"]
 
 [package.metadata.docs.rs]
-features = ["docs-rs"]
+# docs.rs sets the `DOCS_RS` env var; `build.rs` turns it into `--cfg docsrs`,
+# which compiles the crate's FFI call sites as stubs (see the `#[cfg(docsrs)]`
+# gates in `src/`) so rustdoc can type-check without a matching FFmpeg dev
+# environment. `docsrs` is intentionally NOT a Cargo feature, so
+# `cargo build --all-features` always compiles the real FFmpeg path and never
+# ships the crash-prone stub. Enable every real feature for full doc coverage.
+features = ["async", "opengl", "rtmp", "flv", "subtitle", "wgpu"]
 
 [dev-dependencies]
 env_logger = "0.10"

@@ -8,9 +8,13 @@
 #      will NOT link. Provide 7.x through a newer runner image, a PPA/
 #      deb-multimedia source, or a vendored `ffmpeg-sys-next` build before the
 #      `build` job can go green.
-#   2. Tests need media assets and the pre-existing `packet_scanner` segfault
-#      fixed before `test` can be a
-#      required gate — it is non-blocking here.
+#   2. A few scheduler tests hard-code `videotoolbox` (macOS-only) hardware
+#      acceleration and fail on Linux runners, so `test` stays non-blocking until
+#      they are gated by target OS. (An earlier note here claimed a "pre-existing
+#      packet_scanner segfault" — that was a `--all-features` / `docs-rs`
+#      artifact, now fixed: `docsrs` is a `build.rs` cfg rather than a Cargo
+#      feature, so `--all-features` links real FFmpeg instead of the crashing
+#      stub. `--all-features` below now genuinely exercises the FFI path.)
 #
 # `build` + `clippy` are the enforced safety gates once FFmpeg 7.x is available.
 
@@ -66,8 +70,9 @@ jobs:
   test:
     name: Test (non-blocking)
     runs-on: ubuntu-latest
-    # Kept off the required path until test media assets exist and the
-    # packet_scanner SIGSEGV is fixed.
+    # Non-blocking: a few scheduler tests hard-code macOS `videotoolbox` hwaccel
+    # and fail on Linux runners. Promote to a required gate once those are gated
+    # by target OS (media assets are committed as `test.mp4`).
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4

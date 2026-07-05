@@ -6,7 +6,7 @@
 use crate::core::context::output::VSyncMethod;
 use crate::core::context::FrameBox;
 use crossbeam_channel::Sender;
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 use ffmpeg_sys_next::{AVChannelLayout, AVChannelLayout__bindgen_ty_1, AVChannelOrder};
 use ffmpeg_sys_next::{AVCodec, AVColorRange, AVColorSpace, AVMediaType, AVPixelFormat, AVRational, AVSampleFormat};
 use std::ptr::{null, null_mut};
@@ -75,9 +75,9 @@ pub(crate) struct OutputFilterOptions {
     pub(crate) vsync_method: Option<VSyncMethod>,
     pub(crate) sample_rate: i32,
     pub(crate) sample_rates: Option<Vec<i32>>,
-    #[cfg(not(feature = "docs-rs"))]
+    #[cfg(not(docsrs))]
     pub(crate) ch_layout: AVChannelLayout,
-    #[cfg(not(feature = "docs-rs"))]
+    #[cfg(not(docsrs))]
     pub(crate) ch_layouts: Option<Vec<AVChannelLayout>>,
     pub(crate) trim_start_us: Option<i64>,
     pub(crate) trim_duration_us: Option<i64>,
@@ -108,14 +108,14 @@ impl OutputFilterOptions {
             vsync_method: None,
             sample_rate: 0,
             sample_rates: None,
-            #[cfg(not(feature = "docs-rs"))]
+            #[cfg(not(docsrs))]
             ch_layout: AVChannelLayout {
                 order: AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC,
                 nb_channels: 0,
                 u: AVChannelLayout__bindgen_ty_1 { mask: 0 },
                 opaque: null_mut(),
             },
-            #[cfg(not(feature = "docs-rs"))]
+            #[cfg(not(docsrs))]
             ch_layouts: None,
             trim_start_us: None,
             trim_duration_us: None,

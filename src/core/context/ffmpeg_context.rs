@@ -13,7 +13,7 @@ use crate::core::context::output_filter::{
 use crate::core::context::{frame_alloc, CodecContext};
 use crate::core::scheduler::ffmpeg_scheduler;
 use crate::core::scheduler::ffmpeg_scheduler::{FfmpegScheduler, Initialization};
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 use crate::core::scheduler::filter_task::graph_opts_apply;
 use crate::core::scheduler::input_controller::SchNode;
 use crate::error::Error::{
@@ -30,14 +30,14 @@ use crate::error::{
 use crate::error::{Error, Result};
 use crate::filter::frame_pipeline::FramePipeline;
 use crate::util::ffmpeg_utils::{hashmap_to_avdictionary, DictGuard};
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 use ffmpeg_sys_next::AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC;
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 use ffmpeg_sys_next::{
     avformat_query_codec, AVSTREAM_EVENT_FLAG_NEW_PACKETS, AV_DISPOSITION_ATTACHED_PIC,
     AV_DISPOSITION_DEFAULT,
 };
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 use ffmpeg_sys_next::AVCodecConfig::*;
 use ffmpeg_sys_next::AVCodecID::{AV_CODEC_ID_AC3, AV_CODEC_ID_MP3, AV_CODEC_ID_NONE};
 use ffmpeg_sys_next::AVColorRange::AVCOL_RANGE_UNSPECIFIED;
@@ -65,7 +65,7 @@ use ffmpeg_sys_next::{
     AVIO_FLAG_WRITE, AVSEEK_FLAG_BACKWARD, AV_CODEC_PROP_BITMAP_SUB, AV_CODEC_PROP_TEXT_SUB,
     AV_TIME_BASE,
 };
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 use ffmpeg_sys_next::{
     av_channel_layout_copy, av_packet_side_data_new, avcodec_get_supported_config,
     avfilter_graph_segment_apply, avfilter_graph_segment_create_filters,
@@ -924,7 +924,7 @@ fn map_manual(
     Ok(())
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 fn set_channel_layout(
     ch_layout: &mut AVChannelLayout,
     ch_layouts: &Option<Vec<AVChannelLayout>>,
@@ -966,7 +966,7 @@ fn set_channel_layout(
     }
 }
 
-#[cfg(feature = "docs-rs")]
+#[cfg(docsrs)]
 fn configure_output_filter_opts(
     index: usize,
     mux: &mut Muxer,
@@ -978,7 +978,7 @@ fn configure_output_filter_opts(
     Ok(())
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 fn configure_output_filter_opts(
     index: usize,
     mux: &mut Muxer,
@@ -1296,7 +1296,7 @@ fn map_auto_streams(
     Ok(())
 }
 
-#[cfg(feature = "docs-rs")]
+#[cfg(docsrs)]
 unsafe fn map_auto_subtitle(
     mux: &mut Muxer,
     demuxs: &mut Vec<Demuxer>,
@@ -1306,7 +1306,7 @@ unsafe fn map_auto_subtitle(
     Ok(())
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 unsafe fn map_auto_subtitle(
     mux: &mut Muxer,
     demuxs: &mut Vec<Demuxer>,
@@ -1413,7 +1413,7 @@ unsafe fn map_auto_subtitle(
     Ok(())
 }
 
-#[cfg(feature = "docs-rs")]
+#[cfg(docsrs)]
 unsafe fn map_auto_data(
     mux: &mut Muxer,
     demuxs: &mut Vec<Demuxer>,
@@ -1423,7 +1423,7 @@ unsafe fn map_auto_data(
     Ok(())
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 unsafe fn map_auto_data(
     mux: &mut Muxer,
     demuxs: &mut Vec<Demuxer>,
@@ -1505,7 +1505,7 @@ unsafe fn map_auto_data(
     Ok(())
 }
 
-#[cfg(feature = "docs-rs")]
+#[cfg(docsrs)]
 unsafe fn map_auto_stream(
     mux_index: usize,
     mux: &mut Muxer,
@@ -1518,7 +1518,7 @@ unsafe fn map_auto_stream(
     Ok(())
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 unsafe fn map_auto_stream(
     mux_index: usize,
     mux: &mut Muxer,
@@ -1626,7 +1626,7 @@ unsafe fn map_auto_stream(
 /// scored by resolution, audio by channel count, both raised by
 /// NEW_PACKETS/DEFAULT-disposition bonuses; attached pictures only win where
 /// the container itself is picture-based (avformat_query_codec == 'APIC').
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 unsafe fn select_best_stream(
     demuxs: &[Demuxer],
     oformat: *const AVOutputFormat,
@@ -1751,7 +1751,7 @@ unsafe fn rescale_duration(src_duration: i64, src_time_base: AVRational, stream:
     (*stream).duration = av_rescale_q(src_duration, src_time_base, (*stream).time_base);
 }
 
-#[cfg(feature = "docs-rs")]
+#[cfg(docsrs)]
 fn streamcopy_init(
     mux: &mut Muxer,
     input_stream: *mut AVStream,
@@ -1761,7 +1761,7 @@ fn streamcopy_init(
     Ok(())
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 fn streamcopy_init(
     mux: &mut Muxer,
     input_stream: *mut AVStream,
@@ -2083,7 +2083,7 @@ fn open_output_files(
     Ok(muxs)
 }
 
-#[cfg(feature = "docs-rs")]
+#[cfg(docsrs)]
 unsafe fn open_output_file(
     index: usize,
     output: &mut Output,
@@ -2093,7 +2093,7 @@ unsafe fn open_output_file(
     Err(Error::Bug)
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 unsafe fn open_output_file(
     index: usize,
     output: &mut Output,
@@ -2630,7 +2630,7 @@ fn fg_complex_bind_input(
     ifilter_bind_ist(filter_graph, input_filter_index, stream_idx, demux)
 }
 
-#[cfg(feature = "docs-rs")]
+#[cfg(docsrs)]
 fn ifilter_bind_ist(
     filter_graph: &mut FilterGraph,
     input_index: usize,
@@ -2640,7 +2640,7 @@ fn ifilter_bind_ist(
     Ok(())
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 fn ifilter_bind_ist(
     filter_graph: &mut FilterGraph,
     input_index: usize,
@@ -2900,7 +2900,7 @@ fn init_filter_graphs(filter_complexs: Vec<FilterComplex>) -> Result<Vec<FilterG
     Ok(filter_graphs)
 }
 
-#[cfg(feature = "docs-rs")]
+#[cfg(docsrs)]
 fn init_filter_graph(
     fg_index: usize,
     filter_desc: &str,
@@ -2909,7 +2909,7 @@ fn init_filter_graph(
     Err(Error::Bug)
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 fn init_filter_graph(
     fg_index: usize,
     filter_desc: &str,
@@ -2942,7 +2942,7 @@ fn init_filter_graph(
             return Err(FilterGraphParseError::from(ret).into());
         }
 
-        #[cfg(not(feature = "docs-rs"))]
+        #[cfg(not(docsrs))]
         {
             ret = graph_opts_apply(seg);
         }
@@ -3109,7 +3109,7 @@ fn open_input_files(
     Ok(demuxs)
 }
 
-#[cfg(feature = "docs-rs")]
+#[cfg(docsrs)]
 unsafe fn open_input_file(
     index: usize,
     input: &mut Input,
@@ -3119,7 +3119,7 @@ unsafe fn open_input_file(
     Err(Error::Bug)
 }
 
-#[cfg(not(feature = "docs-rs"))]
+#[cfg(not(docsrs))]
 unsafe fn open_input_file(
     index: usize,
     input: &mut Input,

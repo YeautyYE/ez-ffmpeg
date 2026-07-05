@@ -13,9 +13,9 @@
 //! scheduler. They mirror the already-safe pattern in
 //! [`crate::util::frame_utils::ensure_software_format`].
 
-// Callers live in the FFI-only scheduler, which is compiled out under the
-// `docs-rs` feature; suppress the resulting dead-code noise there.
-#![cfg_attr(feature = "docs-rs", allow(dead_code))]
+// Callers live in the FFI-only scheduler, which is compiled out on docs.rs
+// (the `docsrs` cfg); suppress the resulting dead-code noise there.
+#![cfg_attr(docsrs, allow(dead_code))]
 
 use ffmpeg_sys_next::{
     av_pix_fmt_desc_get, AVPixFmtDescriptor, AVPixelFormat, AVSampleFormat,
