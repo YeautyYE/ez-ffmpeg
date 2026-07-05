@@ -35,7 +35,7 @@ use ffmpeg_sys_next::{
     av_color_space_name, av_dict_free, av_frame_alloc, av_frame_free, av_frame_get_side_data,
     av_frame_ref, av_frame_remove_side_data, av_freep, av_get_pix_fmt_name, av_get_sample_fmt_name,
     av_inv_q, av_log2, av_malloc, av_opt_find, av_opt_set, av_opt_set_bin, av_opt_set_int,
-    av_pix_fmt_desc_get, av_q2d, av_rescale_q, avfilter_get_by_name,
+    av_q2d, av_rescale_q, avfilter_get_by_name,
     avfilter_graph_alloc, avfilter_graph_config, avfilter_graph_create_filter, avfilter_graph_free,
     avfilter_graph_request_oldest, avfilter_inout_free, avfilter_link, avfilter_pad_get_type,
     avio_close, avio_closep, avio_open, avio_open2, avio_read, avio_read_to_bprint, avio_size,
@@ -665,19 +665,26 @@ unsafe fn fg_send_frame(
             if need_reinit & AUDIO_CHANGED != 0 {
                 let fmt_str = CString::new("audio parameters changed to %d Hz, ").unwrap();
                 let sample_format_name =
-                    av_get_sample_fmt_name(std::mem::transmute((*frame).format));
+                    match crate::util::format_convert::sample_fmt_from_raw((*frame).format) {
+                        Some(fmt) => av_get_sample_fmt_name(fmt),
+                        None => null(),
+                    };
                 av_bprintf(&mut reason, fmt_str.as_ptr(), (*frame).sample_rate);
                 av_channel_layout_describe_bprint(&(*frame).ch_layout, &mut reason);
                 let comma_str = CString::new(", %s, ").unwrap();
                 av_bprintf(
                     &mut reason,
                     comma_str.as_ptr(),
-                    unknown_if_null(sample_format_name).as_ptr(),
+                    unknown_if_null(sample_format_name),
                 );
             }
 
             if need_reinit & VIDEO_CHANGED != 0 {
-                let pixel_format_name = av_get_pix_fmt_name(std::mem::transmute((*frame).format));
+                let pixel_format_name =
+                    match crate::util::format_convert::pix_fmt_from_raw((*frame).format) {
+                        Some(fmt) => av_get_pix_fmt_name(fmt),
+                        None => null(),
+                    };
                 let color_space_name = av_color_space_name((*frame).colorspace);
                 let color_range_name = av_color_range_name((*frame).color_range);
 
@@ -686,9 +693,9 @@ unsafe fn fg_send_frame(
                 av_bprintf(
                     &mut reason,
                     fmt_str.as_ptr(),
-                    unknown_if_null(pixel_format_name).as_ptr(),
-                    unknown_if_null(color_range_name).as_ptr(),
-                    unknown_if_null(color_space_name).as_ptr(),
+                    unknown_if_null(pixel_format_name),
+                    unknown_if_null(color_range_name),
+                    unknown_if_null(color_space_name),
                     (*frame).width,
                     (*frame).height,
                 );
@@ -771,6 +778,13 @@ unsafe fn configure_filtergraph(
 ) -> crate::error::Result<()> {
     cleanup_filtergraph(graph, ifps, ofps);
     *graph = avfilter_graph_alloc();
+    // avfilter_graph_alloc() returns null on allocation failure (OOM); deref
+    // without this check is undefined behavior.
+    if (*graph).is_null() {
+        return Err(Error::FilterGraph(FilterGraphOperationError::ParseError(
+            FilterGraphParseError::OutOfMemory,
+        )));
+    }
     (**graph).nb_threads = 0;
 
     let hw_device = hw_device_for_filter();
@@ -855,7 +869,14 @@ unsafe fn configure_filtergraph(
     /* limit the lists of allowed formats to the ones selected, to
      * make sure they stay the same if the filtergraph is reconfigured later */
     for ofp in &mut *ofps {
-        ofp.format = std::mem::transmute(av_buffersink_get_format(ofp.filter));
+        // `ofp.format` is AVPixelFormat-typed but carries a sample format for
+        // audio sinks; both are contiguous #[repr(i32)] enums and every valid
+        // sample-format value is < AV_PIX_FMT_NB, so a range-checked pixel-fmt
+        // conversion round-trips either case without the UB risk of a bare
+        // transmute on an out-of-range int. (Rung 2 retypes this field to i32.)
+        ofp.format =
+            crate::util::format_convert::pix_fmt_from_raw(av_buffersink_get_format(ofp.filter))
+                .unwrap_or(AV_PIX_FMT_NONE);
         ofp.width = av_buffersink_get_w(ofp.filter);
         ofp.height = av_buffersink_get_h(ofp.filter);
         ofp.color_space = av_buffersink_get_colorspace(ofp.filter);
@@ -1644,7 +1665,9 @@ unsafe fn close_output(
         };
 
         (*frame.as_mut_ptr()).time_base = ofp.tb_out;
-        (*frame.as_mut_ptr()).format = std::mem::transmute(ofp.format);
+        // `ofp.format` is a typed enum; widening to the raw `c_int` field is a
+        // plain `as` cast, never a transmute.
+        (*frame.as_mut_ptr()).format = ofp.format as i32;
 
         (*frame.as_mut_ptr()).width = ofp.width;
         (*frame.as_mut_ptr()).height = ofp.height;
@@ -1935,11 +1958,15 @@ fn mid_pred(a: i64, b: i64, c: i64) -> i64 {
     }
 }
 
-fn unknown_if_null(ptr: *const c_char) -> &'static str {
+/// Returns a NUL-terminated C string pointer safe to pass to a C `%s` arg: the
+/// input pointer when non-null, else a static `"unknown"`. The previous version
+/// returned a Rust `&str` whose `.as_ptr()` was NOT NUL-terminated, so feeding
+/// it to `%s` overran into adjacent memory.
+fn unknown_if_null(ptr: *const c_char) -> *const c_char {
     if ptr.is_null() {
-        "unknown"
+        b"unknown\0".as_ptr() as *const c_char
     } else {
-        unsafe { CStr::from_ptr(ptr).to_str().unwrap_or("invalid") }
+        ptr
     }
 }
 
@@ -2444,7 +2471,13 @@ unsafe fn configure_input_audio_filter(
     };
 
     av_bprint_init(&mut args, 0, AV_BPRINT_SIZE_AUTOMATIC as u32);
-    let sample_fmt_name = av_get_sample_fmt_name(std::mem::transmute(ifp.format));
+    // Reject an invalid/unknown sample format instead of feeding a null into the
+    // C "%s" args string below — mirrors configure_input_video_filter's
+    // `pix_fmt_desc_from_raw(...) else return AVERROR(EINVAL)`.
+    let Some(sample_fmt) = crate::util::format_convert::sample_fmt_from_raw(ifp.format) else {
+        return AVERROR(ffmpeg_sys_next::EINVAL);
+    };
+    let sample_fmt_name = av_get_sample_fmt_name(sample_fmt);
 
     {
         let fmt_str = CString::new("time_base=%d/%d:sample_rate=%d:sample_fmt=%s").unwrap();
@@ -2584,7 +2617,11 @@ unsafe fn configure_input_video_filter(
     }
 
     let mut last_filter = ifp.filter;
-    let desc = av_pix_fmt_desc_get(std::mem::transmute(ifp.format));
+    // Checked descriptor lookup: reject an invalid/unknown format instead of
+    // transmuting into an out-of-range enum and dereferencing a null descriptor.
+    let Some(desc) = crate::util::format_convert::pix_fmt_desc_from_raw(ifp.format) else {
+        return AVERROR(ffmpeg_sys_next::EINVAL);
+    };
 
     /*if (ifp.opts.flags & IFILTER_FLAG_CROP) {
         char crop_buf[64];

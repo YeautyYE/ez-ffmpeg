@@ -1,6 +1,11 @@
 // In test builds, libtest-generated code references test items through the
 // deprecated `opengl` module path, which a file-level allow cannot cover.
 #![cfg_attr(test, allow(deprecated))]
+// Safety-hygiene lint (clippy-only; does not affect normal builds). Every
+// public `unsafe fn` must document its contract with a `# Safety` section.
+// Broader gates (`clippy::undocumented_unsafe_blocks`, `unsafe_op_in_unsafe_fn`)
+// are deferred until the pre-existing unsafe-doc/import backlog is paid down.
+#![warn(clippy::missing_safety_doc)]
 
 //! # ez-ffmpeg
 //!

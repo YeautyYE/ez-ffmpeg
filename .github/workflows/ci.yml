@@ -1,0 +1,86 @@
+# CI scaffolding for ez-ffmpeg.
+#
+# NOT yet verified on GitHub Actions. Two known constraints must be resolved by
+# whoever first enables this workflow:
+#
+#   1. FFmpeg 7.x: `ffmpeg-sys-next 7.1` links against the FFmpeg 7.x ABI.
+#      `ubuntu-24.04` (current `ubuntu-latest`) ships FFmpeg 6.1 via apt, which
+#      will NOT link. Provide 7.x through a newer runner image, a PPA/
+#      deb-multimedia source, or a vendored `ffmpeg-sys-next` build before the
+#      `build` job can go green.
+#   2. Tests need media assets and the pre-existing `packet_scanner` segfault
+#      fixed before `test` can be a
+#      required gate — it is non-blocking here.
+#
+# `build` + `clippy` are the enforced safety gates once FFmpeg 7.x is available.
+
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: Build & Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install FFmpeg 7.x development libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libavcodec-dev libavformat-dev libavfilter-dev libavdevice-dev \
+            libavutil-dev libswscale-dev libswresample-dev libpostproc-dev \
+            pkg-config clang
+          echo "linked libavcodec: $(pkg-config --modversion libavcodec)"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --all-features --verbose
+
+      # Safety-hygiene lints surface here. Not `-D warnings` yet: the crate has a
+      # pre-existing unused-import / undocumented-unsafe backlog to clear first.
+      - name: Clippy
+        run: cargo clippy --all-features --lib
+
+  test:
+    name: Test (non-blocking)
+    runs-on: ubuntu-latest
+    # Kept off the required path until test media assets exist and the
+    # packet_scanner SIGSEGV is fixed.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install FFmpeg 7.x development libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libavcodec-dev libavformat-dev libavfilter-dev libavdevice-dev \
+            libavutil-dev libswscale-dev libswresample-dev libpostproc-dev \
+            pkg-config clang
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Test
+        run: cargo test --all-features --lib

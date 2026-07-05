@@ -534,6 +534,80 @@ pub(crate) unsafe fn free_input_opaque(mut avio_ctx: *mut AVIOContext) {
     }
 }
 
+/// RAII guard for a partially-initialized output `AVFormatContext`.
+///
+/// While building a [`Muxer`], the raw context (and, for custom-IO outputs, its
+/// `AVIOContext` + callback `Box`) is owned by nobody until `Muxer::new` takes
+/// it. Any `?`/early return in that window used to leak it. Arm this guard once
+/// the context is valid; on drop it frees via [`out_fmt_ctx_free`] — the exact
+/// path the success-path `AVFormatContextBox` drop uses — unless [`OutFmtCtxGuard::release`]
+/// is called when ownership transfers to the muxer.
+pub(crate) struct OutFmtCtxGuard {
+    ctx: *mut AVFormatContext,
+    is_write_callback: bool,
+}
+
+impl OutFmtCtxGuard {
+    pub(crate) fn disarmed() -> Self {
+        Self {
+            ctx: null_mut(),
+            is_write_callback: false,
+        }
+    }
+
+    /// Take ownership of a now-valid context so any early return frees it.
+    pub(crate) fn arm(&mut self, ctx: *mut AVFormatContext, is_write_callback: bool) {
+        self.ctx = ctx;
+        self.is_write_callback = is_write_callback;
+    }
+
+    /// Relinquish ownership (the muxer now owns the context).
+    pub(crate) fn release(&mut self) -> *mut AVFormatContext {
+        let ctx = self.ctx;
+        self.ctx = null_mut();
+        ctx
+    }
+}
+
+impl Drop for OutFmtCtxGuard {
+    fn drop(&mut self) {
+        out_fmt_ctx_free(self.ctx, self.is_write_callback);
+    }
+}
+
+/// RAII guard for a partially-initialized input `AVFormatContext`, mirroring
+/// [`OutFmtCtxGuard`] but freeing via [`in_fmt_ctx_free`].
+pub(crate) struct InFmtCtxGuard {
+    ctx: *mut AVFormatContext,
+    is_read_callback: bool,
+}
+
+impl InFmtCtxGuard {
+    pub(crate) fn disarmed() -> Self {
+        Self {
+            ctx: null_mut(),
+            is_read_callback: false,
+        }
+    }
+
+    pub(crate) fn arm(&mut self, ctx: *mut AVFormatContext, is_read_callback: bool) {
+        self.ctx = ctx;
+        self.is_read_callback = is_read_callback;
+    }
+
+    pub(crate) fn release(&mut self) -> *mut AVFormatContext {
+        let ctx = self.ctx;
+        self.ctx = null_mut();
+        ctx
+    }
+}
+
+impl Drop for InFmtCtxGuard {
+    fn drop(&mut self) {
+        in_fmt_ctx_free(self.ctx, self.is_read_callback);
+    }
+}
+
 #[allow(dead_code)]
 pub(crate) fn type_to_linklabel(media_type: AVMediaType, index: usize) -> Option<String> {
     match media_type {
