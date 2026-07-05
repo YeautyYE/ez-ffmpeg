@@ -381,7 +381,7 @@ impl From<FfmpegContext> for FfmpegScheduler<Initialization> {
 fn check_output_streams(muxs: &Vec<Muxer>) -> Result<()> {
     for mux in muxs {
         unsafe {
-            let oformat = (*mux.out_fmt_ctx).oformat;
+            let oformat = (*mux.out_fmt_ctx_ptr()).oformat;
             if !mux.has_src() && (*oformat).flags & AVFMT_NOSTREAMS == 0 {
                 warn!("Output file does not contain any stream");
                 return Err(OpenOutputError::NotContainStream.into());
@@ -440,7 +440,7 @@ unsafe fn process_metadata(mux: &Muxer, demuxs: &Vec<Demuxer>) -> Result<()> {
         let input_ctx = input_ctxs[mapping.input_index];
         if let Err(e) = copy_metadata(
             input_ctx,
-            mux.out_fmt_ctx,
+            mux.out_fmt_ctx_ptr(),
             &mapping.src_type,
             &mapping.dst_type,
         ) {
@@ -457,7 +457,7 @@ unsafe fn process_metadata(mux: &Muxer, demuxs: &Vec<Demuxer>) -> Result<()> {
             if let Err(e) = copy_chapters_from_input(
                 source_demux.in_fmt_ctx_ptr(),
                 source_demux.ts_offset,
-                mux.out_fmt_ctx,
+                mux.out_fmt_ctx_ptr(),
                 mux.start_time_us,
                 mux.recording_time_us,
                 true,
@@ -475,7 +475,7 @@ unsafe fn process_metadata(mux: &Muxer, demuxs: &Vec<Demuxer>) -> Result<()> {
     if mux.auto_copy_metadata {
         if let Err(e) = copy_metadata_default(
             &input_ctxs,
-            mux.out_fmt_ctx,
+            mux.out_fmt_ctx_ptr(),
             mux.nb_streams,
             &stream_input_mapping,
             &encoding_streams,
@@ -491,7 +491,7 @@ unsafe fn process_metadata(mux: &Muxer, demuxs: &Vec<Demuxer>) -> Result<()> {
     // Step 4: Apply user-specified metadata values (-metadata option)
     // FFmpeg: of_add_metadata runs right after copy_meta (ffmpeg_mux_init.c:3344,3356)
     if let Err(e) = of_add_metadata(
-        mux.out_fmt_ctx,
+        mux.out_fmt_ctx_ptr(),
         &mux.global_metadata,
         &mux.stream_metadata,
         &mux.chapter_metadata,
@@ -858,13 +858,13 @@ fn map_manual(
                 streamcopy_init(
                     mux,
                     *(*demux.in_fmt_ctx_ptr()).streams.add(stream_index),
-                    *(*mux.out_fmt_ctx).streams.add(output_stream_index),
+                    *(*mux.out_fmt_ctx_ptr()).streams.add(output_stream_index),
                     demux.framerate,
                 )?;
                 rescale_duration(
                     input_stream_duration,
                     input_stream_time_base,
-                    *(*mux.out_fmt_ctx).streams.add(output_stream_index),
+                    *(*mux.out_fmt_ctx_ptr()).streams.add(output_stream_index),
                 );
                 mux.stream_ready()
             }
@@ -881,13 +881,13 @@ fn map_manual(
                     streamcopy_init(
                         mux,
                         *(*demux.in_fmt_ctx_ptr()).streams.add(stream_index),
-                        *(*mux.out_fmt_ctx).streams.add(output_stream_index),
+                        *(*mux.out_fmt_ctx_ptr()).streams.add(output_stream_index),
                         demux.framerate,
                     )?;
                     rescale_duration(
                         input_stream_duration,
                         input_stream_time_base,
-                        *(*mux.out_fmt_ctx).streams.add(output_stream_index),
+                        *(*mux.out_fmt_ctx_ptr()).streams.add(output_stream_index),
                     );
                     mux.stream_ready()
                 }
@@ -914,7 +914,7 @@ fn map_manual(
                     rescale_duration(
                         input_stream_duration,
                         input_stream_time_base,
-                        *(*mux.out_fmt_ctx).streams.add(output_stream_index),
+                        *(*mux.out_fmt_ctx_ptr()).streams.add(output_stream_index),
                     );
                 }
             }
@@ -1271,7 +1271,7 @@ fn map_auto_streams(
     auto_disable: i32,
 ) -> Result<()> {
     unsafe {
-        let oformat = (*mux.out_fmt_ctx).oformat;
+        let oformat = (*mux.out_fmt_ctx_ptr()).oformat;
         map_auto_stream(
             mux_index,
             mux,
@@ -1378,7 +1378,7 @@ unsafe fn map_auto_subtitle(
                     rescale_duration(
                         input_stream.duration,
                         input_stream.time_base,
-                        *(*mux.out_fmt_ctx).streams.add(output_stream_index),
+                        *(*mux.out_fmt_ctx_ptr()).streams.add(output_stream_index),
                     );
                 }
             } else {
@@ -1395,13 +1395,13 @@ unsafe fn map_auto_subtitle(
                     streamcopy_init(
                         mux,
                         *(*demux.in_fmt_ctx_ptr()).streams.add(stream_index),
-                        *(*mux.out_fmt_ctx).streams.add(output_stream_index),
+                        *(*mux.out_fmt_ctx_ptr()).streams.add(output_stream_index),
                         demux.framerate,
                     )?;
                     rescale_duration(
                         input_stream_duration,
                         input_stream_time_base,
-                        *(*mux.out_fmt_ctx).streams.add(output_stream_index),
+                        *(*mux.out_fmt_ctx_ptr()).streams.add(output_stream_index),
                     );
                     mux.stream_ready()
                 }
@@ -1438,7 +1438,7 @@ unsafe fn map_auto_data(
     let codec_id = av_guess_codec(
         oformat,
         null(),
-        (*mux.out_fmt_ctx).url,
+        (*mux.out_fmt_ctx_ptr()).url,
         null(),
         AVMEDIA_TYPE_DATA,
     );
@@ -1488,13 +1488,13 @@ unsafe fn map_auto_data(
             streamcopy_init(
                 mux,
                 *(*demux.in_fmt_ctx_ptr()).streams.add(stream_index),
-                *(*mux.out_fmt_ctx).streams.add(output_stream_index),
+                *(*mux.out_fmt_ctx_ptr()).streams.add(output_stream_index),
                 demux.framerate,
             )?;
             rescale_duration(
                 input_stream_duration,
                 input_stream_time_base,
-                *(*mux.out_fmt_ctx).streams.add(output_stream_index),
+                *(*mux.out_fmt_ctx_ptr()).streams.add(output_stream_index),
             );
             mux.stream_ready()
         }
@@ -1534,7 +1534,7 @@ unsafe fn map_auto_stream(
     if (media_type == AVMEDIA_TYPE_VIDEO
         || media_type == AVMEDIA_TYPE_AUDIO
         || media_type == AVMEDIA_TYPE_DATA)
-        && av_guess_codec(oformat, null(), (*mux.out_fmt_ctx).url, null(), media_type)
+        && av_guess_codec(oformat, null(), (*mux.out_fmt_ctx_ptr()).url, null(), media_type)
             == AV_CODEC_ID_NONE
         {
             return Ok(());
@@ -1585,7 +1585,7 @@ unsafe fn map_auto_stream(
                 rescale_duration(
                     input_stream.duration,
                     input_stream.time_base,
-                    *(*mux.out_fmt_ctx).streams.add(output_stream_index),
+                    *(*mux.out_fmt_ctx_ptr()).streams.add(output_stream_index),
                 );
             }
         }
@@ -1607,13 +1607,13 @@ unsafe fn map_auto_stream(
         streamcopy_init(
             mux,
             *(*demux.in_fmt_ctx_ptr()).streams.add(stream_index),
-            *(*mux.out_fmt_ctx).streams.add(output_stream_index),
+            *(*mux.out_fmt_ctx_ptr()).streams.add(output_stream_index),
             demux.framerate,
         )?;
         rescale_duration(
             input_stream_duration,
             input_stream_time_base,
-            *(*mux.out_fmt_ctx).streams.add(output_stream_index),
+            *(*mux.out_fmt_ctx_ptr()).streams.add(output_stream_index),
         );
         mux.stream_ready()
     }
@@ -1794,7 +1794,7 @@ fn streamcopy_init(
         // avformat_write_header rejected it.
         let mut codec_tag = 0;
         if codec_tag == 0 {
-            let ct = (*(*mux.out_fmt_ctx).oformat).codec_tag;
+            let ct = (*(*mux.out_fmt_ctx_ptr()).oformat).codec_tag;
             let mut codec_tag_tmp = 0;
             if ct.is_null()
                 || av_codec_get_id(ct, (*(*output_stream).codecpar).codec_tag)
@@ -1989,7 +1989,7 @@ fn choose_encoder(
             let url = CString::new(&*mux.url)?;
             unsafe {
                 let codec_id = av_guess_codec(
-                    (*mux.out_fmt_ctx).oformat,
+                    (*mux.out_fmt_ctx_ptr()).oformat,
                     null(),
                     url.as_ptr(),
                     null(),
@@ -1997,7 +1997,7 @@ fn choose_encoder(
                 );
                 let enc = avcodec_find_encoder(codec_id);
                 if enc.is_null() {
-                    let format_name = (*(*mux.out_fmt_ctx).oformat).name;
+                    let format_name = (*(*mux.out_fmt_ctx_ptr()).oformat).name;
                     let format_name = CStr::from_ptr(format_name).to_str();
                     let codec_name = avcodec_get_name(codec_id);
                     let codec_name = CStr::from_ptr(codec_name).to_str();
@@ -2251,13 +2251,24 @@ unsafe fn open_output_file(
         None => None,
     };
 
-    // Ownership of out_fmt_ctx transfers to the Muxer; stop the guard from
-    // freeing it.
-    ctx_guard.release();
+    // Ownership of out_fmt_ctx transfers to the Muxer. `release()` disarms the
+    // guard and hands back the pointer; wrap it in a `FormatContext` (custom-IO
+    // variant for the write_callback path — the same discriminant the old
+    // `is_set_write_callback` carried) and move it into the infallible
+    // `Muxer::new`. There is no `?` between here and construction, so the pointer
+    // always reaches its next Drop-home.
+    // SAFETY: out_fmt_ctx is a fully-initialized output context; for custom IO its
+    // pb/AVIO+box are already wired (see the arm(...,true) point above), which
+    // from_output_custom_io's teardown requires.
+    let out_fmt_ctx = ctx_guard.release();
+    let fc = if output.url.is_none() {
+        crate::raw::FormatContext::from_output_custom_io(out_fmt_ctx)
+    } else {
+        crate::raw::FormatContext::from_output(out_fmt_ctx)
+    };
     let mux = Muxer::new(
         url,
-        output.url.is_none(),
-        out_fmt_ctx,
+        fc,
         output.frame_pipelines.take(),
         output.stream_map_specs.clone(),
         output.stream_maps.clone(),

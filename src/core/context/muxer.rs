@@ -3,6 +3,7 @@ use crate::core::context::output::{StreamMap, VSyncMethod};
 use crate::core::context::{FrameBox, PacketBox};
 use crate::core::filter::frame_pipeline::FramePipeline;
 use crate::core::scheduler::input_controller::SchNode;
+use crate::raw::FormatContext;
 use crate::error::OpenOutputError;
 use crossbeam_channel::{Receiver, Sender};
 use log::error;
@@ -77,9 +78,12 @@ impl StreamSourceRegistry {
 
 pub(crate) struct Muxer {
     pub(crate) url: String,
-    pub(crate) is_set_write_callback: bool,
 
-    pub(crate) out_fmt_ctx: *mut AVFormatContext,
+    /// Owns the output `AVFormatContext`. `Some` from construction until the mux
+    /// worker takes it (see `mux_task`); `None` afterward. Dropping the `Muxer`
+    /// before that hand-off (built but never started) frees the context via
+    /// `FormatContext`'s Drop — no manual `Drop` needed.
+    pub(crate) out_fmt_ctx: Option<FormatContext>,
     pub(crate) oformat_flags: i32,
     pub(crate) frame_pipelines: Option<Vec<FramePipeline>>,
 
@@ -155,22 +159,24 @@ pub(crate) struct Muxer {
 // frame_pipelines with Box<dyn FrameFilter> which only implements Send.
 unsafe impl Send for Muxer {}
 
-impl Drop for Muxer {
-    fn drop(&mut self) {
-        // Owns the output context until mux_init/ready_to_init_mux hands it
-        // to the muxer thread (which nulls this field). A context that never
-        // started was previously leaked together with its avio buffer and
-        // write-callback state. The helper no-ops on null.
-        crate::core::context::out_fmt_ctx_free(self.out_fmt_ctx, self.is_set_write_callback);
-        self.out_fmt_ctx = std::ptr::null_mut();
-    }
-}
+// No manual `Drop`: the `Option<FormatContext>` field owns the context and frees it
+// on drop (output path, custom-IO-aware) whether the worker took it (`None`) or the
+// job never started (`Some`). Replaces the old hand-written Drop.
 
 impl Muxer {
+    /// Raw output `AVFormatContext` pointer for read-only FFI (field reads,
+    /// `avformat_new_stream`, `avformat_write_header`). Returns null once the mux
+    /// worker has taken ownership. Callers must not free through it.
+    pub(crate) fn out_fmt_ctx_ptr(&self) -> *mut AVFormatContext {
+        // SAFETY: as_ptr just returns the stored pointer.
+        self.out_fmt_ctx
+            .as_ref()
+            .map_or(std::ptr::null_mut(), |fc| unsafe { fc.as_ptr() })
+    }
+
     pub(crate) fn new(
         url: String,
-        is_set_write_callback: bool,
-        out_fmt_ctx: *mut AVFormatContext,
+        out_fmt_ctx: FormatContext,
         frame_pipelines: Option<Vec<FramePipeline>>,
         stream_map_specs: Vec<crate::core::context::output::StreamMapSpec>,
         stream_maps: Vec<StreamMap>,
@@ -208,11 +214,15 @@ impl Muxer {
         data_disable: bool,
         pix_fmt: Option<ffmpeg_sys_next::AVPixelFormat>,
     ) -> Self {
+        // Read oformat flags via the pointer BEFORE moving `out_fmt_ctx` into the
+        // struct (the field can no longer be the access path once it's moved).
+        // SAFETY: out_fmt_ctx is a valid, just-allocated output context.
+        let oformat_flags = unsafe { (*(*out_fmt_ctx.as_ptr()).oformat).flags };
         Self {
             url,
             frame_pipelines,
-            out_fmt_ctx,
-            oformat_flags: unsafe { (*(*out_fmt_ctx).oformat).flags },
+            out_fmt_ctx: Some(out_fmt_ctx),
+            oformat_flags,
             stream_map_specs,
             stream_maps,
             video_codec,
@@ -244,7 +254,6 @@ impl Muxer {
             enc_handles: crossbeam_channel::unbounded(),
             nb_streams: 0,
             nb_streams_ready: Arc::new(Default::default()),
-            is_set_write_callback,
             mux_stream_nodes: vec![],
             global_metadata,
             stream_metadata,
@@ -300,7 +309,7 @@ impl Muxer {
                     self.vsync_method,
                     self.framerate,
                     self.framerate_max,
-                    self.out_fmt_ctx,
+                    self.out_fmt_ctx_ptr(),
                     self.copy_ts,
                     single_stream_direct_input,
                 )?
@@ -361,7 +370,7 @@ impl Muxer {
 
         self.nb_streams += 1;
         unsafe {
-            let st = avformat_new_stream(self.out_fmt_ctx, null());
+            let st = avformat_new_stream(self.out_fmt_ctx_ptr(), null());
             if st.is_null() {
                 return Err(OpenOutputError::OutOfMemory.into());
             }
