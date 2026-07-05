@@ -54,7 +54,7 @@ use ffmpeg_sys_next::{
     av_inv_q, av_malloc, av_rescale_q, av_seek_frame, avcodec_alloc_context3,
     avcodec_descriptor_get, avcodec_descriptor_get_by_name, avcodec_find_encoder,
     avcodec_find_encoder_by_name, avcodec_get_name, avcodec_parameters_from_context,
-    avcodec_parameters_to_context, avfilter_inout_free,
+    avcodec_parameters_to_context,
     avfilter_pad_get_name, avfilter_pad_get_type, avformat_alloc_context,
     avformat_alloc_output_context2, avformat_close_input, avformat_find_stream_info,
     avformat_flush, avformat_free_context, avformat_open_input, avio_alloc_context,
@@ -2959,26 +2959,21 @@ fn init_filter_graph(
             return Err(FilterGraphParseError::from(ret).into());
         }
 
-        let mut inputs = null_mut();
-        let mut outputs = null_mut();
-        ret = avfilter_graph_segment_apply(seg, 0, &mut inputs, &mut outputs);
+        let mut inputs = crate::raw::FilterInOut::empty();
+        let mut outputs = crate::raw::FilterInOut::empty();
+        ret = avfilter_graph_segment_apply(seg, 0, inputs.as_out_ptr(), outputs.as_out_ptr());
         avfilter_graph_segment_free(&mut seg);
 
         if ret < 0 {
-            avfilter_inout_free(&mut inputs);
-            avfilter_inout_free(&mut outputs);
             return Err(FilterGraphParseError::from(ret).into());
         }
 
-        // NOTE: on these two `?` early returns `inputs`/`outputs` (AVFilterInOut)
-        // still leak — that owner gets its own RAII wrapper in the follow-up
-        // AVFilterInOut PR; the graph itself is now leak-free on every path.
-        let input_filters = inouts_to_input_filters(fg_index, inputs)?;
-        let output_filters = inouts_to_output_filters(outputs)?;
+        // `inputs`/`outputs` own the parsed AVFilterInOut lists; their Drop frees
+        // them on every path below — the two `?` early returns included.
+        let input_filters = inouts_to_input_filters(fg_index, inputs.as_ptr())?;
+        let output_filters = inouts_to_output_filters(outputs.as_ptr())?;
 
         if output_filters.is_empty() {
-            avfilter_inout_free(&mut inputs);
-            avfilter_inout_free(&mut outputs);
             return Err(FilterZeroOutputs);
         }
 
@@ -2988,9 +2983,6 @@ fn init_filter_graph(
             input_filters,
             output_filters,
         );
-
-        avfilter_inout_free(&mut inputs);
-        avfilter_inout_free(&mut outputs);
 
         Ok(filter_graph)
     }
@@ -3589,7 +3581,7 @@ mod tests {
     use std::ptr::null_mut;
 
     use crate::core::context::ffmpeg_context::{strtol, FfmpegContext, Output};
-    use ffmpeg_sys_next::{avfilter_graph_parse_ptr, avfilter_inout_free};
+    use ffmpeg_sys_next::avfilter_graph_parse_ptr;
 
     use crate::core::context::ffmpeg_context::{bind_fg_inputs_by_fg, fg_complex_bind_input};
     use crate::core::context::filter_graph::FilterGraph;
@@ -3710,38 +3702,35 @@ mod tests {
 
         unsafe {
             let graph = crate::raw::FilterGraph::alloc().unwrap();
-            let mut inputs = null_mut();
-            let mut outputs = null_mut();
+            let mut inputs = crate::raw::FilterInOut::empty();
+            let mut outputs = crate::raw::FilterInOut::empty();
 
             let ret = avfilter_graph_parse_ptr(
                 graph.as_ptr(),
                 desc_cstr.as_ptr(),
-                &mut inputs,
-                &mut outputs,
+                inputs.as_out_ptr(),
+                outputs.as_out_ptr(),
                 null_mut(),
             );
             if ret < 0 {
-                avfilter_inout_free(&mut inputs);
-                avfilter_inout_free(&mut outputs);
                 println!("err ret:{}", crate::util::ffmpeg_utils::av_err2str(ret));
                 return;
             }
 
-            println!("inputs.is_null:{}", inputs.is_null());
-            println!("outputs.is_null:{}", outputs.is_null());
+            println!("inputs.is_null:{}", inputs.as_ptr().is_null());
+            println!("outputs.is_null:{}", outputs.as_ptr().is_null());
 
-            let mut cur = inputs;
+            let mut cur = inputs.as_ptr();
             while !cur.is_null() {
                 let input_name = CStr::from_ptr((*cur).name);
                 println!("Input name: {}", input_name.to_str().unwrap());
                 cur = (*cur).next;
             }
 
-            let output_name = CStr::from_ptr((*outputs).name);
+            let output_name = CStr::from_ptr((*outputs.as_ptr()).name);
             println!("Output name: {}", output_name.to_str().unwrap());
 
-            let filter_ctx = (*outputs).filter_ctx;
-            avfilter_inout_free(&mut outputs);
+            let filter_ctx = (*outputs.as_ptr()).filter_ctx;
             println!("filter_ctx.is_null:{}", filter_ctx.is_null());
         }
     }
