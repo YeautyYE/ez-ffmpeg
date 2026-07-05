@@ -149,6 +149,9 @@ pub mod core;
 pub mod util;
 pub mod error;
 
+/// Internal RAII wrappers concentrating raw FFmpeg FFI pointers (Rung-2 boundary).
+pub(crate) mod raw;
+
 pub use self::core::context::ffmpeg_context::FfmpegContext;
 pub use self::core::context::input::Input;
 pub use self::core::context::output::Output;

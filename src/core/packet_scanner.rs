@@ -6,7 +6,7 @@ use ffmpeg_sys_next::{
 
 use std::iter::FusedIterator;
 
-use crate::core::context::AVFormatContextBox;
+use crate::raw::FormatContext;
 use crate::core::stream_info::StreamInfo;
 use crate::error::{DemuxingError, OpenInputError, PacketScannerError, Result};
 
@@ -111,7 +111,7 @@ impl PacketInfo {
 /// }
 /// ```
 pub struct PacketScanner {
-    fmt_ctx_box: AVFormatContextBox,
+    fmt_ctx_box: FormatContext,
     pkt: *mut AVPacket,
     streams: Vec<StreamInfo>,
 }
@@ -120,7 +120,7 @@ pub struct PacketScanner {
 // It is moved between threads, never shared. No thread-affine callbacks are registered.
 // This is safe only because `open()` does not expose custom AVIO or interrupt callbacks.
 // If custom callbacks are added in the future, this impl must be re-evaluated.
-// This matches the safety reasoning of AVFormatContextBox's own `unsafe impl Send`.
+// This matches the safety reasoning of FormatContext's own `unsafe impl Send`.
 unsafe impl Send for PacketScanner {}
 
 impl PacketScanner {
@@ -160,7 +160,7 @@ impl PacketScanner {
         // accepts any timestamp and returns a negative value on failure.
         unsafe {
             let ret = avformat_seek_file(
-                self.fmt_ctx_box.fmt_ctx,
+                self.fmt_ctx_box.as_ptr(),
                 -1,
                 i64::MIN,
                 timestamp_us,
@@ -192,7 +192,7 @@ impl PacketScanner {
 
             let mut eagain_retries: u32 = 0;
             loop {
-                let ret = av_read_frame(self.fmt_ctx_box.fmt_ctx, self.pkt);
+                let ret = av_read_frame(self.fmt_ctx_box.as_ptr(), self.pkt);
                 if ret == AVERROR(EAGAIN) {
                     eagain_retries += 1;
                     if eagain_retries > MAX_EAGAIN_RETRIES {
@@ -292,7 +292,7 @@ impl Drop for PacketScanner {
                 av_packet_free(&mut self.pkt);
             }
         }
-        // AVFormatContextBox handles closing the format context
+        // FormatContext handles closing the format context
     }
 }
 
