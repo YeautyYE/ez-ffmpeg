@@ -1,24 +1,23 @@
-# CI scaffolding for ez-ffmpeg.
+# CI for ez-ffmpeg.
 #
-# NOT yet verified on GitHub Actions. Two known constraints must be resolved by
-# whoever first enables this workflow:
+# FFmpeg 7.x is provided by BUILDING IT FROM SOURCE inside CI, not from apt.
+# `ffmpeg-sys-next 7.1` links against the FFmpeg 7.x ABI (libavcodec 61.x), but
+# `ubuntu-latest` (24.04) only ships FFmpeg 6.1 (libavcodec 60.x) via apt, which
+# does not link. Enabling the crate's `ffmpeg-sys-next/build` feature makes its
+# build script `git clone` the `release/7.1` branch of FFmpeg and compile it, so
+# the linked ABI matches the bindings exactly on any runner. The apt packages
+# below are just the toolchain that compile needs (nasm/yasm/clang/pkg-config/
+# zlib), NOT FFmpeg itself. The first build compiles FFmpeg (~10-20 min); the
+# cache makes subsequent runs fast.
 #
-#   1. FFmpeg 7.x: `ffmpeg-sys-next 7.1` links against the FFmpeg 7.x ABI.
-#      `ubuntu-24.04` (current `ubuntu-latest`) ships FFmpeg 6.1 via apt, which
-#      will NOT link. Provide 7.x through a newer runner image, a PPA/
-#      deb-multimedia source, or a vendored `ffmpeg-sys-next` build before the
-#      `build` job can go green.
-#   2. GPU-dependent tests: with `--all-features`, the `opengl`/`wgpu` frame-filter
-#      tests need a real GPU/display (they fail headless with "Failed to create
-#      Surfman connection: ConnectionFailed"), so `test` stays non-blocking until
-#      those are gated or the runner has a GPU. (The macOS-only `videotoolbox`
-#      scheduler tests are now `#[cfg(target_os = "macos")]`, so they no longer
-#      false-fail on Linux. An earlier note here claimed a "pre-existing
-#      packet_scanner segfault" — that was a `--all-features` / `docs-rs` artifact,
-#      now fixed: `docsrs` is a `build.rs` cfg rather than a Cargo feature, so
-#      `--all-features` links real FFmpeg instead of the crashing stub.)
+# GPU-dependent tests: with `--all-features` the `opengl`/`wgpu` frame-filter
+# tests need a real GPU/display (they fail headless with "Failed to create
+# Surfman connection: ConnectionFailed"), so `test` stays non-blocking until
+# those are gated or the runner has a GPU. The macOS-only `videotoolbox`
+# scheduler tests are `#[cfg(target_os = "macos")]`, so they do not false-fail on
+# Linux.
 #
-# `build` + `clippy` are the enforced safety gates once FFmpeg 7.x is available.
+# `build` + `clippy` are the enforced safety gates.
 
 name: CI
 
@@ -31,6 +30,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Trigger the from-source FFmpeg 7.1 build in ffmpeg-sys-next.
+  FFMPEG_FEATURES: --features ffmpeg-sys-next/build
 
 jobs:
   build:
@@ -39,14 +40,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install FFmpeg 7.x development libraries
+      - name: Install FFmpeg build toolchain
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libavcodec-dev libavformat-dev libavfilter-dev libavdevice-dev \
-            libavutil-dev libswscale-dev libswresample-dev libpostproc-dev \
-            pkg-config clang
-          echo "linked libavcodec: $(pkg-config --modversion libavcodec)"
+            nasm yasm clang pkg-config make git zlib1g-dev
+          echo "nasm: $(nasm --version | head -1)"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -59,15 +58,15 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-buildffmpeg-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build
-        run: cargo build --all-features --verbose
+        run: cargo build --all-features $FFMPEG_FEATURES --verbose
 
       # Safety-hygiene lints surface here. Not `-D warnings` yet: the crate has a
       # pre-existing unused-import / undocumented-unsafe backlog to clear first.
       - name: Clippy
-        run: cargo clippy --all-features --lib
+        run: cargo clippy --all-features $FFMPEG_FEATURES --lib
 
   test:
     name: Test (non-blocking)
@@ -80,15 +79,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install FFmpeg 7.x development libraries
+      - name: Install FFmpeg build toolchain
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libavcodec-dev libavformat-dev libavfilter-dev libavdevice-dev \
-            libavutil-dev libswscale-dev libswresample-dev libpostproc-dev \
-            pkg-config clang
+            nasm yasm clang pkg-config make git zlib1g-dev
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-buildffmpeg-${{ hashFiles('**/Cargo.lock') }}
+
       - name: Test
-        run: cargo test --all-features --lib
+        run: cargo test --all-features $FFMPEG_FEATURES --lib
