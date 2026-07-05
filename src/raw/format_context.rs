@@ -93,8 +93,6 @@ impl FormatContext {
     /// by this context. On drop the AVIO context, its buffer, and that `Box` are
     /// reclaimed (via `in_fmt_ctx_free(ptr, true)`). Ownership transfers to the
     /// returned value; the caller must not free `ptr` (or its `pb`) again.
-    // Wired in PR-B (Demuxer/input custom-IO migration).
-    #[allow(dead_code)]
     pub(crate) unsafe fn from_input_custom_io(ptr: *mut AVFormatContext) -> Self {
         Self {
             ptr,

@@ -2,7 +2,7 @@ use std::ffi::CStr;
 use crate::core::context::decoder_stream::DecoderStream;
 use crate::core::context::demuxer::Demuxer;
 use crate::core::context::obj_pool::ObjPool;
-use crate::core::context::{AVFormatContextBox, PacketBox, PacketData};
+use crate::core::context::{PacketBox, PacketData};
 use crate::core::scheduler::ffmpeg_scheduler::{
     is_stopping, packet_is_null, set_scheduler_error, wait_until_not_paused,
 };
@@ -26,7 +26,6 @@ use ffmpeg_sys_next::{
 };
 use libc::{c_int, c_uint};
 use log::{debug, error, info, warn};
-use std::ptr::null_mut;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use crate::core::scheduler::input_controller::SchNode;
@@ -69,14 +68,20 @@ pub(crate) fn demux_init(
     let copy_ts = demux.copy_ts;
     let mut demux_parameter = DemuxerParameter::new(demux);
 
-    let in_fmt_ctx = demux.in_fmt_ctx;
-    demux.in_fmt_ctx = null_mut();
-    let in_fmt_ctx_box = AVFormatContextBox::new(in_fmt_ctx, true, demux.is_set_read_callback);
+    // Take sole ownership of the input context out of the Demuxer. Moving the
+    // `FormatContext` into the worker closure below IS the ownership transfer —
+    // the compiler guarantees a single owner, so no null-the-source dance and no
+    // separate box are needed. The Demuxer's field is now `None`; if the worker
+    // never spawns, `in_fmt_ctx` drops here and frees exactly once.
+    let in_fmt_ctx = demux
+        .in_fmt_ctx
+        .take()
+        .expect("demux worker started without an input context");
 
     #[cfg(windows)]
     let hwaccel = { demux.hwaccel.take() };
 
-    let format_name = unsafe { CStr::from_ptr((*(*in_fmt_ctx).iformat).name).to_str().unwrap_or("unknown") };
+    let format_name = unsafe { CStr::from_ptr((*(*in_fmt_ctx.as_ptr()).iformat).name).to_str().unwrap_or("unknown") };
 
     // Claim the thread slot before spawning so stop()/wait() can never
     // observe a zero counter while this worker is about to run; the guard
@@ -88,7 +93,9 @@ pub(crate) fn demux_init(
         .name(format!("demuxer{demux_idx}:{format_name}"))
         .spawn(move || {
             let _thread_done = thread_done_guard;
-            let in_fmt_ctx_box = in_fmt_ctx_box;
+            // Move the FormatContext into the worker; it Drops (frees the input
+            // context, custom-IO-aware) when this closure ends — the terminal free.
+            let in_fmt_ctx = in_fmt_ctx;
             let mut is_started = false;
             // Mirrors FFmpeg's Demuxer.nb_streams_warn: warn once per unexpected stream id.
             let mut nb_streams_warn = demux_parameter.demux_streams.len();
@@ -105,7 +112,7 @@ pub(crate) fn demux_init(
                 };
 
                 unsafe {
-                    let mut ret = av_read_frame(in_fmt_ctx_box.fmt_ctx, packet.as_mut_ptr());
+                    let mut ret = av_read_frame(in_fmt_ctx.as_ptr(), packet.as_mut_ptr());
                     if ret == AVERROR(EAGAIN) {
                         if is_stopping(wait_until_not_paused(&scheduler_status)) {
                             info!("Demuxer receiver end command, finishing.");
@@ -172,7 +179,7 @@ pub(crate) fn demux_init(
 
                             // Common seek operation for both cases
                             if ret >= 0 {
-                                ret = seek_to_start(&mut demux_parameter, in_fmt_ctx_box.fmt_ctx);
+                                ret = seek_to_start(&mut demux_parameter, in_fmt_ctx.as_ptr());
                                 if ret >= 0 {
                                     continue;
                                 }
@@ -251,7 +258,7 @@ pub(crate) fn demux_init(
                     is_started = true;
                     ret = input_packet_process(
                         &mut demux_parameter,
-                        in_fmt_ctx_box.fmt_ctx,
+                        in_fmt_ctx.as_ptr(),
                         packet.as_mut_ptr(),
                         &mut send_flags,
                         copy_ts,
@@ -272,7 +279,7 @@ pub(crate) fn demux_init(
                         if readrate != 0.0 {
                             readrate_sleep(
                                 &demux_parameter,
-                                (*in_fmt_ctx_box.fmt_ctx).nb_streams,
+                                (*in_fmt_ctx.as_ptr()).nb_streams,
                                 readrate,
                             );
                         }
@@ -911,7 +918,7 @@ impl DemuxerParameter {
             }
         }
 
-        let nb_streams = unsafe { (*demux.in_fmt_ctx).nb_streams };
+        let nb_streams = unsafe { (*demux.in_fmt_ctx_ptr()).nb_streams };
         let mut demux_streams: Vec<DemuxStreamParameter> = Vec::with_capacity(nb_streams as usize);
         for i in 0..nb_streams {
             let stream = demux.get_stream(i as usize);
