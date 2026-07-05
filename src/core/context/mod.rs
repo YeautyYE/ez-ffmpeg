@@ -433,46 +433,6 @@ pub(crate) struct PacketData {
     pub(crate) is_copy: bool,
 }
 
-// Send + Sync are auto-derived: every field is plain owned data. The muxer
-// reads codec parameters from its own output streams instead of carrying a
-// cross-thread pointer here.
-
-pub(crate) struct AVFormatContextBox {
-    pub(crate) fmt_ctx: *mut AVFormatContext,
-    pub(crate) is_input: bool,
-    pub(crate) is_set_callback: bool,
-}
-// SAFETY: AVFormatContextBox can be sent to another thread. The fmt_ctx pointer is only
-// accessed from the thread that owns the box, and the crate ensures proper cleanup.
-unsafe impl Send for AVFormatContextBox {}
-
-impl AVFormatContextBox {
-    pub(crate) fn new(
-        fmt_ctx: *mut AVFormatContext,
-        is_input: bool,
-        is_set_callback: bool,
-    ) -> Self {
-        Self {
-            fmt_ctx,
-            is_input,
-            is_set_callback,
-        }
-    }
-}
-
-impl Drop for AVFormatContextBox {
-    fn drop(&mut self) {
-        if self.fmt_ctx.is_null() {
-            return;
-        }
-        if self.is_input {
-            in_fmt_ctx_free(self.fmt_ctx, self.is_set_callback)
-        } else {
-            out_fmt_ctx_free(self.fmt_ctx, self.is_set_callback)
-        }
-    }
-}
-
 pub(crate) fn out_fmt_ctx_free(out_fmt_ctx: *mut AVFormatContext, is_set_write_callback: bool) {
     if out_fmt_ctx.is_null() {
         return;
@@ -540,7 +500,7 @@ pub(crate) unsafe fn free_input_opaque(mut avio_ctx: *mut AVIOContext) {
 /// `AVIOContext` + callback `Box`) is owned by nobody until `Muxer::new` takes
 /// it. Any `?`/early return in that window used to leak it. Arm this guard once
 /// the context is valid; on drop it frees via [`out_fmt_ctx_free`] — the exact
-/// path the success-path `AVFormatContextBox` drop uses — unless [`OutFmtCtxGuard::release`]
+/// path a success-path [`crate::raw::FormatContext`] drop uses — unless [`OutFmtCtxGuard::release`]
 /// is called when ownership transfers to the muxer.
 pub(crate) struct OutFmtCtxGuard {
     ctx: *mut AVFormatContext,
