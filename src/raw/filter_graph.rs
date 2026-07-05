@@ -14,6 +14,13 @@
 //! [`crate::core::context::filter_graph::FilterGraph`]. Consumers that see both
 //! refer to this one path-qualified as `raw::FilterGraph`.
 
+// Compiled even under docsrs: the filter worker's slot and `cleanup_filtergraph`
+// (which have no docsrs stub) name `Option<FilterGraph>` there. Under docsrs the
+// real allocators are `#[cfg(not(docsrs))]`, so `alloc`/`as_ptr` are never
+// called and would warn — suppress that (docsrs only; the normal build still
+// catches real dead code).
+#![cfg_attr(docsrs, allow(dead_code))]
+
 use ffmpeg_sys_next::{avfilter_graph_alloc, avfilter_graph_free, AVFilterGraph};
 
 /// Sole owner of a `*mut AVFilterGraph`.

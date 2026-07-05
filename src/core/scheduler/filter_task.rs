@@ -36,7 +36,7 @@ use ffmpeg_sys_next::{
     av_frame_ref, av_frame_remove_side_data, av_freep, av_get_pix_fmt_name, av_get_sample_fmt_name,
     av_inv_q, av_log2, av_malloc, av_opt_find, av_opt_set, av_opt_set_bin, av_opt_set_int,
     av_q2d, av_rescale_q, avfilter_get_by_name,
-    avfilter_graph_alloc, avfilter_graph_config, avfilter_graph_create_filter, avfilter_graph_free,
+    avfilter_graph_config, avfilter_graph_create_filter,
     avfilter_graph_request_oldest, avfilter_inout_free, avfilter_link, avfilter_pad_get_type,
     avio_close, avio_closep, avio_open, avio_open2, avio_read, avio_read_to_bprint, avio_size,
     AVBPrint, AVBufferRef, AVColorRange, AVColorSpace, AVFilterContext, AVFilterGraph,
@@ -126,7 +126,7 @@ pub(crate) fn filter_graph_init(
         .name(format!("filtergraph{fg_index}"))
         .spawn(move || {
             let _thread_done = thread_done_guard;
-            let mut graph: *mut AVFilterGraph = null_mut();
+            let mut graph: Option<crate::raw::FilterGraph> = None;
             let mut fgp = FilterGraphParameter::default();
             let node = filter_node.as_ref();
             let SchNode::Filter {
@@ -240,7 +240,11 @@ pub(crate) fn filter_graph_init(
                 }
 
                 unsafe {
-                    let ret = fg_read_frames(graph, &mut fgp, &ifps, &mut ofps, &frame_pool);
+                    let graph_ptr = match graph.as_ref() {
+                        Some(g) => g.as_ptr(),
+                        None => null_mut(),
+                    };
+                    let ret = fg_read_frames(graph_ptr, &mut fgp, &ifps, &mut ofps, &frame_pool);
                     if ret == AVERROR_EOF {
                         trace!("Filtergraph All consumers returned EOF");
                         break;
@@ -453,7 +457,7 @@ unsafe impl Send for OutputFilterParameter {}
 #[cfg(docsrs)]
 unsafe fn fg_send_eof(
     fg_index: usize,
-    graph: *mut *mut AVFilterGraph,
+    graph: &mut Option<crate::raw::FilterGraph>,
     fgp: &mut FilterGraphParameter,
     graph_desc: &str,
     mut frame_box: FrameBox,
@@ -468,7 +472,7 @@ unsafe fn fg_send_eof(
 #[cfg(not(docsrs))]
 unsafe fn fg_send_eof(
     fg_index: usize,
-    graph: *mut *mut AVFilterGraph,
+    graph: &mut Option<crate::raw::FilterGraph>,
     fgp: &mut FilterGraphParameter,
     graph_desc: &str,
     mut frame_box: FrameBox,
@@ -561,7 +565,7 @@ const HWACCEL_CHANGED: i32 = 1 << 3;
 #[cfg(docsrs)]
 unsafe fn fg_send_frame(
     fg_index: usize,
-    graph: *mut *mut AVFilterGraph,
+    graph: &mut Option<crate::raw::FilterGraph>,
     fgp: &mut FilterGraphParameter,
     graph_desc: &str,
     mut frame_box: FrameBox,
@@ -576,7 +580,7 @@ unsafe fn fg_send_frame(
 #[cfg(not(docsrs))]
 unsafe fn fg_send_frame(
     fg_index: usize,
-    graph: *mut *mut AVFilterGraph,
+    graph: &mut Option<crate::raw::FilterGraph>,
     fgp: &mut FilterGraphParameter,
     graph_desc: &str,
     mut frame_box: FrameBox,
@@ -643,7 +647,7 @@ unsafe fn fg_send_frame(
     }
 
     // Reinitialize if needed
-    if need_reinit != 0 || (*graph).is_null() {
+    if need_reinit != 0 || graph.is_none() {
         ifilter_parameters_from_frame(&mut ifps[input_filter_index], frame, media_type)?;
 
         if !ifilter_has_all_input_formats(ifps) {
@@ -651,8 +655,8 @@ unsafe fn fg_send_frame(
             return Ok(());
         }
 
-        if !(*graph).is_null() {
-            let ret = fg_read_frames(*graph, fgp, ifps, ofps, frame_pool);
+        if let Some(g) = graph.as_ref() {
+            let ret = fg_read_frames(g.as_ptr(), fgp, ifps, ofps, frame_pool);
             if ret < 0 {
                 return Err(Error::FilterGraph(
                     FilterGraphOperationError::ProcessFramesError(FilterGraphError::from(ret)),
@@ -758,7 +762,7 @@ unsafe fn fg_send_frame(
 #[cfg(docsrs)]
 unsafe fn configure_filtergraph(
     fg_index: usize,
-    mut graph: *mut *mut AVFilterGraph,
+    graph: &mut Option<crate::raw::FilterGraph>,
     fgp: &mut FilterGraphParameter,
     graph_desc: &str,
     ifps: &mut Vec<InputFilterParameter>,
@@ -770,28 +774,27 @@ unsafe fn configure_filtergraph(
 #[cfg(not(docsrs))]
 unsafe fn configure_filtergraph(
     fg_index: usize,
-    graph: *mut *mut AVFilterGraph,
+    graph: &mut Option<crate::raw::FilterGraph>,
     fgp: &mut FilterGraphParameter,
     graph_desc: &str,
     ifps: &mut Vec<InputFilterParameter>,
     ofps: &mut Vec<OutputFilterParameter>,
 ) -> crate::error::Result<()> {
     cleanup_filtergraph(graph, ifps, ofps);
-    *graph = avfilter_graph_alloc();
-    // avfilter_graph_alloc() returns null on allocation failure (OOM); deref
-    // without this check is undefined behavior.
-    if (*graph).is_null() {
-        return Err(Error::FilterGraph(FilterGraphOperationError::ParseError(
-            FilterGraphParseError::OutOfMemory,
-        )));
-    }
-    (**graph).nb_threads = 0;
+    *graph = Some(crate::raw::FilterGraph::alloc().ok_or(Error::FilterGraph(
+        FilterGraphOperationError::ParseError(FilterGraphParseError::OutOfMemory),
+    ))?);
+    // Raw pointer into the just-allocated graph. It stays valid until a
+    // `cleanup_filtergraph` on an error path drops the owner — and every such
+    // path returns immediately, so `graph_ptr` is never read after the drop.
+    let graph_ptr = graph.as_ref().unwrap().as_ptr();
+    (*graph_ptr).nb_threads = 0;
 
     let hw_device = hw_device_for_filter();
 
     let mut inputs = null_mut();
     let mut outputs = null_mut();
-    let mut ret = graph_parse(*graph, graph_desc, &mut inputs, &mut outputs, hw_device);
+    let mut ret = graph_parse(graph_ptr, graph_desc, &mut inputs, &mut outputs, hw_device);
     if ret < 0 {
         cleanup_filtergraph(graph, ifps, ofps);
         return Err(Error::FilterGraph(FilterGraphOperationError::ParseError(
@@ -812,7 +815,7 @@ unsafe fn configure_filtergraph(
             break;
         }
 
-        let ret = configure_input_filter(fg_index, *graph, ifp.unwrap(), cur);
+        let ret = configure_input_filter(fg_index, graph_ptr, ifp.unwrap(), cur);
         if ret < 0 {
             avfilter_inout_free(&mut inputs);
             avfilter_inout_free(&mut outputs);
@@ -840,7 +843,7 @@ unsafe fn configure_filtergraph(
             break;
         }
 
-        let ret = configure_output_filter(*graph, ofp.unwrap(), cur);
+        let ret = configure_output_filter(graph_ptr, ofp.unwrap(), cur);
         if ret < 0 {
             avfilter_inout_free(&mut outputs);
             cleanup_filtergraph(graph, ifps, ofps);
@@ -856,7 +859,7 @@ unsafe fn configure_filtergraph(
 
     //TODO disable_conversions
 
-    ret = avfilter_graph_config(*graph, null_mut());
+    ret = avfilter_graph_config(graph_ptr, null_mut());
     if ret < 0 {
         cleanup_filtergraph(graph, ifps, ofps);
         return Err(Error::FilterGraph(FilterGraphOperationError::ParseError(
@@ -864,7 +867,7 @@ unsafe fn configure_filtergraph(
         )));
     }
 
-    fgp.is_meta = graph_is_meta(*graph);
+    fgp.is_meta = graph_is_meta(graph_ptr);
 
     /* limit the lists of allowed formats to the ones selected, to
      * make sure they stay the same if the filtergraph is reconfigured later */
@@ -974,7 +977,7 @@ unsafe fn configure_filtergraph(
 
     if have_input_eof {
         // make sure the EOF propagates to the end of the graph
-        ret = avfilter_graph_request_oldest(*graph);
+        ret = avfilter_graph_request_oldest(graph_ptr);
         if ret < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR_EOF {
             cleanup_filtergraph(graph, ifps, ofps);
             return Err(Error::FilterGraph(
@@ -1255,7 +1258,7 @@ fn insert_trim(
 /// to a HW format requires hw_frames_ctx to be non-NULL". Its lifetime ends
 /// in `free_input_filter_resources` when the filter task exits.
 fn cleanup_filtergraph(
-    graph: *mut *mut AVFilterGraph,
+    graph: &mut Option<crate::raw::FilterGraph>,
     ifps: &mut Vec<InputFilterParameter>,
     ofps: &mut Vec<OutputFilterParameter>,
 ) {
@@ -1265,12 +1268,11 @@ fn cleanup_filtergraph(
     for output_filter_parameter in ofps {
         output_filter_parameter.filter = null_mut();
     }
-    if graph.is_null() {
-        return;
-    }
-    unsafe {
-        avfilter_graph_free(graph);
-    }
+    // Drop the owned graph (if any), freeing it via avfilter_graph_free. The
+    // filter back-refs nulled above point into the graph, so they are cleared
+    // before this drop, never after — a naive drop that skipped the nulling
+    // would leave every ifp/ofp.filter dangling into the freed graph.
+    let _ = graph.take();
 }
 
 /// Final release of per-input resources owned by the filter task, called once

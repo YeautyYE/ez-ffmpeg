@@ -11,18 +11,18 @@
 //! `avfilter_inout_free` calls were hand-balanced across early returns (and
 //! missed on some `?` paths).
 
-// `filter_graph` and `filter_inout` are entirely FFI and their only non-test
-// consumers (`init_filter_graph` et al.) are `#[cfg(not(docsrs))]`, so gate the
-// owners out of the docsrs stub build rather than leave them dead there (mirrors
-// how the crate gates its other FFI-only code). `format_context` stays compiled:
-// it is still partially used under docsrs.
-#[cfg(not(docsrs))]
+// `filter_inout` is entirely FFI and its only non-test consumers are
+// `#[cfg(not(docsrs))]`, so gate it out of the docsrs stub build. `filter_graph`
+// must instead stay compiled: the filter worker's slot and `cleanup_filtergraph`
+// (which have no docsrs stub) name `Option<FilterGraph>` even under docsrs, so
+// the type must exist there — its FFI methods are then dead-code-suppressed
+// under docsrs (see the module attribute in filter_graph.rs). `format_context`
+// likewise stays compiled (still partially used under docsrs).
 pub(crate) mod filter_graph;
 #[cfg(not(docsrs))]
 pub(crate) mod filter_inout;
 pub(crate) mod format_context;
 
-#[cfg(not(docsrs))]
 pub(crate) use filter_graph::FilterGraph;
 #[cfg(not(docsrs))]
 pub(crate) use filter_inout::FilterInOut;
