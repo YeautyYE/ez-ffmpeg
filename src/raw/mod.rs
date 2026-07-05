@@ -10,4 +10,4 @@
 
 pub(crate) mod format_context;
 
-pub(crate) use format_context::FormatContext;
+pub(crate) use format_context::{FormatContext, Mode};

@@ -494,34 +494,46 @@ pub(crate) unsafe fn free_input_opaque(mut avio_ctx: *mut AVIOContext) {
     }
 }
 
-/// RAII guard for a partially-initialized output `AVFormatContext`.
+/// RAII guard for a partially-initialized `AVFormatContext` (input or output).
 ///
-/// While building a [`Muxer`], the raw context (and, for custom-IO outputs, its
-/// `AVIOContext` + callback `Box`) is owned by nobody until `Muxer::new` takes
-/// it. Any `?`/early return in that window used to leak it. Arm this guard once
-/// the context is valid; on drop it frees via [`out_fmt_ctx_free`] — the exact
-/// path a success-path [`crate::raw::FormatContext`] drop uses — unless [`OutFmtCtxGuard::release`]
-/// is called when ownership transfers to the muxer.
-pub(crate) struct OutFmtCtxGuard {
+/// During `open_input_file` / `open_output_file` the raw context (and, for
+/// custom-IO, its `AVIOContext` + callback `Box`) is owned by nobody until a
+/// [`Demuxer`]/[`Muxer`] takes it. Any `?`/early return in that window used to
+/// leak it. [`arm`](FmtCtxGuard::arm) it once the context is valid; on drop it
+/// frees via the same [`in_fmt_ctx_free`]/[`out_fmt_ctx_free`] paths a
+/// success-path [`crate::raw::FormatContext`] drop uses — unless
+/// [`release`](FmtCtxGuard::release) is called when ownership transfers.
+///
+/// The teardown path is selected by [`crate::raw::Mode`] (the same discriminant
+/// `FormatContext` carries), replacing the two former bool-keyed guards
+/// (`OutFmtCtxGuard`/`InFmtCtxGuard`).
+///
+/// Unlike `FormatContext`, this guard is re-armable and covers contexts that are
+/// only *partially* initialized (allocated but not yet opened, or mid custom-IO
+/// setup) — which is why it stays a separate type rather than reusing
+/// `FormatContext`'s already-opened constructors.
+pub(crate) struct FmtCtxGuard {
     ctx: *mut AVFormatContext,
-    is_write_callback: bool,
+    mode: crate::raw::Mode,
 }
 
-impl OutFmtCtxGuard {
+impl FmtCtxGuard {
     pub(crate) fn disarmed() -> Self {
+        // `mode` is irrelevant while `ctx` is null (Drop no-ops on null).
         Self {
             ctx: null_mut(),
-            is_write_callback: false,
+            mode: crate::raw::Mode::Input,
         }
     }
 
-    /// Take ownership of a now-valid context so any early return frees it.
-    pub(crate) fn arm(&mut self, ctx: *mut AVFormatContext, is_write_callback: bool) {
+    /// Take ownership of a now-valid context so any early return frees it, with
+    /// the teardown path selected by `mode`.
+    pub(crate) fn arm(&mut self, ctx: *mut AVFormatContext, mode: crate::raw::Mode) {
         self.ctx = ctx;
-        self.is_write_callback = is_write_callback;
+        self.mode = mode;
     }
 
-    /// Relinquish ownership (the muxer now owns the context).
+    /// Relinquish ownership (a Demuxer/Muxer/FormatContext now owns the context).
     pub(crate) fn release(&mut self) -> *mut AVFormatContext {
         let ctx = self.ctx;
         self.ctx = null_mut();
@@ -529,42 +541,18 @@ impl OutFmtCtxGuard {
     }
 }
 
-impl Drop for OutFmtCtxGuard {
+impl Drop for FmtCtxGuard {
     fn drop(&mut self) {
-        out_fmt_ctx_free(self.ctx, self.is_write_callback);
-    }
-}
-
-/// RAII guard for a partially-initialized input `AVFormatContext`, mirroring
-/// [`OutFmtCtxGuard`] but freeing via [`in_fmt_ctx_free`].
-pub(crate) struct InFmtCtxGuard {
-    ctx: *mut AVFormatContext,
-    is_read_callback: bool,
-}
-
-impl InFmtCtxGuard {
-    pub(crate) fn disarmed() -> Self {
-        Self {
-            ctx: null_mut(),
-            is_read_callback: false,
+        if self.ctx.is_null() {
+            return;
         }
-    }
-
-    pub(crate) fn arm(&mut self, ctx: *mut AVFormatContext, is_read_callback: bool) {
-        self.ctx = ctx;
-        self.is_read_callback = is_read_callback;
-    }
-
-    pub(crate) fn release(&mut self) -> *mut AVFormatContext {
-        let ctx = self.ctx;
-        self.ctx = null_mut();
-        ctx
-    }
-}
-
-impl Drop for InFmtCtxGuard {
-    fn drop(&mut self) {
-        in_fmt_ctx_free(self.ctx, self.is_read_callback);
+        // Same dispatch as `FormatContext::Drop`.
+        match self.mode {
+            crate::raw::Mode::Input => in_fmt_ctx_free(self.ctx, false),
+            crate::raw::Mode::InputCustomIo => in_fmt_ctx_free(self.ctx, true),
+            crate::raw::Mode::Output => out_fmt_ctx_free(self.ctx, false),
+            crate::raw::Mode::OutputCustomIo => out_fmt_ctx_free(self.ctx, true),
+        }
     }
 }
 
