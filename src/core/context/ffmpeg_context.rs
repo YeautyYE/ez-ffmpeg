@@ -237,7 +237,7 @@ const START_AT_ZERO: bool = false;
 fn correct_input_start_times(demuxs: &mut Vec<Demuxer>, copy_ts: bool) {
     for (i, demux) in demuxs.iter_mut().enumerate() {
         unsafe {
-            let is = demux.in_fmt_ctx;
+            let is = demux.in_fmt_ctx_ptr();
 
             demux.start_time_effective = (*is).start_time;
             if (*is).start_time == ffmpeg_sys_next::AV_NOPTS_VALUE
@@ -407,7 +407,7 @@ unsafe fn process_metadata(mux: &Muxer, demuxs: &Vec<Demuxer>) -> Result<()> {
     // Collect input format contexts for metadata copying
     let input_ctxs: Vec<*const AVFormatContext> = demuxs
         .iter()
-        .map(|d| d.in_fmt_ctx as *const AVFormatContext)
+        .map(|d| d.in_fmt_ctx_ptr() as *const AVFormatContext)
         .collect();
 
     let mut metadata_global_manual = false;
@@ -452,10 +452,10 @@ unsafe fn process_metadata(mux: &Muxer, demuxs: &Vec<Demuxer>) -> Result<()> {
     if mux.auto_copy_metadata && !metadata_chapters_manual {
         if let Some(source_demux) = demuxs
             .iter()
-            .find(|d| unsafe { !d.in_fmt_ctx.is_null() && (*d.in_fmt_ctx).nb_chapters > 0 })
+            .find(|d| unsafe { !d.in_fmt_ctx_ptr().is_null() && (*d.in_fmt_ctx_ptr()).nb_chapters > 0 })
         {
             if let Err(e) = copy_chapters_from_input(
-                source_demux.in_fmt_ctx,
+                source_demux.in_fmt_ctx_ptr(),
                 source_demux.ts_offset,
                 mux.out_fmt_ctx,
                 mux.start_time_us,
@@ -616,7 +616,7 @@ unsafe fn expand_stream_maps(
                    existing_map.file_index == file_idx {
                     // Check if stream specifier matches
                     let demux = &demuxs[file_idx];
-                    let fmt_ctx = demux.in_fmt_ctx;
+                    let fmt_ctx = demux.in_fmt_ctx_ptr();
                     let avstream = *(*fmt_ctx).streams.add(existing_map.stream_index);
 
                     if stream_spec.matches(fmt_ctx, avstream) {
@@ -630,7 +630,7 @@ unsafe fn expand_stream_maps(
 
         // FFmpeg reference: opt_map line 555-574 - expand to one StreamMap per matched stream
         let demux = &demuxs[file_idx];
-        let fmt_ctx = demux.in_fmt_ctx;
+        let fmt_ctx = demux.in_fmt_ctx_ptr();
         let mut matched_count = 0;
 
         for (stream_idx, _) in demux.get_streams().iter().enumerate() {
@@ -857,7 +857,7 @@ fn map_manual(
             unsafe {
                 streamcopy_init(
                     mux,
-                    *(*demux.in_fmt_ctx).streams.add(stream_index),
+                    *(*demux.in_fmt_ctx_ptr()).streams.add(stream_index),
                     *(*mux.out_fmt_ctx).streams.add(output_stream_index),
                     demux.framerate,
                 )?;
@@ -880,7 +880,7 @@ fn map_manual(
                 unsafe {
                     streamcopy_init(
                         mux,
-                        *(*demux.in_fmt_ctx).streams.add(stream_index),
+                        *(*demux.in_fmt_ctx_ptr()).streams.add(stream_index),
                         *(*mux.out_fmt_ctx).streams.add(output_stream_index),
                         demux.framerate,
                     )?;
@@ -1394,7 +1394,7 @@ unsafe fn map_auto_subtitle(
                 unsafe {
                     streamcopy_init(
                         mux,
-                        *(*demux.in_fmt_ctx).streams.add(stream_index),
+                        *(*demux.in_fmt_ctx_ptr()).streams.add(stream_index),
                         *(*mux.out_fmt_ctx).streams.add(output_stream_index),
                         demux.framerate,
                     )?;
@@ -1487,7 +1487,7 @@ unsafe fn map_auto_data(
 
             streamcopy_init(
                 mux,
-                *(*demux.in_fmt_ctx).streams.add(stream_index),
+                *(*demux.in_fmt_ctx_ptr()).streams.add(stream_index),
                 *(*mux.out_fmt_ctx).streams.add(output_stream_index),
                 demux.framerate,
             )?;
@@ -1606,7 +1606,7 @@ unsafe fn map_auto_stream(
     unsafe {
         streamcopy_init(
             mux,
-            *(*demux.in_fmt_ctx).streams.add(stream_index),
+            *(*demux.in_fmt_ctx_ptr()).streams.add(stream_index),
             *(*mux.out_fmt_ctx).streams.add(output_stream_index),
             demux.framerate,
         )?;
@@ -2649,7 +2649,7 @@ fn ifilter_bind_ist(
 ) -> Result<()> {
     unsafe {
         let input_filter = &mut filter_graph.inputs[input_index];
-        let ist = *(*demux.in_fmt_ctx).streams.add(stream_idx);
+        let ist = *(*demux.in_fmt_ctx_ptr()).streams.add(stream_idx);
         let par = (*ist).codecpar;
         if (*par).codec_type == AVMEDIA_TYPE_VIDEO {
             // A user-forced input framerate feeds the filtergraph directly;
@@ -2658,7 +2658,7 @@ fn ifilter_bind_ist(
             let framerate = if demux.framerate.num > 0 && demux.framerate.den > 0 {
                 demux.framerate
             } else {
-                av_guess_frame_rate(demux.in_fmt_ctx, ist, null_mut())
+                av_guess_frame_rate(demux.in_fmt_ctx_ptr(), ist, null_mut())
             };
             input_filter.opts.framerate = framerate;
         } else if (*par).codec_type == AVMEDIA_TYPE_SUBTITLE {
@@ -2666,9 +2666,9 @@ fn ifilter_bind_ist(
             input_filter.opts.sub2video_height = (*par).height;
 
             if input_filter.opts.sub2video_width <= 0 || input_filter.opts.sub2video_height <= 0 {
-                let nb_streams = (*demux.in_fmt_ctx).nb_streams;
+                let nb_streams = (*demux.in_fmt_ctx_ptr()).nb_streams;
                 for j in 0..nb_streams {
-                    let par1 = (**(*demux.in_fmt_ctx).streams.add(j as usize)).codecpar;
+                    let par1 = (**(*demux.in_fmt_ctx_ptr()).streams.add(j as usize)).codecpar;
                     if (*par1).codec_type == AVMEDIA_TYPE_VIDEO {
                         input_filter.opts.sub2video_width =
                             std::cmp::max(input_filter.opts.sub2video_width, (*par1).width);
@@ -2728,8 +2728,8 @@ fn ifilter_bind_ist(
             } else {
                 0
             };
-            if (*demux.in_fmt_ctx).start_time != ffmpeg_sys_next::AV_NOPTS_VALUE {
-                tsoffset += (*demux.in_fmt_ctx).start_time
+            if (*demux.in_fmt_ctx_ptr()).start_time != ffmpeg_sys_next::AV_NOPTS_VALUE {
+                tsoffset += (*demux.in_fmt_ctx_ptr()).start_time
             }
             tsoffset
         } else {
@@ -2814,7 +2814,7 @@ fn fg_find_input_idx_by_linklabel(
     // Find first matching stream
     let demux = &demuxs[file_idx];
     unsafe {
-        let fmt_ctx = demux.in_fmt_ctx;
+        let fmt_ctx = demux.in_fmt_ctx_ptr();
 
         let mut subtitle_only_match = false;
         for (idx, _) in demux.get_streams().iter().enumerate() {
@@ -3293,12 +3293,17 @@ unsafe fn open_input_file(
         }
     }
 
-    // Open succeeded, but the tail below (option cleanup, seek, Demuxer::new)
-    // still has fallible steps. Re-arm the guard — released only once
-    // Demuxer::new takes ownership — so any early return here frees in_fmt_ctx
-    // (and, for custom IO, its AVIO + callback box). `is_read_callback` mirrors
-    // the custom-IO branch: no url == the read_callback path.
-    ctx_guard.arm(in_fmt_ctx, input.url.is_none());
+    // Open succeeded. Take ownership of the raw context in a `FormatContext` now:
+    // it owns the pointer (and, for custom IO, its AVIO + callback box) through the
+    // fallible tail below (option cleanup, seek, `Demuxer::new`). Any early return
+    // here drops `fc`, freeing exactly once — this replaces the old re-armed guard.
+    // The custom-IO variant (no url == read_callback path) frees the AVIO + box.
+    // SAFETY: in_fmt_ctx is a successfully-opened input context; ownership moves in.
+    let fc = if input.url.is_none() {
+        crate::raw::FormatContext::from_input_custom_io(in_fmt_ctx)
+    } else {
+        crate::raw::FormatContext::from_input(in_fmt_ctx)
+    };
 
     // Options no demuxer consumed are user typos; report them instead of
     // silently swallowing (fftools check_avoptions aborts here — we warn).
@@ -3312,6 +3317,8 @@ unsafe fn open_input_file(
 
     let mut timestamp = input.start_time_us.unwrap_or(0);
     /* add the stream start time */
+    // SAFETY: fc owns the opened input context; as_ptr yields the live pointer.
+    let in_fmt_ctx = fc.as_ptr();
     if (*in_fmt_ctx).start_time != ffmpeg_sys_next::AV_NOPTS_VALUE {
         timestamp += (*in_fmt_ctx).start_time;
     }
@@ -3359,8 +3366,7 @@ unsafe fn open_input_file(
 
     let demux = Demuxer::new(
         url,
-        input.url.is_none(),
-        in_fmt_ctx,
+        fc,
         0 - if copy_ts { 0 } else { timestamp },
         input.frame_pipelines.take(),
         input.video_codec.clone(),
@@ -3384,9 +3390,8 @@ unsafe fn open_input_file(
         input.log_level_offset.unwrap_or(0),
     )?;
 
-    // Demuxer::new succeeded and now owns in_fmt_ctx (its Drop frees it);
-    // disarm the guard to avoid a double-free.
-    ctx_guard.release();
+    // `Demuxer` now owns the context (via its `Option<FormatContext>`); a failure
+    // above dropped `fc` exactly once. No guard to disarm.
     Ok(demux)
 }
 

@@ -2,6 +2,7 @@ use crate::core::codec::Codec;
 use crate::core::context::decoder_stream::DecoderStream;
 use crate::core::context::PacketBox;
 use crate::core::hwaccel::HWAccelID;
+use crate::raw::FormatContext;
 use crate::core::scheduler::input_controller::SchNode;
 use crate::error::OpenInputError;
 use crate::filter::frame_pipeline::FramePipeline;
@@ -21,8 +22,11 @@ use std::sync::Arc;
 
 pub(crate) struct Demuxer {
     pub(crate) url: String,
-    pub(crate) is_set_read_callback: bool,
-    pub(crate) in_fmt_ctx: *mut AVFormatContext,
+    /// Owns the input `AVFormatContext`. `Some` from construction until the demux
+    /// worker `take()`s it (see `demux_task`); `None` afterward. Dropping the
+    /// `Demuxer` before that hand-off (build succeeded but the job never started)
+    /// frees the context via `FormatContext`'s Drop — no manual `Drop` needed.
+    pub(crate) in_fmt_ctx: Option<FormatContext>,
     pub(crate) ts_offset: i64,
     pub(crate) frame_pipelines: Option<Vec<FramePipeline>>,
 
@@ -71,23 +75,25 @@ pub(crate) struct Demuxer {
 // frame_pipelines with Box<dyn FrameFilter> which only implements Send.
 unsafe impl Send for Demuxer {}
 
-impl Drop for Demuxer {
-    fn drop(&mut self) {
-        // Owns the input context until demux_init hands it to the demuxer
-        // thread (which nulls this field). A context that never started —
-        // build() succeeded but start() was never called or failed midway —
-        // was previously leaked. The helper no-ops on null and reclaims the
-        // custom-IO callback state.
-        crate::core::context::in_fmt_ctx_free(self.in_fmt_ctx, self.is_set_read_callback);
-        self.in_fmt_ctx = std::ptr::null_mut();
-    }
-}
+// No manual `Drop`: the `Option<FormatContext>` field owns the context and frees it
+// on drop (input path, custom-IO-aware) whether it was taken by the worker (`None`)
+// or the job never started (`Some`). This replaces the old hand-written Drop that
+// called `in_fmt_ctx_free` + nulled the raw pointer.
 
 impl Demuxer {
+    /// Raw input `AVFormatContext` pointer for read-only FFI (field reads,
+    /// `av_read_frame`, seek, `av_guess_frame_rate`). Returns null once the demux
+    /// worker has taken ownership. Callers must not free through it.
+    pub(crate) fn in_fmt_ctx_ptr(&self) -> *mut AVFormatContext {
+        // SAFETY: as_ptr just returns the stored pointer.
+        self.in_fmt_ctx
+            .as_ref()
+            .map_or(std::ptr::null_mut(), |fc| unsafe { fc.as_ptr() })
+    }
+
     pub(crate) fn new(
         url: String,
-        is_set_read_callback: bool,
-        in_fmt_ctx: *mut AVFormatContext,
+        in_fmt_ctx: FormatContext,
         ts_offset: i64,
         frame_pipelines: Option<Vec<FramePipeline>>,
         video_codec: Option<String>,
@@ -107,8 +113,12 @@ impl Demuxer {
         framerate: AVRational,
         log_level_offset: i32,
     ) -> crate::error::Result<Self> {
+        // `in_fmt_ctx` is owned here: if `init_streams` fails, it drops exactly
+        // once (input-side free), which is why no external guard is needed across
+        // this fallible constructor. `init_streams` only reads the context.
+        // SAFETY: as_ptr returns the live pointer for read-only stream probing.
         let streams = Self::init_streams(
-            in_fmt_ctx,
+            unsafe { in_fmt_ctx.as_ptr() },
             video_codec,
             audio_codec,
             subtitle_codec,
@@ -121,8 +131,7 @@ impl Demuxer {
 
         Ok(Self {
             url,
-            is_set_read_callback,
-            in_fmt_ctx,
+            in_fmt_ctx: Some(in_fmt_ctx),
             ts_offset,
             frame_pipelines,
             readrate,
