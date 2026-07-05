@@ -879,6 +879,9 @@ mod tests {
         std::thread::sleep(Duration::from_secs(1));
     }
 
+    // videotoolbox is Apple-only; on other platforms the hwaccel device fails to
+    // allocate. Gate to macOS so non-macOS CI isn't a false red.
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_to_stdout() {
         let _ = env_logger::builder()
@@ -901,6 +904,8 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    // videotoolbox is Apple-only; gate to macOS (see test_to_stdout).
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_thumbnail() {
         let _ = env_logger::builder()
@@ -1127,6 +1132,9 @@ mod tests {
         assert!(scheduler.is_ended())
     }
 
+    // Exercises videotoolbox decode + h264_videotoolbox encode — Apple-only.
+    // Gate to macOS (see test_to_stdout).
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_hwaccel() {
         let _ = env_logger::builder()
