@@ -2103,7 +2103,7 @@ unsafe fn open_output_file(
     let mut out_fmt_ctx = null_mut();
     // Frees out_fmt_ctx (and, for custom IO, its AVIO + callback box) on any
     // early return until the Muxer takes ownership below.
-    let mut ctx_guard = crate::core::context::OutFmtCtxGuard::disarmed();
+    let mut ctx_guard = crate::core::context::FmtCtxGuard::disarmed();
     let format = get_format(&output.format)?;
     match &output.url {
         None => {
@@ -2164,7 +2164,7 @@ unsafe fn open_output_file(
 
             (*out_fmt_ctx).pb = avio_ctx;
             (*out_fmt_ctx).flags |= AVFMT_FLAG_CUSTOM_IO;
-            ctx_guard.arm(out_fmt_ctx, true);
+            ctx_guard.arm(out_fmt_ctx, crate::raw::Mode::OutputCustomIo);
         }
         Some(url) => {
             let url_cstr = if url == "-" {
@@ -2178,7 +2178,7 @@ unsafe fn open_output_file(
                 warn!("Error initializing the muxer for {url}");
                 return Err(AllocOutputContextError::from(ret).into());
             }
-            ctx_guard.arm(out_fmt_ctx, false);
+            ctx_guard.arm(out_fmt_ctx, crate::raw::Mode::Output);
 
             // Interrupt callback before avio_open: stop()/abort() can break
             // a blocking network open and any later write on this output
@@ -3143,8 +3143,8 @@ unsafe fn open_input_file(
     }
     // Frees in_fmt_ctx on early returns in the pre-open window (before the
     // branches' own close_input paths take over). Disarmed at each handoff.
-    let mut ctx_guard = crate::core::context::InFmtCtxGuard::disarmed();
-    ctx_guard.arm(in_fmt_ctx, false);
+    let mut ctx_guard = crate::core::context::FmtCtxGuard::disarmed();
+    ctx_guard.arm(in_fmt_ctx, crate::raw::Mode::Input);
 
     // Interrupt callback: lets stop()/abort() break a blocking open, read or
     // find_stream_info on this input (fftools decode_interrupt_cb).
@@ -3260,7 +3260,7 @@ unsafe fn open_input_file(
         Some(url) => {
             // Guard the pre-open window (CString/dict `?`); released before the
             // manual close_input paths below take over.
-            ctx_guard.arm(in_fmt_ctx, false);
+            ctx_guard.arm(in_fmt_ctx, crate::raw::Mode::Input);
             let url_cstr = CString::new(url.as_str())?;
 
             let scan_all_pmts_key = CString::new("scan_all_pmts")?;

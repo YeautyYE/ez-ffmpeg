@@ -32,11 +32,9 @@ use crate::core::context::{in_fmt_ctx_free, out_fmt_ctx_free};
 /// | [`Mode::Output`] | `out_fmt_ctx_free(ptr, false)` |
 /// | [`Mode::OutputCustomIo`] | `out_fmt_ctx_free(ptr, true)` |
 ///
-/// Only [`Mode::Input`] is constructed by the current Rung-2 pilot (the read-only
-/// input path). The remaining variants are wired when `Muxer`/`Demuxer` migrate;
-/// `#[allow(dead_code)]` keeps the pilot warning-free until then.
-#[allow(dead_code)]
-enum Mode {
+/// Shared with `FmtCtxGuard` (the open-time RAII guard in `crate::core::context`),
+/// which dispatches its Drop on the same discriminant.
+pub(crate) enum Mode {
     /// Input context opened from a URL/path (no custom AVIO).
     Input,
     /// Input context with a custom read/seek AVIO callback whose `opaque` `Box`
