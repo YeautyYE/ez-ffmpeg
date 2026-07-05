@@ -13,7 +13,7 @@ use ffmpeg_sys_next::{
     avformat_find_stream_info, AVCodecID, AVDictionary, AVDictionaryEntry, AVRational,
 };
 use ffmpeg_sys_next::{avformat_alloc_context, avformat_close_input, avformat_open_input};
-use crate::core::context::AVFormatContextBox;
+use crate::raw::FormatContext;
 use crate::error::{FindStreamError, OpenInputError, Result};
 
 #[derive(Debug, Clone)]
@@ -397,8 +397,8 @@ unsafe fn extract_stream_info_from_stream(raw_stream: *mut ffmpeg_sys_next::AVSt
 /// The caller must ensure `fmt_ctx_box` holds a valid, fully-initialized
 /// `AVFormatContext` (i.e. `avformat_open_input` + `avformat_find_stream_info`
 /// have succeeded).
-pub(crate) unsafe fn extract_stream_infos(fmt_ctx_box: &AVFormatContextBox) -> Result<Vec<StreamInfo>> {
-    let fmt_ctx = fmt_ctx_box.fmt_ctx;
+pub(crate) unsafe fn extract_stream_infos(fmt_ctx_box: &FormatContext) -> Result<Vec<StreamInfo>> {
+    let fmt_ctx = fmt_ctx_box.as_ptr();
     if fmt_ctx.is_null() {
         return Err(OpenInputError::OutOfMemory.into());
     }
@@ -446,7 +446,7 @@ fn find_best_stream_info(
     // before dereferencing.
     unsafe {
         let best_index = av_find_best_stream(
-            in_fmt_ctx_box.fmt_ctx,
+            in_fmt_ctx_box.as_ptr(),
             media_type,
             -1,
             -1,
@@ -457,13 +457,13 @@ fn find_best_stream_info(
             return Ok(None);
         }
 
-        let nb_streams = (*in_fmt_ctx_box.fmt_ctx).nb_streams as usize;
+        let nb_streams = (*in_fmt_ctx_box.as_ptr()).nb_streams as usize;
         let index = best_index as usize;
         if index >= nb_streams {
             return Err(FindStreamError::NoStreamFound.into());
         }
 
-        let streams_ptr = (*in_fmt_ctx_box.fmt_ctx).streams;
+        let streams_ptr = (*in_fmt_ctx_box.as_ptr()).streams;
         if streams_ptr.is_null() {
             return Err(FindStreamError::NoStreamFound.into());
         }
@@ -623,7 +623,7 @@ fn codec_name(id: AVCodecID) -> String {
     }
 }
 
-pub(crate) fn init_format_context(url: impl Into<String>) -> Result<AVFormatContextBox> {
+pub(crate) fn init_format_context(url: impl Into<String>) -> Result<FormatContext> {
     crate::core::initialize_ffmpeg();
 
     // Convert URL before allocating FFmpeg resources so a NUL-byte error
@@ -678,7 +678,7 @@ pub(crate) fn init_format_context(url: impl Into<String>) -> Result<AVFormatCont
             return Err(FindStreamError::from(ret).into());
         }
 
-        Ok(AVFormatContextBox::new(in_fmt_ctx, true, false))
+        Ok(FormatContext::from_input(in_fmt_ctx))
     }
 }
 
