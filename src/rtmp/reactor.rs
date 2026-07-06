@@ -227,6 +227,21 @@ impl ReactorConnection {
         // Set non-blocking
         socket.set_nonblocking(true)?;
 
+        // PERF-4: disable Nagle on the accepted subscriber socket. Sub-MSS
+        // writes (handshake/command exchange and the steady stream of small
+        // audio tags) would otherwise be held by Nagle and interact with the
+        // peer's delayed ACK, adding up to ~40ms per exchange. This pairs with
+        // the writev batching (PERF-9): batching keeps the small-packet count
+        // low, so disabling Nagle does not fragment the stream. Log and
+        // continue on error - TCP_NODELAY is an optimization, not a
+        // correctness requirement.
+        if let Err(e) = socket.set_nodelay(true) {
+            log::warn!(
+                "Failed to set TCP_NODELAY on connection {}: {:?}",
+                token.id, e
+            );
+        }
+
         #[cfg(unix)]
         let raw_handle = {
             use std::os::unix::io::AsRawFd;
@@ -467,6 +482,12 @@ impl ReactorConnection {
             debug!("Socket shutdown error (expected if already closed): {:?}", e);
         }
         self.mark_closed();
+    }
+
+    /// Current TCP_NODELAY setting of the underlying socket (test only)
+    #[cfg(test)]
+    fn nodelay(&self) -> io::Result<bool> {
+        self.socket.nodelay()
     }
 
 }
@@ -1374,6 +1395,27 @@ mod tests {
                 // The important thing is that enqueue and flush don't panic
             }
         }
+    }
+
+    #[test]
+    fn test_accepted_socket_has_tcp_nodelay() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to get address");
+
+        let _client = TcpStream::connect(addr).expect("Failed to connect");
+        let (server, _) = listener.accept().expect("Failed to accept");
+        let token = ConnectionToken::new(0, 1);
+
+        // PERF-4: ReactorConnection::new must disable Nagle on the accepted
+        // subscriber socket so small audio tags / control exchanges are not
+        // held by Nagle + delayed ACK.
+        let conn = ReactorConnection::new(token, server).expect("Failed to create connection");
+        assert!(
+            conn.nodelay().expect("nodelay query failed"),
+            "accepted subscriber socket must have TCP_NODELAY enabled"
+        );
     }
 
     #[test]
