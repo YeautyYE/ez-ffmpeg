@@ -895,6 +895,11 @@ struct DemuxerParameter {
 
     dsts: Vec<(Sender<PacketBox>, usize, Option<usize>)>,
 
+    /// For each input stream index, the indices into `dsts` that consume that
+    /// stream. Built once in `new`; never mutated on the demux hot path, so
+    /// fan-out is an indexed slice walk with no per-packet allocation (PERF-7).
+    per_stream_dsts: Vec<Vec<usize>>,
+
     /// Streams with at least one bound consumer (ffmpeg_demux.c:906).
     nb_streams_used: usize,
     /// Streams whose consumers have all finished (ffmpeg_demux.c:525).
@@ -910,28 +915,32 @@ impl DemuxerParameter {
         let dsts = demux.take_dsts();
         let dsts_finished = vec![false; dsts.len()];
 
-        let mut have_audio_dec = false;
-        for (_packet_dst, input_stream_index, _output_stream_index) in &dsts {
-            let stream = demux.get_stream(*input_stream_index);
-            if stream.codec_type == AVMEDIA_TYPE_AUDIO {
-                have_audio_dec = true;
-            }
-        }
-
-        let nb_streams = unsafe { (*demux.in_fmt_ctx_ptr()).nb_streams };
-        let mut demux_streams: Vec<DemuxStreamParameter> = Vec::with_capacity(nb_streams as usize);
+        let nb_streams = unsafe { (*demux.in_fmt_ctx_ptr()).nb_streams } as usize;
+        let mut demux_streams: Vec<DemuxStreamParameter> = Vec::with_capacity(nb_streams);
         for i in 0..nb_streams {
-            let stream = demux.get_stream(i as usize);
+            let stream = demux.get_stream(i);
             demux_streams.push(DemuxStreamParameter::new(stream))
         }
+
+        // Precompute, for each input stream, the `dsts` indices that consume it.
+        // The mapping is immutable after construction, so the demux hot path can
+        // index this instead of scanning + collecting all destinations per
+        // packet (PERF-7).
+        let mut per_stream_dsts: Vec<Vec<usize>> = vec![Vec::new(); nb_streams];
+        for (dst_i, (_, input_stream_index, _)) in dsts.iter().enumerate() {
+            debug_assert!(*input_stream_index < nb_streams);
+            per_stream_dsts[*input_stream_index].push(dst_i);
+        }
+
+        let have_audio_dec = demux_streams.iter().any(|ds| {
+            ds.codec_type == AVMEDIA_TYPE_AUDIO && !per_stream_dsts[ds.stream_index].is_empty()
+        });
 
         // fftools flips ds->discard when a consumer binds to the stream and
         // counts it as used (ffmpeg_demux.c:904-906 ist_use).
         let mut nb_streams_used = 0;
         for ds in &mut demux_streams {
-            ds.discard = !dsts
-                .iter()
-                .any(|(_, input_stream_index, _)| *input_stream_index == ds.stream_index);
+            ds.discard = per_stream_dsts[ds.stream_index].is_empty();
             if !ds.discard {
                 nb_streams_used += 1;
             }
@@ -964,6 +973,7 @@ impl DemuxerParameter {
             max_pts: Default::default(),
             demux_streams,
             dsts,
+            per_stream_dsts,
             nb_streams_used,
             nb_streams_finished: 0,
         }
@@ -1106,18 +1116,19 @@ unsafe fn demux_send_for_stream(
     packet_pool: &ObjPool<Packet>,
     flags: usize,
 ) -> i32 {
-    let stream_index = (*packet_box.packet.as_ptr()).stream_index;
+    let stream_index = (*packet_box.packet.as_ptr()).stream_index as usize;
 
-    let send_dsts = demux_parameter
-        .dsts
-        .iter()
-        .enumerate()
-        .filter(
-            |(_i, (_packet_dst, input_stream_index, _output_stream_index))| {
-                *input_stream_index == stream_index as usize
-            },
-        )
-        .collect::<Vec<_>>();
+    // Disjoint field borrows: destination metadata (immutable) and the finished
+    // flags (mutable) are different fields, so the hot path indexes the
+    // precomputed per-stream list instead of scanning + collecting every
+    // destination per packet (PERF-7).
+    let dsts = &demux_parameter.dsts;
+    let dsts_finished = &mut demux_parameter.dsts_finished;
+
+    let Some(send_dsts) = demux_parameter.per_stream_dsts.get(stream_index) else {
+        packet_pool.release(packet_box.packet);
+        return 0;
+    };
 
     // Discarded streams are already skipped at the demux loop top
     // (ffmpeg_demux.c:751); this backstop keeps an empty destination list
@@ -1127,41 +1138,38 @@ unsafe fn demux_send_for_stream(
         return 0;
     }
 
-    let mut nb_done = 0;
+    let dst_count = send_dsts.len();
+    let mut nb_done = 0usize;
 
-    for (i, (dst_i, (packet_dst, _, output_stream_index))) in send_dsts.iter().enumerate() {
-        let dst_finished = &mut demux_parameter.dsts_finished[*dst_i];
-
-        if i < send_dsts.len() - 1 {
-            let Ok(mut to_send) = packet_pool.get() else {
-                return AVERROR(ffmpeg_sys_next::ENOMEM);
-            };
-
-            let packet_data = packet_box.packet_data.clone();
-
-            let mut ret = av_packet_ref(to_send.as_mut_ptr(), packet_box.packet.as_ptr());
-            if ret < 0 {
-                return ret;
-            }
-
-            let packet_box = PacketBox {
-                packet: to_send,
-                packet_data,
-            };
-
-            ret = demux_stream_send_to_dst(
-                packet_box,
-                packet_dst,
-                output_stream_index,
-                dst_finished,
-                flags,
-            );
-            if ret == AVERROR_EOF {
-                nb_done += 1;
-            } else if ret < 0 {
-                return ret;
-            }
+    // First pass: count already-finished destinations and find the last still-
+    // active one. A finished destination gets no packet_pool.get()/av_packet_ref
+    // (NEW-DP-03) — the old path ref'd then immediately dropped for it.
+    let mut move_pos = None;
+    for (pos, &dst_i) in send_dsts.iter().enumerate() {
+        if dsts_finished[dst_i] {
+            nb_done += 1;
         } else {
+            move_pos = Some(pos);
+        }
+    }
+
+    let Some(move_pos) = move_pos else {
+        debug_assert_eq!(nb_done, dst_count);
+        packet_pool.release(packet_box.packet);
+        return AVERROR_EOF;
+    };
+
+    // Second pass: send only active destinations. The last active one receives
+    // the owned packet_box (move); the rest get an av_packet_ref'd copy.
+    for (pos, &dst_i) in send_dsts.iter().enumerate() {
+        if dsts_finished[dst_i] {
+            continue;
+        }
+
+        let (packet_dst, _, output_stream_index) = &dsts[dst_i];
+        let dst_finished = &mut dsts_finished[dst_i];
+
+        if pos == move_pos {
             let ret = demux_stream_send_to_dst(
                 packet_box,
                 packet_dst,
@@ -1174,20 +1182,51 @@ unsafe fn demux_send_for_stream(
             } else if ret < 0 {
                 return ret;
             }
-            break;
+            // EOF means THIS stream's consumers are all done: compare against
+            // this stream's destination count, not every destination of the
+            // demuxer — otherwise a stream whose consumers had all finished
+            // kept the whole demuxer spinning (ffmpeg_sched.c
+            // demux_send_for_stream: nb_done == ds->nb_dst).
+            return if nb_done == dst_count {
+                AVERROR_EOF
+            } else {
+                0
+            };
+        }
+
+        let Ok(mut to_send) = packet_pool.get() else {
+            packet_pool.release(packet_box.packet);
+            return AVERROR(ffmpeg_sys_next::ENOMEM);
+        };
+
+        let packet_data = packet_box.packet_data;
+
+        let mut ret = av_packet_ref(to_send.as_mut_ptr(), packet_box.packet.as_ptr());
+        if ret < 0 {
+            packet_pool.release(to_send);
+            packet_pool.release(packet_box.packet);
+            return ret;
+        }
+
+        ret = demux_stream_send_to_dst(
+            PacketBox {
+                packet: to_send,
+                packet_data,
+            },
+            packet_dst,
+            output_stream_index,
+            dst_finished,
+            flags,
+        );
+        if ret == AVERROR_EOF {
+            nb_done += 1;
+        } else if ret < 0 {
+            packet_pool.release(packet_box.packet);
+            return ret;
         }
     }
 
-    // EOF means THIS stream's consumers are all done: compare against this
-    // stream's destinations, not every destination of the demuxer — that
-    // never matched for multi-stream inputs, so a stream whose consumers had
-    // all finished kept the whole demuxer spinning
-    // (ffmpeg_sched.c demux_send_for_stream: nb_done == ds->nb_dst).
-    if nb_done == send_dsts.len() {
-        AVERROR_EOF
-    } else {
-        0
-    }
+    unreachable!("move_pos was selected from a still-active destination")
 }
 
 const DEMUX_SEND_STREAMCOPY_EOF: usize = 1 << 0;

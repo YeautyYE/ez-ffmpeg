@@ -500,7 +500,7 @@ pub(crate) struct PacketBox {
 unsafe impl Send for PacketBox {}
 
 // optionally attached as opaque_ref to decoded AVFrames
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub(crate) struct PacketData {
     // demuxer-estimated dts in AV_TIME_BASE_Q,
     // to be used when real dts is missing
