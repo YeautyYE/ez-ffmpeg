@@ -26,6 +26,13 @@ use std::sync::Arc;
 /// short enough that stop() on a dead network peer returns within a second.
 const OUTPUT_END_GRACE_US: i64 = 500_000;
 
+/// Default size of the AVIO buffer backing a custom read/write callback. FFmpeg
+/// hands the callback one buffer-sized chunk at a time, so a larger buffer means
+/// fewer Rust↔FFmpeg round-trips for sequential/network IO; the 64 KiB default
+/// keeps first-packet latency low for live/low-latency use. Configurable per
+/// Input/Output via set_io_buffer_size (sys-06).
+pub(crate) const DEFAULT_CUSTOM_IO_BUFFER_SIZE: usize = 64 * 1024;
+
 /// Shared state behind the AVIO interrupt callbacks (fftools installs
 /// decode_interrupt_cb on inputs and outputs, ffmpeg_mux_init.c:3326,3371).
 ///
