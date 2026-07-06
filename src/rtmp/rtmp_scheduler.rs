@@ -26,6 +26,7 @@ enum ClientAction {
     Watching { stream_key: String, stream_id: u32 },
 }
 
+#[derive(Clone, Copy)]
 enum ReceivedDataType {
     Audio,
     Video,
@@ -825,6 +826,15 @@ impl RtmpScheduler {
             }
         }
 
+        // Detect an audio-only stream from the publisher's metadata: it declares
+        // an audio codec but no video codec. Computed once per received packet so
+        // the per-watcher gate can deliver audio for such streams instead of
+        // waiting for a video keyframe that never comes (see
+        // `should_send_to_watcher`).
+        let channel_is_audio_only = channel.metadata.as_ref().is_some_and(|m| {
+            m.audio_codec_id.is_some() && m.video_codec_id.is_none()
+        });
+
         for client_id in &channel.watching_client_ids {
             let client = match self.clients.get_mut(*client_id) {
                 Some(client) => client,
@@ -836,17 +846,13 @@ impl RtmpScheduler {
                 None => continue,
             };
 
-            let should_send_to_client = match data_type {
-                ReceivedDataType::Video => {
-                    client.has_received_video_keyframe
-                        || is_sequence_header
-                        || is_keyframe
-                }
-
-                ReceivedDataType::Audio => {
-                    client.has_received_video_keyframe || is_sequence_header
-                }
-            };
+            let should_send_to_client = should_send_to_watcher(
+                data_type,
+                client.has_received_video_keyframe,
+                is_keyframe,
+                is_sequence_header,
+                channel_is_audio_only,
+            );
 
             if !should_send_to_client {
                 continue;
@@ -924,6 +930,39 @@ impl RtmpScheduler {
     }
 }
 
+/// Decide whether a freshly received media packet should be forwarded to a
+/// watching client right now.
+///
+/// Video is gated on the client already having a keyframe to start decoding
+/// from (the packet itself passes if it *is* that keyframe or a sequence
+/// header). Audio is normally gated the same way so that A/V playback starts in
+/// sync — but that coupling is only correct when the stream actually carries
+/// video. An audio-only stream never produces a video keyframe, so gating its
+/// audio on one leaves every subscriber permanently silent.
+///
+/// We only relax audio delivery when the publisher's metadata positively
+/// declares the stream audio-only (`channel_is_audio_only`); absent that
+/// signal we keep gating on a keyframe, which preserves A/V start-up sync even
+/// during the window before the first video packet arrives. (An audio-only
+/// stream that publishes no metadata at all is the one residual case still
+/// gated — rare, since real audio-only publishers send `onMetaData`.)
+fn should_send_to_watcher(
+    data_type: ReceivedDataType,
+    has_received_video_keyframe: bool,
+    is_keyframe: bool,
+    is_sequence_header: bool,
+    channel_is_audio_only: bool,
+) -> bool {
+    match data_type {
+        ReceivedDataType::Video => {
+            has_received_video_keyframe || is_sequence_header || is_keyframe
+        }
+        ReceivedDataType::Audio => {
+            has_received_video_keyframe || is_sequence_header || channel_is_audio_only
+        }
+    }
+}
+
 fn is_video_sequence_header(data: &Bytes) -> bool {
     // This is assuming h264.
     data.len() >= 2 && data[0] == 0x17 && data[1] == 0x00
@@ -942,6 +981,152 @@ fn is_video_keyframe(data: &Bytes) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // GitHub: audio-only RTMP streams were silent for subscribers because audio
+    // delivery was gated on a video keyframe that never arrives.
+    #[test]
+    fn audio_only_stream_delivers_audio_without_a_video_keyframe() {
+        // Metadata declared the stream audio-only.
+        let channel_is_audio_only = true;
+        // A normal (non-sequence-header) audio packet, client has no keyframe.
+        assert!(
+            should_send_to_watcher(
+                ReceivedDataType::Audio,
+                /* has_received_video_keyframe */ false,
+                /* is_keyframe */ false,
+                /* is_sequence_header */ false,
+                channel_is_audio_only,
+            ),
+            "audio-only stream must deliver audio frames to a fresh subscriber"
+        );
+    }
+
+    #[test]
+    fn av_stream_still_gates_audio_on_a_video_keyframe() {
+        // A/V (or not-yet-known) channel: not positively audio-only.
+        let channel_is_audio_only = false;
+        // Before the client has a keyframe, a plain audio packet is withheld
+        // (unchanged behaviour, keeps A/V start in sync — this also covers the
+        // start-up window before any video packet has arrived).
+        assert!(
+            !should_send_to_watcher(
+                ReceivedDataType::Audio,
+                false,
+                false,
+                false,
+                channel_is_audio_only,
+            ),
+            "A/V stream must still withhold audio until the client has a keyframe"
+        );
+        // Once the client has a keyframe, audio flows.
+        assert!(should_send_to_watcher(
+            ReceivedDataType::Audio,
+            true,
+            false,
+            false,
+            channel_is_audio_only,
+        ));
+        // An audio sequence header is always delivered (needed to decode).
+        assert!(should_send_to_watcher(
+            ReceivedDataType::Audio,
+            false,
+            false,
+            /* is_sequence_header */ true,
+            channel_is_audio_only,
+        ));
+    }
+
+    // Full-path regression guard: with audio-only metadata, a watcher receives
+    // audio even though no video keyframe ever arrives. Complements the
+    // extracted-gate unit tests by exercising the metadata detection at the call
+    // site in `handle_audio_video_data_received`.
+    #[test]
+    fn audio_only_metadata_lets_watcher_receive_audio_before_any_keyframe() {
+        let mut scheduler = RtmpScheduler::new(10);
+        let stream_key = "audio_only".to_string();
+        let publisher_connection_id = 1;
+        let watcher_connection_id = 2;
+
+        scheduler.new_channel(stream_key.clone(), publisher_connection_id);
+        let _ = scheduler.bytes_received(watcher_connection_id, &[]);
+        let mut results = Vec::new();
+        scheduler.handle_play_requested(
+            watcher_connection_id,
+            1,
+            "app".to_string(),
+            stream_key.clone(),
+            1,
+            &mut results,
+        );
+
+        // Publisher declares an audio-only stream: an audio codec, no video codec.
+        let metadata = StreamMetadata {
+            video_width: None,
+            video_height: None,
+            video_codec_id: None,
+            video_frame_rate: None,
+            video_bitrate_kbps: None,
+            audio_codec_id: Some(10), // AAC
+            audio_bitrate_kbps: None,
+            audio_sample_rate: Some(44100),
+            audio_channels: Some(2),
+            audio_is_stereo: Some(true),
+            encoder: None,
+        };
+        scheduler.handle_metadata_received(
+            "app".to_string(),
+            stream_key.clone(),
+            metadata,
+            &mut Vec::new(),
+        );
+
+        // A plain audio packet with no preceding video keyframe must reach the watcher.
+        let mut server_results = Vec::new();
+        let audio_data = Bytes::from(vec![0xAF, 0x01, 0xDD, 0xEE]);
+        scheduler.handle_audio_video_data_received(
+            stream_key.clone(),
+            RtmpTimestamp { value: 50 },
+            audio_data,
+            ReceivedDataType::Audio,
+            &mut server_results,
+        );
+
+        assert_eq!(
+            server_results.len(),
+            1,
+            "audio-only stream (declared via metadata) must deliver audio without a video keyframe"
+        );
+    }
+
+    #[test]
+    fn video_gating_is_unchanged() {
+        // channel_is_audio_only never affects the video path.
+        for audio_only in [false, true] {
+            // Video is withheld until the client has a keyframe...
+            assert!(!should_send_to_watcher(
+                ReceivedDataType::Video,
+                false,
+                false,
+                false,
+                audio_only,
+            ));
+            // ...but the keyframe itself (and sequence headers) always pass.
+            assert!(should_send_to_watcher(
+                ReceivedDataType::Video,
+                false,
+                /* is_keyframe */ true,
+                false,
+                audio_only,
+            ));
+            assert!(should_send_to_watcher(
+                ReceivedDataType::Video,
+                true,
+                false,
+                false,
+                audio_only,
+            ));
+        }
+    }
 
     #[test]
     fn test_new_channel_creation() {
