@@ -1066,7 +1066,7 @@ unsafe fn configure_output_audio_filter(
     let abuffer_str = std::ffi::CString::new("abuffersink").unwrap();
     let abuffer_filter = avfilter_get_by_name(abuffer_str.as_ptr());
 
-    let ret = avfilter_graph_create_filter(
+    let mut ret = avfilter_graph_create_filter(
         &mut ofp.filter,
         abuffer_filter,
         name.as_ptr(),
@@ -1078,16 +1078,12 @@ unsafe fn configure_output_audio_filter(
         return ret;
     }
 
-    let all_channel_counts_str = std::ffi::CString::new("all_channel_counts").unwrap();
-    let mut ret = av_opt_set_int(
-        ofp.filter as *mut _,
-        all_channel_counts_str.as_ptr(),
-        1,
-        AV_OPT_SEARCH_CHILDREN,
-    );
-    if ret < 0 {
-        return ret;
-    }
+    // fftools n7.1 set "all_channel_counts" on the freshly created abuffersink
+    // here. Do not re-add it when re-porting: FFmpeg 8 rejects setting a
+    // non-runtime option after avfilter_graph_create_filter() has initialized
+    // the filter (EINVAL, see ez-ffmpeg issue #37), FFmpeg 9 (lavfi 12)
+    // removes the option entirely, and it was a no-op all along — fftools
+    // n8.0 dropped the call.
 
     let mut bprint = AVBPrint {
         str_: null_mut(),
