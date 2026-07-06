@@ -278,6 +278,23 @@ fn run_pipeline(
 ) -> crate::error::Result<()> {
     let mut src_finished_flag = false;
 
+    // PERF-8: only filters that can produce frames on their own need the
+    // request_frame poll. When none can — the common case of a pipeline built
+    // from passthrough/metadata filters — the loop never sweeps request_frame
+    // and blocks on the input channel with a long safety timeout instead of
+    // waking ~1000x/sec. Filters that DO produce (generators, the GPU pipeline's
+    // delayed output) keep the 1ms poll cadence.
+    let poll_indices = pipeline.request_frame_indices();
+    let needs_polling = !poll_indices.is_empty();
+    let recv_interval = if needs_polling {
+        Duration::from_millis(1)
+    } else {
+        // Long enough to idle cheaply; short enough to re-check STATUS_END if a
+        // stop ever fails to disconnect the source. recv returns immediately
+        // when a frame arrives, so active throughput is unaffected.
+        Duration::from_millis(100)
+    };
+
     loop {
         if crate::core::scheduler::ffmpeg_scheduler::wait_until_not_paused(scheduler_status)
             == crate::core::scheduler::ffmpeg_scheduler::STATUS_END
@@ -287,7 +304,7 @@ fn run_pipeline(
         }
 
         if !src_finished_flag {
-            let result = frame_receiver.recv_timeout(Duration::from_millis(1));
+            let result = frame_receiver.recv_timeout(recv_interval);
             match result {
                 Err(e) => {
                     if e == RecvTimeoutError::Disconnected {
@@ -320,13 +337,18 @@ fn run_pipeline(
                     }
                 }
             }
-        } else {
+        } else if needs_polling {
             sleep(Duration::from_millis(1))
+        } else {
+            // Source finished and no filter produces autonomously: nothing left
+            // to drain. Returning drops frame_senders, signaling EOF downstream.
+            debug!("Source finished and no producing filters, finishing.");
+            return Ok(());
         }
 
-        // request frame
+        // request frame — only from filters that can produce (PERF-8).
         let mut produced_frame = false;
-        for i in 0..pipeline.filter_len() {
+        for &i in &poll_indices {
             loop {
                 let result = pipeline.request_frame(i);
                 if let Err(e) = result {

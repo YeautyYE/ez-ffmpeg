@@ -1,4 +1,4 @@
-use crate::core::filter::frame_filter::FrameFilter;
+use crate::core::filter::frame_filter::{FrameFilter, RequestFrameMode};
 use crate::core::filter::frame_filter_context::FrameFilterContext;
 use ffmpeg_sys_next::AVMediaType;
 use std::any::Any;
@@ -94,8 +94,24 @@ impl FramePipeline {
         Ok(Some(frame))
     }
 
+    // Used by the wgpu feature's tests; the pipeline loop now iterates
+    // request_frame_indices() instead (PERF-8), so it is unused in a default build.
+    #[allow(dead_code)]
     pub(crate) fn filter_len(&self) -> usize {
         self.filters.len()
+    }
+
+    /// Indices of filters whose `request_frame` may produce frames and so must
+    /// be polled by the pipeline loop. Filters declaring
+    /// [`RequestFrameMode::Never`] are omitted, letting an all-`Never` pipeline
+    /// block on its input instead of polling no-op filters (PERF-8).
+    pub(crate) fn request_frame_indices(&self) -> Vec<usize> {
+        self.filters
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| h.filter.request_frame_mode() != RequestFrameMode::Never)
+            .map(|(i, _)| i)
+            .collect()
     }
 
     pub(crate) fn request_frame(&mut self, index: usize) -> Result<Option<ffmpeg_next::Frame>, String> {
@@ -158,5 +174,44 @@ impl FramePipeline {
 impl From<FramePipelineBuilder> for FramePipeline {
     fn from(pipeline: FramePipelineBuilder) -> Self {
         pipeline.build()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::filter::frame_filter::NoopFilter;
+
+    // Keeps the default request_frame_mode (MayProduce): a generator source.
+    struct GeneratorFilter;
+    impl FrameFilter for GeneratorFilter {
+        fn media_type(&self) -> AVMediaType {
+            AVMediaType::AVMEDIA_TYPE_VIDEO
+        }
+    }
+
+    // PERF-8: a pipeline of only passthrough (Never) filters must report no
+    // indices to poll, so the loop can block on input instead of spinning; a
+    // producing filter must still be polled.
+    #[test]
+    fn request_frame_indices_skips_never_filters() {
+        let media = AVMediaType::AVMEDIA_TYPE_VIDEO;
+
+        let mut all_passthrough = FramePipeline::new(media, Some(0));
+        all_passthrough.add_filter("noop0", Box::new(NoopFilter::new(media)));
+        all_passthrough.add_filter("noop1", Box::new(NoopFilter::new(media)));
+        assert!(
+            all_passthrough.request_frame_indices().is_empty(),
+            "an all-passthrough pipeline must not be polled"
+        );
+
+        let mut with_generator = FramePipeline::new(media, Some(0));
+        with_generator.add_filter("noop", Box::new(NoopFilter::new(media)));
+        with_generator.add_filter("gen", Box::new(GeneratorFilter));
+        assert_eq!(
+            with_generator.request_frame_indices(),
+            vec![1],
+            "only the producing filter (index 1) must be polled"
+        );
     }
 }

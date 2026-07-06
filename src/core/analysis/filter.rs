@@ -6,7 +6,7 @@
 //! Mount it on an output frame pipeline downstream of the detector filters.
 
 use crate::core::analysis::event::{parse_frame_metadata, MetadataEvent, ParseState, Timestamp};
-use crate::core::filter::frame_filter::FrameFilter;
+use crate::core::filter::frame_filter::{FrameFilter, RequestFrameMode};
 use crate::core::filter::frame_filter_context::FrameFilterContext;
 use ffmpeg_next::Frame;
 use ffmpeg_sys_next::{AVMediaType, AV_NOPTS_VALUE};
@@ -146,6 +146,11 @@ impl MetadataEventFilter {
 impl FrameFilter for MetadataEventFilter {
     fn media_type(&self) -> AVMediaType {
         self.media_type
+    }
+
+    fn request_frame_mode(&self) -> RequestFrameMode {
+        // Pure metadata tap: transforms input, never generates frames (PERF-8).
+        RequestFrameMode::Never
     }
 
     fn filter_frame(
