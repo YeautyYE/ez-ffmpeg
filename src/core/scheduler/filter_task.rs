@@ -11,7 +11,7 @@ use crate::core::scheduler::ffmpeg_scheduler::{
 };
 use crate::core::scheduler::input_controller::{InputController, SchNode};
 use crate::error::{Error, FilterGraphError, FilterGraphOperationError, FilterGraphParseError};
-use crate::hwaccel::{hw_device_for_filter, init_filter_hw_device, HWDevice};
+use crate::hwaccel::{hw_device_for_filter, HWDevice};
 use crate::util::ffmpeg_utils::av_rescale_q_rnd;
 use crossbeam_channel::{RecvTimeoutError, Sender};
 use ffmpeg_next::Frame;
@@ -75,15 +75,10 @@ pub(crate) fn filter_graph_init(
     thread_sync: ThreadSynchronizer,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
 ) -> crate::error::Result<()> {
-    if let Some(hw_device) = &filter_graph.hw_device {
-        let err = init_filter_hw_device(hw_device);
-        if err < 0 {
-            return Err(Error::FilterGraph(FilterGraphOperationError::ParseError(
-                FilterGraphParseError::from(err),
-            )));
-        }
-    }
-
+    // The graph's filter hw device is registered at context-build time now
+    // (init_filter_graph, fftools 0f5592cfc737 ordering) so that the probe
+    // parse already sees it; configure_filtergraph below resolves it from the
+    // global registry via hw_device_for_filter().
     let (src, finished_flag_list) = filter_graph.take_src();
 
     let input_len = filter_graph.inputs.len();
