@@ -434,20 +434,38 @@ mod bsd {
             // SAFETY: self.kq is valid (owned by self); changes/results are valid
             // Kevent arrays of the same length; EV_RECEIPT yields one result per
             // change; timeout is null (change submission does not wait).
-            let ret = unsafe {
-                kevent(
-                    self.kq,
-                    changes.as_ptr(),
-                    changes.len() as i32,
-                    results.as_mut_ptr(),
-                    results.len() as i32,
-                    std::ptr::null(),
-                )
+            let ret = loop {
+                let ret = unsafe {
+                    kevent(
+                        self.kq,
+                        changes.as_ptr(),
+                        changes.len() as i32,
+                        results.as_mut_ptr(),
+                        results.len() as i32,
+                        std::ptr::null(),
+                    )
+                };
+                if ret < 0 {
+                    let err = std::io::Error::last_os_error();
+                    // EINTR: a signal interrupted change submission. Retry rather
+                    // than surface an error — the caller (update_dirty_interests)
+                    // would otherwise close a healthy connection. Matches poll().
+                    if err.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    // A real syscall failure (bad kq, EFAULT, ...).
+                    return Err(err);
+                }
+                break ret;
             };
-            if ret < 0 {
-                // The kevent() syscall itself failed (bad kq, EFAULT, ...).
-                return Err(std::io::Error::last_os_error());
-            }
+            // EV_RECEIPT reports one result per submitted change; a short receipt
+            // would leave some change unchecked (treated as success below).
+            debug_assert_eq!(
+                ret as usize,
+                changes.len(),
+                "kevent(EV_RECEIPT) returned {ret} results for {} changes",
+                changes.len()
+            );
 
             // Fail on any real per-change error, but ignore ENOENT on an EV_DELETE
             // (the filter we asked to disable simply was not registered).

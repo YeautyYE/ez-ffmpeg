@@ -348,7 +348,6 @@ impl EmbedRtmpServer<Running> {
             // One AVIO write can carry many FLV tags (the muxer hands over
             // 64KB blocks): drain every complete tag now, or the backlog
             // grows and the final tags of the stream are never sent.
-            let mut queued_any = false;
             while let Some(mut flv_tag) = flv_buffer.get_flv_tag() {
                 flv_tag.header.stream_id = 1;
                 match serializer.serialize(&flv_tag_to_message_payload(flv_tag), false, true) {
@@ -357,24 +356,25 @@ impl EmbedRtmpServer<Running> {
                             error!("Failed to send RTMP packet: {:?}", e);
                             return -1;
                         }
-                        queued_any = true;
+                        // Wake the reactor for each enqueued packet. Unconditional
+                        // (no message_sender.is_empty() gate): the reactor can
+                        // drain the queue and sleep in poll() between an emptiness
+                        // check and this send, so a was_empty gate loses the
+                        // wakeup and the packet stalls until the 100ms poll
+                        // fallback. Per-packet rather than once-after-the-batch:
+                        // the channel is bounded (1024), so a large batch would
+                        // block in send() before a post-batch wake ever ran,
+                        // stranding the reactor. The eventfd/pipe token coalesces
+                        // the wakes into a single reactor drain, so the cost is a
+                        // cheap (already-signaled) syscall.
+                        if let Some(waker) = &wake_handle {
+                            waker.wake();
+                        }
                     }
                     Err(e) => {
                         error!("Failed to serialize RTMP message: {:?}", e);
                         return -1;
                     }
-                }
-            }
-            // Wake the reactor once after enqueuing the whole batch. This must be
-            // unconditional, not gated on a prior message_sender.is_empty(): the
-            // reactor can drain the queue and go back to sleep in poll() between
-            // an emptiness check and the send, so a was_empty gate loses the
-            // wakeup and the packet stalls until the 100ms poll fallback. One
-            // wake per AVIO write still coalesces the tag burst, and the
-            // eventfd/pipe wake token coalesces multiple wakes on its own.
-            if queued_any {
-                if let Some(waker) = &wake_handle {
-                    waker.wake();
                 }
             }
             buf.len() as i32
