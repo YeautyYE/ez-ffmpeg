@@ -1159,15 +1159,27 @@ impl Reactor {
     }
 
     /// Update dirty connections' poller interest (O(m) where m = connections with changed interest)
-    fn update_dirty_interests(&mut self) {
+    ///
+    /// Returns the ids whose interest update failed. Such a connection can no
+    /// longer have writable interest (re)registered, so a queued-but-WouldBlock
+    /// write would never be driven to completion — it is not in `pending_flush`
+    /// either (NEW-RS-01). Closing it is the only safe recovery; the caller does
+    /// so. The fd is almost always already broken when modify() fails.
+    fn update_dirty_interests(&mut self) -> Vec<usize> {
         // Drain interest_dirty to get IDs that need updating
         let dirty_ids: Vec<usize> = self.interest_dirty.drain().collect();
 
+        let mut ids_to_close = Vec::new();
         for id in dirty_ids {
             if let Err(e) = self.update_interest(id) {
-                log::warn!("Failed to update interest for connection {}: {:?}", id, e);
+                log::warn!(
+                    "Failed to update interest for connection {}: {:?}; closing (queued writes would otherwise stall)",
+                    id, e
+                );
+                ids_to_close.push(id);
             }
         }
+        ids_to_close
     }
 
     /// Run reactor main loop
@@ -1184,17 +1196,20 @@ impl Reactor {
             String,
             crossbeam_channel::Receiver<Vec<u8>>,
         )>,
-        waker: Waker,
+        waker: Option<Waker>,
     ) {
         info!("Reactor started");
 
-        // Register the wakeup handle. If this fails the reactor still works via
-        // the POLL_TIMEOUT_MS fallback, just without the low-latency wakeups.
-        if let Err(e) = self
-            .poller
-            .register(waker.raw_handle(), WAKER_TOKEN, Interest::READABLE)
-        {
-            error!("Failed to register reactor waker (falling back to poll timeout): {:?}", e);
+        // Register the wakeup handle. If it is absent (waker_pair() failed) or
+        // registration fails, the reactor still works via the POLL_TIMEOUT_MS
+        // fallback, just without the low-latency wakeups.
+        if let Some(waker) = &waker {
+            if let Err(e) = self
+                .poller
+                .register(waker.raw_handle(), WAKER_TOKEN, Interest::READABLE)
+            {
+                error!("Failed to register reactor waker (falling back to poll timeout): {:?}", e);
+            }
         }
 
         let poll_timeout = Duration::from_millis(POLL_TIMEOUT_MS);
@@ -1243,7 +1258,9 @@ impl Reactor {
                 // Wakeup token: drain it and fall through to the channel-drain
                 // steps below. Matched before decoding as a connection token.
                 if poller_token == WAKER_TOKEN {
-                    waker.drain();
+                    if let Some(waker) = &waker {
+                        waker.drain();
+                    }
                     continue;
                 }
 
@@ -1286,7 +1303,8 @@ impl Reactor {
             ids_to_close.extend(flush_closes);
 
             // 8. Update dirty poller interests (O(m) where m = connections with changed interests)
-            self.update_dirty_interests();
+            let interest_closes = self.update_dirty_interests();
+            ids_to_close.extend(interest_closes);
 
             // 9. Check timeouts
             let timed_out = self.check_timeouts();
