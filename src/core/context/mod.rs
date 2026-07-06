@@ -3,10 +3,14 @@ use ffmpeg_sys_next::AVMediaType::{
     AVMEDIA_TYPE_ATTACHMENT, AVMEDIA_TYPE_AUDIO, AVMEDIA_TYPE_DATA, AVMEDIA_TYPE_SUBTITLE,
     AVMEDIA_TYPE_VIDEO,
 };
+// Only SideDataList::push_clone (gated to FFmpeg 8+) clones entries; the
+// free side runs on every lane via Drop.
+#[cfg(ffmpeg_8_0)]
+use ffmpeg_sys_next::av_frame_side_data_clone;
 use ffmpeg_sys_next::{
-    av_freep, av_gettime_relative, avcodec_free_context, avformat_close_input,
-    avformat_free_context, avio_closep, avio_context_free, AVCodecContext, AVFormatContext,
-    AVIOContext, AVMediaType, AVRational, AVStream, AVFMT_NOFILE,
+    av_frame_side_data_free, av_freep, av_gettime_relative, avcodec_free_context,
+    avformat_close_input, avformat_free_context, avio_closep, avio_context_free, AVCodecContext,
+    AVFormatContext, AVFrameSideData, AVIOContext, AVMediaType, AVRational, AVStream, AVFMT_NOFILE,
 };
 use std::ffi::c_void;
 use std::ptr::null_mut;
@@ -387,6 +391,67 @@ pub fn null_frame() -> ffmpeg_next::Frame {
     unsafe { ffmpeg_next::Frame::wrap(null_mut()) }
 }
 
+/// Owned array of global (stream-level) side data entries — the Rust shape of
+/// the `AVFrameSideData **side_data / int nb_side_data` pairs that fftools
+/// threads through InputFilterPriv, OutputFilterPriv and FrameData
+/// (ffmpeg_filter.c, commits e61b9d4094 / 7b18beb477). Entries are
+/// deep-cloned in and freed exactly once on drop.
+pub(crate) struct SideDataList {
+    entries: *mut *mut AVFrameSideData,
+    count: i32,
+}
+
+impl SideDataList {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: null_mut(),
+            count: 0,
+        }
+    }
+
+    /// Deep-clones one entry onto the list (flags as in
+    /// `av_frame_side_data_clone`). Returns 0 or a negative AVERROR.
+    #[cfg(ffmpeg_8_0)]
+    pub(crate) fn push_clone(&mut self, sd: *const AVFrameSideData, flags: u32) -> i32 {
+        unsafe { av_frame_side_data_clone(&mut self.entries, &mut self.count, sd, flags) }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        unsafe { av_frame_side_data_free(&mut self.entries, &mut self.count) }
+    }
+
+    #[cfg(ffmpeg_8_0)]
+    pub(crate) fn len(&self) -> i32 {
+        self.count
+    }
+
+    /// Raw entry array for FFmpeg parameter structs
+    /// (e.g. `AVBufferSrcParameters.side_data`); callees deep-copy what they
+    /// need, the list keeps ownership.
+    #[cfg(ffmpeg_8_0)]
+    pub(crate) fn as_mut_ptr(&self) -> *mut *mut AVFrameSideData {
+        self.entries
+    }
+
+    #[cfg(ffmpeg_8_0)]
+    pub(crate) fn iter(&self) -> impl Iterator<Item = *const AVFrameSideData> + '_ {
+        (0..self.count).map(|i| unsafe { *self.entries.offset(i as isize) as *const AVFrameSideData })
+    }
+}
+
+impl Drop for SideDataList {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+// SAFETY: the list exclusively owns its deep-cloned entries. All mutation
+// happens on the thread that is building it; once frozen behind an Arc it is
+// only read, and readers clone entries out instead of mutating — so both
+// moving it across threads and sharing references are sound.
+unsafe impl Send for SideDataList {}
+unsafe impl Sync for SideDataList {}
+
 #[derive(Clone)]
 pub(crate) struct FrameData {
     pub(crate) framerate: Option<AVRational>,
@@ -399,6 +464,14 @@ pub(crate) struct FrameData {
     pub(crate) subtitle_header: Option<Arc<[u8]>>,
 
     pub(crate) fg_input_index: usize,
+
+    /// Graph-level global side data snapshot, attached by the filtergraph
+    /// output for the frame that opens the encoder and consumed by
+    /// `enc_open` on FFmpeg 8+ (fftools FrameData.side_data, 7b18beb477).
+    /// Always `None` on FFmpeg 7.x, where the encoder scans frame side data
+    /// instead (n7.1 behavior) — hence dead there by design.
+    #[cfg_attr(not(ffmpeg_8_0), allow(dead_code))]
+    pub(crate) side_data: Option<Arc<SideDataList>>,
 }
 // Send + Sync are auto-derived: every field is owned data.
 

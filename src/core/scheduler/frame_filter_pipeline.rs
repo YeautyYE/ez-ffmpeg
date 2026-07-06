@@ -398,6 +398,7 @@ fn send_frame(
                 input_stream_height: 0,
                 subtitle_header: None,
                 fg_input_index: usize::MAX,
+                side_data: None,
             },
         };
 
