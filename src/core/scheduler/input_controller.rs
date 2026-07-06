@@ -35,6 +35,10 @@ pub(crate) enum SchNode {
 const SCHEDULE_TOLERANCE: i64 = 100 * 1000;
 pub(crate) struct InputController {
     lock: Mutex<()>,
+    /// Whether balancing can ever change a choke decision. With a single
+    /// demuxer there is nothing to balance against, so the whole pass is a
+    /// no-op and `update_locked` can skip the lock + scan (PERF-6).
+    balancing_possible: bool,
     demuxs: Vec<Arc<SchNode>>,
     mux_streams: Vec<Arc<SchNode>>,
 }
@@ -57,12 +61,22 @@ impl InputController {
 
         Self {
             lock: Mutex::new(()),
+            balancing_possible: demuxs.len() > 1,
             demuxs,
             mux_streams,
         }
     }
 
     pub(crate) fn update_locked(&self, scheduler_status: &Arc<AtomicUsize>) {
+        // Single-input jobs have nothing to balance: the lone demuxer is always
+        // eventually unchoked (via the trailing-stream unchoke or the fallback),
+        // and this pass can never newly set a choke. Skip the global lock and
+        // the O(streams + demuxers) scan entirely (PERF-6). Multi-input jobs
+        // keep the full, fftools-faithful path.
+        if !self.balancing_possible {
+            return;
+        }
+
         let _guard = self.lock.lock().unwrap();
         if is_stopping(scheduler_status.load(Ordering::Acquire)) {
             return;
@@ -193,5 +207,75 @@ impl InputController {
             Some(min_dts) => min_dts,
             None => AV_NOPTS_VALUE,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::scheduler::ffmpeg_scheduler::STATUS_RUN;
+
+    fn demux_node() -> Arc<SchNode> {
+        Arc::new(SchNode::Demux {
+            waiter: Arc::new(SchWaiter::new()),
+            task_exited: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    fn mux_stream(src: Arc<SchNode>, last_dts: i64) -> Arc<SchNode> {
+        Arc::new(SchNode::MuxStream {
+            src,
+            last_dts: Arc::new(AtomicI64::new(last_dts)),
+            source_finished: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    fn waiter_of(node: &Arc<SchNode>) -> Arc<SchWaiter> {
+        match node.as_ref() {
+            SchNode::Demux { waiter, .. } => waiter.clone(),
+            _ => unreachable!("expected a demux node"),
+        }
+    }
+
+    // PERF-6: a single-input job cannot balance, so update_locked must be a
+    // no-op and never choke the lone demuxer.
+    #[test]
+    fn single_input_update_is_a_noop_and_never_chokes() {
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let demux = demux_node();
+        let mux = mux_stream(demux.clone(), 1_000);
+        let ctrl = InputController::new(vec![demux.clone()], vec![mux]);
+        assert!(!ctrl.balancing_possible, "a single demuxer cannot balance");
+        ctrl.update_locked(&status);
+        assert!(
+            !waiter_of(&demux).get_choked(),
+            "the lone demuxer must never be choked"
+        );
+    }
+
+    // Regression guard: the early return must not affect multi-input jobs — the
+    // full balancing pass still runs and chokes a source that is far ahead of
+    // the trailing stream while keeping the trailing stream runnable.
+    #[test]
+    fn multi_input_runs_the_full_balancing_pass() {
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let trailing = demux_node();
+        let ahead = demux_node();
+        let m_trailing = mux_stream(trailing.clone(), 0);
+        let m_ahead = mux_stream(ahead.clone(), 10 * SCHEDULE_TOLERANCE);
+        let ctrl = InputController::new(
+            vec![trailing.clone(), ahead.clone()],
+            vec![m_trailing, m_ahead],
+        );
+        assert!(ctrl.balancing_possible);
+        ctrl.update_locked(&status);
+        assert!(
+            !waiter_of(&trailing).get_choked(),
+            "the trailing stream stays runnable"
+        );
+        assert!(
+            waiter_of(&ahead).get_choked(),
+            "a source far ahead of the trailing stream must be choked"
+        );
     }
 }
