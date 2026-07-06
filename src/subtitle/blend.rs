@@ -1,9 +1,10 @@
 //! CPU alpha-blend of rendered subtitle overlays onto video frame planes.
 //!
-//! Safe code except for the runtime-dispatched AVX2 kernels (`blend/avx2.rs`;
-//! every call site is gated on `avx2::enabled()` and carries its own SAFETY
-//! note): the renderer produces [`OverlayImage`] views over its coverage
-//! bitmaps and the filter hands plane slices in as [`PlaneView`]s.
+//! Safe code except for the runtime-dispatched SIMD kernels (AVX2 on x86-64
+//! in `blend/avx2.rs`, NEON on aarch64 in `blend/neon.rs`; every call site is
+//! gated on `simd_available()` and carries its own SAFETY note): the renderer
+//! produces [`OverlayImage`] views over its coverage bitmaps and the filter
+//! hands plane slices in as [`PlaneView`]s.
 //!
 //! The math matches FFmpeg's `ff_blend_mask()`/`blend_pixel()`/
 //! `blend_pixel16()` and `ff_draw_color()` (drawutils.c, verified against tag
@@ -22,14 +23,24 @@
 
 #[cfg(target_arch = "x86_64")]
 mod avx2;
+#[cfg(target_arch = "aarch64")]
+mod neon;
 
-/// True when the AVX2 kernels are compiled in and the CPU supports them.
-fn avx2_available() -> bool {
-    #[cfg(target_arch = "x86_64")]
+// Architecture-neutral alias for the active SIMD backend so the dispatch call
+// sites below are written once: AVX2 on x86-64, NEON on aarch64.
+#[cfg(target_arch = "x86_64")]
+use avx2 as arch_simd;
+#[cfg(target_arch = "aarch64")]
+use neon as arch_simd;
+
+/// True when a SIMD backend is compiled in and the CPU supports it (AVX2 on
+/// x86-64, NEON on aarch64); always false on other targets.
+fn simd_available() -> bool {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
-        avx2::enabled()
+        arch_simd::enabled()
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         false
     }
@@ -297,22 +308,22 @@ fn blend_typed<S: Sample>(
     };
 
     if hsub == 0 && vsub == 0 {
-        // Tightly-packed planes take the AVX2 kernels when the CPU has
+        // Tightly-packed planes take the SIMD kernels when the CPU has
         // them; `S::BYTES` uniquely identifies the codec among the two
         // `Sample` impls, so the constant branches fold at monomorphization.
-        #[cfg(target_arch = "x86_64")]
-        if plane.pixel_step == S::BYTES && avx2::enabled() {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        if plane.pixel_step == S::BYTES && simd_available() {
             if S::BYTES == SampleU8::BYTES {
-                // SAFETY: `avx2::enabled()` just verified AVX2 support.
+                // SAFETY: `simd_available()` just verified the SIMD backend.
                 unsafe {
-                    avx2::blend_direct_u8(plane, image, src, alpha, (x0, y0), (xm0, ym0), (w, h))
+                    arch_simd::blend_direct_u8(plane, image, src, alpha, (x0, y0), (xm0, ym0), (w, h))
                 };
                 return;
             }
             if S::BYTES == SampleU16Le::BYTES {
-                // SAFETY: `avx2::enabled()` just verified AVX2 support.
+                // SAFETY: `simd_available()` just verified the SIMD backend.
                 unsafe {
-                    avx2::blend_direct_u16(plane, image, src, alpha, (x0, y0), (xm0, ym0), (w, h))
+                    arch_simd::blend_direct_u16(plane, image, src, alpha, (x0, y0), (xm0, ym0), (w, h))
                 };
                 return;
             }
@@ -666,12 +677,12 @@ pub(crate) fn pool_sums_h2(
     vsub: u32,
     out: &mut Vec<u16>,
 ) -> Option<PooledRect> {
-    pool_sums_h2_impl(grid_w, grid_h, image, vsub, out, avx2_available())
+    pool_sums_h2_impl(grid_w, grid_h, image, vsub, out, simd_available())
 }
 
 /// [`pool_sums_h2`] body. `allow_simd` lets the bench/test harness force
 /// the scalar interior loops; the shipping wrapper passes
-/// [`avx2_available`].
+/// [`simd_available`].
 fn pool_sums_h2_impl(
     grid_w: usize,
     grid_h: usize,
@@ -747,21 +758,21 @@ fn pool_sums_h2_impl(
 
 /// Adjacent-pair sums of one interior span: `span[i] = top[2i] + top[2i+1]`
 /// (+ the same pair from `bot` when present). Scalar sums stay u16 so LLVM
-/// can use narrow lanes; the AVX2 kernel is bit-identical (max sum 1020,
+/// can use narrow lanes; the SIMD kernel is bit-identical (max sum 1020,
 /// no saturation anywhere).
 fn pair_sums(span: &mut [u16], top: &[u8], bot: Option<&[u8]>, allow_simd: bool) {
-    #[cfg(target_arch = "x86_64")]
-    if allow_simd && avx2::enabled() {
-        // SAFETY: `avx2::enabled()` just verified AVX2 support.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    if allow_simd && simd_available() {
+        // SAFETY: `simd_available()` just verified the SIMD backend.
         unsafe {
             match bot {
-                Some(bot) => avx2::pair_sums_two_rows(span, top, bot),
-                None => avx2::pair_sums_one_row(span, top),
+                Some(bot) => arch_simd::pair_sums_two_rows(span, top, bot),
+                None => arch_simd::pair_sums_one_row(span, top),
             }
         }
         return;
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     let _ = allow_simd;
     match bot {
         Some(bot) => {
@@ -787,7 +798,7 @@ fn pair_sums(span: &mut [u16], top: &[u8], bot: Option<&[u8]>, allow_simd: bool)
 /// Blends one component plane from precomputed pooled sums: the apply half
 /// of the two-phase pooled path. Same skip-block/branchless structure as the
 /// other kernels, with the sums standing in for the mask. Tightly-packed
-/// planes dispatch to the AVX2 apply kernels when available.
+/// planes dispatch to the SIMD apply kernels when available.
 pub(crate) fn blend_pooled_from_sums(
     plane: &mut PlaneView<'_>,
     sums: &[u16],
@@ -796,17 +807,17 @@ pub(crate) fn blend_pooled_from_sums(
     alpha: u32,
     sample: SampleFormat,
 ) {
-    #[cfg(target_arch = "x86_64")]
-    if avx2::enabled() {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    if simd_available() {
         match (sample, plane.pixel_step) {
             (SampleFormat::U8, 1) => {
-                // SAFETY: `avx2::enabled()` just verified AVX2 support.
-                unsafe { avx2::apply_sums_u8(plane, sums, rect, src, alpha) };
+                // SAFETY: `simd_available()` just verified the SIMD backend.
+                unsafe { arch_simd::apply_sums_u8(plane, sums, rect, src, alpha) };
                 return;
             }
             (SampleFormat::U16Le, 2) => {
-                // SAFETY: `avx2::enabled()` just verified AVX2 support.
-                unsafe { avx2::apply_sums_u16(plane, sums, rect, src, alpha) };
+                // SAFETY: `simd_available()` just verified the SIMD backend.
+                unsafe { arch_simd::apply_sums_u16(plane, sums, rect, src, alpha) };
                 return;
             }
             _ => {}
@@ -822,13 +833,15 @@ pub(crate) fn blend_pooled_from_sums(
 /// (measured in `bench_kernels.rs`, dense 1080p): pooling each node once
 /// and applying per component beats the fused per-component path for 8-bit
 /// always (372us vs 544us). For 16-bit the scalar fused path used to win
-/// (516us vs 487us was within noise), but the AVX2 apply kernels flip the
-/// two-phase route well ahead — so 16-bit takes it exactly when the AVX2
+/// (516us vs 487us was within noise), but the SIMD apply kernels flip the
+/// two-phase route well ahead — so 16-bit takes it exactly when the SIMD
 /// kernels are live. Both routes are byte-identical (lab parity tests).
+/// (Timings are x86-64 AVX2; the aarch64 NEON route is not yet re-measured
+/// on ARM hardware, but takes the same branch when NEON is available.)
 pub(crate) fn two_phase_pooled_preferred(sample: SampleFormat) -> bool {
     match sample {
         SampleFormat::U8 => true,
-        SampleFormat::U16Le => avx2_available(),
+        SampleFormat::U16Le => simd_available(),
     }
 }
 
@@ -1006,8 +1019,10 @@ pub(crate) mod lab {
         /// The scalar shipping kernel (`blend_direct`, `S::SKIP_CHUNK`
         /// blocks) — the AVX2 fallback and parity reference.
         Shipping,
-        /// The runtime-dispatched AVX2 kernels (falls back to `Shipping`
-        /// when unavailable or the plane is not tightly packed).
+        /// The runtime-dispatched per-arch SIMD kernels — AVX2 on x86-64,
+        /// NEON on aarch64 (falls back to `Shipping` when unavailable or the
+        /// plane is not tightly packed). The variant name stays `Avx2` because
+        /// the out-of-module bench harness (`bench_kernels.rs`) references it.
         Avx2,
     }
 
@@ -1142,22 +1157,23 @@ pub(crate) mod lab {
                 blend_direct::<S>(plane, image, src, alpha, coords.0, coords.1, coords.2)
             }
             DirectKernel::Avx2 => {
-                // Mirror of the shipping dispatch in `blend_typed`.
-                #[cfg(target_arch = "x86_64")]
-                if plane.pixel_step == S::BYTES && avx2::enabled() {
+                // Mirror of the shipping dispatch in `blend_typed` (per-arch
+                // SIMD backend: AVX2 on x86-64, NEON on aarch64).
+                #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+                if plane.pixel_step == S::BYTES && simd_available() {
                     if S::BYTES == SampleU8::BYTES {
-                        // SAFETY: `avx2::enabled()` verified AVX2 support.
+                        // SAFETY: `simd_available()` verified the SIMD backend.
                         unsafe {
-                            avx2::blend_direct_u8(
+                            arch_simd::blend_direct_u8(
                                 plane, image, src, alpha, coords.0, coords.1, coords.2,
                             )
                         };
                         return;
                     }
                     if S::BYTES == SampleU16Le::BYTES {
-                        // SAFETY: `avx2::enabled()` verified AVX2 support.
+                        // SAFETY: `simd_available()` verified the SIMD backend.
                         unsafe {
-                            avx2::blend_direct_u16(
+                            arch_simd::blend_direct_u16(
                                 plane, image, src, alpha, coords.0, coords.1, coords.2,
                             )
                         };
