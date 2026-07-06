@@ -4,13 +4,17 @@ use ffmpeg_sys_next::AVMediaType::{
     AVMEDIA_TYPE_VIDEO,
 };
 // Only SideDataList::push_clone (gated to FFmpeg 8+) clones entries; the
-// free side runs on every lane via Drop.
+// free side runs on every real lane via Drop. Both symbols are FFmpeg 7.0+,
+// and docs.rs generates its bindings against an older apt FFmpeg — so like
+// every other >=7.0 symbol in this crate they stay out of docsrs builds.
 #[cfg(ffmpeg_8_0)]
 use ffmpeg_sys_next::av_frame_side_data_clone;
+#[cfg(not(docsrs))]
+use ffmpeg_sys_next::av_frame_side_data_free;
 use ffmpeg_sys_next::{
-    av_frame_side_data_free, av_freep, av_gettime_relative, avcodec_free_context,
-    avformat_close_input, avformat_free_context, avio_closep, avio_context_free, AVCodecContext,
-    AVFormatContext, AVFrameSideData, AVIOContext, AVMediaType, AVRational, AVStream, AVFMT_NOFILE,
+    av_freep, av_gettime_relative, avcodec_free_context, avformat_close_input,
+    avformat_free_context, avio_closep, avio_context_free, AVCodecContext, AVFormatContext,
+    AVFrameSideData, AVIOContext, AVMediaType, AVRational, AVStream, AVFMT_NOFILE,
 };
 use std::ffi::c_void;
 use std::ptr::null_mut;
@@ -417,7 +421,14 @@ impl SideDataList {
     }
 
     pub(crate) fn clear(&mut self) {
-        unsafe { av_frame_side_data_free(&mut self.entries, &mut self.count) }
+        // docs.rs bindings predate av_frame_side_data_free (FFmpeg 7.0), but
+        // there the list is provably empty — push_clone is ffmpeg_8_0-gated
+        // and that cfg never exists on docs.rs — so skipping the call is the
+        // exact semantics, not a stub.
+        #[cfg(not(docsrs))]
+        unsafe {
+            av_frame_side_data_free(&mut self.entries, &mut self.count)
+        }
     }
 
     #[cfg(ffmpeg_8_0)]
@@ -427,9 +438,11 @@ impl SideDataList {
 
     /// Raw entry array for FFmpeg parameter structs
     /// (e.g. `AVBufferSrcParameters.side_data`); callees deep-copy what they
-    /// need, the list keeps ownership.
+    /// need, the list keeps ownership. Takes `&mut self` so handing out a
+    /// `*mut` view is justified by the signature, not by convention — which
+    /// also keeps the Sync claim honest (shared refs never leak mutability).
     #[cfg(ffmpeg_8_0)]
-    pub(crate) fn as_mut_ptr(&self) -> *mut *mut AVFrameSideData {
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut *mut AVFrameSideData {
         self.entries
     }
 
@@ -473,7 +486,9 @@ pub(crate) struct FrameData {
     #[cfg_attr(not(ffmpeg_8_0), allow(dead_code))]
     pub(crate) side_data: Option<Arc<SideDataList>>,
 }
-// Send + Sync are auto-derived: every field is owned data.
+// Send + Sync are auto-derived. For side_data that rests on SideDataList's
+// hand-written unsafe impls (frozen-behind-Arc discipline); every other
+// field is plain owned data.
 
 pub(crate) struct PacketBox {
     pub(crate) packet: ffmpeg_next::Packet,
