@@ -312,8 +312,12 @@ fn _mux_init(
         let out_fmt_ctx = out_fmt_ctx;
         let mut stream_started: Vec<bool> = vec![false; stream_count];
         let mut stream_eof: Vec<bool> = vec![false; stream_count];
-        let mut st_rescale_delta_last_map = HashMap::new();
-        let mut st_last_dts_map = HashMap::new();
+        // Per-stream timestamp state, indexed by output_stream_index (always a
+        // valid mux stream index in [0, stream_count), same invariant the code
+        // relies on to index out_fmt_ctx.streams). Flat Vecs instead of HashMaps
+        // to drop the per-packet hash lookup on the mux hot path (alloc-06).
+        let mut st_rescale_delta_last: Vec<i64> = vec![0; stream_count];
+        let mut st_last_dts: Vec<i64> = vec![AV_NOPTS_VALUE; stream_count];
 
         let mut nb_done = 0;
 
@@ -456,9 +460,9 @@ fn _mux_init(
                     && (*packet_box.packet.as_ptr()).stream_index >= 0
                 {
                     ret = write_packet(
-                        &mut st_rescale_delta_last_map,
+                        &mut st_rescale_delta_last,
                         oformat_flags,
-                        &mut st_last_dts_map,
+                        &mut st_last_dts,
                         &out_fmt_ctx,
                         &mut packet_box,
                     );
@@ -601,16 +605,16 @@ unsafe fn streamcopy_rescale(
 }
 
 unsafe fn write_packet(
-    st_rescale_delta_last_map: &mut HashMap<i32, i64>,
+    st_rescale_delta_last: &mut [i64],
     oformat_flags: i32,
-    st_last_dts_map: &mut HashMap<i32, i64>,
+    st_last_dts: &mut [i64],
     out_fmt_ctx: &FormatContext,
     sq_packet_box: &mut PacketBox,
 ) -> i32 {
     mux_fixup_ts(
-        st_rescale_delta_last_map,
+        st_rescale_delta_last,
         oformat_flags,
-        st_last_dts_map,
+        st_last_dts,
         sq_packet_box,
         out_fmt_ctx.as_ptr(),
     );
@@ -622,9 +626,9 @@ unsafe fn write_packet(
 }
 
 unsafe fn mux_fixup_ts(
-    st_rescale_delta_last_map: &mut HashMap<i32, i64>,
+    st_rescale_delta_last: &mut [i64],
     oformat_flags: i32,
-    st_last_dts_map: &mut HashMap<i32, i64>,
+    st_last_dts: &mut [i64],
     packet_box: &mut PacketBox,
     out_fmt_ctx: *mut AVFormatContext,
 ) {
@@ -642,8 +646,7 @@ unsafe fn mux_fixup_ts(
             duration = (*codecpar).frame_size;
         }
 
-        st_rescale_delta_last_map.entry(stream_index).or_insert(0);
-        let ts_rescale_delta_last = st_rescale_delta_last_map.get_mut(&stream_index).unwrap();
+        let ts_rescale_delta_last = &mut st_rescale_delta_last[stream_index as usize];
 
         (*pkt).dts = av_rescale_delta(
             (*pkt).time_base,
@@ -672,8 +675,7 @@ unsafe fn mux_fixup_ts(
     }
     (*pkt).time_base = (**(*out_fmt_ctx).streams.add(stream_index as usize)).time_base;
 
-    st_last_dts_map.entry(stream_index).or_insert(AV_NOPTS_VALUE);
-    let last_mux_dts = st_last_dts_map.get_mut(&stream_index).unwrap();
+    let last_mux_dts = &mut st_last_dts[stream_index as usize];
 
     if (oformat_flags & AVFMT_NOTIMESTAMPS) == 0 {
         if (*pkt).dts != AV_NOPTS_VALUE && (*pkt).pts != AV_NOPTS_VALUE && (*pkt).dts > (*pkt).pts {
