@@ -1,6 +1,6 @@
 [package]
 name = "ez-ffmpeg"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2021"
 authors = ["Yeauty <YeautyYE@gmail.com>"]
 description = "A safe and ergonomic Rust interface for FFmpeg integration, designed for ease of use."
@@ -21,8 +21,12 @@ repository = "https://github.com/YeautyYE/ez-ffmpeg"
 [dependencies]
 log = "0.4"
 thiserror = "1.0"
-ffmpeg-next = "7.1.0"
-ffmpeg-sys-next = "7.1.0"
+# 8.1.x is the first upstream line that supports FFmpeg 8 correctly (8.0.x
+# crates fail against FFmpeg 8/8.1 headers). The crates still link FFmpeg
+# 7.x installs: ffmpeg-sys-next probes the installed version and gates its
+# bindings, so this bump does not drop FFmpeg 7 support.
+ffmpeg-next = "8.1.0"
+ffmpeg-sys-next = "8.1.0"
 crossbeam = "0.8.4"
 crossbeam-channel = "0.5.13"
 libc = "0.2.159"
