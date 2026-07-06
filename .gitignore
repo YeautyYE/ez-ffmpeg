@@ -4,6 +4,7 @@ examples/*/target
 .DS_Store
 .idea/
 output.mp4
+output_*.mp4
 output.aac
 output.flv
 output.jpg
