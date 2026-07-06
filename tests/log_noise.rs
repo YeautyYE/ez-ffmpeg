@@ -21,10 +21,19 @@ impl log::Log for Recorder {
 
     fn log(&self, record: &Record) {
         if record.level() <= Level::Warn {
+            let msg = record.args().to_string();
+            // Benign, self-correcting FFmpeg notice: with threads=auto (the
+            // CLI-parity default the encoder now uses), a slice-threaded encoder
+            // like mpeg4 caps the thread count on a many-core host and encodes
+            // fine. It is machine-dependent (never fires on few-core CI) and is
+            // not the kind of "false error" this net guards against.
+            if msg.contains("too many threads/slices") {
+                return;
+            }
             self.entries.lock().unwrap().push((
                 record.level(),
                 record.target().to_string(),
-                record.args().to_string(),
+                msg,
             ));
         }
     }
