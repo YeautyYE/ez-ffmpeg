@@ -7,7 +7,7 @@ use ffmpeg_sys_next::{
     AVRational, AV_DICT_MATCH_CASE, AV_ERROR_MAX_STRING_SIZE,
 };
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
+use std::ffi::{c_char, CStr, CString};
 
 /// Owns an `*mut AVDictionary` and frees it on drop.
 ///
@@ -165,7 +165,7 @@ pub(crate) fn hashmap_to_avdictionary_string(
 /// `AV_ERROR_MAX_STRING_SIZE`), which we allocate on the stack and convert into UTF-8.
 pub fn av_err2str(err: i32) -> String {
     unsafe {
-        let mut buffer = [0i8; AV_ERROR_MAX_STRING_SIZE];
+        let mut buffer = [0 as c_char; AV_ERROR_MAX_STRING_SIZE];
         av_strerror(err, buffer.as_mut_ptr(), AV_ERROR_MAX_STRING_SIZE);
         let c_str = CStr::from_ptr(buffer.as_ptr());
         match c_str.to_str() {

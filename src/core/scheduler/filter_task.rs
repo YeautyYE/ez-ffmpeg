@@ -2294,7 +2294,7 @@ fn choose_sample_fmts(
             }
         }
 
-        av_bprint_chars(bprint, b":"[0] as i8, 1);
+        av_bprint_chars(bprint, b':' as c_char, 1);
     }
 }
 
@@ -2329,7 +2329,7 @@ fn choose_sample_rates(bprint: &mut AVBPrint, rate: i32, rates: Option<Vec<i32>>
             }
         }
 
-        av_bprint_chars(bprint, b":"[0] as i8, 1);
+        av_bprint_chars(bprint, b':' as c_char, 1);
     }
 }
 
@@ -2373,7 +2373,7 @@ fn choose_channel_layouts(
             return;
         }
 
-        av_bprint_chars(bprint, b":"[0] as i8, 1);
+        av_bprint_chars(bprint, b':' as c_char, 1);
     }
 }
 
@@ -2520,7 +2520,7 @@ fn choose_pix_fmts(
             }
         }
 
-        av_bprint_chars(bprint, b":"[0] as i8, 1);
+        av_bprint_chars(bprint, b':' as c_char, 1);
     }
 }
 
@@ -2560,7 +2560,7 @@ fn choose_color_spaces(
             }
         }
 
-        av_bprint_chars(bprint, b":"[0] as i8, 1);
+        av_bprint_chars(bprint, b':' as c_char, 1);
     }
 }
 
@@ -2600,7 +2600,7 @@ fn choose_color_ranges(
             }
         }
 
-        av_bprint_chars(bprint, b":"[0] as i8, 1);
+        av_bprint_chars(bprint, b':' as c_char, 1);
     }
 }
 
