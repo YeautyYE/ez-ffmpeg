@@ -24,8 +24,8 @@ use crate::error::FilterGraphParseError::{
     InvalidFileIndexInFg, InvalidFilterSpecifier, OutputUnconnected,
 };
 use crate::error::{
-    AllocOutputContextError, FilterGraphParseError, FindStreamError, OpenInputError,
-    OpenOutputError,
+    AllocOutputContextError, FilterGraphOperationError, FilterGraphParseError, FindStreamError,
+    OpenInputError, OpenOutputError,
 };
 use crate::error::{Error, Result};
 use crate::filter::frame_pipeline::FramePipeline;
@@ -2938,7 +2938,13 @@ fn init_filter_graph(
     if let Some(hw_device) = &hw_device {
         let err = init_filter_hw_device(hw_device);
         if err < 0 {
-            return Err(FilterGraphParseError::from(err).into());
+            // Keep the pre-move error shape: this used to surface from the
+            // filter task as FilterGraph(ParseError(..)) at scheduler start;
+            // only the timing moved to build(), not the variant callers
+            // match on.
+            return Err(Error::FilterGraph(FilterGraphOperationError::ParseError(
+                FilterGraphParseError::from(err),
+            )));
         }
     }
 
