@@ -14,7 +14,7 @@ use ffmpeg_next::{Frame, Packet};
 use ffmpeg_sys_next::{av_frame_alloc, av_frame_unref, av_packet_unref};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 pub struct Initialization;
@@ -55,6 +55,9 @@ impl Drop for RunningGuard {
             log::debug!("Drop called, setting STATUS_END");
             self.status.store(STATUS_END, Ordering::Release);
         }
+
+        // Wake any paused workers so they observe the terminal state (conc-06).
+        notify_pause_waiters();
 
         // Wake choked demuxers AFTER publishing the terminal state: the
         // waiter re-checks the status and exits (matches FFmpeg sch_stop,
@@ -144,6 +147,7 @@ impl<S: 'static> FfmpegScheduler<S> {
     /// Calling code is responsible for deciding whether to wait or not.
     fn signal_stop(&self) {
         self.status.store(STATUS_END, Ordering::Release);
+        notify_pause_waiters();
         self.wake_demux_waiters();
     }
 
@@ -445,6 +449,7 @@ impl FfmpegScheduler<Initialization> {
         // already handed to worker threads are freed by those threads
         // (STATUS_END makes them exit).
         scheduler_status.store(STATUS_END, Ordering::Release);
+        notify_pause_waiters();
     }
 }
 
@@ -554,6 +559,7 @@ impl FfmpegScheduler<Running> {
     /// ```
     pub fn abort(self) {
         self.status.store(STATUS_ABORT, Ordering::Release);
+        notify_pause_waiters();
         self.wake_demux_waiters();
     }
 
@@ -675,6 +681,9 @@ impl FfmpegScheduler<Paused> {
     pub fn resume(self) -> FfmpegScheduler<Running> {
         if !is_stopping(self.status.load(Ordering::Acquire)) {
             self.status.store(STATUS_RUN, Ordering::Release);
+            // Wake workers parked in wait_until_not_paused so they resume
+            // immediately instead of after the safety-net timeout (conc-06).
+            notify_pause_waiters();
         }
         self.into_state()
     }
@@ -700,6 +709,7 @@ impl FfmpegScheduler<Paused> {
     /// ```
     pub fn abort(self) {
         self.status.store(STATUS_ABORT, Ordering::Release);
+        notify_pause_waiters();
         self.wake_demux_waiters();
     }
 }
@@ -738,15 +748,60 @@ pub(crate) fn packet_is_null(packet: &Packet) -> bool {
     packet.as_ptr().is_null()
 }
 
+/// Process-wide coordination pair for pausing workers (conc-06).
+///
+/// The mutex guards nothing but the condvar handshake — the real predicate is
+/// the per-scheduler `status` atomic. It is shared across schedulers because a
+/// transition in one scheduler only ever produces a harmless spurious wakeup in
+/// another (the woken worker re-checks its own status and parks again), and
+/// pauses are rare, so a global pair avoids threading a per-scheduler gate type
+/// through every worker init signature.
+fn pause_wait() -> &'static (Mutex<()>, Condvar) {
+    static PAUSE_WAIT: OnceLock<(Mutex<()>, Condvar)> = OnceLock::new();
+    PAUSE_WAIT.get_or_init(|| (Mutex::new(()), Condvar::new()))
+}
+
+/// Block while the scheduler is paused, returning the status once it leaves
+/// STATUS_PAUSE (conc-06: replaces a 1ms sleep-poll that burned ~1k wakeups/sec
+/// per worker for the whole pause).
+///
+/// Correctness: the fast path is a single acquire load. On the slow path the
+/// predicate is re-checked under the pause mutex before each wait, and
+/// `notify_pause_waiters()` takes that same mutex around `notify_all()`, so a
+/// transition cannot slip its notify into the window between our check and our
+/// wait — there is no lost wakeup. The bounded `wait_timeout` is only a safety
+/// net: even if some future transition forgot to notify, a paused worker still
+/// re-observes a terminal/resumed status within the timeout instead of hanging.
 pub(crate) fn wait_until_not_paused(scheduler_status: &Arc<AtomicUsize>) -> usize {
-    loop {
-        let status = scheduler_status.load(Ordering::Acquire);
-        if status == STATUS_PAUSE {
-            std::thread::sleep(Duration::from_millis(1));
-            continue;
-        }
+    // Fast path: not paused — no lock, no condvar.
+    let status = scheduler_status.load(Ordering::Acquire);
+    if status != STATUS_PAUSE {
         return status;
     }
+
+    let (lock, cond) = pause_wait();
+    let mut guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    loop {
+        let status = scheduler_status.load(Ordering::Acquire);
+        if status != STATUS_PAUSE {
+            return status;
+        }
+        let (g, _timeout) = cond
+            .wait_timeout(guard, Duration::from_millis(200))
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard = g;
+    }
+}
+
+/// Wake every worker parked in `wait_until_not_paused`. Call this after any
+/// status transition out of STATUS_PAUSE (resume / stop / end / abort / error)
+/// so paused workers observe the new state immediately. Holding the pause mutex
+/// around `notify_all()` closes the lost-wakeup window against the slow-path
+/// predicate re-check.
+pub(crate) fn notify_pause_waiters() {
+    let (lock, cond) = pause_wait();
+    let _guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    cond.notify_all();
 }
 
 pub(crate) fn set_scheduler_error(
@@ -763,6 +818,10 @@ pub(crate) fn set_scheduler_error(
     if scheduler_result.is_none() {
         scheduler_result.replace(Err(error.into()));
         scheduler_status.store(STATUS_END, Ordering::Release);
+        // Wake paused workers so they observe the terminal state and exit,
+        // rather than sleeping until the safety-net timeout (conc-06). The error
+        // result is already recorded above, so a woken wait() sees it.
+        notify_pause_waiters();
     }
 }
 
@@ -782,6 +841,47 @@ mod tests {
     use std::thread::sleep;
     use std::time::Duration;
     use crate::filter::frame_pipeline_builder::FramePipelineBuilder;
+
+    // conc-06: workers parked in wait_until_not_paused must all wake and observe
+    // the new status when a transition out of STATUS_PAUSE notifies the gate —
+    // no 1ms sleep-poll, no lost wakeup.
+    #[test]
+    fn pause_gate_wakes_all_waiters_on_transition() {
+        use crate::core::scheduler::ffmpeg_scheduler::{notify_pause_waiters, wait_until_not_paused};
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::mpsc;
+
+        let status = Arc::new(AtomicUsize::new(STATUS_PAUSE));
+        let (tx, rx) = mpsc::channel();
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let status = Arc::clone(&status);
+            let tx = tx.clone();
+            handles.push(std::thread::spawn(move || {
+                tx.send(wait_until_not_paused(&status)).unwrap();
+            }));
+        }
+        drop(tx);
+
+        // Give the workers time to reach the condvar wait, then resume.
+        sleep(Duration::from_millis(50));
+        // No waiter should have returned while still paused.
+        assert!(rx.try_recv().is_err(), "a paused worker returned before resume");
+
+        status.store(STATUS_RUN, Ordering::Release);
+        notify_pause_waiters();
+
+        for _ in 0..4 {
+            let observed = rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("a paused worker never woke after the transition");
+            assert_eq!(observed, STATUS_RUN);
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
 
     #[test]
     fn set_scheduler_error_survives_a_poisoned_result_lock() {
