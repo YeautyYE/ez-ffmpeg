@@ -1412,8 +1412,14 @@ unsafe fn packet_decode(
 
         ret = avcodec_receive_frame(dec_ctx, frame.as_mut_ptr());
         if ret == AVERROR(EAGAIN) {
+            // Drain done for this packet: the pooled shell was not moved
+            // onward, so recycle it instead of letting Drop free it — otherwise
+            // every decoded packet drains one shell from the ObjPool and the
+            // next get() re-allocates (ffapi-05). Mirrors filter_task's sink.
+            frame_pool.release(frame);
             return Ok(());
         } else if ret == AVERROR_EOF {
+            frame_pool.release(frame);
             return Err(Error::EOF);
         } else if ret < 0 {
             error!("Decoding error: {}", av_err2str(ret));
@@ -1421,6 +1427,7 @@ unsafe fn packet_decode(
             let mut dp = dp.lock().unwrap();
             dp.dec.decode_errors += 1;
 
+            frame_pool.release(frame);
             if exit_on_error {
                 return Err(Decoding(DecodingOperationError::ReceiveFrameError(
                     DecodingError::from(ret),

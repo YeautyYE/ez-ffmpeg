@@ -425,6 +425,11 @@ fn _mux_init(
                         started,
                     );
                     if ret == AVERROR(EAGAIN) {
+                        // The packet was filtered out (before start_time, or a
+                        // pre-keyframe streamcopy packet) and is not written;
+                        // recycle its pooled shell instead of dropping it, like
+                        // the EOF and write paths below (NEW-DP-04).
+                        packet_pool.release(packet_box.packet);
                         continue;
                     } else if ret == AVERROR_EOF {
                         // Per-stream EOF: mark this stream as finished, matching CLI's
