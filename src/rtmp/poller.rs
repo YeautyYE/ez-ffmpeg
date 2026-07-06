@@ -253,6 +253,10 @@ mod bsd {
     const EV_CLEAR: u16 = 0x0020; // Edge-triggered equivalent
     const EV_EOF: u16 = 0x8000;
     const EV_ERROR: u16 = 0x4000;
+    // Force kevent() to report each submitted change's status in the eventlist
+    // (EV_ERROR set, data = errno, 0 on success) instead of stopping at the
+    // first failure and returning a single ambiguous errno.
+    const EV_RECEIPT: u16 = 0x0040;
 
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
@@ -414,33 +418,49 @@ mod bsd {
                 });
             }
 
-            // Apply changes - ignore errors from EV_DELETE on non-existent filters
-            // SAFETY: kevent() for modification requires:
-            // - self.kq is valid (created in new(), owned by self)
-            // - changes.as_ptr() points to valid Kevent array with correct length
-            // - eventlist is null (we're only submitting changes, not polling)
-            // - timeout is null (no wait needed for change submission)
-            // EV_DELETE on non-existent filter may return error (expected behavior)
-            // Thread safety: Poller requires &mut self, ensuring exclusive access
+            // Submit each change with EV_RECEIPT so kevent() reports the result
+            // of every change in the eventlist (EV_ERROR set, data = errno, 0 on
+            // success) without blocking. Without EV_RECEIPT, kevent() stops at the
+            // first failing change and returns one errno, so a benign ENOENT from
+            // an EV_DELETE (disabling a filter that was never enabled — routine
+            // when clearing writable interest after a flush) is indistinguishable
+            // from a real EV_ADD failure. That ambiguity forced the old code to
+            // swallow every error, which also masked genuine EV_ADD failures and
+            // stranded queued writes on the affected connection.
+            for change in changes.iter_mut() {
+                change.flags |= EV_RECEIPT;
+            }
+            let mut results = changes.clone();
+            // SAFETY: self.kq is valid (owned by self); changes/results are valid
+            // Kevent arrays of the same length; EV_RECEIPT yields one result per
+            // change; timeout is null (change submission does not wait).
             let ret = unsafe {
                 kevent(
                     self.kq,
                     changes.as_ptr(),
                     changes.len() as i32,
-                    std::ptr::null_mut(),
-                    0,
+                    results.as_mut_ptr(),
+                    results.len() as i32,
                     std::ptr::null(),
                 )
             };
+            if ret < 0 {
+                // The kevent() syscall itself failed (bad kq, EFAULT, ...).
+                return Err(std::io::Error::last_os_error());
+            }
 
-            // Only fail if we were adding and it failed
-            if ret < 0 && (interest.readable || interest.writable) {
-                // Log warning but don't fail - kqueue EV_DELETE on non-existent filter is expected
-                log::warn!(
-                    "kqueue modify returned error for fd {}: {}",
-                    fd,
-                    std::io::Error::last_os_error()
-                );
+            // Fail on any real per-change error, but ignore ENOENT on an EV_DELETE
+            // (the filter we asked to disable simply was not registered).
+            for res in &results[..ret as usize] {
+                if res.flags & EV_ERROR == 0 || res.data == 0 {
+                    continue;
+                }
+                let is_delete = (res.filter == EVFILT_READ && !interest.readable)
+                    || (res.filter == EVFILT_WRITE && !interest.writable);
+                if is_delete && res.data as i32 == libc::ENOENT {
+                    continue;
+                }
+                return Err(std::io::Error::from_raw_os_error(res.data as i32));
             }
             Ok(())
         }

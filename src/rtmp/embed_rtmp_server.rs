@@ -169,9 +169,18 @@ impl EmbedRtmpServer<Initialization> {
         // into the worker thread and registered with the poller; the WakeHandle
         // (write side) is kept here so create_rtmp_input can signal the reactor
         // the instant media is queued.
-        let (waker, wake_handle) = waker_pair()
-            .map_err(|e| <std::io::Error as Into<crate::error::Error>>::into(e))?;
-        self.wake_handle = Some(wake_handle);
+        // If the wakeup pair cannot be created (e.g. eventfd/loopback exhaustion),
+        // degrade gracefully to the POLL_TIMEOUT_MS fallback rather than failing
+        // server startup: the low-latency wakeup is an optimization, not a
+        // correctness requirement.
+        let (waker, wake_handle) = match waker_pair() {
+            Ok((waker, handle)) => (Some(waker), Some(handle)),
+            Err(e) => {
+                warn!("PERF-3: reactor waker unavailable ({e:?}); falling back to the poll-timeout for in-process media latency");
+                (None, None)
+            }
+        };
+        self.wake_handle = wake_handle;
 
         let stream_keys = self.stream_keys.clone();
         let status = self.status.clone();
@@ -324,6 +333,13 @@ impl EmbedRtmpServer<Running> {
         // for the poll-timeout fallback. Only this internal path holds a
         // WakeHandle; raw create_stream_sender users fall back to the timeout.
         let wake_handle = self.wake_handle.clone();
+        // create_stream_sender already queued the connect/createStream/publish
+        // handshake. Wake once so the reactor flushes it immediately instead of
+        // waiting for the first media frame (or the 100ms poll fallback) to
+        // arrive — otherwise stream setup carries an avoidable startup latency.
+        if let Some(waker) = &wake_handle {
+            waker.wake();
+        }
 
         let mut flv_buffer = FlvBuffer::new();
         let mut serializer = ChunkSerializer::new();
@@ -332,27 +348,33 @@ impl EmbedRtmpServer<Running> {
             // One AVIO write can carry many FLV tags (the muxer hands over
             // 64KB blocks): drain every complete tag now, or the backlog
             // grows and the final tags of the stream are never sent.
+            let mut queued_any = false;
             while let Some(mut flv_tag) = flv_buffer.get_flv_tag() {
                 flv_tag.header.stream_id = 1;
                 match serializer.serialize(&flv_tag_to_message_payload(flv_tag), false, true) {
                     Ok(packet) => {
-                        // Wake only on an empty->non-empty transition so a burst
-                        // of tags coalesces into a single reactor wakeup.
-                        let was_empty = message_sender.is_empty();
                         if let Err(e) = message_sender.send(packet.bytes) {
                             error!("Failed to send RTMP packet: {:?}", e);
                             return -1;
                         }
-                        if was_empty {
-                            if let Some(waker) = &wake_handle {
-                                waker.wake();
-                            }
-                        }
+                        queued_any = true;
                     }
                     Err(e) => {
                         error!("Failed to serialize RTMP message: {:?}", e);
                         return -1;
                     }
+                }
+            }
+            // Wake the reactor once after enqueuing the whole batch. This must be
+            // unconditional, not gated on a prior message_sender.is_empty(): the
+            // reactor can drain the queue and go back to sleep in poll() between
+            // an emptiness check and the send, so a was_empty gate loses the
+            // wakeup and the packet stalls until the 100ms poll fallback. One
+            // wake per AVIO write still coalesces the tag burst, and the
+            // eventfd/pipe wake token coalesces multiple wakes on its own.
+            if queued_any {
+                if let Some(waker) = &wake_handle {
+                    waker.wake();
                 }
             }
             buf.len() as i32
@@ -566,7 +588,7 @@ fn handle_connections(
     gop_limit: usize,
     max_connections: Option<usize>,
     status: Arc<AtomicUsize>,
-    waker: Waker,
+    waker: Option<Waker>,
 ) {
     // Create Reactor
     let mut reactor = match Reactor::new(gop_limit, max_connections, stream_keys, status.clone()) {
