@@ -327,11 +327,16 @@ impl Muxer {
         };
 
         // Pre-mux buffer: packets an encoder produces before the muxer opens
-        // (it waits until every output stream has its first packet). 16384 is a
-        // generous burst headroom while capping the pre-start memory window far
-        // below the old 65536; a fast encoder racing a slow-to-start stream
-        // blocks here (backpressure) until the muxer drains it (PERF-12).
-        let (pre_packet_sender, pre_packet_receiver) = crossbeam_channel::bounded(16384);
+        // (it waits until every output stream has emitted a first packet). This
+        // bound doubles as the demux read-ahead window before backpressure
+        // stalls the demuxer: with a single input, a fast video/audio encoder
+        // fills this queue, blocks, and back-pressures the demuxer — which then
+        // cannot read far enough to reach a sparse subtitle/data stream's first
+        // packet and open its encoder, so the muxer never starts. A large bound
+        // keeps that window wide enough to tolerate such files, so it must NOT
+        // be lowered until the deferred byte-metered, demux-progress-aware
+        // pre-mux queue exists (PERF-12; see artifacts/agent-design-perf12.log).
+        let (pre_packet_sender, pre_packet_receiver) = crossbeam_channel::bounded(65536);
         self.src_pre_receivers.push(pre_packet_receiver);
 
         let stream = EncoderStream::new(

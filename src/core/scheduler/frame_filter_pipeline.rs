@@ -296,9 +296,13 @@ fn run_pipeline(
     };
 
     loop {
-        if crate::core::scheduler::ffmpeg_scheduler::wait_until_not_paused(scheduler_status)
-            == crate::core::scheduler::ffmpeg_scheduler::STATUS_END
-        {
+        // is_stopping() covers STATUS_ABORT as well as STATUS_END, so an abort
+        // (including abort-from-pause) stops this worker like it stops the
+        // decoder/encoder/mux workers — an == STATUS_END check would let an
+        // aborted pipeline with a producing filter keep running.
+        if crate::core::scheduler::ffmpeg_scheduler::is_stopping(
+            crate::core::scheduler::ffmpeg_scheduler::wait_until_not_paused(scheduler_status),
+        ) {
             info!("Receiver end command, finishing.");
             return Ok(());
         }
