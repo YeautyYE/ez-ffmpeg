@@ -48,6 +48,10 @@ pub(crate) struct GpuState {
     /// buffer directly (MAPPABLE_PRIMARY_BUFFERS), skipping the storage
     /// buffer and its per-frame copy.
     pub(crate) direct_pack: bool,
+    /// Bumped on every real `ensure_resources` rebuild. A cached direct-pack
+    /// bind group records the generation it was built against; a mismatch
+    /// means `out_view` was recreated and the bind group must be rebuilt.
+    resource_generation: u64,
 }
 
 /// Size/format-dependent resources, recreated when the input geometry changes.
@@ -71,7 +75,7 @@ pub(crate) struct FrameResources {
     /// Intermediate packed-YUV buffer copied into staging per frame; `None`
     /// in direct-pack mode (the pack pass writes staging directly).
     pub(crate) storage: Option<wgpu::Buffer>,
-    /// Idle MAP_READ staging buffers; one is taken per in-flight frame and
+    /// Idle MAP_READ staging slots; one is taken per in-flight frame and
     /// returned (or dropped, after a geometry change) on completion.
     ///
     /// Uploads deliberately stay on `queue.write_texture`: wgpu's internal
@@ -79,10 +83,14 @@ pub(crate) struct FrameResources {
     /// one-CPU-copy + one-GPU-copy cost. A hand-rolled MAP_WRITE ring was
     /// measured slower here (256-aligned row padding plus an extra map_async
     /// per frame; 1080p upload 0.77 -> 0.95 ms/frame on RADV RENOIR).
-    pub(crate) staging_pool: Vec<wgpu::Buffer>,
+    pub(crate) staging_pool: Vec<StagingSlot>,
     pub(crate) y_stride: usize,
     pub(crate) c_stride: usize,
     pub(crate) buf_size: u64,
+    /// Generation stamp of the `GpuState` at the time these resources were
+    /// built; direct-pack bind groups compare against it to detect a stale
+    /// `out_view`.
+    pub(crate) resource_generation: u64,
 }
 
 impl FrameResources {
@@ -94,6 +102,69 @@ impl FrameResources {
             c_stride: self.c_stride,
             buf_size: self.buf_size,
         }
+    }
+}
+
+/// A readback staging buffer paired with an optional cached direct-pack bind
+/// group. In direct-pack mode the pack compute pass binds this buffer as its
+/// storage target; caching the bind group avoids recreating it every frame.
+/// The cache is guarded by the resource generation it was built against, so a
+/// bind group targeting a since-rebuilt `out_view` is never reused.
+pub(crate) struct StagingSlot {
+    pub(crate) buffer: wgpu::Buffer,
+    /// Buffer size in bytes; used to match a slot against the current geometry
+    /// when recycling (keeps the check identical to the old `(buffer, size)`
+    /// recycle tuple).
+    pub(crate) buf_size: u64,
+    direct_pack_bind: Option<CachedDirectPackBind>,
+}
+
+struct CachedDirectPackBind {
+    resource_generation: u64,
+    bind: wgpu::BindGroup,
+}
+
+impl StagingSlot {
+    pub(crate) fn new(buffer: wgpu::Buffer, buf_size: u64) -> Self {
+        StagingSlot {
+            buffer,
+            buf_size,
+            direct_pack_bind: None,
+        }
+    }
+
+    /// Returns the direct-pack bind group for this slot, (re)creating it when
+    /// none is cached or the cached one predates the current resource
+    /// `generation` (its `out_view` was recreated). Only called in direct-pack
+    /// mode.
+    pub(crate) fn ensure_direct_pack_bind(
+        &mut self,
+        gpu: &GpuState,
+        out_view: &wgpu::TextureView,
+        generation: u64,
+    ) -> &wgpu::BindGroup {
+        let stale = match &self.direct_pack_bind {
+            Some(cached) => cached.resource_generation != generation,
+            None => true,
+        };
+        if stale {
+            self.direct_pack_bind = Some(CachedDirectPackBind {
+                resource_generation: generation,
+                bind: gpu.pack_bind_for(out_view, &self.buffer),
+            });
+        }
+        &self
+            .direct_pack_bind
+            .as_ref()
+            .expect("cache populated above")
+            .bind
+    }
+
+    /// Drops any cached direct-pack bind group. Called before a slot is lent
+    /// out in a zero-copy frame, so a long-lived downstream frame does not pin
+    /// a stale `out_view` through the cached bind group.
+    pub(crate) fn clear_direct_pack_bind(&mut self) {
+        self.direct_pack_bind = None;
     }
 }
 
@@ -467,6 +538,7 @@ impl GpuState {
             resources: None,
             hw_interop,
             direct_pack,
+            resource_generation: 0,
         })
     }
 
@@ -555,6 +627,12 @@ impl GpuState {
             }
         }
 
+        // A real rebuild recreates `out_view` (and every texture/bind group),
+        // so bump the generation to invalidate any cached direct-pack bind
+        // group that still targets the previous `out_view`.
+        self.resource_generation = self.resource_generation.wrapping_add(1);
+        let resource_generation = self.resource_generation;
+
         let device = &self.device;
         let create_tex = |label: &str,
                           w: u32,
@@ -623,8 +701,8 @@ impl GpuState {
                 mapped_at_creation: false,
             })
         });
-        let staging_pool: Vec<wgpu::Buffer> = (0..staging_count)
-            .map(|_| create_staging(device, buf_size, self.direct_pack))
+        let staging_pool: Vec<StagingSlot> = (0..staging_count)
+            .map(|_| StagingSlot::new(create_staging(device, buf_size, self.direct_pack), buf_size))
             .collect();
 
         let view = |t: &wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor::default());
@@ -737,6 +815,7 @@ impl GpuState {
             y_stride,
             c_stride,
             buf_size,
+            resource_generation,
         });
     }
 }
