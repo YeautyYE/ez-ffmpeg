@@ -29,7 +29,12 @@ fn main() {
     // empty value mark versions/macros the linked FFmpeg does NOT have; they
     // still get a check-cfg declaration so e.g. `#[cfg(ffmpeg_8_0)]` lints
     // clean when building against FFmpeg 7.x.
-    for (name, value) in std::env::vars() {
+    // vars_os + explicit UTF-8 filtering: plain env::vars() would panic the
+    // whole build script on an unrelated non-UTF-8 environment variable.
+    for (name, value) in std::env::vars_os() {
+        let (Ok(name), Ok(value)) = (name.into_string(), value.into_string()) else {
+            continue;
+        };
         if let Some(key) = name.strip_prefix("DEP_FFMPEG_") {
             let key = key.to_lowercase();
             // Metadata keys are snake_case idents today; skip anything that
@@ -46,7 +51,9 @@ fn main() {
             }
         }
     }
-    // docs.rs builds see no DEP_FFMPEG_* variables at all; keep the cfgs the
-    // sources reference declared there too.
+    // Belt and suspenders: ffmpeg-sys-next does emit this key even on
+    // docs.rs (it probes whatever FFmpeg the build image ships), but if some
+    // environment ever yields no DEP_FFMPEG_* metadata at all, the cfgs the
+    // sources reference must still be declared for unexpected_cfgs.
     println!("cargo:rustc-check-cfg=cfg(ffmpeg_8_0)");
 }
