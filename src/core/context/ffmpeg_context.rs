@@ -2710,6 +2710,19 @@ fn ifilter_bind_ist(
         }
         let _codec_ctx = CodecContext::new(dec_ctx);
 
+        // A freshly allocated context only carries codec defaults (format
+        // -1, 0x0, timebase 0/1), which made the fallback below useless: the
+        // EOF-before-first-frame path could never configure the graph
+        // ("Cannot determine format of input ... after EOF"). fftools fills
+        // the fallback from the opened decoder (dec_open's param_out); at
+        // bind time no decoder is open, so the stream's codecpar — the same
+        // values a decoder would start from — is the faithful source.
+        let ret = avcodec_parameters_to_context(dec_ctx, par);
+        if ret < 0 {
+            return Err(FilterGraphParseError::from(ret).into());
+        }
+        (*dec_ctx).pkt_timebase = (*ist).time_base;
+
         let fallback = input_filter.opts.fallback.as_mut_ptr();
         if (*dec_ctx).codec_type == AVMEDIA_TYPE_AUDIO {
             (*fallback).format = (*dec_ctx).sample_fmt as i32;
@@ -3770,6 +3783,37 @@ mod tests {
             let filter_ctx = (*outputs.as_ptr()).filter_ctx;
             println!("filter_ctx.is_null:{}", filter_ctx.is_null());
         }
+    }
+
+    #[test]
+    fn fallback_frame_carries_real_stream_parameters() {
+        // Regression: the probe dec_ctx used to stay at codec defaults, so
+        // the fallback frame bound to each filtergraph input had format=-1
+        // and the EOF-before-first-frame path could never configure a graph.
+        let ctx = FfmpegContext::new(
+            vec!["test.mp4".into()],
+            vec!["hue=s=0".into()],
+            vec!["output_fallback_probe.mp4".to_string().into()],
+        )
+        .unwrap();
+        let fallback = unsafe { &*ctx.filter_graphs[0].inputs[0].opts.fallback.as_ptr() };
+        assert!(
+            fallback.format >= 0,
+            "fallback must carry the stream's real format, got {}",
+            fallback.format
+        );
+        assert!(
+            fallback.width > 0 && fallback.height > 0,
+            "fallback must carry the stream's dimensions, got {}x{}",
+            fallback.width,
+            fallback.height
+        );
+        assert!(
+            fallback.time_base.num > 0 && fallback.time_base.den > 0,
+            "fallback must carry the stream's packet time base, got {}/{}",
+            fallback.time_base.num,
+            fallback.time_base.den
+        );
     }
 
     #[test]
