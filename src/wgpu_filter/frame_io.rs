@@ -3,7 +3,7 @@
 
 use crate::util::ffmpeg_utils::av_err2str;
 use crate::util::frame_utils::copy_plane;
-use crate::wgpu_filter::gpu_state::{GpuState, OutputGeometry};
+use crate::wgpu_filter::gpu_state::{GpuState, OutputGeometry, StagingSlot};
 use crate::wgpu_filter::hw_interop::{self, ImportedNv12};
 use crate::wgpu_filter::params::SharedParams;
 use ffmpeg_next::Frame;
@@ -208,7 +208,7 @@ pub(crate) fn upload_and_encode(
     layout: PlaneLayout,
     matrix_id: u32,
     full_range: bool,
-    staging: &wgpu::Buffer,
+    staging: &mut StagingSlot,
     params: &SharedParams,
 ) -> Result<
     (
@@ -281,7 +281,7 @@ pub(crate) fn encode_and_submit(
     frame: &Frame,
     matrix_id: u32,
     full_range: bool,
-    staging: &wgpu::Buffer,
+    staging: &mut StagingSlot,
     params: &SharedParams,
 ) -> Result<
     (
@@ -380,35 +380,40 @@ pub(crate) fn encode_and_submit(
         pass.set_bind_group(1, &res.effect_bind1, &[]);
         pass.draw(0..3, 0..1);
     }
-    // Direct-pack mode (unified memory): the pack pass writes the mappable
-    // staging buffer itself, so there is no storage buffer and no copy. The
-    // bind group is transient because staging rotates per frame.
-    let direct_pack_bind = gpu
-        .direct_pack
-        .then(|| gpu.pack_bind_for(&res.out_view, staging));
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("ez_pack_pass"),
             timestamp_writes: None,
         });
         pass.set_pipeline(&gpu.pack_pipeline);
-        let pack_bind = direct_pack_bind
-            .as_ref()
-            .or(res.pack_bind.as_ref())
-            .expect("copy-path resources always carry a cached pack bind");
+        // Direct-pack mode (unified memory): the pack pass writes the mappable
+        // staging buffer itself, so there is no storage buffer and no copy.
+        // The bind group targeting that buffer is cached on the staging slot
+        // and only rebuilt when the resources (hence `out_view`) were rebuilt
+        // under it, detected via the resource generation.
+        let pack_bind = if gpu.direct_pack {
+            staging.ensure_direct_pack_bind(gpu, &res.out_view, res.resource_generation)
+        } else {
+            res.pack_bind
+                .as_ref()
+                .expect("copy-path resources always carry a cached pack bind")
+        };
         pass.set_bind_group(0, pack_bind, &[]);
         pass.dispatch_workgroups(res.out_w.div_ceil(64), res.out_h.div_ceil(16), 1);
     }
     if let Some(storage) = &res.storage {
-        encoder.copy_buffer_to_buffer(storage, 0, staging, 0, res.buf_size);
+        encoder.copy_buffer_to_buffer(storage, 0, &staging.buffer, 0, res.buf_size);
     }
 
     let submission = gpu.queue.submit(Some(encoder.finish()));
 
     let (tx, rx) = mpsc::channel();
-    staging.slice(..).map_async(wgpu::MapMode::Read, move |result| {
-        let _ = tx.send(result);
-    });
+    staging
+        .buffer
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
     Ok((submission, rx))
 }
 
@@ -634,16 +639,15 @@ impl Drop for OutputFramePool {
 /// send failure just lets the buffer drop entirely, which wgpu handles from
 /// any thread.
 struct ZeroCopyHolder {
-    staging: Option<wgpu::Buffer>,
-    buf_size: u64,
-    recycle_tx: mpsc::Sender<(wgpu::Buffer, u64)>,
+    staging: Option<StagingSlot>,
+    recycle_tx: mpsc::Sender<StagingSlot>,
 }
 
 impl Drop for ZeroCopyHolder {
     fn drop(&mut self) {
         if let Some(staging) = self.staging.take() {
-            staging.unmap();
-            let _ = self.recycle_tx.send((staging, self.buf_size));
+            staging.buffer.unmap();
+            let _ = self.recycle_tx.send(staging);
         }
     }
 }
@@ -664,22 +668,28 @@ unsafe extern "C" fn zero_copy_free(opaque: *mut libc::c_void, _data: *mut u8) {
 /// read their input, and any FFmpeg code that needs to write goes through
 /// `av_frame_make_writable`, which copies first.
 pub(crate) fn build_output_frame_zero_copy(
-    staging: wgpu::Buffer,
+    mut staging: StagingSlot,
     geo: &OutputGeometry,
     src: &Frame,
-    recycle_tx: &mpsc::Sender<(wgpu::Buffer, u64)>,
+    recycle_tx: &mpsc::Sender<StagingSlot>,
 ) -> Result<Frame, String> {
+    // A zero-copy frame can outlive the current resources (it stays alive
+    // downstream until the encoder releases it), so drop the cached direct-pack
+    // bind group before lending the slot out: otherwise a long-lived frame
+    // would pin a since-rebuilt `out_view` through it.
+    staging.clear_direct_pack_bind();
+
     let out_h = geo.out_h as usize;
     let out_ch = geo.out_h.div_ceil(2) as usize;
     let y_end = geo.y_stride * out_h;
     let u_end = y_end + geo.c_stride * out_ch;
     let v_end = u_end + geo.c_stride * out_ch;
 
-    let mapped = staging.slice(..).get_mapped_range();
+    let mapped = staging.buffer.slice(..).get_mapped_range();
     if mapped.len() < v_end {
         drop(mapped);
-        staging.unmap();
-        let _ = recycle_tx.send((staging, geo.buf_size));
+        staging.buffer.unmap();
+        let _ = recycle_tx.send(staging);
         return Err(format!(
             "Mapped readback too small: need {v_end} bytes"
         ));
@@ -692,7 +702,6 @@ pub(crate) fn build_output_frame_zero_copy(
 
     let holder = Box::new(ZeroCopyHolder {
         staging: Some(staging),
-        buf_size: geo.buf_size,
         recycle_tx: recycle_tx.clone(),
     });
 

@@ -5,7 +5,7 @@ use crate::core::filter::frame_filter_context::FrameFilterContext;
 use crate::filter::frame_filter::FrameFilter;
 use crate::util::frame_utils::{ensure_software_format, is_hw_format};
 use crate::wgpu_filter::frame_io::{self, HwMappedFrame, PlaneLayout};
-use crate::wgpu_filter::gpu_state::{create_staging, GpuState, OutputGeometry};
+use crate::wgpu_filter::gpu_state::{create_staging, GpuState, OutputGeometry, StagingSlot};
 use crate::wgpu_filter::hw_interop;
 use crate::wgpu_filter::params::SharedParams;
 use crate::wgpu_filter::shaders;
@@ -189,18 +189,15 @@ pub struct WgpuFrameFilter {
     /// frame reuses a pooled `AVBufferRef` instead of a fresh per-frame
     /// allocation. Rebuilt when the output geometry changes.
     copy_output_pool: Option<frame_io::OutputFramePool>,
-    /// Return path for zero-copy staging buffers: the AVBuffer free callback
-    /// sends `(buffer, size)` from whichever thread drops the last frame
-    /// reference; `filter_frame` drains it back into the staging pool.
-    recycle: (
-        mpsc::Sender<(wgpu::Buffer, u64)>,
-        Receiver<(wgpu::Buffer, u64)>,
-    ),
+    /// Return path for zero-copy staging slots: the AVBuffer free callback
+    /// sends the slot from whichever thread drops the last frame reference;
+    /// `filter_frame` drains it back into the staging pool.
+    recycle: (mpsc::Sender<StagingSlot>, Receiver<StagingSlot>),
 }
 
 /// A frame submitted to the GPU whose readback has not completed yet.
 struct InFlightFrame {
-    staging: wgpu::Buffer,
+    staging: StagingSlot,
     submission: wgpu::SubmissionIndex,
     map_rx: Receiver<Result<(), wgpu::BufferAsyncError>>,
     /// Submission time, for detecting a wedged device during polling.
@@ -295,9 +292,9 @@ impl WgpuFrameFilter {
         let res = self.gpu.as_mut().and_then(|g| g.resources.as_mut());
         match res {
             Some(res) => {
-                while let Ok((buffer, size)) = self.recycle.1.try_recv() {
-                    if size == res.buf_size && res.staging_pool.len() < cap {
-                        res.staging_pool.push(buffer);
+                while let Ok(slot) = self.recycle.1.try_recv() {
+                    if slot.buf_size == res.buf_size && res.staging_pool.len() < cap {
+                        res.staging_pool.push(slot);
                     }
                 }
             }
@@ -364,14 +361,14 @@ impl WgpuFrameFilter {
                 &self.recycle.0,
             )?
         } else {
-            let mapped = slot.staging.slice(..).get_mapped_range();
+            let mapped = slot.staging.buffer.slice(..).get_mapped_range();
             // Fold the pool lookup into `built` so the staging buffer is always
             // unmapped below, even if the pool has to be (re)built and fails.
             let built = self
                 .copy_output_pool_for(slot.geo)
                 .and_then(|pool| pool.build_frame(&mapped, &slot.src_props));
             drop(mapped);
-            slot.staging.unmap();
+            slot.staging.buffer.unmap();
             let frame = built?;
 
             // Recycle the staging buffer while it matches the current
@@ -638,13 +635,16 @@ impl FrameFilter for WgpuFrameFilter {
             }
         }
 
-        let (staging, geo) = {
+        let (mut staging, geo) = {
             let gpu = self.gpu.as_mut().expect("initialized above");
             let res = gpu.resources.as_mut().expect("resources ensured above");
             let geo = res.geometry();
             let staging = match res.staging_pool.pop() {
-                Some(buffer) => buffer,
-                None => create_staging(&gpu.device, geo.buf_size, gpu.direct_pack),
+                Some(slot) => slot,
+                None => StagingSlot::new(
+                    create_staging(&gpu.device, geo.buf_size, gpu.direct_pack),
+                    geo.buf_size,
+                ),
             };
             (staging, geo)
         };
@@ -663,7 +663,7 @@ impl FrameFilter for WgpuFrameFilter {
                     &frame,
                     matrix_id,
                     full_range,
-                    &staging,
+                    &mut staging,
                     &self.params,
                 )
             }
@@ -673,7 +673,7 @@ impl FrameFilter for WgpuFrameFilter {
                 layout,
                 matrix_id,
                 full_range,
-                &staging,
+                &mut staging,
                 &self.params,
             ),
         };
