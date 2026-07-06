@@ -210,13 +210,7 @@ pub(crate) fn upload_and_encode(
     full_range: bool,
     staging: &mut StagingSlot,
     params: &SharedParams,
-) -> Result<
-    (
-        wgpu::SubmissionIndex,
-        mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
-    ),
-    String,
-> {
+) -> Result<wgpu::SubmissionIndex, String> {
     let res = gpu.resources.as_ref().expect("resources ensured");
     let (cw, ch) = layout.chroma_size(res.in_w, res.in_h);
 
@@ -283,13 +277,7 @@ pub(crate) fn encode_and_submit(
     full_range: bool,
     staging: &mut StagingSlot,
     params: &SharedParams,
-) -> Result<
-    (
-        wgpu::SubmissionIndex,
-        mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
-    ),
-    String,
-> {
+) -> Result<wgpu::SubmissionIndex, String> {
     let res = gpu.resources.as_ref().expect("resources ensured");
 
     // Per-frame uniforms. Queue writes are ordered on the queue timeline, so
@@ -407,14 +395,17 @@ pub(crate) fn encode_and_submit(
 
     let submission = gpu.queue.submit(Some(encoder.finish()));
 
-    let (tx, rx) = mpsc::channel();
+    // Reuse this slot's map-completion channel instead of allocating one per
+    // frame. The slot's previous map is always drained before it is reused, so
+    // the channel is empty here and receives exactly this submission's result.
+    let tx = staging.map_sender();
     staging
         .buffer
         .slice(..)
         .map_async(wgpu::MapMode::Read, move |result| {
             let _ = tx.send(result);
         });
-    Ok((submission, rx))
+    Ok(submission)
 }
 
 /// Fixed plane layout of the pooled YUV420P output, captured once from a real

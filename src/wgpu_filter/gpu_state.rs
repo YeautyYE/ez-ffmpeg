@@ -6,6 +6,7 @@ use crate::wgpu_filter::frame_io::PlaneLayout;
 use crate::wgpu_filter::hw_interop::{self, HwVulkanInterop};
 use crate::wgpu_filter::shaders;
 use log::info;
+use std::sync::mpsc;
 
 /// Output-plane geometry captured per submitted frame, so in-flight readbacks
 /// stay valid even if `FrameResources` is rebuilt for a new input size while
@@ -117,6 +118,16 @@ pub(crate) struct StagingSlot {
     /// recycle tuple).
     pub(crate) buf_size: u64,
     direct_pack_bind: Option<CachedDirectPackBind>,
+    /// Reused map-completion channel: the map callback clones `map_tx` and
+    /// sends the result, `wait_for_map` drains it from `map_rx`. Reusing one
+    /// channel per slot avoids allocating a fresh `mpsc::channel` every frame.
+    ///
+    /// Exactly one message crosses this channel per submission: a slot is only
+    /// re-submitted after its previous map completed and was consumed (copy
+    /// path recycles post-completion; zero-copy lends only post-completion), so
+    /// the channel is always empty when a new map is registered.
+    map_tx: mpsc::Sender<Result<(), wgpu::BufferAsyncError>>,
+    map_rx: mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
 }
 
 struct CachedDirectPackBind {
@@ -126,11 +137,27 @@ struct CachedDirectPackBind {
 
 impl StagingSlot {
     pub(crate) fn new(buffer: wgpu::Buffer, buf_size: u64) -> Self {
+        let (map_tx, map_rx) = mpsc::channel();
         StagingSlot {
             buffer,
             buf_size,
             direct_pack_bind: None,
+            map_tx,
+            map_rx,
         }
+    }
+
+    /// A fresh sender for a new submission's map callback. The paired receiver
+    /// stays on the slot; read it with [`Self::map_result`].
+    pub(crate) fn map_sender(&self) -> mpsc::Sender<Result<(), wgpu::BufferAsyncError>> {
+        self.map_tx.clone()
+    }
+
+    /// Non-blocking read of this slot's outstanding map completion.
+    pub(crate) fn map_result(
+        &self,
+    ) -> Result<Result<(), wgpu::BufferAsyncError>, mpsc::TryRecvError> {
+        self.map_rx.try_recv()
     }
 
     /// Returns the direct-pack bind group for this slot, (re)creating it when

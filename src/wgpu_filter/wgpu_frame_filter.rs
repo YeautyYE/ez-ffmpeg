@@ -199,7 +199,6 @@ pub struct WgpuFrameFilter {
 struct InFlightFrame {
     staging: StagingSlot,
     submission: wgpu::SubmissionIndex,
-    map_rx: Receiver<Result<(), wgpu::BufferAsyncError>>,
     /// Submission time, for detecting a wedged device during polling.
     submitted_at: Instant,
     /// Input frame kept alive as the property donor (pts, color tags, ...).
@@ -436,10 +435,8 @@ fn wait_for_map(
     slot: &InFlightFrame,
     block: bool,
 ) -> Result<bool, String> {
-    fn check(
-        rx: &Receiver<Result<(), wgpu::BufferAsyncError>>,
-    ) -> Result<Option<()>, String> {
-        match rx.try_recv() {
+    fn check(slot: &InFlightFrame) -> Result<Option<()>, String> {
+        match slot.staging.map_result() {
             Ok(Ok(())) => Ok(Some(())),
             Ok(Err(e)) => Err(format!("Staging buffer map failed: {e:?}")),
             Err(TryRecvError::Empty) => Ok(None),
@@ -447,14 +444,14 @@ fn wait_for_map(
         }
     }
 
-    if check(&slot.map_rx)?.is_some() {
+    if check(slot)?.is_some() {
         return Ok(true);
     }
     if !block {
         device
             .poll(wgpu::PollType::Poll)
             .map_err(|e| format!("Device poll failed: {e:?}"))?;
-        if check(&slot.map_rx)?.is_some() {
+        if check(slot)?.is_some() {
             return Ok(true);
         }
         if slot.submitted_at.elapsed() > GPU_COMPLETION_TIMEOUT {
@@ -472,7 +469,7 @@ fn wait_for_map(
                 slot.submission.clone(),
             ))
             .map_err(|e| format!("Device poll failed: {e:?}"))?;
-        if check(&slot.map_rx)?.is_some() {
+        if check(slot)?.is_some() {
             return Ok(true);
         }
         // The submission has executed but the map callback has not fired
@@ -677,7 +674,7 @@ impl FrameFilter for WgpuFrameFilter {
                 &self.params,
             ),
         };
-        let (submission, map_rx) = match submitted {
+        let submission = match submitted {
             Ok(v) => v,
             Err(e) => {
                 // Keep the pool consistent even though the job is failing.
@@ -694,7 +691,6 @@ impl FrameFilter for WgpuFrameFilter {
         self.pending.push_back(PendingOutput::Gpu(InFlightFrame {
             staging,
             submission,
-            map_rx,
             submitted_at: Instant::now(),
             src_props: frame,
             _hw: hw_mapped,
