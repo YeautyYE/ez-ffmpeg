@@ -662,7 +662,14 @@ impl RtmpScheduler {
                     // FrozenGop clone is O(1), only increments Arc reference count
                     for frozen_gop in channel.gops.get_frozen_gops() {
                         let frames = frozen_gop.frames();
-                        if !frames.is_empty() {
+                        // Only a GOP that carries a real IDR gives the watcher a
+                        // decodable starting point, so only then may the keyframe
+                        // gate flip. The first GOP is frozen before the first IDR
+                        // (AVC sequence header + pre-roll audio only); if that
+                        // keyframeless GOP flipped the gate, should_send_to_watcher
+                        // would then forward undecodable delta frames to the
+                        // watcher.
+                        if gop_contains_video_keyframe(frames) {
                             client.has_received_video_keyframe = true;
                         }
                         for frame_data in frames {
@@ -961,6 +968,17 @@ fn should_send_to_watcher(
             has_received_video_keyframe || is_sequence_header || channel_is_audio_only
         }
     }
+}
+
+/// Whether replaying `frames` gives a watcher a decodable starting point, i.e.
+/// the GOP contains a real IDR (not merely the AVC sequence header or audio).
+/// Used to gate has_received_video_keyframe during GOP replay: a GOP frozen
+/// before the first IDR must not flip the gate.
+fn gop_contains_video_keyframe(frames: &[FrameData]) -> bool {
+    frames.iter().any(|f| match f {
+        FrameData::Video { data, .. } => is_video_keyframe(data),
+        FrameData::Audio { .. } => false,
+    })
 }
 
 fn is_video_sequence_header(data: &Bytes) -> bool {
@@ -1841,6 +1859,41 @@ mod tests {
             }
             _ => panic!("Expected OutboundPacket"),
         }
+    }
+
+    // The first GOP is frozen before the first IDR and
+    // carries only the AVC sequence header (0x17 0x00) + pre-roll audio. GOP
+    // replay must not mark a watcher as having a keyframe from such a GOP, or
+    // should_send_to_watcher would forward undecodable delta frames to it.
+    #[test]
+    fn keyframeless_gop_does_not_flip_the_replay_keyframe_gate() {
+        let seq_header = FrameData::Video {
+            timestamp: RtmpTimestamp { value: 0 },
+            data: Bytes::from_static(&[0x17, 0x00, 0x00, 0x00, 0x00]),
+        };
+        let pre_roll_audio = FrameData::Audio {
+            timestamp: RtmpTimestamp { value: 0 },
+            data: Bytes::from_static(&[0xaf, 0x01, 0x21]),
+        };
+        // A GOP with only the sequence header and audio (no IDR) must NOT flip.
+        assert!(
+            !gop_contains_video_keyframe(&[seq_header.clone(), pre_roll_audio.clone()]),
+            "a sequence-header-only GOP must not flip the keyframe gate"
+        );
+
+        // A real GOP starts with an IDR (0x17 with AVCPacketType != 0) and must.
+        let idr = FrameData::Video {
+            timestamp: RtmpTimestamp { value: 33 },
+            data: Bytes::from_static(&[0x17, 0x01, 0x00, 0x00, 0x00]),
+        };
+        let delta = FrameData::Video {
+            timestamp: RtmpTimestamp { value: 66 },
+            data: Bytes::from_static(&[0x27, 0x01, 0x00, 0x00, 0x00]),
+        };
+        assert!(
+            gop_contains_video_keyframe(&[idr, delta, pre_roll_audio]),
+            "a GOP containing a real IDR must flip the keyframe gate"
+        );
     }
 }
 
