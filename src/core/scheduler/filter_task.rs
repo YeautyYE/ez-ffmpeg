@@ -2568,25 +2568,6 @@ unsafe fn configure_input_video_filter(
         sar = AVRational { num: 0, den: 1 };
     }
 
-    let mut args = format!(
-        "video_size={}x{}:pix_fmt={}:time_base={}/{}:pixel_aspect={}/{}:colorspace={}:range={}",
-        ifp.width,
-        ifp.height,
-        ifp.format,
-        ifp.time_base.num,
-        ifp.time_base.den,
-        sar.num,
-        sar.den,
-        ifp.color_space as i32,
-        ifp.color_range as i32,
-    );
-    if ifp.opts.framerate.num != 0 && ifp.opts.framerate.den != 0 {
-        args.push_str(&format!(
-            ":frame_rate={}/{}",
-            ifp.opts.framerate.num, ifp.opts.framerate.den
-        ));
-    }
-
     let result = CString::new(format!(
         "graph {fg_index} input from stream {}",
         ifp.opts.name
@@ -2597,26 +2578,37 @@ unsafe fn configure_input_video_filter(
     }
     let name = result.unwrap();
 
-    let Ok(args_cstr) = CString::new(args) else {
+    // All parameters — hw_frames_ctx included — must reach the buffer filter
+    // BEFORE it is initialized: FFmpeg 8 validates a HW pix_fmt against
+    // hw_frames_ctx already in buffersrc's init (EINVAL when it is still
+    // NULL), whereas avfilter_graph_create_filter() initializes right away.
+    // So alloc -> av_buffersrc_parameters_set -> avfilter_init_dict, as
+    // fftools does since n8.0 (ffmpeg_filter.c, commit 53c71777e193). This
+    // ordering behaves identically on FFmpeg 7.x.
+    ifp.filter =
+        ffmpeg_sys_next::avfilter_graph_alloc_filter(graph, buffer_filter, name.as_ptr());
+    if ifp.filter.is_null() {
         av_freep(&mut par as *mut _ as *mut c_void);
-        return AVERROR(EINVAL);
-    };
-    let mut ret = avfilter_graph_create_filter(
-        &mut ifp.filter,
-        buffer_filter,
-        name.as_ptr(),
-        args_cstr.as_ptr(),
-        null_mut(),
-        graph,
-    );
+        return AVERROR(ENOMEM);
+    }
+
+    (*par).format = ifp.format;
+    (*par).time_base = ifp.time_base;
+    (*par).frame_rate = ifp.opts.framerate;
+    (*par).width = ifp.width;
+    (*par).height = ifp.height;
+    (*par).sample_aspect_ratio = sar;
+    (*par).color_space = ifp.color_space;
+    (*par).color_range = ifp.color_range;
+    (*par).hw_frames_ctx = ifp.hw_frames_ctx;
+
+    let mut ret = av_buffersrc_parameters_set(ifp.filter, par);
+    av_freep(&mut par as *mut _ as *mut c_void);
     if ret < 0 {
-        av_freep(&mut par as *mut _ as *mut c_void);
         return ret;
     }
 
-    (*par).hw_frames_ctx = ifp.hw_frames_ctx;
-    ret = av_buffersrc_parameters_set(ifp.filter, par);
-    av_freep(&mut par as *mut _ as *mut c_void);
+    ret = ffmpeg_sys_next::avfilter_init_dict(ifp.filter, null_mut());
     if ret < 0 {
         return ret;
     }
