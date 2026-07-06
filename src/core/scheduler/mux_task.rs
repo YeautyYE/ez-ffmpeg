@@ -12,7 +12,8 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use ffmpeg_next::packet::{Mut, Ref};
 use ffmpeg_next::Packet;
 use ffmpeg_sys_next::AVMediaType::{AVMEDIA_TYPE_AUDIO, AVMEDIA_TYPE_SUBTITLE, AVMEDIA_TYPE_VIDEO};
-use ffmpeg_sys_next::{av_get_audio_frame_duration2, av_interleaved_write_frame, av_packet_rescale_ts, av_rescale_delta, av_rescale_q, av_write_trailer, avformat_write_header, AVFormatContext, AVPacket, AVRational, AVERROR, AVERROR_EOF, AVFMT_NOTIMESTAMPS, AVFMT_TS_NONSTRICT, AV_LOG_DEBUG, AV_LOG_WARNING, AV_NOPTS_VALUE, AV_PKT_FLAG_KEY, AV_TIME_BASE_Q, EAGAIN};
+use ffmpeg_sys_next::{av_compare_ts, av_get_audio_frame_duration2, av_interleaved_write_frame, av_packet_rescale_ts, av_rescale_delta, av_rescale_q, av_write_trailer, avformat_write_header, AVFormatContext, AVPacket, AVRational, AVERROR, AVERROR_EOF, AVFMT_NOTIMESTAMPS, AVFMT_TS_NONSTRICT, AV_LOG_DEBUG, AV_LOG_WARNING, AV_NOPTS_VALUE, AV_PKT_FLAG_KEY, AV_TIME_BASE_Q, EAGAIN};
+use std::collections::VecDeque;
 use log::{debug, error, info, trace, warn};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
@@ -194,10 +195,54 @@ fn mux_task_start(mux_idx: usize,
     // Drain the pre-queues and open the gate atomically: an encoder that
     // saw the gate closed cannot park a packet after this drain ran.
     mux_start_gate.start_with(|| {
-        for src_pre_receiver in &src_pre_receivers {
-            while let Ok(packet_box) = src_pre_receiver.try_recv() {
-                let _ = queue_sender.send(packet_box);
+        // fftools 242ee7b0: flushing the queues stream-by-stream hands the
+        // muxer long single-stream runs that can overflow
+        // max_interleave_delta and degrade interleaving. Snapshot every
+        // queue (the gate locks all senders out for the whole closure) and
+        // merge across them by DTS instead.
+        let mut queues: Vec<VecDeque<PacketBox>> = src_pre_receivers
+            .iter()
+            .map(|receiver| {
+                let mut queue = VecDeque::new();
+                while let Ok(packet_box) = receiver.try_recv() {
+                    queue.push_back(packet_box);
+                }
+                queue
+            })
+            .collect();
+
+        loop {
+            let mut min_stream = None;
+            let mut min_ts: Option<(i64, AVRational)> = None;
+
+            // find the queue whose front packet has the earliest dts; a
+            // missing timestamp or timebase wins immediately, mirroring the
+            // NULL/AV_NOPTS_VALUE short-circuit upstream
+            for (i, queue) in queues.iter().enumerate() {
+                let Some(front) = queue.front() else { continue };
+                // SAFETY: the box owns a live packet parked by an encoder.
+                let (dts, tb) = unsafe {
+                    let pkt = front.packet.as_ptr();
+                    ((*pkt).dts, (*pkt).time_base)
+                };
+                if dts == AV_NOPTS_VALUE || tb.num <= 0 || tb.den <= 0 {
+                    min_stream = Some(i);
+                    break;
+                }
+                match min_ts {
+                    // SAFETY: pure arithmetic on validated timebases.
+                    Some((min_dts, min_tb))
+                        if unsafe { av_compare_ts(min_dts, min_tb, dts, tb) } <= 0 => {}
+                    _ => {
+                        min_stream = Some(i);
+                        min_ts = Some((dts, tb));
+                    }
+                }
             }
+
+            let Some(i) = min_stream else { break };
+            let packet_box = queues[i].pop_front().unwrap();
+            let _ = queue_sender.send(packet_box);
         }
     });
     Ok(())
