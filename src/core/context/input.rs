@@ -884,6 +884,19 @@ impl Input {
     /// the decode process.
     /// Must be compatible with the chosen hardware accel and device.
     ///
+    /// # Performance: avoid a double copy on hardware transcode
+    ///
+    /// Modern `set_hwaccel("cuda"/"vaapi")` without this option keeps the decoder
+    /// output at `AV_PIX_FMT_NONE`, matching the FFmpeg CLI. That is **not**
+    /// zero-copy: every decoded frame is downloaded from the GPU to system memory,
+    /// and a hardware encoder then uploads it right back. For a pure hardware
+    /// pipeline (hardware decode straight into a hardware encoder such as
+    /// `h264_nvenc`/`hevc_vaapi`, with no software filter), pair the accel with the
+    /// device output format — `.set_hwaccel_output_format("cuda")` /
+    /// `("vaapi")` — so frames stay device-resident and skip the download/upload
+    /// round trip. Leave it unset when a **software** filter or encoder consumes
+    /// the frames, or they would receive undownloaded GPU frames.
+    ///
     /// # Parameters
     /// - `format`: A string naming the desired output pixel format (e.g. `"nv12"`).
     ///
@@ -892,6 +905,7 @@ impl Input {
     ///
     /// # Example
     /// ```rust,ignore
+    /// // Pure GPU transcode: keep frames on the device (no double copy).
     /// let input = Input::from("video.mp4")
     ///     .set_hwaccel("cuda")
     ///     .set_hwaccel_output_format("cuda");
