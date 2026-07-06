@@ -2,6 +2,26 @@ use crate::core::filter::frame_filter_context::FrameFilterContext;
 use ffmpeg_sys_next::AVMediaType;
 use ffmpeg_next::Frame;
 
+/// Declares whether a filter's [`request_frame`](FrameFilter::request_frame) can
+/// produce frames on its own, so the pipeline knows whether it must poll it.
+///
+/// The default is [`MayProduce`](RequestFrameMode::MayProduce), which preserves
+/// the historical behavior (every filter is polled). Filters that only ever
+/// transform their input — passthroughs, metadata taps — should return
+/// [`Never`](RequestFrameMode::Never): a pipeline whose filters are all `Never`
+/// blocks on its input instead of waking ~1000×/sec to poll no-op filters
+/// (PERF-8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestFrameMode {
+    /// `request_frame` never yields a frame during normal operation; the
+    /// pipeline never polls this filter.
+    Never,
+    /// `request_frame` may yield frames independently of input — a generator
+    /// source, or a filter releasing delayed / asynchronous output (e.g. the GPU
+    /// pipeline). The pipeline polls this filter.
+    MayProduce,
+}
+
 pub trait FrameFilter: Send {
     /// Returns the media type this filter operates on.
     ///
@@ -80,6 +100,14 @@ pub trait FrameFilter: Send {
         Ok(None)
     }
 
+    /// Declares whether [`request_frame`](FrameFilter::request_frame) can produce
+    /// frames autonomously. Returning [`RequestFrameMode::Never`] lets the
+    /// pipeline stop polling this filter (PERF-8). The default preserves the
+    /// historical always-polled behavior for third-party generator filters.
+    fn request_frame_mode(&self) -> RequestFrameMode {
+        RequestFrameMode::MayProduce
+    }
+
     /// Cleans up the filter.
     ///
     /// This method is called when the filter is removed from the pipeline or when
@@ -113,5 +141,9 @@ impl FrameFilter for NoopFilter {
 
     fn filter_frame(&mut self, frame: Frame, _ctx: &FrameFilterContext) -> Result<Option<Frame>, String> {
         Ok(Some(frame))
+    }
+
+    fn request_frame_mode(&self) -> RequestFrameMode {
+        RequestFrameMode::Never
     }
 }
