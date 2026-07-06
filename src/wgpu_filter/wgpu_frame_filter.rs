@@ -148,6 +148,7 @@ impl WgpuFrameFilterBuilder {
             stats: Arc::new(Mutex::new(WgpuFilterStats::default())),
             gpu: None,
             pending: VecDeque::new(),
+            copy_output_pool: None,
             recycle: mpsc::channel(),
         })
     }
@@ -184,6 +185,10 @@ pub struct WgpuFrameFilter {
     stats: Arc<Mutex<WgpuFilterStats>>,
     gpu: Option<GpuState>,
     pending: VecDeque<PendingOutput>,
+    /// Per-geometry pool backing the default copy-path output frames, so each
+    /// frame reuses a pooled `AVBufferRef` instead of a fresh per-frame
+    /// allocation. Rebuilt when the output geometry changes.
+    copy_output_pool: Option<frame_io::OutputFramePool>,
     /// Return path for zero-copy staging buffers: the AVBuffer free callback
     /// sends `(buffer, size)` from whichever thread drops the last frame
     /// reference; `filter_frame` drains it back into the staging pool.
@@ -300,6 +305,24 @@ impl WgpuFrameFilter {
         }
     }
 
+    /// Returns the copy-path output pool for `geo`, rebuilding it when the
+    /// geometry changed. Replacing the pool drops the old one
+    /// (`av_buffer_pool_uninit`); frames already handed downstream keep their
+    /// own `AVBufferRef`, so the old buffers survive until those refs drop.
+    fn copy_output_pool_for(
+        &mut self,
+        geo: OutputGeometry,
+    ) -> Result<&frame_io::OutputFramePool, String> {
+        let stale = match &self.copy_output_pool {
+            Some(pool) => pool.key() != geo,
+            None => true,
+        };
+        if stale {
+            self.copy_output_pool = Some(frame_io::OutputFramePool::new(geo)?);
+        }
+        Ok(self.copy_output_pool.as_ref().expect("pool set above"))
+    }
+
     /// Completes the oldest in-flight GPU frame in place: it keeps its output
     /// queue position, morphing from `Gpu` to `Done`. With `block = false`
     /// this returns `Ok(false)` when the result is not ready yet; with
@@ -342,7 +365,11 @@ impl WgpuFrameFilter {
             )?
         } else {
             let mapped = slot.staging.slice(..).get_mapped_range();
-            let built = frame_io::build_output_frame(&mapped, &slot.geo, &slot.src_props);
+            // Fold the pool lookup into `built` so the staging buffer is always
+            // unmapped below, even if the pool has to be (re)built and fails.
+            let built = self
+                .copy_output_pool_for(slot.geo)
+                .and_then(|pool| pool.build_frame(&mapped, &slot.src_props));
             drop(mapped);
             slot.staging.unmap();
             let frame = built?;

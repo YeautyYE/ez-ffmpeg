@@ -8,10 +8,11 @@ use crate::wgpu_filter::hw_interop::{self, ImportedNv12};
 use crate::wgpu_filter::params::SharedParams;
 use ffmpeg_next::Frame;
 use ffmpeg_sys_next::{
-    av_buffer_create, av_frame_copy_props, av_frame_get_buffer, av_hwframe_map,
-    av_hwframe_transfer_data, av_q2d, AVDRMFrameDescriptor, AVPixelFormat,
-    AV_BUFFER_FLAG_READONLY, AV_HWFRAME_MAP_READ,
+    av_buffer_create, av_buffer_pool_get, av_buffer_pool_init, av_buffer_pool_uninit,
+    av_frame_copy_props, av_frame_get_buffer, av_hwframe_map, av_hwframe_transfer_data, av_q2d,
+    AVBufferPool, AVDRMFrameDescriptor, AVPixelFormat, AV_BUFFER_FLAG_READONLY, AV_HWFRAME_MAP_READ,
 };
+use std::ptr::NonNull;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 
@@ -411,85 +412,218 @@ pub(crate) fn encode_and_submit(
     Ok((submission, rx))
 }
 
-/// Builds a YUV420P output frame from mapped readback bytes, copying frame
-/// properties (pts, color tags, ...) from `src`.
-pub(crate) fn build_output_frame(
-    mapped: &[u8],
-    geo: &OutputGeometry,
-    src: &Frame,
-) -> Result<Frame, String> {
-    let out_w = geo.out_w as usize;
-    let out_h = geo.out_h as usize;
-    let out_cw = geo.out_w.div_ceil(2) as usize;
-    let out_ch = geo.out_h.div_ceil(2) as usize;
+/// Fixed plane layout of the pooled YUV420P output, captured once from a real
+/// `av_frame_get_buffer(..., 4)` template so the pool reproduces FFmpeg's exact
+/// linesizes, height padding, and per-plane byte offsets instead of a
+/// hand-rolled tight layout.
+struct OutputFrameLayout {
+    /// Size of one pooled buffer, equal to the template's `buf[0]->size`.
+    pool_buffer_size: usize,
+    /// FFmpeg linesizes for planes 0..=3 (Y, U, V, unused-for-420p).
+    linesize: [i32; 4],
+    /// Byte offset of each plane's `data[i]` within the single pooled buffer.
+    plane_offset: [usize; 3],
+}
 
-    let y_end = geo.y_stride * out_h;
-    let u_end = y_end + geo.c_stride * out_ch;
-    let v_end = u_end + geo.c_stride * out_ch;
-    if mapped.len() < v_end {
-        return Err(format!(
-            "Mapped readback too small: {} bytes, need {v_end}",
-            mapped.len()
-        ));
+/// Per-geometry pool of YUV420P output buffers for the default (copy) readback
+/// path. A single [`AVBufferPool`] recycles same-sized buffers; each built
+/// frame owns an independent `AVBufferRef` obtained from the pool, so its
+/// lifetime is driven by FFmpeg refcounting (fan-out `av_frame_ref`, encoder
+/// hold, ...) exactly like a freshly allocated frame. Replacing the pool on a
+/// geometry change is safe: outstanding frames keep their own `AVBufferRef`
+/// and the pool defers its final free until the last buffer is released.
+pub(crate) struct OutputFramePool {
+    key: OutputGeometry,
+    layout: OutputFrameLayout,
+    pool: NonNull<AVBufferPool>,
+}
+
+// SAFETY: `AVBufferPool` is documented as a lock-free thread-safe pool of
+// AVBuffers (FFmpeg libavutil/buffer.h): `av_buffer_pool_get` and the buffer
+// free path that returns a buffer to the pool are safe from multiple threads
+// as long as the default alloc callback is used — which it is here
+// (`av_buffer_pool_init(size, None)`). The `OutputFramePool` itself is only
+// used from the owning filter thread; downstream threads that drop a frame's
+// last reference merely trigger `AVBufferRef` release, which the pool handles
+// internally. The `NonNull` pointer is not otherwise shared.
+unsafe impl Send for OutputFramePool {}
+
+impl OutputFramePool {
+    /// Builds a pool for `key`. Allocates one throwaway template frame via
+    /// `av_frame_get_buffer(..., 4)` to inherit FFmpeg's exact plane layout,
+    /// then initialises an `AVBufferPool` of that buffer size.
+    pub(crate) fn new(key: OutputGeometry) -> Result<Self, String> {
+        // SAFETY: `template` is a freshly allocated frame; av_frame_get_buffer
+        // sizes and lays out its single `buf[0]` for us. We only read scalar
+        // fields and pointer differences before the template is freed on drop.
+        let layout = unsafe {
+            let mut template = Frame::empty();
+            let p = template.as_mut_ptr();
+            if p.is_null() {
+                return Err("Failed to allocate output pool template frame".to_string());
+            }
+            (*p).width = key.out_w as i32;
+            (*p).height = key.out_h as i32;
+            (*p).format = AVPixelFormat::AV_PIX_FMT_YUV420P as i32;
+            // align=4 matches the GPU-side packed strides so copy_plane keeps
+            // its contiguous fast path; the copies still consult the recorded
+            // linesizes, so any allocator layout stays correct.
+            let ret = av_frame_get_buffer(p, 4);
+            if ret < 0 {
+                return Err(format!(
+                    "Failed to allocate output pool template buffer: {}",
+                    av_err2str(ret)
+                ));
+            }
+            let buf0 = (*p).buf[0];
+            if buf0.is_null() {
+                return Err("Output pool template frame has no backing buffer".to_string());
+            }
+            // av_frame_get_buffer packs all YUV420P planes into a single
+            // buf[0] (FFmpeg get_video_buffer), so every data[i] is an offset
+            // into buf0->data.
+            let base = (*buf0).data as usize;
+            let pool_buffer_size = (*buf0).size;
+            let linesize = [
+                (*p).linesize[0],
+                (*p).linesize[1],
+                (*p).linesize[2],
+                (*p).linesize[3],
+            ];
+            let mut plane_offset = [0usize; 3];
+            for (i, off) in plane_offset.iter_mut().enumerate() {
+                let d = (*p).data[i];
+                if d.is_null() {
+                    return Err(format!("Output pool template plane {i} is null"));
+                }
+                *off = (d as usize).checked_sub(base).ok_or_else(|| {
+                    format!("Output pool template plane {i} lies before its buffer base")
+                })?;
+                if off.saturating_add(1) > pool_buffer_size {
+                    return Err(format!(
+                        "Output pool template plane {i} offset {off} exceeds buffer size \
+                         {pool_buffer_size}"
+                    ));
+                }
+            }
+            OutputFrameLayout {
+                pool_buffer_size,
+                linesize,
+                plane_offset,
+            }
+        };
+
+        // SAFETY: passing the default alloc callback (None) makes the pool
+        // thread-safe per FFmpeg's contract; size came from the template.
+        let pool = unsafe { av_buffer_pool_init(layout.pool_buffer_size, None) };
+        let pool = NonNull::new(pool)
+            .ok_or_else(|| "av_buffer_pool_init returned null".to_string())?;
+        Ok(OutputFramePool { key, layout, pool })
     }
 
-    // SAFETY: `out` is freshly allocated; av_frame_get_buffer sizes each plane
-    // to at least linesize * rows, which bounds every slice below.
-    // `src` is only read through FFmpeg's own props-copy API.
-    unsafe {
-        let mut out = Frame::empty();
-        let p = out.as_mut_ptr();
-        if p.is_null() {
-            return Err("Failed to allocate output frame".to_string());
-        }
-        (*p).width = geo.out_w as i32;
-        (*p).height = geo.out_h as i32;
-        (*p).format = AVPixelFormat::AV_PIX_FMT_YUV420P as i32;
-        // align=4 makes FFmpeg's linesizes equal to the GPU-side strides
-        // (both round the 8-bit plane width up to 4), so every copy_plane
-        // below takes its contiguous fast path. The copies still consult the
-        // actual linesize, so a different allocator choice stays correct.
-        let ret = av_frame_get_buffer(p, 4);
-        if ret < 0 {
+    /// Geometry this pool is keyed on. The filter rebuilds the pool when the
+    /// current geometry no longer matches.
+    pub(crate) fn key(&self) -> OutputGeometry {
+        self.key
+    }
+
+    /// Builds a YUV420P output frame from mapped readback bytes into a
+    /// pool-owned buffer, copying frame properties (pts, color tags, ...) from
+    /// `src`.
+    pub(crate) fn build_frame(&self, mapped: &[u8], src: &Frame) -> Result<Frame, String> {
+        let geo = &self.key;
+        let out_w = geo.out_w as usize;
+        let out_h = geo.out_h as usize;
+        let out_cw = geo.out_w.div_ceil(2) as usize;
+        let out_ch = geo.out_h.div_ceil(2) as usize;
+
+        let y_end = geo.y_stride * out_h;
+        let u_end = y_end + geo.c_stride * out_ch;
+        let v_end = u_end + geo.c_stride * out_ch;
+        if mapped.len() < v_end {
             return Err(format!(
-                "Failed to allocate output frame buffer: {}",
-                av_err2str(ret)
+                "Mapped readback too small: {} bytes, need {v_end}",
+                mapped.len()
             ));
         }
-        let ret = av_frame_copy_props(p, src.as_ptr());
-        if ret < 0 {
-            return Err(format!("Failed to copy frame props: {}", av_err2str(ret)));
+
+        // SAFETY: `out` is freshly allocated. `buf[0]` is a pool buffer of
+        // `pool_buffer_size` bytes laid out identically to the template
+        // av_frame_get_buffer(4) produced, so every plane's `offset + stride *
+        // rows` stays within it (the template padded height to 32, which
+        // bounds each `stride * out_rows` slice below). `src` is only read
+        // through FFmpeg's props-copy API. On any error before `out` is
+        // returned, dropping `out` releases `buf[0]` back to the pool.
+        unsafe {
+            let mut out = Frame::empty();
+            let p = out.as_mut_ptr();
+            if p.is_null() {
+                return Err("Failed to allocate output frame".to_string());
+            }
+            let buf = av_buffer_pool_get(self.pool.as_ptr());
+            if buf.is_null() {
+                return Err("av_buffer_pool_get returned null".to_string());
+            }
+            let base = (*buf).data;
+
+            (*p).width = geo.out_w as i32;
+            (*p).height = geo.out_h as i32;
+            (*p).format = AVPixelFormat::AV_PIX_FMT_YUV420P as i32;
+            (*p).buf[0] = buf;
+            (*p).data[0] = base.add(self.layout.plane_offset[0]);
+            (*p).data[1] = base.add(self.layout.plane_offset[1]);
+            (*p).data[2] = base.add(self.layout.plane_offset[2]);
+            (*p).linesize[0] = self.layout.linesize[0];
+            (*p).linesize[1] = self.layout.linesize[1];
+            (*p).linesize[2] = self.layout.linesize[2];
+
+            let ret = av_frame_copy_props(p, src.as_ptr());
+            if ret < 0 {
+                return Err(format!("Failed to copy frame props: {}", av_err2str(ret)));
+            }
+            (*p).time_base = (*src.as_ptr()).time_base;
+            // The packed output is always 4:2:0 planar; color matrix/range
+            // tags carried over by copy_props stay correct by construction of
+            // the convert/pack passes.
+
+            let dst_y_stride = self.layout.linesize[0] as usize;
+            let dst_u_stride = self.layout.linesize[1] as usize;
+            let dst_v_stride = self.layout.linesize[2] as usize;
+            let dst_y = std::slice::from_raw_parts_mut((*p).data[0], dst_y_stride * out_h);
+            let dst_u = std::slice::from_raw_parts_mut((*p).data[1], dst_u_stride * out_ch);
+            let dst_v = std::slice::from_raw_parts_mut((*p).data[2], dst_v_stride * out_ch);
+
+            copy_plane(&mapped[..y_end], geo.y_stride, dst_y, dst_y_stride, out_w, out_h);
+            copy_plane(
+                &mapped[y_end..u_end],
+                geo.c_stride,
+                dst_u,
+                dst_u_stride,
+                out_cw,
+                out_ch,
+            );
+            copy_plane(
+                &mapped[u_end..v_end],
+                geo.c_stride,
+                dst_v,
+                dst_v_stride,
+                out_cw,
+                out_ch,
+            );
+            Ok(out)
         }
-        (*p).time_base = (*src.as_ptr()).time_base;
-        // The packed output is always 4:2:0 planar; color matrix/range tags
-        // carried over by copy_props stay correct by construction of the
-        // convert/pack passes.
+    }
+}
 
-        let dst_y_stride = (*p).linesize[0] as usize;
-        let dst_u_stride = (*p).linesize[1] as usize;
-        let dst_v_stride = (*p).linesize[2] as usize;
-        let dst_y = std::slice::from_raw_parts_mut((*p).data[0], dst_y_stride * out_h);
-        let dst_u = std::slice::from_raw_parts_mut((*p).data[1], dst_u_stride * out_ch);
-        let dst_v = std::slice::from_raw_parts_mut((*p).data[2], dst_v_stride * out_ch);
-
-        copy_plane(&mapped[..y_end], geo.y_stride, dst_y, dst_y_stride, out_w, out_h);
-        copy_plane(
-            &mapped[y_end..u_end],
-            geo.c_stride,
-            dst_u,
-            dst_u_stride,
-            out_cw,
-            out_ch,
-        );
-        copy_plane(
-            &mapped[u_end..v_end],
-            geo.c_stride,
-            dst_v,
-            dst_v_stride,
-            out_cw,
-            out_ch,
-        );
-        Ok(out)
+impl Drop for OutputFramePool {
+    fn drop(&mut self) {
+        // SAFETY: `pool` is a valid pool from av_buffer_pool_init. uninit marks
+        // it freeable; buffers still held by live frames keep the pool alive
+        // internally and are freed when their last reference drops.
+        unsafe {
+            let mut p = self.pool.as_ptr();
+            av_buffer_pool_uninit(&mut p);
+        }
     }
 }
 

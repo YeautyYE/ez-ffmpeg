@@ -9,8 +9,9 @@ use log::info;
 
 /// Output-plane geometry captured per submitted frame, so in-flight readbacks
 /// stay valid even if `FrameResources` is rebuilt for a new input size while
-/// they are still on the GPU.
-#[derive(Clone, Copy, Debug)]
+/// they are still on the GPU. Also the pool key for the copy-path output
+/// frame pool, hence `Eq`/`Hash`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct OutputGeometry {
     pub(crate) out_w: u32,
     pub(crate) out_h: u32,
