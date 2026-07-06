@@ -2578,6 +2578,17 @@ unsafe fn configure_input_video_filter(
     }
     let name = result.unwrap();
 
+    // Checked descriptor lookup BEFORE the buffer filter is initialized:
+    // av_buffersrc_parameters_set copies any non-NONE format through, and
+    // FFmpeg 8's buffersrc init dereferences the format descriptor without a
+    // NULL check, so an out-of-range value must be rejected here — matching
+    // the old args path, whose AVOption parsing rejected it at filter
+    // creation.
+    let Some(desc) = crate::util::format_convert::pix_fmt_desc_from_raw(ifp.format) else {
+        av_freep(&mut par as *mut _ as *mut c_void);
+        return AVERROR(ffmpeg_sys_next::EINVAL);
+    };
+
     // All parameters — hw_frames_ctx included — must reach the buffer filter
     // BEFORE it is initialized: FFmpeg 8 validates a HW pix_fmt against
     // hw_frames_ctx already in buffersrc's init (EINVAL when it is still
@@ -2614,11 +2625,6 @@ unsafe fn configure_input_video_filter(
     }
 
     let mut last_filter = ifp.filter;
-    // Checked descriptor lookup: reject an invalid/unknown format instead of
-    // transmuting into an out-of-range enum and dereferencing a null descriptor.
-    let Some(desc) = crate::util::format_convert::pix_fmt_desc_from_raw(ifp.format) else {
-        return AVERROR(ffmpeg_sys_next::EINVAL);
-    };
 
     /*if (ifp.opts.flags & IFILTER_FLAG_CROP) {
         char crop_buf[64];
