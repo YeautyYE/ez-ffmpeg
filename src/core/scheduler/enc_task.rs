@@ -621,6 +621,34 @@ fn set_encoder_opts(enc_stream: &EncoderStream, video_codec_opts: &Option<HashMa
             );
         }
     }
+
+    // Default software encoders to auto (multi-)threading, matching the ffmpeg
+    // CLI: fftools/ffmpeg_mux_init.c sets thread_count = 0 ("auto") on the
+    // encoder context when the user did not pass a `threads` option. Without
+    // this, libavcodec's default of thread_count = 1 pins the encode stage —
+    // usually the most expensive stage of a software transcode — to a single
+    // core. Hardware encoders ignore thread_count, so no codec gating beyond
+    // media type is needed; subtitles are excluded. A user-supplied `threads`
+    // (applied above via the opts dict) is preserved by only defaulting when
+    // absent.
+    if enc_stream.codec_type == AVMEDIA_TYPE_VIDEO
+        || enc_stream.codec_type == AVMEDIA_TYPE_AUDIO
+    {
+        let codec_opts = if enc_stream.codec_type == AVMEDIA_TYPE_VIDEO {
+            video_codec_opts
+        } else {
+            audio_codec_opts
+        };
+        let user_set_threads = codec_opts
+            .as_ref()
+            .is_some_and(|m| m.keys().any(|k| k.as_bytes() == b"threads"));
+        if !user_set_threads {
+            unsafe {
+                (*enc_ctx_box.as_mut_ptr()).thread_count = 0;
+            }
+        }
+    }
+
     Ok(())
 }
 
