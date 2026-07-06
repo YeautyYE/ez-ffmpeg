@@ -20,6 +20,8 @@ use ffmpeg_sys_next::AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC;
 use ffmpeg_sys_next::AVColorRange::AVCOL_RANGE_UNSPECIFIED;
 use ffmpeg_sys_next::AVColorSpace::AVCOL_SPC_UNSPECIFIED;
 use ffmpeg_sys_next::AVFrameSideDataType::AV_FRAME_DATA_DISPLAYMATRIX;
+#[cfg(ffmpeg_8_0)]
+use ffmpeg_sys_next::AVFrameSideDataType::AV_FRAME_DATA_DOWNMIX_INFO;
 use ffmpeg_sys_next::AVMediaType::{AVMEDIA_TYPE_AUDIO, AVMEDIA_TYPE_SUBTITLE, AVMEDIA_TYPE_VIDEO};
 use ffmpeg_sys_next::AVOptionType::AV_OPT_TYPE_BINARY;
 use ffmpeg_sys_next::AVPixelFormat::AV_PIX_FMT_NONE;
@@ -332,6 +334,13 @@ struct InputFilterParameter {
     // read) on FFmpeg 8+; stays empty on 7.x — hence dead there by design.
     #[cfg_attr(not(ffmpeg_8_0), allow(dead_code))]
     side_data: SideDataList,
+    // Most recent downmix info seen on input frames; a change forces a graph
+    // reinit because aresample consumes it at init time (fftools
+    // 4f9afbb1b2; FFmpeg 8+ only).
+    #[cfg(ffmpeg_8_0)]
+    downmixinfo_present: bool,
+    #[cfg(ffmpeg_8_0)]
+    downmixinfo: ffmpeg_sys_next::AVDownmixInfo,
     filter: *mut AVFilterContext,
 
     frame_queue: VecDeque<FrameBox>,
@@ -371,6 +380,12 @@ impl InputFilterParameter {
             displaymatrix_applied: false,
             displaymatrix: [0; 9],
             side_data: SideDataList::new(),
+            #[cfg(ffmpeg_8_0)]
+            downmixinfo_present: false,
+            // SAFETY: plain-old-data struct; all-zeroes is the fftools zero
+            // init (type 0 = AV_DOWNMIX_TYPE_UNKNOWN).
+            #[cfg(ffmpeg_8_0)]
+            downmixinfo: unsafe { std::mem::zeroed() },
             filter: null_mut(),
             frame_queue: Default::default(),
             eof: false,
@@ -573,7 +588,11 @@ unsafe fn fg_send_eof(
 const VIDEO_CHANGED: i32 = 1 << 0;
 const AUDIO_CHANGED: i32 = 1 << 1;
 const MATRIX_CHANGED: i32 = 1 << 2;
-const HWACCEL_CHANGED: i32 = 1 << 3;
+// Bit 3 belongs to DOWNMIX_CHANGED so the numbering stays aligned with the
+// fftools n8.1 ReinitReason enum (which moved HWACCEL to 1 << 4 as well).
+#[cfg(ffmpeg_8_0)]
+const DOWNMIX_CHANGED: i32 = 1 << 3;
+const HWACCEL_CHANGED: i32 = 1 << 4;
 #[cfg(docsrs)]
 unsafe fn fg_send_frame(
     fg_index: usize,
@@ -644,6 +663,26 @@ unsafe fn fg_send_frame(
         }
     } else if ifp.displaymatrix_present {
         need_reinit |= MATRIX_CHANGED;
+    }
+
+    // Check downmix info (FFmpeg 8+, fftools 4f9afbb1b2): aresample consumes
+    // it at graph init, so a change between frames requires a reinit.
+    #[cfg(ffmpeg_8_0)]
+    {
+        let sd = av_frame_get_side_data(frame, AV_FRAME_DATA_DOWNMIX_INFO);
+        if !sd.is_null() {
+            if !ifp.downmixinfo_present
+                || std::slice::from_raw_parts((*sd).data, size_of_val(&ifp.downmixinfo))
+                    != std::slice::from_raw_parts(
+                        &ifp.downmixinfo as *const _ as *const u8,
+                        size_of_val(&ifp.downmixinfo),
+                    )
+            {
+                need_reinit |= DOWNMIX_CHANGED;
+            }
+        } else if ifp.downmixinfo_present {
+            need_reinit |= DOWNMIX_CHANGED;
+        }
     }
 
     // Always allow reinit
@@ -720,6 +759,12 @@ unsafe fn fg_send_frame(
             if need_reinit & MATRIX_CHANGED != 0 {
                 let matrix_changed_str = CString::new("display matrix changed, ").unwrap();
                 av_bprintf(&mut reason, matrix_changed_str.as_ptr());
+            }
+
+            #[cfg(ffmpeg_8_0)]
+            if need_reinit & DOWNMIX_CHANGED != 0 {
+                let downmix_changed_str = CString::new("downmix metadata changed, ").unwrap();
+                av_bprintf(&mut reason, downmix_changed_str.as_ptr());
             }
 
             if need_reinit & HWACCEL_CHANGED != 0 {
@@ -2178,6 +2223,34 @@ fn ifilter_parameters_from_frame(
             ifp.displaymatrix_present = true;
         } else {
             ifp.displaymatrix_present = false;
+        }
+
+        // Copy downmix-related side data to the input filter parameters so
+        // it reaches the filter chain even though it is not "global":
+        // filters like aresample need it during init, not when remixing a
+        // frame (fftools ifilter_parameters_from_frame, n8.1).
+        #[cfg(ffmpeg_8_0)]
+        {
+            let sd = av_frame_get_side_data(frame, AV_FRAME_DATA_DOWNMIX_INFO);
+            if !sd.is_null() {
+                let ret = ifp.side_data.push_clone(sd, 0);
+                if ret < 0 {
+                    error!("Clone downmix side data error: {}", av_err2str(ret));
+                    return Err(Error::FilterGraph(
+                        FilterGraphOperationError::FrameSideDataCloneError(
+                            FilterGraphError::from(ret),
+                        ),
+                    ));
+                }
+                std::ptr::copy_nonoverlapping(
+                    (*sd).data as *const ffmpeg_sys_next::AVDownmixInfo,
+                    &mut ifp.downmixinfo,
+                    1,
+                );
+                ifp.downmixinfo_present = true;
+            } else {
+                ifp.downmixinfo_present = false;
+            }
         }
 
         Ok(())
