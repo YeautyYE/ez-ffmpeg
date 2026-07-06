@@ -2,6 +2,7 @@ use crate::core::context::output::Output;
 use crate::error::Error::{RtmpCreateStream, RtmpStreamAlreadyExists};
 use crate::flv::flv_buffer::FlvBuffer;
 use crate::flv::flv_tag::FlvTag;
+use crate::rtmp::poller::{waker_pair, WakeHandle, Waker};
 use crate::rtmp::reactor::{effective_max_connections, Reactor, CHANNEL_HEADROOM};
 use bytes::{BufMut, Bytes};
 use log::{debug, error, info, warn};
@@ -30,6 +31,8 @@ pub struct EmbedRtmpServer<S> {
     stream_keys: dashmap::DashSet<String>,
     // stream_key bytes_receiver
     publisher_sender: Option<crossbeam_channel::Sender<(String, crossbeam_channel::Receiver<Vec<u8>>)>>,
+    /// Producer-side wakeup for the reactor (PERF-3), set in `start()`.
+    wake_handle: Option<WakeHandle>,
     gop_limit: usize,
     max_connections: Option<usize>,
     state: PhantomData<S>,
@@ -47,6 +50,7 @@ impl<S: 'static> EmbedRtmpServer<S> {
             status: self.status,
             stream_keys: self.stream_keys,
             publisher_sender: self.publisher_sender,
+            wake_handle: self.wake_handle,
             gop_limit: self.gop_limit,
             max_connections: self.max_connections,
             state: Default::default(),
@@ -106,6 +110,7 @@ impl EmbedRtmpServer<Initialization> {
             status: Arc::new(AtomicUsize::new(STATUS_INIT)),
             stream_keys: Default::default(),
             publisher_sender: None,
+            wake_handle: None,
             gop_limit,
             max_connections: None,
             state: Default::default(),
@@ -159,12 +164,21 @@ impl EmbedRtmpServer<Initialization> {
         let (stream_sender, stream_receiver) = crossbeam_channel::bounded(channel_capacity);
         let (publisher_sender, publisher_receiver) = crossbeam_channel::bounded(1024);
         self.publisher_sender = Some(publisher_sender);
+
+        // PERF-3: create the reactor wakeup pair. The Waker (read side) is moved
+        // into the worker thread and registered with the poller; the WakeHandle
+        // (write side) is kept here so create_rtmp_input can signal the reactor
+        // the instant media is queued.
+        let (waker, wake_handle) = waker_pair()
+            .map_err(|e| <std::io::Error as Into<crate::error::Error>>::into(e))?;
+        self.wake_handle = Some(wake_handle);
+
         let stream_keys = self.stream_keys.clone();
         let status = self.status.clone();
         let max_connections = self.max_connections;
         let result = std::thread::Builder::new()
             .name("rtmp-server-worker".to_string())
-            .spawn(move || handle_connections(stream_receiver, publisher_receiver, stream_keys, self.gop_limit, max_connections, status));
+            .spawn(move || handle_connections(stream_receiver, publisher_receiver, stream_keys, self.gop_limit, max_connections, status, waker));
         if let Err(e) = result {
             error!("Thread[rtmp-server-worker] exited with error: {e}");
             return Err(crate::error::Error::RtmpThreadExited);
@@ -306,6 +320,10 @@ impl EmbedRtmpServer<Running> {
         stream_key: impl Into<String>,
     ) -> crate::error::Result<Output> {
         let message_sender = self.create_stream_sender(app_name, stream_key)?;
+        // PERF-3: signal the reactor when media is queued so it does not wait
+        // for the poll-timeout fallback. Only this internal path holds a
+        // WakeHandle; raw create_stream_sender users fall back to the timeout.
+        let wake_handle = self.wake_handle.clone();
 
         let mut flv_buffer = FlvBuffer::new();
         let mut serializer = ChunkSerializer::new();
@@ -318,9 +336,17 @@ impl EmbedRtmpServer<Running> {
                 flv_tag.header.stream_id = 1;
                 match serializer.serialize(&flv_tag_to_message_payload(flv_tag), false, true) {
                     Ok(packet) => {
+                        // Wake only on an empty->non-empty transition so a burst
+                        // of tags coalesces into a single reactor wakeup.
+                        let was_empty = message_sender.is_empty();
                         if let Err(e) = message_sender.send(packet.bytes) {
                             error!("Failed to send RTMP packet: {:?}", e);
                             return -1;
+                        }
+                        if was_empty {
+                            if let Some(waker) = &wake_handle {
+                                waker.wake();
+                            }
                         }
                     }
                     Err(e) => {
@@ -540,6 +566,7 @@ fn handle_connections(
     gop_limit: usize,
     max_connections: Option<usize>,
     status: Arc<AtomicUsize>,
+    waker: Waker,
 ) {
     // Create Reactor
     let mut reactor = match Reactor::new(gop_limit, max_connections, stream_keys, status.clone()) {
@@ -552,7 +579,7 @@ fn handle_connections(
     };
 
     // Run Reactor main loop
-    reactor.run(connection_receiver, publisher_receiver);
+    reactor.run(connection_receiver, publisher_receiver, waker);
 
     if status.load(Ordering::Acquire) != STATUS_END {
         error!("Rtmp Server aborted.");

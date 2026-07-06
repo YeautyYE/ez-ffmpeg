@@ -68,6 +68,14 @@ impl Event {
     }
 }
 
+/// Reserved poller token for the reactor's [`Waker`] (PERF-3).
+///
+/// Connection tokens encode `(generation << 32) | id`, so `usize::MAX` would
+/// only collide if a slot reached `generation == id == u32::MAX` (4 billion
+/// reuses of slot `0xFFFF_FFFF`). The reactor also matches this token before
+/// decoding it as a connection, so even a collision is harmless.
+pub const WAKER_TOKEN: usize = usize::MAX;
+
 // ============================================================================
 // Platform-specific implementations
 // ============================================================================
@@ -791,6 +799,287 @@ pub use bsd::{Poller, RawHandle};
 pub use windows::{Poller, RawHandle};
 
 // ============================================================================
+// Waker - cross-platform reactor wakeup (PERF-3)
+// ============================================================================
+//
+// A `Waker`/`WakeHandle` pair lets the in-process publisher send path
+// interrupt the reactor's `poll()` the instant media arrives, instead of
+// waiting up to POLL_TIMEOUT_MS. `Waker` is the reactor-side read end,
+// registered with the `Poller` for readable interest and drained after each
+// poll. `WakeHandle` is a cloneable `Send + Sync` producer handle whose
+// `wake()` writes a coalesced token.
+//
+//   - Linux:      eventfd (a single fd; the kernel sums concurrent writes)
+//   - macOS/BSD:  self-pipe (kqueue EVFILT_READ; EVFILT_USER is an alternative)
+//   - Windows:    connected loopback TCP socketpair (WSAPoll only polls sockets)
+
+#[cfg(target_os = "linux")]
+mod waker_backend {
+    use super::*;
+    use std::os::unix::io::RawFd;
+    use std::sync::Arc;
+
+    /// Shared eventfd, closed once when the last handle drops.
+    struct WakerFd(RawFd);
+    impl Drop for WakerFd {
+        fn drop(&mut self) {
+            // SAFETY: self.0 is a valid eventfd created in waker_pair(), owned
+            // exclusively by this Arc; Drop runs once, when the last Arc drops.
+            unsafe { libc::close(self.0); }
+        }
+    }
+
+    pub struct Waker {
+        fd: Arc<WakerFd>,
+    }
+
+    #[derive(Clone)]
+    pub struct WakeHandle {
+        fd: Arc<WakerFd>,
+    }
+
+    pub fn waker_pair() -> io::Result<(Waker, WakeHandle)> {
+        // SAFETY: eventfd() with a literal initval/flags returns a new fd or -1,
+        // checked immediately.
+        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let shared = Arc::new(WakerFd(fd));
+        Ok((Waker { fd: shared.clone() }, WakeHandle { fd: shared }))
+    }
+
+    impl Waker {
+        /// Raw handle to register with the Poller for readable interest.
+        pub fn raw_handle(&self) -> RawFd {
+            self.fd.0
+        }
+
+        /// Drain pending wake tokens, resetting the eventfd counter to 0.
+        pub fn drain(&self) {
+            let mut buf = [0u8; 8];
+            loop {
+                // SAFETY: reading 8 bytes from a valid non-blocking eventfd into
+                // an 8-byte stack buffer. A successful read (n == 8) returns the
+                // counter and resets it to 0; EFD_NONBLOCK yields EAGAIN (n < 0)
+                // once empty.
+                let n = unsafe {
+                    libc::read(self.fd.0, buf.as_mut_ptr() as *mut libc::c_void, 8)
+                };
+                if n != 8 {
+                    break;
+                }
+            }
+        }
+    }
+
+    impl WakeHandle {
+        /// Signal the reactor. eventfd sums writes, so multiple wakes before a
+        /// drain coalesce into a single readiness event.
+        pub fn wake(&self) {
+            let val: u64 = 1;
+            // SAFETY: writing 8 bytes from a u64 to a valid eventfd. A saturated
+            // counter returns EAGAIN (EFD_NONBLOCK), which still means a wake is
+            // pending; the result is intentionally ignored.
+            let _ = unsafe {
+                libc::write(self.fd.0, &val as *const u64 as *const libc::c_void, 8)
+            };
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
+mod waker_backend {
+    use super::*;
+    use std::os::unix::io::RawFd;
+    use std::sync::Arc;
+
+    /// Shared self-pipe, both ends closed once when the last handle drops.
+    struct Pipe {
+        read_fd: RawFd,
+        write_fd: RawFd,
+    }
+    impl Drop for Pipe {
+        fn drop(&mut self) {
+            // SAFETY: both fds are valid pipe ends created in waker_pair(), owned
+            // exclusively by this Arc; closed once, when the last Arc drops.
+            unsafe {
+                libc::close(self.read_fd);
+                libc::close(self.write_fd);
+            }
+        }
+    }
+
+    pub struct Waker {
+        pipe: Arc<Pipe>,
+    }
+
+    #[derive(Clone)]
+    pub struct WakeHandle {
+        pipe: Arc<Pipe>,
+    }
+
+    pub fn waker_pair() -> io::Result<(Waker, WakeHandle)> {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: pipe() fills a valid 2-element c_int array or returns -1.
+        let ret = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let read_fd = fds[0] as RawFd;
+        let write_fd = fds[1] as RawFd;
+        // macOS has no pipe2; set O_NONBLOCK + FD_CLOEXEC explicitly on both ends.
+        if let Err(e) = set_nonblocking_cloexec(read_fd)
+            .and_then(|_| set_nonblocking_cloexec(write_fd))
+        {
+            // SAFETY: closing the two fds we just created on the error path.
+            unsafe {
+                libc::close(read_fd);
+                libc::close(write_fd);
+            }
+            return Err(e);
+        }
+        let shared = Arc::new(Pipe { read_fd, write_fd });
+        Ok((Waker { pipe: shared.clone() }, WakeHandle { pipe: shared }))
+    }
+
+    fn set_nonblocking_cloexec(fd: RawFd) -> io::Result<()> {
+        // SAFETY: fcntl F_GETFL/F_SETFL/F_SETFD on a valid fd; each result checked.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    impl Waker {
+        pub fn raw_handle(&self) -> RawFd {
+            self.pipe.read_fd
+        }
+
+        pub fn drain(&self) {
+            let mut buf = [0u8; 64];
+            loop {
+                // SAFETY: reading into a valid 64-byte buffer from a non-blocking
+                // pipe read end; drains all queued wake bytes, EAGAIN => empty.
+                let n = unsafe {
+                    libc::read(
+                        self.pipe.read_fd,
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        buf.len(),
+                    )
+                };
+                if n <= 0 || (n as usize) < buf.len() {
+                    break;
+                }
+            }
+        }
+    }
+
+    impl WakeHandle {
+        pub fn wake(&self) {
+            let byte: u8 = 1;
+            // SAFETY: writing 1 byte to a valid non-blocking pipe write end. A
+            // full pipe returns EAGAIN, which still means a wake is pending.
+            let _ = unsafe {
+                libc::write(
+                    self.pipe.write_fd,
+                    &byte as *const u8 as *const libc::c_void,
+                    1,
+                )
+            };
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod waker_backend {
+    use super::*;
+    use std::net::{TcpListener, TcpStream};
+    use std::os::windows::io::{AsRawSocket, RawSocket};
+    use std::sync::Arc;
+
+    // Byte-level signalling on the loopback pair without needing &mut TcpStream,
+    // matching the RawSocket convention used by the WSAPoll bindings above.
+    #[link(name = "ws2_32")]
+    extern "system" {
+        fn send(s: RawSocket, buf: *const i8, len: i32, flags: i32) -> i32;
+        fn recv(s: RawSocket, buf: *mut i8, len: i32, flags: i32) -> i32;
+    }
+
+    /// Connected loopback TCP pair; both sockets closed when the last Arc drops.
+    struct Pair {
+        reader: TcpStream,
+        writer: TcpStream,
+    }
+
+    pub struct Waker {
+        pair: Arc<Pair>,
+    }
+
+    #[derive(Clone)]
+    pub struct WakeHandle {
+        pair: Arc<Pair>,
+    }
+
+    pub fn waker_pair() -> io::Result<(Waker, WakeHandle)> {
+        // Establish a connected loopback pair; WSAPoll can only poll sockets.
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let writer = TcpStream::connect(addr)?;
+        let (reader, _) = listener.accept()?;
+        reader.set_nonblocking(true)?;
+        writer.set_nonblocking(true)?;
+        let shared = Arc::new(Pair { reader, writer });
+        Ok((Waker { pair: shared.clone() }, WakeHandle { pair: shared }))
+    }
+
+    impl Waker {
+        pub fn raw_handle(&self) -> RawSocket {
+            self.pair.reader.as_raw_socket()
+        }
+
+        pub fn drain(&self) {
+            let mut buf = [0i8; 64];
+            loop {
+                // SAFETY: recv on a valid non-blocking loopback socket into a
+                // 64-byte buffer; WSAEWOULDBLOCK / EOF (n <= 0) => nothing left.
+                let n = unsafe {
+                    recv(
+                        self.pair.reader.as_raw_socket(),
+                        buf.as_mut_ptr(),
+                        buf.len() as i32,
+                        0,
+                    )
+                };
+                if n <= 0 || (n as usize) < buf.len() {
+                    break;
+                }
+            }
+        }
+    }
+
+    impl WakeHandle {
+        pub fn wake(&self) {
+            let byte: i8 = 1;
+            // SAFETY: send 1 byte on a valid non-blocking loopback socket; a full
+            // send buffer returns WSAEWOULDBLOCK, wake still pending.
+            let _ = unsafe { send(self.pair.writer.as_raw_socket(), &byte as *const i8, 1, 0) };
+        }
+    }
+}
+
+pub use waker_backend::{waker_pair, WakeHandle, Waker};
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -943,6 +1232,42 @@ mod tests {
             let events = poller.poll(Some(Duration::from_millis(50))).expect("Failed to poll");
             assert!(!events.iter().any(|e| e.token == 1));
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn waker_wakes_the_poller_and_drains() {
+        let mut poller = Poller::new().expect("Failed to create poller");
+        let (waker, handle) = waker_pair().expect("Failed to create waker");
+        poller
+            .register(waker.raw_handle(), WAKER_TOKEN, Interest::READABLE)
+            .expect("Failed to register waker");
+
+        // No wake yet: a short poll times out with no waker event.
+        let events = poller.poll(Some(Duration::from_millis(50))).expect("poll");
+        assert!(
+            events.iter().all(|e| e.token != WAKER_TOKEN),
+            "no wake => no waker event"
+        );
+
+        // Two coalesced wakes still produce a single readable event.
+        handle.wake();
+        handle.wake();
+        let events = poller.poll(Some(Duration::from_millis(500))).expect("poll");
+        assert!(
+            events.iter().any(|e| e.token == WAKER_TOKEN && e.is_readable()),
+            "wake() must produce a readable event on WAKER_TOKEN"
+        );
+
+        // Drain clears the token; the next poll times out again.
+        waker.drain();
+        let events = poller.poll(Some(Duration::from_millis(50))).expect("poll");
+        assert!(
+            events.iter().all(|e| e.token != WAKER_TOKEN),
+            "drain() must clear the wake token"
+        );
+
+        poller.deregister(waker.raw_handle()).ok();
     }
 
     #[test]

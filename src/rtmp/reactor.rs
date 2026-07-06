@@ -8,7 +8,7 @@
 // - Connection timeout detection
 // - Graceful shutdown support
 
-use crate::rtmp::poller::{Interest, Poller, RawHandle};
+use crate::rtmp::poller::{Interest, Poller, RawHandle, Waker, WAKER_TOKEN};
 use crate::rtmp::rtmp_scheduler::{RtmpScheduler, ServerResult};
 use crate::rtmp::write_queue::{BackpressureLevel, FlushResult, WriteQueue};
 use bytes::Bytes;
@@ -1171,6 +1171,12 @@ impl Reactor {
     }
 
     /// Run reactor main loop
+    ///
+    /// `waker` is registered with the poller so the in-process publisher send
+    /// path can interrupt `poll()` the moment media arrives (PERF-3), instead
+    /// of waiting for the POLL_TIMEOUT_MS fallback. The fallback timeout is
+    /// retained so raw `create_stream_sender` users (who do not hold a
+    /// WakeHandle) still make progress.
     pub fn run(
         &mut self,
         connection_receiver: crossbeam_channel::Receiver<TcpStream>,
@@ -1178,8 +1184,18 @@ impl Reactor {
             String,
             crossbeam_channel::Receiver<Vec<u8>>,
         )>,
+        waker: Waker,
     ) {
         info!("Reactor started");
+
+        // Register the wakeup handle. If this fails the reactor still works via
+        // the POLL_TIMEOUT_MS fallback, just without the low-latency wakeups.
+        if let Err(e) = self
+            .poller
+            .register(waker.raw_handle(), WAKER_TOKEN, Interest::READABLE)
+        {
+            error!("Failed to register reactor waker (falling back to poll timeout): {:?}", e);
+        }
 
         let poll_timeout = Duration::from_millis(POLL_TIMEOUT_MS);
 
@@ -1223,6 +1239,13 @@ impl Reactor {
 
             for event in events {
                 let poller_token = event.token;
+
+                // Wakeup token: drain it and fall through to the channel-drain
+                // steps below. Matched before decoding as a connection token.
+                if poller_token == WAKER_TOKEN {
+                    waker.drain();
+                    continue;
+                }
 
                 // Validate token and get connection id (checks generation)
                 let Some(id) = self.validate_connection(poller_token) else {
