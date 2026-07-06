@@ -578,6 +578,13 @@ impl RtmpScheduler {
                 stream_key: stream_key.clone(),
                 stream_id,
             };
+            // Reset the keyframe gate for this play request: has_received_video_keyframe
+            // is persistent client state, so a connection that previously watched
+            // another stream (and saw its IDR) must not carry that True over and let
+            // should_send_to_watcher forward this stream's delta frames before an IDR
+            // is replayed or arrives live. Replay of a GOP with
+            // a real IDR, or a later live IDR, re-sets it.
+            client.has_received_video_keyframe = false;
 
             let channel = self
                 .channels
