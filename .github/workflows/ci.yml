@@ -1,23 +1,34 @@
 # CI for ez-ffmpeg.
 #
-# FFmpeg 7.x is provided by BUILDING IT FROM SOURCE inside CI, not from apt.
-# `ffmpeg-sys-next 7.1` links against the FFmpeg 7.x ABI (libavcodec 61.x), but
-# `ubuntu-latest` (24.04) only ships FFmpeg 6.1 (libavcodec 60.x) via apt, which
-# does not link. Enabling the crate's `ffmpeg-sys-next/build` feature makes its
-# build script `git clone` the `release/7.1` branch of FFmpeg and compile it, so
-# the linked ABI matches the bindings exactly on any runner. The apt packages
-# below are just the toolchain that compile needs (nasm/yasm/clang/pkg-config/
-# zlib), NOT FFmpeg itself. The first build compiles FFmpeg (~10-20 min); the
-# cache makes subsequent runs fast.
+# Every job runs in a two-lane FFmpeg matrix, because the crate supports
+# linking either major and the two lanes are provisioned differently:
+#
+#   * ffmpeg 8.1 lane — `--features ffmpeg-sys-next/build`: the sys crate's
+#     build script git-clones FFmpeg `release/8.1` (the branch is hardcoded to
+#     the crate's own major.minor) and compiles/statically links it. This is
+#     the same mechanism the pre-8 CI used, which then produced FFmpeg 7.1 —
+#     after the dependency bump the SAME flag silently produces 8.1, which is
+#     exactly why the 7.x lane below must NOT use it.
+#
+#   * ffmpeg 7.1 lane — explicit from-source build of FFmpeg `release/7.1`
+#     (shared libs, default components, no external deps) installed under
+#     $HOME/ffmpeg71 and linked via pkg-config. This proves the bump keeps
+#     FFmpeg 7.x users working: ffmpeg-sys-next 8.1 probes the installed
+#     headers and only enables cfg flags up to ffmpeg_7_1.
+#
+# Ubuntu's apt FFmpeg (6.1 on 24.04) matches neither lane, so it is never
+# installed; the apt packages below are just the FFmpeg build toolchain
+# (nasm/yasm/clang/pkg-config/zlib). First build per lane compiles FFmpeg
+# (~10-20 min); caches make subsequent runs fast.
 #
 # GPU-dependent code: the `opengl`/`wgpu` frame filters need a real GPU/display
 # and their tests fail headless ("Failed to create Surfman connection"). The
-# `build` job still compiles them (via `--all-features`) so they stay type-checked;
-# the `test` job omits those two features so the suite runs green on a GPU-less
-# runner (everything else — 465 tests — passes). The macOS-only `videotoolbox`
-# scheduler tests are `#[cfg(target_os = "macos")]`, so they do not run on Linux.
+# `build` job still compiles them (via `--all-features`) so they stay
+# type-checked; the `test` job omits those two features so the suite runs green
+# on a GPU-less runner. The macOS-only `videotoolbox` scheduler tests are
+# `#[cfg(target_os = "macos")]`, so they do not run on Linux.
 #
-# `build` + `clippy` + `test` are all enforced gates.
+# `build` + `clippy` + `test` are all enforced gates, per lane.
 
 name: CI
 
@@ -30,13 +41,19 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Trigger the from-source FFmpeg 7.1 build in ffmpeg-sys-next.
-  FFMPEG_FEATURES: --features ffmpeg-sys-next/build
 
 jobs:
   build:
-    name: Build & Clippy
+    name: Build & Clippy (FFmpeg ${{ matrix.ffmpeg }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ffmpeg: "8.1"
+            ffmpeg-features: "--features ffmpeg-sys-next/build"
+          - ffmpeg: "7.1"
+            ffmpeg-features: ""
     steps:
       - uses: actions/checkout@v4
 
@@ -51,6 +68,32 @@ jobs:
         with:
           components: clippy
 
+      - name: Cache FFmpeg 7.1 install
+        if: matrix.ffmpeg == '7.1'
+        uses: actions/cache@v4
+        with:
+          path: ~/ffmpeg71
+          key: ${{ runner.os }}-ffmpeg71-shared-v1
+
+      - name: Build FFmpeg 7.1 from source (if not cached)
+        if: matrix.ffmpeg == '7.1'
+        run: |
+          if [ ! -f "$HOME/ffmpeg71/lib/pkgconfig/libavcodec.pc" ]; then
+            git clone --depth=1 -b release/7.1 https://github.com/FFmpeg/FFmpeg ffmpeg-71-src
+            cd ffmpeg-71-src
+            ./configure --prefix="$HOME/ffmpeg71" \
+                        --disable-programs --disable-doc \
+                        --disable-static --enable-shared
+            make -j"$(nproc)"
+            make install
+          fi
+
+      - name: Point pkg-config at FFmpeg 7.1
+        if: matrix.ffmpeg == '7.1'
+        run: |
+          echo "PKG_CONFIG_PATH=$HOME/ffmpeg71/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$HOME/ffmpeg71/lib" >> "$GITHUB_ENV"
+
       - name: Cache cargo registry and target
         uses: actions/cache@v4
         with:
@@ -58,19 +101,27 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-buildffmpeg-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-ffmpeg${{ matrix.ffmpeg }}-${{ hashFiles('**/Cargo.toml') }}
 
       - name: Build
-        run: cargo build --all-features $FFMPEG_FEATURES --verbose
+        run: cargo build --all-features ${{ matrix.ffmpeg-features }} --verbose
 
       # Safety-hygiene lints surface here. Not `-D warnings` yet: the crate has a
       # pre-existing unused-import / undocumented-unsafe backlog to clear first.
       - name: Clippy
-        run: cargo clippy --all-features $FFMPEG_FEATURES --lib
+        run: cargo clippy --all-features ${{ matrix.ffmpeg-features }} --lib
 
   test:
-    name: Test
+    name: Test (FFmpeg ${{ matrix.ffmpeg }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ffmpeg: "8.1"
+            ffmpeg-features: "--features ffmpeg-sys-next/build"
+          - ffmpeg: "7.1"
+            ffmpeg-features: ""
     # Runs the full library suite MINUS the opengl/wgpu features, whose tests
     # need a GPU/display. Everything else passes headless. Media assets are
     # committed as test.mp4.
@@ -85,6 +136,32 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache FFmpeg 7.1 install
+        if: matrix.ffmpeg == '7.1'
+        uses: actions/cache@v4
+        with:
+          path: ~/ffmpeg71
+          key: ${{ runner.os }}-ffmpeg71-shared-v1
+
+      - name: Build FFmpeg 7.1 from source (if not cached)
+        if: matrix.ffmpeg == '7.1'
+        run: |
+          if [ ! -f "$HOME/ffmpeg71/lib/pkgconfig/libavcodec.pc" ]; then
+            git clone --depth=1 -b release/7.1 https://github.com/FFmpeg/FFmpeg ffmpeg-71-src
+            cd ffmpeg-71-src
+            ./configure --prefix="$HOME/ffmpeg71" \
+                        --disable-programs --disable-doc \
+                        --disable-static --enable-shared
+            make -j"$(nproc)"
+            make install
+          fi
+
+      - name: Point pkg-config at FFmpeg 7.1
+        if: matrix.ffmpeg == '7.1'
+        run: |
+          echo "PKG_CONFIG_PATH=$HOME/ffmpeg71/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$HOME/ffmpeg71/lib" >> "$GITHUB_ENV"
+
       - name: Cache cargo registry and target
         uses: actions/cache@v4
         with:
@@ -92,7 +169,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-buildffmpeg-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-ffmpeg${{ matrix.ffmpeg }}-${{ hashFiles('**/Cargo.toml') }}
 
       - name: Test
-        run: cargo test --lib --features async,rtmp,flv,subtitle $FFMPEG_FEATURES
+        run: cargo test --lib --features async,rtmp,flv,subtitle ${{ matrix.ffmpeg-features }}
