@@ -1234,14 +1234,29 @@ impl Reactor {
             }
 
             // 3. Non-blocking receive new publishers
+            let mut new_publisher_added = false;
             while let Ok((stream_key, receiver)) = publisher_receiver.try_recv() {
                 if self.add_publisher(stream_key.clone(), receiver).is_some() {
                     debug!("New publisher added for stream: {}", stream_key);
+                    new_publisher_added = true;
                 }
             }
 
-            // 4. Poll IO events
-            let events = match self.poller.poll(Some(poll_timeout)) {
+            // 4. Poll IO events.
+            //
+            // A just-registered in-process publisher already has its
+            // connect/createStream/publish handshake queued on a crossbeam
+            // channel — not a socket the poller watches — and process_publishers
+            // (which drains it) runs only after this poll. So when a publisher
+            // was just added, poll non-blocking and fall straight through to
+            // process_publishers, delivering the handshake and first media
+            // immediately instead of stalling on the poll timeout (PERF-5a).
+            let poll_wait = if new_publisher_added {
+                Duration::ZERO
+            } else {
+                poll_timeout
+            };
+            let events = match self.poller.poll(Some(poll_wait)) {
                 Ok(events) => events,
                 Err(e) => {
                     error!("Poller error: {:?}", e);
