@@ -826,7 +826,7 @@ mod tests {
                 .set_recording_time_us(10 * 1000_000)
             )
             .filter_desc("scale=1280:720")
-            .output(Output::from("output.mp4"))
+            .output(Output::from("output_img_to_video.mp4"))
             .build().unwrap()
             .start().unwrap()
             .wait();
@@ -842,7 +842,7 @@ mod tests {
 
         let result = FfmpegContext::builder()
             .input("test.mp4")
-            .output( Output::from("output.mp4")
+            .output( Output::from("output_copy.mp4")
                 .add_stream_map_with_copy("0:v")
                 .add_stream_map_with_copy("0:a")
             )
@@ -867,7 +867,7 @@ mod tests {
             .input("test.mp4")
             .input("test.mp4")
             .filter_desc("concat=n=3:v=1:a=1")
-            .output("output.mp4")
+            .output("output_concat.mp4")
             .build()
             .unwrap()
             .start()
@@ -942,7 +942,7 @@ mod tests {
         use std::io::{Read, Seek, SeekFrom, Write};
 
         let input_file = "test.mp4";
-        let output_file = "output.mp4";
+        let output_file = "output_rw_callback.mp4";
 
         let input_file = Arc::new(Mutex::new(
             File::open(input_file).expect("Failed to open input file"),
@@ -1120,7 +1120,7 @@ mod tests {
         let context = FfmpegContext::builder()
             .input("test.mp4")
             .filter_desc("hue=s=0")
-            .output("output.mp4")
+            .output("output_is_ended.mp4")
             .build()
             .unwrap();
 
@@ -1143,7 +1143,7 @@ mod tests {
             .try_init();
 
         let input: Input = "test.mp4".into();
-        let output: Output = "output.mp4".into();
+        let output: Output = "output_hwaccel.mp4".into();
 
         let result = FfmpegContext::builder()
             .input(input.set_hwaccel("videotoolbox"))
@@ -1169,7 +1169,7 @@ mod tests {
         let context = FfmpegContext::builder()
             .input("test.mp4")
             .filter_desc("hue=s=0")
-            .output("output.mp4")
+            .output("output_async.mp4")
             .build()
             .unwrap();
 
@@ -1189,7 +1189,7 @@ mod tests {
         let context = FfmpegContext::builder()
             .input("test.mp4")
             .filter_desc("hue=s=0")
-            .output("output.mp4")
+            .output("output_pause.mp4")
             .build()
             .unwrap();
 
@@ -1213,7 +1213,7 @@ mod tests {
         let context = FfmpegContext::builder()
             .input("test.mp4")
             .filter_desc("hue=s=0")
-            .output("output.mp4")
+            .output("output_pause_abort.mp4")
             .build()
             .unwrap();
 
@@ -1235,7 +1235,7 @@ mod tests {
         let context = FfmpegContext::builder()
             .input("test.mp4")
             .filter_desc("hue=s=0")
-            .output("output.mp4")
+            .output("output_wait.mp4")
             .build()
             .unwrap();
 
@@ -1256,7 +1256,7 @@ mod tests {
         let context = FfmpegContext::builder()
             .input("test.mp4")
             .filter_desc("hue=s=0")
-            .output("output.mp4")
+            .output("output_status.mp4")
             .build()
             .unwrap();
 
@@ -1285,24 +1285,41 @@ mod tests {
             .is_test(true)
             .try_init();
 
+        // A leftover file from a previous run would satisfy the wait loop
+        // below before this run's muxer even opens it.
+        let _ = std::fs::remove_file("output_stop.mp4");
+
         let context = FfmpegContext::builder()
             .input("test.mp4")
             .filter_desc("hue=s=0")
-            .output("output.mp4")
+            .output("output_stop.mp4")
             .build()
             .unwrap();
 
         let scheduler = FfmpegScheduler::new(context);
         let scheduler = scheduler.start().unwrap();
 
-        // Let the job process some frames before stopping
-        sleep(Duration::from_millis(500));
+        // Let the job process some frames before stopping: wait until the
+        // muxer has flushed its first bytes so the stop() lands mid-stream on
+        // any machine speed (a fixed sleep raced slow CI runners), bounded so
+        // a hung pipeline still fails.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !std::fs::metadata("output_stop.mp4")
+            .map(|m| m.len() > 0)
+            .unwrap_or(false)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pipeline wrote no output within 30s"
+            );
+            sleep(Duration::from_millis(50));
+        }
 
         // stop() should block until all threads complete
         scheduler.stop();
 
         // Verify output file exists and has content
-        let metadata = std::fs::metadata("output.mp4").unwrap();
+        let metadata = std::fs::metadata("output_stop.mp4").unwrap();
         assert!(metadata.len() > 0, "Output file should have content after stop()");
     }
 }
