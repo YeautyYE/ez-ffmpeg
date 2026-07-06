@@ -32,6 +32,9 @@ use std::time::{Duration, Instant};
 const READ_BUFFER_SIZE: usize = 8192;
 const POLL_TIMEOUT_MS: u64 = 100;
 const CONNECTION_TIMEOUT_SECS: u64 = 60; // Connection timeout
+/// Minimum interval between full connection-timeout sweeps (PERF-10 throttle).
+/// A 60s timeout tolerates being detected up to this much late.
+const TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 5; // Graceful shutdown timeout
 const MAX_READ_PER_POLL: usize = 512 * 1024; // 512KB max read per poll to prevent memory DoS
 const DEFAULT_MAX_CONNECTIONS: usize = 10000; // Default max connections (auto-adjusted by system FD limit)
@@ -282,7 +285,16 @@ impl ReactorConnection {
 
     /// Is timed out
     pub fn is_timed_out(&self, timeout: Duration) -> bool {
-        self.last_activity().elapsed() > timeout
+        self.is_timed_out_at(Instant::now(), timeout)
+    }
+
+    /// Is timed out, evaluated against a caller-provided `now`.
+    ///
+    /// PERF-10: lets the reactor read the clock once per sweep instead of once
+    /// per connection. `saturating_duration_since` guards against a `now` that
+    /// is (marginally) earlier than the last activity due to clock coarseness.
+    pub fn is_timed_out_at(&self, now: Instant, timeout: Duration) -> bool {
+        now.saturating_duration_since(self.last_activity()) > timeout
     }
 
     /// Enqueue data
@@ -543,6 +555,8 @@ pub struct Reactor {
     ids_to_close_buffer: Vec<usize>,
     /// Reusable buffer for handle results (avoids allocation in handle_readable)
     results_buffer: Vec<HandleResult>,
+    /// Last time the full connection-timeout sweep ran (PERF-10 throttle)
+    last_timeout_check: Instant,
 }
 
 // Status constants
@@ -586,6 +600,7 @@ impl Reactor {
             packets_buffer: Vec::with_capacity(64),
             ids_to_close_buffer: Vec::with_capacity(16),
             results_buffer: Vec::with_capacity(16),
+            last_timeout_check: Instant::now(),
         })
     }
 
@@ -1115,12 +1130,23 @@ impl Reactor {
     }
 
     /// Check timed out connections
+    ///
+    /// PERF-10: a 60s idle timeout does not need re-evaluating on every poll
+    /// wakeup (the loop can wake thousands of times per second under load or
+    /// ~10x/sec idle). Throttle the full slab scan to at most ~1/sec and read
+    /// the clock once per sweep instead of once per connection.
     fn check_timeouts(&mut self) -> Vec<usize> {
+        let now = Instant::now();
+        if now.saturating_duration_since(self.last_timeout_check) < TIMEOUT_CHECK_INTERVAL {
+            return Vec::new();
+        }
+        self.last_timeout_check = now;
+
         let timeout = Duration::from_secs(CONNECTION_TIMEOUT_SECS);
         let mut timed_out = Vec::new();
 
         for (id, conn) in self.connections.iter() {
-            if conn.is_timed_out(timeout) {
+            if conn.is_timed_out_at(now, timeout) {
                 debug!("Connection {} timed out", id);
                 timed_out.push(id);
             }
@@ -1435,6 +1461,78 @@ mod tests {
 
         // Should be timed out with zero timeout
         assert!(conn.is_timed_out(Duration::from_nanos(1)));
+    }
+
+    #[test]
+    fn test_is_timed_out_at_uses_hoisted_now() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to get address");
+        let client = TcpStream::connect(addr).expect("Failed to connect");
+        let token = ConnectionToken::new(0, 1);
+        let conn = ReactorConnection::new(token, client).expect("Failed to create connection");
+
+        let timeout = Duration::from_secs(CONNECTION_TIMEOUT_SECS);
+        let base = conn.last_activity();
+
+        // Exactly at the boundary is not yet timed out ( `>` , not `>=` ).
+        assert!(!conn.is_timed_out_at(base, timeout));
+        assert!(!conn.is_timed_out_at(base + timeout, timeout));
+        assert!(conn.is_timed_out_at(base + timeout + Duration::from_millis(1), timeout));
+
+        // A `now` earlier than the last activity must saturate to zero, never
+        // panic or report a spurious timeout.
+        assert!(!conn.is_timed_out_at(
+            base.checked_sub(Duration::from_secs(1)).unwrap_or(base),
+            timeout
+        ));
+    }
+
+    #[test]
+    fn test_check_timeouts_throttle_and_detection() {
+        let stream_keys = dashmap::DashSet::new();
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let mut reactor = Reactor::new(3, None, stream_keys, status).expect("Failed to create reactor");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to get address");
+        let _client = TcpStream::connect(addr).expect("Failed to connect");
+        let (server, _) = listener.accept().expect("Failed to accept");
+        let token = reactor.add_connection(server).expect("Failed to add connection");
+
+        // PERF-10: new() stamped last_timeout_check ~now, so an immediate sweep
+        // is throttled and skipped entirely.
+        assert!(
+            reactor.check_timeouts().is_empty(),
+            "sweep within the throttle interval must be skipped"
+        );
+
+        // Make the connection stale and let the throttle window lapse.
+        let stale = Instant::now()
+            .checked_sub(Duration::from_secs(CONNECTION_TIMEOUT_SECS * 2))
+            .expect("monotonic clock should be well past 120s after a full build");
+        if let Some(conn) = reactor.connections.get_mut(token.id) {
+            conn.last_read_activity = stale;
+            conn.last_write_activity = stale;
+        }
+        reactor.last_timeout_check = stale;
+
+        // Now the sweep actually runs and reports the stale connection.
+        assert_eq!(
+            reactor.check_timeouts(),
+            vec![token.id],
+            "after the interval elapses the stale connection must be detected"
+        );
+
+        // The sweep restamped last_timeout_check, so an immediate re-run is
+        // throttled again even though the connection is still stale.
+        assert!(
+            reactor.check_timeouts().is_empty(),
+            "the sweep must restamp the throttle and skip an immediate re-run"
+        );
+
+        reactor.remove_connection(token.id);
     }
 
     #[test]
