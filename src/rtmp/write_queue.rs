@@ -9,8 +9,14 @@
 
 use bytes::Bytes;
 use std::collections::VecDeque;
-use std::io::{self, Write};
+use std::io::{self, IoSlice, Write};
 use std::time::Instant;
+
+/// Maximum number of `IoSlice`s gathered into a single `write_vectored` call.
+/// Capped well below the platform IOV_MAX (Linux 1024) to bound the per-flush
+/// gather buffer. GOP replay of ~140 entries collapses to ceil(140/64)=3
+/// writev syscalls instead of ~140 individual write() calls (PERF-9).
+const MAX_IOV: usize = 64;
 
 // Backpressure threshold constants
 const QUEUE_WARN_BYTES: usize = 1 * 1024 * 1024; // 1MB warning
@@ -36,10 +42,6 @@ impl WriteEntry {
 
     fn advance(&mut self, n: usize) {
         self.offset += n;
-    }
-
-    fn is_complete(&self) -> bool {
-        self.offset >= self.data.len()
     }
 
     fn remaining_bytes(&self) -> usize {
@@ -214,30 +216,61 @@ impl WriteQueue {
 
     /// Try to flush to writer
     ///
-    /// Supports partial write, tracks write offset for each entry
+    /// PERF-9: gathers up to `MAX_IOV` queued entries into a single
+    /// `write_vectored` call instead of issuing one `write()` per entry, then
+    /// walks the returned byte count across those entries. Partial writes are
+    /// tracked per entry via `offset`, preserving the pinned-partial-entry
+    /// rule enforced by `evict_old_entries` (an entry with `offset > 0` is
+    /// never evicted, so the byte stream never resumes mid-tag).
+    ///
+    /// A short vectored write on a non-blocking socket means the kernel send
+    /// buffer is full; this returns `WouldBlock` immediately rather than
+    /// retrying, so the reactor waits for the writable event (NEW-RS-01)
+    /// instead of burning a guaranteed-EAGAIN syscall.
     pub fn try_flush<W: Write>(&mut self, writer: &mut W) -> io::Result<FlushResult> {
         let mut bytes_written = 0;
 
-        while let Some(entry) = self.queue.front_mut() {
-            let buf = entry.remaining();
-            if buf.is_empty() {
-                // Entry complete, subtract from total bytes
-                let entry_size = self.queue.front().map(|e| e.data.len()).unwrap_or(0);
-                self.total_bytes = self.total_bytes.saturating_sub(entry_size);
-                self.queue.pop_front();
-                continue;
+        loop {
+            // Drop any fully-consumed entries at the front (e.g. an entry that
+            // a previous flush partially wrote and this one completes).
+            self.pop_completed_front();
+
+            if self.queue.is_empty() {
+                return Ok(FlushResult::Complete { bytes_written });
             }
 
-            match writer.write(buf) {
+            // Gather up to MAX_IOV slices from the front of the queue and issue
+            // a single vectored write. The IoSlices borrow the queue entries,
+            // so the borrow is scoped and the queue is only mutated afterwards.
+            let mut gathered = 0usize;
+            let write_result = {
+                let mut iov: Vec<IoSlice> = Vec::with_capacity(MAX_IOV);
+                for entry in self.queue.iter() {
+                    if iov.len() == MAX_IOV {
+                        break;
+                    }
+                    let rem = entry.remaining();
+                    if !rem.is_empty() {
+                        gathered += rem.len();
+                        iov.push(IoSlice::new(rem));
+                    }
+                }
+                // pop_completed_front ran and the queue is non-empty, so the
+                // front entry has unsent bytes and iov is non-empty here.
+                writer.write_vectored(&iov)
+            };
+
+            match write_result {
                 Ok(0) => return Ok(FlushResult::Closed),
                 Ok(n) => {
                     bytes_written += n;
-                    entry.advance(n);
-                    if entry.is_complete() {
-                        let entry_size = self.queue.front().map(|e| e.data.len()).unwrap_or(0);
-                        self.total_bytes = self.total_bytes.saturating_sub(entry_size);
-                        self.queue.pop_front();
+                    self.advance_front(n);
+                    if n < gathered {
+                        // Short write: send buffer full, stop and wait for the
+                        // writable event rather than retry into EAGAIN.
+                        return Ok(FlushResult::WouldBlock { bytes_written });
                     }
+                    // Whole batch drained; loop to gather the next one.
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                     return Ok(FlushResult::WouldBlock { bytes_written });
@@ -245,8 +278,48 @@ impl WriteQueue {
                 Err(e) => return Err(e),
             }
         }
+    }
 
-        Ok(FlushResult::Complete { bytes_written })
+    /// Pop fully-written entries from the front, keeping `total_bytes` in sync.
+    fn pop_completed_front(&mut self) {
+        while let Some(front) = self.queue.front() {
+            if front.remaining().is_empty() {
+                let full = front.data.len();
+                self.total_bytes = self.total_bytes.saturating_sub(full);
+                self.queue.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Distribute `n` written bytes across the front entries, popping each one
+    /// as it completes. `n` is always <= the bytes gathered for this write, so
+    /// the walk never runs past the queue. `total_bytes` tracks the sum of full
+    /// entry lengths, so it is decremented by an entry's full length exactly
+    /// once, when that entry completes (matching `enqueue`/`evict`).
+    fn advance_front(&mut self, mut n: usize) {
+        while n > 0 {
+            let Some(front) = self.queue.front_mut() else { break };
+            let rem = front.remaining_bytes();
+            if rem == 0 {
+                // A zero-length entry contributes nothing; drop it.
+                let full = front.data.len();
+                self.total_bytes = self.total_bytes.saturating_sub(full);
+                self.queue.pop_front();
+                continue;
+            }
+            if n >= rem {
+                // Entry fully sent this call: account for its full length once.
+                let full = front.data.len();
+                self.total_bytes = self.total_bytes.saturating_sub(full);
+                self.queue.pop_front();
+                n -= rem;
+            } else {
+                front.advance(n);
+                n = 0;
+            }
+        }
     }
 
     /// Is queue empty
@@ -437,79 +510,152 @@ mod tests {
         assert!(!result);
     }
 
-    #[test]
-    fn test_partial_write() {
-        let mut queue = WriteQueue::new();
-        queue.enqueue(Bytes::from_static(b"hello"), false, false, true);
-        queue.enqueue(Bytes::from_static(b"world"), false, false, true);
+    /// A writer that accepts up to `capacity` bytes total across all calls,
+    /// then returns WouldBlock - modelling a non-blocking socket whose send
+    /// buffer fills up. `write_vectored` drains across slices like a real
+    /// vectored write so the gather/walk accounting is exercised.
+    struct CapWriter {
+        inner: Vec<u8>,
+        capacity: usize,
+    }
 
-        // Create a limited writer that can only write 3 bytes at a time
-        struct LimitedWriter {
-            inner: Vec<u8>,
-            limit: usize,
+    impl Write for CapWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.inner.len() >= self.capacity {
+                return Err(io::Error::from(io::ErrorKind::WouldBlock));
+            }
+            let room = self.capacity - self.inner.len();
+            let n = buf.len().min(room);
+            self.inner.extend_from_slice(&buf[..n]);
+            Ok(n)
         }
 
-        impl Write for LimitedWriter {
-            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                let n = buf.len().min(self.limit);
-                self.inner.extend_from_slice(&buf[..n]);
-                Ok(n)
+        fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+            if self.inner.len() >= self.capacity {
+                return Err(io::Error::from(io::ErrorKind::WouldBlock));
             }
-
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
+            let mut total = 0;
+            for b in bufs {
+                let room = self.capacity - self.inner.len();
+                if room == 0 {
+                    break;
+                }
+                let n = b.len().min(room);
+                self.inner.extend_from_slice(&b[..n]);
+                total += n;
+                if n < b.len() {
+                    break; // slice only partially accepted -> buffer full
+                }
             }
+            Ok(total)
         }
 
-        let mut writer = LimitedWriter {
-            inner: Vec::new(),
-            limit: 3,
-        };
-
-        // First flush: writes "hel" from "hello"
-        let result = queue.try_flush(&mut writer).unwrap();
-        assert!(matches!(result, FlushResult::Complete { .. }));
-
-        // All data should be written
-        assert_eq!(writer.inner, b"helloworld");
-        assert!(queue.is_empty());
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
-    fn test_would_block_handling() {
-        struct WouldBlockWriter {
-            written: usize,
-            block_after: usize,
+    fn test_partial_write_walks_across_entries() {
+        let mut queue = WriteQueue::new();
+        queue.enqueue(Bytes::from_static(b"hello"), false, false, true);
+        queue.enqueue(Bytes::from_static(b"world"), false, false, true);
+        assert_eq!(queue.pending_bytes(), 10);
+
+        // Capacity 7: one writev writes "hello" (5) then "wo" (2) and fills.
+        // The returned count (7) must walk across the entry boundary: pop the
+        // first entry, pin the second at offset 2.
+        let mut writer = CapWriter { inner: Vec::new(), capacity: 7 };
+        let result = queue.try_flush(&mut writer).unwrap();
+        assert!(matches!(result, FlushResult::WouldBlock { bytes_written: 7 }));
+        assert_eq!(writer.inner, b"hellowo");
+        assert_eq!(queue.pending_entries(), 1);
+        assert_eq!(queue.front_offset(), Some(2));
+        // total_bytes drops by the first entry's full length, not by bytes sent.
+        assert_eq!(queue.pending_bytes(), 5);
+
+        // With room, the pinned partial entry resumes from offset 2 - the byte
+        // stream must never restart from the beginning of the tag.
+        writer.capacity = 100;
+        let result = queue.try_flush(&mut writer).unwrap();
+        assert!(matches!(result, FlushResult::Complete { bytes_written: 3 }));
+        assert_eq!(writer.inner, b"helloworld");
+        assert!(queue.is_empty());
+        assert_eq!(queue.pending_bytes(), 0);
+    }
+
+    #[test]
+    fn test_would_block_returns_bytes_written() {
+        let mut queue = WriteQueue::new();
+        queue.enqueue(Bytes::from_static(b"hello"), false, false, true);
+        queue.enqueue(Bytes::from_static(b"world"), false, false, true);
+
+        // Capacity 3: writev writes "hel" then fills mid first entry.
+        let mut writer = CapWriter { inner: Vec::new(), capacity: 3 };
+        let result = queue.try_flush(&mut writer).unwrap();
+        assert!(matches!(result, FlushResult::WouldBlock { bytes_written: 3 }));
+        assert_eq!(writer.inner, b"hel");
+        assert!(!queue.is_empty());
+        assert_eq!(queue.front_offset(), Some(3));
+
+        // An immediate retry with no room returns WouldBlock, zero progress -
+        // no partial state is corrupted by the empty write.
+        let result = queue.try_flush(&mut writer).unwrap();
+        assert!(matches!(result, FlushResult::WouldBlock { bytes_written: 0 }));
+        assert_eq!(queue.front_offset(), Some(3));
+    }
+
+    #[test]
+    fn test_flush_batches_many_entries_into_few_writev() {
+        // A counting writer with unlimited capacity, recording each
+        // write_vectored call and the flattened byte stream.
+        struct CountingWriter {
+            inner: Vec<u8>,
+            writev_calls: usize,
         }
-
-        impl Write for WouldBlockWriter {
+        impl Write for CountingWriter {
             fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                if self.written >= self.block_after {
-                    return Err(io::Error::from(io::ErrorKind::WouldBlock));
-                }
-                let n = buf.len().min(self.block_after - self.written);
-                self.written += n;
-                Ok(n)
+                self.inner.extend_from_slice(buf);
+                Ok(buf.len())
             }
-
+            fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+                self.writev_calls += 1;
+                let mut total = 0;
+                for b in bufs {
+                    self.inner.extend_from_slice(b);
+                    total += b.len();
+                }
+                Ok(total)
+            }
             fn flush(&mut self) -> io::Result<()> {
                 Ok(())
             }
         }
 
+        // Simulate a GOP replay: many small entries.
+        let count = MAX_IOV * 2 + 5; // 133 with MAX_IOV = 64
         let mut queue = WriteQueue::new();
-        queue.enqueue(Bytes::from_static(b"hello"), false, false, true);
-        queue.enqueue(Bytes::from_static(b"world"), false, false, true);
+        let mut flat = Vec::new();
+        for i in 0..count {
+            let payload = vec![(i % 251) as u8; 3];
+            flat.extend_from_slice(&payload);
+            queue.enqueue(Bytes::from(payload), false, false, true);
+        }
 
-        let mut writer = WouldBlockWriter {
-            written: 0,
-            block_after: 3,
-        };
-
-        // Should write 3 bytes then WouldBlock
+        let mut writer = CountingWriter { inner: Vec::new(), writev_calls: 0 };
         let result = queue.try_flush(&mut writer).unwrap();
-        assert!(matches!(result, FlushResult::WouldBlock { bytes_written: 3 }));
-        assert!(!queue.is_empty());
+        assert!(matches!(result, FlushResult::Complete { .. }));
+        assert!(queue.is_empty());
+        assert_eq!(queue.pending_bytes(), 0);
+        // Byte order across the gathered entries must be preserved exactly.
+        assert_eq!(writer.inner, flat, "writev must preserve packet order");
+        // PERF-9: ceil(count / MAX_IOV) writev syscalls, not one per entry.
+        let expected_calls = (count + MAX_IOV - 1) / MAX_IOV;
+        assert_eq!(
+            writer.writev_calls, expected_calls,
+            "should batch {} entries into {} writev calls",
+            count, expected_calls
+        );
     }
 
     #[test]

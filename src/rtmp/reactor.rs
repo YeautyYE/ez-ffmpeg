@@ -1110,13 +1110,16 @@ impl Reactor {
                             ids_to_close.push(id);
                         }
                         Ok(false) => {
-                            if conn.has_pending_writes() {
-                                // Still has pending writes, re-add to pending_flush
-                                self.pending_flush.insert(id);
-                            } else {
-                                // Queue drained, update interest to clear writable flag
-                                self.interest_dirty.insert(id);
-                            }
+                            // NEW-RS-01: do NOT reinsert into pending_flush. A
+                            // still-non-empty queue here means try_flush stopped
+                            // on WouldBlock (kernel send buffer full); retrying
+                            // next loop would just burn a guaranteed-EAGAIN
+                            // syscall. Marking interest_dirty (re)registers
+                            // writable interest while data is pending, or clears
+                            // it once drained (desired_interest() derives
+                            // writable from has_pending_writes()); the poller's
+                            // writable event then drives the next flush.
+                            self.interest_dirty.insert(id);
                         }
                     }
                 } else {
@@ -1323,6 +1326,12 @@ impl Reactor {
     #[cfg(test)]
     pub fn is_interest_dirty(&self, id: usize) -> bool {
         self.interest_dirty.contains(&id)
+    }
+
+    /// Check if a connection ID is in the pending_flush set (test only)
+    #[cfg(test)]
+    pub fn is_pending_flush(&self, id: usize) -> bool {
+        self.pending_flush.contains(&id)
     }
 
     /// Clear interest_dirty set and return its previous contents (test only)
@@ -1930,6 +1939,80 @@ mod tests {
 
         // Cleanup
         reactor.remove_connection(token.id);
+    }
+
+    /// Shrink a socket's send/receive buffer so a modest enqueue reliably
+    /// fills the kernel pipe and forces WouldBlock in tests.
+    #[cfg(unix)]
+    fn set_small_socket_buffer(fd: std::os::unix::io::RawFd, opt: libc::c_int) {
+        let size: libc::c_int = 2048;
+        // SAFETY: setsockopt on a valid fd with a valid SOL_SOCKET option and a
+        // correctly-sized c_int value; return value is intentionally ignored
+        // (best-effort tuning for the test).
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                opt,
+                &size as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+
+    /// NEW-RS-01: a WouldBlock flush must register writable interest and must
+    /// NOT reinsert the connection into pending_flush (which would re-attempt
+    /// the write every loop and burn a guaranteed-EAGAIN syscall).
+    #[cfg(unix)]
+    #[test]
+    fn test_flush_pending_wouldblock_registers_writable_not_pending_flush() {
+        use std::os::unix::io::AsRawFd;
+
+        let stream_keys = dashmap::DashSet::new();
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let mut reactor = Reactor::new(3, None, stream_keys, status).expect("Failed to create reactor");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to get address");
+        let client = TcpStream::connect(addr).expect("Failed to connect");
+        let (server, _) = listener.accept().expect("Failed to accept");
+
+        // Tiny buffers + a client that never reads => writes WouldBlock fast.
+        set_small_socket_buffer(server.as_raw_fd(), libc::SO_SNDBUF);
+        set_small_socket_buffer(client.as_raw_fd(), libc::SO_RCVBUF);
+
+        let token = reactor.add_connection(server).expect("Failed to add connection");
+        if let Some(conn) = reactor.connections.get_mut(token.id) {
+            conn.state = ConnectionState::Active;
+            // ~1MB single sequence-header entry: far larger than the shrunk
+            // buffers, under the 4MB critical threshold, never dropped.
+            let big = Bytes::from(vec![0u8; 1024 * 1024]);
+            assert!(conn.enqueue_data(big, false, true, true));
+            assert!(conn.has_pending_writes());
+        }
+
+        reactor.pending_flush.insert(token.id);
+        reactor.drain_interest_dirty();
+
+        let closes = reactor.flush_pending();
+        assert!(closes.is_empty(), "a full-buffer slow client must not be closed");
+
+        let conn = reactor.connections.get(token.id).expect("connection present");
+        assert!(
+            conn.has_pending_writes(),
+            "WouldBlock must leave the remaining data queued"
+        );
+        assert!(
+            !reactor.is_pending_flush(token.id),
+            "WouldBlock must NOT reinsert into pending_flush (no EAGAIN spin)"
+        );
+        assert!(
+            reactor.is_interest_dirty(token.id),
+            "WouldBlock must mark interest_dirty so writable interest is registered"
+        );
+
+        reactor.remove_connection(token.id);
+        drop(client);
     }
 
     /// Test that flush_pending marks interest_dirty when connection has no pending writes
