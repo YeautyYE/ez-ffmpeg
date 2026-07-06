@@ -67,10 +67,12 @@ use ffmpeg_sys_next::{
 };
 #[cfg(not(docsrs))]
 use ffmpeg_sys_next::{
-    av_channel_layout_copy, av_packet_side_data_new, avcodec_get_supported_config,
-    avfilter_graph_segment_apply, avfilter_graph_segment_create_filters,
-    avfilter_graph_segment_free, avfilter_graph_segment_parse, AVChannelLayout,
+    av_buffer_ref, av_channel_layout_copy, av_packet_side_data_new,
+    avcodec_get_supported_config, avfilter_graph_segment_apply,
+    avfilter_graph_segment_create_filters, avfilter_graph_segment_free,
+    avfilter_graph_segment_parse, AVChannelLayout, AVFILTER_FLAG_HWDEVICE,
 };
+use crate::hwaccel::{hw_device_for_filter, init_filter_hw_device};
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::ffi::{c_uint, c_void, CStr, CString};
@@ -2928,6 +2930,18 @@ fn init_filter_graph(
 ) -> Result<FilterGraph> {
     let desc_cstr = CString::new(filter_desc)?;
 
+    // fftools 0f5592cfc737: hardware devices must exist before fg_create's
+    // probe parse, because some HW filters refuse to initialize without one.
+    // ez-ffmpeg's equivalent ordering: register the graph's filter device
+    // here at build time (it used to happen at filter-task startup, i.e.
+    // after this probe had already run — and failed — for such graphs).
+    if let Some(hw_device) = &hw_device {
+        let err = init_filter_hw_device(hw_device);
+        if err < 0 {
+            return Err(FilterGraphParseError::from(err).into());
+        }
+    }
+
     unsafe {
         /* this graph is only used for determining the kinds of inputs
         and outputs we have, and is discarded on exit from this function */
@@ -2948,6 +2962,24 @@ fn init_filter_graph(
         if ret < 0 {
             avfilter_graph_segment_free(&mut seg);
             return Err(FilterGraphParseError::from(ret).into());
+        }
+
+        // Same injection point as the scheduler's graph_parse: the filters
+        // exist but are not initialized yet, so a HW-flagged filter can still
+        // receive its device — fftools 0f5592cfc737 gave the probe-only parse
+        // this ability, and FFmpeg 8 filters may hard-require it in init.
+        if let Some(dev) = hw_device_for_filter() {
+            for i in 0..(*graph.as_ptr()).nb_filters {
+                let f = *(*graph.as_ptr()).filters.add(i as usize);
+                if (*(*f).filter).flags & AVFILTER_FLAG_HWDEVICE == 0 {
+                    continue;
+                }
+                (*f).hw_device_ctx = av_buffer_ref(dev.device_ref);
+                if (*f).hw_device_ctx.is_null() {
+                    avfilter_graph_segment_free(&mut seg);
+                    return Err(FilterGraphParseError::OutOfMemory.into());
+                }
+            }
         }
 
         #[cfg(not(docsrs))]
@@ -2979,7 +3011,6 @@ fn init_filter_graph(
 
         let filter_graph = FilterGraph::new(
             filter_desc.to_string(),
-            hw_device,
             input_filters,
             output_filters,
         );
@@ -3600,7 +3631,7 @@ mod tests {
     }
 
     fn test_graph(inputs: Vec<InputFilter>, outputs: Vec<OutputFilter>) -> FilterGraph {
-        FilterGraph::new("null".to_string(), None, inputs, outputs)
+        FilterGraph::new("null".to_string(), inputs, outputs)
     }
 
     #[test]

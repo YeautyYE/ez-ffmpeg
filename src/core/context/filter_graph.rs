@@ -8,7 +8,6 @@ use std::sync::Arc;
 
 pub(crate) struct FilterGraph {
     pub(crate) graph_desc: String,
-    pub(crate) hw_device: Option<String>,
 
     pub(crate) inputs: Vec<InputFilter>,
     pub(crate) outputs: Vec<OutputFilter>,
@@ -19,8 +18,11 @@ pub(crate) struct FilterGraph {
 }
 
 impl FilterGraph {
+    // The graph's filter hw device is not stored here: init_filter_graph
+    // registers it in the global hwaccel registry at context-build time
+    // (before the probe parse), and the filter task resolves it back through
+    // hw_device_for_filter().
     pub(crate) fn new(graph_desc: String,
-                      hw_device: Option<String>,
                       inputs: Vec<InputFilter>,
                       outputs: Vec<OutputFilter>) -> Self {
         let (sender, receiver) = crossbeam_channel::bounded(8);
@@ -30,7 +32,6 @@ impl FilterGraph {
 
         Self {
             graph_desc,
-            hw_device,
             inputs,
             outputs,
             src: Some((sender, receiver, Arc::from(finished_flag_list))),
