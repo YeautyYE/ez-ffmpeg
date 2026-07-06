@@ -1750,9 +1750,19 @@ unsafe fn fg_output_frame(
     }
 
     let frame_is_null = frame_is_null(&frame);
-    if !frame_is_null && ofp.media_type == AVMEDIA_TYPE_VIDEO {
-        let frame_prev = std::mem::replace(&mut ofp.fpsconv_context.last_frame, frame);
-        frame_pool.release(frame_prev);
+    if !frame_is_null {
+        if ofp.media_type == AVMEDIA_TYPE_VIDEO {
+            let frame_prev = std::mem::replace(&mut ofp.fpsconv_context.last_frame, frame);
+            frame_pool.release(frame_prev);
+        } else {
+            // Audio (and any non-video) sink frame: fg_output_frame already
+            // copied the buffers into a separate pooled shell via av_frame_ref
+            // and sent that downstream, so this original sink shell can return
+            // to the pool instead of Drop-freeing it every output frame
+            // (alloc-05). release() only unrefs this shell; the refcounted
+            // buffers now held by the sent frame are untouched.
+            frame_pool.release(frame);
+        }
     }
 
     if frame_is_null {
