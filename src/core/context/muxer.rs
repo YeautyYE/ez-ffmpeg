@@ -326,7 +326,12 @@ impl Muxer {
             None
         };
 
-        let (pre_packet_sender, pre_packet_receiver) = crossbeam_channel::bounded(65536);
+        // Pre-mux buffer: packets an encoder produces before the muxer opens
+        // (it waits until every output stream has its first packet). 16384 is a
+        // generous burst headroom while capping the pre-start memory window far
+        // below the old 65536; a fast encoder racing a slow-to-start stream
+        // blocks here (backpressure) until the muxer drains it (PERF-12).
+        let (pre_packet_sender, pre_packet_receiver) = crossbeam_channel::bounded(16384);
         self.src_pre_receivers.push(pre_packet_receiver);
 
         let stream = EncoderStream::new(
