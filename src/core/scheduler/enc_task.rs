@@ -1464,8 +1464,18 @@ fn send_to_mux(
     // The gate serializes "started?" with the pre-queue send: without it a
     // packet parked between the muxer's drain and its gate flip would never
     // be delivered.
+    //
+    // Termination is driven by Disconnected, not the tick cap: on stop or a
+    // mux-init failure the muxer drops the pre-queue receiver, so send_pre
+    // promptly returns Disconnected and this returns Err (handled as
+    // MuxerFinished, not a job failure). The tick cap is only a backstop
+    // against a muxer that never starts and is never stopped. It is generous
+    // (PRE_MUX_BACKPRESSURE_MAX_TICKS × 10ms) precisely because a valid job can
+    // legitimately be slow to open the muxer — e.g. a sparse subtitle/data
+    // stream whose first packet lands seconds in — and the old 6.4s cap failed
+    // such jobs (PERF-12).
     let mut packet_box = packet_box;
-    for _ in 0..640 {
+    for _ in 0..PRE_MUX_BACKPRESSURE_MAX_TICKS {
         packet_box = match mux_start_gate.send_pre(pre_pkt_sender, packet_box) {
             PreSendOutcome::Sent => return Ok(()),
             PreSendOutcome::Started(pb) => return pkt_sender.send(pb),
@@ -1479,3 +1489,10 @@ fn send_to_mux(
     }
     Err(SendError(packet_box))
 }
+
+/// Backstop for pre-mux backpressure: at 10ms/tick this is ~60s of waiting for
+/// the muxer to open before an encoder gives up. Termination normally comes
+/// from the pre-queue receiver disconnecting (stop / mux-init failure) long
+/// before this; the cap only guards a muxer that never starts and is never
+/// stopped.
+const PRE_MUX_BACKPRESSURE_MAX_TICKS: u32 = 6000;
