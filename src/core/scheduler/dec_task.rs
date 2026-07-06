@@ -60,31 +60,37 @@ pub(crate) fn dec_init(
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
 ) -> crate::error::Result<()> {
     let receiver = dec_stream.take_src();
-    
-    let codec_ptr = dec_stream.codec.as_ptr();
-    if codec_ptr.is_null() {
-        error!("Decoder codec pointer is null for stream {}", dec_stream.stream_index);
-        return Err(OpenDecoder(OpenDecoderOperationError::ContextAllocationError(OpenDecoderError::OutOfMemory)));
-    }
-    
-    let codec_name_ptr = unsafe { (*codec_ptr).name };
-    if codec_name_ptr.is_null() {
-        error!("Decoder codec name pointer is null for stream {}", dec_stream.stream_index);
-        return Err(OpenDecoder(OpenDecoderOperationError::ContextAllocationError(OpenDecoderError::OutOfMemory)));
-    }
-    
-    let decoder_name = unsafe {
-        CStr::from_ptr(codec_name_ptr).to_str().unwrap_or("unknown")
-    };
 
+    // A stream with no downstream consumer is never decoded, so skip it before
+    // requiring a decoder. Decoder-less streams (e.g. `tmcd`/`data`) legitimately
+    // carry a null codec pointer; the null-codec guard below used to run first and
+    // abort the whole job even when such a stream is only demuxed/stream-copied or
+    // dropped (GitHub #43). `connect_stream` only wires a source for streams routed
+    // to a decoder, so `receiver.is_none()` precisely marks the not-decoded case.
     if receiver.is_none() {
         debug!(
-            "Demuxer:{demux_idx}:{decoder_name} stream:[{}] not be used. skip.",
+            "Demuxer:{demux_idx} stream:[{}] not be used. skip.",
             dec_stream.stream_index
         );
         return Ok(());
     }
     let receiver = receiver.unwrap();
+
+    let codec_ptr = dec_stream.codec.as_ptr();
+    if codec_ptr.is_null() {
+        error!("Decoder codec pointer is null for stream {}", dec_stream.stream_index);
+        return Err(OpenDecoder(OpenDecoderOperationError::ContextAllocationError(OpenDecoderError::OutOfMemory)));
+    }
+
+    let codec_name_ptr = unsafe { (*codec_ptr).name };
+    if codec_name_ptr.is_null() {
+        error!("Decoder codec name pointer is null for stream {}", dec_stream.stream_index);
+        return Err(OpenDecoder(OpenDecoderOperationError::ContextAllocationError(OpenDecoderError::OutOfMemory)));
+    }
+
+    let decoder_name = unsafe {
+        CStr::from_ptr(codec_name_ptr).to_str().unwrap_or("unknown")
+    };
 
     let dp = DecoderParameter::new(dec_stream);
     let dp_arc = Arc::new(Mutex::new(dp));
