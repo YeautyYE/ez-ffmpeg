@@ -46,6 +46,13 @@ pub struct Input {
     /// ```
     pub(crate) read_callback: Option<Box<dyn FnMut(&mut [u8]) -> i32 + Send>>,
 
+    /// Size of the AVIO buffer backing a custom `read_callback`, in bytes.
+    /// Only used when the input is a callback (no URL). Larger values reduce
+    /// Rust↔FFmpeg round-trips for sequential/network sources; the default is
+    /// [`DEFAULT_CUSTOM_IO_BUFFER_SIZE`](crate::core::context::DEFAULT_CUSTOM_IO_BUFFER_SIZE)
+    /// (64 KiB). Set via [`Input::set_io_buffer_size`].
+    pub(crate) io_buffer_size: usize,
+
     /// A callback function for custom seeking within the input stream.
     ///
     /// The `seek_callback` function allows defining custom seeking behavior.
@@ -349,6 +356,25 @@ impl Input {
         F: FnMut(&mut [u8]) -> i32 + Send + 'static,
     {
         (Box::new(read_callback) as Box<dyn FnMut(&mut [u8]) -> i32 + Send>).into()
+    }
+
+    /// Sets the AVIO buffer size, in bytes, for a custom `read_callback` input.
+    ///
+    /// FFmpeg fills one buffer-sized chunk per callback, so a larger buffer means
+    /// fewer Rust↔FFmpeg round-trips for sequential or network sources. Only
+    /// applies when the input is a callback (no URL); ignored otherwise. The
+    /// default is 64 KiB, which keeps first-packet latency low for live use.
+    ///
+    /// # Panics
+    /// Panics if `size` is 0 or exceeds `i32::MAX` (FFmpeg's `avio_alloc_context`
+    /// takes an `int` buffer size).
+    pub fn set_io_buffer_size(mut self, size: usize) -> Self {
+        assert!(
+            size > 0 && size <= i32::MAX as usize,
+            "io_buffer_size must be in 1..=i32::MAX, got {size}"
+        );
+        self.io_buffer_size = size;
+        self
     }
 
     /// Sets a custom seek callback for the input stream.
@@ -1050,6 +1076,7 @@ impl From<Box<dyn FnMut(&mut [u8]) -> i32 + Send>> for Input {
         Self {
             url: None,
             read_callback: Some(read_callback),
+            io_buffer_size: crate::core::context::DEFAULT_CUSTOM_IO_BUFFER_SIZE,
             seek_callback: None,
             frame_pipelines: None,
             format: None,
@@ -1079,6 +1106,7 @@ impl From<String> for Input {
         Self {
             url: Some(url),
             read_callback: None,
+            io_buffer_size: crate::core::context::DEFAULT_CUSTOM_IO_BUFFER_SIZE,
             seek_callback: None,
             frame_pipelines: None,
             format: None,
@@ -1207,5 +1235,35 @@ mod tests {
             buf2[..len].copy_from_slice(&data_source2[..len]);
             len as i32 // Return the number of bytes written
         });
+    }
+
+    #[test]
+    fn io_buffer_size_defaults_to_64k() {
+        use crate::core::context::DEFAULT_CUSTOM_IO_BUFFER_SIZE;
+        assert_eq!(DEFAULT_CUSTOM_IO_BUFFER_SIZE, 64 * 1024);
+        assert_eq!(
+            Input::from("test.mp4").io_buffer_size,
+            DEFAULT_CUSTOM_IO_BUFFER_SIZE
+        );
+    }
+
+    #[test]
+    fn set_io_buffer_size_valid() {
+        assert_eq!(
+            Input::from("test.mp4").set_io_buffer_size(1 << 20).io_buffer_size,
+            1 << 20
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "io_buffer_size must be in 1..=i32::MAX")]
+    fn set_io_buffer_size_zero_panics() {
+        Input::from("test.mp4").set_io_buffer_size(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "io_buffer_size must be in 1..=i32::MAX")]
+    fn set_io_buffer_size_too_large_panics() {
+        Input::from("test.mp4").set_io_buffer_size(i32::MAX as usize + 1);
     }
 }

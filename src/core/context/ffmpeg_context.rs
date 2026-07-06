@@ -2116,7 +2116,7 @@ unsafe fn open_output_file(
 
             let write_callback = output.write_callback.take().unwrap();
 
-            let avio_ctx_buffer_size = 1024 * 64;
+            let avio_ctx_buffer_size = output.io_buffer_size;
             let mut avio_ctx_buffer = av_malloc(avio_ctx_buffer_size);
             if avio_ctx_buffer.is_null() {
                 return Err(OpenOutputError::OutOfMemory.into());
@@ -3233,7 +3233,7 @@ unsafe fn open_input_file(
                 return Err(OpenInputError::InvalidSource.into());
             }
 
-            let avio_ctx_buffer_size = 1024 * 64;
+            let avio_ctx_buffer_size = input.io_buffer_size;
             let mut avio_ctx_buffer = av_malloc(avio_ctx_buffer_size);
             if avio_ctx_buffer.is_null() {
                 avformat_close_input(&mut in_fmt_ctx);
