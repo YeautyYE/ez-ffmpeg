@@ -5,7 +5,7 @@ use crate::core::context::obj_pool::ObjPool;
 use crate::core::context::output::VSyncMethod;
 use crate::core::context::output::VSyncMethod::{VsyncCfr, VsyncVscfr};
 use crate::core::context::output_filter::OutputFilterOptions;
-use crate::core::context::{null_frame, FrameBox, FrameData};
+use crate::core::context::{null_frame, FrameBox, FrameData, SideDataList};
 use crate::core::scheduler::ffmpeg_scheduler::{
     frame_is_null, is_stopping, set_scheduler_error, wait_until_not_paused,
 };
@@ -54,6 +54,11 @@ use ffmpeg_sys_next::{
     avfilter_graph_segment_create_filters, avfilter_graph_segment_free,
     avfilter_graph_segment_parse, AVChannelLayout, AVChannelLayout__bindgen_ty_1, AVChannelOrder,
     AVFilterGraphSegment, AVFILTER_FLAG_HWDEVICE, AVFILTER_FLAG_METADATA_ONLY, AV_FRAME_FLAG_KEY,
+};
+#[cfg(ffmpeg_8_0)]
+use ffmpeg_sys_next::{
+    av_buffersink_get_side_data, av_frame_side_data_desc,
+    AVSideDataProps::AV_SIDE_DATA_PROP_GLOBAL, AV_FRAME_SIDE_DATA_FLAG_REPLACE,
 };
 use log::{debug, error, info, trace, warn};
 use std::collections::VecDeque;
@@ -322,6 +327,11 @@ struct InputFilterParameter {
     displaymatrix_present: bool,
     displaymatrix_applied: bool,
     displaymatrix: [i32; 9],
+    // Global side data collected from input frames for the buffersrc
+    // parameters (fftools InputFilterPriv.side_data). Only populated (and
+    // read) on FFmpeg 8+; stays empty on 7.x — hence dead there by design.
+    #[cfg_attr(not(ffmpeg_8_0), allow(dead_code))]
+    side_data: SideDataList,
     filter: *mut AVFilterContext,
 
     frame_queue: VecDeque<FrameBox>,
@@ -360,6 +370,7 @@ impl InputFilterParameter {
             displaymatrix_present: false,
             displaymatrix_applied: false,
             displaymatrix: [0; 9],
+            side_data: SideDataList::new(),
             filter: null_mut(),
             frame_queue: Default::default(),
             eof: false,
@@ -401,6 +412,11 @@ struct OutputFilterParameter {
     sample_aspect_ratio: AVRational,
     sample_rate: i32,
 
+    // Per-configuration snapshot of the side data the sink negotiated,
+    // shared into FrameData for the frame that opens the encoder (fftools
+    // OutputFilterPriv.side_data). Only populated on FFmpeg 8+.
+    side_data: Option<Arc<SideDataList>>,
+
     tb_out: AVRational,
     // Once an output frame chose the timebase, a filtergraph reconfig must
     // not change it: downstream timestamps are already scaled to it
@@ -438,6 +454,7 @@ impl OutputFilterParameter {
             color_range: AVColorRange::AVCOL_RANGE_UNSPECIFIED,
             sample_aspect_ratio: AVRational { num: 0, den: 0 },
             sample_rate: 0,
+            side_data: None,
             tb_out: AVRational { num: 0, den: 0 },
             tb_out_locked: false,
             next_pts: 0,
@@ -905,6 +922,49 @@ unsafe fn configure_filtergraph(
                 FilterGraphParseError::from(ret),
             )));
         }
+
+        // FFmpeg 8+: merge the side data this sink negotiated over the
+        // previous configuration's entries (REPLACE keeps entries older
+        // configurations produced, matching n8.1 configure_filtergraph),
+        // then freeze the snapshot the encoder side reads via FrameData.
+        #[cfg(ffmpeg_8_0)]
+        {
+            let mut merged = SideDataList::new();
+            // Arc-clone the previous snapshot first: iterating it through
+            // `ofp` would keep `ofps` borrowed across the error paths, which
+            // hand `ofps` to cleanup_filtergraph again (E0499).
+            let prev = ofp.side_data.clone();
+            if let Some(prev) = prev {
+                for sd in prev.iter() {
+                    let err = merged.push_clone(sd, 0);
+                    if err < 0 {
+                        cleanup_filtergraph(graph, ifps, ofps);
+                        return Err(Error::FilterGraph(
+                            FilterGraphOperationError::FrameSideDataCloneError(
+                                FilterGraphError::from(err),
+                            ),
+                        ));
+                    }
+                }
+            }
+            let mut nb_sd = 0;
+            let sd_arr = av_buffersink_get_side_data(ofp.filter, &mut nb_sd);
+            for j in 0..nb_sd {
+                let err = merged.push_clone(
+                    *sd_arr.offset(j as isize),
+                    AV_FRAME_SIDE_DATA_FLAG_REPLACE as u32,
+                );
+                if err < 0 {
+                    cleanup_filtergraph(graph, ifps, ofps);
+                    return Err(Error::FilterGraph(
+                        FilterGraphOperationError::FrameSideDataCloneError(
+                            FilterGraphError::from(err),
+                        ),
+                    ));
+                }
+            }
+            ofp.side_data = Some(Arc::new(merged));
+        }
     }
 
     for ifp in &mut *ifps {
@@ -940,6 +1000,15 @@ unsafe fn configure_filtergraph(
                             FilterGraphError::from(ret),
                         ),
                     ));
+                }
+                // Frames queued before the first configuration still carry
+                // their display matrix; autorotate already consumed it, so
+                // strip it like the direct send path does. Upstream fixed
+                // this on the 8.x line only (01f63ef0b4), hence the gate:
+                // 7.x stays bit-identical with fftools n7.1.
+                #[cfg(ffmpeg_8_0)]
+                if ifp.media_type == AVMEDIA_TYPE_VIDEO && ifp.displaymatrix_applied {
+                    av_frame_remove_side_data(tmp_frame, AV_FRAME_DATA_DISPLAYMATRIX);
                 }
                 ret = av_buffersrc_add_frame(ifp.filter, tmp_frame);
                 // add_frame moves the data references out of tmp_frame but
@@ -1603,6 +1672,13 @@ unsafe fn fg_output_frame(
                     input_stream_height: 0,
                     subtitle_header: None,
                     fg_input_index: ofp.fg_input_index,
+                    // Only the frame that opens the encoder needs the graph's
+                    // side data snapshot (fftools fg_output_step).
+                    side_data: if fgp.got_frame {
+                        None
+                    } else {
+                        ofp.side_data.clone()
+                    },
                 },
             };
 
@@ -1707,6 +1783,9 @@ unsafe fn close_output(
                     input_stream_height: 0,
                     subtitle_header: None,
                     fg_input_index: ofp.fg_input_index,
+                    // The dummy init frame carries the snapshot too
+                    // (n8.1 close_output).
+                    side_data: ofp.side_data.clone(),
                 },
             };
 
@@ -1728,6 +1807,7 @@ unsafe fn close_output(
                 input_stream_height: 0,
                 subtitle_header: None,
                 fg_input_index: ofp.fg_input_index,
+                side_data: None,
             },
         };
 
@@ -2058,6 +2138,33 @@ fn ifilter_parameters_from_frame(
             return Err(Error::FilterGraph(
                 FilterGraphOperationError::ChannelLayoutCopyError(FilterGraphError::from(ret)),
             ));
+        }
+
+        // FFmpeg 8+: collect global side data for the buffersrc parameters.
+        // The display matrix is excluded — autorotate consumes it (and strips
+        // it from frames), so forwarding it too would rotate twice (fftools
+        // ifilter_parameters_from_frame, n8.1 / 7b18beb477).
+        #[cfg(ffmpeg_8_0)]
+        {
+            ifp.side_data.clear();
+            for i in 0..(*frame).nb_side_data {
+                let sd = *(*frame).side_data.offset(i as isize);
+                let desc = av_frame_side_data_desc((*sd).type_);
+                if (*desc).props & AV_SIDE_DATA_PROP_GLOBAL as u32 == 0
+                    || (*sd).type_ == AV_FRAME_DATA_DISPLAYMATRIX
+                {
+                    continue;
+                }
+                let ret = ifp.side_data.push_clone(sd, 0);
+                if ret < 0 {
+                    error!("Clone side data error: {}", av_err2str(ret));
+                    return Err(Error::FilterGraph(
+                        FilterGraphOperationError::FrameSideDataCloneError(
+                            FilterGraphError::from(ret),
+                        ),
+                    ));
+                }
+            }
         }
 
         // Handle display matrix side data
@@ -2521,6 +2628,25 @@ unsafe fn configure_input_audio_filter(
         return ret;
     }
 
+    // FFmpeg 8+: the args string cannot carry side data, so hand the
+    // collected global entries to abuffer through the parameters API —
+    // buffersrc deep-copies them (n8.1 configure_input_audio_filter,
+    // e61b9d4094).
+    #[cfg(ffmpeg_8_0)]
+    {
+        let mut par = av_buffersrc_parameters_alloc();
+        if par.is_null() {
+            return AVERROR(ENOMEM);
+        }
+        (*par).side_data = ifp.side_data.as_mut_ptr();
+        (*par).nb_side_data = ifp.side_data.len();
+        let ret = av_buffersrc_parameters_set(ifp.filter, par);
+        av_freep(&mut par as *mut _ as *mut c_void);
+        if ret < 0 {
+            return ret;
+        }
+    }
+
     let mut last_filter = ifp.filter;
 
     let name = format!("trim_in_{}", ifp.name);
@@ -2607,6 +2733,14 @@ unsafe fn configure_input_video_filter(
     (*par).color_space = ifp.color_space;
     (*par).color_range = ifp.color_range;
     (*par).hw_frames_ctx = ifp.hw_frames_ctx;
+    // FFmpeg 8+ propagates global side data through the graph; buffersrc
+    // deep-copies the entries, the list keeps ownership (n8.1
+    // configure_input_video_filter).
+    #[cfg(ffmpeg_8_0)]
+    {
+        (*par).side_data = ifp.side_data.as_mut_ptr();
+        (*par).nb_side_data = ifp.side_data.len();
+    }
 
     let mut ret = av_buffersrc_parameters_set(ifp.filter, par);
     av_freep(&mut par as *mut _ as *mut c_void);

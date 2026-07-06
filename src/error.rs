@@ -293,6 +293,9 @@ pub enum FilterGraphOperationError {
     #[error("during replace buffer: {0}")]
     BufferReplaceoseError(FilterGraphError),
 
+    #[error("during cloning frame side data: {0}")]
+    FrameSideDataCloneError(FilterGraphError),
+
     #[error("during parse: {0}")]
     ParseError(FilterGraphParseError),
 

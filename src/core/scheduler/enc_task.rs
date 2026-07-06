@@ -22,10 +22,12 @@ use ffmpeg_sys_next::AVMediaType::{AVMEDIA_TYPE_AUDIO, AVMEDIA_TYPE_SUBTITLE, AV
 use ffmpeg_sys_next::AVPictureType::AV_PICTURE_TYPE_NONE;
 use ffmpeg_sys_next::AVPixelFormat::AV_PIX_FMT_NONE;
 use ffmpeg_sys_next::AVSampleFormat::AV_SAMPLE_FMT_NONE;
-#[cfg(not(docsrs))]
+#[cfg(all(not(docsrs), not(ffmpeg_8_0)))]
 use ffmpeg_sys_next::AVSideDataProps::AV_SIDE_DATA_PROP_GLOBAL;
+#[cfg(all(not(docsrs), not(ffmpeg_8_0)))]
+use ffmpeg_sys_next::av_frame_side_data_desc;
 #[cfg(not(docsrs))]
-use ffmpeg_sys_next::{av_channel_layout_copy, av_frame_side_data_clone, av_frame_side_data_desc, AV_CODEC_FLAG_COPY_OPAQUE, AV_CODEC_FLAG_FRAME_DURATION, AV_FRAME_FLAG_INTERLACED, AV_FRAME_FLAG_TOP_FIELD_FIRST, AV_FRAME_SIDE_DATA_FLAG_UNIQUE};
+use ffmpeg_sys_next::{av_channel_layout_copy, av_frame_side_data_clone, AV_CODEC_FLAG_COPY_OPAQUE, AV_CODEC_FLAG_FRAME_DURATION, AV_FRAME_FLAG_INTERLACED, AV_FRAME_FLAG_TOP_FIELD_FIRST, AV_FRAME_SIDE_DATA_FLAG_UNIQUE};
 use ffmpeg_sys_next::{av_add_q, av_buffer_ref, av_compare_ts, av_cpu_max_align, av_frame_copy_props, av_frame_get_buffer, av_frame_ref, av_get_bytes_per_sample, av_get_pix_fmt_name, av_opt_set_dict2, av_rescale_q, av_sample_fmt_is_planar, av_samples_copy, av_shrink_packet, avcodec_alloc_context3, avcodec_encode_subtitle, avcodec_get_hw_config, avcodec_open2, avcodec_parameters_from_context, avcodec_receive_packet, avcodec_send_frame, AVBufferRef, AVCodecContext, AVFrame, AVHWFramesContext, AVMediaType, AVRational, AVStream, AVSubtitle, AVERROR, AVERROR_EOF, AVERROR_EXPERIMENTAL, AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE, AV_CODEC_CAP_PARAM_CHANGE, AV_CODEC_FLAG_INTERLACED_DCT, AV_CODEC_FLAG_INTERLACED_ME, AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX, AV_CODEC_HW_CONFIG_METHOD_HW_FRAMES_CTX, AV_NOPTS_VALUE, AV_OPT_SEARCH_CHILDREN, AV_PKT_FLAG_TRUSTED, AV_TIME_BASE_Q, EAGAIN};
 use ffmpeg_sys_next::av_mallocz;
 use log::{debug, error, info, trace, warn};
@@ -789,6 +791,9 @@ fn enc_open(
         if (*enc_ctx).codec_type == AVMEDIA_TYPE_VIDEO
             || (*enc_ctx).codec_type == AVMEDIA_TYPE_AUDIO
         {
+            // FFmpeg 7.x: global side data still rides on the frames coming
+            // out of the filtergraph, so scan them (fftools n7.1 enc_open).
+            #[cfg(not(ffmpeg_8_0))]
             for i in 0..(*frame).nb_side_data {
                 let desc = av_frame_side_data_desc((**(*frame).side_data.offset(i as isize)).type_);
 
@@ -808,6 +813,28 @@ fn enc_open(
                             OpenEncoderError::OutOfMemory,
                         ),
                     ));
+                }
+            }
+
+            // FFmpeg 8+: the filtergraph negotiates global side data itself
+            // and it arrives on the FrameData sidecar instead of the frames
+            // (fftools enc_open after 7b18beb477).
+            #[cfg(ffmpeg_8_0)]
+            if let Some(sd_list) = frame_box.frame_data.side_data.as_ref() {
+                for sd in sd_list.iter() {
+                    let ret = av_frame_side_data_clone(
+                        &mut (*enc_ctx).decoded_side_data,
+                        &mut (*enc_ctx).nb_decoded_side_data,
+                        sd,
+                        AV_FRAME_SIDE_DATA_FLAG_UNIQUE as u32,
+                    );
+                    if ret < 0 {
+                        return Err(OpenEncoder(
+                            OpenEncoderOperationError::FrameSideDataCloneError(
+                                OpenEncoderError::OutOfMemory,
+                            ),
+                        ));
+                    }
                 }
             }
 

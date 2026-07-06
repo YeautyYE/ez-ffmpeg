@@ -668,6 +668,7 @@ unsafe fn dec_frame_to_box(dp_arc: Arc<Mutex<DecoderParameter>>, frame: Frame) -
             input_stream_height: (*dec_ctx).height,
             subtitle_header: dp.dec.subtitle_header.clone(),
             fg_input_index: usize::MAX,
+            side_data: None,
         },
     }
 }
