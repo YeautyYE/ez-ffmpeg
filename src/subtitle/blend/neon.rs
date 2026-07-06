@@ -20,11 +20,8 @@
 //! the vector code loads/stores them as bytes and `vreinterpret`s to `u16`,
 //! which is the same value as `u16::from_le_bytes` on the little-endian
 //! aarch64 targets this module compiles for.
-//!
-//! (Staged rollout: `apply_sums_*` and `pair_sums_*` still delegate to the
-//! scalar kernels here; their NEON kernels land in the next commit.)
 
-use super::{apply_sums, OverlayImage, PlaneView, PooledRect, SampleU16Le, SampleU8};
+use super::{OverlayImage, PlaneView, PooledRect, SampleU16Le, SampleU8};
 use core::arch::aarch64::*;
 
 /// True when the running CPU supports NEON. On aarch64 NEON is baseline-
@@ -92,8 +89,15 @@ pub(super) unsafe fn apply_sums_u8(
     src: u32,
     alpha: u32,
 ) {
-    debug_assert_eq!(plane.pixel_step, 1);
-    apply_sums::<SampleU8>(plane, sums, rect, src, alpha);
+    if alpha == 0 {
+        return;
+    }
+    for row in 0..rect.ph {
+        let sums_row = &sums[row * rect.pw..(row + 1) * rect.pw];
+        let dst_start = (rect.py0 + row) * plane.linesize + rect.px0;
+        let dst_row = &mut plane.data[dst_start..dst_start + rect.pw];
+        apply_row_u8(dst_row, sums_row, src, alpha, rect.shift);
+    }
 }
 
 /// NEON counterpart of `apply_sums::<SampleU16Le>` for `pixel_step == 2`.
@@ -107,8 +111,15 @@ pub(super) unsafe fn apply_sums_u16(
     src: u32,
     alpha: u32,
 ) {
-    debug_assert_eq!(plane.pixel_step, 2);
-    apply_sums::<SampleU16Le>(plane, sums, rect, src, alpha);
+    if alpha == 0 {
+        return;
+    }
+    for row in 0..rect.ph {
+        let sums_row = &sums[row * rect.pw..(row + 1) * rect.pw];
+        let dst_start = (rect.py0 + row) * plane.linesize + rect.px0 * 2;
+        let dst_row = &mut plane.data[dst_start..dst_start + rect.pw * 2];
+        apply_row_u16(dst_row, sums_row, src, alpha, rect.shift);
+    }
 }
 
 /// Interior adjacent-pair sums for `pool_sums_h2`, single mask row:
@@ -117,7 +128,7 @@ pub(super) unsafe fn apply_sums_u16(
 /// # Safety
 /// The CPU must support NEON ([`enabled`]).
 pub(super) unsafe fn pair_sums_one_row(span: &mut [u16], top: &[u8]) {
-    super::pair_sums(span, top, None, false);
+    pair_sums_row::<false>(span, top, top);
 }
 
 /// Interior adjacent-pair sums for `pool_sums_h2`, two mask rows:
@@ -126,7 +137,7 @@ pub(super) unsafe fn pair_sums_one_row(span: &mut [u16], top: &[u8]) {
 /// # Safety
 /// The CPU must support NEON ([`enabled`]).
 pub(super) unsafe fn pair_sums_two_rows(span: &mut [u16], top: &[u8], bot: &[u8]) {
-    super::pair_sums(span, top, Some(bot), false);
+    pair_sums_row::<true>(span, top, bot);
 }
 
 // ---------------------------------------------------------------------------
@@ -145,6 +156,17 @@ pub(super) unsafe fn pair_sums_two_rows(span: &mut [u16], top: &[u8], bot: &[u8]
 #[target_feature(enable = "neon")]
 unsafe fn is_zero_u8x16(v: uint8x16_t) -> bool {
     let words = vreinterpretq_u64_u8(v);
+    (vgetq_lane_u64::<0>(words) | vgetq_lane_u64::<1>(words)) == 0
+}
+
+/// True when all eight sums (sixteen bytes) are zero.
+///
+/// # Safety
+/// Requires NEON.
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn is_zero_u16x8(v: uint16x8_t) -> bool {
+    let words = vreinterpretq_u64_u16(v);
     (vgetq_lane_u64::<0>(words) | vgetq_lane_u64::<1>(words)) == 0
 }
 
@@ -187,6 +209,16 @@ unsafe fn narrow_to_u8x16(b: [uint32x4_t; 4]) -> uint8x16_t {
     let lo = vcombine_u16(vmovn_u32(b[0]), vmovn_u32(b[1])); // u16x8: pixels 0..8
     let hi = vcombine_u16(vmovn_u32(b[2]), vmovn_u32(b[3])); // u16x8: pixels 8..16
     vcombine_u8(vmovn_u16(lo), vmovn_u16(hi))
+}
+
+/// Truncates two `u32x4` groups (each lane <= 255) back to eight u8s.
+///
+/// # Safety
+/// Requires NEON.
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn narrow_to_u8x8(b: [uint32x4_t; 2]) -> uint8x8_t {
+    vmovn_u16(vcombine_u16(vmovn_u32(b[0]), vmovn_u32(b[1])))
 }
 
 /// Truncates two `u32x4` groups (each lane <= 0xFFFF) back to eight u16s.
@@ -310,5 +342,511 @@ unsafe fn blend_row_u16(dst: &mut [u8], mask: &[u8], src: u32, alpha: u32) {
     }
     if !mask[x..].iter().all(|&m| m == 0) {
         super::blend_span::<SampleU16Le>(&mut dst[2 * x..], &mask[x..], src, alpha, 2);
+    }
+}
+
+/// One row of the pooled u8 apply: 8 output pixels per iteration. Parity order
+/// matters: coverage is `sum >> shift` FIRST (u16 lanes), then widened and
+/// multiplied by alpha — exactly the scalar `(u32::from(sum) >> shift) * alpha`
+/// (each pooled sum aggregates `1 << shift` mask bytes, so `sum >> shift` fits
+/// a byte). The variable right shift is a `vshlq_u16` by a negative count.
+///
+/// # Safety
+/// Requires NEON; `dst.len() == sums.len()`.
+#[target_feature(enable = "neon")]
+unsafe fn apply_row_u8(dst: &mut [u8], sums: &[u16], src: u32, alpha: u32, shift: u32) {
+    debug_assert_eq!(dst.len(), sums.len());
+    let alpha_v = vdupq_n_u32(alpha);
+    let src_v = vdupq_n_u32(src);
+    let shift_v = vdupq_n_s16(-(shift as i16)); // negative count => logical right shift
+    let n = sums.len();
+    let mut x = 0usize;
+    while x + 8 <= n {
+        // In-bounds: x + 8 <= n covers the 16-byte sums read and the 8-byte
+        // dst read/write.
+        let s = vld1q_u16(sums.as_ptr().add(x));
+        if !is_zero_u16x8(s) {
+            let cov = widen_u16x8(vshlq_u16(s, shift_v));
+            let dg = widen_u16x8(vmovl_u8(vld1_u8(dst.as_ptr().add(x))));
+            let b = [
+                blend4_u8(cov[0], dg[0], alpha_v, src_v),
+                blend4_u8(cov[1], dg[1], alpha_v, src_v),
+            ];
+            vst1_u8(dst.as_mut_ptr().add(x), narrow_to_u8x8(b));
+        }
+        x += 8;
+    }
+    if !sums[x..].iter().all(|&s| s == 0) {
+        super::apply_sums_span::<SampleU8>(&mut dst[x..], &sums[x..], src, alpha, shift, 1);
+    }
+}
+
+/// One row of the pooled u16 apply at `pixel_step == 2`: 8 output pixels per
+/// iteration, coverage computed sum-shift-first like the scalar path.
+///
+/// # Safety
+/// Requires NEON; `dst.len() == sums.len() * 2`.
+#[target_feature(enable = "neon")]
+unsafe fn apply_row_u16(dst: &mut [u8], sums: &[u16], src: u32, alpha: u32, shift: u32) {
+    debug_assert_eq!(dst.len(), sums.len() * 2);
+    let alpha_v = vdupq_n_u32(alpha);
+    let src_v = vdupq_n_u32(src);
+    let shift_v = vdupq_n_s16(-(shift as i16));
+    let n = sums.len();
+    let mut x = 0usize;
+    while x + 8 <= n {
+        // In-bounds: x + 8 <= n covers the 16-byte sums read; dst accesses
+        // span bytes [2x, 2x + 16) <= 2n == dst.len().
+        let s = vld1q_u16(sums.as_ptr().add(x));
+        if !is_zero_u16x8(s) {
+            let cov = widen_u16x8(vshlq_u16(s, shift_v));
+            let base = dst.as_mut_ptr().add(2 * x);
+            let dg = widen_u16x8(vreinterpretq_u16_u8(vld1q_u8(base)));
+            let out = narrow_to_u16x8([
+                blend4_u16(cov[0], dg[0], alpha_v, src_v),
+                blend4_u16(cov[1], dg[1], alpha_v, src_v),
+            ]);
+            vst1q_u8(base, vreinterpretq_u8_u16(out));
+        }
+        x += 8;
+    }
+    if !sums[x..].iter().all(|&s| s == 0) {
+        super::apply_sums_span::<SampleU16Le>(&mut dst[2 * x..], &sums[x..], src, alpha, shift, 2);
+    }
+}
+
+/// Interior pair-sums: 8 output sums per iteration via `vpaddlq_u8` (adjacent
+/// u8 pairs widened to u16; the max sum 4 * 255 = 1020 stays well within u16,
+/// so the sums are exact), scalar loop on the tail.
+///
+/// # Safety
+/// Requires NEON; `top.len() == span.len() * 2` (and `bot` likewise when
+/// `TWO_ROWS`).
+#[target_feature(enable = "neon")]
+unsafe fn pair_sums_row<const TWO_ROWS: bool>(span: &mut [u16], top: &[u8], bot: &[u8]) {
+    debug_assert_eq!(top.len(), span.len() * 2);
+    if TWO_ROWS {
+        debug_assert_eq!(bot.len(), span.len() * 2);
+    }
+    let n = span.len();
+    let mut x = 0usize;
+    while x + 8 <= n {
+        // In-bounds: x + 8 <= n covers the 16-byte mask reads (offset 2x <=
+        // 2n - 16) and the 16-byte span store.
+        let mut s = vpaddlq_u8(vld1q_u8(top.as_ptr().add(2 * x)));
+        if TWO_ROWS {
+            s = vaddq_u16(s, vpaddlq_u8(vld1q_u8(bot.as_ptr().add(2 * x))));
+        }
+        vst1q_u16(span.as_mut_ptr().add(x), s);
+        x += 8;
+    }
+    for i in x..n {
+        let mut sum = u16::from(top[2 * i]) + u16::from(top[2 * i + 1]);
+        if TWO_ROWS {
+            sum += u16::from(bot[2 * i]) + u16::from(bot[2 * i + 1]);
+        }
+        span[i] = sum;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{apply_sums, blend_direct, SampleFormat};
+    use super::*;
+
+    /// Deterministic LCG byte stream (fixed seed per call site).
+    fn lcg_bytes(len: usize, seed: &mut u64) -> Vec<u8> {
+        (0..len)
+            .map(|_| {
+                *seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (*seed >> 33) as u8
+            })
+            .collect()
+    }
+
+    /// Mask rows exercising every byte value, zero runs (skip blocks) and
+    /// random content, at widths that cover vector body + tail.
+    fn mask_variants(w: usize, seed: &mut u64) -> Vec<Vec<u8>> {
+        let ramp: Vec<u8> = (0..w).map(|i| (i % 256) as u8).collect();
+        let mut sparse = lcg_bytes(w, seed);
+        for (i, byte) in sparse.iter_mut().enumerate() {
+            if (i / 24) % 2 == 0 {
+                *byte = 0;
+            }
+        }
+        vec![
+            vec![0u8; w],
+            vec![255u8; w],
+            ramp,
+            sparse,
+            lcg_bytes(w, seed),
+        ]
+    }
+
+    fn opacity_alphas(sample: SampleFormat) -> Vec<u32> {
+        [0u8, 1, 127, 128, 254, 255]
+            .into_iter()
+            .map(|o| sample.alpha_fixed(o))
+            .filter(|&a| a != 0) // alpha 0 never reaches the kernels
+            .collect()
+    }
+
+    /// Direct NEON kernels vs `blend_direct` on identical rows: all alpha
+    /// edge values, mask bytes 0..=255, widths through body + tail, u8 and
+    /// u16 dst edge patterns.
+    #[test]
+    fn direct_rows_match_scalar_bitexact() {
+        if !enabled() {
+            eprintln!("skipping: NEON unavailable on this CPU");
+            return;
+        }
+        let mut seed = 0x00C0_FFEE_1234_5678u64;
+        for w in (1..=67).chain([256]) {
+            for mask in mask_variants(w, &mut seed) {
+                let image = OverlayImage {
+                    w,
+                    h: 1,
+                    stride: w,
+                    bitmap: &mask,
+                    color: 0xFFFFFF00,
+                    dst_x: 0,
+                    dst_y: 0,
+                };
+                // u8: dst edge fills + random.
+                for alpha in opacity_alphas(SampleFormat::U8) {
+                    for src in [0u32, 16, 128, 235, 255] {
+                        for base in [vec![0u8; w], vec![255u8; w], lcg_bytes(w, &mut seed)] {
+                            let mut expected = base.clone();
+                            blend_direct::<SampleU8>(
+                                &mut PlaneView {
+                                    data: &mut expected,
+                                    linesize: w,
+                                    pixel_step: 1,
+                                },
+                                &image,
+                                src,
+                                alpha,
+                                (0, 0),
+                                (0, 0),
+                                (w, 1),
+                            );
+                            let mut got = base.clone();
+                            // SAFETY: `enabled()` checked at test entry.
+                            unsafe {
+                                blend_direct_u8(
+                                    &mut PlaneView {
+                                        data: &mut got,
+                                        linesize: w,
+                                        pixel_step: 1,
+                                    },
+                                    &image,
+                                    src,
+                                    alpha,
+                                    (0, 0),
+                                    (0, 0),
+                                    (w, 1),
+                                )
+                            };
+                            assert_eq!(got, expected, "u8 w={w} alpha={alpha} src={src}");
+                        }
+                    }
+                }
+                // u16: dst 0x0000 / 0xFFFF / random, src across the range.
+                for alpha in opacity_alphas(SampleFormat::U16Le) {
+                    for src in [0u32, 514, 943, 60395, 65535] {
+                        for base in [
+                            vec![0u8; w * 2],
+                            vec![255u8; w * 2],
+                            lcg_bytes(w * 2, &mut seed),
+                        ] {
+                            let mut expected = base.clone();
+                            blend_direct::<SampleU16Le>(
+                                &mut PlaneView {
+                                    data: &mut expected,
+                                    linesize: w * 2,
+                                    pixel_step: 2,
+                                },
+                                &image,
+                                src,
+                                alpha,
+                                (0, 0),
+                                (0, 0),
+                                (w, 1),
+                            );
+                            let mut got = base.clone();
+                            // SAFETY: `enabled()` checked at test entry.
+                            unsafe {
+                                blend_direct_u16(
+                                    &mut PlaneView {
+                                        data: &mut got,
+                                        linesize: w * 2,
+                                        pixel_step: 2,
+                                    },
+                                    &image,
+                                    src,
+                                    alpha,
+                                    (0, 0),
+                                    (0, 0),
+                                    (w, 1),
+                                )
+                            };
+                            assert_eq!(got, expected, "u16 w={w} alpha={alpha} src={src}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Multi-row geometry (stride > w, mask offsets, several rows) through
+    /// the NEON wrappers vs the scalar kernel.
+    #[test]
+    fn direct_multi_row_geometry_matches_scalar() {
+        if !enabled() {
+            eprintln!("skipping: NEON unavailable on this CPU");
+            return;
+        }
+        let mut seed = 0xDEAD_BEEF_0BAD_F00Du64;
+        let (w, h, stride) = (61usize, 9usize, 71usize);
+        let bitmap = lcg_bytes(stride * (h - 1) + w, &mut seed);
+        let image = OverlayImage {
+            w,
+            h,
+            stride,
+            bitmap: &bitmap,
+            color: 0xFFFFFF00,
+            dst_x: 0,
+            dst_y: 0,
+        };
+        let coords = ((3usize, 2usize), (1usize, 1usize), (w - 4, h - 3));
+        for (bytes, src, alpha) in [
+            (1usize, 235u32, SampleFormat::U8.alpha_fixed(200)),
+            (2, 943, SampleFormat::U16Le.alpha_fixed(200)),
+        ] {
+            let linesize = (w + 8) * bytes;
+            let base = lcg_bytes(linesize * (h + 4), &mut seed);
+            let mut expected = base.clone();
+            let mut got = base.clone();
+            if bytes == 1 {
+                blend_direct::<SampleU8>(
+                    &mut PlaneView {
+                        data: &mut expected,
+                        linesize,
+                        pixel_step: 1,
+                    },
+                    &image,
+                    src,
+                    alpha,
+                    coords.0,
+                    coords.1,
+                    coords.2,
+                );
+                // SAFETY: `enabled()` checked at test entry.
+                unsafe {
+                    blend_direct_u8(
+                        &mut PlaneView {
+                            data: &mut got,
+                            linesize,
+                            pixel_step: 1,
+                        },
+                        &image,
+                        src,
+                        alpha,
+                        coords.0,
+                        coords.1,
+                        coords.2,
+                    )
+                };
+            } else {
+                blend_direct::<SampleU16Le>(
+                    &mut PlaneView {
+                        data: &mut expected,
+                        linesize,
+                        pixel_step: 2,
+                    },
+                    &image,
+                    src,
+                    alpha,
+                    coords.0,
+                    coords.1,
+                    coords.2,
+                );
+                // SAFETY: `enabled()` checked at test entry.
+                unsafe {
+                    blend_direct_u16(
+                        &mut PlaneView {
+                            data: &mut got,
+                            linesize,
+                            pixel_step: 2,
+                        },
+                        &image,
+                        src,
+                        alpha,
+                        coords.0,
+                        coords.1,
+                        coords.2,
+                    )
+                };
+            }
+            assert_eq!(got, expected, "bytes={bytes}");
+        }
+    }
+
+    /// `pair_sums_row` vs the scalar pair-sum loops for both row modes,
+    /// spans covering vector body + tail, mask bytes up to 255.
+    #[test]
+    fn pair_sums_match_scalar_bitexact() {
+        if !enabled() {
+            eprintln!("skipping: NEON unavailable on this CPU");
+            return;
+        }
+        let mut seed = 0x5EED_5EED_5EED_5EEDu64;
+        for n in (0..=67).chain([256]) {
+            let mut tops = mask_variants((2 * n).max(1), &mut seed);
+            for top in &mut tops {
+                top.truncate(2 * n);
+            }
+            for top in tops {
+                let bot = lcg_bytes(2 * n, &mut seed);
+                for two_rows in [false, true] {
+                    let mut expected = vec![0u16; n];
+                    for (i, sum) in expected.iter_mut().enumerate() {
+                        let mut s = u16::from(top[2 * i]) + u16::from(top[2 * i + 1]);
+                        if two_rows {
+                            s += u16::from(bot[2 * i]) + u16::from(bot[2 * i + 1]);
+                        }
+                        *sum = s;
+                    }
+                    let mut got = vec![0xAAAAu16; n]; // poisoned: every slot must be written
+                                                      // SAFETY: `enabled()` checked at test entry.
+                    unsafe {
+                        if two_rows {
+                            pair_sums_two_rows(&mut got, &top, &bot);
+                        } else {
+                            pair_sums_one_row(&mut got, &top);
+                        }
+                    }
+                    assert_eq!(got, expected, "n={n} two_rows={two_rows}");
+                }
+            }
+        }
+    }
+
+    /// `apply_sums_u8`/`apply_sums_u16` vs the scalar `apply_sums` across
+    /// shifts, alphas, widths and sum values up to the 1020 maximum.
+    #[test]
+    fn apply_sums_match_scalar_bitexact() {
+        if !enabled() {
+            eprintln!("skipping: NEON unavailable on this CPU");
+            return;
+        }
+        let mut seed = 0x0123_4567_89AB_CDEFu64;
+        for pw in (1..=67).step_by(3).chain([64, 256]) {
+            let ph = 3usize;
+            for shift in [1u32, 2] {
+                // Pooling invariant: a sum aggregates `1 << shift` mask
+                // bytes, so its ceiling is `(1 << shift) * 255` (any more
+                // would overflow the u32 blend headroom).
+                let max_sum = (1u16 << shift) * 255;
+                let mut sums = Vec::with_capacity(pw * ph);
+                for i in 0..pw * ph {
+                    let value = match i % 5 {
+                        0 => 0u16,
+                        1 => 1,
+                        2 => max_sum / 2,
+                        3 => max_sum,
+                        _ => {
+                            seed = seed
+                                .wrapping_mul(6364136223846793005)
+                                .wrapping_add(1442695040888963407);
+                            ((seed >> 33) % u64::from(max_sum + 1)) as u16
+                        }
+                    };
+                    sums.push(value);
+                }
+                for (sample, bytes, srcs) in [
+                    (SampleFormat::U8, 1usize, [16u32, 128, 240]),
+                    (SampleFormat::U16Le, 2, [514, 943, 60395]),
+                ] {
+                    for alpha in opacity_alphas(sample) {
+                        for src in srcs {
+                            let rect = PooledRect {
+                                px0: 2,
+                                py0: 1,
+                                pw,
+                                ph,
+                                shift,
+                            };
+                            let linesize = (pw + 5) * bytes;
+                            let base = lcg_bytes(linesize * (ph + 3), &mut seed);
+                            let mut expected = base.clone();
+                            let mut got = base.clone();
+                            match sample {
+                                SampleFormat::U8 => {
+                                    apply_sums::<SampleU8>(
+                                        &mut PlaneView {
+                                            data: &mut expected,
+                                            linesize,
+                                            pixel_step: 1,
+                                        },
+                                        &sums,
+                                        rect,
+                                        src,
+                                        alpha,
+                                    );
+                                    // SAFETY: `enabled()` checked at entry.
+                                    unsafe {
+                                        apply_sums_u8(
+                                            &mut PlaneView {
+                                                data: &mut got,
+                                                linesize,
+                                                pixel_step: 1,
+                                            },
+                                            &sums,
+                                            rect,
+                                            src,
+                                            alpha,
+                                        )
+                                    };
+                                }
+                                SampleFormat::U16Le => {
+                                    apply_sums::<SampleU16Le>(
+                                        &mut PlaneView {
+                                            data: &mut expected,
+                                            linesize,
+                                            pixel_step: 2,
+                                        },
+                                        &sums,
+                                        rect,
+                                        src,
+                                        alpha,
+                                    );
+                                    // SAFETY: `enabled()` checked at entry.
+                                    unsafe {
+                                        apply_sums_u16(
+                                            &mut PlaneView {
+                                                data: &mut got,
+                                                linesize,
+                                                pixel_step: 2,
+                                            },
+                                            &sums,
+                                            rect,
+                                            src,
+                                            alpha,
+                                        )
+                                    };
+                                }
+                            }
+                            assert_eq!(
+                                got, expected,
+                                "sample={sample:?} pw={pw} shift={shift} alpha={alpha} src={src}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }
