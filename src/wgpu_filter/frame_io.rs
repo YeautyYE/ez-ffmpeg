@@ -486,21 +486,36 @@ impl OutputFramePool {
                 (*p).linesize[2],
                 (*p).linesize[3],
             ];
+            // Rows each plane occupies in a built frame: Y is full height, the
+            // two 4:2:0 chroma planes are half height (rounded up).
+            let out_h = key.out_h as usize;
+            let out_ch = key.out_h.div_ceil(2) as usize;
+            let plane_rows = [out_h, out_ch, out_ch];
             let mut plane_offset = [0usize; 3];
             for (i, off) in plane_offset.iter_mut().enumerate() {
                 let d = (*p).data[i];
                 if d.is_null() {
                     return Err(format!("Output pool template plane {i} is null"));
                 }
-                *off = (d as usize).checked_sub(base).ok_or_else(|| {
+                let offset = (d as usize).checked_sub(base).ok_or_else(|| {
                     format!("Output pool template plane {i} lies before its buffer base")
                 })?;
-                if off.saturating_add(1) > pool_buffer_size {
+                // build_frame copies `linesize[i] * plane_rows[i]` bytes from
+                // `base + offset`; validate that extent fits one pooled buffer
+                // so the per-frame from_raw_parts_mut slices are provably sound
+                // regardless of the allocator's exact layout choices.
+                let stride = linesize[i].max(0) as usize;
+                let extent = stride
+                    .checked_mul(plane_rows[i])
+                    .and_then(|span| offset.checked_add(span))
+                    .ok_or_else(|| format!("Output pool template plane {i} extent overflow"))?;
+                if extent > pool_buffer_size {
                     return Err(format!(
-                        "Output pool template plane {i} offset {off} exceeds buffer size \
+                        "Output pool template plane {i} extent {extent} exceeds buffer size \
                          {pool_buffer_size}"
                     ));
                 }
+                *off = offset;
             }
             OutputFrameLayout {
                 pool_buffer_size,

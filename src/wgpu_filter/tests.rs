@@ -3,7 +3,9 @@ use crate::filter::frame_filter::FrameFilter;
 use crate::wgpu_filter::shaders;
 use crate::wgpu_filter::wgpu_frame_filter::WgpuFrameFilter;
 use ffmpeg_next::Frame;
-use ffmpeg_sys_next::{av_frame_get_buffer, AVPixelFormat};
+use ffmpeg_sys_next::{
+    av_frame_get_buffer, av_frame_is_writable, av_frame_make_writable, av_frame_ref, AVPixelFormat,
+};
 use std::collections::HashMap;
 
 fn make_ctx(map: &mut HashMap<String, Box<dyn std::any::Any + Send>>) -> FrameFilterContext<'_> {
@@ -706,4 +708,185 @@ fn test_zero_copy_frame_outlives_filter() {
     // The staging buffer behind `out` must still be mapped and readable.
     let diff = max_luma_diff(&out, &expected, w as usize, h as usize);
     assert!(diff <= 3, "luma diff too large after filter drop: {diff}");
+}
+
+// --- OutputFramePool: GPU-independent unit tests -------------------------
+//
+// These exercise the AVBufferPool-backed copy-path output frame directly,
+// with synthetic "mapped readback" bytes, so they run on any machine (no GPU
+// required) and cover exactly the FFmpeg-refcount / uninit / writability
+// semantics that the software-Vulkan integration tests cannot make explicit.
+
+use crate::wgpu_filter::frame_io::OutputFramePool;
+use crate::wgpu_filter::gpu_state::OutputGeometry;
+
+fn align4(v: u32) -> usize {
+    v.div_ceil(4) as usize * 4
+}
+
+/// Geometry + a filled synthetic mapped buffer for the given output size,
+/// using the same packed strides `ensure_resources` computes.
+fn pool_geo_and_mapped(out_w: u32, out_h: u32) -> (OutputGeometry, Vec<u8>) {
+    let y_stride = align4(out_w);
+    let c_stride = align4(out_w.div_ceil(2));
+    let out_ch = out_h.div_ceil(2) as usize;
+    let y_end = y_stride * out_h as usize;
+    let u_end = y_end + c_stride * out_ch;
+    let v_end = u_end + c_stride * out_ch;
+
+    let mut mapped = vec![0u8; v_end];
+    let cw = out_w.div_ceil(2) as usize;
+    for row in 0..out_h as usize {
+        for col in 0..out_w as usize {
+            mapped[row * y_stride + col] = ((row * 7 + col * 3) % 251) as u8;
+        }
+    }
+    for row in 0..out_ch {
+        for col in 0..cw {
+            mapped[u_end - (c_stride * out_ch) + row * c_stride + col] = (100 + (row % 40)) as u8;
+            mapped[v_end - (c_stride * out_ch) + row * c_stride + col] = (200 + (row % 40)) as u8;
+        }
+    }
+    let geo = OutputGeometry {
+        out_w,
+        out_h,
+        y_stride,
+        c_stride,
+        buf_size: v_end as u64,
+    };
+    (geo, mapped)
+}
+
+/// A property donor carrying pts + time_base, like the input frame the filter
+/// copies props from.
+fn make_props_donor(pts: i64) -> Frame {
+    unsafe {
+        let mut f = Frame::empty();
+        let p = f.as_mut_ptr();
+        (*p).pts = pts;
+        (*p).time_base = ffmpeg_sys_next::AVRational { num: 1, den: 25 };
+        f
+    }
+}
+
+#[test]
+fn test_output_frame_pool_copies_planes_and_props() {
+    let (out_w, out_h) = (10u32, 6u32); // odd chroma width exercises stride tail
+    let (geo, mapped) = pool_geo_and_mapped(out_w, out_h);
+    let pool = OutputFramePool::new(geo).expect("pool init");
+    let src = make_props_donor(77);
+    let frame = pool.build_frame(&mapped, &src).expect("build_frame");
+
+    unsafe {
+        let p = frame.as_ptr();
+        assert_eq!((*p).width, out_w as i32);
+        assert_eq!((*p).height, out_h as i32);
+        assert_eq!((*p).format, AVPixelFormat::AV_PIX_FMT_YUV420P as i32);
+        assert_eq!((*p).pts, 77, "pts must propagate");
+        assert_eq!((*p).time_base.num, 1);
+        assert_eq!((*p).time_base.den, 25, "time_base must propagate");
+
+        let out_ch = out_h.div_ceil(2) as usize;
+        let cw = out_w.div_ceil(2) as usize;
+        let dls = (*p).linesize[0] as usize;
+        let dy = std::slice::from_raw_parts((*p).data[0], dls * out_h as usize);
+        for row in 0..out_h as usize {
+            for col in 0..out_w as usize {
+                assert_eq!(
+                    dy[row * dls + col],
+                    ((row * 7 + col * 3) % 251) as u8,
+                    "Y[{row}][{col}]"
+                );
+            }
+        }
+        let uls = (*p).linesize[1] as usize;
+        let du = std::slice::from_raw_parts((*p).data[1], uls * out_ch);
+        let vls = (*p).linesize[2] as usize;
+        let dv = std::slice::from_raw_parts((*p).data[2], vls * out_ch);
+        for row in 0..out_ch {
+            for col in 0..cw {
+                assert_eq!(du[row * uls + col], (100 + (row % 40)) as u8, "U[{row}][{col}]");
+                assert_eq!(dv[row * vls + col], (200 + (row % 40)) as u8, "V[{row}][{col}]");
+            }
+        }
+    }
+}
+
+#[test]
+fn test_output_frame_pool_refcount_prevents_reuse() {
+    let (geo, mapped) = pool_geo_and_mapped(16, 12);
+    let pool = OutputFramePool::new(geo).expect("pool init");
+    let src = make_props_donor(0);
+
+    let f1 = pool.build_frame(&mapped, &src).expect("frame 1");
+    let f1_ptr = unsafe { (*f1.as_ptr()).data[0] };
+
+    // Keep f1's buffer referenced through a clone, then drop f1.
+    let mut clone = unsafe { Frame::empty() };
+    unsafe { assert!(av_frame_ref(clone.as_mut_ptr(), f1.as_ptr()) >= 0) };
+    let clone_ptr = unsafe { (*clone.as_ptr()).data[0] };
+    assert_eq!(clone_ptr, f1_ptr, "clone shares f1's pooled buffer");
+    drop(f1); // buffer stays alive: clone still holds a reference
+
+    // A new frame must NOT reuse the still-referenced buffer.
+    let f2 = pool.build_frame(&mapped, &src).expect("frame 2");
+    let f2_ptr = unsafe { (*f2.as_ptr()).data[0] };
+    assert_ne!(
+        f2_ptr, clone_ptr,
+        "pool handed out a buffer still referenced downstream"
+    );
+}
+
+#[test]
+fn test_output_frame_pool_uninit_keeps_live_frame_valid() {
+    let (geo, mapped) = pool_geo_and_mapped(16, 12);
+    let pool = OutputFramePool::new(geo).expect("pool init");
+    let src = make_props_donor(0);
+    let frame = pool.build_frame(&mapped, &src).expect("build_frame");
+
+    // Drop the pool (av_buffer_pool_uninit) while a built frame is still live;
+    // its AVBufferRef must keep the buffer valid and readable.
+    drop(pool);
+    unsafe {
+        let p = frame.as_ptr();
+        let dls = (*p).linesize[0] as usize;
+        let dy = std::slice::from_raw_parts((*p).data[0], dls * 12);
+        // Row 0 of the synthetic Y pattern is `(0 * 7 + col * 3) % 251`.
+        for (col, &got) in dy.iter().take(16).enumerate() {
+            assert_eq!(got, ((col * 3) % 251) as u8, "row 0 col {col}");
+        }
+    }
+}
+
+#[test]
+fn test_output_frame_pool_frame_writability() {
+    let (geo, mapped) = pool_geo_and_mapped(16, 12);
+    let pool = OutputFramePool::new(geo).expect("pool init");
+    let src = make_props_donor(0);
+    let mut frame = pool.build_frame(&mapped, &src).expect("build_frame");
+
+    unsafe {
+        assert_eq!(
+            av_frame_is_writable(frame.as_mut_ptr()),
+            1,
+            "a singly-owned pooled frame must be writable"
+        );
+        let mut clone = Frame::empty();
+        assert!(av_frame_ref(clone.as_mut_ptr(), frame.as_ptr()) >= 0);
+        assert_eq!(
+            av_frame_is_writable(frame.as_mut_ptr()),
+            0,
+            "a shared pooled frame must be non-writable"
+        );
+
+        let before = (*frame.as_ptr()).data[0];
+        assert!(av_frame_make_writable(frame.as_mut_ptr()) >= 0);
+        assert_eq!(
+            av_frame_is_writable(frame.as_mut_ptr()),
+            1,
+            "make_writable must restore writability"
+        );
+        let after = (*frame.as_ptr()).data[0];
+        assert_ne!(before, after, "make_writable must copy to a fresh buffer");
+    }
 }
