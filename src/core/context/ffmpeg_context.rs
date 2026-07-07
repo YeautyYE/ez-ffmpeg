@@ -860,7 +860,19 @@ fn map_manual(
         None => {
             // copy
             let (packet_sender, _st, output_stream_index) = mux.new_stream(demux_node)?;
-            demux.add_packet_dst(packet_sender, stream_index, output_stream_index);
+            demux.add_packet_dst(
+                packet_sender,
+                stream_index,
+                output_stream_index,
+                // Architecture Y': a `-shortest` copy follower carries its mux
+                // stream's `source_finished` so the demux can stop producing it
+                // once `sq_mux` cascade-finishes it. `None` otherwise.
+                if mux.shortest {
+                    mux.stream_source_finished(output_stream_index)
+                } else {
+                    None
+                },
+            );
             mux.register_stream_source(output_stream_index, demux_idx, stream_index, false);
 
             unsafe {
@@ -883,7 +895,19 @@ fn map_manual(
             if stream_map.copy {
                 // copy
                 let (packet_sender, _st, output_stream_index) = mux.new_stream(demux_node)?;
-                demux.add_packet_dst(packet_sender, stream_index, output_stream_index);
+                demux.add_packet_dst(
+                packet_sender,
+                stream_index,
+                output_stream_index,
+                // Architecture Y': a `-shortest` copy follower carries its mux
+                // stream's `source_finished` so the demux can stop producing it
+                // once `sq_mux` cascade-finishes it. `None` otherwise.
+                if mux.shortest {
+                    mux.stream_source_finished(output_stream_index)
+                } else {
+                    None
+                },
+            );
                 mux.register_stream_source(output_stream_index, demux_idx, stream_index, false);
 
                 unsafe {
@@ -1403,7 +1427,19 @@ unsafe fn map_auto_subtitle(
 
                 let (packet_sender, _st, output_stream_index) =
                     mux.new_stream(demux.node.clone())?;
-                demux.add_packet_dst(packet_sender, stream_index, output_stream_index);
+                demux.add_packet_dst(
+                packet_sender,
+                stream_index,
+                output_stream_index,
+                // Architecture Y': a `-shortest` copy follower carries its mux
+                // stream's `source_finished` so the demux can stop producing it
+                // once `sq_mux` cascade-finishes it. `None` otherwise.
+                if mux.shortest {
+                    mux.stream_source_finished(output_stream_index)
+                } else {
+                    None
+                },
+            );
                 mux.register_stream_source(output_stream_index, demux_idx, stream_index, false);
 
                 unsafe {
@@ -1497,7 +1533,19 @@ unsafe fn map_auto_data(
             let input_stream_time_base = input_stream.time_base;
 
             let (packet_sender, _st, output_stream_index) = mux.new_stream(demux.node.clone())?;
-            demux.add_packet_dst(packet_sender, stream_index, output_stream_index);
+            demux.add_packet_dst(
+                packet_sender,
+                stream_index,
+                output_stream_index,
+                // Architecture Y': a `-shortest` copy follower carries its mux
+                // stream's `source_finished` so the demux can stop producing it
+                // once `sq_mux` cascade-finishes it. `None` otherwise.
+                if mux.shortest {
+                    mux.stream_source_finished(output_stream_index)
+                } else {
+                    None
+                },
+            );
             mux.register_stream_source(output_stream_index, demux_idx, stream_index, false);
 
             streamcopy_init(
@@ -1615,7 +1663,16 @@ unsafe fn map_auto_stream(
     let input_stream_time_base = input_stream.time_base;
 
     let (packet_sender, _st, output_stream_index) = mux.new_stream(demux.node.clone())?;
-    demux.add_packet_dst(packet_sender, stream_index, output_stream_index);
+    demux.add_packet_dst(
+        packet_sender,
+        stream_index,
+        output_stream_index,
+        if mux.shortest {
+            mux.stream_source_finished(output_stream_index)
+        } else {
+            None
+        },
+    );
     mux.register_stream_source(output_stream_index, input_file_idx, stream_index, false);
 
     unsafe {
@@ -2308,6 +2365,8 @@ unsafe fn open_output_file(
         bsf_chains,
         output.start_time_us,
         recording_time_us,
+        output.shortest,
+        output.shortest_buf_duration_us,
         output.framerate,
         output.framerate_max,
         output.vsync_method,

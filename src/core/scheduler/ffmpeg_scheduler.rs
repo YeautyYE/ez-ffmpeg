@@ -7,13 +7,16 @@ use crate::core::scheduler::filter_task::filter_graph_init;
 use crate::core::scheduler::frame_filter_pipeline::{input_pipeline_init, output_pipeline_init};
 use crate::core::scheduler::input_controller::InputController;
 use crate::core::scheduler::mux_task::{mux_init, ready_to_init_mux};
+use crate::core::scheduler::sync_queue::SyncQueue;
+use crate::core::context::encoder_stream::EncSyncHandle;
 use crate::error::{AllocFrameError, AllocPacketError};
 use crate::util::thread_synchronizer::ThreadSynchronizer;
 use ffmpeg_next::packet::{Mut, Ref};
 use ffmpeg_next::{Frame, Packet};
 use ffmpeg_sys_next::{av_frame_alloc, av_frame_unref, av_packet_unref};
+use ffmpeg_sys_next::AVMediaType::{AVMEDIA_TYPE_AUDIO, AVMEDIA_TYPE_VIDEO};
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -308,6 +311,43 @@ impl FfmpegScheduler<Initialization> {
                     return Err(e);
                 }
             };
+
+            // -shortest (sq_enc): build a frame-level sync queue over this mux's
+            // encoded audio/video streams so none outruns the shortest limiting
+            // one. FFmpeg gate (ffmpeg_mux_init.c setup_sync_queues): shortest &&
+            // nb_av_enc > 1. Encoded subtitle/data are NOT sq_enc members (they
+            // ride sq_mux only); attachments never reach enc_init. Handles are
+            // attached before the streams are moved into enc_init below.
+            if mux.shortest {
+                let buf_us = mux.shortest_buf_duration_us;
+                let streams = mux.get_streams_mut();
+                let av_positions: Vec<usize> = streams
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| {
+                        s.codec_type == AVMEDIA_TYPE_VIDEO || s.codec_type == AVMEDIA_TYPE_AUDIO
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                if av_positions.len() >= 2 {
+                    let mut sq = SyncQueue::new(buf_us);
+                    // add_stream in position order → each stream's sq_idx.
+                    let assigned: Vec<(usize, usize)> = av_positions
+                        .iter()
+                        .map(|&pos| (pos, sq.add_stream(true)))
+                        .collect();
+                    let sq_finished: Arc<[AtomicBool]> =
+                        (0..av_positions.len()).map(|_| AtomicBool::new(false)).collect();
+                    let queue = Arc::new((Mutex::new(sq), Condvar::new()));
+                    for (pos, sq_idx) in assigned {
+                        streams[pos].set_sync_queue(EncSyncHandle {
+                            queue: queue.clone(),
+                            sq_idx,
+                            sq_finished: sq_finished.clone(),
+                        });
+                    }
+                }
+            }
 
             for enc_stream in mux.take_streams_mut() {
                 if let Err(e) = enc_init(

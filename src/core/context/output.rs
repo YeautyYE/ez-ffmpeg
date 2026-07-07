@@ -230,6 +230,15 @@ pub struct Output {
     pub(crate) start_time_us: Option<i64>,
     pub(crate) recording_time_us: Option<i64>,
     pub(crate) stop_time_us: Option<i64>,
+    /// FFmpeg `-shortest`: finish the output when its shortest limiting stream
+    /// ends. Encoded audio/video truncate at the frame level (sq_enc, no B-frame
+    /// stranding); copy/subtitle/data truncate at the packet level (sq_mux).
+    /// Default `false`. Set via [`Output::set_shortest`].
+    pub(crate) shortest: bool,
+    /// FFmpeg `-shortest_buf_duration` (seconds upstream, microseconds here): the
+    /// maximum time one stream is buffered waiting for a lagging peer before it is
+    /// released anyway. Bounds `-shortest` memory and precision. Default 10 s.
+    pub(crate) shortest_buf_duration_us: i64,
     pub(crate) framerate: Option<AVRational>,
     /// Maximum output frame rate cap (`-fpsmax`): the native rate is kept and
     /// only clamped when it exceeds the cap or is unknown
@@ -1016,6 +1025,43 @@ impl Output {
     /// ```
     pub fn set_stop_time_us(mut self, stop_time_us: i64) -> Self {
         self.stop_time_us = Some(stop_time_us);
+        self
+    }
+
+    /// Finish the output when its shortest limiting stream ends (FFmpeg `-shortest`).
+    ///
+    /// Encoded audio/video are truncated at the **frame** level before encoding
+    /// (no B-frame stranding); streamcopy / subtitle / data are truncated at the
+    /// **packet** level — the same presentation-time cut FFmpeg makes, with the
+    /// same limitation that a copy B-frame near the cut may reference a dropped
+    /// later packet. Exact when the shortest→longest gap is within the buffering
+    /// window (see [`set_shortest_buf_duration_us`](Self::set_shortest_buf_duration_us),
+    /// default 10 s). Default: `false`.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let output = Output::from("output.mp4").set_shortest(true);
+    /// ```
+    pub fn set_shortest(mut self, shortest: bool) -> Self {
+        self.shortest = shortest;
+        self
+    }
+
+    /// Maximum microseconds one stream is buffered waiting for a lagging peer
+    /// before it is released anyway (FFmpeg `-shortest_buf_duration`, expressed in
+    /// seconds upstream, microseconds here). Bounds `-shortest` memory use and
+    /// precision. Values `<= 0` are ignored. Default: `10_000_000` (10 s).
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let output = Output::from("output.mp4")
+    ///     .set_shortest(true)
+    ///     .set_shortest_buf_duration_us(30_000_000); // tolerate a 30 s gap
+    /// ```
+    pub fn set_shortest_buf_duration_us(mut self, shortest_buf_duration_us: i64) -> Self {
+        if shortest_buf_duration_us > 0 {
+            self.shortest_buf_duration_us = shortest_buf_duration_us;
+        }
         self
     }
 
@@ -2153,6 +2199,8 @@ impl From<Box<dyn FnMut(&[u8]) -> i32 + Send>> for Output {
             sws_opts: None,
             swr_opts: None,
             attachments: Vec::new(),
+            shortest: false,
+            shortest_buf_duration_us: 10_000_000,
         }
     }
 }
@@ -2214,6 +2262,8 @@ impl From<String> for Output {
             sws_opts: None,
             swr_opts: None,
             attachments: Vec::new(),
+            shortest: false,
+            shortest_buf_duration_us: 10_000_000,
         }
     }
 }

@@ -111,6 +111,21 @@ impl StreamBsfChains {
     }
 }
 
+/// Plan for a muxer's `-shortest` packet sync-queue (`sq_mux`), computed while the
+/// output context is still owned and consumed by the mux worker to build the
+/// actual `SyncQueue<PacketBox>`. Mirrors the `sq_mux` branch of FFmpeg's
+/// `setup_sync_queues` (`ffmpeg_mux_init.c:2114-2138`). Plain data so it threads
+/// cleanly from the build layer into the scheduler layer.
+pub(crate) struct SqMuxPlan {
+    /// `-shortest_buf_duration` in microseconds.
+    pub(crate) buf_size_us: i64,
+    /// One entry per interleaved (non-attachment) output stream, in
+    /// output-stream-index order: `(output_stream_index, limiting, frames_max)`.
+    /// `limiting` mirrors `shortest || max_frames < MAX`; `frames_max` drives
+    /// `sq_limit_frames`.
+    pub(crate) streams: Vec<(usize, bool, Option<u64>)>,
+}
+
 pub(crate) struct Muxer {
     pub(crate) url: String,
 
@@ -133,6 +148,12 @@ pub(crate) struct Muxer {
     pub(crate) bsf_chains: StreamBsfChains,
     pub(crate) start_time_us: Option<i64>,
     pub(crate) recording_time_us: Option<i64>,
+    /// FFmpeg `-shortest` for this output (`Output::set_shortest`): finish when the
+    /// shortest limiting stream ends. Drives the per-mux `sq_enc`/`sq_mux` build.
+    pub(crate) shortest: bool,
+    /// `-shortest_buf_duration` in microseconds (default 10 s); the sync-queue
+    /// buffering bound.
+    pub(crate) shortest_buf_duration_us: i64,
     pub(crate) framerate: Option<AVRational>,
     pub(crate) framerate_max: Option<AVRational>,
     pub(crate) vsync_method: VSyncMethod,
@@ -243,6 +264,8 @@ impl Muxer {
         bsf_chains: StreamBsfChains,
         start_time_us: Option<i64>,
         recording_time_us: Option<i64>,
+        shortest: bool,
+        shortest_buf_duration_us: i64,
         framerate: Option<AVRational>,
         framerate_max: Option<AVRational>,
         vsync_method: VSyncMethod,
@@ -294,6 +317,8 @@ impl Muxer {
             bsf_chains,
             start_time_us,
             recording_time_us,
+            shortest,
+            shortest_buf_duration_us,
             framerate,
             framerate_max,
             vsync_method,
@@ -480,6 +505,99 @@ impl Muxer {
 
     pub(crate) fn stream_count(&self) -> usize {
         self.nb_streams
+    }
+
+    /// This output stream's `source_finished` flag (`SchNode::MuxStream`), cloned
+    /// so the demux can observe an `sq_mux` cascade-finish (Architecture Y').
+    /// `None` if the index is out of range or the node is not a mux stream.
+    pub(crate) fn stream_source_finished(
+        &self,
+        output_stream_index: usize,
+    ) -> Option<Arc<AtomicBool>> {
+        match self.mux_stream_nodes.get(output_stream_index)?.as_ref() {
+            SchNode::MuxStream { source_finished, .. } => Some(source_finished.clone()),
+            _ => None,
+        }
+    }
+
+    /// Per-media-type frame cap (`-frames:v/a/s N`), as an `sq_limit_frames` bound.
+    fn max_frames_for_type(&self, media_type: AVMediaType) -> Option<u64> {
+        let v = match media_type {
+            AVMediaType::AVMEDIA_TYPE_VIDEO => self.max_video_frames,
+            AVMediaType::AVMEDIA_TYPE_AUDIO => self.max_audio_frames,
+            AVMediaType::AVMEDIA_TYPE_SUBTITLE => self.max_subtitle_frames,
+            _ => None,
+        };
+        v.and_then(|n| if n >= 0 { Some(n as u64) } else { None })
+    }
+
+    /// Compute the `-shortest` packet sync-queue plan (mirrors the `sq_mux`
+    /// branch of `setup_sync_queues`, `ffmpeg_mux_init.c:2114-2138`). Built only
+    /// when `shortest && nb_interleaved > 1 && nb_interleaved > nb_av_enc`, i.e.
+    /// there is at least one interleaved stream that is NOT an encoded A/V stream
+    /// (a copy / subtitle / data follower) to truncate. Every interleaved
+    /// (non-attachment) stream is a member; under `-shortest` all are limiting.
+    ///
+    /// MUST be called while `out_fmt_ctx` is still owned (before the worker takes
+    /// it) — it reads each output stream's media type from the output context.
+    pub(crate) fn sq_mux_plan(&self) -> Option<SqMuxPlan> {
+        if !self.shortest {
+            return None;
+        }
+        let stream_count = self.stream_count();
+        if stream_count < 2 {
+            return None;
+        }
+        let oc = self.out_fmt_ctx_ptr();
+        if oc.is_null() {
+            return None;
+        }
+
+        // Encoded A/V streams: the `EncoderStream` list holds exactly the streams
+        // with an encoder; A/V among them are `nb_av_enc` (IS_AV_ENC).
+        let mut is_av_enc = vec![false; stream_count];
+        for s in &self.streams {
+            if matches!(
+                s.codec_type,
+                AVMediaType::AVMEDIA_TYPE_VIDEO | AVMediaType::AVMEDIA_TYPE_AUDIO
+            ) && s.stream_index < stream_count
+            {
+                is_av_enc[s.stream_index] = true;
+            }
+        }
+
+        // Media type per output stream index (set at stream creation).
+        let types: Vec<AVMediaType> = (0..stream_count)
+            .map(|i| unsafe {
+                let st = *(*oc).streams.add(i);
+                (*(*st).codecpar).codec_type
+            })
+            .collect();
+
+        let is_interleaved =
+            |t: AVMediaType| t != AVMediaType::AVMEDIA_TYPE_ATTACHMENT;
+        let nb_interleaved = types.iter().filter(|&&t| is_interleaved(t)).count();
+        let nb_av_enc = is_av_enc.iter().filter(|&&b| b).count();
+
+        // FFmpeg gate (shortest trigger): the outer `nb_interleaved > 1 &&
+        // shortest` plus the sq_mux-specific `nb_interleaved > nb_av_enc`.
+        if !(nb_interleaved > 1 && nb_interleaved > nb_av_enc) {
+            return None;
+        }
+
+        let mut streams = Vec::with_capacity(nb_interleaved);
+        for i in 0..stream_count {
+            if !is_interleaved(types[i]) {
+                continue;
+            }
+            // limiting = shortest || max_frames < MAX; shortest is true here.
+            streams.push((i, true, self.max_frames_for_type(types[i])));
+        }
+
+        Some(SqMuxPlan {
+            buf_size_us: self.shortest_buf_duration_us,
+            streams,
+        })
     }
 
     pub(crate) fn has_src(&self) -> bool {
