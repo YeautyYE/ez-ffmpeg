@@ -411,6 +411,13 @@ impl RtmpScheduler {
                 );
             }
 
+            ServerSessionEvent::PlayStreamFinished {
+                app_name,
+                stream_key,
+            } => {
+                self.handle_play_finished(executed_connection_id, app_name, stream_key);
+            }
+
             ServerSessionEvent::StreamMetadataChanged {
                 app_name,
                 stream_key,
@@ -566,6 +573,31 @@ impl RtmpScheduler {
     ) {
         debug!("Rtmp play requested on app '{app_name}' and stream key '{stream_key}'");
 
+        // A connection that switches streams with a second `play` must leave
+        // the previous channel's watcher set before its action is overwritten:
+        // otherwise the old channel's fanout keeps delivering frames to it,
+        // and the old stream's live IDR could wrongly re-open the keyframe
+        // gate for the new stream.
+        let previous_watch = {
+            let client_id = self
+                .connection_to_client_map
+                .get(&requested_connection_id)
+                .unwrap();
+            let client = self.clients.get(*client_id).unwrap();
+            match &client.current_action {
+                ClientAction::Watching {
+                    stream_key: old_stream_key,
+                    ..
+                } if *old_stream_key != stream_key => Some((*client_id, old_stream_key.clone())),
+                _ => None,
+            }
+        };
+        if let Some((client_id, old_stream_key)) = previous_watch {
+            // Removes the membership and GCs the old channel if it is now
+            // empty and unpublished (same idiom as a connection close).
+            self.play_ended(client_id, old_stream_key);
+        }
+
         let accept_result;
         {
             let client_id = self
@@ -577,6 +609,12 @@ impl RtmpScheduler {
                 stream_key: stream_key.clone(),
                 stream_id,
             };
+            // Reset the keyframe gate for this play request:
+            // has_received_video_keyframe is persistent client state, so a
+            // connection that previously watched another stream (and saw its
+            // IDR) must not carry that `true` over and receive this stream's
+            // delta frames before an IDR is replayed or arrives live.
+            client.has_received_video_keyframe = false;
 
             let channel = self
                 .channels
@@ -731,6 +769,48 @@ impl RtmpScheduler {
         }
     }
 
+    /// A watcher stopped its play (`closeStream`/`deleteStream`) without
+    /// dropping the connection. Leave the watched channel so its fanout stops
+    /// targeting this client, reset the play state, and GC the channel if it
+    /// is now empty and unpublished. Connection close only cleans the current
+    /// action, so an unhandled finish would leak the membership forever.
+    fn handle_play_finished(
+        &mut self,
+        finished_connection_id: usize,
+        app_name: String,
+        stream_key: String,
+    ) {
+        debug!("Rtmp play finished on app '{app_name}' and stream key '{stream_key}'");
+
+        let client_id = match self.connection_to_client_map.get(&finished_connection_id) {
+            Some(client_id) => *client_id,
+            None => return,
+        };
+        let client = match self.clients.get_mut(client_id) {
+            Some(client) => client,
+            None => return,
+        };
+
+        let is_watching_finished_stream = matches!(
+            &client.current_action,
+            ClientAction::Watching {
+                stream_key: watched_stream_key,
+                ..
+            } if *watched_stream_key == stream_key
+        );
+        if !is_watching_finished_stream {
+            debug!(
+                "Rtmp connection {finished_connection_id} finished playing '{stream_key}' \
+                 which it is not currently watching; ignoring"
+            );
+            return;
+        }
+
+        client.current_action = ClientAction::Waiting;
+        client.has_received_video_keyframe = false;
+        self.play_ended(client_id, stream_key);
+    }
+
     fn handle_metadata_received(
         &mut self,
         app_name: String,
@@ -831,9 +911,25 @@ impl RtmpScheduler {
                 None => continue,
             };
 
-            let active_stream_id = match client.get_active_stream_id() {
-                Some(stream_id) => stream_id,
-                None => continue,
+            // Defense-in-depth: a watcher whose current action points at a
+            // different stream must not receive this channel's frames, even
+            // if its id is still (incorrectly) present in this watcher set.
+            let active_stream_id = match &client.current_action {
+                ClientAction::Watching {
+                    stream_key: watched_stream_key,
+                    stream_id,
+                } => {
+                    if *watched_stream_key != stream_key {
+                        debug!(
+                            "Rtmp client {} is watching '{}'; skipping frame delivery \
+                             from channel '{}'",
+                            client_id, watched_stream_key, stream_key
+                        );
+                        continue;
+                    }
+                    *stream_id
+                }
+                _ => continue,
             };
 
             let should_send_to_client = match data_type {
@@ -1656,6 +1752,317 @@ mod tests {
             }
             _ => panic!("Expected OutboundPacket"),
         }
+    }
+
+    fn play(scheduler: &mut RtmpScheduler, connection_id: usize, stream_key: &str) {
+        let _ = scheduler.bytes_received(connection_id, &[]);
+        let mut results = Vec::new();
+        scheduler.handle_play_requested(
+            connection_id,
+            1,
+            "app".to_string(),
+            stream_key.to_string(),
+            1,
+            &mut results,
+        );
+    }
+
+    fn feed_video(
+        scheduler: &mut RtmpScheduler,
+        stream_key: &str,
+        timestamp: u32,
+        data: &'static [u8],
+    ) -> Vec<ServerResult> {
+        let mut results = Vec::new();
+        scheduler.handle_audio_video_data_received(
+            stream_key.to_string(),
+            RtmpTimestamp { value: timestamp },
+            Bytes::from_static(data),
+            ReceivedDataType::Video,
+            &mut results,
+        );
+        results
+    }
+
+    const IDR: &[u8] = &[0x17, 0x01, 0x00, 0x00, 0x00];
+    const DELTA: &[u8] = &[0x27, 0x01, 0x00, 0x00, 0x00];
+
+    // Pre-existing multi-play bug:
+    // a client that plays stream A and then plays stream B on the same
+    // connection must leave A's watcher set, stop receiving A's frames, and
+    // have its keyframe gate reset so B's deltas are withheld until B's IDR.
+    #[test]
+    fn switching_streams_leaves_the_old_channel_and_regates_on_the_new_idr() {
+        let mut scheduler = RtmpScheduler::new(10);
+        let publisher_a_conn = 100;
+        let watcher_conn = 2;
+
+        assert!(scheduler.new_channel("stream_a".to_string(), publisher_a_conn));
+        play(&mut scheduler, watcher_conn, "stream_a");
+        let client_id = *scheduler.connection_to_client_map.get(&watcher_conn).unwrap();
+        assert!(scheduler
+            .channels
+            .get("stream_a")
+            .unwrap()
+            .watching_client_ids
+            .contains(&client_id));
+
+        // A's live IDR reaches the watcher and opens its keyframe gate.
+        let results = feed_video(&mut scheduler, "stream_a", 0, IDR);
+        assert_eq!(results.len(), 1, "watcher should receive A's IDR");
+        assert!(scheduler.clients.get(client_id).unwrap().has_received_video_keyframe);
+
+        // The same connection now plays stream B.
+        let mut results = Vec::new();
+        scheduler.handle_play_requested(
+            watcher_conn,
+            2,
+            "app".to_string(),
+            "stream_b".to_string(),
+            1,
+            &mut results,
+        );
+
+        assert!(
+            !scheduler
+                .channels
+                .get("stream_a")
+                .unwrap()
+                .watching_client_ids
+                .contains(&client_id),
+            "switching to B must remove the client from A's watcher set"
+        );
+        assert!(
+            scheduler
+                .channels
+                .get("stream_b")
+                .unwrap()
+                .watching_client_ids
+                .contains(&client_id),
+            "the client must be a member of B's watcher set"
+        );
+
+        // The keyframe gate must have been reset by the new play request.
+        assert!(
+            !scheduler.clients.get(client_id).unwrap().has_received_video_keyframe,
+            "a new play request must reset the keyframe gate"
+        );
+
+        // A's frames are no longer delivered to the switched client, and A's
+        // IDR must not re-open the gate for B.
+        let results = feed_video(&mut scheduler, "stream_a", 33, IDR);
+        assert!(
+            results.is_empty(),
+            "A's frames must not reach a client that switched to B"
+        );
+        assert!(
+            !scheduler.clients.get(client_id).unwrap().has_received_video_keyframe,
+            "A's live IDR must not open the gate of a client watching B"
+        );
+
+        // B's delta frames are withheld until B's own IDR arrives.
+        let results = feed_video(&mut scheduler, "stream_b", 40, DELTA);
+        assert!(
+            results.is_empty(),
+            "B's deltas must be withheld until B's IDR"
+        );
+        let results = feed_video(&mut scheduler, "stream_b", 66, IDR);
+        assert_eq!(results.len(), 1, "B's IDR must be delivered");
+        let results = feed_video(&mut scheduler, "stream_b", 100, DELTA);
+        assert_eq!(results.len(), 1, "B's deltas flow after B's IDR");
+    }
+
+    #[test]
+    fn switching_streams_gcs_the_empty_unpublished_old_channel() {
+        let mut scheduler = RtmpScheduler::new(10);
+        let watcher_conn = 2;
+
+        // Play "stream_a" with no publisher: the channel is created on demand.
+        play(&mut scheduler, watcher_conn, "stream_a");
+        assert!(scheduler.channels.contains_key("stream_a"));
+
+        // Switching to "stream_b" leaves "stream_a" empty and unpublished, so
+        // the channel must be garbage collected.
+        let mut results = Vec::new();
+        scheduler.handle_play_requested(
+            watcher_conn,
+            2,
+            "app".to_string(),
+            "stream_b".to_string(),
+            1,
+            &mut results,
+        );
+        assert!(
+            !scheduler.channels.contains_key("stream_a"),
+            "an empty, unpublished channel must be removed on stream switch"
+        );
+        assert!(scheduler.channels.contains_key("stream_b"));
+    }
+
+    #[test]
+    fn replaying_the_same_stream_keeps_the_watcher_membership() {
+        let mut scheduler = RtmpScheduler::new(10);
+        let publisher_conn = 100;
+        let watcher_conn = 2;
+
+        assert!(scheduler.new_channel("stream_a".to_string(), publisher_conn));
+        play(&mut scheduler, watcher_conn, "stream_a");
+        let client_id = *scheduler.connection_to_client_map.get(&watcher_conn).unwrap();
+
+        // A second play request for the same stream key must not drop the
+        // membership (and must not GC the channel).
+        let mut results = Vec::new();
+        scheduler.handle_play_requested(
+            watcher_conn,
+            2,
+            "app".to_string(),
+            "stream_a".to_string(),
+            1,
+            &mut results,
+        );
+        assert!(scheduler
+            .channels
+            .get("stream_a")
+            .unwrap()
+            .watching_client_ids
+            .contains(&client_id));
+    }
+
+    // Pre-existing bug: PlayStreamFinished used to fall into the scheduler's
+    // catch-all arm, leaking the watcher membership and the keyframe gate.
+    #[test]
+    fn play_stream_finished_leaves_the_channel_and_resets_the_play_state() {
+        let mut scheduler = RtmpScheduler::new(10);
+        let publisher_conn = 100;
+        let watcher_conn = 2;
+
+        assert!(scheduler.new_channel("stream_a".to_string(), publisher_conn));
+        play(&mut scheduler, watcher_conn, "stream_a");
+        let client_id = *scheduler.connection_to_client_map.get(&watcher_conn).unwrap();
+
+        let results = feed_video(&mut scheduler, "stream_a", 0, IDR);
+        assert_eq!(results.len(), 1, "watcher should receive the IDR");
+        assert!(scheduler.clients.get(client_id).unwrap().has_received_video_keyframe);
+
+        // Deliver the finish through the real scheduler event path to prove
+        // it no longer lands in the `_ => debug!` catch-all.
+        let mut results = Vec::new();
+        scheduler.handle_raised_event(
+            watcher_conn,
+            ServerSessionEvent::PlayStreamFinished {
+                app_name: "app".to_string(),
+                stream_key: "stream_a".to_string(),
+            },
+            &mut results,
+        );
+
+        let channel = scheduler.channels.get("stream_a").unwrap();
+        assert!(
+            !channel.watching_client_ids.contains(&client_id),
+            "PlayStreamFinished must remove the watcher membership"
+        );
+        let client = scheduler.clients.get(client_id).unwrap();
+        assert!(
+            matches!(client.current_action, ClientAction::Waiting),
+            "PlayStreamFinished must reset the action to Waiting"
+        );
+        assert!(
+            !client.has_received_video_keyframe,
+            "PlayStreamFinished must reset the keyframe gate"
+        );
+
+        // The published channel itself must survive, and its frames must no
+        // longer be delivered to the finished client.
+        let results = feed_video(&mut scheduler, "stream_a", 33, IDR);
+        assert!(results.is_empty(), "no frames after the play finished");
+    }
+
+    #[test]
+    fn play_stream_finished_gcs_the_empty_unpublished_channel() {
+        let mut scheduler = RtmpScheduler::new(10);
+        let watcher_conn = 2;
+
+        play(&mut scheduler, watcher_conn, "stream_a");
+        assert!(scheduler.channels.contains_key("stream_a"));
+
+        let mut results = Vec::new();
+        scheduler.handle_raised_event(
+            watcher_conn,
+            ServerSessionEvent::PlayStreamFinished {
+                app_name: "app".to_string(),
+                stream_key: "stream_a".to_string(),
+            },
+            &mut results,
+        );
+
+        assert!(
+            !scheduler.channels.contains_key("stream_a"),
+            "an empty, unpublished channel must be removed when the play finishes"
+        );
+    }
+
+    #[test]
+    fn play_stream_finished_for_another_stream_is_ignored() {
+        let mut scheduler = RtmpScheduler::new(10);
+        let watcher_conn = 2;
+
+        play(&mut scheduler, watcher_conn, "stream_b");
+        let client_id = *scheduler.connection_to_client_map.get(&watcher_conn).unwrap();
+
+        // A finish for a stream the client is not watching must not disturb
+        // the current play.
+        let mut results = Vec::new();
+        scheduler.handle_raised_event(
+            watcher_conn,
+            ServerSessionEvent::PlayStreamFinished {
+                app_name: "app".to_string(),
+                stream_key: "stream_a".to_string(),
+            },
+            &mut results,
+        );
+
+        let client = scheduler.clients.get(client_id).unwrap();
+        assert!(matches!(
+            client.current_action,
+            ClientAction::Watching { ref stream_key, .. } if stream_key == "stream_b"
+        ));
+        assert!(scheduler
+            .channels
+            .get("stream_b")
+            .unwrap()
+            .watching_client_ids
+            .contains(&client_id));
+    }
+
+    // Defense-in-depth for the fanout path: even if a stale membership leaks
+    // into a channel's watcher set, frames must not follow it.
+    #[test]
+    fn fanout_skips_watchers_whose_action_points_at_another_stream() {
+        let mut scheduler = RtmpScheduler::new(10);
+        let publisher_conn = 100;
+        let watcher_conn = 2;
+
+        assert!(scheduler.new_channel("stream_a".to_string(), publisher_conn));
+        play(&mut scheduler, watcher_conn, "stream_a");
+        let client_id = *scheduler.connection_to_client_map.get(&watcher_conn).unwrap();
+
+        // Simulate the stale membership this fix prevents: the client's
+        // action moved to another stream but its id was left in A's set.
+        scheduler.clients.get_mut(client_id).unwrap().current_action =
+            ClientAction::Watching {
+                stream_key: "stream_b".to_string(),
+                stream_id: 1,
+            };
+
+        let results = feed_video(&mut scheduler, "stream_a", 0, IDR);
+        assert!(
+            results.is_empty(),
+            "frames must not be delivered through a stale watcher membership"
+        );
+        assert!(
+            !scheduler.clients.get(client_id).unwrap().has_received_video_keyframe,
+            "a mismatched channel must not open the client's keyframe gate"
+        );
     }
 }
 
