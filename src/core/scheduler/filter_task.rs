@@ -37,7 +37,7 @@ use ffmpeg_sys_next::{
     av_color_space_name, av_dict_free, av_frame_alloc, av_frame_free, av_frame_get_side_data,
     av_frame_ref, av_frame_remove_side_data, av_freep, av_get_pix_fmt_name, av_get_sample_fmt_name,
     av_inv_q, av_log2, av_malloc, av_opt_find, av_opt_set, av_opt_set_bin, av_opt_set_int,
-    av_q2d, av_rescale_q, avfilter_get_by_name,
+    av_q2d, av_rescale_q, av_strdup, avfilter_get_by_name,
     avfilter_graph_config, avfilter_graph_create_filter,
     avfilter_graph_request_oldest, avfilter_link, avfilter_pad_get_type,
     avio_close, avio_closep, avio_open, avio_open2, avio_read, avio_read_to_bprint, avio_size,
@@ -91,6 +91,11 @@ pub(crate) fn filter_graph_init(
     let input_len = filter_graph.inputs.len();
     let output_len = filter_graph.outputs.len();
     let graph_desc = filter_graph.graph_desc.clone();
+    // NEW-SC-03: snapshot the graph-level sws/swr opts before spawning the
+    // filter thread; they are moved into the closure and installed on the
+    // FilterGraphParameter, then applied on every (re)configure.
+    let graph_sws_opts = filter_graph.sws_opts.clone();
+    let graph_swr_opts = filter_graph.swr_opts.clone();
 
     let mut ifps = Vec::with_capacity(input_len);
     for i in 0..input_len {
@@ -130,6 +135,8 @@ pub(crate) fn filter_graph_init(
             let _thread_done = thread_done_guard;
             let mut graph: Option<crate::raw::FilterGraph> = None;
             let mut fgp = FilterGraphParameter::default();
+            fgp.sws_opts = graph_sws_opts;
+            fgp.swr_opts = graph_swr_opts;
             let node = filter_node.as_ref();
             let SchNode::Filter {
                 inputs: _,
@@ -404,6 +411,14 @@ struct FilterGraphParameter {
     got_frame: bool,
     nb_outputs_done: usize,
     is_meta: bool,
+
+    // NEW-SC-03: graph-level sws/swr option strings for the auto-inserted
+    // scale/aresample filters (from an explicit FilterComplex). Set once when
+    // the filter thread starts and read on every (re)configure to fill
+    // AVFilterGraph.scale_sws_opts / aresample_swr_opts. `None` for implicit
+    // per-output graphs, which resolve their value from the bound outputs.
+    sws_opts: Option<String>,
+    swr_opts: Option<String>,
 }
 
 struct OutputFilterParameter {
@@ -816,6 +831,106 @@ unsafe fn fg_send_frame(
     Ok(())
 }
 
+/// A view of an option string that treats both `None` and `""` as "unset".
+#[cfg(not(docsrs))]
+fn non_empty_opt(opt: &Option<String>) -> Option<&str> {
+    match opt {
+        Some(s) if !s.is_empty() => Some(s.as_str()),
+        _ => None,
+    }
+}
+
+/// Resolve the single graph-level value for one auto-conversion option
+/// (sws or swr) from the graph-level override and the per-output requests.
+///
+/// FFmpeg's `scale_sws_opts` / `aresample_swr_opts` are graph-level, so a graph
+/// can carry exactly one value:
+///   * an explicit graph-level value (from a `FilterComplex`) always wins;
+///   * otherwise the unique non-empty value among the bound outputs is used;
+///   * two bound outputs asking for DIFFERENT non-empty values is a hard
+///     `InvalidArgument` — we must not silently pick one.
+#[cfg(not(docsrs))]
+fn resolve_auto_conv_opt<'a>(
+    graph_level: Option<&'a str>,
+    per_output: impl Iterator<Item = Option<&'a str>>,
+) -> crate::error::Result<Option<&'a str>> {
+    if let Some(g) = graph_level {
+        return Ok(Some(g));
+    }
+    let mut chosen: Option<&'a str> = None;
+    for v in per_output.flatten() {
+        match chosen {
+            None => chosen = Some(v),
+            Some(prev) if prev != v => {
+                return Err(Error::FilterGraph(FilterGraphOperationError::ParseError(
+                    FilterGraphParseError::InvalidArgument,
+                )));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(chosen)
+}
+
+/// `av_strdup` a resolved option string for storage on the graph. A NUL byte in
+/// the string maps to `InvalidArgument`; allocation failure to `OutOfMemory`.
+/// The returned pointer is owned by FFmpeg once written onto the graph.
+#[cfg(not(docsrs))]
+unsafe fn av_strdup_opt(s: &str) -> crate::error::Result<*mut c_char> {
+    let c = CString::new(s).map_err(|_| {
+        Error::FilterGraph(FilterGraphOperationError::ParseError(
+            FilterGraphParseError::InvalidArgument,
+        ))
+    })?;
+    let dup = av_strdup(c.as_ptr());
+    if dup.is_null() {
+        return Err(Error::FilterGraph(FilterGraphOperationError::ParseError(
+            FilterGraphParseError::OutOfMemory,
+        )));
+    }
+    Ok(dup)
+}
+
+/// NEW-SC-03: install the graph-level sws/swr option strings onto a freshly
+/// allocated `AVFilterGraph` so libavfilter's **auto-inserted** `scale` /
+/// `aresample` filters pick them up. Explicit `scale=`/`aresample=` filters the
+/// user wrote keep their own arguments — only the auto-inserted ones read these
+/// graph fields.
+///
+/// FFmpeg takes ownership of the `av_strdup`-ed strings and frees them in
+/// `avfilter_graph_free`, matching fftools. Both option strings are resolved
+/// first (either may raise a conflict error) before any allocation, so the only
+/// FFI state we leave behind on error is the graph itself, which the caller
+/// frees via `cleanup_filtergraph`.
+///
+/// # Safety
+/// `graph_ptr` must point at a live `AVFilterGraph` whose `scale_sws_opts` /
+/// `aresample_swr_opts` are still NULL (a just-allocated graph), so overwriting
+/// them leaks nothing.
+#[cfg(not(docsrs))]
+unsafe fn apply_auto_conv_opts(
+    graph_ptr: *mut AVFilterGraph,
+    fgp: &FilterGraphParameter,
+    ofps: &[OutputFilterParameter],
+) -> crate::error::Result<()> {
+    let sws = resolve_auto_conv_opt(
+        non_empty_opt(&fgp.sws_opts),
+        ofps.iter().map(|o| non_empty_opt(&o.opts.sws_opts)),
+    )?;
+    let swr = resolve_auto_conv_opt(
+        non_empty_opt(&fgp.swr_opts),
+        ofps.iter().map(|o| non_empty_opt(&o.opts.swr_opts)),
+    )?;
+
+    if let Some(sws) = sws {
+        (*graph_ptr).scale_sws_opts = av_strdup_opt(sws)?;
+    }
+    if let Some(swr) = swr {
+        (*graph_ptr).aresample_swr_opts = av_strdup_opt(swr)?;
+    }
+    Ok(())
+}
+
 #[cfg(docsrs)]
 unsafe fn configure_filtergraph(
     fg_index: usize,
@@ -846,6 +961,15 @@ unsafe fn configure_filtergraph(
     // path returns immediately, so `graph_ptr` is never read after the drop.
     let graph_ptr = graph.as_ref().unwrap().as_ptr();
     (*graph_ptr).nb_threads = 0;
+
+    // NEW-SC-03: apply the resolved graph-level sws/swr option strings to the
+    // auto-inserted scale/aresample filters BEFORE parse/config. On a resolution
+    // conflict or OOM, free the just-allocated graph first (same as every other
+    // error path in this function), then surface the error.
+    if let Err(e) = apply_auto_conv_opts(graph_ptr, fgp, ofps) {
+        cleanup_filtergraph(graph, ifps, ofps);
+        return Err(e);
+    }
 
     let hw_device = hw_device_for_filter();
 
@@ -3214,4 +3338,63 @@ unsafe fn read_binary(path: *mut c_char) -> crate::error::Result<(*mut c_void, i
     avio_close(io);
 
     Ok((data, fsize))
+}
+
+// NEW-SC-03: unit tests for the graph-level sws/swr option resolver. These pin
+// the precedence and conflict contract (the P3-hard part) without needing an
+// encoder — the integration coverage lives in tests/sws_swr_tuning.rs.
+#[cfg(all(test, not(docsrs)))]
+mod auto_conv_opts_tests {
+    use super::*;
+
+    fn is_invalid_argument(err: &Error) -> bool {
+        matches!(
+            err,
+            Error::FilterGraph(FilterGraphOperationError::ParseError(
+                FilterGraphParseError::InvalidArgument
+            ))
+        )
+    }
+
+    #[test]
+    fn non_empty_opt_treats_none_and_empty_as_unset() {
+        assert_eq!(non_empty_opt(&None), None);
+        assert_eq!(non_empty_opt(&Some(String::new())), None);
+        assert_eq!(non_empty_opt(&Some("flags=lanczos".to_string())), Some("flags=lanczos"));
+    }
+
+    #[test]
+    fn graph_level_value_wins_over_conflicting_outputs() {
+        // A graph-level value short-circuits: even outputs that disagree with
+        // each other never produce a conflict once the graph itself decided.
+        let per_output = vec![Some("flags=bilinear"), Some("flags=bicubic")];
+        let resolved = resolve_auto_conv_opt(Some("flags=lanczos"), per_output.into_iter())
+            .expect("graph-level value must resolve without conflict");
+        assert_eq!(resolved, Some("flags=lanczos"));
+    }
+
+    #[test]
+    fn unique_non_empty_output_value_is_chosen() {
+        // Only some outputs set a value; identical repeats are not a conflict.
+        let per_output = vec![None, Some("resampler=soxr"), None, Some("resampler=soxr")];
+        let resolved = resolve_auto_conv_opt(None, per_output.into_iter())
+            .expect("a single distinct output value must resolve");
+        assert_eq!(resolved, Some("resampler=soxr"));
+    }
+
+    #[test]
+    fn conflicting_output_values_error_with_invalid_argument() {
+        let per_output = vec![Some("flags=bilinear"), Some("flags=bicubic")];
+        let err = resolve_auto_conv_opt(None, per_output.into_iter())
+            .expect_err("two different output values must be rejected");
+        assert!(is_invalid_argument(&err), "expected InvalidArgument, got {err:?}");
+    }
+
+    #[test]
+    fn nothing_set_resolves_to_none() {
+        let per_output: Vec<Option<&str>> = vec![None, None];
+        let resolved = resolve_auto_conv_opt(None, per_output.into_iter())
+            .expect("no values must resolve to None (default behavior)");
+        assert_eq!(resolved, None);
+    }
 }
