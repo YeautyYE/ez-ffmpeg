@@ -14,17 +14,21 @@ pub(crate) struct Codec {
 unsafe impl Send for Codec {}
 
 impl Codec {
+    #[inline]
     pub(crate) fn null() -> Self {
         Self { inner: null() }
     }
+    #[inline]
     pub(crate) fn is_null(&self) -> bool {
         self.inner.is_null()
     }
 
+    #[inline]
     pub(crate) fn new(avcodec: *const ffmpeg_sys_next::AVCodec) -> Self {
         Self { inner: avcodec }
     }
 
+    #[inline]
     pub(crate) fn as_ptr(&self) -> *const ffmpeg_sys_next::AVCodec {
         self.inner
     }

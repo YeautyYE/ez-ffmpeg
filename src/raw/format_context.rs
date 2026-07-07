@@ -74,6 +74,7 @@ impl FormatContext {
     /// `avformat_open_input` (optionally followed by `avformat_find_stream_info`).
     /// Ownership transfers to the returned value: the caller must not free `ptr`
     /// again, and must not retain another owner of it.
+    #[inline]
     pub(crate) unsafe fn from_input(ptr: *mut AVFormatContext) -> Self {
         Self {
             ptr,
@@ -91,6 +92,7 @@ impl FormatContext {
     /// by this context. On drop the AVIO context, its buffer, and that `Box` are
     /// reclaimed (via `in_fmt_ctx_free(ptr, true)`). Ownership transfers to the
     /// returned value; the caller must not free `ptr` (or its `pb`) again.
+    #[inline]
     pub(crate) unsafe fn from_input_custom_io(ptr: *mut AVFormatContext) -> Self {
         Self {
             ptr,
@@ -111,6 +113,7 @@ impl FormatContext {
     // Dead only under docsrs, where the output open path (its sole caller) is
     // `#[cfg(not(docsrs))]`; the normal build wires it, so suppress there only.
     #[cfg_attr(docsrs, allow(dead_code))]
+    #[inline]
     pub(crate) unsafe fn from_output(ptr: *mut AVFormatContext) -> Self {
         Self {
             ptr,
@@ -132,6 +135,7 @@ impl FormatContext {
     // Dead only under docsrs, where the output open path (its sole caller) is
     // `#[cfg(not(docsrs))]`; the normal build wires it, so suppress there only.
     #[cfg_attr(docsrs, allow(dead_code))]
+    #[inline]
     pub(crate) unsafe fn from_output_custom_io(ptr: *mut AVFormatContext) -> Self {
         Self {
             ptr,
@@ -148,6 +152,7 @@ impl FormatContext {
     /// # Safety
     ///
     /// The returned pointer must not be freed and must not outlive `self`.
+    #[inline]
     pub(crate) unsafe fn as_ptr(&self) -> *mut AVFormatContext {
         self.ptr
     }

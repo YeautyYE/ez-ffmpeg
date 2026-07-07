@@ -732,18 +732,22 @@ fn new_packet() -> crate::error::Result<Packet> {
     Ok(packet)
 }
 
+#[inline]
 pub(crate) fn unref_frame(frame: &mut Frame) {
     unsafe { av_frame_unref(frame.as_mut_ptr()) };
 }
 
+#[inline]
 pub(crate) fn unref_packet(packet: &mut Packet) {
     unsafe { av_packet_unref(packet.as_mut_ptr()) };
 }
 
+#[inline]
 pub(crate) fn frame_is_null(frame: &Frame) -> bool {
     unsafe { frame.as_ptr().is_null() }
 }
 
+#[inline]
 pub(crate) fn packet_is_null(packet: &Packet) -> bool {
     packet.as_ptr().is_null()
 }

@@ -30,6 +30,7 @@ pub(crate) struct FilterInOut {
 impl FilterInOut {
     /// An empty (null) owner, to be filled via [`as_out_ptr`](Self::as_out_ptr)
     /// by an FFmpeg out-parameter.
+    #[inline]
     pub(crate) fn empty() -> Self {
         Self { ptr: null_mut() }
     }
@@ -43,6 +44,7 @@ impl FilterInOut {
     /// Must be called on an `empty()` owner (its pointer still null). FFmpeg
     /// overwrites the slot, so calling this when the owner already holds a list
     /// would leak that existing list.
+    #[inline]
     pub(crate) unsafe fn as_out_ptr(&mut self) -> *mut *mut AVFilterInOut {
         &mut self.ptr
     }
@@ -56,6 +58,7 @@ impl FilterInOut {
     /// # Safety
     ///
     /// The returned pointer must not be freed and must not outlive `self`.
+    #[inline]
     pub(crate) unsafe fn as_ptr(&self) -> *mut AVFilterInOut {
         self.ptr
     }
