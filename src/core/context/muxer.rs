@@ -1,5 +1,5 @@
 use crate::core::context::encoder_stream::EncoderStream;
-use crate::core::context::output::{StreamMap, VSyncMethod};
+use crate::core::context::output::{AttachmentSpec, StreamMap, VSyncMethod};
 use crate::core::context::pre_mux_queue::{
     self, PreMuxQueueConfig, PreMuxQueueReceiver,
 };
@@ -185,6 +185,12 @@ pub(crate) struct Muxer {
     pub(crate) sws_opts: Option<String>,
     pub(crate) swr_opts: Option<String>,
 
+    /// Files to embed as attachment streams (`-attach`). Resolved into
+    /// `AVMEDIA_TYPE_ATTACHMENT` streams during `outputs_bind`, after every
+    /// mapped/encoded stream has been created (so they take the highest indices
+    /// and never collide with the packet path).
+    pub(crate) attachments: Vec<AttachmentSpec>,
+
     streams: Vec<EncoderStream>,
     queue: Option<(Sender<PacketBox>, Receiver<PacketBox>)>,
     src_pre_receivers: Vec<PreMuxQueueReceiver>,
@@ -269,6 +275,7 @@ impl Muxer {
         pre_mux_queue_config: PreMuxQueueConfig,
         sws_opts: Option<String>,
         swr_opts: Option<String>,
+        attachments: Vec<AttachmentSpec>,
     ) -> Self {
         // Read oformat flags via the pointer BEFORE moving `out_fmt_ctx` into the
         // struct (the field can no longer be the access path once it's moved).
@@ -328,6 +335,7 @@ impl Muxer {
             pix_fmt,
             sws_opts,
             swr_opts,
+            attachments,
         }
     }
 

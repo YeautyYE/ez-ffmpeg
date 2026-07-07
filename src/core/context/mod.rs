@@ -292,6 +292,7 @@ pub mod output;
 pub mod filter_complex;
 
 
+pub(super) mod attachment;
 pub(super) mod decoder_stream;
 pub(super) mod demuxer;
 pub(super) mod encoder_stream;
