@@ -1944,4 +1944,96 @@ mod tests {
         reactor.remove_connection(token.id);
     }
 
+    // PERF-5a: exercise the real mixed PublisherFeed::Raw + PublisherFeed::Media
+    // drain in process_publishers (not just the scheduler entry point), so the
+    // create_rtmp_input registration path is regression-tested at the reactor
+    // level. FIFO ordering is structural — a single crossbeam Receiver drained
+    // in-order by the try_recv loop — so this asserts that both variants are
+    // processed on one drain and the bypassed media reaches the scheduler,
+    // rather than re-proving the channel's ordering.
+    #[test]
+    fn feed_publisher_drains_mixed_raw_and_media() {
+        use crate::rtmp::embed_rtmp_server::build_publish_control;
+
+        let stream_keys = dashmap::DashSet::new();
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let mut reactor = Reactor::new(3, None, stream_keys, status).expect("reactor");
+
+        // Register an in-process (create_rtmp_input-style) Feed publisher.
+        let (feed_tx, feed_rx) = crossbeam_channel::bounded(64);
+        let pub_id = reactor
+            .add_publisher("live".to_string(), PublisherSource::Feed(feed_rx))
+            .expect("publisher registered");
+
+        // Realistic mixed sequence on ONE FIFO feed: connect/createStream/publish
+        // as Raw (fed to the session), then audio/video tags as bypassed Media.
+        for control in
+            build_publish_control("app".to_string(), "live".to_string()).expect("control")
+        {
+            feed_tx.send(PublisherFeed::Raw(control)).unwrap();
+        }
+        let video_seq: &[u8] = &[0x17, 0x00, 0x00, 0x00, 0x00, 0x01, 0x64];
+        let audio_seq: &[u8] = &[0xaf, 0x00, 0x12, 0x10];
+        feed_tx
+            .send(PublisherFeed::Media {
+                tag_type: 0x09,
+                timestamp: RtmpTimestamp { value: 0 },
+                data: Bytes::from_static(video_seq),
+            })
+            .unwrap();
+        feed_tx
+            .send(PublisherFeed::Media {
+                tag_type: 0x08,
+                timestamp: RtmpTimestamp { value: 0 },
+                data: Bytes::from_static(audio_seq),
+            })
+            .unwrap();
+        feed_tx
+            .send(PublisherFeed::Media {
+                tag_type: 0x09,
+                timestamp: RtmpTimestamp { value: 33 },
+                data: Bytes::from_static(&[0x17, 0x01, 0xAA, 0xBB]),
+            })
+            .unwrap();
+        // A second IDR freezes the first GOP into the replay cache.
+        feed_tx
+            .send(PublisherFeed::Media {
+                tag_type: 0x09,
+                timestamp: RtmpTimestamp { value: 66 },
+                data: Bytes::from_static(&[0x17, 0x01, 0xCC, 0xDD]),
+            })
+            .unwrap();
+
+        // Drain the mixed feed; a healthy publisher must not be removed.
+        let removed = reactor.process_publishers();
+        assert!(removed.is_empty(), "healthy publisher must not be removed");
+
+        // The Media items were dispatched through publish_media_received (not the
+        // serializer): sequence headers cached and a GOP frozen. The Raw control
+        // was fed to the session on the same drain without error — proving the
+        // mixed Raw+Media path works and preserves the channel state the
+        // serialize path would produce.
+        assert_eq!(
+            reactor.scheduler.channel_video_sequence_header("live").as_deref(),
+            Some(video_seq),
+            "bypassed video sequence header must be cached"
+        );
+        assert_eq!(
+            reactor.scheduler.channel_audio_sequence_header("live").as_deref(),
+            Some(audio_seq),
+            "bypassed audio sequence header must be cached"
+        );
+        assert!(
+            reactor.scheduler.channel_frozen_gop_count("live") >= 1,
+            "the completed GOP must be frozen from bypassed media"
+        );
+
+        // Dropping the sender disconnects the publisher; the next drain removes it.
+        drop(feed_tx);
+        let removed = reactor.process_publishers();
+        assert!(
+            removed.contains(&pub_id),
+            "a disconnected publisher must be scheduled for removal"
+        );
+    }
 }

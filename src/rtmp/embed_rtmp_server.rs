@@ -549,7 +549,7 @@ fn handle_connections(
 /// path ([`create_stream_sender`](EmbedRtmpServer<Running>::create_stream_sender))
 /// and the media-bypass path ([`create_rtmp_input`](EmbedRtmpServer<Running>::create_rtmp_input))
 /// so their control bytes stay identical.
-fn build_publish_control(
+pub(crate) fn build_publish_control(
     app_name: String,
     stream_key: String,
 ) -> crate::error::Result<[Vec<u8>; 3]> {
