@@ -3753,8 +3753,11 @@ mod find_stream_info_tests {
             (0, &[("skip_frame", "nokey")]),
             (5, &[("lowres", "1")]),
         ]);
-        // Drop of the partially built array frees whatever dicts were already
-        // built before the invalid index was hit (HashMap order is arbitrary).
+        // Asserts the out-of-range index is rejected. The error path still
+        // drops the partially built array (HashMap order decides whether
+        // stream 0's dict was built before index 5 tripped the error, so this
+        // does not assert ordering); the deterministic drop-frees-real-dicts
+        // coverage lives in `sparse_indices_leave_null_dicts_for_missing_streams`.
         let err = match FindStreamInfoOptions::new(2, Some(&configured)) {
             Ok(_) => panic!("expected InvalidArgument for out-of-range stream index"),
             Err(err) => err,
@@ -3763,6 +3766,18 @@ mod find_stream_info_tests {
             matches!(err, Error::FindStream(FindStreamError::InvalidArgument)),
             "expected InvalidArgument, got {err:?}"
         );
+    }
+
+    #[test]
+    fn drop_after_partial_build_is_leak_free() {
+        // Deterministic partial-build-then-drop: a valid stream 0 dict IS
+        // built (asserted non-null) before this array drops, so ASAN/valgrind
+        // in the sanitizer job observes the error-path Drop freeing a real
+        // dict rather than only null slots.
+        let configured = probing_opts(&[(0, &[("skip_frame", "nokey")])]);
+        let opts = FindStreamInfoOptions::new(1, Some(&configured)).unwrap();
+        assert!(!opts.dicts[0].is_null());
+        drop(opts);
     }
 }
 
