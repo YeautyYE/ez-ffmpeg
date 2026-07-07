@@ -2,6 +2,7 @@ use crate::core::context::encoder_stream::EncoderStream;
 use crate::core::context::obj_pool::ObjPool;
 use crate::core::context::pre_mux_queue::{packet_payload_size, PreMuxQueueSender};
 use crate::core::context::{CodecContext, FrameBox, PacketBox, PacketData};
+use crate::core::scheduler::sync_queue::SyncQueue;
 use crate::error::Error::{Encoding, OpenEncoder};
 use crate::error::{AllocPacketError, EncodeSubtitleError, EncodingError, EncodingOperationError, OpenEncoderError, OpenEncoderOperationError, OpenOutputError};
 use crate::core::scheduler::ffmpeg_scheduler::{
@@ -35,8 +36,8 @@ use log::{debug, error, info, trace, warn};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString};
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 #[cfg(docsrs)]
@@ -120,6 +121,12 @@ pub(crate) fn enc_init(
     // Move them out before the encoder thread starts, mirroring take_src() above.
     let forced_kf_pts = std::mem::take(&mut enc_stream.forced_kf_pts);
 
+    // -shortest frame-level sync-queue handle: `Some` only for an encoded-A/V
+    // member of a mux built with `sq_enc`. Moved into the encoder thread; drives
+    // the Architecture-B producer-then-drainer loop below. `None` keeps today's
+    // verbatim encode path byte-for-byte.
+    let enc_sync = enc_stream.take_sync_queue();
+
     let stream_box = enc_stream.stream;
     let stream_index = enc_stream.stream_index;
 
@@ -152,7 +159,122 @@ pub(crate) fn enc_init(
             index: 0,
         };
 
-        loop {
+        // ===== Architecture B (sq_enc / -shortest): producer-then-drainer =====
+        // Runs only for an encoded-A/V member of an sq_enc mux. The encoder both
+        // produces (receive -> queue) and drains (pop its own now-releasable frames
+        // and encode them). It never exits at producer-EOF while it still holds
+        // frames a slower peer will later release: it enters a drain phase and waits
+        // on the queue Condvar. The sync-queue lock is held ONLY for in-memory
+        // VecDeque/timestamp ops, never across frame_encode (which may park on the
+        // pre-mux queue), so it lies on no wait-for cycle. `enc_sync == None` skips
+        // this entirely and runs the verbatim loop below, byte-for-byte.
+        if let Some(h) = enc_sync.as_ref() {
+            let (sq_lock, sq_cv) = (&h.queue.0, &h.queue.1);
+            let sq_idx = h.sq_idx;
+            let sq_finished: &[AtomicBool] = &h.sq_finished;
+            const DRAIN_TICK: Duration = Duration::from_millis(100);
+            let mut last_tb = AVRational { num: 1, den: 1 };
+            let mut producer_eof = false;
+            // stop feeding: recording_time limit, encode error, natural encoder EOF,
+            // or external abort -> skip further draining, proceed to the shared flush.
+            let mut stop = false;
+
+            // ---- producer + live drain ----
+            while !stop {
+                // (0) cascade-finish: a shorter peer truncated this stream.
+                if sq_finished[sq_idx].load(Ordering::Acquire) {
+                    break; // -> drain phase (the peer already signalled the finish)
+                }
+                let sync_frame = receive_frame(&mut opened, &receiver, &frame_pool, enc_ctx_box.as_mut_ptr(), stream_box.inner,
+                                                   &ready_sender, &bits_per_raw_sample, &mut frame_samples, &mut align_mask, &mut samples_queued, &mut audio_frame_queue,
+                                                   &mut samples_sent, &mut frames_sent, &mut is_finished,
+                                                   &scheduler_status, &scheduler_result);
+                let frame_box_opt = match sync_frame {
+                    SyncFrame::FrameBox(fb) => Some(fb),
+                    // timeout/dummy: no new frame, but a peer may have advanced the
+                    // head -> still drain our own now-releasable frames.
+                    SyncFrame::Continue => None,
+                    SyncFrame::Break => { producer_eof = true; break; }
+                };
+
+                let mut local: Vec<FrameBox> = Vec::new();
+                {
+                    let mut q = sq_lock.lock().unwrap();
+                    if let Some(fb) = frame_box_opt {
+                        let (end_ts, tb, nb_samples) = sq_frame_end_tb(&fb);
+                        last_tb = tb;
+                        q.send(sq_idx, Some(fb), end_ts, tb, nb_samples);
+                    }
+                    q.drain_releasable_into(sq_idx, &mut local);
+                    if local.is_empty() {
+                        // nothing released -> the true EAGAIN point: heartbeat may
+                        // fake-advance a stalled laggard, then retry (FFmpeg sq_receive).
+                        q.heartbeat();
+                        q.drain_releasable_into(sq_idx, &mut local);
+                    }
+                    sq_propagate_and_notify(&mut q, sq_finished, sq_cv);
+                }
+                for fb in local {
+                    if sq_encode_drained(enc_ctx_box.as_mut_ptr(), fb, start_time_us, recording_time_us,
+                                         &pkt_sender, &pre_pkt_sender, &mux_start_gate, stream_box.inner,
+                                         &packet_pool, &mut forced_kf, &frame_pool,
+                                         &scheduler_status, &scheduler_result, &mut finished) {
+                        stop = true;
+                    }
+                }
+            }
+
+            // ---- drain phase: my producer is done, but I may still hold frames a
+            // slower peer will release. Do not exit until my FIFO is drained. ----
+            if !stop {
+                if producer_eof && !sq_finished[sq_idx].load(Ordering::Acquire) {
+                    let mut local: Vec<FrameBox> = Vec::new();
+                    {
+                        let mut q = sq_lock.lock().unwrap();
+                        q.send(sq_idx, None, None, last_tb, 0); // finish + cascade
+                        q.drain_releasable_into(sq_idx, &mut local);
+                        sq_propagate_and_notify(&mut q, sq_finished, sq_cv);
+                    }
+                    for fb in local {
+                        if sq_encode_drained(enc_ctx_box.as_mut_ptr(), fb, start_time_us, recording_time_us,
+                                             &pkt_sender, &pre_pkt_sender, &mux_start_gate, stream_box.inner,
+                                             &packet_pool, &mut forced_kf, &frame_pool,
+                                             &scheduler_status, &scheduler_result, &mut finished) {
+                            stop = true;
+                        }
+                    }
+                }
+                while !stop {
+                    let mut local: Vec<FrameBox> = Vec::new();
+                    let done;
+                    {
+                        let mut q = sq_lock.lock().unwrap();
+                        q.heartbeat();
+                        q.drain_releasable_into(sq_idx, &mut local);
+                        sq_propagate_and_notify(&mut q, sq_finished, sq_cv);
+                        done = q.is_stream_drained(sq_idx)
+                            || is_stopping(scheduler_status.load(Ordering::Acquire));
+                        if !done && local.is_empty() {
+                            // wait for a peer's head advance; wait_timeout atomically
+                            // releases the lock while blocked (deadlock-proof Lemma 1).
+                            let _ = sq_cv.wait_timeout(q, DRAIN_TICK).unwrap();
+                            continue;
+                        }
+                    }
+                    for fb in local {
+                        if sq_encode_drained(enc_ctx_box.as_mut_ptr(), fb, start_time_us, recording_time_us,
+                                             &pkt_sender, &pre_pkt_sender, &mux_start_gate, stream_box.inner,
+                                             &packet_pool, &mut forced_kf, &frame_pool,
+                                             &scheduler_status, &scheduler_result, &mut finished) {
+                            stop = true;
+                        }
+                    }
+                    if done { break; }
+                }
+            }
+        }
+
+        while enc_sync.is_none() {
             let sync_frame = receive_frame(&mut opened, &receiver, &frame_pool, enc_ctx_box.as_mut_ptr(), stream_box.inner,
                                                &ready_sender, &bits_per_raw_sample, &mut frame_samples, &mut align_mask, &mut samples_queued, &mut audio_frame_queue,
                                                &mut samples_sent, &mut frames_sent, &mut is_finished,
@@ -595,6 +717,88 @@ fn receive_frame(
     } else {
         *frames_sent += 1;
         SyncFrame::FrameBox(frame_box)
+    }
+}
+
+/// `-shortest` (sq_enc): `(end_ts, time_base, nb_samples)` for a frame entering the
+/// sync queue. `end_ts = pts + duration` (FFmpeg `frame_end`), `None` when pts is
+/// unset. `nb_samples` is the audio sample count (0 for video) for the engine's
+/// `frames_max` accounting. Duration is already filled upstream (audio in
+/// `receive_frame`/`process_audio_queue`; video by the filtergraph).
+unsafe fn sq_frame_end_tb(fb: &FrameBox) -> (Option<i64>, AVRational, i32) {
+    let f = fb.frame.as_ptr();
+    let pts = (*f).pts;
+    let end_ts = if pts == AV_NOPTS_VALUE { None } else { Some(pts + (*f).duration) };
+    (end_ts, (*f).time_base, (*f).nb_samples)
+}
+
+/// `-shortest` (sq_enc): after a `send`/`heartbeat` under the sync-queue lock,
+/// mark every stream the engine just cascade-finished in `sq_finished` (so a
+/// truncated encoder observes it and enters its drain phase) and wake any
+/// drain-phase peers whose head just advanced. In-memory ops only.
+fn sq_propagate_and_notify(q: &mut SyncQueue<FrameBox>, sq_finished: &[AtomicBool], cv: &Condvar) {
+    let mut newly = Vec::new();
+    q.newly_finished(&mut newly);
+    for j in newly {
+        sq_finished[j].store(true, Ordering::Release);
+    }
+    cv.notify_all();
+}
+
+/// `-shortest` (sq_enc): encode one frame drained from the queue. The sync-queue
+/// lock is already released, so `frame_encode` may park on the pre-mux queue with
+/// no lock held (Architecture B). Mirrors the verbatim loop's encode + status
+/// handling; returns `true` when the encoder should stop feeding (natural EOF,
+/// recording_time limit, or a real error) so the caller proceeds to the shared
+/// flush, and sets `finished` on a natural EOF.
+unsafe fn sq_encode_drained(
+    enc_ctx: *mut AVCodecContext,
+    mut fb: FrameBox,
+    start_time_us: Option<i64>,
+    recording_time_us: Option<i64>,
+    pkt_sender: &Sender<PacketBox>,
+    pre_pkt_sender: &PreMuxQueueSender,
+    mux_start_gate: &Arc<crate::core::context::MuxStartGate>,
+    stream: *mut AVStream,
+    packet_pool: &ObjPool<Packet>,
+    forced_kf: &mut ForcedKeyframes,
+    frame_pool: &ObjPool<Frame>,
+    scheduler_status: &Arc<AtomicUsize>,
+    scheduler_result: &Arc<Mutex<Option<crate::error::Result<()>>>>,
+    finished: &mut bool,
+) -> bool {
+    let result = frame_encode(
+        enc_ctx,
+        fb.frame.as_mut_ptr(),
+        start_time_us,
+        recording_time_us,
+        pkt_sender,
+        pre_pkt_sender,
+        mux_start_gate,
+        stream,
+        packet_pool,
+        forced_kf,
+    );
+    frame_pool.release(fb.frame);
+    match result {
+        Err(e) => {
+            if is_stopping(scheduler_status.load(Ordering::Acquire))
+                && matches!(e, Encoding(EncodingOperationError::MuxerFinished))
+            {
+                debug!("Encoder stopping: muxer already finished");
+            } else {
+                error!("Error encoding a frame: {}", e);
+                set_scheduler_error(scheduler_status, scheduler_result, e);
+            }
+            true
+        }
+        Ok(EncodeStatus::Eof) => {
+            trace!("Encoder returned EOF, finishing");
+            *finished = true;
+            true
+        }
+        Ok(EncodeStatus::LimitReached) => true,
+        Ok(EncodeStatus::Continue) => false,
     }
 }
 

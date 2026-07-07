@@ -408,7 +408,6 @@ unsafe impl Send for InputFilterParameter {}
 struct FilterGraphParameter {
     // index of the next input to request from the scheduler
     next_in: usize,
-    got_frame: bool,
     nb_outputs_done: usize,
     is_meta: bool,
 
@@ -433,6 +432,15 @@ struct OutputFilterParameter {
     name: String,
     fpsconv_context: FPSConvContext,
     eof: bool,
+
+    // Whether THIS output has emitted at least one frame. Tracked per-output
+    // rather than graph-wide: FFmpeg keeps a single thread-level
+    // FilterGraphThread.got_frame, but ez drives multiple outputs from one
+    // filtergraph, so gating each output's init-dummy, EOF flush, and
+    // side-data snapshot on a shared flag mis-fires when a sibling output
+    // produced frames while this one produced none. Owned by the filter
+    // thread, like `eof`.
+    got_frame: bool,
 
     format: AVPixelFormat,
     width: i32,
@@ -477,6 +485,7 @@ impl OutputFilterParameter {
             opts,
             fpsconv_context,
             eof: false,
+            got_frame: false,
             format: AVPixelFormat::AV_PIX_FMT_NONE,
             width: 0,
             height: 0,
@@ -1758,7 +1767,7 @@ unsafe fn fg_output_frame(
     let mut nb_frames = if !frame_is_null(&frame) { 1 } else { 0 };
     let mut nb_frames_prev = 0;
 
-    if ofp.media_type == AVMEDIA_TYPE_VIDEO && (!frame_is_null(&frame) || fgp.got_frame) {
+    if ofp.media_type == AVMEDIA_TYPE_VIDEO && (!frame_is_null(&frame) || ofp.got_frame) {
         unsafe { video_sync_process(ofp, frame.as_mut_ptr(), &mut nb_frames, &mut nb_frames_prev) };
     }
 
@@ -1843,7 +1852,7 @@ unsafe fn fg_output_frame(
                     fg_input_index: ofp.fg_input_index,
                     // Only the frame that opens the encoder needs the graph's
                     // side data snapshot (fftools fg_output_step).
-                    side_data: if fgp.got_frame {
+                    side_data: if ofp.got_frame {
                         None
                     } else {
                         ofp.side_data.clone()
@@ -1870,7 +1879,7 @@ unsafe fn fg_output_frame(
                 }
         }
 
-        fgp.got_frame = true;
+        ofp.got_frame = true;
     }
 
     let frame_is_null = frame_is_null(&frame);
@@ -1890,7 +1899,7 @@ unsafe fn fg_output_frame(
     }
 
     if frame_is_null {
-        return close_output(ofp, fgp, frame_pool);
+        return close_output(ofp, frame_pool);
     }
 
     0
@@ -1899,7 +1908,6 @@ unsafe fn fg_output_frame(
 #[cfg(docsrs)]
 unsafe fn close_output(
     ofp: &mut OutputFilterParameter,
-    fgp: &mut FilterGraphParameter,
     frame_pool: &ObjPool<Frame>,
 ) -> i32 {
     0
@@ -1908,13 +1916,12 @@ unsafe fn close_output(
 #[cfg(not(docsrs))]
 unsafe fn close_output(
     ofp: &mut OutputFilterParameter,
-    fgp: &mut FilterGraphParameter,
     frame_pool: &ObjPool<Frame>,
 ) -> i32 {
     // we are finished and no frames were ever seen at this output,
     // at least initialize the encoder with a dummy frame
 
-    if !fgp.got_frame {
+    if !ofp.got_frame {
         let Ok(mut frame) = frame_pool.get() else {
             return AVERROR(ffmpeg_sys_next::ENOMEM);
         };
@@ -3406,5 +3413,79 @@ mod auto_conv_opts_tests {
         let resolved = resolve_auto_conv_opt(None, per_output.into_iter())
             .expect("no values must resolve to None (default behavior)");
         assert_eq!(resolved, None);
+    }
+}
+
+// Regression tests for the per-output `got_frame` gate. `got_frame` used to be
+// graph-level, so in a multi-output complex graph a sibling output that emitted
+// frames would flip the shared flag and suppress THIS output's init dummy —
+// starving its encoder. The flag now lives on OutputFilterParameter, so each
+// output's dummy is gated on whether IT produced a frame.
+//
+// `close_output` is exercised directly: no filtergraph, media, or GPU needed.
+//   got_frame == false -> a non-null init dummy, then the null EOF marker.
+//   got_frame == true  -> only the null EOF marker (no dummy).
+#[cfg(all(test, not(docsrs)))]
+mod per_output_got_frame_tests {
+    use super::*;
+    use crate::core::scheduler::ffmpeg_scheduler::unref_frame;
+
+    // Local mirror of ffmpeg_scheduler::new_frame (which is module-private):
+    // allocate a bare AVFrame shell for the pool.
+    fn test_new_frame() -> crate::error::Result<Frame> {
+        let f = unsafe { av_frame_alloc() };
+        assert!(!f.is_null(), "av_frame_alloc failed in test");
+        Ok(unsafe { Frame::wrap(f) })
+    }
+
+    fn make_video_ofp(dst: Sender<FrameBox>) -> OutputFilterParameter {
+        OutputFilterParameter::new(
+            AVMEDIA_TYPE_VIDEO,
+            OutputFilterOptions::new(),
+            Some(dst),
+            0,
+            Arc::from(Vec::<AtomicBool>::new()),
+        )
+    }
+
+    #[test]
+    fn empty_output_emits_its_own_init_dummy() {
+        let frame_pool = ObjPool::new(1, test_new_frame, unref_frame, frame_is_null)
+            .expect("frame pool");
+        let (tx, rx) = crossbeam_channel::unbounded::<FrameBox>();
+        let mut ofp = make_video_ofp(tx);
+        // This output produced nothing; a sibling output may have, but that must
+        // no longer matter now the flag is per-output.
+        ofp.got_frame = false;
+
+        let ret = unsafe { close_output(&mut ofp, &frame_pool) };
+        assert_eq!(ret, 0);
+
+        // First: the non-null init dummy that opens this output's encoder.
+        let dummy = rx.try_recv().expect("expected an init dummy frame");
+        assert!(!frame_is_null(&dummy.frame), "init dummy must be a real frame");
+        // Then: the null EOF marker.
+        let marker = rx.try_recv().expect("expected the EOF marker");
+        assert!(frame_is_null(&marker.frame), "EOF marker must be the null frame");
+        assert!(ofp.eof, "close_output must mark the output EOF");
+    }
+
+    #[test]
+    fn output_with_frames_skips_the_init_dummy() {
+        let frame_pool = ObjPool::new(1, test_new_frame, unref_frame, frame_is_null)
+            .expect("frame pool");
+        let (tx, rx) = crossbeam_channel::unbounded::<FrameBox>();
+        let mut ofp = make_video_ofp(tx);
+        // This output already emitted a frame -> no dummy needed.
+        ofp.got_frame = true;
+
+        let ret = unsafe { close_output(&mut ofp, &frame_pool) };
+        assert_eq!(ret, 0);
+
+        // Only the null EOF marker is sent; no dummy precedes it.
+        let marker = rx.try_recv().expect("expected the EOF marker");
+        assert!(frame_is_null(&marker.frame), "only the null EOF marker is expected");
+        assert!(rx.try_recv().is_err(), "no init dummy must be emitted");
+        assert!(ofp.eof, "close_output must mark the output EOF");
     }
 }

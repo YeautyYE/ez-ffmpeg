@@ -1,10 +1,11 @@
-use crate::core::context::muxer::{Muxer, StreamBsfChains};
+use crate::core::context::muxer::{Muxer, SqMuxPlan, StreamBsfChains};
 use crate::core::context::obj_pool::ObjPool;
 use crate::core::context::pre_mux_queue::PreMuxQueueReceiver;
 use crate::core::context::{PacketBox, PacketData};
 use crate::raw::{BitStreamFilter, FormatContext};
 use crate::core::scheduler::ffmpeg_scheduler::{is_stopping, packet_is_null, set_scheduler_error, wait_until_not_paused, STATUS_ABORT, STATUS_END};
 use crate::core::scheduler::input_controller::{InputController, SchNode};
+use crate::core::scheduler::sync_queue::SyncQueue;
 use crate::error::Error::Muxing;
 use crate::error::{MuxingError, MuxingOperationError, WriteHeaderError};
 use crate::util::ffmpeg_utils::{av_err2str, hashmap_to_avdictionary, DictGuard};
@@ -22,6 +23,55 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// A muxer's `-shortest` packet sync queue (mirrors `Muxer.sq_mux`). Owns the
+/// single-threaded `SyncQueue<PacketBox>` and the output-stream-index <-> sq-index
+/// maps. Built from an [`SqMuxPlan`]; present only when the FFmpeg gate fires.
+struct SqMux {
+    queue: SyncQueue<PacketBox>,
+    /// `output_stream_index -> Some(sq_idx)` for interleaved members, `None` for
+    /// attachments (mirrors `ms->sq_idx_mux == -1`).
+    sq_idx: Vec<Option<usize>>,
+    /// `sq_idx -> output_stream_index` (reverse of `sq_idx`), for mapping a
+    /// cascade-finished sq stream back to its output stream.
+    ostream: Vec<usize>,
+}
+
+/// Build the `sq_mux` from its plan. `add_stream` order is output-stream-index
+/// order (the plan is built that way), so `ostream[sq_idx]` is the reverse map.
+fn build_sq_mux(plan: SqMuxPlan, stream_count: usize) -> SqMux {
+    let mut queue = SyncQueue::<PacketBox>::new(plan.buf_size_us);
+    let mut sq_idx = vec![None; stream_count];
+    let mut ostream = Vec::with_capacity(plan.streams.len());
+    for (output_stream_index, limiting, frames_max) in plan.streams {
+        let idx = queue.add_stream(limiting);
+        if output_stream_index < stream_count {
+            sq_idx[output_stream_index] = Some(idx);
+        }
+        ostream.push(output_stream_index);
+        if let Some(max) = frames_max {
+            queue.sq_limit_frames(idx, max);
+        }
+    }
+    SqMux {
+        queue,
+        sq_idx,
+        ostream,
+    }
+}
+
+/// `frame_end` for a mux packet (`sync_queue.c:126`): `pts + duration` in the
+/// packet's own time base, or `None` when the packet carries no pts. Packets
+/// have no `frame_samples`, so `nb_samples` is always 0.
+unsafe fn sq_pkt_end(pkt: *const AVPacket) -> (Option<i64>, AVRational, i32) {
+    let pts = (*pkt).pts;
+    let end = if pts == AV_NOPTS_VALUE {
+        None
+    } else {
+        Some(pts + (*pkt).duration)
+    };
+    (end, (*pkt).time_base, 0)
+}
+
 pub(crate) fn mux_init(
     mux_idx: usize,
     mux: &mut Muxer,
@@ -32,6 +82,10 @@ pub(crate) fn mux_init(
     thread_sync: ThreadSynchronizer,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
 ) -> crate::error::Result<()> {
+    // Compute the `-shortest` packet sync-queue plan while the output context is
+    // still owned (it reads each stream's media type); `None` unless the gate
+    // fires.
+    let sq_mux_plan = mux.sq_mux_plan();
     // Take sole ownership of the output context out of the Muxer; move it by
     // value through the handoff. The move is the ownership transfer — no
     // null-the-source dance.
@@ -54,6 +108,7 @@ pub(crate) fn mux_init(
         packet_pool,
         input_controller,
         mux_stream_nodes,
+        sq_mux_plan,
         scheduler_status,
         thread_sync,
         scheduler_result,
@@ -75,6 +130,8 @@ pub(crate) fn ready_to_init_mux(
         // Take sole ownership of the output context out of the Muxer. It is moved
         // into the waiter thread below; if streams never become ready the waiter
         // drops it (freeing once) — the RAII net the old box#1 provided.
+        // Computed while the output context is still owned (reads stream types).
+        let sq_mux_plan = mux.sq_mux_plan();
         let out_fmt_ctx = mux
             .out_fmt_ctx
             .take()
@@ -147,6 +204,7 @@ pub(crate) fn ready_to_init_mux(
                         packet_pool,
                         input_controller,
                         mux_stream_nodes,
+                        sq_mux_plan,
                         scheduler_status,
                         thread_sync,
                         scheduler_result,
@@ -183,6 +241,7 @@ fn mux_task_start(mux_idx: usize,
                   packet_pool: ObjPool<Packet>,
                   input_controller: Arc<InputController>,
                   mux_stream_nodes: Vec<Arc<SchNode>>,
+                  sq_mux_plan: Option<SqMuxPlan>,
                   scheduler_status: Arc<AtomicUsize>,
                   thread_sync: ThreadSynchronizer,
                   scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,) -> crate::error::Result<()> {
@@ -202,7 +261,7 @@ fn mux_task_start(mux_idx: usize,
 
     let (queue_sender, queue_receiver) = queue.unwrap();
 
-    _mux_init(mux_idx, out_fmt_ctx, queue_receiver, start_time_us, recording_time_us, stream_count, format_opts, bsf_chains, enc_handle_receiver, packet_pool, input_controller, mux_stream_nodes, scheduler_status, thread_sync, scheduler_result)?;
+    _mux_init(mux_idx, out_fmt_ctx, queue_receiver, start_time_us, recording_time_us, stream_count, format_opts, bsf_chains, enc_handle_receiver, packet_pool, input_controller, mux_stream_nodes, sq_mux_plan, scheduler_status, thread_sync, scheduler_result)?;
 
     // Drain the pre-queues and open the gate atomically: an encoder that
     // saw the gate closed cannot park a packet after this drain ran.
@@ -269,6 +328,7 @@ fn _mux_init(
     packet_pool: ObjPool<Packet>,
     input_controller: Arc<InputController>,
     mux_stream_nodes: Vec<Arc<SchNode>>,
+    sq_mux_plan: Option<SqMuxPlan>,
     scheduler_status: Arc<AtomicUsize>,
     thread_sync: ThreadSynchronizer,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
@@ -385,9 +445,245 @@ fn _mux_init(
         let mut st_rescale_delta_last: Vec<i64> = vec![0; stream_count];
         let mut st_last_dts: Vec<i64> = vec![AV_NOPTS_VALUE; stream_count];
 
+        // `-shortest` packet sync queue (owned by this single worker; `None`
+        // unless the gate fired). When present, the loop routes every packet
+        // through it so copy/subtitle/data followers truncate to the shortest
+        // encoded stream, and its cascade publishes `source_finished` to stop a
+        // live follower on the demux side (Architecture Y').
+        let sq_mux = sq_mux_plan.map(|plan| build_sq_mux(plan, stream_count));
+
         let mut nb_done = 0;
 
         let mut ret = 0;
+
+        if let Some(mut sq) = sq_mux {
+            // Reused scratch: released packets to write, and cascade-finished
+            // sq-indices, both cleared inside `sq_mux_pump` each call.
+            let mut released: Vec<PacketBox> = Vec::new();
+            let mut nf: Vec<usize> = Vec::new();
+            // finish tb is unused on the null-item (finish) path.
+            let fin_tb = AVRational { num: 1, den: 1 };
+
+            // Pre-finish any non-member stream that is inside `stream_count`. The
+            // only non-interleaved type is ATTACHMENT, which normally lives
+            // OUTSIDE `stream_count` (created via raw `avformat_new_stream`, see
+            // context/attachment.rs) — but a mapped attachment-copy (`-map 0:t`)
+            // can land inside it. Such a stream is header-only and never streams a
+            // packet, so it is done immediately: count it toward `nb_done`, mark
+            // it EOF (drop any stray packet), and publish `source_finished`. That
+            // last step is essential — otherwise its `last_dts` stays 0 and pins
+            // the balancing InputController's `trailing_dts`, choking the real
+            // members, and its demux follower scan never retires. In the normal
+            // case (no such stream) this loop does nothing.
+            for i in 0..stream_count {
+                if sq.sq_idx.get(i).copied().flatten().is_none() {
+                    if let Err(e) = unsafe {
+                        sq_finish_output_stream(
+                            i,
+                            stream_count,
+                            &mut stream_eof,
+                            &mut nb_done,
+                            has_bsf,
+                            &mut stream_bsfs,
+                            &stream_pkt_templates,
+                            &mut st_rescale_delta_last,
+                            &mut st_last_dts,
+                            oformat_flags,
+                            &out_fmt_ctx,
+                            &mux_stream_nodes,
+                            &input_controller,
+                            &scheduler_status,
+                            &packet_pool,
+                        )
+                    } {
+                        ret = e;
+                    }
+                }
+            }
+
+            while nb_done < stream_count && ret >= 0 {
+                let result = pkt_receiver.recv_timeout(Duration::from_millis(100));
+
+                if is_stopping(wait_until_not_paused(&scheduler_status)) {
+                    info!("Muxer receiver end command, finishing.");
+                    break;
+                }
+
+                let mut packet_box = match result {
+                    Ok(pb) => pb,
+                    Err(RecvTimeoutError::Disconnected) => {
+                        debug!("Encoder thread exit.");
+                        break;
+                    }
+                    Err(RecvTimeoutError::Timeout) => {
+                        // Idle tick: fire the sync-queue heartbeat so a live-but-
+                        // stalled laggard cannot pin releasable followers forever.
+                        match sq_mux_pump(
+                            &mut sq, &mut released, &mut nf, stream_count,
+                            &mut stream_eof, &mut nb_done, has_bsf, &mut stream_bsfs,
+                            &mut stream_pkt_templates, &mut st_rescale_delta_last,
+                            &mut st_last_dts, oformat_flags, &out_fmt_ctx,
+                            &mux_stream_nodes, &input_controller, &scheduler_status,
+                            &packet_pool,
+                        ) {
+                            Ok(true) => break,
+                            Ok(false) => continue,
+                            Err(e) => { ret = e; break; }
+                        }
+                    }
+                };
+
+                let pkt = packet_box.packet.as_ptr();
+                let raw_stream_index = unsafe { (*pkt).stream_index };
+
+                // Demux EOF signal (recording_time / streamcopy EOF): finish that
+                // stream in sq_mux so the cascade truncates its followers.
+                if raw_stream_index < 0 {
+                    let eof_stream = packet_box.packet_data.output_stream_index;
+                    packet_pool.release(packet_box.packet);
+                    if eof_stream >= 0 {
+                        if let Some(Some(sq_i)) =
+                            sq.sq_idx.get(eof_stream as usize).copied()
+                        {
+                            sq.queue.send(sq_i, None, None, fin_tb, 0);
+                        }
+                    }
+                    match sq_mux_pump(
+                        &mut sq, &mut released, &mut nf, stream_count,
+                        &mut stream_eof, &mut nb_done, has_bsf, &mut stream_bsfs,
+                        &mut stream_pkt_templates, &mut st_rescale_delta_last,
+                        &mut st_last_dts, oformat_flags, &out_fmt_ctx,
+                        &mux_stream_nodes, &input_controller, &scheduler_status,
+                        &packet_pool,
+                    ) {
+                        Ok(true) => break,
+                        Ok(false) => continue,
+                        Err(e) => { ret = e; break; }
+                    }
+                }
+
+                let stream_index = raw_stream_index as usize;
+                if stream_index >= mux_stream_nodes.len() {
+                    error!("Invalid stream_index: {} >= {}", stream_index, mux_stream_nodes.len());
+                    packet_pool.release(packet_box.packet);
+                    continue;
+                }
+
+                // Encoder EOF marker (null / empty packet): finish this stream in
+                // sq_mux, driving the cascade (mirrors the plain loop's marker).
+                let is_marker = unsafe {
+                    let has_side_data = (*pkt).side_data_elems > 0;
+                    packet_is_null(&packet_box.packet)
+                        || (packet_box.packet.is_empty() && !has_side_data)
+                };
+                if is_marker {
+                    if scheduler_status.load(Ordering::Acquire) == STATUS_ABORT {
+                        debug!("Muxer detected abort from stream {}, exiting without trailer", stream_index);
+                        packet_pool.release(packet_box.packet);
+                        break;
+                    }
+                    packet_pool.release(packet_box.packet);
+                    if !stream_eof[stream_index] {
+                        if let Some(Some(sq_i)) = sq.sq_idx.get(stream_index).copied() {
+                            sq.queue.send(sq_i, None, None, fin_tb, 0);
+                        }
+                    }
+                    match sq_mux_pump(
+                        &mut sq, &mut released, &mut nf, stream_count,
+                        &mut stream_eof, &mut nb_done, has_bsf, &mut stream_bsfs,
+                        &mut stream_pkt_templates, &mut st_rescale_delta_last,
+                        &mut st_last_dts, oformat_flags, &out_fmt_ctx,
+                        &mux_stream_nodes, &input_controller, &scheduler_status,
+                        &packet_pool,
+                    ) {
+                        Ok(true) => break,
+                        Ok(false) => continue,
+                        Err(e) => { ret = e; break; }
+                    }
+                }
+
+                unsafe {
+                    update_last_dts(&mux_stream_nodes[stream_index], &input_controller, &scheduler_status, pkt);
+                }
+
+                // Already truncated: drop further packets for this stream.
+                if stream_eof[stream_index] {
+                    packet_pool.release(packet_box.packet);
+                    continue;
+                }
+
+                // Resolve this stream's sq slot. A non-member (attachment) is not
+                // expected on the packet path; write it directly rather than drop.
+                let sq_i = match sq.sq_idx.get(stream_index).copied().flatten() {
+                    Some(i) => i,
+                    None => {
+                        let wret = unsafe {
+                            mux_write_released(
+                                &mut packet_box, has_bsf, &mut stream_bsfs,
+                                &mut stream_pkt_templates, &mut st_rescale_delta_last,
+                                &mut st_last_dts, oformat_flags, &out_fmt_ctx,
+                                &packet_pool,
+                            )
+                        };
+                        packet_pool.release(packet_box.packet);
+                        if wret == AVERROR_EOF { break; }
+                        if wret < 0 { ret = wret; error!("Error muxing a packet: stream_index={stream_index}, ret={wret}"); break; }
+                        continue;
+                    }
+                };
+
+                // Streamcopy timestamp fixup + recording_time, exactly as the
+                // plain path — before the packet enters sq_mux.
+                if packet_box.packet_data.is_copy {
+                    let started = &mut stream_started[stream_index];
+                    let rret = unsafe {
+                        streamcopy_rescale(
+                            packet_box.packet.as_mut_ptr(),
+                            &packet_box.packet_data,
+                            &start_time_us,
+                            &recording_time_us,
+                            started,
+                        )
+                    };
+                    if rret == AVERROR(EAGAIN) {
+                        packet_pool.release(packet_box.packet);
+                        continue;
+                    } else if rret == AVERROR_EOF {
+                        packet_pool.release(packet_box.packet);
+                        sq.queue.send(sq_i, None, None, fin_tb, 0);
+                        match sq_mux_pump(
+                            &mut sq, &mut released, &mut nf, stream_count,
+                            &mut stream_eof, &mut nb_done, has_bsf, &mut stream_bsfs,
+                            &mut stream_pkt_templates, &mut st_rescale_delta_last,
+                            &mut st_last_dts, oformat_flags, &out_fmt_ctx,
+                            &mux_stream_nodes, &input_controller, &scheduler_status,
+                            &packet_pool,
+                        ) {
+                            Ok(true) => break,
+                            Ok(false) => continue,
+                            Err(e) => { ret = e; break; }
+                        }
+                    }
+                }
+
+                // Feed the data packet; sq_mux holds / reorders / truncates it.
+                let (end_ts, tb, nb_samples) =
+                    unsafe { sq_pkt_end(packet_box.packet.as_ptr()) };
+                sq.queue.send(sq_i, Some(packet_box), end_ts, tb, nb_samples);
+                match sq_mux_pump(
+                    &mut sq, &mut released, &mut nf, stream_count,
+                    &mut stream_eof, &mut nb_done, has_bsf, &mut stream_bsfs,
+                    &mut stream_pkt_templates, &mut st_rescale_delta_last,
+                    &mut st_last_dts, oformat_flags, &out_fmt_ctx,
+                    &mux_stream_nodes, &input_controller, &scheduler_status,
+                    &packet_pool,
+                ) {
+                    Ok(true) => break,
+                    Ok(false) => {}
+                    Err(e) => { ret = e; break; }
+                }
+            }
+        } else {
 
         loop {
             let result = pkt_receiver.recv_timeout(Duration::from_millis(100));
@@ -627,6 +923,7 @@ fn _mux_init(
                 }
             }
         }
+        }
 
         if ret < 0 && ret != AVERROR_EOF {
             set_scheduler_error(
@@ -808,6 +1105,186 @@ unsafe fn write_packet(
         sq_packet_box.packet_data.output_stream_index;
 
     av_interleaved_write_frame(out_fmt_ctx.as_ptr(), sq_packet_box.packet.as_mut_ptr())
+}
+
+/// Write one packet the `sq_mux` released, via the per-stream BSF (or the direct
+/// path when the mux has none) — the same write the plain loop performs, just on
+/// an `sq_mux`-ordered packet. Snapshots the BSF template exactly like the plain
+/// path so an EOF flush stamps trailing packets correctly. Does NOT recycle the
+/// pool shell (the caller owns the released `PacketBox`).
+unsafe fn mux_write_released(
+    packet_box: &mut PacketBox,
+    has_bsf: bool,
+    stream_bsfs: &mut [Option<BitStreamFilter>],
+    stream_pkt_templates: &mut [Option<PacketData>],
+    st_rescale_delta_last: &mut [i64],
+    st_last_dts: &mut [i64],
+    oformat_flags: i32,
+    out_fmt_ctx: &FormatContext,
+    packet_pool: &ObjPool<Packet>,
+) -> i32 {
+    let stream_index = packet_box.packet_data.output_stream_index as usize;
+    if has_bsf {
+        if stream_bsfs
+            .get(stream_index)
+            .map_or(false, |b| b.is_some())
+        {
+            stream_pkt_templates[stream_index] = Some(packet_box.packet_data.clone());
+        }
+        mux_filter_and_write_packet(
+            st_rescale_delta_last,
+            oformat_flags,
+            st_last_dts,
+            out_fmt_ctx,
+            packet_box,
+            stream_bsfs[stream_index].as_mut(),
+            packet_pool,
+        )
+    } else {
+        write_packet(
+            st_rescale_delta_last,
+            oformat_flags,
+            st_last_dts,
+            out_fmt_ctx,
+            packet_box,
+        )
+    }
+}
+
+/// Finish one output stream in the mux worker: flush its trailing BSF packets,
+/// mark it EOF, count it toward `nb_done`, and publish `source_finished` so the
+/// demux stops producing this follower (Architecture Y'). Mirrors the plain
+/// loop's per-stream EOF handling; the `sq_mux` cascade is the single place that
+/// counts each stream once. Returns `Err(ret)` on a BSF flush error.
+unsafe fn sq_finish_output_stream(
+    ost: usize,
+    stream_count: usize,
+    stream_eof: &mut [bool],
+    nb_done: &mut usize,
+    has_bsf: bool,
+    stream_bsfs: &mut [Option<BitStreamFilter>],
+    stream_pkt_templates: &[Option<PacketData>],
+    st_rescale_delta_last: &mut [i64],
+    st_last_dts: &mut [i64],
+    oformat_flags: i32,
+    out_fmt_ctx: &FormatContext,
+    mux_stream_nodes: &[Arc<SchNode>],
+    input_controller: &Arc<InputController>,
+    scheduler_status: &Arc<AtomicUsize>,
+    packet_pool: &ObjPool<Packet>,
+) -> Result<(), i32> {
+    if ost >= stream_count || stream_eof[ost] {
+        return Ok(());
+    }
+    if has_bsf {
+        let fret = flush_stream_bsf(
+            st_rescale_delta_last,
+            oformat_flags,
+            st_last_dts,
+            out_fmt_ctx,
+            stream_bsfs,
+            stream_pkt_templates,
+            ost,
+            packet_pool,
+        );
+        if fret < 0 {
+            return Err(fret);
+        }
+    }
+    stream_eof[ost] = true;
+    *nb_done += 1;
+    if ost < mux_stream_nodes.len() {
+        if let SchNode::MuxStream { source_finished, .. } = mux_stream_nodes[ost].as_ref() {
+            source_finished.store(true, Ordering::Release);
+        }
+    }
+    input_controller.update_locked(scheduler_status);
+    Ok(())
+}
+
+/// After feeding `sq_mux`, write every releasable packet to the muxer, THEN apply
+/// any cascade-finishes — strictly in that order so a follower's in-bound packets
+/// are written before its finish drops the rest. This is the single place that
+/// writes `sq_mux` output and counts `nb_done` (each stream once, via the
+/// cascade). Returns `Ok(true)` when the muxer should stop (every stream done, or
+/// a write EOF), `Ok(false)` to keep going, or `Err(ret)` on a fatal write/BSF
+/// error.
+fn sq_mux_pump(
+    sq: &mut SqMux,
+    released: &mut Vec<PacketBox>,
+    nf: &mut Vec<usize>,
+    stream_count: usize,
+    stream_eof: &mut [bool],
+    nb_done: &mut usize,
+    has_bsf: bool,
+    stream_bsfs: &mut [Option<BitStreamFilter>],
+    stream_pkt_templates: &mut [Option<PacketData>],
+    st_rescale_delta_last: &mut [i64],
+    st_last_dts: &mut [i64],
+    oformat_flags: i32,
+    out_fmt_ctx: &FormatContext,
+    mux_stream_nodes: &[Arc<SchNode>],
+    input_controller: &Arc<InputController>,
+    scheduler_status: &Arc<AtomicUsize>,
+    packet_pool: &ObjPool<Packet>,
+) -> Result<bool, i32> {
+    // 1) Write everything releasable BEFORE any finish drops future packets.
+    released.clear();
+    sq.queue.drain_all_releasable(released);
+    for mut pb in released.drain(..) {
+        let wret = unsafe {
+            mux_write_released(
+                &mut pb,
+                has_bsf,
+                stream_bsfs,
+                stream_pkt_templates,
+                st_rescale_delta_last,
+                st_last_dts,
+                oformat_flags,
+                out_fmt_ctx,
+                packet_pool,
+            )
+        };
+        packet_pool.release(pb.packet);
+        if wret == AVERROR_EOF {
+            return Ok(true);
+        } else if wret < 0 {
+            return Err(wret);
+        }
+    }
+
+    // 2) Apply cascade-finishes (the single `nb_done` authority).
+    nf.clear();
+    sq.queue.newly_finished(nf);
+    for &sq_j in nf.iter() {
+        let ost = sq.ostream[sq_j];
+        unsafe {
+            sq_finish_output_stream(
+                ost,
+                stream_count,
+                stream_eof,
+                nb_done,
+                has_bsf,
+                stream_bsfs,
+                stream_pkt_templates,
+                st_rescale_delta_last,
+                st_last_dts,
+                oformat_flags,
+                out_fmt_ctx,
+                mux_stream_nodes,
+                input_controller,
+                scheduler_status,
+                packet_pool,
+            )?;
+        }
+    }
+
+    // Termination is over ALL `stream_count` streams, like the plain loop:
+    // members are counted here via the cascade, and any non-member (a header-only
+    // stream in `stream_count`, e.g. a mapped attachment-copy) is pre-finished at
+    // worker start (see the `sq_idx == None` pre-finish loop), so `nb_done` can
+    // always reach `stream_count`.
+    Ok(*nb_done == stream_count)
 }
 
 /// Build the per-output-stream BSF list, resolving each stream's chain by its
@@ -1253,5 +1730,23 @@ mod tests {
         );
         // Last thread released: STATUS_END published, but no error recorded.
         assert!(is_stopping(scheduler_status.load(Ordering::Acquire)));
+    }
+
+    // build_sq_mux wires the plan into the output-index <-> sq-index maps,
+    // leaving a None gap for a non-member (attachment) index.
+    #[test]
+    fn build_sq_mux_maps_members_with_attachment_gap() {
+        // Interleaved members at output indices 0, 1, 3; index 2 is a gap
+        // (e.g. an attachment), stream_count = 4.
+        let plan = SqMuxPlan {
+            buf_size_us: 5_000_000,
+            streams: vec![(0, true, None), (1, true, Some(7)), (3, true, None)],
+        };
+        let sq = build_sq_mux(plan, 4);
+
+        // output_stream_index -> sq_idx: members numbered in plan order; gap None.
+        assert_eq!(sq.sq_idx, vec![Some(0), Some(1), None, Some(2)]);
+        // sq_idx -> output_stream_index (reverse map used by the cascade).
+        assert_eq!(sq.ostream, vec![0, 1, 3]);
     }
 }

@@ -26,7 +26,7 @@ use ffmpeg_sys_next::{
 };
 use libc::{c_int, c_uint};
 use log::{debug, error, info, warn};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use crate::core::scheduler::input_controller::SchNode;
 use crate::util::ffmpeg_utils::av_err2str;
@@ -102,6 +102,15 @@ pub(crate) fn demux_init(
             demux_parameter.wallclock_start = unsafe { av_gettime_relative() };
 
             loop {
+                // Architecture Y': stop any `-shortest` follower the muxer's
+                // `sq_mux` has cascade-finished, before blocking on the next
+                // read. Runs every iteration so a live/sparse follower is
+                // retired on the next packet from any stream.
+                if demux_check_source_finished(&mut demux_parameter) {
+                    debug!("All consumers done (shortest follower cascade); finishing.");
+                    break;
+                }
+
                 let mut send_flags = 0usize;
                 let mut packet = match packet_pool.get() {
                     Ok(packet) => packet,
@@ -904,6 +913,17 @@ struct DemuxerParameter {
     nb_streams_used: usize,
     /// Streams whose consumers have all finished (ffmpeg_demux.c:525).
     nb_streams_finished: usize,
+
+    /// Parallel to `dsts`: a `-shortest` streamcopy destination's mux
+    /// `source_finished` flag (Architecture Y'), or `None`. When set by the mux
+    /// (its `sq_mux` cascade-finished this follower), the demux retires that
+    /// destination — reusing the exact per-dst `dsts_finished` accounting the
+    /// channel-disconnect path uses, so even a live/unbounded follower stops.
+    dst_source_finished: Vec<Option<Arc<AtomicBool>>>,
+    /// `true` iff any `dst_source_finished` is `Some`; the loop-top scan
+    /// early-outs on this so the common (non-shortest) path pays a single bool
+    /// test per iteration.
+    has_source_finished_dsts: bool,
 }
 
 // SAFETY: all raw pointers live in DemuxStreamParameter (see its SAFETY
@@ -914,6 +934,9 @@ impl DemuxerParameter {
     fn new(demux: &mut Demuxer) -> Self {
         let dsts = demux.take_dsts();
         let dsts_finished = vec![false; dsts.len()];
+        let dst_source_finished = demux.take_dst_source_finished();
+        debug_assert_eq!(dst_source_finished.len(), dsts.len());
+        let has_source_finished_dsts = dst_source_finished.iter().any(|x| x.is_some());
 
         let nb_streams = unsafe { (*demux.in_fmt_ctx_ptr()).nb_streams } as usize;
         let mut demux_streams: Vec<DemuxStreamParameter> = Vec::with_capacity(nb_streams);
@@ -976,6 +999,74 @@ impl DemuxerParameter {
             per_stream_dsts,
             nb_streams_used,
             nb_streams_finished: 0,
+            dst_source_finished,
+            has_source_finished_dsts,
+        }
+    }
+}
+
+/// Architecture Y': retire any `-shortest` streamcopy follower whose muxer has
+/// cascade-finished it (`source_finished` is set). Reuses the exact
+/// per-destination `dsts_finished` + `nb_streams_finished` accounting the
+/// channel-disconnect path uses (`demux_send_for_stream`), so the stop is
+/// per-destination — a second output copying the same input stream (its own
+/// `dsts` entry, `None` flag) is untouched. Called once per demux-loop
+/// iteration, so a sparse or blocked follower is stopped on the next read from
+/// ANY stream — the same bound `recording_time` already ships. Returns `true`
+/// when every used stream is finished and the demuxer must exit.
+fn demux_check_source_finished(dp: &mut DemuxerParameter) -> bool {
+    if !dp.has_source_finished_dsts {
+        return false;
+    }
+    // `Vec::new()` does not allocate until the first push, so a scan that retires
+    // nothing (the common tick) stays alloc-free.
+    let mut finished_streams = Vec::new();
+    scan_source_finished_dsts(
+        &dp.dst_source_finished,
+        &dp.dsts,
+        &dp.per_stream_dsts,
+        &mut dp.dsts_finished,
+        &mut finished_streams,
+    );
+    for s in finished_streams {
+        let ds = &mut dp.demux_streams[s];
+        if !ds.finished {
+            ds.finished = true;
+            dp.nb_streams_finished += 1;
+        }
+    }
+    dp.nb_streams_finished == dp.nb_streams_used
+}
+
+/// Pure core of [`demux_check_source_finished`] (unit-testable, no FFI): retire
+/// every destination whose `source_finished` flag is set, and record each input
+/// stream that thereby became fully finished (all its destinations done), each at
+/// most once per scan. Mirrors the per-dst / per-stream accounting of
+/// `demux_send_for_stream` (a stream finishes only when `nb_done == dst_count`),
+/// so it is inherently per-destination — a second output copying the same input
+/// stream (its own `dsts` entry with a `None` flag) is never touched.
+fn scan_source_finished_dsts(
+    dst_source_finished: &[Option<Arc<AtomicBool>>],
+    dsts: &[(Sender<PacketBox>, usize, Option<usize>)],
+    per_stream_dsts: &[Vec<usize>],
+    dsts_finished: &mut [bool],
+    finished_streams: &mut Vec<usize>,
+) {
+    for dst_i in 0..dst_source_finished.len() {
+        let Some(flag) = &dst_source_finished[dst_i] else {
+            continue;
+        };
+        if dsts_finished[dst_i] || !flag.load(Ordering::Acquire) {
+            continue;
+        }
+        // Retire this destination exactly like the disconnect path.
+        dsts_finished[dst_i] = true;
+        let in_stream = dsts[dst_i].1;
+        if per_stream_dsts[in_stream]
+            .iter()
+            .all(|&di| dsts_finished[di])
+        {
+            finished_streams.push(in_stream);
         }
     }
 }
@@ -1618,5 +1709,83 @@ mod tests {
         // avg_frame_rate.num == 0: falls back to 0
         let dts = compute_initial_dts(1, AVRational { num: 0, den: 1 });
         assert_eq!(dts, 0);
+    }
+
+    // Architecture Y' scan: a `-shortest` follower's `source_finished` retires
+    // only ITS destination (per-destination), and its input stream finishes only
+    // when every one of that stream's destinations is done.
+    #[test]
+    fn source_finished_scan_is_per_destination() {
+        use super::scan_source_finished_dsts;
+        use crate::core::context::PacketBox;
+        use crossbeam_channel::{bounded, Sender};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let sender = || -> Sender<PacketBox> { bounded::<PacketBox>(1).0 };
+
+        // Input stream 0 -> dst0 (shortest, flagged) AND dst1 (plain, no flag).
+        // Input stream 1 -> dst2 (shortest, flagged).
+        let f0 = Arc::new(AtomicBool::new(false));
+        let f2 = Arc::new(AtomicBool::new(false));
+        let dst_source_finished: Vec<Option<Arc<AtomicBool>>> =
+            vec![Some(f0.clone()), None, Some(f2.clone())];
+        let dsts: Vec<(Sender<PacketBox>, usize, Option<usize>)> =
+            vec![(sender(), 0, Some(0)), (sender(), 0, Some(1)), (sender(), 1, Some(2))];
+        let per_stream_dsts: Vec<Vec<usize>> = vec![vec![0, 1], vec![2]];
+        let mut dsts_finished = vec![false; 3];
+
+        // Nothing signalled: no-op.
+        let mut finished = Vec::new();
+        scan_source_finished_dsts(&dst_source_finished, &dsts, &per_stream_dsts, &mut dsts_finished, &mut finished);
+        assert!(finished.is_empty());
+        assert_eq!(dsts_finished, vec![false, false, false]);
+
+        // Flag stream 0's follower: only dst0 retires; the plain co-copy (dst1)
+        // stays live, so stream 0 is NOT finished (per-destination isolation).
+        f0.store(true, Ordering::Release);
+        let mut finished = Vec::new();
+        scan_source_finished_dsts(&dst_source_finished, &dsts, &per_stream_dsts, &mut dsts_finished, &mut finished);
+        assert!(finished.is_empty(), "co-copy still live -> stream 0 not finished");
+        assert_eq!(dsts_finished, vec![true, false, false]);
+
+        // Flag stream 1's follower: its sole dst retires -> stream 1 finishes.
+        f2.store(true, Ordering::Release);
+        let mut finished = Vec::new();
+        scan_source_finished_dsts(&dst_source_finished, &dsts, &per_stream_dsts, &mut dsts_finished, &mut finished);
+        assert_eq!(finished, vec![1]);
+        assert_eq!(dsts_finished, vec![true, false, true]);
+    }
+
+    // Two followers on the SAME input stream both flip in one scan: the stream is
+    // reported finished exactly once (not once per destination).
+    #[test]
+    fn source_finished_scan_reports_stream_once() {
+        use super::scan_source_finished_dsts;
+        use crate::core::context::PacketBox;
+        use crossbeam_channel::{bounded, Sender};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let sender = || -> Sender<PacketBox> { bounded::<PacketBox>(1).0 };
+
+        // Input stream 0 -> dst0, dst1 (two shortest outputs), both flagged.
+        let fa = Arc::new(AtomicBool::new(true));
+        let fb = Arc::new(AtomicBool::new(true));
+        let dst_source_finished = vec![Some(fa), Some(fb)];
+        let dsts: Vec<(Sender<PacketBox>, usize, Option<usize>)> =
+            vec![(sender(), 0, Some(0)), (sender(), 0, Some(1))];
+        let per_stream_dsts: Vec<Vec<usize>> = vec![vec![0, 1]];
+        let mut dsts_finished = vec![false; 2];
+
+        let mut finished = Vec::new();
+        scan_source_finished_dsts(&dst_source_finished, &dsts, &per_stream_dsts, &mut dsts_finished, &mut finished);
+        assert_eq!(finished, vec![0], "stream 0 finished once, not per-dst");
+        assert_eq!(dsts_finished, vec![true, true]);
+
+        // A second scan reports nothing (both dsts already retired).
+        let mut finished = Vec::new();
+        scan_source_finished_dsts(&dst_source_finished, &dsts, &per_stream_dsts, &mut dsts_finished, &mut finished);
+        assert!(finished.is_empty());
     }
 }

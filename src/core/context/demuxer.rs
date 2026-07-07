@@ -19,6 +19,7 @@ use log::{debug, error, warn};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::ptr::{null, null_mut};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 pub(crate) struct Demuxer {
@@ -69,6 +70,11 @@ pub(crate) struct Demuxer {
     pub(crate) node: Arc<SchNode>,
     streams: Vec<DecoderStream>,
     dsts: Vec<(Sender<PacketBox>, usize, Option<usize>)>,
+    /// Parallel to `dsts`: for a `-shortest` streamcopy destination, the mux
+    /// stream's `source_finished` flag (`SchNode::MuxStream`), so the demux can
+    /// stop producing a follower the muxer's `sq_mux` has cascade-finished
+    /// (Architecture Y'). `None` for every non-shortest / non-copy destination.
+    dst_source_finished: Vec<Option<Arc<AtomicBool>>>,
 }
 
 // SAFETY: Demuxer can be sent to another thread. The raw FFmpeg pointers are only
@@ -155,6 +161,7 @@ impl Demuxer {
             node: Arc::new(SchNode::Demux { waiter: Arc::new(Default::default()), task_exited: Arc::new(Default::default()) }),
             streams,
             dsts: vec![],
+            dst_source_finished: vec![],
             start_time_effective: 0,
         })
     }
@@ -263,9 +270,13 @@ impl Demuxer {
         packet_dst: Sender<PacketBox>,
         input_stream_index: usize,
         output_stream_index: usize,
+        source_finished: Option<Arc<AtomicBool>>,
     ) {
         self.dsts
             .push((packet_dst, input_stream_index, Some(output_stream_index)));
+        // Kept strictly in lockstep with `dsts` so `dst_source_finished[i]`
+        // always describes `dsts[i]`.
+        self.dst_source_finished.push(source_finished);
     }
 
     pub(crate) fn get_streams(&self) -> &Vec<DecoderStream> {
@@ -290,11 +301,17 @@ impl Demuxer {
         }
         let (sender, receiver) = crossbeam_channel::bounded(8);
         self.dsts.push((sender, index, None));
+        // A decoded (non-copy) destination is never an `sq_mux` follower.
+        self.dst_source_finished.push(None);
         self.streams[index].set_src(receiver);
     }
 
     pub(crate) fn take_dsts(&mut self) -> Vec<(Sender<PacketBox>, usize, Option<usize>)> {
         std::mem::take(&mut self.dsts)
+    }
+
+    pub(crate) fn take_dst_source_finished(&mut self) -> Vec<Option<Arc<AtomicBool>>> {
+        std::mem::take(&mut self.dst_source_finished)
     }
 
     pub(crate) fn destination_is_empty(&mut self) -> bool {

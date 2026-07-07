@@ -1,9 +1,27 @@
-use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Condvar, Mutex};
 use crate::core::context::output::VSyncMethod;
 use crate::core::context::pre_mux_queue::PreMuxQueueSender;
 use crate::core::context::{FrameBox, PacketBox, Stream};
+use crate::core::scheduler::sync_queue::SyncQueue;
 use crossbeam_channel::{Receiver, Sender};
 use ffmpeg_sys_next::{AVCodec, AVMediaType, AVStream};
+
+/// `-shortest` frame-level sync-queue handle for one encoded-A/V stream.
+///
+/// The `queue` + `sq_finished` `Arc`s are **shared** across a mux's encoder
+/// threads (all encoded-A/V members point at the same `sq_enc`); `sq_idx` is this
+/// stream's own slot. The paired `Condvar` wakes drain-phase encoders when any
+/// peer advances the queue head (see `enc_task` Architecture B).
+#[derive(Clone)]
+pub(crate) struct EncSyncHandle {
+    pub(crate) queue: Arc<(Mutex<SyncQueue<FrameBox>>, Condvar)>,
+    /// This stream's slot in `sq_enc` (from `SyncQueue::add_stream`).
+    pub(crate) sq_idx: usize,
+    /// One flag per `sq_enc` stream; set when the engine cascade-finishes that
+    /// stream, so a truncated encoder observes it and enters its drain phase.
+    pub(crate) sq_finished: Arc<[AtomicBool]>,
+}
 
 /// fftools: `OutputStream` + `MuxStream` (ffmpeg.h / ffmpeg_mux.h).
 #[derive(Clone)]
@@ -21,6 +39,9 @@ pub(crate) struct EncoderStream {
     dst: Option<Sender<PacketBox>>,
     dst_pre: Option<PreMuxQueueSender>,
     mux_start_gate: Option<Arc<crate::core::context::MuxStartGate>>,
+    /// `-shortest` sync-queue handle; `None` unless the mux built `sq_enc` and this
+    /// stream is an encoded-A/V member. Set by the scheduler before `enc_init`.
+    sync_queue: Option<EncSyncHandle>,
 }
 
 impl EncoderStream {
@@ -49,7 +70,18 @@ impl EncoderStream {
             dst: Some(dst),
             dst_pre: Some(dst_pre),
             mux_start_gate: Some(mux_start_gate),
+            sync_queue: None,
         }
+    }
+
+    /// Attach this stream's `-shortest` sync-queue handle (scheduler, before `enc_init`).
+    pub(crate) fn set_sync_queue(&mut self, handle: EncSyncHandle) {
+        self.sync_queue = Some(handle);
+    }
+
+    /// Take the `-shortest` handle for the encoder thread (`None` when not participating).
+    pub(crate) fn take_sync_queue(&mut self) -> Option<EncSyncHandle> {
+        self.sync_queue.take()
     }
 
     pub(crate) fn take_src(&mut self) -> Receiver<FrameBox> {
