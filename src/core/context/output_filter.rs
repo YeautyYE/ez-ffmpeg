@@ -83,6 +83,16 @@ pub(crate) struct OutputFilterOptions {
     pub(crate) trim_duration_us: Option<i64>,
     pub(crate) ts_offset: Option<i64>,
     pub(crate) flags: u32,
+
+    /// Per-output request for the graph-level sws options of the auto-inserted
+    /// `scale` filters. Copied from `Output::set_sws_opts` via the muxer. Used
+    /// only when the graph itself (an explicit `FilterComplex`) did not set one;
+    /// see `filter_task::configure_filtergraph`. Default `None`.
+    pub(crate) sws_opts: Option<String>,
+
+    /// Per-output request for the graph-level swr options of the auto-inserted
+    /// `aresample` filters. See [`sws_opts`](Self::sws_opts). Default `None`.
+    pub(crate) swr_opts: Option<String>,
 }
 // SAFETY: enc points at FFmpeg's static codec registry (read-only,
 // process lifetime); everything else is owned data. Sync is intentionally
@@ -121,6 +131,8 @@ impl OutputFilterOptions {
             trim_duration_us: None,
             ts_offset: None,
             flags: 0,
+            sws_opts: None,
+            swr_opts: None,
         }
     }
 }

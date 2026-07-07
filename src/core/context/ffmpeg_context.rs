@@ -995,6 +995,12 @@ fn configure_output_filter_opts(
         output_filter.opts.trim_start_us = mux.start_time_us;
         output_filter.opts.trim_duration_us = mux.recording_time_us;
         output_filter.opts.ts_offset = mux.start_time_us;
+        // NEW-SC-03: carry this output's auto-conversion tuning to the output
+        // filter opts. filter_task::configure_filtergraph resolves the graph
+        // level value (scale_sws_opts / aresample_swr_opts) from these when the
+        // graph itself has none.
+        output_filter.opts.sws_opts = mux.sws_opts.clone();
+        output_filter.opts.swr_opts = mux.swr_opts.clone();
 
         output_filter.opts.flags = OFILTER_FLAG_DISABLE_CONVERT
             | OFILTER_FLAG_AUTOSCALE
@@ -1724,7 +1730,12 @@ fn init_simple_filtergraph(
     } else {
         "anull"
     };
-    let mut filter_graph = init_filter_graph(filter_graphs.len(), filter_desc, None)?;
+    // Implicit per-output graph: no explicit FilterComplex, so there is no
+    // graph-level sws/swr value here. The per-output request (Output::set_sws_opts
+    // / set_swr_opts) flows in through the bound OutputFilterOptions instead and
+    // is resolved in filter_task::configure_filtergraph.
+    let mut filter_graph =
+        init_filter_graph(filter_graphs.len(), filter_desc, None, None, None)?;
 
     // filter_graph.inputs[0].media_type = codec_type;
     // filter_graph.outputs[0].media_type = codec_type;
@@ -2322,6 +2333,8 @@ unsafe fn open_output_file(
             max_packets: output.max_muxing_queue_size,
             data_threshold: output.muxing_queue_data_threshold,
         },
+        output.sws_opts.clone(),
+        output.swr_opts.clone(),
     );
 
     Ok(mux)
@@ -2935,7 +2948,13 @@ fn strtol(input: &str) -> Result<(i64, &str)> {
 fn init_filter_graphs(filter_complexs: Vec<FilterComplex>) -> Result<Vec<FilterGraph>> {
     let mut filter_graphs = Vec::with_capacity(filter_complexs.len());
     for (i, filter) in filter_complexs.iter().enumerate() {
-        let filter_graph = init_filter_graph(i, &filter.filter_descs, filter.hw_device.clone())?;
+        let filter_graph = init_filter_graph(
+            i,
+            &filter.filter_descs,
+            filter.hw_device.clone(),
+            filter.sws_opts.clone(),
+            filter.swr_opts.clone(),
+        )?;
         filter_graphs.push(filter_graph);
     }
     Ok(filter_graphs)
@@ -2946,6 +2965,8 @@ fn init_filter_graph(
     fg_index: usize,
     filter_desc: &str,
     hw_device: Option<String>,
+    sws_opts: Option<String>,
+    swr_opts: Option<String>,
 ) -> Result<FilterGraph> {
     Err(Error::Bug)
 }
@@ -2955,6 +2976,8 @@ fn init_filter_graph(
     fg_index: usize,
     filter_desc: &str,
     hw_device: Option<String>,
+    sws_opts: Option<String>,
+    swr_opts: Option<String>,
 ) -> Result<FilterGraph> {
     let desc_cstr = CString::new(filter_desc)?;
 
@@ -3047,6 +3070,8 @@ fn init_filter_graph(
             filter_desc.to_string(),
             input_filters,
             output_filters,
+            sws_opts,
+            swr_opts,
         );
 
         Ok(filter_graph)
@@ -3944,7 +3969,7 @@ mod tests {
     }
 
     fn test_graph(inputs: Vec<InputFilter>, outputs: Vec<OutputFilter>) -> FilterGraph {
-        FilterGraph::new("null".to_string(), inputs, outputs)
+        FilterGraph::new("null".to_string(), inputs, outputs, None, None)
     }
 
     #[test]
