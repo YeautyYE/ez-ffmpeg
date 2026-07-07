@@ -1,5 +1,8 @@
 use crate::core::context::encoder_stream::EncoderStream;
 use crate::core::context::output::{StreamMap, VSyncMethod};
+use crate::core::context::pre_mux_queue::{
+    self, PreMuxQueueConfig, PreMuxQueueReceiver,
+};
 use crate::core::context::{FrameBox, PacketBox};
 use crate::core::filter::frame_pipeline::FramePipeline;
 use crate::core::scheduler::input_controller::SchNode;
@@ -137,7 +140,8 @@ pub(crate) struct Muxer {
 
     streams: Vec<EncoderStream>,
     queue: Option<(Sender<PacketBox>, Receiver<PacketBox>)>,
-    src_pre_receivers: Vec<Receiver<PacketBox>>,
+    src_pre_receivers: Vec<PreMuxQueueReceiver>,
+    pre_mux_queue_config: PreMuxQueueConfig,
     mux_start_gate: Arc<crate::core::context::MuxStartGate>,
 
     // Join handles of this muxer's encoder threads, delivered by enc_init.
@@ -213,6 +217,7 @@ impl Muxer {
         subtitle_disable: bool,
         data_disable: bool,
         pix_fmt: Option<ffmpeg_sys_next::AVPixelFormat>,
+        pre_mux_queue_config: PreMuxQueueConfig,
     ) -> Self {
         // Read oformat flags via the pointer BEFORE moving `out_fmt_ctx` into the
         // struct (the field can no longer be the access path once it's moved).
@@ -250,6 +255,7 @@ impl Muxer {
             streams: vec![],
             queue: None,
             src_pre_receivers: vec![],
+            pre_mux_queue_config,
             mux_start_gate: Arc::new(crate::core::context::MuxStartGate::new()),
             enc_handles: crossbeam_channel::unbounded(),
             nb_streams: 0,
@@ -327,16 +333,20 @@ impl Muxer {
         };
 
         // Pre-mux buffer: packets an encoder produces before the muxer opens
-        // (it waits until every output stream has emitted a first packet). This
-        // bound doubles as the demux read-ahead window before backpressure
-        // stalls the demuxer: with a single input, a fast video/audio encoder
-        // fills this queue, blocks, and back-pressures the demuxer — which then
-        // cannot read far enough to reach a sparse subtitle/data stream's first
-        // packet and open its encoder, so the muxer never starts. A large bound
-        // keeps that window wide enough to tolerate such files, so it must NOT
-        // be lowered until the deferred byte-metered, demux-progress-aware
-        // pre-mux queue exists (PERF-12; see artifacts/agent-design-perf12.log).
-        let (pre_packet_sender, pre_packet_receiver) = crossbeam_channel::bounded(65536);
+        // (it waits until every output stream has emitted a first packet).
+        // Byte-metered with FFmpeg's max_muxing_queue_size /
+        // muxing_queue_data_threshold semantics (PERF-12): below the byte
+        // threshold the packet cap does not apply, so sparse small-packet
+        // streams keep parking, while high-bitrate streams are bounded by
+        // bytes instead of the old blind 65536-packet window that could park
+        // gigabytes. The bound still doubles as the demux read-ahead window
+        // before backpressure stalls the demuxer; a job that needs a larger
+        // window (e.g. a sparse subtitle stream whose first packet lands deep
+        // into a high-bitrate file) parks ~60s and then fails with an error
+        // naming the Output knobs that raise it — the same remedy FFmpeg CLI
+        // prescribes for "Too many packets buffered for output stream".
+        let (pre_packet_sender, pre_packet_receiver) =
+            pre_mux_queue::channel(self.pre_mux_queue_config);
         self.src_pre_receivers.push(pre_packet_receiver);
 
         let stream = EncoderStream::new(
@@ -408,7 +418,7 @@ impl Muxer {
         self.queue.take()
     }
 
-    pub(crate) fn take_src_pre_recvs(&mut self) -> Vec<Receiver<PacketBox>> {
+    pub(crate) fn take_src_pre_recvs(&mut self) -> Vec<PreMuxQueueReceiver> {
         std::mem::take(&mut self.src_pre_receivers)
     }
 

@@ -1,5 +1,6 @@
 use crate::core::context::encoder_stream::EncoderStream;
 use crate::core::context::obj_pool::ObjPool;
+use crate::core::context::pre_mux_queue::{packet_payload_size, PreMuxQueueSender};
 use crate::core::context::{CodecContext, FrameBox, PacketBox, PacketData};
 use crate::error::Error::{Encoding, OpenEncoder};
 use crate::error::{AllocPacketError, EncodeSubtitleError, EncodingError, EncodingOperationError, OpenEncoderError, OpenEncoderOperationError, OpenOutputError};
@@ -36,8 +37,7 @@ use std::ffi::{CStr, CString};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(docsrs)]
 pub(crate) fn enc_init(
@@ -1202,7 +1202,7 @@ fn frame_encode(
     start_time_us: Option<i64>,
     recording_time_us: Option<i64>,
     pkt_sender: &Sender<PacketBox>,
-    pre_pkt_sender: &Sender<PacketBox>,
+    pre_pkt_sender: &PreMuxQueueSender,
     mux_start_gate: &Arc<crate::core::context::MuxStartGate>,
     stream: *mut AVStream,
     packet_pool: &ObjPool<Packet>,
@@ -1267,7 +1267,7 @@ unsafe fn do_subtitle_out(
     start_time_us: Option<i64>,
     recording_time_us: Option<i64>,
     pkt_sender: &Sender<PacketBox>,
-    pre_pkt_sender: &Sender<PacketBox>,
+    pre_pkt_sender: &PreMuxQueueSender,
     mux_start_gate: &Arc<crate::core::context::MuxStartGate>,
     stream: *mut AVStream,
 ) -> crate::error::Result<EncodeStatus> {
@@ -1385,7 +1385,7 @@ unsafe fn encode_frame(
     enc_ctx: *mut AVCodecContext,
     frame: *mut AVFrame,
     pkt_sender: &Sender<PacketBox>,
-    pre_pkt_sender: &Sender<PacketBox>,
+    pre_pkt_sender: &PreMuxQueueSender,
     mux_start_gate: &Arc<crate::core::context::MuxStartGate>,
     stream: *mut AVStream,
     packet_pool: &ObjPool<Packet>,
@@ -1452,7 +1452,7 @@ unsafe fn encode_frame(
 fn send_to_mux(
     packet_box: PacketBox,
     pkt_sender: &Sender<PacketBox>,
-    pre_pkt_sender: &Sender<PacketBox>,
+    pre_pkt_sender: &PreMuxQueueSender,
     mux_start_gate: &Arc<crate::core::context::MuxStartGate>,
 ) -> Result<(), SendError<PacketBox>> {
     use crate::core::context::PreSendOutcome;
@@ -1461,38 +1461,53 @@ fn send_to_mux(
         return pkt_sender.send(packet_box);
     }
 
-    // The gate serializes "started?" with the pre-queue send: without it a
+    // The gate serializes "started?" with pre-queue admission: without it a
     // packet parked between the muxer's drain and its gate flip would never
     // be delivered.
     //
-    // Termination is driven by Disconnected, not the tick cap: on stop or a
-    // mux-init failure the muxer drops the pre-queue receiver, so send_pre
-    // promptly returns Disconnected and this returns Err (handled as
-    // MuxerFinished, not a job failure). The tick cap is only a backstop
-    // against a muxer that never starts and is never stopped. It is generous
-    // (PRE_MUX_BACKPRESSURE_MAX_TICKS × 10ms) precisely because a valid job can
-    // legitimately be slow to open the muxer — e.g. a sparse subtitle/data
-    // stream whose first packet lands seconds in — and the old 6.4s cap failed
-    // such jobs (PERF-12).
+    // A full pre-queue parks on the queue condvar (PERF-12; replaces the old
+    // 10ms sleep ticks) and re-runs the gated send_pre — the authoritative
+    // admission / gate-started / disconnected check — after every wake.
+    // Wakes come from the mux-start drain and from the receiver dropping
+    // (stop or mux-init failure promptly resolves Disconnected, handled as
+    // MuxerFinished, not a job failure); the bounded wait slice is only a
+    // lost-notify safety net. The deadline guards a muxer that never starts
+    // and is never stopped — e.g. a single-input job where this very
+    // backpressure keeps the demuxer from ever reaching a sparse stream's
+    // first packet, so no drain can ever come. FFmpeg fails such jobs
+    // immediately ("Too many packets buffered for output stream"); parking
+    // ~60s first keeps multi-input slow starts (a second input taking
+    // seconds to open) succeeding, then fails with the same remedy.
     let mut packet_box = packet_box;
-    for _ in 0..PRE_MUX_BACKPRESSURE_MAX_TICKS {
+    let deadline = Instant::now() + PRE_MUX_FULL_BACKSTOP;
+    loop {
         packet_box = match mux_start_gate.send_pre(pre_pkt_sender, packet_box) {
             PreSendOutcome::Sent => return Ok(()),
             PreSendOutcome::Started(pb) => return pkt_sender.send(pb),
-            PreSendOutcome::Full(pb) => {
-                // Pre-queue full: wait for the muxer to start and drain it.
-                sleep(Duration::from_millis(10));
-                pb
-            }
+            PreSendOutcome::Full(pb) => pb,
             PreSendOutcome::Disconnected(pb) => return Err(SendError(pb)),
         };
+        if Instant::now() >= deadline {
+            error!(
+                "pre-mux queue stayed full for {}s before the muxer started; raise \
+                 Output::set_max_muxing_queue_size / set_muxing_queue_data_threshold, \
+                 or check that every mapped output stream receives data",
+                PRE_MUX_FULL_BACKSTOP.as_secs()
+            );
+            return Err(SendError(packet_box));
+        }
+        let size = packet_payload_size(&packet_box);
+        pre_pkt_sender.wait_for_space(size, PRE_MUX_FULL_WAIT_SLICE);
     }
-    Err(SendError(packet_box))
 }
 
-/// Backstop for pre-mux backpressure: at 10ms/tick this is ~60s of waiting for
-/// the muxer to open before an encoder gives up. Termination normally comes
-/// from the pre-queue receiver disconnecting (stop / mux-init failure) long
-/// before this; the cap only guards a muxer that never starts and is never
-/// stopped.
-const PRE_MUX_BACKPRESSURE_MAX_TICKS: u32 = 6000;
+/// How long an encoder parks on a full pre-mux queue waiting for the muxer to
+/// open before giving up. Termination normally comes from the pre-queue
+/// receiver disconnecting (stop / mux-init failure) long before this; the
+/// deadline only guards a muxer that never starts and is never stopped.
+const PRE_MUX_FULL_BACKSTOP: Duration = Duration::from_secs(60);
+
+/// Upper bound on one condvar wait while parked on a full pre-mux queue.
+/// Purely a lost-notify safety net (mirrors the conc-06 pause gate); real
+/// wakes come from the drain and from receiver drop.
+const PRE_MUX_FULL_WAIT_SLICE: Duration = Duration::from_millis(200);

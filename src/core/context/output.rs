@@ -58,6 +58,17 @@ pub struct Output {
     /// (64 KiB). Set via [`Output::set_io_buffer_size`].
     pub(crate) io_buffer_size: usize,
 
+    /// FFmpeg `-max_muxing_queue_size` parity: per-stream packet cap for the
+    /// pre-mux queue, applied only once
+    /// [`muxing_queue_data_threshold`](Output::set_muxing_queue_data_threshold)
+    /// is exceeded. Default 128. Set via [`Output::set_max_muxing_queue_size`].
+    pub(crate) max_muxing_queue_size: usize,
+
+    /// FFmpeg `-muxing_queue_data_threshold` parity: parked payload bytes per
+    /// stream below which the packet cap does not apply. Default 50 MiB. Set
+    /// via [`Output::set_muxing_queue_data_threshold`].
+    pub(crate) muxing_queue_data_threshold: usize,
+
     /// A callback function for custom seeking within the output stream.
     ///
     /// The `seek_callback` function allows custom logic for adjusting the write position in
@@ -435,6 +446,44 @@ impl Output {
             "io_buffer_size must be in 1..=i32::MAX, got {size}"
         );
         self.io_buffer_size = size;
+        self
+    }
+
+    /// Sets the per-stream packet cap of the pre-mux queue (FFmpeg
+    /// `-max_muxing_queue_size` parity; default 128).
+    ///
+    /// Until the muxer starts (it waits for every mapped output stream to
+    /// become ready), each encoder parks its packets in a per-stream queue.
+    /// The cap only applies once the queue's byte threshold
+    /// ([`set_muxing_queue_data_threshold`](Output::set_muxing_queue_data_threshold))
+    /// is exceeded — below it, packet count is unlimited. Raise this (or the
+    /// byte threshold) if a job fails with a pre-mux backpressure error, e.g.
+    /// a sparse subtitle stream whose first packet lands deep into a
+    /// high-bitrate file.
+    ///
+    /// # Panics
+    /// Panics if `size` is 0.
+    pub fn set_max_muxing_queue_size(mut self, size: usize) -> Self {
+        assert!(size > 0, "max_muxing_queue_size must be > 0");
+        self.max_muxing_queue_size = size;
+        self
+    }
+
+    /// Sets the per-stream byte threshold below which the pre-mux queue's
+    /// packet cap does not apply (FFmpeg `-muxing_queue_data_threshold`
+    /// parity; default 50 MiB).
+    ///
+    /// This bounds the memory a fast encoder can park before the muxer
+    /// starts, and doubles as the demux read-ahead window: jobs that must
+    /// read further ahead (late first packet on one mapped stream) need a
+    /// larger threshold. See
+    /// [`set_max_muxing_queue_size`](Output::set_max_muxing_queue_size).
+    ///
+    /// # Panics
+    /// Panics if `bytes` is 0.
+    pub fn set_muxing_queue_data_threshold(mut self, bytes: usize) -> Self {
+        assert!(bytes > 0, "muxing_queue_data_threshold must be > 0");
+        self.muxing_queue_data_threshold = bytes;
         self
     }
 
@@ -1797,6 +1846,10 @@ impl From<Box<dyn FnMut(&[u8]) -> i32 + Send>> for Output {
             url: None,
             write_callback: Some(write_callback_and_format),
             io_buffer_size: crate::core::context::DEFAULT_CUSTOM_IO_BUFFER_SIZE,
+            max_muxing_queue_size:
+                crate::core::context::pre_mux_queue::DEFAULT_PRE_MUX_MAX_PACKETS,
+            muxing_queue_data_threshold:
+                crate::core::context::pre_mux_queue::DEFAULT_PRE_MUX_DATA_THRESHOLD,
             seek_callback: None,
             frame_pipelines: None,
             stream_map_specs: vec![],
@@ -1847,6 +1900,10 @@ impl From<String> for Output {
             url: Some(url),
             write_callback: None,
             io_buffer_size: crate::core::context::DEFAULT_CUSTOM_IO_BUFFER_SIZE,
+            max_muxing_queue_size:
+                crate::core::context::pre_mux_queue::DEFAULT_PRE_MUX_MAX_PACKETS,
+            muxing_queue_data_threshold:
+                crate::core::context::pre_mux_queue::DEFAULT_PRE_MUX_DATA_THRESHOLD,
             seek_callback: None,
             frame_pipelines: None,
             stream_map_specs: vec![],
@@ -1958,5 +2015,39 @@ mod tests {
     #[should_panic(expected = "io_buffer_size must be in 1..=i32::MAX")]
     fn set_io_buffer_size_zero_panics() {
         Output::from("out.mp4").set_io_buffer_size(0);
+    }
+
+    #[test]
+    fn muxing_queue_knobs_default_to_ffmpeg_parity() {
+        use crate::core::context::pre_mux_queue::{
+            DEFAULT_PRE_MUX_DATA_THRESHOLD, DEFAULT_PRE_MUX_MAX_PACKETS,
+        };
+        let output = Output::from("out.mp4");
+        assert_eq!(output.max_muxing_queue_size, DEFAULT_PRE_MUX_MAX_PACKETS);
+        assert_eq!(
+            output.muxing_queue_data_threshold,
+            DEFAULT_PRE_MUX_DATA_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn set_muxing_queue_knobs_valid() {
+        let output = Output::from("out.mp4")
+            .set_max_muxing_queue_size(1024)
+            .set_muxing_queue_data_threshold(256 * 1024 * 1024);
+        assert_eq!(output.max_muxing_queue_size, 1024);
+        assert_eq!(output.muxing_queue_data_threshold, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    #[should_panic(expected = "max_muxing_queue_size must be > 0")]
+    fn set_max_muxing_queue_size_zero_panics() {
+        Output::from("out.mp4").set_max_muxing_queue_size(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "muxing_queue_data_threshold must be > 0")]
+    fn set_muxing_queue_data_threshold_zero_panics() {
+        Output::from("out.mp4").set_muxing_queue_data_threshold(0);
     }
 }

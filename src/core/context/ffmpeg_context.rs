@@ -2307,6 +2307,10 @@ unsafe fn open_output_file(
         output.subtitle_disable,
         output.data_disable,
         pix_fmt,
+        crate::core::context::pre_mux_queue::PreMuxQueueConfig {
+            max_packets: output.max_muxing_queue_size,
+            data_threshold: output.muxing_queue_data_threshold,
+        },
     );
 
     Ok(mux)

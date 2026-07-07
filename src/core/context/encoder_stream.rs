@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use crate::core::context::output::VSyncMethod;
+use crate::core::context::pre_mux_queue::PreMuxQueueSender;
 use crate::core::context::{FrameBox, PacketBox, Stream};
 use crossbeam_channel::{Receiver, Sender};
 use ffmpeg_sys_next::{AVCodec, AVMediaType, AVStream};
@@ -15,7 +16,7 @@ pub(crate) struct EncoderStream {
     pub(crate) qscale: Option<i32>,
     src: Option<Receiver<FrameBox>>,
     dst: Option<Sender<PacketBox>>,
-    dst_pre: Option<Sender<PacketBox>>,
+    dst_pre: Option<PreMuxQueueSender>,
     mux_start_gate: Option<Arc<crate::core::context::MuxStartGate>>,
 }
 
@@ -29,7 +30,7 @@ impl EncoderStream {
         qscale: Option<i32>,
         src: Receiver<FrameBox>,
         dst: Sender<PacketBox>,
-        dst_pre: Sender<PacketBox>,
+        dst_pre: PreMuxQueueSender,
         mux_start_gate: Arc<crate::core::context::MuxStartGate>,
     ) -> Self {
         Self {
@@ -54,7 +55,7 @@ impl EncoderStream {
         self.dst.take().unwrap()
     }
 
-    pub(crate) fn take_dst_pre(&mut self) -> Sender<PacketBox> {
+    pub(crate) fn take_dst_pre(&mut self) -> PreMuxQueueSender {
         self.dst_pre.take().unwrap()
     }
 

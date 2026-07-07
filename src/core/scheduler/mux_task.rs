@@ -1,5 +1,6 @@
 use crate::core::context::muxer::Muxer;
 use crate::core::context::obj_pool::ObjPool;
+use crate::core::context::pre_mux_queue::PreMuxQueueReceiver;
 use crate::core::context::{PacketBox, PacketData};
 use crate::raw::FormatContext;
 use crate::core::scheduler::ffmpeg_scheduler::{is_stopping, packet_is_null, set_scheduler_error, wait_until_not_paused, STATUS_ABORT, STATUS_END};
@@ -172,7 +173,7 @@ fn mux_task_start(mux_idx: usize,
                   recording_time_us: Option<i64>,
                   stream_count: usize,
                   format_opts: Option<HashMap<CString, CString>>,
-                  src_pre_receivers: Vec<Receiver<PacketBox>>,
+                  src_pre_receivers: Vec<PreMuxQueueReceiver>,
                   mux_start_gate: Arc<crate::core::context::MuxStartGate>,
                   enc_handle_receiver: Receiver<std::thread::JoinHandle<()>>,
                   packet_pool: ObjPool<Packet>,
@@ -199,16 +200,12 @@ fn mux_task_start(mux_idx: usize,
         // muxer long single-stream runs that can overflow
         // max_interleave_delta and degrade interleaving. Snapshot every
         // queue (the gate locks all senders out for the whole closure) and
-        // merge across them by DTS instead.
+        // merge across them by DTS instead. drain_all also wakes senders
+        // parked on a full queue; they divert to the live queue once the
+        // gate flips.
         let mut queues: Vec<VecDeque<PacketBox>> = src_pre_receivers
             .iter()
-            .map(|receiver| {
-                let mut queue = VecDeque::new();
-                while let Ok(packet_box) = receiver.try_recv() {
-                    queue.push_back(packet_box);
-                }
-                queue
-            })
+            .map(|receiver| receiver.drain_all())
             .collect();
 
         loop {
@@ -277,18 +274,12 @@ fn _mux_init(
     let ret = unsafe { avformat_write_header(out_fmt_ctx_ptr, opts.as_double_ptr()) };
     if ret < 0 {
         error!("Could not write header (incorrect codec parameters ?): {}", av_err2str(ret));
-        // Record the failure BEFORE releasing this muxer's thread slot, so
-        // wait() can never observe "all threads done" without the error
-        // (set_scheduler_error also publishes STATUS_END, which unwinds the
-        // encoders still feeding the pre-mux channels).
-        set_scheduler_error(
+        fail_mux_init(
             &scheduler_status,
             &scheduler_result,
+            &thread_sync,
             Muxing(MuxingOperationError::WriteHeader(WriteHeaderError::from(ret))),
         );
-        thread_sync.thread_done_with(|| {
-            scheduler_status.store(STATUS_END, Ordering::Release);
-        });
         // `out_fmt_ctx` drops here, freeing the context.
         return Err(Muxing(MuxingOperationError::WriteHeader(
             WriteHeaderError::from(ret),
@@ -305,6 +296,13 @@ fn _mux_init(
     };
 
     let format_name = unsafe { CStr::from_ptr((*(*out_fmt_ctx_ptr).oformat).name).to_str().unwrap_or("unknown") };
+
+    // Handles for the spawn-failure branch below: the originals move into the
+    // worker closure, and a failed spawn drops that closure without ever
+    // running it.
+    let scheduler_status_spawn = scheduler_status.clone();
+    let thread_sync_spawn = thread_sync.clone();
+    let scheduler_result_spawn = scheduler_result.clone();
 
     let result = std::thread::Builder::new().name(format!("muxer{mux_idx}:{format_name}")).spawn(move || {
         // Move the FormatContext into the worker; it Drops (frees the output
@@ -528,10 +526,37 @@ fn _mux_init(
     });
     if let Err(e) = result {
         error!("Muxer thread exited with error: {e}");
+        // The mux slot was pre-counted at scheduler start and the worker that
+        // would release it never ran: record the error and release the slot
+        // here, or wait()/stop() hangs forever on the leaked slot. The caller
+        // (the ready-to-init thread) only logs this error — it must not
+        // release again.
+        fail_mux_init(
+            &scheduler_status_spawn,
+            &scheduler_result_spawn,
+            &thread_sync_spawn,
+            Muxing(MuxingOperationError::ThreadExited),
+        );
         return Err(MuxingOperationError::ThreadExited.into())
     }
 
     Ok(())
+}
+
+/// Records a mux-init failure and releases this muxer's pre-counted thread
+/// slot, in that order: the error must be visible before wait() can observe
+/// "all threads done" (set_scheduler_error also publishes STATUS_END, which
+/// unwinds the encoders still feeding the pre-mux queues).
+fn fail_mux_init(
+    scheduler_status: &Arc<AtomicUsize>,
+    scheduler_result: &Arc<Mutex<Option<crate::error::Result<()>>>>,
+    thread_sync: &ThreadSynchronizer,
+    error: crate::error::Error,
+) {
+    set_scheduler_error(scheduler_status, scheduler_result, error);
+    thread_sync.thread_done_with(|| {
+        scheduler_status.store(STATUS_END, Ordering::Release);
+    });
 }
 
 unsafe fn update_last_dts(mux_stream_node: &Arc<SchNode>, input_controller: &Arc<InputController>, scheduler_status: &Arc<AtomicUsize>, pkt: *const AVPacket) {
@@ -743,4 +768,53 @@ fn min3(a: i64, b: i64, c: i64) -> i64 {
 
 fn max3(a: i64, b: i64, c: i64) -> i64 {
     std::cmp::max(a, std::cmp::max(b, c))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::scheduler::ffmpeg_scheduler::{is_stopping, STATUS_RUN};
+    use std::sync::mpsc;
+
+    /// The delayed-mux failure paths (write_header error, worker spawn
+    /// failure) must release the pre-counted mux thread slot AFTER recording
+    /// the error — otherwise wait()/stop() hangs forever on the leaked slot
+    /// (the thread-slot leak found by review), or wait() returns success
+    /// without the error.
+    #[test]
+    fn fail_mux_init_releases_slot_and_records_error() {
+        let thread_sync = ThreadSynchronizer::new();
+        let scheduler_status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>> =
+            Arc::new(Mutex::new(None));
+
+        // The slot the scheduler pre-counts for a (possibly delayed) muxer.
+        thread_sync.thread_start();
+
+        fail_mux_init(
+            &scheduler_status,
+            &scheduler_result,
+            &thread_sync,
+            Muxing(MuxingOperationError::ThreadExited),
+        );
+
+        // Slot released: wait_for_all_threads returns instead of hanging.
+        let (done_tx, done_rx) = mpsc::channel();
+        let sync_clone = thread_sync.clone();
+        std::thread::spawn(move || {
+            sync_clone.wait_for_all_threads();
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "mux thread slot leaked: wait_for_all_threads did not return"
+        );
+
+        // Error recorded before the slot release, terminal status published.
+        assert!(is_stopping(scheduler_status.load(Ordering::Acquire)));
+        assert!(matches!(
+            &*scheduler_result.lock().unwrap(),
+            Some(Err(_))
+        ));
+    }
 }
