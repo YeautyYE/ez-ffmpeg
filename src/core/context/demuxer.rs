@@ -16,6 +16,7 @@ use ffmpeg_sys_next::{
     av_channel_layout_default, av_codec_is_decoder, av_codec_iterate, av_get_pix_fmt, av_hwdevice_find_type_by_name, av_hwdevice_get_type_name, avcodec_descriptor_get, avcodec_descriptor_get_by_name, avcodec_find_decoder, avcodec_find_decoder_by_name, avcodec_get_hw_config, AVChannelOrder, AVCodecID, AVCodecParameters, AVFormatContext, AVHWDeviceType, AVMediaType, AVPixelFormat, AVRational, AVERROR, EINVAL
 };
 use log::{debug, error, warn};
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::ptr::{null, null_mut};
 use std::sync::Arc;
@@ -99,6 +100,9 @@ impl Demuxer {
         video_codec: Option<String>,
         audio_codec: Option<String>,
         subtitle_codec: Option<String>,
+        video_codec_opts: Option<HashMap<CString, CString>>,
+        audio_codec_opts: Option<HashMap<CString, CString>>,
+        subtitle_codec_opts: Option<HashMap<CString, CString>>,
         readrate: Option<f32>,
         start_time_us: Option<i64>,
         recording_time_us: Option<i64>,
@@ -122,6 +126,9 @@ impl Demuxer {
             video_codec,
             audio_codec,
             subtitle_codec,
+            video_codec_opts,
+            audio_codec_opts,
+            subtitle_codec_opts,
             hwaccel.clone(),
             hwaccel_device,
             hwaccel_output_format,
@@ -157,6 +164,9 @@ impl Demuxer {
         video_codec: Option<String>,
         audio_codec: Option<String>,
         subtitle_codec: Option<String>,
+        video_codec_opts: Option<HashMap<CString, CString>>,
+        audio_codec_opts: Option<HashMap<CString, CString>>,
+        subtitle_codec_opts: Option<HashMap<CString, CString>>,
         hwaccel: Option<String>,
         hwaccel_device: Option<String>,
         hwaccel_output_format: Option<String>,
@@ -213,6 +223,12 @@ impl Demuxer {
                     hwaccel_device_type,
                 )?;
                 let codec_desc = avcodec_descriptor_get(codec_id);
+                let codec_opts = get_codec_opts(
+                    codec_type,
+                    &video_codec_opts,
+                    &audio_codec_opts,
+                    &subtitle_codec_opts,
+                );
 
                 let stream = DecoderStream::new(
                     i as usize,
@@ -224,6 +240,7 @@ impl Demuxer {
                         None => { null() },
                     },
                     codec_desc,
+                    codec_opts,
                     duration,
                     time_base,
                     avg_framerate,
@@ -297,6 +314,23 @@ fn get_codec_name(
         audio_codec.clone()
     } else if codec_type == AVMEDIA_TYPE_SUBTITLE {
         subtitle_codec.clone()
+    } else {
+        None
+    }
+}
+
+fn get_codec_opts(
+    codec_type: AVMediaType,
+    video_codec_opts: &Option<HashMap<CString, CString>>,
+    audio_codec_opts: &Option<HashMap<CString, CString>>,
+    subtitle_codec_opts: &Option<HashMap<CString, CString>>,
+) -> Option<HashMap<CString, CString>> {
+    if codec_type == AVMEDIA_TYPE_VIDEO {
+        video_codec_opts.clone()
+    } else if codec_type == AVMEDIA_TYPE_AUDIO {
+        audio_codec_opts.clone()
+    } else if codec_type == AVMEDIA_TYPE_SUBTITLE {
+        subtitle_codec_opts.clone()
     } else {
         None
     }
