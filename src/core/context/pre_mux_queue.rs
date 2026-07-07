@@ -3,13 +3,14 @@
 //! fftools: `PreMuxQueue` (ffmpeg_sched.c) — packets an encoder produces
 //! before its muxer starts (the muxer waits until every output stream is
 //! ready) are parked per-stream, metered with FFmpeg's
-//! `max_muxing_queue_size` / `muxing_queue_data_threshold` semantics:
-//! below the byte threshold the packet cap does not apply
+//! `max_muxing_queue_size` / `muxing_queue_data_threshold` semantics: the
+//! packet cap applies only once parked bytes exceed the threshold
 //! (ffmpeg_sched.h: `data_threshold` is "the size of the data past which
-//! `max_packets` applies"). Many tiny packets (sparse subtitles) therefore
-//! never wedge admission on the packet cap, while large packets are
-//! bounded by bytes instead of the old blind 65536-packet window that
-//! could park gigabytes.
+//! `max_packets` applies"). It is a trigger, not a hard byte cap — below
+//! the threshold, packet count is unbounded (so sparse tiny-packet streams
+//! keep parking); above it, admission stops at `max_packets`. This replaces
+//! the old blind 65536-packet window, which could park gigabytes of a
+//! high-bitrate stream regardless of byte size.
 //!
 //! A full queue parks the sender on this queue's condvar — no sleep-poll.
 //! Wakes: the mux-start drain (`drain_all`), receiver drop (stop /
@@ -104,9 +105,12 @@ pub(crate) fn channel(config: PreMuxQueueConfig) -> (PreMuxQueueSender, PreMuxQu
 }
 
 /// Payload bytes the packet contributes to `data_threshold` accounting
-/// (`pkt->size`, like FFmpeg). Empty end-of-stream markers weigh 0 — and
-/// since a 0-byte add never crosses the threshold, a stream's EOF marker
-/// can never be wedged out by a full queue.
+/// (`pkt->size`, like FFmpeg). Empty end-of-stream markers weigh 0, so they
+/// never themselves push the queue over the threshold; they are still
+/// subject to admission like any packet (a queue already past the threshold
+/// with the packet cap reached parks them too — but a single encoder emits
+/// its EOF marker only after its data packets have been admitted, so it
+/// waits for the same mux start they do, never behind its own backlog).
 pub(crate) fn packet_payload_size(packet_box: &PacketBox) -> usize {
     // SAFETY: the box owns a live packet (possibly an allocated-but-empty
     // EOF marker); reading its size field is valid.
@@ -238,7 +242,8 @@ mod tests {
             tx.try_push(packet_box(1)),
             PreQueueTryPush::Full(_)
         ));
-        // A 0-byte EOF marker never crosses the threshold: always admitted.
+        // A 0-byte marker adds no bytes; with byte_size (10) still within the
+        // threshold (10) it is admitted even though the packet cap is reached.
         assert!(matches!(tx.try_push(packet_box(0)), PreQueueTryPush::Sent));
 
         let drained = rx.drain_all();
