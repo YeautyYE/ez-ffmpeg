@@ -55,6 +55,7 @@ pub mod ffmpeg_scheduler;
 mod frame_filter_pipeline;
 mod mux_task;
 mod enc_task;
+pub(crate) mod sync_queue;
 pub(crate) mod filter_task;
 mod dec_task;
 mod demux_task;
