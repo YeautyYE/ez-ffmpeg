@@ -76,6 +76,38 @@ impl StreamSourceRegistry {
     }
 }
 
+/// Per-media-type bitstream-filter chains for one output, materialized from
+/// the public `Output::set_{video,audio,subtitle}_bsf` API into NUL-terminated
+/// `CString`s (validated at build time). Resolved down to a per-output-stream
+/// chain by media type in `_mux_init` (FFmpeg `-bsf:v/-bsf:a/-bsf:s`).
+///
+/// PR2 seam: explicit per-map BSF (`add_stream_map_with_bsf`) will override the
+/// media-type default per stream; that override is not carried here yet.
+#[derive(Clone, Default)]
+pub(crate) struct StreamBsfChains {
+    pub(crate) video: Option<CString>,
+    pub(crate) audio: Option<CString>,
+    pub(crate) subtitle: Option<CString>,
+}
+
+impl StreamBsfChains {
+    /// True when no media type has a BSF chain: the mux packet path then takes
+    /// exactly the pre-BSF code path (zero behavior change).
+    pub(crate) fn is_empty(&self) -> bool {
+        self.video.is_none() && self.audio.is_none() && self.subtitle.is_none()
+    }
+
+    /// The chain that applies to a stream of `media_type`, or `None`.
+    pub(crate) fn for_media_type(&self, media_type: AVMediaType) -> Option<&CString> {
+        match media_type {
+            AVMediaType::AVMEDIA_TYPE_VIDEO => self.video.as_ref(),
+            AVMediaType::AVMEDIA_TYPE_AUDIO => self.audio.as_ref(),
+            AVMediaType::AVMEDIA_TYPE_SUBTITLE => self.subtitle.as_ref(),
+            _ => None,
+        }
+    }
+}
+
 pub(crate) struct Muxer {
     pub(crate) url: String,
 
@@ -92,6 +124,10 @@ pub(crate) struct Muxer {
     pub(crate) video_codec: Option<String>,
     pub(crate) audio_codec: Option<String>,
     pub(crate) subtitle_codec: Option<String>,
+
+    /// Per-media-type BSF chains (`-bsf:v/-bsf:a/-bsf:s`), NUL-validated at
+    /// build time. Resolved per output stream by media type in `_mux_init`.
+    pub(crate) bsf_chains: StreamBsfChains,
     pub(crate) start_time_us: Option<i64>,
     pub(crate) recording_time_us: Option<i64>,
     pub(crate) framerate: Option<AVRational>,
@@ -183,6 +219,7 @@ impl Muxer {
         video_codec: Option<String>,
         audio_codec: Option<String>,
         subtitle_codec: Option<String>,
+        bsf_chains: StreamBsfChains,
         start_time_us: Option<i64>,
         recording_time_us: Option<i64>,
         framerate: Option<AVRational>,
@@ -228,6 +265,7 @@ impl Muxer {
             video_codec,
             audio_codec,
             subtitle_codec,
+            bsf_chains,
             start_time_us,
             recording_time_us,
             framerate,

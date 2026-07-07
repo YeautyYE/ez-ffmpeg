@@ -2262,6 +2262,16 @@ unsafe fn open_output_file(
     // SAFETY: out_fmt_ctx is a fully-initialized output context; for custom IO its
     // pb/AVIO+box are already wired (see the arm(...,true) point above), which
     // from_output_custom_io's teardown requires.
+    // Materialize the per-media-type BSF chains into NUL-validated CStrings
+    // now (build time): a NUL byte surfaces as the existing NulError -> Error
+    // path here, before any thread is spawned. Empty strings were already
+    // normalized to None by the Output setters.
+    let bsf_chains = crate::core::context::muxer::StreamBsfChains {
+        video: output.video_bsf.as_deref().map(CString::new).transpose()?,
+        audio: output.audio_bsf.as_deref().map(CString::new).transpose()?,
+        subtitle: output.subtitle_bsf.as_deref().map(CString::new).transpose()?,
+    };
+
     let out_fmt_ctx = ctx_guard.release();
     let fc = if output.url.is_none() {
         crate::raw::FormatContext::from_output_custom_io(out_fmt_ctx)
@@ -2277,6 +2287,7 @@ unsafe fn open_output_file(
         output.video_codec.clone(),
         output.audio_codec.clone(),
         output.subtitle_codec.clone(),
+        bsf_chains,
         output.start_time_us,
         recording_time_us,
         output.framerate,
