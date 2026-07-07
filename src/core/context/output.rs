@@ -197,6 +197,18 @@ pub struct Output {
     /// forces FFmpeg to use the specified codec. If the chosen codec is not supported by your build of FFmpeg,
     /// an error will be returned during initialization.
     pub(crate) subtitle_codec: Option<String>,
+
+    /// Bitstream-filter chain applied to the **video** output stream(s),
+    /// equivalent to FFmpeg `-bsf:v`. See [`set_video_bsf`](Self::set_video_bsf).
+    pub(crate) video_bsf: Option<String>,
+
+    /// Bitstream-filter chain applied to the **audio** output stream(s),
+    /// equivalent to FFmpeg `-bsf:a`. See [`set_audio_bsf`](Self::set_audio_bsf).
+    pub(crate) audio_bsf: Option<String>,
+
+    /// Bitstream-filter chain applied to the **subtitle** output stream(s),
+    /// equivalent to FFmpeg `-bsf:s`. See [`set_subtitle_bsf`](Self::set_subtitle_bsf).
+    pub(crate) subtitle_bsf: Option<String>,
     pub(crate) start_time_us: Option<i64>,
     pub(crate) recording_time_us: Option<i64>,
     pub(crate) stop_time_us: Option<i64>,
@@ -586,6 +598,66 @@ impl Output {
     /// ```
     pub fn set_subtitle_codec(mut self, subtitle_codec: impl Into<String>) -> Self {
         self.subtitle_codec = Some(subtitle_codec.into());
+        self
+    }
+
+    /// Sets the **bitstream-filter chain** for the **video** output stream(s),
+    /// equivalent to FFmpeg `-bsf:v`.
+    ///
+    /// Bitstream filters transform encoded packets without decoding them (e.g.
+    /// rewriting NAL headers). The chain runs in the mux stage — after stream
+    /// copy or encoding, before the packet is written — matching the FFmpeg CLI.
+    ///
+    /// # Arguments
+    /// * `bsf_chain` - A single BSF name (e.g. `"h264_mp4toannexb"`) or a
+    ///   comma-separated chain with per-filter options
+    ///   (e.g. `"hevc_metadata=aud=insert,extract_extradata"`), parsed by
+    ///   FFmpeg's `av_bsf_list_parse_str`. An **empty string clears** any
+    ///   previously set video BSF.
+    ///
+    /// # Returns
+    /// * `Self` - Returns the modified `Output`, allowing for method chaining.
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// // Convert H.264 from MP4 (length-prefixed) to Annex B for MPEG-TS.
+    /// let output = Output::from("output.ts")
+    ///     .set_format("mpegts")
+    ///     .add_stream_map_with_copy("0:v")
+    ///     .set_video_bsf("h264_mp4toannexb");
+    /// ```
+    pub fn set_video_bsf(mut self, bsf_chain: impl Into<String>) -> Self {
+        let chain = bsf_chain.into();
+        self.video_bsf = if chain.is_empty() { None } else { Some(chain) };
+        self
+    }
+
+    /// Sets the **bitstream-filter chain** for the **audio** output stream(s),
+    /// equivalent to FFmpeg `-bsf:a`.
+    ///
+    /// See [`set_video_bsf`](Self::set_video_bsf) for the chain syntax; an
+    /// **empty string clears** any previously set audio BSF.
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// let output = Output::from("output.aac")
+    ///     .add_stream_map_with_copy("0:a")
+    ///     .set_audio_bsf("aac_adtstoasc");
+    /// ```
+    pub fn set_audio_bsf(mut self, bsf_chain: impl Into<String>) -> Self {
+        let chain = bsf_chain.into();
+        self.audio_bsf = if chain.is_empty() { None } else { Some(chain) };
+        self
+    }
+
+    /// Sets the **bitstream-filter chain** for the **subtitle** output
+    /// stream(s), equivalent to FFmpeg `-bsf:s`.
+    ///
+    /// See [`set_video_bsf`](Self::set_video_bsf) for the chain syntax; an
+    /// **empty string clears** any previously set subtitle BSF.
+    pub fn set_subtitle_bsf(mut self, bsf_chain: impl Into<String>) -> Self {
+        let chain = bsf_chain.into();
+        self.subtitle_bsf = if chain.is_empty() { None } else { Some(chain) };
         self
     }
 
@@ -1778,6 +1850,9 @@ impl From<Box<dyn FnMut(&[u8]) -> i32 + Send>> for Output {
             video_codec: None,
             audio_codec: None,
             subtitle_codec: None,
+            video_bsf: None,
+            audio_bsf: None,
+            subtitle_bsf: None,
             start_time_us: None,
             recording_time_us: None,
             stop_time_us: None,
@@ -1827,6 +1902,9 @@ impl From<String> for Output {
             video_codec: None,
             audio_codec: None,
             subtitle_codec: None,
+            video_bsf: None,
+            audio_bsf: None,
+            subtitle_bsf: None,
             start_time_us: None,
             recording_time_us: None,
             stop_time_us: None,
