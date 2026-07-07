@@ -475,10 +475,74 @@ impl ReactorConnection {
 // Publisher State
 // ============================================================================
 
+/// One item fed by an in-process publisher.
+///
+/// The steady-state media path (PERF-5a) short-circuits the serialize→
+/// reparse round-trip: audio/video FLV tags arrive already parsed as
+/// [`PublisherFeed::Media`] and go straight to the channel machinery, while
+/// control and metadata bytes stay on [`PublisherFeed::Raw`] (fed to the
+/// session's `handle_input`). Both variants travel a single FIFO channel, so
+/// the total ordering the serialize path guarantees is preserved exactly.
+pub enum PublisherFeed {
+    /// RTMP chunk bytes to feed to the session (handshake-free control,
+    /// createStream/publish, and `0x12` metadata).
+    Raw(Vec<u8>),
+    /// A pre-parsed audio (`0x08`) or video (`0x09`) FLV tag.
+    Media {
+        tag_type: u8,
+        timestamp: RtmpTimestamp,
+        data: Bytes,
+    },
+}
+
+/// How a registered publisher delivers its data.
+///
+/// - [`PublisherSource::Raw`] is the public `create_stream_sender` path:
+///   opaque RTMP chunk bytes, byte-identical to the pre-PERF-5a behaviour.
+/// - [`PublisherSource::Feed`] is the `create_rtmp_input` path that mixes
+///   bypassed media tags with raw control/metadata bytes.
+#[derive(Clone)]
+pub enum PublisherSource {
+    Raw(crossbeam_channel::Receiver<Vec<u8>>),
+    Feed(crossbeam_channel::Receiver<PublisherFeed>),
+}
+
 /// Publisher state
 pub struct PublisherState {
     pub stream_key: String,
-    pub receiver: crossbeam_channel::Receiver<Vec<u8>>,
+    pub source: PublisherSource,
+}
+
+/// Route a batch of [`ServerResult`]s into the reactor's write / close buffers.
+fn collect_server_results(
+    server_results: Vec<ServerResult>,
+    packets_to_write: &mut Vec<(usize, Vec<u8>, bool, bool, bool)>,
+    ids_to_close: &mut Vec<usize>,
+) {
+    for result in server_results {
+        match result {
+            ServerResult::OutboundPacket {
+                target_connection_id,
+                packet,
+                is_keyframe,
+                is_sequence_header,
+                is_video,
+            } => {
+                packets_to_write.push((
+                    target_connection_id,
+                    packet.bytes,
+                    is_keyframe,
+                    is_sequence_header,
+                    is_video,
+                ));
+            }
+            ServerResult::DisconnectConnection {
+                connection_id: close_id,
+            } => {
+                ids_to_close.push(close_id);
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -627,7 +691,7 @@ impl Reactor {
     pub fn add_publisher(
         &mut self,
         stream_key: String,
-        receiver: crossbeam_channel::Receiver<Vec<u8>>,
+        source: PublisherSource,
     ) -> Option<usize> {
         let entry = self.publishers.vacant_entry();
         let id = entry.key();
@@ -636,7 +700,7 @@ impl Reactor {
             self.stream_keys.insert(stream_key.clone());
             entry.insert(PublisherState {
                 stream_key,
-                receiver,
+                source,
             });
             debug!("Publisher {} added", id);
             Some(id)
@@ -905,6 +969,28 @@ impl Reactor {
         }
     }
 
+    /// Feed a raw RTMP chunk from a publisher to the session and collect the
+    /// resulting outbound packets / disconnects. Returns `false` if the
+    /// scheduler errored and the publisher should be removed.
+    fn dispatch_publish_bytes(
+        &mut self,
+        pub_id: usize,
+        bytes: Vec<u8>,
+        packets_to_write: &mut Vec<(usize, Vec<u8>, bool, bool, bool)>,
+        ids_to_close: &mut Vec<usize>,
+    ) -> bool {
+        match self.scheduler.publish_bytes_received(pub_id, bytes) {
+            Ok(server_results) => {
+                collect_server_results(server_results, packets_to_write, ids_to_close);
+                true
+            }
+            Err(e) => {
+                debug!("Publisher {} scheduler error: {}", pub_id, e);
+                false
+            }
+        }
+    }
+
     /// Handle publishers data
     fn process_publishers(&mut self) -> Vec<usize> {
         let mut publisher_ids_to_remove = Vec::new();
@@ -914,60 +1000,87 @@ impl Reactor {
         let publisher_ids: Vec<usize> = self.publishers.iter().map(|(id, _)| id).collect();
 
         for pub_id in publisher_ids {
-            let receiver = {
+            let source = {
                 let pub_state = match self.publishers.get(pub_id) {
                     Some(p) => p,
                     None => continue,
                 };
-                pub_state.receiver.clone()
+                pub_state.source.clone()
             };
 
-            loop {
-                match receiver.try_recv() {
-                    Ok(bytes) => {
-                        match self.scheduler.publish_bytes_received(pub_id, bytes) {
-                            Ok(server_results) => {
-                                for result in server_results {
-                                    match result {
-                                        ServerResult::OutboundPacket {
-                                            target_connection_id,
-                                            packet,
-                                            is_keyframe,
-                                            is_sequence_header,
-                                            is_video,
-                                        } => {
-                                            packets_to_write.push((
-                                                target_connection_id,
-                                                packet.bytes,
-                                                is_keyframe,
-                                                is_sequence_header,
-                                                is_video,
-                                            ));
-                                        }
-                                        ServerResult::DisconnectConnection {
-                                            connection_id: close_id,
-                                        } => {
-                                            ids_to_close.push(close_id);
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                debug!("Publisher {} scheduler error: {}", pub_id, e);
+            match source {
+                PublisherSource::Raw(receiver) => loop {
+                    match receiver.try_recv() {
+                        Ok(bytes) => {
+                            if !self.dispatch_publish_bytes(
+                                pub_id,
+                                bytes,
+                                &mut packets_to_write,
+                                &mut ids_to_close,
+                            ) {
                                 publisher_ids_to_remove.push(pub_id);
                                 break;
                             }
                         }
+                        Err(crossbeam_channel::TryRecvError::Empty) => break,
+                        Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                            debug!("Publisher {} disconnected", pub_id);
+                            // Send deleteStream command
+                            self.send_delete_stream(
+                                pub_id,
+                                &mut packets_to_write,
+                                &mut ids_to_close,
+                            );
+                            publisher_ids_to_remove.push(pub_id);
+                            break;
+                        }
                     }
-                    Err(crossbeam_channel::TryRecvError::Empty) => break,
-                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                        debug!("Publisher {} disconnected", pub_id);
-                        // Send deleteStream command
-                        self.send_delete_stream(pub_id, &mut packets_to_write, &mut ids_to_close);
-                        publisher_ids_to_remove.push(pub_id);
-                        break;
+                },
+
+                PublisherSource::Feed(receiver) => loop {
+                    match receiver.try_recv() {
+                        // Control / metadata bytes stay on the session path so
+                        // ordering with the bypassed media stays FIFO.
+                        Ok(PublisherFeed::Raw(bytes)) => {
+                            if !self.dispatch_publish_bytes(
+                                pub_id,
+                                bytes,
+                                &mut packets_to_write,
+                                &mut ids_to_close,
+                            ) {
+                                publisher_ids_to_remove.push(pub_id);
+                                break;
+                            }
+                        }
+                        // PERF-5a bypass: parsed audio/video tag straight to
+                        // the channel machinery, no serialize/reparse.
+                        Ok(PublisherFeed::Media {
+                            tag_type,
+                            timestamp,
+                            data,
+                        }) => {
+                            let results = self.scheduler.publish_media_received(
+                                pub_id, tag_type, timestamp, data,
+                            );
+                            collect_server_results(
+                                results,
+                                &mut packets_to_write,
+                                &mut ids_to_close,
+                            );
+                        }
+                        Err(crossbeam_channel::TryRecvError::Empty) => break,
+                        Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                            debug!("Publisher {} disconnected", pub_id);
+                            self.send_delete_stream(
+                                pub_id,
+                                &mut packets_to_write,
+                                &mut ids_to_close,
+                            );
+                            publisher_ids_to_remove.push(pub_id);
+                            break;
+                        }
                     }
-                }
+                },
             }
         }
 
@@ -1124,10 +1237,7 @@ impl Reactor {
     pub fn run(
         &mut self,
         connection_receiver: crossbeam_channel::Receiver<TcpStream>,
-        publisher_receiver: crossbeam_channel::Receiver<(
-            String,
-            crossbeam_channel::Receiver<Vec<u8>>,
-        )>,
+        publisher_receiver: crossbeam_channel::Receiver<(String, PublisherSource)>,
     ) {
         info!("Reactor started");
 
@@ -1153,8 +1263,8 @@ impl Reactor {
             }
 
             // 3. Non-blocking receive new publishers
-            while let Ok((stream_key, receiver)) = publisher_receiver.try_recv() {
-                if self.add_publisher(stream_key.clone(), receiver).is_some() {
+            while let Ok((stream_key, source)) = publisher_receiver.try_recv() {
+                if self.add_publisher(stream_key.clone(), source).is_some() {
                     debug!("New publisher added for stream: {}", stream_key);
                 }
             }
