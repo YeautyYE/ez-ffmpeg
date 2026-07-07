@@ -241,6 +241,80 @@ impl RtmpScheduler {
         Ok(server_results)
     }
 
+    /// Direct in-process media ingest (PERF-5a serialize-bypass).
+    ///
+    /// An in-process publisher hands an already-parsed FLV audio/video tag
+    /// straight to the channel machinery, skipping the serialize→channel→
+    /// deserialize round-trip the socket path needs. The `(timestamp, data)`
+    /// pair is byte-identical to what `flv_tag_to_message_payload` +
+    /// `ChunkSerializer` + `handle_input` would reconstruct for the same tag,
+    /// so this converges on the very same `handle_audio_video_data_received`
+    /// the serialize path reaches — the scheduler observes an identical
+    /// `FrameData` sequence (metadata / sequence headers / keyframe gate /
+    /// GOP cache semantics are all unchanged).
+    ///
+    /// Only tag types `0x08` (audio) and `0x09` (video) are delivered here;
+    /// metadata (`0x12`) and control messages stay on the byte path because
+    /// they require AMF parsing / session state.
+    pub(super) fn publish_media_received(
+        &mut self,
+        publisher_connection_id: usize,
+        tag_type: u8,
+        timestamp: RtmpTimestamp,
+        data: Bytes,
+    ) -> Vec<ServerResult> {
+        let mut server_results = Vec::new();
+
+        let data_type = match tag_type {
+            0x08 => ReceivedDataType::Audio,
+            0x09 => ReceivedDataType::Video,
+            other => {
+                // Only audio/video tags are bypassed; anything else is a
+                // caller bug (metadata and control must stay on the byte path).
+                warn!("In-process media bypass received unexpected FLV tag type {other:#04x}");
+                return server_results;
+            }
+        };
+
+        let client_id = match self
+            .publisher_to_client_map
+            .get(&publisher_connection_id)
+        {
+            Some(client_id) => *client_id,
+            None => {
+                warn!(
+                    "In-process media for non-existent publisher connection_id: {}",
+                    publisher_connection_id
+                );
+                return server_results;
+            }
+        };
+
+        let stream_key = match self.clients.get(client_id) {
+            Some(client) => match &client.current_action {
+                ClientAction::Publishing(stream_key) => stream_key.clone(),
+                _ => {
+                    warn!(
+                        "In-process media for a publisher not in the Publishing state: {}",
+                        publisher_connection_id
+                    );
+                    return server_results;
+                }
+            },
+            None => return server_results,
+        };
+
+        self.handle_audio_video_data_received(
+            stream_key,
+            timestamp,
+            data,
+            data_type,
+            &mut server_results,
+        );
+
+        server_results
+    }
+
     pub(super) fn bytes_received(
         &mut self,
         connection_id: usize,
@@ -2032,6 +2106,124 @@ mod tests {
             .unwrap()
             .watching_client_ids
             .contains(&client_id));
+    }
+
+    fn feed_media(
+        scheduler: &mut RtmpScheduler,
+        publisher_conn: usize,
+        tag_type: u8,
+        timestamp: u32,
+        data: &'static [u8],
+    ) -> Vec<ServerResult> {
+        scheduler.publish_media_received(
+            publisher_conn,
+            tag_type,
+            RtmpTimestamp { value: timestamp },
+            Bytes::from_static(data),
+        )
+    }
+
+    const VIDEO_SEQ: &[u8] = &[0x17, 0x00, 0x00, 0x00, 0x00, 0x01, 0x64];
+    const AUDIO_SEQ: &[u8] = &[0xaf, 0x00, 0x12, 0x10];
+    const AUDIO_FRAME: &[u8] = &[0xaf, 0x01, 0xDD, 0xEE];
+
+    // PERF-5a: the in-process media bypass (publish_media_received) must feed
+    // the exact same channel machinery the serialize path reaches, so a live
+    // watcher observes sequence-header-first, IDR-first, correctly gated and
+    // interleaved audio/video.
+    #[test]
+    fn in_process_bypass_delivers_seq_header_then_gated_idr_then_interleaved() {
+        let mut scheduler = RtmpScheduler::new(10);
+        let publisher_conn = 100;
+        let watcher_conn = 2;
+
+        assert!(scheduler.new_channel("live".to_string(), publisher_conn));
+        play(&mut scheduler, watcher_conn, "live");
+        let watcher_client_id = *scheduler.connection_to_client_map.get(&watcher_conn).unwrap();
+
+        // Sequence headers pass the gate even before any keyframe.
+        let results = feed_media(&mut scheduler, publisher_conn, 0x09, 0, VIDEO_SEQ);
+        assert_eq!(results.len(), 1, "video sequence header must reach the watcher");
+        assert!(matches!(
+            &results[0],
+            ServerResult::OutboundPacket { is_sequence_header: true, is_video: true, .. }
+        ));
+
+        let results = feed_media(&mut scheduler, publisher_conn, 0x08, 0, AUDIO_SEQ);
+        assert_eq!(results.len(), 1, "audio sequence header must reach the watcher");
+        assert!(matches!(
+            &results[0],
+            ServerResult::OutboundPacket { is_sequence_header: true, is_video: false, .. }
+        ));
+
+        // A delta frame and audio before the first IDR are withheld (gate).
+        assert!(
+            feed_media(&mut scheduler, publisher_conn, 0x09, 33, DELTA).is_empty(),
+            "delta before the IDR must be withheld"
+        );
+        assert!(
+            feed_media(&mut scheduler, publisher_conn, 0x08, 33, AUDIO_FRAME).is_empty(),
+            "audio before the first IDR must be withheld"
+        );
+        assert!(!scheduler.clients.get(watcher_client_id).unwrap().has_received_video_keyframe);
+
+        // The IDR opens the gate and is delivered as a keyframe.
+        let results = feed_media(&mut scheduler, publisher_conn, 0x09, 66, IDR);
+        assert_eq!(results.len(), 1, "the IDR must be delivered");
+        assert!(matches!(
+            &results[0],
+            ServerResult::OutboundPacket { is_keyframe: true, is_video: true, .. }
+        ));
+        assert!(scheduler.clients.get(watcher_client_id).unwrap().has_received_video_keyframe);
+
+        // After the IDR, audio and delta video interleave through to the watcher.
+        let results = feed_media(&mut scheduler, publisher_conn, 0x08, 70, AUDIO_FRAME);
+        assert_eq!(results.len(), 1, "audio flows after the IDR");
+        assert!(matches!(
+            &results[0],
+            ServerResult::OutboundPacket { is_video: false, is_keyframe: false, .. }
+        ));
+
+        let results = feed_media(&mut scheduler, publisher_conn, 0x09, 99, DELTA);
+        assert_eq!(results.len(), 1, "delta flows after the IDR");
+        assert!(matches!(
+            &results[0],
+            ServerResult::OutboundPacket { is_video: true, is_keyframe: false, .. }
+        ));
+    }
+
+    // PERF-5a: bypassed media must populate the same cached sequence headers,
+    // header timestamps and GOP cache the serialize path would, so the
+    // existing late-watcher replay path has identical state to work from.
+    #[test]
+    fn in_process_bypass_populates_seq_headers_and_gop_cache_for_replay() {
+        let mut scheduler = RtmpScheduler::new(10);
+        let publisher_conn = 100;
+
+        assert!(scheduler.new_channel("live".to_string(), publisher_conn));
+
+        // Publish a full GOP via the bypass before any watcher joins.
+        feed_media(&mut scheduler, publisher_conn, 0x09, 0, VIDEO_SEQ);
+        feed_media(&mut scheduler, publisher_conn, 0x08, 0, AUDIO_SEQ);
+        feed_media(&mut scheduler, publisher_conn, 0x09, 33, IDR);
+        feed_media(&mut scheduler, publisher_conn, 0x08, 34, AUDIO_FRAME);
+        feed_media(&mut scheduler, publisher_conn, 0x09, 66, DELTA);
+        // A second IDR freezes the first GOP into the replay cache.
+        feed_media(&mut scheduler, publisher_conn, 0x09, 99, IDR);
+
+        // The bypass must have cached the sequence headers and their timestamps
+        // (byte-identical to the serialize path), and frozen the completed GOP.
+        // This is exactly the state handle_play_requested replays to late
+        // joiners, so preserving it proves metadata/seq-header/GOP semantics.
+        let channel = scheduler.channels.get("live").unwrap();
+        assert_eq!(channel.video_sequence_header.as_deref(), Some(VIDEO_SEQ));
+        assert_eq!(channel.video_timestamp, RtmpTimestamp { value: 0 });
+        assert_eq!(channel.audio_sequence_header.as_deref(), Some(AUDIO_SEQ));
+        assert_eq!(channel.audio_timestamp, RtmpTimestamp { value: 0 });
+        assert!(
+            channel.gops.frozen_count() >= 1,
+            "the completed GOP must be frozen for replay"
+        );
     }
 
     // Defense-in-depth for the fanout path: even if a stale membership leaks
