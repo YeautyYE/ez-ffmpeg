@@ -720,7 +720,14 @@ fn outputs_bind(
             }
         }
 
-        //TODO add_attachments
+        // Create attachment streams (`-attach`) AFTER stream mapping and BEFORE
+        // metadata, mirroring FFmpeg's `of_add_attachments`. They take the
+        // highest stream indices and never enter the packet path.
+        // SAFETY: the output AVFormatContext is live and still owned by `mux`
+        // here (the mux worker has not been spawned yet).
+        unsafe {
+            crate::core::context::attachment::create_attachment_streams(mux)?;
+        }
 
         // Process metadata
         unsafe {
@@ -2336,6 +2343,7 @@ unsafe fn open_output_file(
         },
         output.sws_opts.clone(),
         output.swr_opts.clone(),
+        std::mem::take(&mut output.attachments),
     );
 
     Ok(mux)

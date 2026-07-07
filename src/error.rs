@@ -702,6 +702,18 @@ pub enum OpenOutputError {
 
     #[error("Unknown pixel format: '{0}'")]
     UnknownPixelFormat(String),
+
+    #[error("Failed to read attachment file '{0}'")]
+    AttachmentRead(String, #[source] io::Error),
+
+    #[error("Attachment file '{0}' is empty")]
+    AttachmentEmpty(String),
+
+    #[error("Attachment file '{0}' is too large ({1} bytes, limit {2} bytes)")]
+    AttachmentTooLarge(String, u64, u64),
+
+    #[error("Attachment mimetype must not be empty (file '{0}')")]
+    AttachmentEmptyMimetype(String),
 }
 
 impl From<i32> for OpenOutputError {
