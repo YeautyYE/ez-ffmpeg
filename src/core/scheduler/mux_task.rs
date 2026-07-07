@@ -355,14 +355,21 @@ fn _mux_init(
         // Move the FormatContext into the worker; it Drops (frees the output
         // context, custom-IO-aware) when this closure ends — the terminal free.
         let out_fmt_ctx = out_fmt_ctx;
-        // Per-output-stream BSF chains (None for streams without one). Owned by
-        // the worker; each `BitStreamFilter` frees its AVBSFContext/AVPacket on
-        // drop when the closure ends.
+        // Per-output-stream BSF chains (None for streams without one), or an
+        // empty vec when no output set a BSF at all. Owned by the worker; each
+        // `BitStreamFilter` frees its AVBSFContext/AVPacket on drop.
         let mut stream_bsfs = stream_bsfs;
+        // Loop-invariant gate: when false, the packet path below is byte-for-
+        // byte the pre-BSF path (no wrapper call, no template, no flush).
+        let has_bsf = !stream_bsfs.is_empty();
         // Last packet_data seen per stream, used as the metadata template for
         // BSF flush packets at EOF (they carry no PacketData of their own).
-        let mut stream_pkt_templates: Vec<Option<PacketData>> =
-            (0..stream_count).map(|_| None).collect();
+        // Only allocated when at least one stream has a BSF.
+        let mut stream_pkt_templates: Vec<Option<PacketData>> = if has_bsf {
+            (0..stream_count).map(|_| None).collect()
+        } else {
+            Vec::new()
+        };
         let mut stream_started: Vec<bool> = vec![false; stream_count];
         let mut stream_eof: Vec<bool> = vec![false; stream_count];
         let mut st_rescale_delta_last_map = HashMap::new();
@@ -404,24 +411,26 @@ fn _mux_init(
                     let eof_idx = eof_stream as usize;
                     if eof_idx < stream_count && !stream_eof[eof_idx] {
                         // Flush trailing BSF packets before finishing this
-                        // stream (no-op when it has no BSF).
-                        let fret = unsafe {
-                            flush_stream_bsf(
-                                &mut st_rescale_delta_last_map,
-                                oformat_flags,
-                                &mut st_last_dts_map,
-                                &out_fmt_ctx,
-                                &mut stream_bsfs,
-                                &stream_pkt_templates,
-                                eof_idx,
-                                &packet_pool,
-                            )
-                        };
-                        if fret < 0 {
-                            ret = fret;
-                            error!("Error flushing bitstream filter at EOF: stream={eof_idx}, ret={fret}");
-                            packet_pool.release(packet_box.packet);
-                            break;
+                        // stream. Skipped entirely when no mux stream has a BSF.
+                        if has_bsf {
+                            let fret = unsafe {
+                                flush_stream_bsf(
+                                    &mut st_rescale_delta_last_map,
+                                    oformat_flags,
+                                    &mut st_last_dts_map,
+                                    &out_fmt_ctx,
+                                    &mut stream_bsfs,
+                                    &stream_pkt_templates,
+                                    eof_idx,
+                                    &packet_pool,
+                                )
+                            };
+                            if fret < 0 {
+                                ret = fret;
+                                error!("Error flushing bitstream filter at EOF: stream={eof_idx}, ret={fret}");
+                                packet_pool.release(packet_box.packet);
+                                break;
+                            }
                         }
                         stream_eof[eof_idx] = true;
                         nb_done += 1;
@@ -464,23 +473,26 @@ fn _mux_init(
                         continue;
                     }
 
-                    // Flush trailing BSF packets before finishing this stream
-                    // (no-op when it has no BSF). Already inside `unsafe`.
-                    let fret = flush_stream_bsf(
-                        &mut st_rescale_delta_last_map,
-                        oformat_flags,
-                        &mut st_last_dts_map,
-                        &out_fmt_ctx,
-                        &mut stream_bsfs,
-                        &stream_pkt_templates,
-                        stream_index,
-                        &packet_pool,
-                    );
-                    if fret < 0 {
-                        ret = fret;
-                        error!("Error flushing bitstream filter at EOF: stream={stream_index}, ret={fret}");
-                        packet_pool.release(packet_box.packet);
-                        break;
+                    // Flush trailing BSF packets before finishing this stream.
+                    // Skipped entirely when no mux stream has a BSF. Already
+                    // inside `unsafe`.
+                    if has_bsf {
+                        let fret = flush_stream_bsf(
+                            &mut st_rescale_delta_last_map,
+                            oformat_flags,
+                            &mut st_last_dts_map,
+                            &out_fmt_ctx,
+                            &mut stream_bsfs,
+                            &stream_pkt_templates,
+                            stream_index,
+                            &packet_pool,
+                        );
+                        if fret < 0 {
+                            ret = fret;
+                            error!("Error flushing bitstream filter at EOF: stream={stream_index}, ret={fret}");
+                            packet_pool.release(packet_box.packet);
+                            break;
+                        }
                     }
 
                     nb_done += 1;
@@ -521,22 +533,25 @@ fn _mux_init(
                     } else if ret == AVERROR_EOF {
                         // Per-stream EOF: mark this stream as finished, matching CLI's
                         // sch_mux_receive_finish behavior in ffmpeg_mux.c:442.
-                        // Flush trailing BSF packets first (no-op without a BSF).
-                        let fret = flush_stream_bsf(
-                            &mut st_rescale_delta_last_map,
-                            oformat_flags,
-                            &mut st_last_dts_map,
-                            &out_fmt_ctx,
-                            &mut stream_bsfs,
-                            &stream_pkt_templates,
-                            stream_index,
-                            &packet_pool,
-                        );
-                        if fret < 0 {
-                            ret = fret;
-                            error!("Error flushing bitstream filter at EOF: stream={stream_index}, ret={fret}");
-                            packet_pool.release(packet_box.packet);
-                            break;
+                        // Flush trailing BSF packets first. Skipped entirely when
+                        // no mux stream has a BSF.
+                        if has_bsf {
+                            let fret = flush_stream_bsf(
+                                &mut st_rescale_delta_last_map,
+                                oformat_flags,
+                                &mut st_last_dts_map,
+                                &out_fmt_ctx,
+                                &mut stream_bsfs,
+                                &stream_pkt_templates,
+                                stream_index,
+                                &packet_pool,
+                            );
+                            if fret < 0 {
+                                ret = fret;
+                                error!("Error flushing bitstream filter at EOF: stream={stream_index}, ret={fret}");
+                                packet_pool.release(packet_box.packet);
+                                break;
+                            }
                         }
                         stream_eof[stream_index] = true;
                         packet_pool.release(packet_box.packet);
@@ -555,27 +570,36 @@ fn _mux_init(
                     }
                 }
 
-                // write (bitstream-filter aware). With no BSF for this stream,
-                // `mux_filter_and_write_packet` calls exactly the same
-                // `write_packet` as before — zero behavior change.
+                // write. Without any BSF on this mux, take exactly the pre-BSF
+                // path (direct `write_packet`, no wrapper, no template).
                 if !packet_is_null(&packet_box.packet)
                     && (*packet_box.packet.as_ptr()).stream_index >= 0
                 {
-                    // Snapshot this stream's packet metadata so a later EOF
-                    // flush can stamp the BSF's trailing packets correctly.
-                    if stream_bsfs[stream_index].is_some() {
-                        stream_pkt_templates[stream_index] =
-                            Some(packet_box.packet_data.clone());
+                    if has_bsf {
+                        // Snapshot this stream's packet metadata so a later EOF
+                        // flush can stamp the BSF's trailing packets correctly.
+                        if stream_bsfs[stream_index].is_some() {
+                            stream_pkt_templates[stream_index] =
+                                Some(packet_box.packet_data.clone());
+                        }
+                        ret = mux_filter_and_write_packet(
+                            &mut st_rescale_delta_last_map,
+                            oformat_flags,
+                            &mut st_last_dts_map,
+                            &out_fmt_ctx,
+                            &mut packet_box,
+                            stream_bsfs[stream_index].as_mut(),
+                            &packet_pool,
+                        );
+                    } else {
+                        ret = write_packet(
+                            &mut st_rescale_delta_last_map,
+                            oformat_flags,
+                            &mut st_last_dts_map,
+                            &out_fmt_ctx,
+                            &mut packet_box,
+                        );
                     }
-                    ret = mux_filter_and_write_packet(
-                        &mut st_rescale_delta_last_map,
-                        oformat_flags,
-                        &mut st_last_dts_map,
-                        &out_fmt_ctx,
-                        &mut packet_box,
-                        stream_bsfs[stream_index].as_mut(),
-                        &packet_pool,
-                    );
                     packet_pool.release(packet_box.packet);
 
                     if ret == AVERROR_EOF {
@@ -751,14 +775,15 @@ unsafe fn init_bitstream_filters(
     bsf_chains: &StreamBsfChains,
     stream_count: usize,
 ) -> Result<Vec<Option<BitStreamFilter>>, (String, i32)> {
+    // No output requested a BSF: return an EMPTY vec (no allocation). The mux
+    // worker keys `has_bsf` off `is_empty()` and then takes byte-for-byte the
+    // pre-BSF path — no wrapper, no template, no flush.
+    if bsf_chains.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let mut stream_bsfs: Vec<Option<BitStreamFilter>> =
         (0..stream_count).map(|_| None).collect();
-
-    // No output requested a BSF: leave every slot None so the packet path stays
-    // byte-for-byte the pre-BSF path.
-    if bsf_chains.is_empty() {
-        return Ok(stream_bsfs);
-    }
 
     for i in 0..stream_count {
         let st = *(*out_fmt_ctx).streams.add(i);
@@ -826,19 +851,12 @@ unsafe fn mux_filter_and_write_packet(
         );
     };
 
-    // Empty packets carry no bitstream to filter (in ez they are stream-end
-    // markers or side-data-only). Feeding one to av_bsf_send_packet would be
-    // read as EOF and prematurely close the filter, so write it directly.
-    if packet_box.packet.is_empty() {
-        return write_packet(
-            st_rescale_delta_last_map,
-            oformat_flags,
-            st_last_dts_map,
-            out_fmt_ctx,
-            packet_box,
-        );
-    }
-
+    // Send every real packet to the filter, exactly like fftools
+    // mux_packet_filter (ffmpeg_mux.c). av_bsf_send_packet only treats a packet
+    // as EOF when it is FFmpeg-empty (data == NULL && side_data_elems == 0,
+    // AVPACKET_IS_EMPTY); side-data-only packets are filtered, not dropped. The
+    // stream-end markers (truly-empty packets) are already intercepted upstream
+    // and never reach this wrapper, so there is no premature-EOF hazard here.
     let pkt = packet_box.packet.as_mut_ptr();
     // Rescale into the filter's input timebase (fftools ffmpeg_mux.c).
     av_packet_rescale_ts(pkt, (*pkt).time_base, bsf.time_base_in());
