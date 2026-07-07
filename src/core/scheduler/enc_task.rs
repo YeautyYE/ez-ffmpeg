@@ -605,6 +605,24 @@ fn receive_frame(
     let mut frame_box = if !*opened {
         let mut frame_box = match receive_from(receiver, scheduler_status) {
             Ok(frame) => frame,
+            Err(SyncFrame::Break) => {
+                // The source disconnected before delivering the first frame:
+                // like the EOF-marker (null frame) case below, the encoder never
+                // opened, so this output stream never becomes ready and the muxer
+                // aborts on the ready-channel disconnect WITHOUT an error —
+                // reporting a false success. Record the failure so wait() surfaces
+                // it, unless we are shutting down (a clean stop is not a failure).
+                if !is_stopping(scheduler_status.load(Ordering::Acquire)) {
+                    let output_stream_index = unsafe { (*stream).index };
+                    error!("Source disconnected before any frame for output stream {output_stream_index}; encoder never opened");
+                    set_scheduler_error(
+                        scheduler_status,
+                        scheduler_result,
+                        OpenEncoder(OpenEncoderOperationError::NoFramesReceived),
+                    );
+                }
+                return SyncFrame::Break;
+            }
             Err(sync) => return sync,
         };
 
