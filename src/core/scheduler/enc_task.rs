@@ -8,6 +8,7 @@ use crate::error::{AllocPacketError, EncodeSubtitleError, EncodingError, Encodin
 use crate::core::scheduler::ffmpeg_scheduler::{
     frame_is_null, is_stopping, packet_is_null, set_scheduler_error, wait_until_not_paused, STATUS_ABORT,
 };
+use crate::core::scheduler::input_controller::InputController;
 use crate::hwaccel::hw_device_get_by_type;
 use crate::util::ffmpeg_utils::{av_err2str, hashmap_to_avdictionary, DictGuard};
 use crate::util::thread_synchronizer::{ThreadDoneGuard, ThreadSynchronizer};
@@ -61,6 +62,7 @@ pub(crate) fn enc_init(
     thread_sync: ThreadSynchronizer,
     enc_handle_sender: Sender<std::thread::JoinHandle<()>>,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
+    _input_controller: Arc<InputController>,
 ) -> crate::error::Result<()> {
     Ok(())
 }
@@ -86,6 +88,7 @@ pub(crate) fn enc_init(
     thread_sync: ThreadSynchronizer,
     enc_handle_sender: Sender<std::thread::JoinHandle<()>>,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
+    input_controller: Arc<InputController>,
 ) -> crate::error::Result<()> {
     let enc_ctx = unsafe { avcodec_alloc_context3(enc_stream.encoder) };
     if enc_ctx.is_null() {
@@ -172,6 +175,8 @@ pub(crate) fn enc_init(
             let (sq_lock, sq_cv) = (&h.queue.0, &h.queue.1);
             let sq_idx = h.sq_idx;
             let sq_finished: &[AtomicBool] = &h.sq_finished;
+            // This stream's own balancer flag, published at producer-EOF below.
+            let source_finished = h.source_finished.as_ref();
             const DRAIN_TICK: Duration = Duration::from_millis(100);
             let mut last_tb = AVRational { num: 1, den: 1 };
             let mut producer_eof = false;
@@ -190,7 +195,22 @@ pub(crate) fn enc_init(
                                                    &mut samples_sent, &mut frames_sent, &mut is_finished,
                                                    &scheduler_status, &scheduler_result);
                 let frame_box_opt = match sync_frame {
-                    SyncFrame::FrameBox(fb) => Some(fb),
+                    SyncFrame::FrameBox(fb) => {
+                        // A null frame is the upstream EOF marker (the filtergraph
+                        // sends it explicitly; the audio path also re-emits it out
+                        // of `process_audio_queue`), NOT a real frame — it must not
+                        // enter the sync queue (`sq_frame_end_tb` would deref a null
+                        // AVFrame). Release it and treat it exactly like `Break`:
+                        // producer-EOF -> drain phase, then the encoder is flushed
+                        // (send NULL) by the shared flush below since `finished`
+                        // stays false.
+                        if frame_is_null(&fb.frame) {
+                            frame_pool.release(fb.frame);
+                            producer_eof = true;
+                            break;
+                        }
+                        Some(fb)
+                    }
                     // timeout/dummy: no new frame, but a peer may have advanced the
                     // head -> still drain our own now-releasable frames.
                     SyncFrame::Continue => None,
@@ -224,9 +244,26 @@ pub(crate) fn enc_init(
                 }
             }
 
-            // ---- drain phase: my producer is done, but I may still hold frames a
-            // slower peer will release. Do not exit until my FIFO is drained. ----
+            // ---- drain phase: my producer is done — I hit producer-EOF or a
+            // shorter peer cascade-cut me — but I may still hold frames a slower
+            // peer will release. Do not exit until my FIFO is drained. ----
             if !stop {
+                // Publish this stream's balancer flag and re-balance BEFORE
+                // draining. A stream that has stopped producing MUST leave the
+                // input balancer at once — whether it hit producer-EOF or was
+                // cascade-cut by a shorter peer (`sq_finished`) — or its now-stale
+                // `last_dts` keeps choking a peer this drain waits on, deadlocking
+                // a job with 2+ encoded streams. FFmpeg reaches the same publish
+                // for both cases: it forwards the sync-queue EOF up the pipeline
+                // into `send_to_enc_sq(!frame)` (ffmpeg_sched.c:1916-1933, plus the
+                // decoder/filter EOF forwards at :2423-2435 / :2694-2698). The mux
+                // also publishes on its side, but only after this drain completes —
+                // too late to break the choke.
+                if let Some(sf) = source_finished {
+                    sf.store(true, Ordering::Release);
+                    input_controller.update_locked(&scheduler_status);
+                }
+
                 if producer_eof && !sq_finished[sq_idx].load(Ordering::Acquire) {
                     let mut local: Vec<FrameBox> = Vec::new();
                     {
