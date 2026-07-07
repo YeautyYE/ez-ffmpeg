@@ -14,7 +14,7 @@
 //! is graph-level and we must not silently pick one.
 
 use ez_ffmpeg::core::context::filter_complex::FilterComplex;
-use ez_ffmpeg::stream_info::{find_video_stream_info, StreamInfo};
+use ez_ffmpeg::stream_info::{find_audio_stream_info, find_video_stream_info, StreamInfo};
 use ez_ffmpeg::{FfmpegContext, FfmpegScheduler, Input, Output};
 use std::time::Duration;
 
@@ -118,6 +118,44 @@ fn invalid_sws_opts_fails_graph_config() {
     assert!(
         result.is_err(),
         "an invalid scale_sws_opts must fail graph configuration (proves the field is applied)"
+    );
+}
+
+/// Audio compat / canary: the same 44100 -> 48000 auto-aresample path, WITHOUT
+/// any swr opts, must still succeed. Confirms the aac encoder + resample path
+/// works, so the invalid-swr test below fails because of the opts, not an
+/// unrelated audio runtime failure.
+#[test]
+fn auto_resample_pipeline_without_opts_succeeds() {
+    let out = tmp_path("compat_no_swr_opts.m4a");
+    let result = wait_with_watchdog(
+        FfmpegContext::builder()
+            .input(
+                Input::from("sine=frequency=440:sample_rate=44100:duration=1")
+                    .set_format("lavfi"),
+            )
+            .output(
+                Output::from(out.as_str())
+                    .set_audio_codec("aac")
+                    .set_audio_sample_rate(48000)
+                    .set_max_audio_frames(20),
+            )
+            .build()
+            .unwrap()
+            .start()
+            .unwrap(),
+        60,
+        "compat no swr opts",
+    );
+    assert!(
+        result.is_ok(),
+        "an auto-resample pipeline with no swr opts must still succeed: {result:?}"
+    );
+    assert!(
+        find_audio_stream_info(&out)
+            .expect("failed to probe output")
+            .is_some(),
+        "compat audio pipeline must produce an audio stream"
     );
 }
 
