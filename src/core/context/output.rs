@@ -391,6 +391,18 @@ pub struct Output {
     /// When set, forces the output video to use the specified pixel format.
     /// Only effective when re-encoding (not when using stream copy).
     pub(crate) pix_fmt: Option<String>,
+
+    /// sws (libswscale) options for the `scale` filters libavfilter
+    /// auto-inserts ahead of this output's encoder. Maps to the graph-level
+    /// `AVFilterGraph.scale_sws_opts`. Default `None`. Set via
+    /// [`Output::set_sws_opts`].
+    pub(crate) sws_opts: Option<String>,
+
+    /// swr (libswresample) options for the `aresample` filters libavfilter
+    /// auto-inserts ahead of this output's encoder. Maps to the graph-level
+    /// `AVFilterGraph.aresample_swr_opts`. Default `None`. Set via
+    /// [`Output::set_swr_opts`].
+    pub(crate) swr_opts: Option<String>,
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -1912,6 +1924,62 @@ impl Output {
         self.pix_fmt = Some(pix_fmt.into());
         self
     }
+
+    /// Sets sws (libswscale) options for the `scale` filters libavfilter
+    /// **auto-inserts** to convert this output's frames to a format/size the
+    /// encoder accepts (pixel format, resolution, color).
+    ///
+    /// This maps to FFmpeg's graph-level `AVFilterGraph.scale_sws_opts`. It only
+    /// affects *auto-inserted* scaling; if you build the filtergraph yourself
+    /// with an explicit `scale=...`, that filter's own arguments still apply.
+    /// Has no effect on stream-copy (`-c:v copy`) outputs, which are not filtered.
+    ///
+    /// The string uses FFmpeg option syntax, e.g.
+    /// `"flags=lanczos+accurate_rnd"`. To see the available flags, run
+    /// `ffmpeg -h filter=scale`.
+    ///
+    /// # Graph-level, not per-output
+    /// FFmpeg applies these options to the whole filtergraph, not a single
+    /// output. When one filtergraph drives several outputs, they must not set
+    /// *different* non-empty values — that conflict is rejected when the graph is
+    /// configured. An explicit [`FilterComplex::set_sws_opts`](crate::core::context::filter_complex::FilterComplex::set_sws_opts)
+    /// takes precedence over this per-output value.
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// let output = Output::from("output.mp4")
+    ///     .set_sws_opts("flags=lanczos+accurate_rnd");
+    /// ```
+    pub fn set_sws_opts(mut self, opts: impl Into<String>) -> Self {
+        self.sws_opts = Some(opts.into());
+        self
+    }
+
+    /// Sets swr (libswresample) options for the `aresample` filters libavfilter
+    /// **auto-inserts** to convert this output's audio to a sample
+    /// format / rate / channel layout the encoder accepts.
+    ///
+    /// This maps to FFmpeg's graph-level `AVFilterGraph.aresample_swr_opts`. It
+    /// only affects *auto-inserted* resampling; an explicit `aresample=...` in a
+    /// hand-written filtergraph keeps its own arguments. Has no effect on
+    /// stream-copy outputs.
+    ///
+    /// The string uses FFmpeg option syntax, e.g.
+    /// `"resampler=soxr:precision=28"`.
+    ///
+    /// # Graph-level, not per-output
+    /// See [`set_sws_opts`](Self::set_sws_opts): the value is graph-level and the
+    /// same precedence / conflict rules apply.
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// let output = Output::from("output.mp4")
+    ///     .set_swr_opts("resampler=soxr:precision=28");
+    /// ```
+    pub fn set_swr_opts(mut self, opts: impl Into<String>) -> Self {
+        self.swr_opts = Some(opts.into());
+        self
+    }
 }
 
 impl From<Box<dyn FnMut(&[u8]) -> i32 + Send>> for Output {
@@ -1967,6 +2035,8 @@ impl From<Box<dyn FnMut(&[u8]) -> i32 + Send>> for Output {
             subtitle_disable: false,
             data_disable: false,
             pix_fmt: None,
+            sws_opts: None,
+            swr_opts: None,
         }
     }
 }
@@ -2024,6 +2094,8 @@ impl From<String> for Output {
             subtitle_disable: false,
             data_disable: false,
             pix_fmt: None,
+            sws_opts: None,
+            swr_opts: None,
         }
     }
 }

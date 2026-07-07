@@ -174,6 +174,13 @@ pub(crate) struct Muxer {
     // Parsed from string in open_output_file, stored as AVPixelFormat
     pub(crate) pix_fmt: Option<ffmpeg_sys_next::AVPixelFormat>,
 
+    // Auto-conversion tuning (NEW-SC-03): sws/swr option strings requested by
+    // this output for the auto-inserted scale/aresample filters. Threaded into
+    // the output's OutputFilterOptions in configure_output_filter_opts; the
+    // graph-level value is finally resolved and applied in filter_task.
+    pub(crate) sws_opts: Option<String>,
+    pub(crate) swr_opts: Option<String>,
+
     streams: Vec<EncoderStream>,
     queue: Option<(Sender<PacketBox>, Receiver<PacketBox>)>,
     src_pre_receivers: Vec<PreMuxQueueReceiver>,
@@ -255,6 +262,8 @@ impl Muxer {
         data_disable: bool,
         pix_fmt: Option<ffmpeg_sys_next::AVPixelFormat>,
         pre_mux_queue_config: PreMuxQueueConfig,
+        sws_opts: Option<String>,
+        swr_opts: Option<String>,
     ) -> Self {
         // Read oformat flags via the pointer BEFORE moving `out_fmt_ctx` into the
         // struct (the field can no longer be the access path once it's moved).
@@ -311,6 +320,8 @@ impl Muxer {
             subtitle_disable,
             data_disable,
             pix_fmt,
+            sws_opts,
+            swr_opts,
         }
     }
 
