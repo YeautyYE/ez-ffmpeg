@@ -271,6 +271,23 @@ pub struct Input {
     /// of the FFmpeg input pipeline.
     pub(crate) input_opts: Option<HashMap<String, String>>,
 
+    /// Whether to probe stream information with `avformat_find_stream_info`
+    /// after opening the input (default: `true`).
+    ///
+    /// Probing reads ahead to fill in stream parameters the container header
+    /// does not carry (frame rate, pixel format, extradata, ...). Disabling it
+    /// (`false`) skips that read-ahead — useful for low-latency or
+    /// known-format inputs — but may leave `codecpar` incomplete downstream.
+    pub(crate) find_stream_info: bool,
+
+    /// Per-stream codec options used only while probing stream information
+    /// inside `avformat_find_stream_info`, keyed by stream index.
+    ///
+    /// These configure the temporary probing codec contexts (e.g.
+    /// `skip_frame`, `lowres`); they are separate from the decoder options
+    /// applied at decode time (`set_video_codec_opt` and friends).
+    pub(crate) find_stream_info_codec_opts: Option<HashMap<usize, HashMap<String, String>>>,
+
     /// Automatically rotate video based on display matrix metadata.
     ///
     /// When enabled (default), videos with rotation metadata (common in smartphone
@@ -1128,6 +1145,109 @@ impl Input {
         self
     }
 
+    /// Enables or disables stream-information probing (`avformat_find_stream_info`)
+    /// after the input is opened. Enabled by default.
+    ///
+    /// Probing reads ahead in the input to fill stream parameters the
+    /// container header does not carry. Disabling it cuts startup latency and
+    /// read-ahead, which suits **low-latency or known-format inputs** (e.g. a
+    /// live stream whose container already exposes complete stream headers).
+    ///
+    /// **Warning:** with probing disabled, FFmpeg only knows what the
+    /// container header declares. Formats that reveal streams or codec
+    /// parameters progressively (raw streams, some MPEG-TS variants) may
+    /// yield **incomplete `codecpar`** — decoders, filters, or stream copy
+    /// further down the pipeline can then fail or misbehave. If no stream at
+    /// all is visible at open time, the input is rejected with
+    /// `FindStreamError::NoStreamFound`.
+    ///
+    /// To shrink probing instead of skipping it, prefer
+    /// `set_input_opt("probesize", ...)` / `set_input_opt("analyzeduration", ...)`.
+    ///
+    /// # Parameters
+    /// - `enabled`: `true` to probe (default), `false` to trust the container header.
+    ///
+    /// # Returns
+    /// * `Self` - allowing method chaining.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// // Known-format low-latency ingest: skip the probing read-ahead.
+    /// let input = Input::from("rtmp://example.com/live/stream")
+    ///     .set_find_stream_info(false);
+    /// ```
+    pub fn set_find_stream_info(mut self, enabled: bool) -> Self {
+        self.find_stream_info = enabled;
+        self
+    }
+
+    /// Sets a codec option applied to one stream's **probing** codec context
+    /// inside `avformat_find_stream_info`.
+    ///
+    /// The options only affect the temporary decoders FFmpeg opens while
+    /// probing (they can speed probing up or work around quirky streams);
+    /// they are **not** the decode-time options — use
+    /// [`set_video_codec_opt`](Self::set_video_codec_opt) and friends for
+    /// those. They are ignored when probing is disabled via
+    /// [`set_find_stream_info(false)`](Self::set_find_stream_info).
+    ///
+    /// # Parameters
+    /// - `stream_index`: Index of the stream the option applies to. Must be a
+    ///   valid index of the opened input (`< nb_streams`), otherwise opening
+    ///   the input fails with `FindStreamError::InvalidArgument`.
+    /// - `key`: The codec option name (e.g., `"skip_frame"`).
+    /// - `value`: The option value (e.g., `"nokey"`).
+    ///
+    /// # Returns
+    /// * `Self` - allowing method chaining.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let input = Input::from("video.mp4")
+    ///     .set_find_stream_info_codec_opt(0, "skip_frame", "nokey");
+    /// ```
+    pub fn set_find_stream_info_codec_opt(
+        mut self,
+        stream_index: usize,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.find_stream_info_codec_opts
+            .get_or_insert_with(HashMap::new)
+            .entry(stream_index)
+            .or_default()
+            .insert(key.into(), value.into());
+        self
+    }
+
+    /// **Sets multiple probing codec options at once** for one stream of
+    /// `avformat_find_stream_info` (see
+    /// [`set_find_stream_info_codec_opt`](Self::set_find_stream_info_codec_opt)).
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let input = Input::from("video.mp4")
+    ///     .set_find_stream_info_codec_opts(0, vec![
+    ///         ("skip_frame", "nokey"),
+    ///         ("lowres", "1")
+    ///     ]);
+    /// ```
+    pub fn set_find_stream_info_codec_opts(
+        mut self,
+        stream_index: usize,
+        opts: Vec<(impl Into<String>, impl Into<String>)>,
+    ) -> Self {
+        let stream_opts = self
+            .find_stream_info_codec_opts
+            .get_or_insert_with(HashMap::new)
+            .entry(stream_index)
+            .or_default();
+        for (key, value) in opts {
+            stream_opts.insert(key.into(), value.into());
+        }
+        self
+    }
+
     /// Sets whether to automatically rotate video based on display matrix metadata.
     ///
     /// When enabled (default is `true`), videos with rotation metadata (common in
@@ -1257,6 +1377,8 @@ impl From<Box<dyn FnMut(&mut [u8]) -> i32 + Send>> for Input {
             hwaccel_output_format: None,
             log_level_offset: None,
             input_opts: None,
+            find_stream_info: true,
+            find_stream_info_codec_opts: None,
             autorotate: None,
             ts_scale: None,
             framerate: None,
@@ -1289,6 +1411,8 @@ impl From<String> for Input {
             hwaccel_output_format: None,
             log_level_offset: None,
             input_opts: None,
+            find_stream_info: true,
+            find_stream_info_codec_opts: None,
             autorotate: None,
             ts_scale: None,
             framerate: None,
@@ -1413,6 +1537,43 @@ mod tests {
             Some("CP1252")
         );
         assert!(input.video_codec_opts.is_none());
+    }
+
+    #[test]
+    fn find_stream_info_defaults_to_enabled() {
+        let input = Input::from("test.mp4");
+        assert!(input.find_stream_info);
+        assert!(input.find_stream_info_codec_opts.is_none());
+
+        let input = Input::new_by_read_callback(|_buf| 0);
+        assert!(input.find_stream_info);
+        assert!(input.find_stream_info_codec_opts.is_none());
+    }
+
+    #[test]
+    fn set_find_stream_info_toggles() {
+        let input = Input::from("test.mp4").set_find_stream_info(false);
+        assert!(!input.find_stream_info);
+        let input = input.set_find_stream_info(true);
+        assert!(input.find_stream_info);
+    }
+
+    #[test]
+    fn set_find_stream_info_codec_opts_merges_per_stream() {
+        let input = Input::from("test.mp4")
+            .set_find_stream_info_codec_opt(0, "skip_frame", "default")
+            .set_find_stream_info_codec_opts(0, vec![("skip_frame", "nokey"), ("lowres", "1")])
+            .set_find_stream_info_codec_opt(2, "skip_frame", "all");
+        let opts = input.find_stream_info_codec_opts.as_ref().unwrap();
+        assert_eq!(opts.len(), 2, "sparse stream indices stay separate entries");
+        let stream0 = opts.get(&0).unwrap();
+        assert_eq!(stream0.get("skip_frame").map(String::as_str), Some("nokey"));
+        assert_eq!(stream0.get("lowres").map(String::as_str), Some("1"));
+        assert_eq!(
+            opts.get(&2).unwrap().get("skip_frame").map(String::as_str),
+            Some("all")
+        );
+        assert!(opts.get(&1).is_none());
     }
 
     #[test]
