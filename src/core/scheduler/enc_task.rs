@@ -1490,7 +1490,7 @@ fn send_to_mux(
         if Instant::now() >= deadline {
             error!(
                 "pre-mux queue stayed full for {}s before the muxer started; raise \
-                 Output::set_max_muxing_queue_size / set_muxing_queue_data_threshold, \
+                 Output::set_max_muxing_queue_size / Output::set_muxing_queue_data_threshold, \
                  or check that every mapped output stream receives data",
                 PRE_MUX_FULL_BACKSTOP.as_secs()
             );

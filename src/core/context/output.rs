@@ -473,11 +473,13 @@ impl Output {
     /// packet cap does not apply (FFmpeg `-muxing_queue_data_threshold`
     /// parity; default 50 MiB).
     ///
-    /// This bounds the memory a fast encoder can park before the muxer
-    /// starts, and doubles as the demux read-ahead window: jobs that must
-    /// read further ahead (late first packet on one mapped stream) need a
-    /// larger threshold. See
-    /// [`set_max_muxing_queue_size`](Output::set_max_muxing_queue_size).
+    /// This is a trigger, not a hard byte cap: below the threshold the packet
+    /// count is unbounded, and above it admission stops at
+    /// [`max_muxing_queue_size`](Output::set_max_muxing_queue_size). Together
+    /// they bound how much a fast encoder parks before the muxer starts, which
+    /// doubles as the demux read-ahead window: jobs that must read further
+    /// ahead (late first packet on one mapped stream) need a larger threshold
+    /// (and/or packet cap).
     ///
     /// # Panics
     /// Panics if `bytes` is 0.

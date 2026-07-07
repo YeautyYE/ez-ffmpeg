@@ -184,6 +184,13 @@ fn mux_task_start(mux_idx: usize,
                   scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,) -> crate::error::Result<()> {
 
     if queue.is_none() {
+        // Zero-stream output (e.g. an AVFMT_NOSTREAMS muxer): no mux worker
+        // thread will be spawned to release this muxer's pre-counted thread
+        // slot, so release it here — otherwise wait()/stop() hangs forever on
+        // the leaked slot (pre-existing; surfaced by the PERF-12 slot-leak
+        // review). A streamless output is legitimate for such formats, so this
+        // is not an error.
+        release_mux_slot(&scheduler_status, &thread_sync);
         // `out_fmt_ctx` is owned here: this early return drops it, freeing the
         // context. Previously the raw pointer was leaked on this zero-stream path.
         return Ok(());
@@ -543,6 +550,17 @@ fn _mux_init(
     Ok(())
 }
 
+/// Releases a muxer's pre-counted thread slot, publishing STATUS_END if this
+/// was the last live thread (mirroring the normal mux-worker exit). Used on
+/// every path where the slot was counted at scheduler start but no (further)
+/// worker will release it: streamless output, write_header failure, worker
+/// spawn failure. Without this the slot leaks and wait()/stop() hangs forever.
+fn release_mux_slot(scheduler_status: &Arc<AtomicUsize>, thread_sync: &ThreadSynchronizer) {
+    thread_sync.thread_done_with(|| {
+        scheduler_status.store(STATUS_END, Ordering::Release);
+    });
+}
+
 /// Records a mux-init failure and releases this muxer's pre-counted thread
 /// slot, in that order: the error must be visible before wait() can observe
 /// "all threads done" (set_scheduler_error also publishes STATUS_END, which
@@ -554,9 +572,7 @@ fn fail_mux_init(
     error: crate::error::Error,
 ) {
     set_scheduler_error(scheduler_status, scheduler_result, error);
-    thread_sync.thread_done_with(|| {
-        scheduler_status.store(STATUS_END, Ordering::Release);
-    });
+    release_mux_slot(scheduler_status, thread_sync);
 }
 
 unsafe fn update_last_dts(mux_stream_node: &Arc<SchNode>, input_controller: &Arc<InputController>, scheduler_status: &Arc<AtomicUsize>, pkt: *const AVPacket) {
@@ -816,5 +832,31 @@ mod tests {
             &*scheduler_result.lock().unwrap(),
             Some(Err(_))
         ));
+    }
+
+    /// The zero-stream (AVFMT_NOSTREAMS) early return must release the
+    /// pre-counted slot WITHOUT recording an error — a streamless output is
+    /// legitimate, but leaving the slot counted hangs wait()/stop() (the
+    /// pre-existing leak surfaced by the slot-leak review).
+    #[test]
+    fn release_mux_slot_unblocks_wait_without_error() {
+        let thread_sync = ThreadSynchronizer::new();
+        let scheduler_status = Arc::new(AtomicUsize::new(STATUS_RUN));
+
+        thread_sync.thread_start();
+        release_mux_slot(&scheduler_status, &thread_sync);
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let sync_clone = thread_sync.clone();
+        std::thread::spawn(move || {
+            sync_clone.wait_for_all_threads();
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "zero-stream mux slot leaked: wait_for_all_threads did not return"
+        );
+        // Last thread released: STATUS_END published, but no error recorded.
+        assert!(is_stopping(scheduler_status.load(Ordering::Acquire)));
     }
 }
