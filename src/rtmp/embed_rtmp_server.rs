@@ -3,7 +3,9 @@ use crate::error::Error::{RtmpCreateStream, RtmpStreamAlreadyExists};
 use crate::flv::flv_buffer::FlvBuffer;
 use crate::flv::flv_tag::FlvTag;
 use crate::rtmp::poller::{waker_pair, WakeHandle, Waker};
-use crate::rtmp::reactor::{effective_max_connections, Reactor, CHANNEL_HEADROOM};
+use crate::rtmp::reactor::{
+    effective_max_connections, PublisherFeed, PublisherSource, Reactor, CHANNEL_HEADROOM,
+};
 use bytes::{BufMut, Bytes};
 use log::{debug, error, info, warn};
 use rml_rtmp::chunk_io::ChunkSerializer;
@@ -29,8 +31,8 @@ pub struct EmbedRtmpServer<S> {
     bound_addr: Option<std::net::SocketAddr>,
     status: Arc<AtomicUsize>,
     stream_keys: dashmap::DashSet<String>,
-    // stream_key bytes_receiver
-    publisher_sender: Option<crossbeam_channel::Sender<(String, crossbeam_channel::Receiver<Vec<u8>>)>>,
+    // stream_key -> publisher source (raw byte path or media-bypass feed)
+    publisher_sender: Option<crossbeam_channel::Sender<(String, PublisherSource)>>,
     /// Producer-side wakeup for the reactor (PERF-3), set in `start()`.
     wake_handle: Option<WakeHandle>,
     gop_limit: usize,
@@ -328,15 +330,21 @@ impl EmbedRtmpServer<Running> {
         app_name: impl Into<String>,
         stream_key: impl Into<String>,
     ) -> crate::error::Result<Output> {
-        let message_sender = self.create_stream_sender(app_name, stream_key)?;
-        // PERF-3: signal the reactor when media is queued so it does not wait
-        // for the poll-timeout fallback. Only this internal path holds a
-        // WakeHandle; raw create_stream_sender users fall back to the timeout.
+        // PERF-5a serialize-bypass: steady-state audio/video FLV tags are
+        // handed to the scheduler already parsed (PublisherFeed::Media),
+        // skipping the serialize→loopback→re-parse round-trip. Metadata and
+        // control still travel as serialized RTMP chunk bytes on the same FIFO
+        // feed (PublisherFeed::Raw), so the scheduler observes an identical,
+        // in-order sequence to the pure-serialize path. External TCP clients
+        // are unaffected — they never touch this feed.
+        let feed_sender = self.create_bypass_feed_sender(app_name, stream_key)?;
+        // PERF-3: only this internal path holds a WakeHandle (raw
+        // create_stream_sender users fall back to the poll timeout). Wake once
+        // now so the reactor flushes the queued connect/createStream/publish
+        // handshake immediately instead of waiting for the first media frame or
+        // the 100ms poll fallback — otherwise stream setup carries avoidable
+        // startup latency.
         let wake_handle = self.wake_handle.clone();
-        // create_stream_sender already queued the connect/createStream/publish
-        // handshake. Wake once so the reactor flushes it immediately instead of
-        // waiting for the first media frame (or the 100ms poll fallback) to
-        // arrive — otherwise stream setup carries an avoidable startup latency.
         if let Some(waker) = &wake_handle {
             waker.wake();
         }
@@ -350,9 +358,41 @@ impl EmbedRtmpServer<Running> {
             // grows and the final tags of the stream are never sent.
             while let Some(mut flv_tag) = flv_buffer.get_flv_tag() {
                 flv_tag.header.stream_id = 1;
+                let tag_type = flv_tag.header.tag_type;
+
+                // 0x08 audio / 0x09 video: bypass the serializer. The
+                // (timestamp, data) handed over is byte-identical to what
+                // flv_tag_to_message_payload would build and the RTMP chunk
+                // round-trip would reconstruct, so the scheduler's sequence-
+                // header / keyframe-gate / GOP semantics are preserved exactly.
+                if tag_type == 0x08 || tag_type == 0x09 {
+                    let timestamp = flv_tag.header.timestamp
+                        | ((flv_tag.header.timestamp_ext as u32) << 24);
+                    let feed = PublisherFeed::Media {
+                        tag_type,
+                        timestamp: RtmpTimestamp { value: timestamp },
+                        data: flv_tag.data,
+                    };
+                    if let Err(e) = feed_sender.send(feed) {
+                        error!("Failed to send in-process media tag: {:?}", e);
+                        return -1;
+                    }
+                    // PERF-3: wake the reactor for each bypassed media tag, the
+                    // same as the Raw path below — without it the parsed tag
+                    // waits in the feed until the 100ms poll fallback, negating
+                    // the PERF-5a bypass. The token coalesces repeated wakes.
+                    if let Some(waker) = &wake_handle {
+                        waker.wake();
+                    }
+                    continue;
+                }
+
+                // 0x12 metadata and anything else keep the serialize path: the
+                // scheduler consumes the parsed StreamMetadataChanged event,
+                // which needs the @setDataFrame wrapping + AMF decode.
                 match serializer.serialize(&flv_tag_to_message_payload(flv_tag), false, true) {
                     Ok(packet) => {
-                        if let Err(e) = message_sender.send(packet.bytes) {
+                        if let Err(e) = feed_sender.send(PublisherFeed::Raw(packet.bytes)) {
                             error!("Failed to send RTMP packet: {:?}", e);
                             return -1;
                         }
@@ -421,7 +461,55 @@ impl EmbedRtmpServer<Running> {
         }
 
         let (sender, receiver) = crossbeam_channel::bounded(1024);
+        self.register_publisher(stream_key.clone(), PublisherSource::Raw(receiver))?;
 
+        // Prime the raw byte channel with the connect / createStream / publish
+        // handshake the server session expects before any media.
+        for packet_bytes in build_publish_control(app_name.into(), stream_key)? {
+            if sender.send(packet_bytes).is_err() {
+                error!("Can't send publish control command to rtmp server.");
+                return Err(RtmpCreateStream.into());
+            }
+        }
+        Ok(sender)
+    }
+
+    /// Registers an in-process publisher whose steady-state audio/video is
+    /// delivered already parsed (PERF-5a serialize-bypass). Metadata and
+    /// control still ride the same feed as serialized RTMP chunk bytes, so the
+    /// scheduler sees an identical, in-order message sequence to the raw path.
+    ///
+    /// Returns the feed sender, primed with the publish handshake.
+    fn create_bypass_feed_sender(
+        &self,
+        app_name: impl Into<String>,
+        stream_key: impl Into<String>,
+    ) -> crate::error::Result<crossbeam_channel::Sender<PublisherFeed>> {
+        let stream_key = stream_key.into();
+        if self.stream_keys.contains(&stream_key) {
+            return Err(RtmpStreamAlreadyExists(stream_key));
+        }
+
+        let (sender, receiver) = crossbeam_channel::bounded(1024);
+        self.register_publisher(stream_key.clone(), PublisherSource::Feed(receiver))?;
+
+        // Prime the feed with the same connect / createStream / publish bytes
+        // the raw path would send, wrapped as PublisherFeed::Raw.
+        for packet_bytes in build_publish_control(app_name.into(), stream_key)? {
+            if sender.send(PublisherFeed::Raw(packet_bytes)).is_err() {
+                error!("Can't send publish control command to rtmp server.");
+                return Err(RtmpCreateStream.into());
+            }
+        }
+        Ok(sender)
+    }
+
+    /// Hands a newly registered publisher's receiving end to the reactor.
+    fn register_publisher(
+        &self,
+        stream_key: String,
+        source: PublisherSource,
+    ) -> crate::error::Result<()> {
         let publisher_sender = match self.publisher_sender.as_ref() {
             Some(sender) => sender,
             None => {
@@ -430,7 +518,7 @@ impl EmbedRtmpServer<Running> {
             }
         };
 
-        if let Err(_) = publisher_sender.send((stream_key.clone(), receiver)) {
+        if publisher_sender.send((stream_key, source)).is_err() {
             if self.status.load(Ordering::Acquire) != STATUS_END {
                 warn!("Rtmp server worker already exited. Can't create stream sender.");
             } else {
@@ -438,104 +526,7 @@ impl EmbedRtmpServer<Running> {
             }
             return Err(RtmpCreateStream.into());
         }
-
-        let mut serializer = ChunkSerializer::new();
-
-        // send connect
-        let mut properties: HashMap<String, Amf0Value> = HashMap::new();
-        properties.insert("app".to_string(), Amf0Value::Utf8String(app_name.into()));
-        let connect_cmd = RtmpMessage::Amf0Command {
-            command_name: "connect".to_string(),
-            transaction_id: 1.0,
-            command_object: Amf0Value::Object(properties),
-            additional_arguments: Vec::new(),
-        }
-        .into_message_payload(RtmpTimestamp { value: 0 }, 0);
-
-        let connect_cmd = match connect_cmd {
-            Ok(cmd) => cmd,
-            Err(e) => {
-                error!("Failed to create connect command: {:?}", e);
-                return Err(RtmpCreateStream.into());
-            }
-        };
-
-        let connect_packet = match serializer.serialize(&connect_cmd, false, true) {
-            Ok(packet) => packet,
-            Err(e) => {
-                error!("Failed to serialize connect command: {:?}", e);
-                return Err(RtmpCreateStream.into());
-            }
-        };
-
-        if let Err(_) = sender.send(connect_packet.bytes) {
-            error!("Can't send connect command to rtmp server.");
-            return Err(RtmpCreateStream.into());
-        }
-
-        // send createStream
-        let create_stream_cmd = RtmpMessage::Amf0Command {
-            command_name: "createStream".to_string(),
-            transaction_id: 2.0,
-            command_object: Amf0Value::Null,
-            additional_arguments: Vec::new(),
-        }
-        .into_message_payload(RtmpTimestamp { value: 0 }, 1);
-
-        let create_stream_cmd = match create_stream_cmd {
-            Ok(cmd) => cmd,
-            Err(e) => {
-                error!("Failed to create createStream command: {:?}", e);
-                return Err(RtmpCreateStream.into());
-            }
-        };
-
-        let create_stream_packet = match serializer.serialize(&create_stream_cmd, false, true) {
-            Ok(packet) => packet,
-            Err(e) => {
-                error!("Failed to serialize createStream command: {:?}", e);
-                return Err(RtmpCreateStream.into());
-            }
-        };
-
-        if let Err(_) = sender.send(create_stream_packet.bytes) {
-            error!("Can't send createStream command to rtmp server.");
-            return Err(RtmpCreateStream.into());
-        }
-
-        // send publish
-        let mut arguments = Vec::new();
-        arguments.push(Amf0Value::Utf8String(stream_key));
-        arguments.push(Amf0Value::Utf8String("live".into()));
-        let publish_cmd = RtmpMessage::Amf0Command {
-            command_name: "publish".to_string(),
-            transaction_id: 3.0,
-            command_object: Amf0Value::Null,
-            additional_arguments: arguments,
-        }
-        .into_message_payload(RtmpTimestamp { value: 0 }, 1);
-
-        let publish_cmd = match publish_cmd {
-            Ok(cmd) => cmd,
-            Err(e) => {
-                error!("Failed to create publish command: {:?}", e);
-                return Err(RtmpCreateStream.into());
-            }
-        };
-
-        let publish_packet = match serializer.serialize(&publish_cmd, false, true) {
-            Ok(packet) => packet,
-            Err(e) => {
-                error!("Failed to serialize publish command: {:?}", e);
-                return Err(RtmpCreateStream.into());
-            }
-        };
-
-        if let Err(_) = sender.send(publish_packet.bytes) {
-            error!("Can't send publish command to rtmp server.");
-            return Err(RtmpCreateStream.into());
-        }
-        Ok(sender)
+        Ok(())
     }
 
     /// Stops the RTMP server by signaling the listening and connection-handling threads
@@ -583,7 +574,7 @@ fn is_fd_exhaustion(e: &std::io::Error) -> bool {
 
 fn handle_connections(
     connection_receiver: crossbeam_channel::Receiver<TcpStream>,
-    publisher_receiver: crossbeam_channel::Receiver<(String, crossbeam_channel::Receiver<Vec<u8>>)>,
+    publisher_receiver: crossbeam_channel::Receiver<(String, PublisherSource)>,
     stream_keys: dashmap::DashSet<String>,
     gop_limit: usize,
     max_connections: Option<usize>,
@@ -606,6 +597,81 @@ fn handle_connections(
     if status.load(Ordering::Acquire) != STATUS_END {
         error!("Rtmp Server aborted.");
     }
+}
+
+/// Serializes the `connect` / `createStream` / `publish` command sequence an
+/// in-process publisher sends before any media. Shared by both the raw byte
+/// path ([`create_stream_sender`](EmbedRtmpServer<Running>::create_stream_sender))
+/// and the media-bypass path ([`create_rtmp_input`](EmbedRtmpServer<Running>::create_rtmp_input))
+/// so their control bytes stay identical.
+pub(crate) fn build_publish_control(
+    app_name: String,
+    stream_key: String,
+) -> crate::error::Result<[Vec<u8>; 3]> {
+    let mut serializer = ChunkSerializer::new();
+
+    // connect
+    let mut properties: HashMap<String, Amf0Value> = HashMap::new();
+    properties.insert("app".to_string(), Amf0Value::Utf8String(app_name));
+    let connect_cmd = RtmpMessage::Amf0Command {
+        command_name: "connect".to_string(),
+        transaction_id: 1.0,
+        command_object: Amf0Value::Object(properties),
+        additional_arguments: Vec::new(),
+    }
+    .into_message_payload(RtmpTimestamp { value: 0 }, 0)
+    .map_err(|e| {
+        error!("Failed to create connect command: {:?}", e);
+        RtmpCreateStream
+    })?;
+    let connect_packet = serializer.serialize(&connect_cmd, false, true).map_err(|e| {
+        error!("Failed to serialize connect command: {:?}", e);
+        RtmpCreateStream
+    })?;
+
+    // createStream
+    let create_stream_cmd = RtmpMessage::Amf0Command {
+        command_name: "createStream".to_string(),
+        transaction_id: 2.0,
+        command_object: Amf0Value::Null,
+        additional_arguments: Vec::new(),
+    }
+    .into_message_payload(RtmpTimestamp { value: 0 }, 1)
+    .map_err(|e| {
+        error!("Failed to create createStream command: {:?}", e);
+        RtmpCreateStream
+    })?;
+    let create_stream_packet = serializer.serialize(&create_stream_cmd, false, true).map_err(|e| {
+        error!("Failed to serialize createStream command: {:?}", e);
+        RtmpCreateStream
+    })?;
+
+    // publish
+    let arguments = vec![
+        Amf0Value::Utf8String(stream_key),
+        Amf0Value::Utf8String("live".into()),
+    ];
+    let publish_cmd = RtmpMessage::Amf0Command {
+        command_name: "publish".to_string(),
+        transaction_id: 3.0,
+        command_object: Amf0Value::Null,
+        additional_arguments: arguments,
+    }
+    .into_message_payload(RtmpTimestamp { value: 0 }, 1)
+    .map_err(|e| {
+        error!("Failed to create publish command: {:?}", e);
+        RtmpCreateStream
+    })?;
+    let publish_packet = serializer.serialize(&publish_cmd, false, true).map_err(|e| {
+        error!("Failed to serialize publish command: {:?}", e);
+        RtmpCreateStream
+    })?;
+
+    Ok([
+        connect_packet.bytes,
+        create_stream_packet.bytes,
+        publish_packet.bytes,
+    ])
 }
 
 pub fn flv_tag_to_message_payload(flv_tag: FlvTag) -> MessagePayload {
@@ -926,6 +992,128 @@ impl EmbedRtmpServer<Initialization> {
     /// ```
     pub fn stream_builder() -> StreamBuilder {
         StreamBuilder::new()
+    }
+}
+
+#[cfg(test)]
+mod bypass_parity_tests {
+    //! PERF-5a: the in-process media bypass hands the scheduler a
+    //! `(timestamp, data)` pair taken directly from the parsed FLV tag. These
+    //! tests prove that pair is byte-identical to what the pure-serialize path
+    //! reconstructs (FLV tag -> `flv_tag_to_message_payload` -> RTMP chunk
+    //! serialize -> deserialize -> `MessagePayload`), so the scheduler observes
+    //! an identical sequence either way.
+    use super::*;
+    use crate::flv::flv_tag::FlvTag;
+    use crate::flv::flv_tag_header::FlvTagHeader;
+    use rml_rtmp::chunk_io::ChunkDeserializer;
+
+    fn make_tag(tag_type: u8, timestamp: u32, timestamp_ext: u8, data: Vec<u8>) -> FlvTag {
+        FlvTag {
+            header: FlvTagHeader {
+                tag_type,
+                data_size: data.len() as u32,
+                timestamp,
+                timestamp_ext,
+                stream_id: 1,
+            },
+            data: Bytes::from(data),
+            previous_tag_size: 0,
+        }
+    }
+
+    /// Assert the bypass `(timestamp, data)` equals the serialize round-trip.
+    fn assert_parity(tag_type: u8, timestamp: u32, timestamp_ext: u8, data: Vec<u8>) {
+        let tag = make_tag(tag_type, timestamp, timestamp_ext, data);
+
+        // What the bypass path hands to the scheduler, straight from the tag.
+        let bypass_timestamp = tag.header.timestamp | ((tag.header.timestamp_ext as u32) << 24);
+        let bypass_data = tag.data.clone();
+
+        // What the serialize path reconstructs: payload -> chunk bytes ->
+        // deserialize -> payload.
+        let payload = flv_tag_to_message_payload(tag);
+        let mut serializer = ChunkSerializer::new();
+        let packet = serializer
+            .serialize(&payload, false, true)
+            .expect("serialize");
+        let mut deserializer = ChunkDeserializer::new();
+        let round = deserializer
+            .get_next_message(&packet.bytes)
+            .expect("deserialize")
+            .expect("a complete message from the serialized chunks");
+
+        assert_eq!(
+            round.type_id, tag_type,
+            "tag type parity for {tag_type:#04x}"
+        );
+        assert_eq!(
+            round.timestamp.value, bypass_timestamp,
+            "timestamp parity for tag {tag_type:#04x}"
+        );
+        assert_eq!(
+            round.data, bypass_data,
+            "payload parity for tag {tag_type:#04x}"
+        );
+    }
+
+    #[test]
+    fn video_sequence_header_round_trips_identically() {
+        // AVC sequence header (0x17 0x00 ...), timestamp 0.
+        assert_parity(
+            0x09,
+            0,
+            0,
+            vec![0x17, 0x00, 0x00, 0x00, 0x00, 0x01, 0x64, 0x00, 0x1f],
+        );
+    }
+
+    #[test]
+    fn audio_sequence_header_round_trips_identically() {
+        // AAC AudioSpecificConfig (0xaf 0x00 ...).
+        assert_parity(0x08, 0, 0, vec![0xaf, 0x00, 0x12, 0x10]);
+    }
+
+    #[test]
+    fn large_idr_spanning_multiple_chunks_round_trips_identically() {
+        // A keyframe larger than the default 128-byte chunk size forces the
+        // serializer to split it into continuation chunks; the deserializer
+        // must reassemble the exact same bytes.
+        let mut data = vec![0x17, 0x01, 0x00, 0x00, 0x00];
+        data.extend((0u16..400).map(|i| (i & 0xff) as u8));
+        assert_parity(0x09, 0x1234, 0, data);
+    }
+
+    #[test]
+    fn delta_frame_round_trips_identically() {
+        assert_parity(0x09, 0x0001_0000, 0, vec![0x27, 0x01, 0x00, 0x11, 0x22]);
+    }
+
+    #[test]
+    fn extended_timestamp_round_trips_identically() {
+        // timestamp field saturated (0xFFFFFF) plus an extension byte forces
+        // the RTMP extended-timestamp encoding; the full 32-bit value must
+        // survive the round-trip.
+        assert_parity(0x08, 0x00ff_ffff, 0x01, vec![0xaf, 0x01, 0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn audio_and_video_tags_never_wrap_their_payload() {
+        // Unlike 0x12 metadata (which flv_tag_to_message_payload prefixes with
+        // @setDataFrame), media payloads must pass through untouched — the
+        // bypass relies on this to skip the serializer entirely.
+        let audio = make_tag(0x08, 10, 0, vec![0xaf, 0x01, 0x01, 0x02, 0x03]);
+        let video = make_tag(0x09, 10, 0, vec![0x27, 0x01, 0x09, 0x08, 0x07]);
+        assert_eq!(
+            flv_tag_to_message_payload(audio.clone()).data,
+            audio.data,
+            "audio payload must not be wrapped"
+        );
+        assert_eq!(
+            flv_tag_to_message_payload(video.clone()).data,
+            video.data,
+            "video payload must not be wrapped"
+        );
     }
 }
 

@@ -508,10 +508,74 @@ impl ReactorConnection {
 // Publisher State
 // ============================================================================
 
+/// One item fed by an in-process publisher.
+///
+/// The steady-state media path (PERF-5a) short-circuits the serialize→
+/// reparse round-trip: audio/video FLV tags arrive already parsed as
+/// [`PublisherFeed::Media`] and go straight to the channel machinery, while
+/// control and metadata bytes stay on [`PublisherFeed::Raw`] (fed to the
+/// session's `handle_input`). Both variants travel a single FIFO channel, so
+/// the total ordering the serialize path guarantees is preserved exactly.
+pub enum PublisherFeed {
+    /// RTMP chunk bytes to feed to the session (handshake-free control,
+    /// createStream/publish, and `0x12` metadata).
+    Raw(Vec<u8>),
+    /// A pre-parsed audio (`0x08`) or video (`0x09`) FLV tag.
+    Media {
+        tag_type: u8,
+        timestamp: RtmpTimestamp,
+        data: Bytes,
+    },
+}
+
+/// How a registered publisher delivers its data.
+///
+/// - [`PublisherSource::Raw`] is the public `create_stream_sender` path:
+///   opaque RTMP chunk bytes, byte-identical to the pre-PERF-5a behaviour.
+/// - [`PublisherSource::Feed`] is the `create_rtmp_input` path that mixes
+///   bypassed media tags with raw control/metadata bytes.
+#[derive(Clone)]
+pub enum PublisherSource {
+    Raw(crossbeam_channel::Receiver<Vec<u8>>),
+    Feed(crossbeam_channel::Receiver<PublisherFeed>),
+}
+
 /// Publisher state
 pub struct PublisherState {
     pub stream_key: String,
-    pub receiver: crossbeam_channel::Receiver<Vec<u8>>,
+    pub source: PublisherSource,
+}
+
+/// Route a batch of [`ServerResult`]s into the reactor's write / close buffers.
+fn collect_server_results(
+    server_results: Vec<ServerResult>,
+    packets_to_write: &mut Vec<(usize, Vec<u8>, bool, bool, bool)>,
+    ids_to_close: &mut Vec<usize>,
+) {
+    for result in server_results {
+        match result {
+            ServerResult::OutboundPacket {
+                target_connection_id,
+                packet,
+                is_keyframe,
+                is_sequence_header,
+                is_video,
+            } => {
+                packets_to_write.push((
+                    target_connection_id,
+                    packet.bytes,
+                    is_keyframe,
+                    is_sequence_header,
+                    is_video,
+                ));
+            }
+            ServerResult::DisconnectConnection {
+                connection_id: close_id,
+            } => {
+                ids_to_close.push(close_id);
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -663,7 +727,7 @@ impl Reactor {
     pub fn add_publisher(
         &mut self,
         stream_key: String,
-        receiver: crossbeam_channel::Receiver<Vec<u8>>,
+        source: PublisherSource,
     ) -> Option<usize> {
         let entry = self.publishers.vacant_entry();
         let id = entry.key();
@@ -672,7 +736,7 @@ impl Reactor {
             self.stream_keys.insert(stream_key.clone());
             entry.insert(PublisherState {
                 stream_key,
-                receiver,
+                source,
             });
             debug!("Publisher {} added", id);
             Some(id)
@@ -941,6 +1005,28 @@ impl Reactor {
         }
     }
 
+    /// Feed a raw RTMP chunk from a publisher to the session and collect the
+    /// resulting outbound packets / disconnects. Returns `false` if the
+    /// scheduler errored and the publisher should be removed.
+    fn dispatch_publish_bytes(
+        &mut self,
+        pub_id: usize,
+        bytes: Vec<u8>,
+        packets_to_write: &mut Vec<(usize, Vec<u8>, bool, bool, bool)>,
+        ids_to_close: &mut Vec<usize>,
+    ) -> bool {
+        match self.scheduler.publish_bytes_received(pub_id, bytes) {
+            Ok(server_results) => {
+                collect_server_results(server_results, packets_to_write, ids_to_close);
+                true
+            }
+            Err(e) => {
+                debug!("Publisher {} scheduler error: {}", pub_id, e);
+                false
+            }
+        }
+    }
+
     /// Handle publishers data
     fn process_publishers(&mut self) -> Vec<usize> {
         let mut publisher_ids_to_remove = Vec::new();
@@ -950,60 +1036,87 @@ impl Reactor {
         let publisher_ids: Vec<usize> = self.publishers.iter().map(|(id, _)| id).collect();
 
         for pub_id in publisher_ids {
-            let receiver = {
+            let source = {
                 let pub_state = match self.publishers.get(pub_id) {
                     Some(p) => p,
                     None => continue,
                 };
-                pub_state.receiver.clone()
+                pub_state.source.clone()
             };
 
-            loop {
-                match receiver.try_recv() {
-                    Ok(bytes) => {
-                        match self.scheduler.publish_bytes_received(pub_id, bytes) {
-                            Ok(server_results) => {
-                                for result in server_results {
-                                    match result {
-                                        ServerResult::OutboundPacket {
-                                            target_connection_id,
-                                            packet,
-                                            is_keyframe,
-                                            is_sequence_header,
-                                            is_video,
-                                        } => {
-                                            packets_to_write.push((
-                                                target_connection_id,
-                                                packet.bytes,
-                                                is_keyframe,
-                                                is_sequence_header,
-                                                is_video,
-                                            ));
-                                        }
-                                        ServerResult::DisconnectConnection {
-                                            connection_id: close_id,
-                                        } => {
-                                            ids_to_close.push(close_id);
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                debug!("Publisher {} scheduler error: {}", pub_id, e);
+            match source {
+                PublisherSource::Raw(receiver) => loop {
+                    match receiver.try_recv() {
+                        Ok(bytes) => {
+                            if !self.dispatch_publish_bytes(
+                                pub_id,
+                                bytes,
+                                &mut packets_to_write,
+                                &mut ids_to_close,
+                            ) {
                                 publisher_ids_to_remove.push(pub_id);
                                 break;
                             }
                         }
+                        Err(crossbeam_channel::TryRecvError::Empty) => break,
+                        Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                            debug!("Publisher {} disconnected", pub_id);
+                            // Send deleteStream command
+                            self.send_delete_stream(
+                                pub_id,
+                                &mut packets_to_write,
+                                &mut ids_to_close,
+                            );
+                            publisher_ids_to_remove.push(pub_id);
+                            break;
+                        }
                     }
-                    Err(crossbeam_channel::TryRecvError::Empty) => break,
-                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                        debug!("Publisher {} disconnected", pub_id);
-                        // Send deleteStream command
-                        self.send_delete_stream(pub_id, &mut packets_to_write, &mut ids_to_close);
-                        publisher_ids_to_remove.push(pub_id);
-                        break;
+                },
+
+                PublisherSource::Feed(receiver) => loop {
+                    match receiver.try_recv() {
+                        // Control / metadata bytes stay on the session path so
+                        // ordering with the bypassed media stays FIFO.
+                        Ok(PublisherFeed::Raw(bytes)) => {
+                            if !self.dispatch_publish_bytes(
+                                pub_id,
+                                bytes,
+                                &mut packets_to_write,
+                                &mut ids_to_close,
+                            ) {
+                                publisher_ids_to_remove.push(pub_id);
+                                break;
+                            }
+                        }
+                        // PERF-5a bypass: parsed audio/video tag straight to
+                        // the channel machinery, no serialize/reparse.
+                        Ok(PublisherFeed::Media {
+                            tag_type,
+                            timestamp,
+                            data,
+                        }) => {
+                            let results = self.scheduler.publish_media_received(
+                                pub_id, tag_type, timestamp, data,
+                            );
+                            collect_server_results(
+                                results,
+                                &mut packets_to_write,
+                                &mut ids_to_close,
+                            );
+                        }
+                        Err(crossbeam_channel::TryRecvError::Empty) => break,
+                        Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                            debug!("Publisher {} disconnected", pub_id);
+                            self.send_delete_stream(
+                                pub_id,
+                                &mut packets_to_write,
+                                &mut ids_to_close,
+                            );
+                            publisher_ids_to_remove.push(pub_id);
+                            break;
+                        }
                     }
-                }
+                },
             }
         }
 
@@ -1192,10 +1305,7 @@ impl Reactor {
     pub fn run(
         &mut self,
         connection_receiver: crossbeam_channel::Receiver<TcpStream>,
-        publisher_receiver: crossbeam_channel::Receiver<(
-            String,
-            crossbeam_channel::Receiver<Vec<u8>>,
-        )>,
+        publisher_receiver: crossbeam_channel::Receiver<(String, PublisherSource)>,
         waker: Option<Waker>,
     ) {
         info!("Reactor started");
@@ -1235,8 +1345,8 @@ impl Reactor {
 
             // 3. Non-blocking receive new publishers
             let mut new_publisher_added = false;
-            while let Ok((stream_key, receiver)) = publisher_receiver.try_recv() {
-                if self.add_publisher(stream_key.clone(), receiver).is_some() {
+            while let Ok((stream_key, source)) = publisher_receiver.try_recv() {
+                if self.add_publisher(stream_key.clone(), source).is_some() {
                     debug!("New publisher added for stream: {}", stream_key);
                     new_publisher_added = true;
                 }
@@ -2113,4 +2223,96 @@ mod tests {
         reactor.remove_connection(token.id);
     }
 
+    // PERF-5a: exercise the real mixed PublisherFeed::Raw + PublisherFeed::Media
+    // drain in process_publishers (not just the scheduler entry point), so the
+    // create_rtmp_input registration path is regression-tested at the reactor
+    // level. FIFO ordering is structural — a single crossbeam Receiver drained
+    // in-order by the try_recv loop — so this asserts that both variants are
+    // processed on one drain and the bypassed media reaches the scheduler,
+    // rather than re-proving the channel's ordering.
+    #[test]
+    fn feed_publisher_drains_mixed_raw_and_media() {
+        use crate::rtmp::embed_rtmp_server::build_publish_control;
+
+        let stream_keys = dashmap::DashSet::new();
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let mut reactor = Reactor::new(3, None, stream_keys, status).expect("reactor");
+
+        // Register an in-process (create_rtmp_input-style) Feed publisher.
+        let (feed_tx, feed_rx) = crossbeam_channel::bounded(64);
+        let pub_id = reactor
+            .add_publisher("live".to_string(), PublisherSource::Feed(feed_rx))
+            .expect("publisher registered");
+
+        // Realistic mixed sequence on ONE FIFO feed: connect/createStream/publish
+        // as Raw (fed to the session), then audio/video tags as bypassed Media.
+        for control in
+            build_publish_control("app".to_string(), "live".to_string()).expect("control")
+        {
+            feed_tx.send(PublisherFeed::Raw(control)).unwrap();
+        }
+        let video_seq: &[u8] = &[0x17, 0x00, 0x00, 0x00, 0x00, 0x01, 0x64];
+        let audio_seq: &[u8] = &[0xaf, 0x00, 0x12, 0x10];
+        feed_tx
+            .send(PublisherFeed::Media {
+                tag_type: 0x09,
+                timestamp: RtmpTimestamp { value: 0 },
+                data: Bytes::from_static(video_seq),
+            })
+            .unwrap();
+        feed_tx
+            .send(PublisherFeed::Media {
+                tag_type: 0x08,
+                timestamp: RtmpTimestamp { value: 0 },
+                data: Bytes::from_static(audio_seq),
+            })
+            .unwrap();
+        feed_tx
+            .send(PublisherFeed::Media {
+                tag_type: 0x09,
+                timestamp: RtmpTimestamp { value: 33 },
+                data: Bytes::from_static(&[0x17, 0x01, 0xAA, 0xBB]),
+            })
+            .unwrap();
+        // A second IDR freezes the first GOP into the replay cache.
+        feed_tx
+            .send(PublisherFeed::Media {
+                tag_type: 0x09,
+                timestamp: RtmpTimestamp { value: 66 },
+                data: Bytes::from_static(&[0x17, 0x01, 0xCC, 0xDD]),
+            })
+            .unwrap();
+
+        // Drain the mixed feed; a healthy publisher must not be removed.
+        let removed = reactor.process_publishers();
+        assert!(removed.is_empty(), "healthy publisher must not be removed");
+
+        // The Media items were dispatched through publish_media_received (not the
+        // serializer): sequence headers cached and a GOP frozen. The Raw control
+        // was fed to the session on the same drain without error — proving the
+        // mixed Raw+Media path works and preserves the channel state the
+        // serialize path would produce.
+        assert_eq!(
+            reactor.scheduler.channel_video_sequence_header("live").as_deref(),
+            Some(video_seq),
+            "bypassed video sequence header must be cached"
+        );
+        assert_eq!(
+            reactor.scheduler.channel_audio_sequence_header("live").as_deref(),
+            Some(audio_seq),
+            "bypassed audio sequence header must be cached"
+        );
+        assert!(
+            reactor.scheduler.channel_frozen_gop_count("live") >= 1,
+            "the completed GOP must be frozen from bypassed media"
+        );
+
+        // Dropping the sender disconnects the publisher; the next drain removes it.
+        drop(feed_tx);
+        let removed = reactor.process_publishers();
+        assert!(
+            removed.contains(&pub_id),
+            "a disconnected publisher must be scheduled for removal"
+        );
+    }
 }
