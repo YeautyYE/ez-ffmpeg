@@ -27,10 +27,12 @@ impl DictGuard {
     }
 
     /// Pointer for FFmpeg consumer APIs; the guard keeps owning the result.
+    #[inline]
     pub(crate) fn as_double_ptr(&mut self) -> *mut *mut AVDictionary {
         &mut self.dict
     }
 
+    #[inline]
     pub(crate) fn as_ptr(&self) -> *const AVDictionary {
         self.dict as *const _
     }

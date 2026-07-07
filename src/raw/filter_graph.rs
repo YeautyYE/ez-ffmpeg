@@ -46,6 +46,7 @@ impl FilterGraph {
     /// Returns `None` on allocation failure — `avfilter_graph_alloc` returns
     /// null on OOM, which is surfaced as `None` rather than wrapping a null
     /// owner.
+    #[inline]
     pub(crate) fn alloc() -> Option<Self> {
         // SAFETY: `avfilter_graph_alloc` has no preconditions and returns null
         // on OOM; we never construct an owner around a null pointer here.
@@ -66,6 +67,7 @@ impl FilterGraph {
     /// # Safety
     ///
     /// The returned pointer must not be freed and must not outlive `self`.
+    #[inline]
     pub(crate) unsafe fn as_ptr(&self) -> *mut AVFilterGraph {
         self.ptr
     }

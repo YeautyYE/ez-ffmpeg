@@ -99,6 +99,32 @@ More examples can be found [here][examples].
 
 [examples]: https://github.com/YeautyYE/ez-ffmpeg/tree/master/examples
 
+## Performance build
+
+ez-ffmpeg is a library; release-profile choices are controlled by the final
+application or workspace root, not by this crate when used as a dependency.
+For production binaries, start with:
+
+```toml
+[profile.release]
+lto = "thin"
+codegen-units = 1
+```
+
+For machine-specific deployments, benchmark with `target-cpu=native` (do NOT
+use it for redistributed generic binaries):
+
+```bash
+RUSTFLAGS="-C target-cpu=native" cargo build --release
+```
+
+These Rust settings optimize ez-ffmpeg and your application code. Dynamically
+linked FFmpeg libraries are built separately; their performance depends on how
+your FFmpeg package was compiled. Allocator choice is workload-dependent — for
+RTMP fan-out, many concurrent connections, or allocation-heavy callback
+pipelines, measure jemalloc or mimalloc against the system allocator before
+adopting one globally.
+
 ## Features
 
 **ez-ffmpeg** offers several optional features that can be enabled in your `Cargo.toml` as needed:

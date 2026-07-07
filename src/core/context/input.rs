@@ -271,11 +271,14 @@ pub struct Input {
     /// - `pixel_format` - Input pixel format
     ///
     /// **General input options:**
-    /// - `thread_queue_size` - Input thread queue size
     /// - `re` - Read input at native frame rate
     ///
     /// These options allow fine-tuning of input behavior across different components
     /// of the FFmpeg input pipeline.
+    ///
+    /// Note: FFmpeg CLI's `thread_queue_size` is NOT an `avformat_open_input`
+    /// demuxer/protocol option, so setting it here has no effect. ez-ffmpeg's
+    /// internal scheduler queues are fixed-size today and not yet configurable.
     pub(crate) input_opts: Option<HashMap<String, String>>,
 
     /// Whether to probe stream information with `avformat_find_stream_info`
