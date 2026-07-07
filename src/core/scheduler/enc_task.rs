@@ -20,7 +20,7 @@ use ffmpeg_sys_next::AVFieldOrder::{
     AV_FIELD_BB, AV_FIELD_BT, AV_FIELD_PROGRESSIVE, AV_FIELD_TB, AV_FIELD_TT,
 };
 use ffmpeg_sys_next::AVMediaType::{AVMEDIA_TYPE_AUDIO, AVMEDIA_TYPE_SUBTITLE, AVMEDIA_TYPE_VIDEO};
-use ffmpeg_sys_next::AVPictureType::AV_PICTURE_TYPE_NONE;
+use ffmpeg_sys_next::AVPictureType::{AV_PICTURE_TYPE_I, AV_PICTURE_TYPE_NONE};
 use ffmpeg_sys_next::AVPixelFormat::AV_PIX_FMT_NONE;
 use ffmpeg_sys_next::AVSampleFormat::AV_SAMPLE_FMT_NONE;
 #[cfg(all(not(docsrs), not(ffmpeg_8_0)))]
@@ -116,6 +116,10 @@ pub(crate) fn enc_init(
     let pre_pkt_sender = enc_stream.take_dst_pre();
     let mux_start_gate = enc_stream.take_mux_start_gate();
 
+    // Forced-keyframe times ride inside EncoderStream (video only, empty = off).
+    // Move them out before the encoder thread starts, mirroring take_src() above.
+    let forced_kf_pts = std::mem::take(&mut enc_stream.forced_kf_pts);
+
     let stream_box = enc_stream.stream;
     let stream_index = enc_stream.stream_index;
 
@@ -142,6 +146,12 @@ pub(crate) fn enc_init(
         let mut audio_frame_queue: VecDeque<FrameBox> = VecDeque::new();
         let mut is_finished = false;
 
+        // Per-encoder forced-keyframe cursor (fftools KeyframeForceCtx, list subset).
+        let mut forced_kf = ForcedKeyframes {
+            pts: forced_kf_pts,
+            index: 0,
+        };
+
         loop {
             let sync_frame = receive_frame(&mut opened, &receiver, &frame_pool, enc_ctx_box.as_mut_ptr(), stream_box.inner,
                                                &ready_sender, &bits_per_raw_sample, &mut frame_samples, &mut align_mask, &mut samples_queued, &mut audio_frame_queue,
@@ -164,6 +174,7 @@ pub(crate) fn enc_init(
                 &mux_start_gate,
                 stream_box.inner,
                 &packet_pool,
+                &mut forced_kf,
             );
             frame_pool.release(receive_frame_box.frame);
             let status = match result {
@@ -1195,6 +1206,17 @@ unsafe fn frame_is_aligned(align_mask: usize, frame: *const AVFrame) -> bool {
     false
 }
 
+/// fftools `KeyframeForceCtx` (list subset): sorted forced-keyframe times in
+/// `AV_TIME_BASE_Q` microseconds plus the cursor into them. One per video encoder;
+/// `index` advances across frames as forced times are consumed. Empty `pts` = off.
+#[cfg(not(docsrs))]
+struct ForcedKeyframes {
+    /// Sorted ascending, microseconds.
+    pts: Vec<i64>,
+    /// Cursor into `pts`.
+    index: usize,
+}
+
 #[cfg(not(docsrs))]
 fn frame_encode(
     enc_ctx: *mut AVCodecContext,
@@ -1206,6 +1228,7 @@ fn frame_encode(
     mux_start_gate: &Arc<crate::core::context::MuxStartGate>,
     stream: *mut AVStream,
     packet_pool: &ObjPool<Packet>,
+    forced_kf: &mut ForcedKeyframes,
 ) -> crate::error::Result<EncodeStatus> {
     unsafe {
         if (*enc_ctx).codec_type == AVMEDIA_TYPE_SUBTITLE {
@@ -1248,6 +1271,24 @@ fn frame_encode(
             if (*enc_ctx).codec_type == AVMEDIA_TYPE_VIDEO {
                 (*frame).quality = (*enc_ctx).global_quality;
                 (*frame).pict_type = AV_PICTURE_TYPE_NONE;
+
+                // fftools forced_kf_apply (list form): request an IDR at the first
+                // frame whose PTS reaches the next forced time. `if`, not `while` —
+                // at most one advance per frame, matching the CLI. The empty-list and
+                // NOPTS checks are defensive supersets that never force spuriously.
+                if !forced_kf.pts.is_empty()
+                    && (*frame).pts != AV_NOPTS_VALUE
+                    && forced_kf.index < forced_kf.pts.len()
+                    && av_compare_ts(
+                        (*frame).pts,
+                        (*frame).time_base,
+                        forced_kf.pts[forced_kf.index],
+                        AV_TIME_BASE_Q,
+                    ) >= 0
+                {
+                    (*frame).pict_type = AV_PICTURE_TYPE_I;
+                    forced_kf.index += 1;
+                }
             } else if (*(*enc_ctx).codec).capabilities & AV_CODEC_CAP_PARAM_CHANGE as i32 == 0
                 && (*enc_ctx).ch_layout.nb_channels != (*frame).ch_layout.nb_channels
             {
