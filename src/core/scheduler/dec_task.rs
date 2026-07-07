@@ -24,14 +24,15 @@ use ffmpeg_sys_next::AVRounding::AV_ROUND_UP;
 use ffmpeg_sys_next::AVSubtitleType::SUBTITLE_BITMAP;
 #[cfg(not(docsrs))]
 use ffmpeg_sys_next::{av_channel_layout_copy, AV_CODEC_FLAG_COPY_OPAQUE};
-use ffmpeg_sys_next::{av_buffer_create, av_buffer_ref, av_calloc, av_dict_free, av_dict_set, av_frame_apply_cropping, av_frame_copy_props, av_frame_move_ref, av_frame_ref, av_frame_unref, av_free, av_freep, av_gcd, av_hwdevice_get_type_name, av_hwframe_transfer_data, av_inv_q, av_mallocz, av_memdup, av_mul_q, av_opt_set_dict2, av_pix_fmt_desc_get, av_rescale_delta, av_rescale_q, av_strdup, avcodec_alloc_context3, avcodec_decode_subtitle2, avcodec_default_get_buffer2, avcodec_flush_buffers, avcodec_get_hw_config, avcodec_open2, avcodec_parameters_to_context, avcodec_receive_frame, avcodec_send_packet, avsubtitle_free, AVCodec, AVCodecContext, AVDictionary, AVFrame, AVHWDeviceType, AVMediaType, AVPixelFormat, AVRational, AVSubtitle, AVSubtitleRect, AVERROR, AVERROR_EOF, AVPALETTE_SIZE, AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX, AV_FRAME_CROP_UNALIGNED, AV_FRAME_FLAG_CORRUPT, AV_NOPTS_VALUE, AV_PIX_FMT_FLAG_HWACCEL, AV_TIME_BASE_Q, EAGAIN, EINVAL, ENOMEM};
+use ffmpeg_sys_next::{av_buffer_create, av_buffer_ref, av_calloc, av_dict_set, av_frame_apply_cropping, av_frame_copy_props, av_frame_move_ref, av_frame_ref, av_frame_unref, av_free, av_freep, av_gcd, av_hwdevice_get_type_name, av_hwframe_transfer_data, av_inv_q, av_mallocz, av_memdup, av_mul_q, av_opt_set_dict2, av_pix_fmt_desc_get, av_rescale_delta, av_rescale_q, av_strdup, avcodec_alloc_context3, avcodec_decode_subtitle2, avcodec_default_get_buffer2, avcodec_flush_buffers, avcodec_get_hw_config, avcodec_open2, avcodec_parameters_to_context, avcodec_receive_frame, avcodec_send_packet, avsubtitle_free, AVCodec, AVCodecContext, AVFrame, AVHWDeviceType, AVMediaType, AVPixelFormat, AVRational, AVSubtitle, AVSubtitleRect, AVERROR, AVERROR_EOF, AVPALETTE_SIZE, AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX, AV_FRAME_CROP_UNALIGNED, AV_FRAME_FLAG_CORRUPT, AV_NOPTS_VALUE, AV_PIX_FMT_FLAG_HWACCEL, AV_TIME_BASE_Q, EAGAIN, EINVAL, ENOMEM};
 use log::{debug, error, info, trace, warn};
+use std::collections::HashMap;
 use std::ffi::{c_void, CStr, CString};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
-use crate::util::ffmpeg_utils::av_err2str;
+use crate::util::ffmpeg_utils::{av_err2str, hashmap_to_avdictionary, DictGuard};
 use crate::util::thread_synchronizer::{ThreadDoneGuard, ThreadSynchronizer};
 
 #[cfg(docsrs)]
@@ -688,6 +689,40 @@ fn dec_open(
     Ok(())
 }
 
+/// Builds the decoder options dict from the user's per-media opts
+/// (`Input::set_video_codec_opt` and friends, threaded through
+/// `DecoderStream::codec_opts`).
+///
+/// ez-ffmpeg has always opened decoders with `threads=auto`; keep that default
+/// by injecting it when — and only when — the user did not provide their own
+/// `threads` value (`AV_DICT_DONT_OVERWRITE` semantics). Returns the guard
+/// owning the dict plus whether `threads` was injected internally, so the
+/// caller can avoid reporting the injected entry as an unrecognized user
+/// option.
+#[cfg(not(docsrs))]
+fn build_decoder_opts(codec_opts: &Option<HashMap<CString, CString>>) -> (DictGuard, bool) {
+    let mut dec_opts = DictGuard::new(hashmap_to_avdictionary(codec_opts));
+    let user_set_threads = codec_opts
+        .as_ref()
+        .is_some_and(|opts| opts.keys().any(|key| key.as_bytes() == b"threads"));
+    if !user_set_threads {
+        // Both literals are NUL-free; unwrap cannot fail.
+        let key = CString::new("threads").unwrap();
+        let value = CString::new("auto").unwrap();
+        // SAFETY: the guard owns a valid (possibly null) dict pointer that
+        // av_dict_set allocates or extends in place.
+        unsafe {
+            av_dict_set(
+                dec_opts.as_double_ptr(),
+                key.as_ptr(),
+                value.as_ptr(),
+                ffmpeg_sys_next::AV_DICT_DONT_OVERWRITE,
+            );
+        }
+    }
+    (dec_opts, !user_set_threads)
+}
+
 /// Reclaims the `Arc<Mutex<DecoderParameter>>` refcount stashed in an
 /// `AVCodecContext.opaque` if `dec_open` fails after installing it.
 ///
@@ -799,21 +834,35 @@ fn dec_open(
             }
         }
 
-        // Allocate the options dict only after hw setup (so the failure path
-        // above can never leak it) and free it unconditionally right after use.
-        // `av_opt_set_dict2` consumes the entries it applies; `av_dict_free`
-        // reclaims any leftover (and is a no-op on the null it usually leaves).
-        let mut dec_opts: *mut AVDictionary = null_mut();
-        let opt_key = CString::new("threads".to_string()).unwrap();
-        let opt_val = CString::new("auto".to_string()).unwrap();
-        av_dict_set(&mut dec_opts, opt_key.as_ptr(), opt_val.as_ptr(), 0);
-        ret = av_opt_set_dict2(dec_ctx as *mut c_void, &mut dec_opts, ffmpeg_sys_next::AV_OPT_SEARCH_CHILDREN);
-        av_dict_free(&mut dec_opts);
+        // Build the options dict only after hw setup (so the failure path
+        // above can never leak it). The guard owns the dict on every path:
+        // `av_opt_set_dict2` consumes the entries it applies and leaves the
+        // leftovers behind, which the guard frees on drop.
+        let (mut dec_opts, injected_threads) = build_decoder_opts(&dec_stream.codec_opts);
+        ret = av_opt_set_dict2(
+            dec_ctx as *mut c_void,
+            dec_opts.as_double_ptr(),
+            ffmpeg_sys_next::AV_OPT_SEARCH_CHILDREN,
+        );
         if ret < 0 {
             error!("Error applying decoder options: {}", av_err2str(ret));
             return Err(OpenDecoder(
                 OpenDecoderOperationError::ParameterApplicationError(OpenDecoderError::from(ret)),
             ));
+        }
+        // The internally injected `threads` default must not be blamed on the
+        // user. Entries no decoder option matched are user typos (fftools
+        // check_avoptions errors out; we surface them as warnings, mirroring
+        // the encoder path in enc_task::set_encoder_opts).
+        if injected_threads {
+            // The literal is NUL-free; unwrap cannot fail.
+            dec_opts.remove(&CString::new("threads").unwrap());
+        }
+        for key in dec_opts.leftover_keys() {
+            warn!(
+                "Option '{key}' was not recognized by decoder for stream {}",
+                dec_stream.stream_index
+            );
         }
 
         (*dec_ctx).flags |= AV_CODEC_FLAG_COPY_OPAQUE as i32;
@@ -1729,4 +1778,72 @@ unsafe fn audio_samplerate_update(
     dp.last_frame_sample_rate = (*frame).sample_rate;
 
     dp.last_frame_tb
+}
+
+#[cfg(all(test, not(docsrs)))]
+mod tests {
+    use super::build_decoder_opts;
+    use ffmpeg_sys_next::{av_dict_count, av_dict_get, AV_DICT_MATCH_CASE};
+    use std::collections::HashMap;
+    use std::ffi::{CStr, CString};
+
+    fn dict_value(guard: &crate::util::ffmpeg_utils::DictGuard, key: &str) -> Option<String> {
+        let key = CString::new(key).unwrap();
+        // SAFETY: the guard owns a valid (possibly null) dict; av_dict_get
+        // tolerates null and returns entries owned by the dict.
+        unsafe {
+            let entry = av_dict_get(guard.as_ptr(), key.as_ptr(), std::ptr::null(), AV_DICT_MATCH_CASE);
+            if entry.is_null() {
+                None
+            } else {
+                Some(CStr::from_ptr((*entry).value).to_string_lossy().into_owned())
+            }
+        }
+    }
+
+    fn opts(pairs: &[(&str, &str)]) -> Option<HashMap<CString, CString>> {
+        Some(
+            pairs
+                .iter()
+                .map(|(k, v)| (CString::new(*k).unwrap(), CString::new(*v).unwrap()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn no_user_opts_injects_threads_auto() {
+        let (guard, injected) = build_decoder_opts(&None);
+        assert!(injected, "threads must be injected when the user set none");
+        assert_eq!(dict_value(&guard, "threads").as_deref(), Some("auto"));
+        // SAFETY: guard owns the dict.
+        assert_eq!(unsafe { av_dict_count(guard.as_ptr()) }, 1);
+    }
+
+    #[test]
+    fn user_threads_value_is_not_overwritten() {
+        let (guard, injected) = build_decoder_opts(&opts(&[("threads", "1")]));
+        assert!(!injected, "a user-provided threads value must be kept");
+        assert_eq!(dict_value(&guard, "threads").as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn user_opts_are_merged_with_injected_threads() {
+        let (guard, injected) = build_decoder_opts(&opts(&[("skip_frame", "nokey")]));
+        assert!(injected);
+        assert_eq!(dict_value(&guard, "skip_frame").as_deref(), Some("nokey"));
+        assert_eq!(dict_value(&guard, "threads").as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn injected_threads_is_removed_before_leftover_reporting() {
+        // Mirrors dec_open: unrecognized user opts stay behind after
+        // av_opt_set_dict2, but the internally injected `threads` entry must
+        // never surface in the leftover warnings.
+        let (mut guard, injected) = build_decoder_opts(&opts(&[("no_such_opt", "1")]));
+        assert!(injected);
+        if injected {
+            guard.remove(&CString::new("threads").unwrap());
+        }
+        assert_eq!(guard.leftover_keys(), vec!["no_such_opt".to_string()]);
+    }
 }

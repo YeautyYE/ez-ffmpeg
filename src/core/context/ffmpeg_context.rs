@@ -3413,6 +3413,13 @@ unsafe fn open_input_file(
         .clone()
         .unwrap_or_else(|| format!("read_callback[{index}]"));
 
+    // Per-media decoder options (Input::set_*_codec_opt). Converted here —
+    // like the output-side encoder opts — and applied later at decoder open
+    // (dec_task); an invalid C string drops `fc`, freeing the context once.
+    let video_codec_opts = convert_options(input.video_codec_opts.clone())?;
+    let audio_codec_opts = convert_options(input.audio_codec_opts.clone())?;
+    let subtitle_codec_opts = convert_options(input.subtitle_codec_opts.clone())?;
+
     let demux = Demuxer::new(
         url,
         fc,
@@ -3421,6 +3428,9 @@ unsafe fn open_input_file(
         input.video_codec.clone(),
         input.audio_codec.clone(),
         input.subtitle_codec.clone(),
+        video_codec_opts,
+        audio_codec_opts,
+        subtitle_codec_opts,
         input.readrate,
         input.start_time_us,
         recording_time_us,
