@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::ffi::CString;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use crate::core::codec::Codec;
@@ -18,6 +20,9 @@ pub(crate) struct DecoderStream {
     pub(crate) codec_type: AVMediaType,
     pub(crate) codec: Codec,
     pub(crate) codec_desc: *const AVCodecDescriptor,
+    /// User decoder options for this stream's media type
+    /// (`Input::set_video_codec_opt` and friends), applied at decoder open.
+    pub(crate) codec_opts: Option<HashMap<CString, CString>>,
     pub(crate) duration: i64,
     pub(crate) time_base: AVRational,
     pub(crate) avg_framerate: AVRational,
@@ -47,6 +52,7 @@ impl DecoderStream {
         codec_type: AVMediaType,
         codec: *const AVCodec,
         codec_desc: *const AVCodecDescriptor,
+        codec_opts: Option<HashMap<CString, CString>>,
         duration: i64,
         time_base: AVRational,
         avg_framerate: AVRational,
@@ -64,6 +70,7 @@ impl DecoderStream {
             codec_type,
             codec: Codec::new(codec),
             codec_desc,
+            codec_opts,
             duration,
             time_base,
             avg_framerate,
