@@ -335,6 +335,9 @@ pub enum MuxingOperationError {
     #[error("during write header: {0}")]
     WriteHeader(WriteHeaderError),
 
+    #[error("while initializing bitstream filter chain '{0}': {1}")]
+    BitstreamFilterInit(String, MuxingError),
+
     #[error("during interleaved write: {0}")]
     InterleavedWriteError(MuxingError),
 
