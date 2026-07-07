@@ -14,6 +14,9 @@ pub(crate) struct EncoderStream {
     pub(crate) encoder: *const AVCodec,
     pub(crate) vsync_method: Option<VSyncMethod>,
     pub(crate) qscale: Option<i32>,
+    /// Sorted forced-keyframe times in microseconds (`AV_TIME_BASE_Q`); empty = off.
+    /// Video only — populated by the muxer's `add_enc_stream` gate.
+    pub(crate) forced_kf_pts: Vec<i64>,
     src: Option<Receiver<FrameBox>>,
     dst: Option<Sender<PacketBox>>,
     dst_pre: Option<PreMuxQueueSender>,
@@ -28,6 +31,7 @@ impl EncoderStream {
         encoder: *const AVCodec,
         vsync_method: Option<VSyncMethod>,
         qscale: Option<i32>,
+        forced_kf_pts: Vec<i64>,
         src: Receiver<FrameBox>,
         dst: Sender<PacketBox>,
         dst_pre: PreMuxQueueSender,
@@ -40,6 +44,7 @@ impl EncoderStream {
             encoder,
             vsync_method,
             qscale,
+            forced_kf_pts,
             src: Some(src),
             dst: Some(dst),
             dst_pre: Some(dst_pre),

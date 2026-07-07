@@ -2310,6 +2310,7 @@ unsafe fn open_output_file(
         output.audio_sample_fmt,
         output.video_qscale,
         output.audio_qscale,
+        output.forced_kf_pts.clone(),
         output.max_video_frames,
         output.max_audio_frames,
         output.max_subtitle_frames,

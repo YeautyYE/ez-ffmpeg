@@ -249,6 +249,11 @@ pub struct Output {
     // set audio quality (codec-specific)
     pub(crate) audio_qscale: Option<i32>,
 
+    /// Parsed, sorted forced-keyframe times in microseconds (`AV_TIME_BASE_Q`).
+    /// FFmpeg `-force_key_frames` list form. `None` = feature off; set via
+    /// [`Output::set_force_key_frames`]. Applies to re-encoded video only.
+    pub(crate) forced_kf_pts: Option<Vec<i64>>,
+
     /// Maximum number of **video** frames to encode (equivalent to `-frames:v` in FFmpeg).
     ///
     /// This option limits the number of **video** frames processed by the encoder.
@@ -1155,6 +1160,45 @@ impl Output {
         self
     }
 
+    /// Force the **video** encoder to emit a keyframe (an IDR request) at the given
+    /// absolute output times — the list form of FFmpeg's `-force_key_frames "0,5,10.5"`.
+    ///
+    /// `spec` is a comma-separated list of times in **seconds** (e.g. `"0,5,10.5"`).
+    /// Each token is parsed as a decimal number of seconds and converted to
+    /// microseconds. The list is sorted ascending internally, so input order does not
+    /// matter; duplicate times are kept (matching FFmpeg).
+    ///
+    /// # Semantics and limitations
+    /// * Times are **absolute** output/encoder presentation timestamps, not offsets
+    ///   relative to the first frame.
+    /// * `pict_type = I` is a **request**: software encoders such as `mpeg4`,
+    ///   `libx264` and `libx265` honor it and emit a keyframe; some hardware encoders
+    ///   may ignore it or keep their own GOP cadence. ez-ffmpeg can guarantee no more
+    ///   than the FFmpeg CLI does here.
+    /// * Applies only to **re-encoded video** streams. Audio, subtitle, and
+    ///   stream-copy outputs ignore it; there is no effect if it is never set.
+    /// * MVP grammar: only a comma-separated list of decimal **seconds** is supported.
+    ///   The `HH:MM:SS`, `expr:`, `source`, and `source_no_drop` forms of FFmpeg's
+    ///   option are **not** supported and such tokens return an error.
+    /// * **Negative times are rejected** — an ez-ffmpeg MVP choice; a negative forced
+    ///   time is meaningless.
+    ///
+    /// # Errors
+    /// Returns `Err(String)` if `spec` is empty, contains an empty token, or contains a
+    /// token that is not a finite, non-negative decimal number (this rejects `NaN`,
+    /// infinities, and values that would overflow `i64` microseconds).
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let output = Output::from("output.mp4")
+    ///     .set_video_codec("libx264")
+    ///     .set_force_key_frames("0,5,10.5")?;
+    /// ```
+    pub fn set_force_key_frames(mut self, spec: impl AsRef<str>) -> Result<Self, String> {
+        self.forced_kf_pts = Some(parse_forced_key_frames(spec.as_ref())?);
+        Ok(self)
+    }
+
     /// Sets the **audio quality scale** for encoding.
     ///
     /// This method configures codec-specific audio quality settings. The range, behavior,
@@ -2015,6 +2059,7 @@ impl From<Box<dyn FnMut(&[u8]) -> i32 + Send>> for Output {
             audio_sample_fmt: None,
             video_qscale: None,
             audio_qscale: None,
+            forced_kf_pts: None,
             max_video_frames: None,
             max_audio_frames: None,
             max_subtitle_frames: None,
@@ -2074,6 +2119,7 @@ impl From<String> for Output {
             audio_sample_fmt: None,
             video_qscale: None,
             audio_qscale: None,
+            forced_kf_pts: None,
             max_video_frames: None,
             max_audio_frames: None,
             max_subtitle_frames: None,
@@ -2142,9 +2188,50 @@ pub(crate) struct StreamMap {
     pub(crate) copy: bool,
 }
 
+/// Parse an FFmpeg `-force_key_frames` **list-form** spec (e.g. `"0,5,10.5"`) into a
+/// sorted `Vec<i64>` of microsecond timestamps (`AV_TIME_BASE_Q` units).
+///
+/// This is pure, set-time validation — no FFmpeg handle is required. It rejects empty
+/// specs, empty tokens, non-numeric tokens (so the `expr:` / `source` forms are
+/// refused), negative times, `NaN`/infinite values, and values that would overflow
+/// `i64` microseconds. Overflow is rejected explicitly rather than relying on `as i64`
+/// saturation. Duplicates are kept; the result is sorted ascending.
+pub(crate) fn parse_forced_key_frames(spec: &str) -> Result<Vec<i64>, String> {
+    if spec.trim().is_empty() {
+        return Err("force_key_frames: empty spec".to_string());
+    }
+
+    let mut pts = Vec::new();
+    for token in spec.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            return Err("force_key_frames: empty time entry".to_string());
+        }
+
+        let secs = token
+            .parse::<f64>()
+            .map_err(|_| format!("force_key_frames: invalid time '{token}'"))?;
+        if !secs.is_finite() || secs < 0.0 {
+            return Err(format!("force_key_frames: invalid time '{token}'"));
+        }
+
+        // Reject out-of-range values instead of relying on `as i64` saturation.
+        // `i64::MAX as f64` rounds up to 2^63, so `>=` also rejects the boundary.
+        let us = (secs * 1_000_000.0).round();
+        if !us.is_finite() || us < 0.0 || us >= i64::MAX as f64 {
+            return Err(format!("force_key_frames: time out of range '{token}'"));
+        }
+
+        pts.push(us as i64);
+    }
+
+    pts.sort_unstable();
+    Ok(pts)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Output;
+    use super::{parse_forced_key_frames, Output};
 
     #[test]
     fn io_buffer_size_defaults_to_64k() {
@@ -2201,5 +2288,72 @@ mod tests {
     #[should_panic(expected = "muxing_queue_data_threshold must be > 0")]
     fn set_muxing_queue_data_threshold_zero_panics() {
         Output::from("out.mp4").set_muxing_queue_data_threshold(0);
+    }
+
+    #[test]
+    fn parses_sorted_microseconds() {
+        assert_eq!(
+            parse_forced_key_frames("0,5,10.5").unwrap(),
+            vec![0, 5_000_000, 10_500_000]
+        );
+    }
+
+    #[test]
+    fn sorts_unsorted_input() {
+        assert_eq!(
+            parse_forced_key_frames("5,0,10").unwrap(),
+            vec![0, 5_000_000, 10_000_000]
+        );
+    }
+
+    #[test]
+    fn rounds_fractional_seconds() {
+        assert_eq!(parse_forced_key_frames("10.5").unwrap(), vec![10_500_000]);
+    }
+
+    #[test]
+    fn keeps_duplicates() {
+        assert_eq!(
+            parse_forced_key_frames("5,5").unwrap(),
+            vec![5_000_000, 5_000_000]
+        );
+    }
+
+    #[test]
+    fn tolerates_surrounding_whitespace() {
+        assert_eq!(
+            parse_forced_key_frames(" 1 , 2 ").unwrap(),
+            vec![1_000_000, 2_000_000]
+        );
+    }
+
+    #[test]
+    fn accepts_zero() {
+        assert_eq!(parse_forced_key_frames("0").unwrap(), vec![0]);
+    }
+
+    #[test]
+    fn rejects_garbage_without_panicking() {
+        for bad in [
+            "",
+            "   ",
+            "5,,10",
+            "abc",
+            "expr:gte(t,5)",
+            "-1",
+            "5,NaN",
+            "inf",
+            "5,-0.5",
+        ] {
+            assert!(
+                parse_forced_key_frames(bad).is_err(),
+                "expected Err for {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_overflow_instead_of_saturating() {
+        assert!(parse_forced_key_frames("1e30").is_err());
     }
 }

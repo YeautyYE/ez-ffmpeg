@@ -144,6 +144,10 @@ pub(crate) struct Muxer {
     pub(crate) video_qscale: Option<i32>,
     pub(crate) audio_qscale: Option<i32>,
 
+    /// Sorted forced-keyframe times in microseconds (`AV_TIME_BASE_Q`); `None` = off.
+    /// FFmpeg `-force_key_frames` list form, applied to re-encoded video only.
+    pub(crate) forced_kf_pts: Option<Vec<i64>>,
+
     pub(crate) max_video_frames: Option<i64>,
     pub(crate) max_audio_frames: Option<i64>,
     pub(crate) max_subtitle_frames: Option<i64>,
@@ -242,6 +246,7 @@ impl Muxer {
         audio_sample_fmt: Option<AVSampleFormat>,
         video_qscale: Option<i32>,
         audio_qscale: Option<i32>,
+        forced_kf_pts: Option<Vec<i64>>,
         max_video_frames: Option<i64>,
         max_audio_frames: Option<i64>,
         max_subtitle_frames: Option<i64>,
@@ -291,6 +296,7 @@ impl Muxer {
             audio_sample_fmt,
             video_qscale,
             audio_qscale,
+            forced_kf_pts,
             max_video_frames,
             max_audio_frames,
             max_subtitle_frames,
@@ -381,6 +387,14 @@ impl Muxer {
             None
         };
 
+        // Forced-keyframe times apply to re-encoded video only; audio and subtitle
+        // encoders receive an empty list, so the request never reaches them.
+        let forced_kf_pts = if media_type == AVMediaType::AVMEDIA_TYPE_VIDEO {
+            self.forced_kf_pts.clone().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
         // Pre-mux buffer: packets an encoder produces before the muxer opens
         // (it waits until every output stream has emitted a first packet).
         // Byte-metered with FFmpeg's max_muxing_queue_size /
@@ -405,6 +419,7 @@ impl Muxer {
             enc,
             vsync_method,
             qscale,
+            forced_kf_pts,
             frame_receiver,
             packet_sender,
             pre_packet_sender,
