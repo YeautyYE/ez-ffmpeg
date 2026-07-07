@@ -848,6 +848,15 @@ impl RtmpScheduler {
     /// targeting this client, reset the play state, and GC the channel if it
     /// is now empty and unpublished. Connection close only cleans the current
     /// action, so an unhandled finish would leak the membership forever.
+    ///
+    /// Matched by `stream_key` alone: `ServerSessionEvent::PlayStreamFinished`
+    /// carries no `stream_id` (rml_rtmp 0.8 only reports `app_name` +
+    /// `stream_key`), and this scheduler models a single active play per
+    /// connection via one `current_action`. A same-key replay therefore
+    /// collapses to one membership, so stopping the connection's current play
+    /// when its key finishes is the only representable — and correct —
+    /// behaviour for the model. Multiple concurrent plays of the same key on
+    /// one connection are not modelled and cannot be disambiguated here.
     fn handle_play_finished(
         &mut self,
         finished_connection_id: usize,
@@ -1091,6 +1100,31 @@ impl RtmpScheduler {
         if should_remove {
             self.channels.remove(&stream_key);
         }
+    }
+
+    /// The cached video sequence header for a channel, if any (test only).
+    #[cfg(test)]
+    pub(crate) fn channel_video_sequence_header(&self, stream_key: &str) -> Option<Bytes> {
+        self.channels
+            .get(stream_key)
+            .and_then(|c| c.video_sequence_header.clone())
+    }
+
+    /// The cached audio sequence header for a channel, if any (test only).
+    #[cfg(test)]
+    pub(crate) fn channel_audio_sequence_header(&self, stream_key: &str) -> Option<Bytes> {
+        self.channels
+            .get(stream_key)
+            .and_then(|c| c.audio_sequence_header.clone())
+    }
+
+    /// The number of frozen GOPs cached for a channel (test only).
+    #[cfg(test)]
+    pub(crate) fn channel_frozen_gop_count(&self, stream_key: &str) -> usize {
+        self.channels
+            .get(stream_key)
+            .map(|c| c.gops.frozen_count())
+            .unwrap_or(0)
     }
 }
 
@@ -2073,6 +2107,67 @@ mod tests {
             !scheduler.channels.contains_key("stream_a"),
             "an empty, unpublished channel must be removed when the play finishes"
         );
+    }
+
+    // A same-key replay collapses to one membership (single current_action),
+    // so a later PlayStreamFinished for that key stops the connection's current
+    // play. PlayStreamFinished carries no stream_id, so this key-only match is
+    // the only representable behaviour; pin it against regressions.
+    #[test]
+    fn play_stream_finished_after_a_same_stream_replay_tears_down_the_current_play() {
+        let mut scheduler = RtmpScheduler::new(10);
+        let publisher_conn = 100;
+        let watcher_conn = 2;
+
+        assert!(scheduler.new_channel("stream_a".to_string(), publisher_conn));
+        play(&mut scheduler, watcher_conn, "stream_a");
+        let client_id = *scheduler.connection_to_client_map.get(&watcher_conn).unwrap();
+
+        // Replay the SAME stream on a new stream_id (2). Membership is retained.
+        let mut results = Vec::new();
+        scheduler.handle_play_requested(
+            watcher_conn,
+            2,
+            "app".to_string(),
+            "stream_a".to_string(),
+            2,
+            &mut results,
+        );
+        assert!(scheduler
+            .channels
+            .get("stream_a")
+            .unwrap()
+            .watching_client_ids
+            .contains(&client_id));
+        assert!(matches!(
+            scheduler.clients.get(client_id).unwrap().current_action,
+            ClientAction::Watching { stream_id: 2, .. }
+        ));
+
+        // A finish for "stream_a" stops the connection's (single) current play:
+        // membership removed and action reset. The channel is NOT GC'd because
+        // the publisher still holds it.
+        let mut results = Vec::new();
+        scheduler.handle_raised_event(
+            watcher_conn,
+            ServerSessionEvent::PlayStreamFinished {
+                app_name: "app".to_string(),
+                stream_key: "stream_a".to_string(),
+            },
+            &mut results,
+        );
+        assert!(!scheduler
+            .channels
+            .get("stream_a")
+            .unwrap()
+            .watching_client_ids
+            .contains(&client_id));
+        assert!(matches!(
+            scheduler.clients.get(client_id).unwrap().current_action,
+            ClientAction::Waiting
+        ));
+        // Publisher keeps the channel alive.
+        assert!(scheduler.channels.contains_key("stream_a"));
     }
 
     #[test]
