@@ -286,8 +286,9 @@ fn _mux_init(
     // (ffmpeg_mux.c). This runs in the mux worker, AFTER every stream is ready
     // (codecpar populated by streamcopy_init/enc_open) and BEFORE the pre-mux
     // queue is drained, so no packet is filtered before the header exists.
-    // When no output sets a BSF, `stream_bsfs` is all-None and the packet path
-    // below is byte-for-byte the pre-BSF path.
+    // When no output sets a BSF, `stream_bsfs` is an empty vec; the worker then
+    // gates all BSF work off `has_bsf` and the packet path below is byte-for-
+    // byte the pre-BSF path.
     let stream_bsfs = match unsafe {
         init_bitstream_filters(out_fmt_ctx_ptr, &bsf_chains, stream_count)
     } {
@@ -868,7 +869,7 @@ unsafe fn mux_filter_and_write_packet(
     // send_packet took ownership of pkt's contents (reset to empty); the caller
     // still releases the now-empty shell to the pool.
 
-    drain_bsf_write(
+    match drain_bsf_write(
         st_rescale_delta_last_map,
         oformat_flags,
         st_last_dts_map,
@@ -876,14 +877,37 @@ unsafe fn mux_filter_and_write_packet(
         bsf,
         &packet_box.packet_data,
         packet_pool,
-    )
+    ) {
+        // Normal in-stream drain: input consumed, wait for more.
+        BsfDrain::Exhausted => 0,
+        // The filter self-EOF'd without a NULL flush (rare): stop the stream
+        // just like a muxer EOF on the normal write path.
+        BsfDrain::Flushed => AVERROR_EOF,
+        // Propagate write/receive errors (incl. a muxer-side AVERROR_EOF).
+        BsfDrain::Err(ret) => ret,
+    }
+}
+
+/// Outcome of draining a bitstream filter's output packets. Distinguishes the
+/// filter running out of input (`Exhausted`), a NULL-flush completing
+/// (`Flushed`), and a write/receive error (`Err`) — critically keeping a
+/// muxer-side `AVERROR_EOF` returned by `write_packet` as an `Err`, not a
+/// completed flush, so it terminates muxing like the normal write path.
+enum BsfDrain {
+    /// `av_bsf_receive_packet` returned `EAGAIN`: input is exhausted, more may
+    /// arrive later.
+    Exhausted,
+    /// `av_bsf_receive_packet` returned `AVERROR_EOF`: a NULL-flush completed.
+    Flushed,
+    /// A `write_packet`/muxer or `receive_packet` error (negative averror, which
+    /// may itself be `AVERROR_EOF` when the *muxer* signals end).
+    Err(i32),
 }
 
 /// Drain all currently available output packets from `bsf` into the muxer. Each
 /// received packet is moved into a pooled `Packet`, stamped with the filter's
 /// output timebase, tagged with `template` metadata, and written via
-/// `write_packet`. Returns `0` on `EAGAIN` (input exhausted), `AVERROR_EOF`
-/// after a NULL-flush completes, or a negative error.
+/// `write_packet`.
 unsafe fn drain_bsf_write(
     st_rescale_delta_last_map: &mut HashMap<i32, i64>,
     oformat_flags: i32,
@@ -892,15 +916,15 @@ unsafe fn drain_bsf_write(
     bsf: &mut BitStreamFilter,
     template: &PacketData,
     packet_pool: &ObjPool<Packet>,
-) -> i32 {
+) -> BsfDrain {
     loop {
         let ret = bsf.receive_packet();
         if ret == AVERROR(EAGAIN) {
-            return 0;
+            return BsfDrain::Exhausted;
         } else if ret == AVERROR_EOF {
-            return AVERROR_EOF;
+            return BsfDrain::Flushed;
         } else if ret < 0 {
-            return ret;
+            return BsfDrain::Err(ret);
         }
 
         // Move the filtered packet into a pooled shell so it flows through the
@@ -908,7 +932,7 @@ unsafe fn drain_bsf_write(
         // clean for the next receive.
         let mut out_pkt = match packet_pool.get() {
             Ok(p) => p,
-            Err(_) => return AVERROR(ENOMEM),
+            Err(_) => return BsfDrain::Err(AVERROR(ENOMEM)),
         };
         av_packet_move_ref(out_pkt.as_mut_ptr(), bsf.pkt_ptr());
         (*out_pkt.as_mut_ptr()).time_base = bsf.time_base_out();
@@ -926,7 +950,9 @@ unsafe fn drain_bsf_write(
         );
         packet_pool.release(out_box.packet);
         if wret < 0 {
-            return wret;
+            // Includes a muxer-side AVERROR_EOF — an error to propagate, NOT a
+            // completed BSF flush.
+            return BsfDrain::Err(wret);
         }
     }
 }
@@ -968,7 +994,7 @@ unsafe fn flush_stream_bsf(
     if ret < 0 {
         return ret;
     }
-    let dret = drain_bsf_write(
+    match drain_bsf_write(
         st_rescale_delta_last_map,
         oformat_flags,
         st_last_dts_map,
@@ -976,12 +1002,12 @@ unsafe fn flush_stream_bsf(
         bsf,
         &template,
         packet_pool,
-    );
-    // A completed flush ends with AVERROR_EOF from the drain; that is success.
-    if dret == AVERROR_EOF {
-        0
-    } else {
-        dret
+    ) {
+        // The NULL-flush completed (Flushed) or produced no trailing packets
+        // (Exhausted): both are success. A write/receive error — including a
+        // muxer-side AVERROR_EOF — propagates so the worker terminates.
+        BsfDrain::Flushed | BsfDrain::Exhausted => 0,
+        BsfDrain::Err(ret) => ret,
     }
 }
 
