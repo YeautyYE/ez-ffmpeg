@@ -1,7 +1,7 @@
-use crate::core::context::muxer::Muxer;
+use crate::core::context::muxer::{Muxer, StreamBsfChains};
 use crate::core::context::obj_pool::ObjPool;
 use crate::core::context::{PacketBox, PacketData};
-use crate::raw::FormatContext;
+use crate::raw::{BitStreamFilter, FormatContext};
 use crate::core::scheduler::ffmpeg_scheduler::{is_stopping, packet_is_null, set_scheduler_error, wait_until_not_paused, STATUS_ABORT, STATUS_END};
 use crate::core::scheduler::input_controller::{InputController, SchNode};
 use crate::error::Error::Muxing;
@@ -12,7 +12,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use ffmpeg_next::packet::{Mut, Ref};
 use ffmpeg_next::Packet;
 use ffmpeg_sys_next::AVMediaType::{AVMEDIA_TYPE_AUDIO, AVMEDIA_TYPE_SUBTITLE, AVMEDIA_TYPE_VIDEO};
-use ffmpeg_sys_next::{av_compare_ts, av_get_audio_frame_duration2, av_interleaved_write_frame, av_packet_rescale_ts, av_rescale_delta, av_rescale_q, av_write_trailer, avformat_write_header, AVFormatContext, AVPacket, AVRational, AVERROR, AVERROR_EOF, AVFMT_NOTIMESTAMPS, AVFMT_TS_NONSTRICT, AV_LOG_DEBUG, AV_LOG_WARNING, AV_NOPTS_VALUE, AV_PKT_FLAG_KEY, AV_TIME_BASE_Q, EAGAIN};
+use ffmpeg_sys_next::{av_compare_ts, av_get_audio_frame_duration2, av_interleaved_write_frame, av_packet_move_ref, av_packet_rescale_ts, av_rescale_delta, av_rescale_q, av_write_trailer, avcodec_parameters_copy, avformat_write_header, AVFormatContext, AVPacket, AVRational, AVERROR, AVERROR_EOF, AVFMT_NOTIMESTAMPS, AVFMT_TS_NONSTRICT, AV_LOG_DEBUG, AV_LOG_WARNING, AV_NOPTS_VALUE, AV_PKT_FLAG_KEY, AV_TIME_BASE_Q, EAGAIN, ENOMEM};
 use std::collections::VecDeque;
 use log::{debug, error, info, trace, warn};
 use std::collections::HashMap;
@@ -46,6 +46,7 @@ pub(crate) fn mux_init(
         mux.recording_time_us,
         mux.stream_count(),
         mux.format_opts.clone(),
+        mux.bsf_chains.clone(),
         mux.take_src_pre_recvs(),
         mux.mux_start_gate(),
         mux.enc_handle_receiver(),
@@ -87,6 +88,7 @@ pub(crate) fn ready_to_init_mux(
         let stream_count = mux.stream_count();
         let nb_streams_ready = mux.nb_streams_ready.clone();
         let format_opts = mux.format_opts.clone();
+        let bsf_chains = mux.bsf_chains.clone();
 
         let result = std::thread::Builder::new().name(format!("ready-to-init-muxer{mux_idx}")).spawn(move || {
             // Owns the context until streams are ready; drops (frees) if the loop
@@ -137,6 +139,7 @@ pub(crate) fn ready_to_init_mux(
                         recording_time_us,
                         stream_count,
                         format_opts,
+                        bsf_chains,
                         src_pre_recvs,
                         mux_start_gate,
                         enc_handle_receiver,
@@ -172,6 +175,7 @@ fn mux_task_start(mux_idx: usize,
                   recording_time_us: Option<i64>,
                   stream_count: usize,
                   format_opts: Option<HashMap<CString, CString>>,
+                  bsf_chains: StreamBsfChains,
                   src_pre_receivers: Vec<Receiver<PacketBox>>,
                   mux_start_gate: Arc<crate::core::context::MuxStartGate>,
                   enc_handle_receiver: Receiver<std::thread::JoinHandle<()>>,
@@ -190,7 +194,7 @@ fn mux_task_start(mux_idx: usize,
 
     let (queue_sender, queue_receiver) = queue.unwrap();
 
-    _mux_init(mux_idx, out_fmt_ctx, queue_receiver, start_time_us, recording_time_us, stream_count, format_opts, enc_handle_receiver, packet_pool, input_controller, mux_stream_nodes, scheduler_status, thread_sync, scheduler_result)?;
+    _mux_init(mux_idx, out_fmt_ctx, queue_receiver, start_time_us, recording_time_us, stream_count, format_opts, bsf_chains, enc_handle_receiver, packet_pool, input_controller, mux_stream_nodes, scheduler_status, thread_sync, scheduler_result)?;
 
     // Drain the pre-queues and open the gate atomically: an encoder that
     // saw the gate closed cannot park a packet after this drain ran.
@@ -256,6 +260,7 @@ fn _mux_init(
     recording_time_us: Option<i64>,
     stream_count: usize,
     format_opts: Option<HashMap<CString, CString>>,
+    bsf_chains: StreamBsfChains,
     enc_handle_receiver: Receiver<std::thread::JoinHandle<()>>,
     packet_pool: ObjPool<Packet>,
     input_controller: Arc<InputController>,
@@ -273,6 +278,46 @@ fn _mux_init(
     // Guard owns the dict on every path: write_header leaves unrecognized
     // entries behind, which leaked (and were silently swallowed) before.
     let mut opts = DictGuard::new(hashmap_to_avdictionary(&format_opts));
+
+    // Initialize bitstream filters BEFORE writing the header. BSFs such as
+    // h264_mp4toannexb / *_metadata rewrite codecpar/extradata inside
+    // av_bsf_init, and those changes must reach the muxer header — FFmpeg runs
+    // bsf_init in of_stream_init, before mux_check_init's avformat_write_header
+    // (ffmpeg_mux.c). This runs in the mux worker, AFTER every stream is ready
+    // (codecpar populated by streamcopy_init/enc_open) and BEFORE the pre-mux
+    // queue is drained, so no packet is filtered before the header exists.
+    // When no output sets a BSF, `stream_bsfs` is all-None and the packet path
+    // below is byte-for-byte the pre-BSF path.
+    let stream_bsfs = match unsafe {
+        init_bitstream_filters(out_fmt_ctx_ptr, &bsf_chains, stream_count)
+    } {
+        Ok(bsfs) => bsfs,
+        Err((name, bsf_ret)) => {
+            error!(
+                "Could not initialize bitstream filter chain '{name}': {}",
+                av_err2str(bsf_ret)
+            );
+            // Same terminal ordering as the write_header failure below: publish
+            // the error before releasing this muxer's thread slot.
+            set_scheduler_error(
+                &scheduler_status,
+                &scheduler_result,
+                Muxing(MuxingOperationError::BitstreamFilterInit(
+                    name.clone(),
+                    MuxingError::from(bsf_ret),
+                )),
+            );
+            thread_sync.thread_done_with(|| {
+                scheduler_status.store(STATUS_END, Ordering::Release);
+            });
+            // `out_fmt_ctx` drops here (frees the context); any partially built
+            // `BitStreamFilter`s were already dropped inside the helper.
+            return Err(Muxing(MuxingOperationError::BitstreamFilterInit(
+                name,
+                MuxingError::from(bsf_ret),
+            )));
+        }
+    };
 
     let ret = unsafe { avformat_write_header(out_fmt_ctx_ptr, opts.as_double_ptr()) };
     if ret < 0 {
@@ -310,6 +355,14 @@ fn _mux_init(
         // Move the FormatContext into the worker; it Drops (frees the output
         // context, custom-IO-aware) when this closure ends — the terminal free.
         let out_fmt_ctx = out_fmt_ctx;
+        // Per-output-stream BSF chains (None for streams without one). Owned by
+        // the worker; each `BitStreamFilter` frees its AVBSFContext/AVPacket on
+        // drop when the closure ends.
+        let mut stream_bsfs = stream_bsfs;
+        // Last packet_data seen per stream, used as the metadata template for
+        // BSF flush packets at EOF (they carry no PacketData of their own).
+        let mut stream_pkt_templates: Vec<Option<PacketData>> =
+            (0..stream_count).map(|_| None).collect();
         let mut stream_started: Vec<bool> = vec![false; stream_count];
         let mut stream_eof: Vec<bool> = vec![false; stream_count];
         let mut st_rescale_delta_last_map = HashMap::new();
@@ -350,6 +403,26 @@ fn _mux_init(
                 if eof_stream >= 0 {
                     let eof_idx = eof_stream as usize;
                     if eof_idx < stream_count && !stream_eof[eof_idx] {
+                        // Flush trailing BSF packets before finishing this
+                        // stream (no-op when it has no BSF).
+                        let fret = unsafe {
+                            flush_stream_bsf(
+                                &mut st_rescale_delta_last_map,
+                                oformat_flags,
+                                &mut st_last_dts_map,
+                                &out_fmt_ctx,
+                                &mut stream_bsfs,
+                                &stream_pkt_templates,
+                                eof_idx,
+                                &packet_pool,
+                            )
+                        };
+                        if fret < 0 {
+                            ret = fret;
+                            error!("Error flushing bitstream filter at EOF: stream={eof_idx}, ret={fret}");
+                            packet_pool.release(packet_box.packet);
+                            break;
+                        }
                         stream_eof[eof_idx] = true;
                         nb_done += 1;
                         if eof_idx < mux_stream_nodes.len() {
@@ -391,6 +464,25 @@ fn _mux_init(
                         continue;
                     }
 
+                    // Flush trailing BSF packets before finishing this stream
+                    // (no-op when it has no BSF). Already inside `unsafe`.
+                    let fret = flush_stream_bsf(
+                        &mut st_rescale_delta_last_map,
+                        oformat_flags,
+                        &mut st_last_dts_map,
+                        &out_fmt_ctx,
+                        &mut stream_bsfs,
+                        &stream_pkt_templates,
+                        stream_index,
+                        &packet_pool,
+                    );
+                    if fret < 0 {
+                        ret = fret;
+                        error!("Error flushing bitstream filter at EOF: stream={stream_index}, ret={fret}");
+                        packet_pool.release(packet_box.packet);
+                        break;
+                    }
+
                     nb_done += 1;
                     packet_pool.release(packet_box.packet);
 
@@ -428,7 +520,24 @@ fn _mux_init(
                         continue;
                     } else if ret == AVERROR_EOF {
                         // Per-stream EOF: mark this stream as finished, matching CLI's
-                        // sch_mux_receive_finish behavior in ffmpeg_mux.c:442
+                        // sch_mux_receive_finish behavior in ffmpeg_mux.c:442.
+                        // Flush trailing BSF packets first (no-op without a BSF).
+                        let fret = flush_stream_bsf(
+                            &mut st_rescale_delta_last_map,
+                            oformat_flags,
+                            &mut st_last_dts_map,
+                            &out_fmt_ctx,
+                            &mut stream_bsfs,
+                            &stream_pkt_templates,
+                            stream_index,
+                            &packet_pool,
+                        );
+                        if fret < 0 {
+                            ret = fret;
+                            error!("Error flushing bitstream filter at EOF: stream={stream_index}, ret={fret}");
+                            packet_pool.release(packet_box.packet);
+                            break;
+                        }
                         stream_eof[stream_index] = true;
                         packet_pool.release(packet_box.packet);
 
@@ -446,16 +555,26 @@ fn _mux_init(
                     }
                 }
 
-                // write
+                // write (bitstream-filter aware). With no BSF for this stream,
+                // `mux_filter_and_write_packet` calls exactly the same
+                // `write_packet` as before — zero behavior change.
                 if !packet_is_null(&packet_box.packet)
                     && (*packet_box.packet.as_ptr()).stream_index >= 0
                 {
-                    ret = write_packet(
+                    // Snapshot this stream's packet metadata so a later EOF
+                    // flush can stamp the BSF's trailing packets correctly.
+                    if stream_bsfs[stream_index].is_some() {
+                        stream_pkt_templates[stream_index] =
+                            Some(packet_box.packet_data.clone());
+                    }
+                    ret = mux_filter_and_write_packet(
                         &mut st_rescale_delta_last_map,
                         oformat_flags,
                         &mut st_last_dts_map,
                         &out_fmt_ctx,
                         &mut packet_box,
+                        stream_bsfs[stream_index].as_mut(),
+                        &packet_pool,
                     );
                     packet_pool.release(packet_box.packet);
 
@@ -614,6 +733,238 @@ unsafe fn write_packet(
         sq_packet_box.packet_data.output_stream_index;
 
     av_interleaved_write_frame(out_fmt_ctx.as_ptr(), sq_packet_box.packet.as_mut_ptr())
+}
+
+/// Build the per-output-stream BSF list, resolving each stream's chain by its
+/// media type (`-bsf:v/-bsf:a/-bsf:s`). Runs BEFORE `avformat_write_header`, so
+/// filters that rewrite codecpar/extradata in `av_bsf_init` (h264_mp4toannexb,
+/// `*_metadata`) reach the muxer header. Mirrors fftools `bsf_init`
+/// (ffmpeg_mux.c): copy the stream's codecpar into `par_in`, seed
+/// `time_base_in` from the stream time_base, init, then copy `par_out` back and
+/// adopt `time_base_out` (rescaling any preset duration).
+///
+/// Returns one entry per stream (`None` where the stream has no BSF). On any
+/// failure returns `Err((chain_name, averror))`; every `BitStreamFilter`
+/// allocated so far is dropped (freed) as the local vec unwinds.
+unsafe fn init_bitstream_filters(
+    out_fmt_ctx: *mut AVFormatContext,
+    bsf_chains: &StreamBsfChains,
+    stream_count: usize,
+) -> Result<Vec<Option<BitStreamFilter>>, (String, i32)> {
+    let mut stream_bsfs: Vec<Option<BitStreamFilter>> =
+        (0..stream_count).map(|_| None).collect();
+
+    // No output requested a BSF: leave every slot None so the packet path stays
+    // byte-for-byte the pre-BSF path.
+    if bsf_chains.is_empty() {
+        return Ok(stream_bsfs);
+    }
+
+    for i in 0..stream_count {
+        let st = *(*out_fmt_ctx).streams.add(i);
+        let codec_type = (*(*st).codecpar).codec_type;
+        let Some(chain) = bsf_chains.for_media_type(codec_type) else {
+            continue;
+        };
+        let name = || chain.to_string_lossy().into_owned();
+
+        let mut bsf = BitStreamFilter::parse(chain.as_c_str()).map_err(|ret| (name(), ret))?;
+        let ctx = bsf.as_ptr();
+
+        let ret = avcodec_parameters_copy((*ctx).par_in, (*st).codecpar);
+        if ret < 0 {
+            return Err((name(), ret));
+        }
+        (*ctx).time_base_in = (*st).time_base;
+
+        let ret = bsf.init();
+        if ret < 0 {
+            return Err((name(), ret));
+        }
+
+        let ret = avcodec_parameters_copy((*st).codecpar, (*ctx).par_out);
+        if ret < 0 {
+            return Err((name(), ret));
+        }
+
+        // Adopt the filter's output timebase and rescale any duration that was
+        // set against the old one (fftools of_stream_init, ffmpeg_mux.c).
+        let old_tb = (*st).time_base;
+        let old_duration = (*st).duration;
+        (*st).time_base = bsf.time_base_out();
+        if old_duration != AV_NOPTS_VALUE && old_tb.num > 0 && old_tb.den > 0 {
+            (*st).duration = av_rescale_q(old_duration, old_tb, (*st).time_base);
+        }
+
+        stream_bsfs[i] = Some(bsf);
+    }
+
+    Ok(stream_bsfs)
+}
+
+/// Write one packet, applying this stream's bitstream filter first when
+/// present. With `bsf = None` this is exactly the pre-BSF `write_packet` call —
+/// the no-BSF path is unchanged. Mirrors fftools `mux_packet_filter`
+/// (ffmpeg_mux.c): rescale into the BSF input timebase, send, then drain every
+/// output packet to the muxer.
+unsafe fn mux_filter_and_write_packet(
+    st_rescale_delta_last_map: &mut HashMap<i32, i64>,
+    oformat_flags: i32,
+    st_last_dts_map: &mut HashMap<i32, i64>,
+    out_fmt_ctx: &FormatContext,
+    packet_box: &mut PacketBox,
+    bsf: Option<&mut BitStreamFilter>,
+    packet_pool: &ObjPool<Packet>,
+) -> i32 {
+    let Some(bsf) = bsf else {
+        return write_packet(
+            st_rescale_delta_last_map,
+            oformat_flags,
+            st_last_dts_map,
+            out_fmt_ctx,
+            packet_box,
+        );
+    };
+
+    // Empty packets carry no bitstream to filter (in ez they are stream-end
+    // markers or side-data-only). Feeding one to av_bsf_send_packet would be
+    // read as EOF and prematurely close the filter, so write it directly.
+    if packet_box.packet.is_empty() {
+        return write_packet(
+            st_rescale_delta_last_map,
+            oformat_flags,
+            st_last_dts_map,
+            out_fmt_ctx,
+            packet_box,
+        );
+    }
+
+    let pkt = packet_box.packet.as_mut_ptr();
+    // Rescale into the filter's input timebase (fftools ffmpeg_mux.c).
+    av_packet_rescale_ts(pkt, (*pkt).time_base, bsf.time_base_in());
+
+    let ret = bsf.send_packet(pkt);
+    if ret < 0 {
+        return ret;
+    }
+    // send_packet took ownership of pkt's contents (reset to empty); the caller
+    // still releases the now-empty shell to the pool.
+
+    drain_bsf_write(
+        st_rescale_delta_last_map,
+        oformat_flags,
+        st_last_dts_map,
+        out_fmt_ctx,
+        bsf,
+        &packet_box.packet_data,
+        packet_pool,
+    )
+}
+
+/// Drain all currently available output packets from `bsf` into the muxer. Each
+/// received packet is moved into a pooled `Packet`, stamped with the filter's
+/// output timebase, tagged with `template` metadata, and written via
+/// `write_packet`. Returns `0` on `EAGAIN` (input exhausted), `AVERROR_EOF`
+/// after a NULL-flush completes, or a negative error.
+unsafe fn drain_bsf_write(
+    st_rescale_delta_last_map: &mut HashMap<i32, i64>,
+    oformat_flags: i32,
+    st_last_dts_map: &mut HashMap<i32, i64>,
+    out_fmt_ctx: &FormatContext,
+    bsf: &mut BitStreamFilter,
+    template: &PacketData,
+    packet_pool: &ObjPool<Packet>,
+) -> i32 {
+    loop {
+        let ret = bsf.receive_packet();
+        if ret == AVERROR(EAGAIN) {
+            return 0;
+        } else if ret == AVERROR_EOF {
+            return AVERROR_EOF;
+        } else if ret < 0 {
+            return ret;
+        }
+
+        // Move the filtered packet into a pooled shell so it flows through the
+        // existing write_packet/mux_fixup_ts path; the BSF's own packet is left
+        // clean for the next receive.
+        let mut out_pkt = match packet_pool.get() {
+            Ok(p) => p,
+            Err(_) => return AVERROR(ENOMEM),
+        };
+        av_packet_move_ref(out_pkt.as_mut_ptr(), bsf.pkt_ptr());
+        (*out_pkt.as_mut_ptr()).time_base = bsf.time_base_out();
+
+        let mut out_box = PacketBox {
+            packet: out_pkt,
+            packet_data: template.clone(),
+        };
+        let wret = write_packet(
+            st_rescale_delta_last_map,
+            oformat_flags,
+            st_last_dts_map,
+            out_fmt_ctx,
+            &mut out_box,
+        );
+        packet_pool.release(out_box.packet);
+        if wret < 0 {
+            return wret;
+        }
+    }
+}
+
+/// Flush a stream's bitstream filter at EOF: send NULL and drain trailing
+/// packets before the stream is marked finished. No-op (returns `0`) when the
+/// stream has no BSF. Returns `0` on success (including the drain's terminal
+/// EOF) or a negative muxing error.
+unsafe fn flush_stream_bsf(
+    st_rescale_delta_last_map: &mut HashMap<i32, i64>,
+    oformat_flags: i32,
+    st_last_dts_map: &mut HashMap<i32, i64>,
+    out_fmt_ctx: &FormatContext,
+    stream_bsfs: &mut [Option<BitStreamFilter>],
+    stream_pkt_templates: &[Option<PacketData>],
+    stream_index: usize,
+    packet_pool: &ObjPool<Packet>,
+) -> i32 {
+    let Some(bsf) = stream_bsfs[stream_index].as_mut() else {
+        return 0;
+    };
+
+    // Metadata for the trailing packets: reuse the last real packet's template,
+    // or synthesize one from the output stream's codecpar if none was seen.
+    let template = match &stream_pkt_templates[stream_index] {
+        Some(t) => t.clone(),
+        None => {
+            let st = *(*out_fmt_ctx.as_ptr()).streams.add(stream_index);
+            PacketData {
+                dts_est: 0,
+                codec_type: (*(*st).codecpar).codec_type,
+                output_stream_index: stream_index as i32,
+                is_copy: false,
+            }
+        }
+    };
+
+    let ret = bsf.send_packet(std::ptr::null_mut());
+    if ret < 0 {
+        return ret;
+    }
+    let dret = drain_bsf_write(
+        st_rescale_delta_last_map,
+        oformat_flags,
+        st_last_dts_map,
+        out_fmt_ctx,
+        bsf,
+        &template,
+        packet_pool,
+    );
+    // A completed flush ends with AVERROR_EOF from the drain; that is success.
+    if dret == AVERROR_EOF {
+        0
+    } else {
+        dret
+    }
 }
 
 unsafe fn mux_fixup_ts(
