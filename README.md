@@ -29,7 +29,9 @@ By abstracting the complexity of the raw C API, `ez-ffmpeg` simplifies configuri
 
 The transcoding pipeline is ported from the FFmpeg CLI sources (`fftools/ffmpeg`, FFmpeg 7.x): the demux/decode/filter/encode/mux stages keep the fftools function names and semantics, and code comments cite the corresponding C file and line (line numbers refer to the FFmpeg `n7.1` tag). FFmpeg developers can navigate the codebase by grepping for the names they already know (`ts_fixup`, `video_sync_process`, `enc_open`, `mux_fixup_ts`, ...).
 
-Not every CLI feature is implemented. Notable gaps (unsupported paths fail with explicit errors): progress/stats reporting (`-progress`), sub2video, `-shortest` cross-stream sync, bitstream filters (`-bsf`), keyframe forcing (`-force_key_frames`), `-fix_sub_duration`, two-pass encoding, and attachments.
+Bitstream filters (`-bsf:v/-bsf:a/-bsf:s`) are supported via `Output::set_video_bsf` / `set_audio_bsf` / `set_subtitle_bsf` (single filter or comma-separated chain, e.g. `h264_mp4toannexb`).
+
+Not every CLI feature is implemented. Notable gaps (unsupported paths fail with explicit errors): progress/stats reporting (`-progress`), sub2video, `-shortest` cross-stream sync, keyframe forcing (`-force_key_frames`), `-fix_sub_duration`, two-pass encoding, and attachments.
 
 ## Version Requirements
 

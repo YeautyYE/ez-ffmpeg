@@ -121,12 +121,16 @@
 //! for the same function names (`ts_fixup`, `video_sync_process`,
 //! `enc_open`, `mux_fixup_ts`, ...) lands in the equivalent Rust.
 //!
+//! Bitstream filters (`-bsf:v/-bsf:a/-bsf:s`) are supported through
+//! [`Output::set_video_bsf`](crate::core::context::output::Output::set_video_bsf)
+//! and its audio/subtitle siblings (single filter or comma-separated chain).
+//!
 //! Not every CLI feature is implemented. Notable gaps: progress/stats
 //! reporting (`-progress`), sub2video (rendering bitmap subtitles into
-//! video), `-shortest` cross-stream sync, bitstream filters (`-bsf`),
-//! keyframe forcing (`-force_key_frames`), `-fix_sub_duration`, two-pass
-//! encoding, and attachments. Unsupported paths fail with explicit errors
-//! rather than approximations.
+//! video), `-shortest` cross-stream sync, keyframe forcing
+//! (`-force_key_frames`), `-fix_sub_duration`, two-pass encoding, and
+//! attachments. Unsupported paths fail with explicit errors rather than
+//! approximations.
 //!
 //! ## Logging
 //!
