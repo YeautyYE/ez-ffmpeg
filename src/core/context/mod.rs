@@ -120,8 +120,8 @@ pub(crate) enum PreSendOutcome {
     Sent,
     /// The gate opened first: send to the live queue instead.
     Started(PacketBox),
-    /// Pre-queue full: back off and retry (the lock must not be held across
-    /// a blocking send, or the drain could never run).
+    /// Pre-queue full: park on the queue condvar and retry (the gate lock
+    /// must not be held across the wait, or the drain could never run).
     Full(PacketBox),
     /// Pre-queue receiver is gone (muxer never started).
     Disconnected(PacketBox),
@@ -149,17 +149,17 @@ impl MuxStartGate {
     /// Attempts a pre-queue send while the gate is verifiably closed.
     pub(crate) fn send_pre(
         &self,
-        pre_sender: &crossbeam_channel::Sender<PacketBox>,
+        pre_sender: &pre_mux_queue::PreMuxQueueSender,
         packet_box: PacketBox,
     ) -> PreSendOutcome {
         let _guard = self.lock.lock().unwrap();
         if self.started.load(Ordering::Acquire) {
             return PreSendOutcome::Started(packet_box);
         }
-        match pre_sender.try_send(packet_box) {
-            Ok(()) => PreSendOutcome::Sent,
-            Err(crossbeam_channel::TrySendError::Full(pb)) => PreSendOutcome::Full(pb),
-            Err(crossbeam_channel::TrySendError::Disconnected(pb)) => {
+        match pre_sender.try_push(packet_box) {
+            pre_mux_queue::PreQueueTryPush::Sent => PreSendOutcome::Sent,
+            pre_mux_queue::PreQueueTryPush::Full(pb) => PreSendOutcome::Full(pb),
+            pre_mux_queue::PreQueueTryPush::Disconnected(pb) => {
                 PreSendOutcome::Disconnected(pb)
             }
         }
@@ -300,6 +300,7 @@ pub(super) mod input_filter;
 pub(super) mod muxer;
 pub(super) mod obj_pool;
 pub(super) mod output_filter;
+pub(super) mod pre_mux_queue;
 
 /// The **null_output** module provides a custom null output implementation for FFmpeg
 /// that discards all data while supporting seeking.
