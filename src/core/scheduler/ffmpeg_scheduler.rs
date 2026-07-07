@@ -320,30 +320,42 @@ impl FfmpegScheduler<Initialization> {
             // attached before the streams are moved into enc_init below.
             if mux.shortest {
                 let buf_us = mux.shortest_buf_duration_us;
-                let streams = mux.get_streams_mut();
-                let av_positions: Vec<usize> = streams
+                // (position in the encoder-stream Vec, output stream index) for
+                // each encoded audio/video stream. The output index resolves this
+                // stream's `source_finished` flag below; collected before the
+                // mutable borrow that attaches the handles.
+                let av: Vec<(usize, usize)> = mux
+                    .get_streams()
                     .iter()
                     .enumerate()
                     .filter(|(_, s)| {
                         s.codec_type == AVMEDIA_TYPE_VIDEO || s.codec_type == AVMEDIA_TYPE_AUDIO
                     })
-                    .map(|(i, _)| i)
+                    .map(|(i, s)| (i, s.stream_index))
                     .collect();
-                if av_positions.len() >= 2 {
+                if av.len() >= 2 {
                     let mut sq = SyncQueue::new(buf_us);
-                    // add_stream in position order → each stream's sq_idx.
-                    let assigned: Vec<(usize, usize)> = av_positions
+                    // Each member: (encoder-vec position, its sq_idx, its own
+                    // `source_finished`). `add_stream(true)` in `av` order fixes
+                    // each stream's sq_idx; the balancer flag (`SchNode::MuxStream`)
+                    // lets a finished producer leave the input balancer before
+                    // draining (fftools send_to_enc_sq, ffmpeg_sched.c:1929).
+                    let members: Vec<(usize, usize, Option<Arc<AtomicBool>>)> = av
                         .iter()
-                        .map(|&pos| (pos, sq.add_stream(true)))
+                        .map(|&(pos, osi)| {
+                            (pos, sq.add_stream(true), mux.stream_source_finished(osi))
+                        })
                         .collect();
                     let sq_finished: Arc<[AtomicBool]> =
-                        (0..av_positions.len()).map(|_| AtomicBool::new(false)).collect();
+                        (0..av.len()).map(|_| AtomicBool::new(false)).collect();
                     let queue = Arc::new((Mutex::new(sq), Condvar::new()));
-                    for (pos, sq_idx) in assigned {
+                    let streams = mux.get_streams_mut();
+                    for (pos, sq_idx, source_finished) in members {
                         streams[pos].set_sync_queue(EncSyncHandle {
                             queue: queue.clone(),
                             sq_idx,
                             sq_finished: sq_finished.clone(),
+                            source_finished,
                         });
                     }
                 }
@@ -370,6 +382,7 @@ impl FfmpegScheduler<Initialization> {
                     thread_sync.clone(),
                     mux.enc_handle_sender(),
                     scheduler_result.clone(),
+                    input_controller.clone(),
                 ) {
                     Self::cleanup(&scheduler_status, ffmpeg_context);
                     return Err(e);

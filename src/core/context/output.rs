@@ -1038,6 +1038,14 @@ impl Output {
     /// window (see [`set_shortest_buf_duration_us`](Self::set_shortest_buf_duration_us),
     /// default 10 s). Default: `false`.
     ///
+    /// # Limitation
+    /// With three or more encoded output streams, a cut stream fed by an input
+    /// whose read cannot be interrupted mid-packet — a pipe, a custom IO source,
+    /// a live device, or a readrate-limited (`-re`) input — may keep that
+    /// demuxer alive until its in-flight read returns, delaying termination.
+    /// Ordinary seekable file and network inputs, and the common one/two-stream
+    /// cases, are unaffected.
+    ///
     /// # Example
     /// ```rust,ignore
     /// let output = Output::from("output.mp4").set_shortest(true);

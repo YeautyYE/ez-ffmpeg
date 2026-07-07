@@ -21,6 +21,13 @@ pub(crate) struct EncSyncHandle {
     /// One flag per `sq_enc` stream; set when the engine cascade-finishes that
     /// stream, so a truncated encoder observes it and enters its drain phase.
     pub(crate) sq_finished: Arc<[AtomicBool]>,
+    /// This encoded stream's own `source_finished` flag (`SchNode::MuxStream`),
+    /// the same `Arc` the input balancer reads. The encoder sets it at
+    /// producer-EOF — before the drain phase — so the balancer stops trailing on
+    /// this stream's now-stale `last_dts` while the sync queue still holds its
+    /// tail frames (fftools `send_to_enc_sq`, ffmpeg_sched.c:1916-1933). `None`
+    /// only if the output stream node could not be resolved.
+    pub(crate) source_finished: Option<Arc<AtomicBool>>,
 }
 
 /// fftools: `OutputStream` + `MuxStream` (ffmpeg.h / ffmpeg_mux.h).

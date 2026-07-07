@@ -126,7 +126,17 @@ impl InputController {
             have_unchoked = true;
         }
 
-        // make sure to unchoke at least one source, if still available
+        // No stream steered a source this pass — every mux stream is either
+        // finished or too far ahead. Guarantee progress by unchoking EVERY live
+        // demuxer, not just one. FFmpeg unchokes a single fallback source because
+        // its sync-queue EOF is forwarded up to stop a cascade-cut stream's
+        // demuxer; ez does not forward that EOF for encoded streams, so a
+        // cascade-cut member still draining needs its own demuxer to keep
+        // advancing to the cut. Waking only one starves the rest and deadlocks a
+        // `-shortest` job with 3+ encoded streams (a lagging peer's drain waits on
+        // a demuxer this pass left choked). Over-unchoking is safe: the next
+        // balancing pass re-chokes anything that runs ahead, and the pre-mux queue
+        // still bounds memory.
         if !have_unchoked {
             for demux in self.demuxs.iter() {
                 let node = demux.as_ref();
@@ -139,8 +149,6 @@ impl InputController {
                 };
                 if !task_exited.load(Ordering::Acquire) {
                     waiter.set_choked_next(false);
-                    // have_unchoked = true;
-                    break;
                 }
             }
         }
