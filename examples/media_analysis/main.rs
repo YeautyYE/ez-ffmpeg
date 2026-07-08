@@ -9,7 +9,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             pixel_th: 0.10,
             picture_th: 0.98,
         })
-        .video_detector(VideoDetector::Scene { threshold_pct: 10.0 })
+        .video_detector(VideoDetector::Scene {
+            threshold_pct: 10.0,
+        })
         .audio_detector(AudioDetector::Silence {
             noise_db: -30.0,
             min_duration_s: 0.5,

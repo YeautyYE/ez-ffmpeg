@@ -13,10 +13,7 @@ use ez_ffmpeg::{FfmpegContext, FfmpegScheduler, Input, Output};
 use std::time::Duration;
 
 fn tmp_path(name: &str) -> String {
-    let dir = std::env::temp_dir().join(format!(
-        "ez_ffmpeg_enc_open_tests_{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("ez_ffmpeg_enc_open_tests_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir.join(name).to_string_lossy().into_owned()
 }
@@ -66,11 +63,7 @@ fn subtitle_stream_with_no_cues_in_range_still_muxes() {
     // Subtitle fixture whose only cue starts at t=10s — far outside the 1s
     // output range, so the subtitle encoder never receives a frame.
     let srt = tmp_path("late_cue.srt");
-    std::fs::write(
-        &srt,
-        "1\n00:00:10,000 --> 00:00:11,000\nlate cue\n\n",
-    )
-    .unwrap();
+    std::fs::write(&srt, "1\n00:00:10,000 --> 00:00:11,000\nlate cue\n\n").unwrap();
 
     // Intermediate mkv whose subtitle track exists but carries ZERO packets
     // (CLI: -map 1:s -c:s srt -t 1 keeps the track, drops the late cue).
@@ -100,18 +93,12 @@ fn subtitle_stream_with_no_cues_in_range_still_muxes() {
     // opens without ever receiving a frame.
     let mut scanner = PacketScanner::open(mkv.as_str()).expect("failed to open mkv fixture");
     let mut sub_packets = 0usize;
-    while let Some(pkt) = scanner
-        .next_packet()
-        .expect("failed to scan mkv fixture")
-    {
+    while let Some(pkt) = scanner.next_packet().expect("failed to scan mkv fixture") {
         if !pkt.is_video() && !pkt.is_audio() {
             sub_packets += 1;
         }
     }
-    assert_eq!(
-        sub_packets, 0,
-        "fixture subtitle track must be packet-less"
-    );
+    assert_eq!(sub_packets, 0, "fixture subtitle track must be packet-less");
 
     // CLI: ffmpeg -i empty_sub.mkv -map 0:v -map 0:s -c:s mov_text succeeds
     // and writes both streams even though the subtitle encoder receives no

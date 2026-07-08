@@ -2,8 +2,8 @@ use std::ffi::CStr;
 use std::ptr::null_mut;
 
 pub mod frame_filter;
-pub mod frame_pipeline;
 pub mod frame_filter_context;
+pub mod frame_pipeline;
 pub mod frame_pipeline_builder;
 
 /// Retrieves a list of all filters recognized by FFmpeg.

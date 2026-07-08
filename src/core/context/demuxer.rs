@@ -3,10 +3,10 @@ use crate::core::context::decoder_stream::DecoderStream;
 use crate::core::context::pre_mux_queue::PreMuxQueueSender;
 use crate::core::context::PacketBox;
 use crate::core::hwaccel::HWAccelID;
-use crate::raw::FormatContext;
 use crate::core::scheduler::input_controller::SchNode;
 use crate::error::OpenInputError;
 use crate::filter::frame_pipeline::FramePipeline;
+use crate::raw::FormatContext;
 use crossbeam_channel::Sender;
 use ffmpeg_sys_next::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE;
 use ffmpeg_sys_next::AVMediaType::{AVMEDIA_TYPE_AUDIO, AVMEDIA_TYPE_SUBTITLE, AVMEDIA_TYPE_VIDEO};
@@ -14,7 +14,11 @@ use ffmpeg_sys_next::AVPixelFormat::{
     AV_PIX_FMT_CUDA, AV_PIX_FMT_MEDIACODEC, AV_PIX_FMT_NONE, AV_PIX_FMT_QSV,
 };
 use ffmpeg_sys_next::{
-    av_channel_layout_default, av_codec_is_decoder, av_codec_iterate, av_get_pix_fmt, av_hwdevice_find_type_by_name, av_hwdevice_get_type_name, avcodec_descriptor_get, avcodec_descriptor_get_by_name, avcodec_find_decoder, avcodec_find_decoder_by_name, avcodec_get_hw_config, AVChannelOrder, AVCodecID, AVCodecParameters, AVFormatContext, AVHWDeviceType, AVMediaType, AVPixelFormat, AVRational, AVERROR, EINVAL
+    av_channel_layout_default, av_codec_is_decoder, av_codec_iterate, av_get_pix_fmt,
+    av_hwdevice_find_type_by_name, av_hwdevice_get_type_name, avcodec_descriptor_get,
+    avcodec_descriptor_get_by_name, avcodec_find_decoder, avcodec_find_decoder_by_name,
+    avcodec_get_hw_config, AVChannelOrder, AVCodecID, AVCodecParameters, AVFormatContext,
+    AVHWDeviceType, AVMediaType, AVPixelFormat, AVRational, AVERROR, EINVAL,
 };
 use log::{debug, error, warn};
 use std::collections::HashMap;
@@ -175,7 +179,10 @@ impl Demuxer {
             framerate,
             #[cfg(windows)]
             hwaccel,
-            node: Arc::new(SchNode::Demux { waiter: Arc::new(Default::default()), task_exited: Arc::new(Default::default()) }),
+            node: Arc::new(SchNode::Demux {
+                waiter: Arc::new(Default::default()),
+                task_exited: Arc::new(Default::default()),
+            }),
             streams,
             dsts: vec![],
             dst_source_finished: vec![],
@@ -211,8 +218,8 @@ impl Demuxer {
                 // for video (ffmpeg_demux.c:1002-1006: forced -> flags |=
                 // FRAMERATE_FORCED, else framerate = avg_frame_rate).
                 let codec_type_early = (*(*st).codecpar).codec_type;
-                let framerate_forced = forced_framerate.num != 0
-                    && codec_type_early == AVMEDIA_TYPE_VIDEO;
+                let framerate_forced =
+                    forced_framerate.num != 0 && codec_type_early == AVMEDIA_TYPE_VIDEO;
                 let avg_framerate = if framerate_forced {
                     forced_framerate
                 } else {
@@ -232,9 +239,14 @@ impl Demuxer {
                 let codec_id = (*codec_parameters).codec_id;
 
                 if codec_type == AVMEDIA_TYPE_AUDIO
-                    && (*codec_parameters).ch_layout.order == AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC
-                        && (*codec_parameters).ch_layout.nb_channels > 0 {
-                        av_channel_layout_default(&mut (*codec_parameters).ch_layout, (*codec_parameters).ch_layout.nb_channels);
+                    && (*codec_parameters).ch_layout.order
+                        == AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC
+                    && (*codec_parameters).ch_layout.nb_channels > 0
+                {
+                    av_channel_layout_default(
+                        &mut (*codec_parameters).ch_layout,
+                        (*codec_parameters).ch_layout.nb_channels,
+                    );
                 }
 
                 let codec_name =
@@ -261,8 +273,8 @@ impl Demuxer {
                     codec_parameters,
                     codec_type,
                     match decoder {
-                        Some(decoder) => { decoder.as_ptr() },
-                        None => { null() },
+                        Some(decoder) => decoder.as_ptr(),
+                        None => null(),
                     },
                     codec_desc,
                     codec_opts,

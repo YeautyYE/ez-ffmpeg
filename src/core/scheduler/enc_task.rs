@@ -2,19 +2,26 @@ use crate::core::context::encoder_stream::EncoderStream;
 use crate::core::context::obj_pool::ObjPool;
 use crate::core::context::pre_mux_queue::{packet_payload_size, PreMuxQueueSender};
 use crate::core::context::{CodecContext, FrameBox, PacketBox, PacketData};
-use crate::core::scheduler::sync_queue::SyncQueue;
-use crate::error::Error::{Encoding, OpenEncoder};
-use crate::error::{AllocPacketError, EncodeSubtitleError, EncodingError, EncodingOperationError, OpenEncoderError, OpenEncoderOperationError, OpenOutputError};
 use crate::core::scheduler::ffmpeg_scheduler::{
-    frame_is_null, is_stopping, packet_is_null, set_scheduler_error, wait_until_not_paused, STATUS_ABORT,
+    frame_is_null, is_stopping, packet_is_null, set_scheduler_error, wait_until_not_paused,
+    STATUS_ABORT,
 };
 use crate::core::scheduler::input_controller::InputController;
+use crate::core::scheduler::sync_queue::SyncQueue;
+use crate::error::Error::{Encoding, OpenEncoder};
+use crate::error::{
+    AllocPacketError, EncodeSubtitleError, EncodingError, EncodingOperationError, OpenEncoderError,
+    OpenEncoderOperationError, OpenOutputError,
+};
 use crate::hwaccel::hw_device_get_by_type;
 use crate::util::ffmpeg_utils::{av_err2str, hashmap_to_avdictionary, DictGuard};
 use crate::util::thread_synchronizer::{ThreadDoneGuard, ThreadSynchronizer};
 use crossbeam_channel::{Receiver, RecvTimeoutError, SendError, Sender};
 use ffmpeg_next::packet::Mut;
 use ffmpeg_next::{Frame, Packet};
+#[cfg(all(not(docsrs), not(ffmpeg_8_0)))]
+use ffmpeg_sys_next::av_frame_side_data_desc;
+use ffmpeg_sys_next::av_mallocz;
 use ffmpeg_sys_next::AVCodecID::{
     AV_CODEC_ID_ASS, AV_CODEC_ID_CODEC2, AV_CODEC_ID_DVB_SUBTITLE, AV_CODEC_ID_MJPEG,
 };
@@ -27,12 +34,24 @@ use ffmpeg_sys_next::AVPixelFormat::AV_PIX_FMT_NONE;
 use ffmpeg_sys_next::AVSampleFormat::AV_SAMPLE_FMT_NONE;
 #[cfg(all(not(docsrs), not(ffmpeg_8_0)))]
 use ffmpeg_sys_next::AVSideDataProps::AV_SIDE_DATA_PROP_GLOBAL;
-#[cfg(all(not(docsrs), not(ffmpeg_8_0)))]
-use ffmpeg_sys_next::av_frame_side_data_desc;
+use ffmpeg_sys_next::{
+    av_add_q, av_buffer_ref, av_compare_ts, av_cpu_max_align, av_frame_copy_props,
+    av_frame_get_buffer, av_frame_ref, av_get_bytes_per_sample, av_get_pix_fmt_name,
+    av_opt_set_dict2, av_rescale_q, av_sample_fmt_is_planar, av_samples_copy, av_shrink_packet,
+    avcodec_alloc_context3, avcodec_encode_subtitle, avcodec_get_hw_config, avcodec_open2,
+    avcodec_parameters_from_context, avcodec_receive_packet, avcodec_send_frame, AVBufferRef,
+    AVCodecContext, AVFrame, AVHWFramesContext, AVMediaType, AVRational, AVStream, AVSubtitle,
+    AVERROR, AVERROR_EOF, AVERROR_EXPERIMENTAL, AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE,
+    AV_CODEC_CAP_PARAM_CHANGE, AV_CODEC_FLAG_INTERLACED_DCT, AV_CODEC_FLAG_INTERLACED_ME,
+    AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX, AV_CODEC_HW_CONFIG_METHOD_HW_FRAMES_CTX,
+    AV_NOPTS_VALUE, AV_OPT_SEARCH_CHILDREN, AV_PKT_FLAG_TRUSTED, AV_TIME_BASE_Q, EAGAIN,
+};
 #[cfg(not(docsrs))]
-use ffmpeg_sys_next::{av_channel_layout_copy, av_frame_side_data_clone, AV_CODEC_FLAG_COPY_OPAQUE, AV_CODEC_FLAG_FRAME_DURATION, AV_FRAME_FLAG_INTERLACED, AV_FRAME_FLAG_TOP_FIELD_FIRST, AV_FRAME_SIDE_DATA_FLAG_UNIQUE};
-use ffmpeg_sys_next::{av_add_q, av_buffer_ref, av_compare_ts, av_cpu_max_align, av_frame_copy_props, av_frame_get_buffer, av_frame_ref, av_get_bytes_per_sample, av_get_pix_fmt_name, av_opt_set_dict2, av_rescale_q, av_sample_fmt_is_planar, av_samples_copy, av_shrink_packet, avcodec_alloc_context3, avcodec_encode_subtitle, avcodec_get_hw_config, avcodec_open2, avcodec_parameters_from_context, avcodec_receive_packet, avcodec_send_frame, AVBufferRef, AVCodecContext, AVFrame, AVHWFramesContext, AVMediaType, AVRational, AVStream, AVSubtitle, AVERROR, AVERROR_EOF, AVERROR_EXPERIMENTAL, AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE, AV_CODEC_CAP_PARAM_CHANGE, AV_CODEC_FLAG_INTERLACED_DCT, AV_CODEC_FLAG_INTERLACED_ME, AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX, AV_CODEC_HW_CONFIG_METHOD_HW_FRAMES_CTX, AV_NOPTS_VALUE, AV_OPT_SEARCH_CHILDREN, AV_PKT_FLAG_TRUSTED, AV_TIME_BASE_Q, EAGAIN};
-use ffmpeg_sys_next::av_mallocz;
+use ffmpeg_sys_next::{
+    av_channel_layout_copy, av_frame_side_data_clone, AV_CODEC_FLAG_COPY_OPAQUE,
+    AV_CODEC_FLAG_FRAME_DURATION, AV_FRAME_FLAG_INTERLACED, AV_FRAME_FLAG_TOP_FIELD_FIRST,
+    AV_FRAME_SIDE_DATA_FLAG_UNIQUE,
+};
 use log::{debug, error, info, trace, warn};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString};
@@ -107,13 +126,26 @@ pub(crate) fn enc_init(
     }
 
     if oformat_flags & ffmpeg_sys_next::AVFMT_GLOBALHEADER != 0 {
-       unsafe { (*enc_ctx).flags |= ffmpeg_sys_next::AV_CODEC_FLAG_GLOBAL_HEADER as i32; }
+        unsafe {
+            (*enc_ctx).flags |= ffmpeg_sys_next::AV_CODEC_FLAG_GLOBAL_HEADER as i32;
+        }
     }
     let enc_ctx_box = CodecContext::new(enc_ctx);
 
-    let max_frames = get_max_frames(enc_stream.codec_type, max_video_frames, max_audio_frames, max_subtitle_frames);
+    let max_frames = get_max_frames(
+        enc_stream.codec_type,
+        max_video_frames,
+        max_audio_frames,
+        max_subtitle_frames,
+    );
 
-    set_encoder_opts(&enc_stream, video_codec_opts, audio_codec_opts, subtitle_codec_opts, &enc_ctx_box)?;
+    set_encoder_opts(
+        &enc_stream,
+        video_codec_opts,
+        audio_codec_opts,
+        subtitle_codec_opts,
+        &enc_ctx_box,
+    )?;
 
     let receiver = enc_stream.take_src();
     let pkt_sender = enc_stream.take_dst();
@@ -133,7 +165,11 @@ pub(crate) fn enc_init(
     let stream_box = enc_stream.stream;
     let stream_index = enc_stream.stream_index;
 
-    let encoder_name = unsafe { CStr::from_ptr((*enc_stream.encoder).name).to_str().unwrap_or("unknown") };
+    let encoder_name = unsafe {
+        CStr::from_ptr((*enc_stream.encoder).name)
+            .to_str()
+            .unwrap_or("unknown")
+    };
 
     // Slot claimed before spawn; the guard releases it on any exit path.
     thread_sync.thread_start();
@@ -580,7 +616,7 @@ fn receive_from(
                 return Err(SyncFrame::Break);
             }
             Ok(frame_box)
-        },
+        }
         Err(e) if e == RecvTimeoutError::Disconnected => {
             debug!("Source[decoder/filtergraph/pipeline] thread exit.");
             Err(SyncFrame::Break)
@@ -599,7 +635,7 @@ fn process_audio_queue(
     frames_sent: &mut i64,
     is_finished: &mut bool,
     scheduler_status: &Arc<AtomicUsize>,
-    scheduler_result: &Arc<Mutex<Option<crate::error::Result<()>>>>
+    scheduler_result: &Arc<Mutex<Option<crate::error::Result<()>>>>,
 ) -> Result<Option<FrameBox>, ()> {
     if let Some(peek) = audio_frame_queue.front() {
         if frame_samples <= *samples_queued || *is_finished {
@@ -643,7 +679,7 @@ fn process_audio_queue(
                         Ok(audio_frame_queue.pop_front())
                     }
                 }
-            }
+            };
         }
     }
     Ok(None)
@@ -665,7 +701,7 @@ fn receive_frame(
     frames_sent: &mut i64,
     is_finished: &mut bool,
     scheduler_status: &Arc<AtomicUsize>,
-    scheduler_result: &Arc<Mutex<Option<crate::error::Result<()>>>>
+    scheduler_result: &Arc<Mutex<Option<crate::error::Result<()>>>>,
 ) -> SyncFrame {
     let mut frame_box = if !*opened {
         let mut frame_box = match receive_from(receiver, scheduler_status) {
@@ -706,7 +742,13 @@ fn receive_frame(
             return SyncFrame::Break;
         }
 
-        if let Err(e) = enc_open(enc_ctx, stream, &mut frame_box, ready_sender.clone(), *bits_per_raw_sample) {
+        if let Err(e) = enc_open(
+            enc_ctx,
+            stream,
+            &mut frame_box,
+            ready_sender.clone(),
+            *bits_per_raw_sample,
+        ) {
             frame_pool.release(frame_box.frame);
             error!("Open encoder error: {e}");
             set_scheduler_error(scheduler_status, scheduler_result, e);
@@ -752,8 +794,6 @@ fn receive_frame(
                 _ => {}
             }
         }
-
-        
 
         match receive_from(receiver, scheduler_status) {
             Ok(frame) => frame,
@@ -818,7 +858,16 @@ unsafe fn sq_frame_end_tb(fb: &FrameBox) -> (Option<i64>, AVRational, i32) {
     let end_ts = if pts == AV_NOPTS_VALUE {
         None
     } else if nb_samples > 0 && (*f).sample_rate > 0 {
-        Some(pts + av_rescale_q(nb_samples as i64, AVRational { num: 1, den: (*f).sample_rate }, tb))
+        Some(
+            pts + av_rescale_q(
+                nb_samples as i64,
+                AVRational {
+                    num: 1,
+                    den: (*f).sample_rate,
+                },
+                tb,
+            ),
+        )
     } else {
         Some(pts + (*f).duration)
     };
@@ -895,7 +944,13 @@ unsafe fn sq_encode_drained(
     }
 }
 
-fn set_encoder_opts(enc_stream: &EncoderStream, video_codec_opts: &Option<HashMap<CString, CString>>, audio_codec_opts: &Option<HashMap<CString, CString>>, subtitle_codec_opts: &Option<HashMap<CString, CString>>, enc_ctx_box: &CodecContext) -> crate::error::Result<()> {
+fn set_encoder_opts(
+    enc_stream: &EncoderStream,
+    video_codec_opts: &Option<HashMap<CString, CString>>,
+    audio_codec_opts: &Option<HashMap<CString, CString>>,
+    subtitle_codec_opts: &Option<HashMap<CString, CString>>,
+    enc_ctx_box: &CodecContext,
+) -> crate::error::Result<()> {
     let mut encoder_opts = DictGuard::new(if enc_stream.codec_type == AVMEDIA_TYPE_VIDEO {
         hashmap_to_avdictionary(video_codec_opts)
     } else if enc_stream.codec_type == AVMEDIA_TYPE_AUDIO {
@@ -939,9 +994,7 @@ fn set_encoder_opts(enc_stream: &EncoderStream, video_codec_opts: &Option<HashMa
     // media type is needed; subtitles are excluded. A user-supplied `threads`
     // (applied above via the opts dict) is preserved by only defaulting when
     // absent.
-    if enc_stream.codec_type == AVMEDIA_TYPE_VIDEO
-        || enc_stream.codec_type == AVMEDIA_TYPE_AUDIO
-    {
+    if enc_stream.codec_type == AVMEDIA_TYPE_VIDEO || enc_stream.codec_type == AVMEDIA_TYPE_AUDIO {
         let codec_opts = if enc_stream.codec_type == AVMEDIA_TYPE_VIDEO {
             video_codec_opts
         } else {
@@ -960,7 +1013,12 @@ fn set_encoder_opts(enc_stream: &EncoderStream, video_codec_opts: &Option<HashMa
     Ok(())
 }
 
-fn get_max_frames(codec_type: AVMediaType, max_video_frames: Option<i64>, max_audio_frames: Option<i64>, max_subtitle_frames: Option<i64>) -> Option<i64> {
+fn get_max_frames(
+    codec_type: AVMediaType,
+    max_video_frames: Option<i64>,
+    max_audio_frames: Option<i64>,
+    max_subtitle_frames: Option<i64>,
+) -> Option<i64> {
     if codec_type == AVMEDIA_TYPE_VIDEO {
         max_video_frames
     } else if codec_type == AVMEDIA_TYPE_AUDIO {
@@ -1227,20 +1285,17 @@ fn enc_open(
                 (*enc_ctx).sample_aspect_ratio = (*frame).sample_aspect_ratio;
                 (*stream).sample_aspect_ratio = (*frame).sample_aspect_ratio;
 
-                (*enc_ctx).pix_fmt =
-                    crate::util::format_convert::pix_fmt_from_raw((*frame).format)
-                        .ok_or(OpenOutputError::UnknownFrameFormat)?;
+                (*enc_ctx).pix_fmt = crate::util::format_convert::pix_fmt_from_raw((*frame).format)
+                    .ok_or(OpenOutputError::UnknownFrameFormat)?;
 
                 if let Some(bits_per_raw_sample) = bits_per_raw_sample {
                     (*enc_ctx).bits_per_raw_sample = bits_per_raw_sample;
                 } else {
                     // Checked descriptor lookup: a null descriptor (invalid /
                     // unknown pix_fmt) must not be dereferenced.
-                    let depth = crate::util::format_convert::pix_fmt_desc_from_raw(
-                        (*frame).format,
-                    )
-                    .ok_or(OpenOutputError::UnknownFrameFormat)?
-                    .comp[0]
+                    let depth = crate::util::format_convert::pix_fmt_desc_from_raw((*frame).format)
+                        .ok_or(OpenOutputError::UnknownFrameFormat)?
+                        .comp[0]
                         .depth;
                     (*enc_ctx).bits_per_raw_sample =
                         std::cmp::min(frame_box.frame_data.bits_per_raw_sample, depth);
@@ -1589,12 +1644,28 @@ fn frame_encode(
             } else if (*(*enc_ctx).codec).capabilities & AV_CODEC_CAP_PARAM_CHANGE as i32 == 0
                 && (*enc_ctx).ch_layout.nb_channels != (*frame).ch_layout.nb_channels
             {
-                error!("Audio channel count changed and encoder does not support parameter changes");
+                error!(
+                    "Audio channel count changed and encoder does not support parameter changes"
+                );
                 return Ok(EncodeStatus::Continue);
             }
         }
-        encode_frame(enc_ctx, frame, pkt_sender,  pre_pkt_sender, mux_start_gate, stream, packet_pool)
-            .map(|eof| if eof { EncodeStatus::Eof } else { EncodeStatus::Continue })
+        encode_frame(
+            enc_ctx,
+            frame,
+            pkt_sender,
+            pre_pkt_sender,
+            mux_start_gate,
+            stream,
+            packet_pool,
+        )
+        .map(|eof| {
+            if eof {
+                EncodeStatus::Eof
+            } else {
+                EncodeStatus::Continue
+            }
+        })
     }
 }
 
@@ -1701,15 +1772,20 @@ unsafe fn do_subtitle_out(
         }
         (*pkt).dts = (*pkt).pts;
 
-        match send_to_mux(PacketBox {
-            packet,
-            packet_data: PacketData {
-                dts_est: 0,
-                codec_type: (*enc_ctx).codec_type,
-                output_stream_index: (*stream).index,
-                is_copy: false,
+        match send_to_mux(
+            PacketBox {
+                packet,
+                packet_data: PacketData {
+                    dts_est: 0,
+                    codec_type: (*enc_ctx).codec_type,
+                    output_stream_index: (*stream).index,
+                    is_copy: false,
+                },
             },
-        }, pkt_sender, pre_pkt_sender, mux_start_gate) {
+            pkt_sender,
+            pre_pkt_sender,
+            mux_start_gate,
+        ) {
             Ok(()) => {}
             // Mux receiver gone: the muxer legitimately finished. Graceful stop
             // (only recorded as a failure if we were NOT asked to stop).
@@ -1738,20 +1814,19 @@ unsafe fn encode_frame(
     stream: *mut AVStream,
     packet_pool: &ObjPool<Packet>,
 ) -> crate::error::Result<bool> {
-    if !frame.is_null()
-        && (*frame).sample_aspect_ratio.num != 0 {
-            (*enc_ctx).sample_aspect_ratio = (*frame).sample_aspect_ratio;
-        }
+    if !frame.is_null() && (*frame).sample_aspect_ratio.num != 0 {
+        (*enc_ctx).sample_aspect_ratio = (*frame).sample_aspect_ratio;
+    }
 
     let ret = avcodec_send_frame(enc_ctx, frame);
     if ret < 0 && !(ret == AVERROR_EOF && frame.is_null()) {
-        if ret == AVERROR_EOF && frame.is_null(){
+        if ret == AVERROR_EOF && frame.is_null() {
             trace!("EOF reached, no more frames to encode.");
         } else {
             error!(
-            "Error submitting {:?} frame to the encoder",
-            (*enc_ctx).codec_type
-        );
+                "Error submitting {:?} frame to the encoder",
+                (*enc_ctx).codec_type
+            );
             return Err(Encoding(EncodingOperationError::SendFrameError(
                 EncodingError::from(ret),
             )));
@@ -1781,15 +1856,20 @@ unsafe fn encode_frame(
 
         (*pkt).flags |= AV_PKT_FLAG_TRUSTED;
 
-        match send_to_mux(PacketBox {
-            packet,
-            packet_data: PacketData {
-                dts_est: 0,
-                codec_type: (*enc_ctx).codec_type,
-                output_stream_index: (*stream).index,
-                is_copy: false,
+        match send_to_mux(
+            PacketBox {
+                packet,
+                packet_data: PacketData {
+                    dts_est: 0,
+                    codec_type: (*enc_ctx).codec_type,
+                    output_stream_index: (*stream).index,
+                    is_copy: false,
+                },
             },
-        }, pkt_sender, pre_pkt_sender, mux_start_gate) {
+            pkt_sender,
+            pre_pkt_sender,
+            mux_start_gate,
+        ) {
             Ok(()) => {}
             // Mux receiver gone: the muxer legitimately finished. Graceful stop.
             Err(SendToMuxError::Disconnected(_)) => {
@@ -1804,7 +1884,6 @@ unsafe fn encode_frame(
         }
     }
 }
-
 
 /// Classified failure of [`send_to_mux`]. The two cases must be handled
 /// differently: `Disconnected` means the mux receiver is gone (benign — the
@@ -1870,9 +1949,7 @@ pub(crate) fn send_to_mux(
                     .map_err(|SendError(pb)| SendToMuxError::Disconnected(pb));
             }
             PreSendOutcome::Full(pb) => pb,
-            PreSendOutcome::Disconnected(pb) => {
-                return Err(SendToMuxError::Disconnected(pb))
-            }
+            PreSendOutcome::Disconnected(pb) => return Err(SendToMuxError::Disconnected(pb)),
         };
         if Instant::now() >= deadline {
             error!(

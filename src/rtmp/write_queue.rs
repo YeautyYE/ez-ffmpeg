@@ -62,7 +62,6 @@ pub enum BackpressureLevel {
     Critical, // >= 4MB: should disconnect
 }
 
-
 /// Flush result
 #[derive(Debug)]
 pub enum FlushResult {
@@ -300,7 +299,9 @@ impl WriteQueue {
     /// once, when that entry completes (matching `enqueue`/`evict`).
     fn advance_front(&mut self, mut n: usize) {
         while n > 0 {
-            let Some(front) = self.queue.front_mut() else { break };
+            let Some(front) = self.queue.front_mut() else {
+                break;
+            };
             let rem = front.remaining_bytes();
             if rem == 0 {
                 // A zero-length entry contributes nothing; drop it.
@@ -349,9 +350,7 @@ impl WriteQueue {
     #[cfg(test)]
     fn backdate_front(&mut self, secs: u64) {
         if let Some(front) = self.queue.front_mut() {
-            if let Some(t) =
-                Instant::now().checked_sub(std::time::Duration::from_secs(secs))
-            {
+            if let Some(t) = Instant::now().checked_sub(std::time::Duration::from_secs(secs)) {
                 front.timestamp = t;
             }
         }
@@ -368,7 +367,6 @@ impl WriteQueue {
     fn has_video(&self) -> bool {
         self.has_video
     }
-
 }
 
 impl Default for WriteQueue {
@@ -430,7 +428,10 @@ mod tests {
             // Try to add 600KB which would push total to 4.1MB >= 4MB (critical)
             // This should be rejected
             let result = queue.enqueue(make_data(600 * 1024), true, false, true);
-            assert!(!result, "Enqueue should be rejected when it would reach Critical");
+            assert!(
+                !result,
+                "Enqueue should be rejected when it would reach Critical"
+            );
             // Queue should still be at High level (data was rejected)
             assert_eq!(queue.backpressure_level(), BackpressureLevel::High);
         }
@@ -501,12 +502,18 @@ mod tests {
         // Try to add data that would exceed critical threshold
         // Even keyframes should be rejected
         let result = queue.enqueue(make_data(200 * 1024), true, false, true);
-        assert!(!result, "Keyframe should be rejected when it would exceed Critical");
+        assert!(
+            !result,
+            "Keyframe should be rejected when it would exceed Critical"
+        );
 
         // Even sequence headers should be rejected when threshold would be exceeded
         // (Note: sequence headers bypass drop policy but not critical threshold)
         let result = queue.enqueue(make_data(200 * 1024), false, true, true);
-        assert!(!result, "Sequence header should be rejected when it would exceed Critical");
+        assert!(
+            !result,
+            "Sequence header should be rejected when it would exceed Critical"
+        );
         assert!(!result);
     }
 
@@ -565,9 +572,15 @@ mod tests {
         // Capacity 7: one writev writes "hello" (5) then "wo" (2) and fills.
         // The returned count (7) must walk across the entry boundary: pop the
         // first entry, pin the second at offset 2.
-        let mut writer = CapWriter { inner: Vec::new(), capacity: 7 };
+        let mut writer = CapWriter {
+            inner: Vec::new(),
+            capacity: 7,
+        };
         let result = queue.try_flush(&mut writer).unwrap();
-        assert!(matches!(result, FlushResult::WouldBlock { bytes_written: 7 }));
+        assert!(matches!(
+            result,
+            FlushResult::WouldBlock { bytes_written: 7 }
+        ));
         assert_eq!(writer.inner, b"hellowo");
         assert_eq!(queue.pending_entries(), 1);
         assert_eq!(queue.front_offset(), Some(2));
@@ -591,9 +604,15 @@ mod tests {
         queue.enqueue(Bytes::from_static(b"world"), false, false, true);
 
         // Capacity 3: writev writes "hel" then fills mid first entry.
-        let mut writer = CapWriter { inner: Vec::new(), capacity: 3 };
+        let mut writer = CapWriter {
+            inner: Vec::new(),
+            capacity: 3,
+        };
         let result = queue.try_flush(&mut writer).unwrap();
-        assert!(matches!(result, FlushResult::WouldBlock { bytes_written: 3 }));
+        assert!(matches!(
+            result,
+            FlushResult::WouldBlock { bytes_written: 3 }
+        ));
         assert_eq!(writer.inner, b"hel");
         assert!(!queue.is_empty());
         assert_eq!(queue.front_offset(), Some(3));
@@ -601,7 +620,10 @@ mod tests {
         // An immediate retry with no room returns WouldBlock, zero progress -
         // no partial state is corrupted by the empty write.
         let result = queue.try_flush(&mut writer).unwrap();
-        assert!(matches!(result, FlushResult::WouldBlock { bytes_written: 0 }));
+        assert!(matches!(
+            result,
+            FlushResult::WouldBlock { bytes_written: 0 }
+        ));
         assert_eq!(queue.front_offset(), Some(3));
     }
 
@@ -642,7 +664,10 @@ mod tests {
             queue.enqueue(Bytes::from(payload), false, false, true);
         }
 
-        let mut writer = CountingWriter { inner: Vec::new(), writev_calls: 0 };
+        let mut writer = CountingWriter {
+            inner: Vec::new(),
+            writev_calls: 0,
+        };
         let result = queue.try_flush(&mut writer).unwrap();
         assert!(matches!(result, FlushResult::Complete { .. }));
         assert!(queue.is_empty());

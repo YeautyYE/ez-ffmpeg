@@ -8,11 +8,11 @@
 //! - [`animated_gif`]: high-quality GIF export (palettegen/paletteuse).
 //! - [`HlsLadder`]: VOD adaptive-bitrate HLS ladder.
 
-pub mod thumbnail;
 pub mod gif;
 pub mod hls;
 pub mod hls_master;
+pub mod thumbnail;
 
-pub use thumbnail::*;
 pub use gif::*;
 pub use hls::*;
+pub use thumbnail::*;

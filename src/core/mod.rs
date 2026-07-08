@@ -604,13 +604,12 @@ struct FfmpegLogState {
     last_msg: String,
 }
 
-static FFMPEG_LOG_STATE: std::sync::Mutex<FfmpegLogState> =
-    std::sync::Mutex::new(FfmpegLogState {
-        print_prefix: 1,
-        last_level: ffmpeg_sys_next::AV_LOG_INFO,
-        repeated: 0,
-        last_msg: String::new(),
-    });
+static FFMPEG_LOG_STATE: std::sync::Mutex<FfmpegLogState> = std::sync::Mutex::new(FfmpegLogState {
+    print_prefix: 1,
+    last_level: ffmpeg_sys_next::AV_LOG_INFO,
+    repeated: 0,
+    last_msg: String::new(),
+});
 
 unsafe extern "C" fn ffmpeg_log_callback(
     ptr: *mut libc::c_void,

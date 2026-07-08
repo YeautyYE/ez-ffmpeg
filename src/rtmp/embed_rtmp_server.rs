@@ -105,7 +105,10 @@ impl EmbedRtmpServer<Initialization> {
     ///
     /// An [`EmbedRtmpServer`] instance configured to listen on the given address and
     /// using the specified GOP limit.
-    pub fn new_with_gop_limit(address: impl Into<String>, gop_limit: usize) -> EmbedRtmpServer<Initialization> {
+    pub fn new_with_gop_limit(
+        address: impl Into<String>,
+        gop_limit: usize,
+    ) -> EmbedRtmpServer<Initialization> {
         Self {
             address: address.into(),
             bound_addr: None,
@@ -149,7 +152,8 @@ impl EmbedRtmpServer<Initialization> {
             .map_err(|e| <std::io::Error as Into<crate::error::Error>>::into(e))?;
 
         // Get actual bound address (important for port 0)
-        let actual_addr = listener.local_addr()
+        let actual_addr = listener
+            .local_addr()
             .map_err(|e| <std::io::Error as Into<crate::error::Error>>::into(e))?;
         self.bound_addr = Some(actual_addr);
 
@@ -189,7 +193,17 @@ impl EmbedRtmpServer<Initialization> {
         let max_connections = self.max_connections;
         let result = std::thread::Builder::new()
             .name("rtmp-server-worker".to_string())
-            .spawn(move || handle_connections(stream_receiver, publisher_receiver, stream_keys, self.gop_limit, max_connections, status, waker));
+            .spawn(move || {
+                handle_connections(
+                    stream_receiver,
+                    publisher_receiver,
+                    stream_keys,
+                    self.gop_limit,
+                    max_connections,
+                    status,
+                    waker,
+                )
+            });
         if let Err(e) = result {
             error!("Thread[rtmp-server-worker] exited with error: {e}");
             return Err(crate::error::Error::RtmpThreadExited);
@@ -204,50 +218,52 @@ impl EmbedRtmpServer<Initialization> {
         let result = std::thread::Builder::new()
             .name("rtmp-server-io".to_string())
             .spawn(move || {
-            for stream in listener.incoming() {
-                // Check the stop flag on every iteration, not only when the
-                // listener runs dry: under a steady stream of incoming
-                // connections the WouldBlock branch is never taken and
-                // stop() would otherwise never terminate this thread.
-                if status.load(Ordering::Acquire) == STATUS_END {
-                    info!("Embed rtmp server stopped.");
-                    break;
-                }
-                match stream {
-                    Ok(stream) => {
-                        // Use try_send to apply backpressure when channel is full
-                        match stream_sender.try_send(stream) {
-                            Ok(_) => {
-                                debug!("New rtmp connection accepted.");
+                for stream in listener.incoming() {
+                    // Check the stop flag on every iteration, not only when the
+                    // listener runs dry: under a steady stream of incoming
+                    // connections the WouldBlock branch is never taken and
+                    // stop() would otherwise never terminate this thread.
+                    if status.load(Ordering::Acquire) == STATUS_END {
+                        info!("Embed rtmp server stopped.");
+                        break;
+                    }
+                    match stream {
+                        Ok(stream) => {
+                            // Use try_send to apply backpressure when channel is full
+                            match stream_sender.try_send(stream) {
+                                Ok(_) => {
+                                    debug!("New rtmp connection accepted.");
+                                }
+                                Err(crossbeam_channel::TrySendError::Full(s)) => {
+                                    // Channel full - server at capacity, reject connection immediately
+                                    let _ = s.shutdown(Shutdown::Both);
+                                    debug!(
+                                        "Connection rejected: server at capacity (channel full)"
+                                    );
+                                }
+                                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                                    error!("Connection channel disconnected");
+                                    status.store(STATUS_END, Ordering::Release);
+                                    return;
+                                }
                             }
-                            Err(crossbeam_channel::TrySendError::Full(s)) => {
-                                // Channel full - server at capacity, reject connection immediately
-                                let _ = s.shutdown(Shutdown::Both);
-                                debug!("Connection rejected: server at capacity (channel full)");
-                            }
-                            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
-                                error!("Connection channel disconnected");
-                                status.store(STATUS_END, Ordering::Release);
-                                return;
+                        }
+                        Err(e) => {
+                            if e.kind() == std::io::ErrorKind::WouldBlock {
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                            } else if is_fd_exhaustion(&e) {
+                                // Accepting again immediately would fail the same
+                                // way and spin the CPU; back off and let existing
+                                // connections close first.
+                                warn!("Accept failed, file descriptors exhausted: {e}");
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                            } else {
+                                debug!("Rtmp connection error: {:?}", e);
                             }
                         }
                     }
-                    Err(e) => {
-                        if e.kind() == std::io::ErrorKind::WouldBlock {
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                        } else if is_fd_exhaustion(&e) {
-                            // Accepting again immediately would fail the same
-                            // way and spin the CPU; back off and let existing
-                            // connections close first.
-                            warn!("Accept failed, file descriptors exhausted: {e}");
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                        } else {
-                            debug!("Rtmp connection error: {:?}", e);
-                        }
-                    }
                 }
-            }
-        });
+            });
         if let Err(e) = result {
             error!("Thread[rtmp-server-io] exited with error: {e}");
             return Err(crate::error::Error::RtmpThreadExited);
@@ -351,74 +367,75 @@ impl EmbedRtmpServer<Running> {
 
         let mut flv_buffer = FlvBuffer::new();
         let mut serializer = ChunkSerializer::new();
-        let write_callback: Box<dyn FnMut(&[u8]) -> i32 + Send> = Box::new(move |buf: &[u8]| -> i32 {
-            flv_buffer.write_data(buf);
-            // One AVIO write can carry many FLV tags (the muxer hands over
-            // 64KB blocks): drain every complete tag now, or the backlog
-            // grows and the final tags of the stream are never sent.
-            while let Some(mut flv_tag) = flv_buffer.get_flv_tag() {
-                flv_tag.header.stream_id = 1;
-                let tag_type = flv_tag.header.tag_type;
+        let write_callback: Box<dyn FnMut(&[u8]) -> i32 + Send> =
+            Box::new(move |buf: &[u8]| -> i32 {
+                flv_buffer.write_data(buf);
+                // One AVIO write can carry many FLV tags (the muxer hands over
+                // 64KB blocks): drain every complete tag now, or the backlog
+                // grows and the final tags of the stream are never sent.
+                while let Some(mut flv_tag) = flv_buffer.get_flv_tag() {
+                    flv_tag.header.stream_id = 1;
+                    let tag_type = flv_tag.header.tag_type;
 
-                // 0x08 audio / 0x09 video: bypass the serializer. The
-                // (timestamp, data) handed over is byte-identical to what
-                // flv_tag_to_message_payload would build and the RTMP chunk
-                // round-trip would reconstruct, so the scheduler's sequence-
-                // header / keyframe-gate / GOP semantics are preserved exactly.
-                if tag_type == 0x08 || tag_type == 0x09 {
-                    let timestamp = flv_tag.header.timestamp
-                        | ((flv_tag.header.timestamp_ext as u32) << 24);
-                    let feed = PublisherFeed::Media {
-                        tag_type,
-                        timestamp: RtmpTimestamp { value: timestamp },
-                        data: flv_tag.data,
-                    };
-                    if let Err(e) = feed_sender.send(feed) {
-                        error!("Failed to send in-process media tag: {:?}", e);
-                        return -1;
-                    }
-                    // PERF-3: wake the reactor for each bypassed media tag, the
-                    // same as the Raw path below — without it the parsed tag
-                    // waits in the feed until the 100ms poll fallback, negating
-                    // the PERF-5a bypass. The token coalesces repeated wakes.
-                    if let Some(waker) = &wake_handle {
-                        waker.wake();
-                    }
-                    continue;
-                }
-
-                // 0x12 metadata and anything else keep the serialize path: the
-                // scheduler consumes the parsed StreamMetadataChanged event,
-                // which needs the @setDataFrame wrapping + AMF decode.
-                match serializer.serialize(&flv_tag_to_message_payload(flv_tag), false, true) {
-                    Ok(packet) => {
-                        if let Err(e) = feed_sender.send(PublisherFeed::Raw(packet.bytes)) {
-                            error!("Failed to send RTMP packet: {:?}", e);
+                    // 0x08 audio / 0x09 video: bypass the serializer. The
+                    // (timestamp, data) handed over is byte-identical to what
+                    // flv_tag_to_message_payload would build and the RTMP chunk
+                    // round-trip would reconstruct, so the scheduler's sequence-
+                    // header / keyframe-gate / GOP semantics are preserved exactly.
+                    if tag_type == 0x08 || tag_type == 0x09 {
+                        let timestamp = flv_tag.header.timestamp
+                            | ((flv_tag.header.timestamp_ext as u32) << 24);
+                        let feed = PublisherFeed::Media {
+                            tag_type,
+                            timestamp: RtmpTimestamp { value: timestamp },
+                            data: flv_tag.data,
+                        };
+                        if let Err(e) = feed_sender.send(feed) {
+                            error!("Failed to send in-process media tag: {:?}", e);
                             return -1;
                         }
-                        // Wake the reactor for each enqueued packet. Unconditional
-                        // (no message_sender.is_empty() gate): the reactor can
-                        // drain the queue and sleep in poll() between an emptiness
-                        // check and this send, so a was_empty gate loses the
-                        // wakeup and the packet stalls until the 100ms poll
-                        // fallback. Per-packet rather than once-after-the-batch:
-                        // the channel is bounded (1024), so a large batch would
-                        // block in send() before a post-batch wake ever ran,
-                        // stranding the reactor. The eventfd/pipe token coalesces
-                        // the wakes into a single reactor drain, so the cost is a
-                        // cheap (already-signaled) syscall.
+                        // PERF-3: wake the reactor for each bypassed media tag, the
+                        // same as the Raw path below — without it the parsed tag
+                        // waits in the feed until the 100ms poll fallback, negating
+                        // the PERF-5a bypass. The token coalesces repeated wakes.
                         if let Some(waker) = &wake_handle {
                             waker.wake();
                         }
+                        continue;
                     }
-                    Err(e) => {
-                        error!("Failed to serialize RTMP message: {:?}", e);
-                        return -1;
+
+                    // 0x12 metadata and anything else keep the serialize path: the
+                    // scheduler consumes the parsed StreamMetadataChanged event,
+                    // which needs the @setDataFrame wrapping + AMF decode.
+                    match serializer.serialize(&flv_tag_to_message_payload(flv_tag), false, true) {
+                        Ok(packet) => {
+                            if let Err(e) = feed_sender.send(PublisherFeed::Raw(packet.bytes)) {
+                                error!("Failed to send RTMP packet: {:?}", e);
+                                return -1;
+                            }
+                            // Wake the reactor for each enqueued packet. Unconditional
+                            // (no message_sender.is_empty() gate): the reactor can
+                            // drain the queue and sleep in poll() between an emptiness
+                            // check and this send, so a was_empty gate loses the
+                            // wakeup and the packet stalls until the 100ms poll
+                            // fallback. Per-packet rather than once-after-the-batch:
+                            // the channel is bounded (1024), so a large batch would
+                            // block in send() before a post-batch wake ever ran,
+                            // stranding the reactor. The eventfd/pipe token coalesces
+                            // the wakes into a single reactor drain, so the cost is a
+                            // cheap (already-signaled) syscall.
+                            if let Some(waker) = &wake_handle {
+                                waker.wake();
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to serialize RTMP message: {:?}", e);
+                            return -1;
+                        }
                     }
                 }
-            }
-            buf.len() as i32
-        });
+                buf.len() as i32
+            });
 
         let output: Output = write_callback.into();
 
@@ -624,10 +641,12 @@ pub(crate) fn build_publish_control(
         error!("Failed to create connect command: {:?}", e);
         RtmpCreateStream
     })?;
-    let connect_packet = serializer.serialize(&connect_cmd, false, true).map_err(|e| {
-        error!("Failed to serialize connect command: {:?}", e);
-        RtmpCreateStream
-    })?;
+    let connect_packet = serializer
+        .serialize(&connect_cmd, false, true)
+        .map_err(|e| {
+            error!("Failed to serialize connect command: {:?}", e);
+            RtmpCreateStream
+        })?;
 
     // createStream
     let create_stream_cmd = RtmpMessage::Amf0Command {
@@ -641,10 +660,12 @@ pub(crate) fn build_publish_control(
         error!("Failed to create createStream command: {:?}", e);
         RtmpCreateStream
     })?;
-    let create_stream_packet = serializer.serialize(&create_stream_cmd, false, true).map_err(|e| {
-        error!("Failed to serialize createStream command: {:?}", e);
-        RtmpCreateStream
-    })?;
+    let create_stream_packet = serializer
+        .serialize(&create_stream_cmd, false, true)
+        .map_err(|e| {
+            error!("Failed to serialize createStream command: {:?}", e);
+            RtmpCreateStream
+        })?;
 
     // publish
     let arguments = vec![
@@ -662,10 +683,12 @@ pub(crate) fn build_publish_control(
         error!("Failed to create publish command: {:?}", e);
         RtmpCreateStream
     })?;
-    let publish_packet = serializer.serialize(&publish_cmd, false, true).map_err(|e| {
-        error!("Failed to serialize publish command: {:?}", e);
-        RtmpCreateStream
-    })?;
+    let publish_packet = serializer
+        .serialize(&publish_cmd, false, true)
+        .map_err(|e| {
+            error!("Failed to serialize publish command: {:?}", e);
+            RtmpCreateStream
+        })?;
 
     Ok([
         connect_packet.bytes,
@@ -709,7 +732,6 @@ fn wrap_metadata(data: Bytes) -> Bytes {
 
     bytes.freeze()
 }
-
 
 // ============================================================================
 // StreamBuilder API - Simplified RTMP streaming interface
@@ -1146,20 +1168,9 @@ mod tests {
         let start = current();
 
         let result = FfmpegContext::builder()
-            .input(Input::from("test.mp4")
-                .set_readrate(1.0)
-                .set_stream_loop(3)
-            )
-            .input(
-                Input::from("test.mp4")
-                    .set_readrate(1.0)
-                    .set_stream_loop(3)
-            )
-            .input(
-                Input::from("test.mp4")
-                    .set_readrate(1.0)
-                    .set_stream_loop(3)
-            )
+            .input(Input::from("test.mp4").set_readrate(1.0).set_stream_loop(3))
+            .input(Input::from("test.mp4").set_readrate(1.0).set_stream_loop(3))
+            .input(Input::from("test.mp4").set_readrate(1.0).set_stream_loop(3))
             .filter_desc("[0:v][0:a][1:v][1:a][2:v][2:a]concat=n=3:v=1:a=1")
             .output(output)
             .build()
@@ -1190,7 +1201,11 @@ mod tests {
         let start = current();
 
         let result = FfmpegContext::builder()
-            .input(Input::from("test.mp4").set_readrate(1.0).set_stream_loop(-1))
+            .input(
+                Input::from("test.mp4")
+                    .set_readrate(1.0)
+                    .set_stream_loop(-1),
+            )
             // .filter_desc("hue=s=0")
             .output(output.set_video_codec("h264_videotoolbox"))
             .build()
@@ -1224,14 +1239,8 @@ mod tests {
         let result = FfmpegContext::builder()
             .independent_readrate()
             .input(Input::from("test.mp4").set_readrate(1.0))
-            .input(
-                Input::from("test.mp4")
-                    .set_readrate(1.0)
-            )
-            .input(
-                Input::from("test.mp4")
-                    .set_readrate(1.0)
-            )
+            .input(Input::from("test.mp4").set_readrate(1.0))
+            .input(Input::from("test.mp4").set_readrate(1.0))
             .filter_desc("[0:v][0:a][1:v][1:a][2:v][2:a]concat=n=3:v=1:a=1")
             .output(output)
             .build()

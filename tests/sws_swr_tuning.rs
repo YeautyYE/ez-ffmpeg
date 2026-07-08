@@ -131,8 +131,7 @@ fn auto_resample_pipeline_without_opts_succeeds() {
     let result = wait_with_watchdog(
         FfmpegContext::builder()
             .input(
-                Input::from("sine=frequency=440:sample_rate=44100:duration=1")
-                    .set_format("lavfi"),
+                Input::from("sine=frequency=440:sample_rate=44100:duration=1").set_format("lavfi"),
             )
             .output(
                 Output::from(out.as_str())
@@ -168,8 +167,7 @@ fn invalid_swr_opts_fails_graph_config() {
     let result = wait_with_watchdog(
         FfmpegContext::builder()
             .input(
-                Input::from("sine=frequency=440:sample_rate=44100:duration=1")
-                    .set_format("lavfi"),
+                Input::from("sine=frequency=440:sample_rate=44100:duration=1").set_format("lavfi"),
             )
             .output(
                 Output::from(out.as_str())

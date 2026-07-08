@@ -1,3 +1,4 @@
+use crate::rtmp::gop::{FrameData, Gops};
 use bytes::Bytes;
 use log::{debug, warn};
 use rml_rtmp::chunk_io::Packet;
@@ -10,7 +11,6 @@ use slab::Slab;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use thiserror::Error;
-use crate::rtmp::gop::{FrameData, Gops};
 
 /// Error type for RTMP scheduler operations
 #[derive(Error, Debug)]
@@ -188,10 +188,11 @@ impl RtmpScheduler {
                 .get(&publisher_connection_id)
                 .unwrap();
             let client = self.clients.get_mut(*client_id).unwrap();
-            let publisher_results: Vec<ServerSessionResult> = match client.session.handle_input(&bytes) {
-                Ok(results) => results,
-                Err(error) => return Err(error.into()),
-            };
+            let publisher_results: Vec<ServerSessionResult> =
+                match client.session.handle_input(&bytes) {
+                    Ok(results) => results,
+                    Err(error) => return Err(error.into()),
+                };
             publisher_results
         };
 
@@ -210,30 +211,44 @@ impl RtmpScheduler {
                     | ServerSessionEvent::PublishStreamFinished { .. } => {
                         self.handle_raised_event(usize::MAX, event, &mut server_results);
                     }
-                    ServerSessionEvent::ConnectionRequested {request_id, app_name: _} => {
+                    ServerSessionEvent::ConnectionRequested {
+                        request_id,
+                        app_name: _,
+                    } => {
                         let client_id = self
                             .publisher_to_client_map
                             .get(&publisher_connection_id)
                             .unwrap();
                         let client = self.clients.get_mut(*client_id).unwrap();
                         if let Err(e) = client.session.accept_request(request_id) {
-                            warn!("Failed to accept connection request {}: {:?}", request_id, e);
+                            warn!(
+                                "Failed to accept connection request {}: {:?}",
+                                request_id, e
+                            );
                         }
                     }
-                    ServerSessionEvent::PublishStreamRequested {request_id, app_name: _, stream_key, mode: _} => {
+                    ServerSessionEvent::PublishStreamRequested {
+                        request_id,
+                        app_name: _,
+                        stream_key,
+                        mode: _,
+                    } => {
                         let client_id = self
                             .publisher_to_client_map
                             .get(&publisher_connection_id)
                             .unwrap();
                         let client = self.clients.get_mut(*client_id).unwrap();
                         if let Err(e) = client.session.accept_request(request_id) {
-                            warn!("Failed to accept publish request {} for stream '{}': {:?}", request_id, stream_key, e);
+                            warn!(
+                                "Failed to accept publish request {} for stream '{}': {:?}",
+                                request_id, stream_key, e
+                            );
                         }
                     }
                     _ => {
                         debug!("Publisher received unexpected event: {:?}", event);
                     }
-                }
+                },
 
                 x => warn!("Server result received: {:?}", x),
             }
@@ -277,10 +292,7 @@ impl RtmpScheduler {
             }
         };
 
-        let client_id = match self
-            .publisher_to_client_map
-            .get(&publisher_connection_id)
-        {
+        let client_id = match self.publisher_to_client_map.get(&publisher_connection_id) {
             Some(client_id) => *client_id,
             None => {
                 warn!(
@@ -460,11 +472,7 @@ impl RtmpScheduler {
                 app_name,
                 stream_key,
             } => {
-                self.handle_publish_finished(
-                    app_name,
-                    stream_key,
-                    server_results,
-                );
+                self.handle_publish_finished(app_name, stream_key, server_results);
             }
 
             ServerSessionEvent::PlayStreamRequested {
@@ -806,9 +814,11 @@ impl RtmpScheduler {
                                         Ok(packet) => packet,
                                         Err(error) => {
                                             debug!("Rtmp client error occurred sending video data to new client: {:?}", error);
-                                            server_results.push(ServerResult::DisconnectConnection {
-                                                connection_id: requested_connection_id,
-                                            });
+                                            server_results.push(
+                                                ServerResult::DisconnectConnection {
+                                                    connection_id: requested_connection_id,
+                                                },
+                                            );
 
                                             return;
                                         }
@@ -825,9 +835,11 @@ impl RtmpScheduler {
                                         Ok(packet) => packet,
                                         Err(error) => {
                                             debug!("Rtmp client error occurred sending audio data to new client: {:?}", error);
-                                            server_results.push(ServerResult::DisconnectConnection {
-                                                connection_id: requested_connection_id,
-                                            });
+                                            server_results.push(
+                                                ServerResult::DisconnectConnection {
+                                                    connection_id: requested_connection_id,
+                                                },
+                                            );
 
                                             return;
                                         }
@@ -994,7 +1006,13 @@ impl RtmpScheduler {
                     channel.video_sequence_header = Some(data.clone());
                     channel.video_timestamp = timestamp;
                 }
-                channel.gops.save_frame_data(crate::rtmp::gop::FrameData::Video { timestamp, data: data.clone() }, is_keyframe);
+                channel.gops.save_frame_data(
+                    crate::rtmp::gop::FrameData::Video {
+                        timestamp,
+                        data: data.clone(),
+                    },
+                    is_keyframe,
+                );
             }
 
             ReceivedDataType::Audio => {
@@ -1002,7 +1020,13 @@ impl RtmpScheduler {
                     channel.audio_sequence_header = Some(data.clone());
                     channel.audio_timestamp = timestamp;
                 }
-                channel.gops.save_frame_data(crate::rtmp::gop::FrameData::Audio { timestamp, data: data.clone() }, false);
+                channel.gops.save_frame_data(
+                    crate::rtmp::gop::FrameData::Audio {
+                        timestamp,
+                        data: data.clone(),
+                    },
+                    false,
+                );
             }
         }
 
@@ -1011,9 +1035,10 @@ impl RtmpScheduler {
         // the per-watcher gate can deliver audio for such streams instead of
         // waiting for a video keyframe that never comes (see
         // `should_send_to_watcher`).
-        let channel_is_audio_only = channel.metadata.as_ref().is_some_and(|m| {
-            m.audio_codec_id.is_some() && m.video_codec_id.is_none()
-        });
+        let channel_is_audio_only = channel
+            .metadata
+            .as_ref()
+            .is_some_and(|m| m.audio_codec_id.is_some() && m.video_codec_id.is_none());
 
         for client_id in &channel.watching_client_ids {
             let client = match self.clients.get_mut(*client_id) {
@@ -1055,23 +1080,19 @@ impl RtmpScheduler {
             }
 
             let send_result = match data_type {
-                ReceivedDataType::Audio => client.session.send_audio_data(
-                    active_stream_id,
-                    data.clone(),
-                    timestamp,
-                    true,
-                ),
+                ReceivedDataType::Audio => {
+                    client
+                        .session
+                        .send_audio_data(active_stream_id, data.clone(), timestamp, true)
+                }
                 ReceivedDataType::Video => {
                     if is_keyframe {
                         client.has_received_video_keyframe = true;
                     }
 
-                    client.session.send_video_data(
-                        active_stream_id,
-                        data.clone(),
-                        timestamp,
-                        true,
-                    )
+                    client
+                        .session
+                        .send_video_data(active_stream_id, data.clone(), timestamp, true)
                 }
             };
 
@@ -1175,9 +1196,7 @@ fn should_send_to_watcher(
     channel_is_audio_only: bool,
 ) -> bool {
     match data_type {
-        ReceivedDataType::Video => {
-            has_received_video_keyframe || is_sequence_header || is_keyframe
-        }
+        ReceivedDataType::Video => has_received_video_keyframe || is_sequence_header || is_keyframe,
         ReceivedDataType::Audio => {
             has_received_video_keyframe || is_sequence_header || channel_is_audio_only
         }
@@ -1377,7 +1396,9 @@ mod tests {
         assert!(scheduler.channels.contains_key(&stream_key));
 
         // Verify publisher mapping exists
-        assert!(scheduler.publisher_to_client_map.contains_key(&publisher_connection_id));
+        assert!(scheduler
+            .publisher_to_client_map
+            .contains_key(&publisher_connection_id));
     }
 
     #[test]
@@ -1401,8 +1422,12 @@ mod tests {
         assert!(!result2, "Duplicate channel creation should be rejected");
 
         // Verify only first publisher is mapped
-        assert!(scheduler.publisher_to_client_map.contains_key(&publisher_connection_id_1));
-        assert!(!scheduler.publisher_to_client_map.contains_key(&publisher_connection_id_2));
+        assert!(scheduler
+            .publisher_to_client_map
+            .contains_key(&publisher_connection_id_1));
+        assert!(!scheduler
+            .publisher_to_client_map
+            .contains_key(&publisher_connection_id_2));
     }
 
     #[test]
@@ -1414,15 +1439,22 @@ mod tests {
         let _ = scheduler.bytes_received(connection_id, &[]);
 
         // Verify connection exists
-        assert!(scheduler.connection_to_client_map.contains_key(&connection_id));
-        let client_id = *scheduler.connection_to_client_map.get(&connection_id).unwrap();
+        assert!(scheduler
+            .connection_to_client_map
+            .contains_key(&connection_id));
+        let client_id = *scheduler
+            .connection_to_client_map
+            .get(&connection_id)
+            .unwrap();
         assert!(scheduler.clients.contains(client_id));
 
         // Close the connection
         scheduler.notify_connection_closed(connection_id);
 
         // Verify connection is removed
-        assert!(!scheduler.connection_to_client_map.contains_key(&connection_id));
+        assert!(!scheduler
+            .connection_to_client_map
+            .contains_key(&connection_id));
         assert!(!scheduler.clients.contains(client_id));
     }
 
@@ -1437,15 +1469,22 @@ mod tests {
         assert!(result, "Channel creation should succeed");
 
         // Verify publisher exists
-        assert!(scheduler.publisher_to_client_map.contains_key(&publisher_connection_id));
-        let client_id = *scheduler.publisher_to_client_map.get(&publisher_connection_id).unwrap();
+        assert!(scheduler
+            .publisher_to_client_map
+            .contains_key(&publisher_connection_id));
+        let client_id = *scheduler
+            .publisher_to_client_map
+            .get(&publisher_connection_id)
+            .unwrap();
         assert!(scheduler.clients.contains(client_id));
 
         // Close the publisher
         scheduler.notify_publisher_closed(publisher_connection_id);
 
         // Verify publisher is removed
-        assert!(!scheduler.publisher_to_client_map.contains_key(&publisher_connection_id));
+        assert!(!scheduler
+            .publisher_to_client_map
+            .contains_key(&publisher_connection_id));
         assert!(!scheduler.clients.contains(client_id));
 
         // With no watchers, channel should be removed (memory cleanup)
@@ -1474,7 +1513,9 @@ mod tests {
         scheduler.notify_publisher_closed(publisher_connection_id);
 
         // Verify publisher is removed
-        assert!(!scheduler.publisher_to_client_map.contains_key(&publisher_connection_id));
+        assert!(!scheduler
+            .publisher_to_client_map
+            .contains_key(&publisher_connection_id));
 
         // With watchers still present, channel should remain
         assert!(
@@ -1506,7 +1547,9 @@ mod tests {
         let connection_id = 1;
 
         // Verify connection doesn't exist initially
-        assert!(!scheduler.connection_to_client_map.contains_key(&connection_id));
+        assert!(!scheduler
+            .connection_to_client_map
+            .contains_key(&connection_id));
 
         // Receive bytes from new connection
         let result = scheduler.bytes_received(connection_id, &[0x03]);
@@ -1515,8 +1558,13 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify session was created
-        assert!(scheduler.connection_to_client_map.contains_key(&connection_id));
-        let client_id = *scheduler.connection_to_client_map.get(&connection_id).unwrap();
+        assert!(scheduler
+            .connection_to_client_map
+            .contains_key(&connection_id));
+        let client_id = *scheduler
+            .connection_to_client_map
+            .get(&connection_id)
+            .unwrap();
         assert!(scheduler.clients.contains(client_id));
 
         // Verify client is in Waiting state
@@ -1534,8 +1582,13 @@ mod tests {
         let _ = scheduler.bytes_received(connection_id, &[]);
 
         // Verify connection exists and is in Waiting state
-        assert!(scheduler.connection_to_client_map.contains_key(&connection_id));
-        let client_id = *scheduler.connection_to_client_map.get(&connection_id).unwrap();
+        assert!(scheduler
+            .connection_to_client_map
+            .contains_key(&connection_id));
+        let client_id = *scheduler
+            .connection_to_client_map
+            .get(&connection_id)
+            .unwrap();
         let client = scheduler.clients.get(client_id).unwrap();
         assert!(matches!(client.current_action, ClientAction::Waiting));
 
@@ -1552,7 +1605,10 @@ mod tests {
 
         // Verify client is now in Watching state
         let client = scheduler.clients.get(client_id).unwrap();
-        assert!(matches!(client.current_action, ClientAction::Watching { .. }));
+        assert!(matches!(
+            client.current_action,
+            ClientAction::Watching { .. }
+        ));
 
         // Verify channel was created and client is registered as watcher
         assert!(scheduler.channels.contains_key(&stream_key));
@@ -1680,7 +1736,11 @@ mod tests {
         );
 
         // Watcher should receive non-keyframe (after having received keyframe)
-        assert_eq!(server_results.len(), 1, "Watcher should receive non-keyframe");
+        assert_eq!(
+            server_results.len(),
+            1,
+            "Watcher should receive non-keyframe"
+        );
         match &server_results[0] {
             ServerResult::OutboundPacket {
                 is_keyframe,
@@ -1835,7 +1895,10 @@ mod tests {
         // Verify sequence header is cached in channel
         let channel = scheduler.channels.get(&stream_key).unwrap();
         assert!(channel.video_sequence_header.is_some());
-        assert_eq!(channel.video_sequence_header.as_ref().unwrap(), &sequence_header);
+        assert_eq!(
+            channel.video_sequence_header.as_ref().unwrap(),
+            &sequence_header
+        );
     }
 
     #[test]
@@ -2034,7 +2097,15 @@ mod tests {
         }
 
         // Verify both watchers in channel
-        assert_eq!(scheduler.channels.get(&stream_key).unwrap().watching_client_ids.len(), 2);
+        assert_eq!(
+            scheduler
+                .channels
+                .get(&stream_key)
+                .unwrap()
+                .watching_client_ids
+                .len(),
+            2
+        );
 
         // Send initial keyframe to both
         let mut server_results = Vec::new();
@@ -2046,7 +2117,11 @@ mod tests {
             ReceivedDataType::Video,
             &mut server_results,
         );
-        assert_eq!(server_results.len(), 2, "Both watchers should receive keyframe");
+        assert_eq!(
+            server_results.len(),
+            2,
+            "Both watchers should receive keyframe"
+        );
 
         // Watcher 1 disconnects
         scheduler.notify_connection_closed(watcher1_id);
@@ -2066,7 +2141,11 @@ mod tests {
             &mut server_results,
         );
 
-        assert_eq!(server_results.len(), 1, "Only remaining watcher should receive frame");
+        assert_eq!(
+            server_results.len(),
+            1,
+            "Only remaining watcher should receive frame"
+        );
         match &server_results[0] {
             ServerResult::OutboundPacket {
                 target_connection_id,
@@ -2177,7 +2256,10 @@ mod tests {
 
         assert!(scheduler.new_channel("stream_a".to_string(), publisher_a_conn));
         play(&mut scheduler, watcher_conn, "stream_a");
-        let client_id = *scheduler.connection_to_client_map.get(&watcher_conn).unwrap();
+        let client_id = *scheduler
+            .connection_to_client_map
+            .get(&watcher_conn)
+            .unwrap();
         assert!(scheduler
             .channels
             .get("stream_a")
@@ -2188,7 +2270,13 @@ mod tests {
         // A's live IDR reaches the watcher and opens its keyframe gate.
         let results = feed_video(&mut scheduler, "stream_a", 0, IDR);
         assert_eq!(results.len(), 1, "watcher should receive A's IDR");
-        assert!(scheduler.clients.get(client_id).unwrap().has_received_video_keyframe);
+        assert!(
+            scheduler
+                .clients
+                .get(client_id)
+                .unwrap()
+                .has_received_video_keyframe
+        );
 
         // The same connection now plays stream B.
         let mut results = Vec::new();
@@ -2222,7 +2310,11 @@ mod tests {
 
         // The keyframe gate must have been reset by the new play request.
         assert!(
-            !scheduler.clients.get(client_id).unwrap().has_received_video_keyframe,
+            !scheduler
+                .clients
+                .get(client_id)
+                .unwrap()
+                .has_received_video_keyframe,
             "a new play request must reset the keyframe gate"
         );
 
@@ -2234,7 +2326,11 @@ mod tests {
             "A's frames must not reach a client that switched to B"
         );
         assert!(
-            !scheduler.clients.get(client_id).unwrap().has_received_video_keyframe,
+            !scheduler
+                .clients
+                .get(client_id)
+                .unwrap()
+                .has_received_video_keyframe,
             "A's live IDR must not open the gate of a client watching B"
         );
 
@@ -2285,7 +2381,10 @@ mod tests {
 
         assert!(scheduler.new_channel("stream_a".to_string(), publisher_conn));
         play(&mut scheduler, watcher_conn, "stream_a");
-        let client_id = *scheduler.connection_to_client_map.get(&watcher_conn).unwrap();
+        let client_id = *scheduler
+            .connection_to_client_map
+            .get(&watcher_conn)
+            .unwrap();
 
         // A second play request for the same stream key must not drop the
         // membership (and must not GC the channel).
@@ -2316,11 +2415,20 @@ mod tests {
 
         assert!(scheduler.new_channel("stream_a".to_string(), publisher_conn));
         play(&mut scheduler, watcher_conn, "stream_a");
-        let client_id = *scheduler.connection_to_client_map.get(&watcher_conn).unwrap();
+        let client_id = *scheduler
+            .connection_to_client_map
+            .get(&watcher_conn)
+            .unwrap();
 
         let results = feed_video(&mut scheduler, "stream_a", 0, IDR);
         assert_eq!(results.len(), 1, "watcher should receive the IDR");
-        assert!(scheduler.clients.get(client_id).unwrap().has_received_video_keyframe);
+        assert!(
+            scheduler
+                .clients
+                .get(client_id)
+                .unwrap()
+                .has_received_video_keyframe
+        );
 
         // Deliver the finish through the real scheduler event path to prove
         // it no longer lands in the `_ => debug!` catch-all.
@@ -2391,7 +2499,10 @@ mod tests {
 
         assert!(scheduler.new_channel("stream_a".to_string(), publisher_conn));
         play(&mut scheduler, watcher_conn, "stream_a");
-        let client_id = *scheduler.connection_to_client_map.get(&watcher_conn).unwrap();
+        let client_id = *scheduler
+            .connection_to_client_map
+            .get(&watcher_conn)
+            .unwrap();
 
         // Replay the SAME stream on a new stream_id (2). Membership is retained.
         let mut results = Vec::new();
@@ -2446,7 +2557,10 @@ mod tests {
         let watcher_conn = 2;
 
         play(&mut scheduler, watcher_conn, "stream_b");
-        let client_id = *scheduler.connection_to_client_map.get(&watcher_conn).unwrap();
+        let client_id = *scheduler
+            .connection_to_client_map
+            .get(&watcher_conn)
+            .unwrap();
 
         // A finish for a stream the client is not watching must not disturb
         // the current play.
@@ -2504,21 +2618,40 @@ mod tests {
 
         assert!(scheduler.new_channel("live".to_string(), publisher_conn));
         play(&mut scheduler, watcher_conn, "live");
-        let watcher_client_id = *scheduler.connection_to_client_map.get(&watcher_conn).unwrap();
+        let watcher_client_id = *scheduler
+            .connection_to_client_map
+            .get(&watcher_conn)
+            .unwrap();
 
         // Sequence headers pass the gate even before any keyframe.
         let results = feed_media(&mut scheduler, publisher_conn, 0x09, 0, VIDEO_SEQ);
-        assert_eq!(results.len(), 1, "video sequence header must reach the watcher");
+        assert_eq!(
+            results.len(),
+            1,
+            "video sequence header must reach the watcher"
+        );
         assert!(matches!(
             &results[0],
-            ServerResult::OutboundPacket { is_sequence_header: true, is_video: true, .. }
+            ServerResult::OutboundPacket {
+                is_sequence_header: true,
+                is_video: true,
+                ..
+            }
         ));
 
         let results = feed_media(&mut scheduler, publisher_conn, 0x08, 0, AUDIO_SEQ);
-        assert_eq!(results.len(), 1, "audio sequence header must reach the watcher");
+        assert_eq!(
+            results.len(),
+            1,
+            "audio sequence header must reach the watcher"
+        );
         assert!(matches!(
             &results[0],
-            ServerResult::OutboundPacket { is_sequence_header: true, is_video: false, .. }
+            ServerResult::OutboundPacket {
+                is_sequence_header: true,
+                is_video: false,
+                ..
+            }
         ));
 
         // A delta frame and audio before the first IDR are withheld (gate).
@@ -2530,30 +2663,54 @@ mod tests {
             feed_media(&mut scheduler, publisher_conn, 0x08, 33, AUDIO_FRAME).is_empty(),
             "audio before the first IDR must be withheld"
         );
-        assert!(!scheduler.clients.get(watcher_client_id).unwrap().has_received_video_keyframe);
+        assert!(
+            !scheduler
+                .clients
+                .get(watcher_client_id)
+                .unwrap()
+                .has_received_video_keyframe
+        );
 
         // The IDR opens the gate and is delivered as a keyframe.
         let results = feed_media(&mut scheduler, publisher_conn, 0x09, 66, IDR);
         assert_eq!(results.len(), 1, "the IDR must be delivered");
         assert!(matches!(
             &results[0],
-            ServerResult::OutboundPacket { is_keyframe: true, is_video: true, .. }
+            ServerResult::OutboundPacket {
+                is_keyframe: true,
+                is_video: true,
+                ..
+            }
         ));
-        assert!(scheduler.clients.get(watcher_client_id).unwrap().has_received_video_keyframe);
+        assert!(
+            scheduler
+                .clients
+                .get(watcher_client_id)
+                .unwrap()
+                .has_received_video_keyframe
+        );
 
         // After the IDR, audio and delta video interleave through to the watcher.
         let results = feed_media(&mut scheduler, publisher_conn, 0x08, 70, AUDIO_FRAME);
         assert_eq!(results.len(), 1, "audio flows after the IDR");
         assert!(matches!(
             &results[0],
-            ServerResult::OutboundPacket { is_video: false, is_keyframe: false, .. }
+            ServerResult::OutboundPacket {
+                is_video: false,
+                is_keyframe: false,
+                ..
+            }
         ));
 
         let results = feed_media(&mut scheduler, publisher_conn, 0x09, 99, DELTA);
         assert_eq!(results.len(), 1, "delta flows after the IDR");
         assert!(matches!(
             &results[0],
-            ServerResult::OutboundPacket { is_video: true, is_keyframe: false, .. }
+            ServerResult::OutboundPacket {
+                is_video: true,
+                is_keyframe: false,
+                ..
+            }
         ));
     }
 
@@ -2601,15 +2758,17 @@ mod tests {
 
         assert!(scheduler.new_channel("stream_a".to_string(), publisher_conn));
         play(&mut scheduler, watcher_conn, "stream_a");
-        let client_id = *scheduler.connection_to_client_map.get(&watcher_conn).unwrap();
+        let client_id = *scheduler
+            .connection_to_client_map
+            .get(&watcher_conn)
+            .unwrap();
 
         // Simulate the stale membership this fix prevents: the client's
         // action moved to another stream but its id was left in A's set.
-        scheduler.clients.get_mut(client_id).unwrap().current_action =
-            ClientAction::Watching {
-                stream_key: "stream_b".to_string(),
-                stream_id: 1,
-            };
+        scheduler.clients.get_mut(client_id).unwrap().current_action = ClientAction::Watching {
+            stream_key: "stream_b".to_string(),
+            stream_id: 1,
+        };
 
         let results = feed_video(&mut scheduler, "stream_a", 0, IDR);
         assert!(
@@ -2617,9 +2776,12 @@ mod tests {
             "frames must not be delivered through a stale watcher membership"
         );
         assert!(
-            !scheduler.clients.get(client_id).unwrap().has_received_video_keyframe,
+            !scheduler
+                .clients
+                .get(client_id)
+                .unwrap()
+                .has_received_video_keyframe,
             "a mismatched channel must not open the client's keyframe gate"
         );
     }
 }
-

@@ -637,7 +637,8 @@ impl Output {
     where
         F: FnMut(i64, i32) -> i64 + Send + 'static,
     {
-        self.seek_callback = Some(Box::new(seek_callback) as Box<dyn FnMut(i64, i32) -> i64 + Send>);
+        self.seek_callback =
+            Some(Box::new(seek_callback) as Box<dyn FnMut(i64, i32) -> i64 + Send>);
         self
     }
 
@@ -1741,7 +1742,6 @@ impl Output {
         self
     }
 
-
     /// Disable automatic metadata copying from input files.
     ///
     /// By default, FFmpeg automatically copies global and stream metadata
@@ -2160,8 +2160,7 @@ impl From<Box<dyn FnMut(&[u8]) -> i32 + Send>> for Output {
             url: None,
             write_callback: Some(write_callback_and_format),
             io_buffer_size: crate::core::context::DEFAULT_CUSTOM_IO_BUFFER_SIZE,
-            max_muxing_queue_size:
-                crate::core::context::pre_mux_queue::DEFAULT_PRE_MUX_MAX_PACKETS,
+            max_muxing_queue_size: crate::core::context::pre_mux_queue::DEFAULT_PRE_MUX_MAX_PACKETS,
             muxing_queue_data_threshold:
                 crate::core::context::pre_mux_queue::DEFAULT_PRE_MUX_DATA_THRESHOLD,
             seek_callback: None,
@@ -2223,8 +2222,7 @@ impl From<String> for Output {
             url: Some(url),
             write_callback: None,
             io_buffer_size: crate::core::context::DEFAULT_CUSTOM_IO_BUFFER_SIZE,
-            max_muxing_queue_size:
-                crate::core::context::pre_mux_queue::DEFAULT_PRE_MUX_MAX_PACKETS,
+            max_muxing_queue_size: crate::core::context::pre_mux_queue::DEFAULT_PRE_MUX_MAX_PACKETS,
             muxing_queue_data_threshold:
                 crate::core::context::pre_mux_queue::DEFAULT_PRE_MUX_DATA_THRESHOLD,
             seek_callback: None,
@@ -2392,7 +2390,9 @@ mod tests {
     #[test]
     fn set_io_buffer_size_valid() {
         assert_eq!(
-            Output::from("out.mp4").set_io_buffer_size(1 << 20).io_buffer_size,
+            Output::from("out.mp4")
+                .set_io_buffer_size(1 << 20)
+                .io_buffer_size,
             1 << 20
         );
     }

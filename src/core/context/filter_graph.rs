@@ -24,7 +24,7 @@ pub(crate) struct FilterGraph {
     /// (`AVFilterGraph.aresample_swr_opts`). See [`sws_opts`](Self::sws_opts).
     pub(crate) swr_opts: Option<String>,
 
-    pub(crate) node: Arc<SchNode>
+    pub(crate) node: Arc<SchNode>,
 }
 
 impl FilterGraph {
@@ -32,15 +32,16 @@ impl FilterGraph {
     // registers it in the global hwaccel registry at context-build time
     // (before the probe parse), and the filter task resolves it back through
     // hw_device_for_filter().
-    pub(crate) fn new(graph_desc: String,
-                      inputs: Vec<InputFilter>,
-                      outputs: Vec<OutputFilter>,
-                      sws_opts: Option<String>,
-                      swr_opts: Option<String>) -> Self {
+    pub(crate) fn new(
+        graph_desc: String,
+        inputs: Vec<InputFilter>,
+        outputs: Vec<OutputFilter>,
+        sws_opts: Option<String>,
+        swr_opts: Option<String>,
+    ) -> Self {
         let (sender, receiver) = crossbeam_channel::bounded(8);
-        let finished_flag_list: Vec<AtomicBool> = inputs.iter()
-            .map(|_| AtomicBool::new(false))
-            .collect();
+        let finished_flag_list: Vec<AtomicBool> =
+            inputs.iter().map(|_| AtomicBool::new(false)).collect();
 
         Self {
             graph_desc,
@@ -49,7 +50,10 @@ impl FilterGraph {
             src: Some((sender, receiver, Arc::from(finished_flag_list))),
             sws_opts,
             swr_opts,
-            node: Arc::new(SchNode::Filter { inputs: Vec::new(), best_input: Arc::new(AtomicUsize::from(0)) })
+            node: Arc::new(SchNode::Filter {
+                inputs: Vec::new(),
+                best_input: Arc::new(AtomicUsize::from(0)),
+            }),
         }
     }
 

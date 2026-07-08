@@ -108,7 +108,8 @@ fn make_h264_mp4(path: &str) -> bool {
             .build();
         if let Ok(ctx) = built {
             if let Ok(running) = ctx.start() {
-                if wait_with_watchdog(running, 60, "h264 fixture").is_ok() && fixture_is_h264(path) {
+                if wait_with_watchdog(running, 60, "h264 fixture").is_ok() && fixture_is_h264(path)
+                {
                     return true;
                 }
             }

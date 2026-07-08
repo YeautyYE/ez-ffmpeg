@@ -572,9 +572,7 @@ impl StreamSpecifier {
                         continue;
                     }
                     // Check no_apic flag (V specifier - video without attached pictures)
-                    if self.no_apic
-                        && (candidate.disposition & AV_DISPOSITION_ATTACHED_PIC) != 0
-                    {
+                    if self.no_apic && (candidate.disposition & AV_DISPOSITION_ATTACHED_PIC) != 0 {
                         continue;
                     }
                 }

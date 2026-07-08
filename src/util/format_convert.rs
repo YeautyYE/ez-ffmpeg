@@ -17,9 +17,7 @@
 // (the `docsrs` cfg); suppress the resulting dead-code noise there.
 #![cfg_attr(docsrs, allow(dead_code))]
 
-use ffmpeg_sys_next::{
-    av_pix_fmt_desc_get, AVPixFmtDescriptor, AVPixelFormat, AVSampleFormat,
-};
+use ffmpeg_sys_next::{av_pix_fmt_desc_get, AVPixFmtDescriptor, AVPixelFormat, AVSampleFormat};
 
 /// Converts a raw `AVFrame.format` / `AVCodecContext.pix_fmt` integer into a
 /// typed [`AVPixelFormat`], returning `None` when the value is outside the

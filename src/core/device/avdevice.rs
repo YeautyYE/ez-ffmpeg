@@ -13,7 +13,6 @@ pub fn find_input_audio_device_list() -> crate::error::Result<Vec<String>> {
     find_input_device_list(AVMediaType::AVMEDIA_TYPE_AUDIO)
 }
 
-
 fn find_input_device_list(media_type: AVMediaType) -> crate::error::Result<Vec<String>> {
     unsafe {
         crate::core::initialize_ffmpeg();
@@ -42,7 +41,8 @@ fn find_input_device_list(media_type: AVMediaType) -> crate::error::Result<Vec<S
             return Err(MediaTypeSupported(media_type as i32).into());
         };
 
-        let ret = avdevice_list_input_sources(null(), device_name.as_ptr(), null_mut(), &mut device_list);
+        let ret =
+            avdevice_list_input_sources(null(), device_name.as_ptr(), null_mut(), &mut device_list);
         if ret >= 0 && !device_list.is_null() {
             let nb_devices = (*device_list).nb_devices;
 

@@ -189,9 +189,10 @@ impl<T> SyncQueue<T> {
 
                 self.tb_update(idx, tb);
                 let end = end_ts.unwrap_or(AV_NOPTS_VALUE);
-                self.streams[idx]
-                    .fifo
-                    .push_back(QueuedItem { item: payload, end_ts: end });
+                self.streams[idx].fifo.push_back(QueuedItem {
+                    item: payload,
+                    end_ts: end,
+                });
                 self.stream_update_ts(idx, end);
 
                 // frames_max accounting (sq_send :371-384). nb_samples is >= 0 by
@@ -301,7 +302,9 @@ impl<T> SyncQueue<T> {
         // Pick the stream that is most ahead (largest head_ts).
         let mut best: Option<usize> = None;
         for i in 0..self.streams.len() {
-            let Some(hts) = self.streams[i].head_ts else { continue };
+            let Some(hts) = self.streams[i].head_ts else {
+                continue;
+            };
             match best {
                 None => best = Some(i),
                 Some(b) => {
@@ -393,8 +396,12 @@ impl<T> SyncQueue<T> {
             return true;
         }
         // Limiting streams exist but the head is not established yet -> hold.
-        let Some(h) = self.head_stream else { return false };
-        let Some(head_ts) = self.streams[h].head_ts else { return false };
+        let Some(h) = self.head_stream else {
+            return false;
+        };
+        let Some(head_ts) = self.streams[h].head_ts else {
+            return false;
+        };
         compare_ts(front_end, self.streams[idx].tb, head_ts, self.streams[h].tb) <= 0
     }
 
@@ -486,7 +493,9 @@ impl<T> SyncQueue<T> {
             if !self.streams[i].limiting {
                 continue;
             }
-            let Some(other_ts) = self.streams[i].head_ts else { continue };
+            let Some(other_ts) = self.streams[i].head_ts else {
+                continue;
+            };
             let other_tb = self.streams[i].tb;
             let h = self.head_stream.expect("head set above");
             let head_ts = self.streams[h].head_ts.expect("head has ts");
@@ -653,7 +662,10 @@ mod tests {
 
         // Just below the threshold: no heartbeat, tail stays stuck.
         let (mut q, a, _b) = build(2_000_001);
-        assert!(drain(&mut q, a).is_empty(), "A tail held behind stalled head");
+        assert!(
+            drain(&mut q, a).is_empty(),
+            "A tail held behind stalled head"
+        );
         assert!(!q.heartbeat(), "gap < buf_size_us -> no heartbeat");
         assert!(drain(&mut q, a).is_empty());
 
@@ -661,7 +673,11 @@ mod tests {
         let (mut q, a, _b) = build(2_000_000);
         assert!(drain(&mut q, a).is_empty());
         assert!(q.heartbeat(), "gap == buf_size_us -> heartbeat");
-        assert_eq!(drain(&mut q, a), vec![1], "stuck tail released after heartbeat");
+        assert_eq!(
+            drain(&mut q, a),
+            vec![1],
+            "stuck tail released after heartbeat"
+        );
     }
 
     // R4: an untimestamped finish must NOT collapse peers' bound to 0.
@@ -680,7 +696,10 @@ mod tests {
         assert_eq!(finish(&mut q, a), SqSend::StreamFinished);
 
         // The finish must not treat None as 0: B stays live, queue not finished.
-        assert!(!q.is_finished(), "untimestamped finish must not finish the queue");
+        assert!(
+            !q.is_finished(),
+            "untimestamped finish must not finish the queue"
+        );
         // No further send re-runs queue_head_update, so the head is still
         // unestablished and B holds — but crucially it was NOT truncated to a
         // bogus 0 bound.
@@ -874,11 +893,18 @@ mod tests {
         }
         // head = min(A 5s, B 10s) = A = 5s.
         finish(&mut q, b);
-        assert!(!q.is_finished(), "A still live -> B's finish does not end the queue");
+        assert!(
+            !q.is_finished(),
+            "A still live -> B's finish does not end the queue"
+        );
 
         // B's <= 5s release; (5s,10s] are held (buffered, NOT dropped).
         assert_eq!(drain(&mut q, b), vec![101, 102, 103, 104, 105]);
-        assert_eq!(q.streams[b].fifo.len(), 5, "(5s,10s] still buffered, nothing lost");
+        assert_eq!(
+            q.streams[b].fifo.len(),
+            5,
+            "(5s,10s] still buffered, nothing lost"
+        );
 
         // A advances to 10s -> head reaches 10s -> B's (5s,10s] become releasable.
         for s in 6..=10 {
@@ -918,8 +944,15 @@ mod tests {
 
         // B releases <= 7s; (7s,10s] = 108,109,110 stay abandoned in the fifo.
         assert_eq!(drain(&mut q, b), vec![101, 102, 103, 104, 105, 106, 107]);
-        assert!(drain(&mut q, b).is_empty(), "over-bound (7s,10s] never release");
-        assert_eq!(q.streams[b].fifo.len(), 3, "over-bound (7s,10s] remain buffered");
+        assert!(
+            drain(&mut q, b).is_empty(),
+            "over-bound (7s,10s] never release"
+        );
+        assert_eq!(
+            q.streams[b].fifo.len(),
+            3,
+            "over-bound (7s,10s] remain buffered"
+        );
     }
 
     // frames_max: sq_limit_frames(idx, 1) makes the stream finish right after its
@@ -933,7 +966,7 @@ mod tests {
         let _b = q.add_stream(true);
 
         q.sq_limit_frames(a, 1); // cap A at one frame
-        // frames_sent was 0, so the cap does not finish it yet.
+                                 // frames_sent was 0, so the cap does not finish it yet.
         assert!(!q.streams[a].finished);
 
         // 1st send: frames_sent hits 1 >= 1 -> finish A, bound frozen at 1000.
@@ -943,7 +976,11 @@ mod tests {
             "reaching frames_max finishes the stream"
         );
         assert!(q.streams[a].finished);
-        assert_eq!(q.streams[a].head_ts, Some(1000), "bound frozen at frame-1 end");
+        assert_eq!(
+            q.streams[a].head_ts,
+            Some(1000),
+            "bound frozen at frame-1 end"
+        );
         assert_eq!(q.streams[a].fifo.len(), 1, "frame 1 enqueued");
 
         // 2nd send to the finished stream: dropped, StreamFinished, no corruption.
@@ -952,7 +989,11 @@ mod tests {
             SqSend::StreamFinished,
             "send to a finished stream is dropped"
         );
-        assert_eq!(q.streams[a].head_ts, Some(1000), "bound unchanged by the drop");
+        assert_eq!(
+            q.streams[a].head_ts,
+            Some(1000),
+            "bound unchanged by the drop"
+        );
         assert_eq!(q.streams[a].fifo.len(), 1, "frame 2 was not enqueued");
     }
 
@@ -970,7 +1011,10 @@ mod tests {
         assert!(!q.streams[a].finished);
 
         q.sq_limit_frames(a, 2); // already at the cap -> finish now
-        assert!(q.streams[a].finished, "frames_sent >= frames_max -> finished");
+        assert!(
+            q.streams[a].finished,
+            "frames_sent >= frames_max -> finished"
+        );
     }
 
     // drain_all_releasable returns releasable items across every stream in

@@ -316,10 +316,9 @@ mod tests {
 
     #[test]
     fn plan_single_audio_detector_has_no_asplit() {
-        let (desc, branches) =
-            Analysis::new("input.mp4")
-                .audio_detector(AudioDetector::Ebur128 { true_peak: true })
-                .plan();
+        let (desc, branches) = Analysis::new("input.mp4")
+            .audio_detector(AudioDetector::Ebur128 { true_peak: true })
+            .plan();
         assert_eq!(desc, "[0:a]ebur128=metadata=1:peak=true[adet0]");
         assert_eq!(branches.len(), 1);
     }
@@ -333,8 +332,12 @@ mod tests {
     #[test]
     fn duplicate_detector_is_rejected() {
         let result = Analysis::new("input.mp4")
-            .video_detector(VideoDetector::Scene { threshold_pct: 10.0 })
-            .video_detector(VideoDetector::Scene { threshold_pct: 20.0 })
+            .video_detector(VideoDetector::Scene {
+                threshold_pct: 10.0,
+            })
+            .video_detector(VideoDetector::Scene {
+                threshold_pct: 20.0,
+            })
             .validate();
         assert!(matches!(result, Err(Error::InvalidRecipeArg(_))));
     }

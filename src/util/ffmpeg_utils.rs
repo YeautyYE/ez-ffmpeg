@@ -3,8 +3,8 @@
 //! implementations from libavutil/libavformat when debugging.
 
 use ffmpeg_sys_next::{
-    av_dict_free, av_dict_get, av_dict_iterate, av_dict_set, av_strerror, AVDictionary,
-    AVRational, AV_DICT_MATCH_CASE, AV_ERROR_MAX_STRING_SIZE,
+    av_dict_free, av_dict_get, av_dict_iterate, av_dict_set, av_strerror, AVDictionary, AVRational,
+    AV_DICT_MATCH_CASE, AV_ERROR_MAX_STRING_SIZE,
 };
 use std::collections::HashMap;
 use std::ffi::{c_char, CStr, CString};
@@ -57,8 +57,13 @@ impl DictGuard {
     /// reported as "unrecognized user option").
     pub(crate) fn remove(&mut self, key: &CStr) {
         unsafe {
-            if !av_dict_get(self.dict, key.as_ptr(), std::ptr::null(), AV_DICT_MATCH_CASE)
-                .is_null()
+            if !av_dict_get(
+                self.dict,
+                key.as_ptr(),
+                std::ptr::null(),
+                AV_DICT_MATCH_CASE,
+            )
+            .is_null()
             {
                 // Setting a key to NULL deletes it (libavutil/dict.c).
                 av_dict_set(&mut self.dict, key.as_ptr(), std::ptr::null(), 0);

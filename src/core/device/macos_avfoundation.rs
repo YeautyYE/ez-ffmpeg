@@ -3,16 +3,16 @@
 extern crate core_foundation;
 extern crate objc;
 
+use crate::error::FindDevicesError::AVCaptureDeviceNotFound;
 use core_foundation::base::TCFType;
 use core_foundation::string::CFString;
-use objc::runtime::{Class, Object};
 use objc::msg_send;
+use objc::runtime::{Class, Object};
 use objc::sel;
 use objc::sel_impl;
-use crate::error::FindDevicesError::AVCaptureDeviceNotFound;
 
 pub fn get_avfoundation_devices(media_type: &str) -> crate::error::Result<Vec<String>> {
-    let option =  Class::get("AVCaptureDevice");
+    let option = Class::get("AVCaptureDevice");
     if option.is_none() {
         return Err(AVCaptureDeviceNotFound.into());
     }

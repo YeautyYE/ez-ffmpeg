@@ -35,7 +35,10 @@ fn lavfi_video_secs(secs: u32) -> Input {
 
 /// A finite lavfi audio source of `secs` seconds.
 fn lavfi_audio_secs(secs: u32) -> Input {
-    Input::from(format!("sine=frequency=440:duration={secs}:sample_rate=44100")).set_format("lavfi")
+    Input::from(format!(
+        "sine=frequency=440:duration={secs}:sample_rate=44100"
+    ))
+    .set_format("lavfi")
 }
 
 /// A hang is a test failure, not a suite timeout.
@@ -60,26 +63,39 @@ fn wait_with_watchdog(
 }
 
 fn video_nb_frames(url: &str) -> i64 {
-    match find_video_stream_info(url).unwrap().expect("output has no video stream") {
+    match find_video_stream_info(url)
+        .unwrap()
+        .expect("output has no video stream")
+    {
         StreamInfo::Video { nb_frames, .. } => nb_frames,
         other => panic!("expected video stream info, got {other:?}"),
     }
 }
 
 fn audio_duration_secs(url: &str) -> f64 {
-    match find_audio_stream_info(url).unwrap().expect("output has no audio stream") {
-        StreamInfo::Audio { duration, time_base, .. } => {
-            duration as f64 * time_base.num as f64 / time_base.den as f64
-        }
+    match find_audio_stream_info(url)
+        .unwrap()
+        .expect("output has no audio stream")
+    {
+        StreamInfo::Audio {
+            duration,
+            time_base,
+            ..
+        } => duration as f64 * time_base.num as f64 / time_base.den as f64,
         other => panic!("expected audio stream info, got {other:?}"),
     }
 }
 
 fn video_duration_secs(url: &str) -> f64 {
-    match find_video_stream_info(url).unwrap().expect("output has no video stream") {
-        StreamInfo::Video { duration, time_base, .. } => {
-            duration as f64 * time_base.num as f64 / time_base.den as f64
-        }
+    match find_video_stream_info(url)
+        .unwrap()
+        .expect("output has no video stream")
+    {
+        StreamInfo::Video {
+            duration,
+            time_base,
+            ..
+        } => duration as f64 * time_base.num as f64 / time_base.den as f64,
         other => panic!("expected video stream info, got {other:?}"),
     }
 }
@@ -257,8 +273,15 @@ fn shortest_with_max_frames_bounds_infinite_streams() {
         .start()
         .unwrap();
 
-    let result = wait_with_watchdog(scheduler, 60, "shortest + max_video_frames bounds infinite streams");
-    assert!(result.is_ok(), "-shortest + max_frames job failed: {result:?}");
+    let result = wait_with_watchdog(
+        scheduler,
+        60,
+        "shortest + max_video_frames bounds infinite streams",
+    );
+    assert!(
+        result.is_ok(),
+        "-shortest + max_frames job failed: {result:?}"
+    );
 
     // Both infinite videos are capped at 30 frames. A bounded count (not thousands)
     // proves the cap took effect; termination at all proves neither infinite source

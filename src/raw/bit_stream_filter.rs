@@ -175,8 +175,7 @@ impl Drop for BitStreamFilter {
 mod tests {
     use super::*;
     use ffmpeg_sys_next::{
-        av_new_packet, av_packet_alloc, av_packet_free, AVCodecID, AVMediaType, AVERROR_EOF,
-        EAGAIN,
+        av_new_packet, av_packet_alloc, av_packet_free, AVCodecID, AVMediaType, AVERROR_EOF, EAGAIN,
     };
     use std::ffi::CString;
 

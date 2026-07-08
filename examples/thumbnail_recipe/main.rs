@@ -1,4 +1,6 @@
-use ez_ffmpeg::recipes::{sprite_sheet, thumbnail, At, Every, SpriteSheetOptions, ThumbnailOptions};
+use ez_ffmpeg::recipes::{
+    sprite_sheet, thumbnail, At, Every, SpriteSheetOptions, ThumbnailOptions,
+};
 
 /// One-shot thumbnail and sprite-sheet extraction via the `recipes` helpers,
 /// which own the graph-level `scale`/`select`/`tile` plus the output config.

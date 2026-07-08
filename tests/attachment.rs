@@ -9,15 +9,16 @@
 use ez_ffmpeg::error::{Error, OpenOutputError};
 use ez_ffmpeg::{FfmpegContext, FfmpegScheduler, Input, Output};
 use ffmpeg_sys_next::{
-    av_dict_get, avformat_close_input, avformat_find_stream_info, avformat_open_input, AVFormatContext,
-    AVMediaType, AVStream,
+    av_dict_get, avformat_close_input, avformat_find_stream_info, avformat_open_input,
+    AVFormatContext, AVMediaType, AVStream,
 };
 use std::ffi::{CStr, CString};
 use std::ptr;
 use std::time::Duration;
 
 fn tmp_path(name: &str) -> String {
-    let dir = std::env::temp_dir().join(format!("ez_ffmpeg_attachment_tests_{}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("ez_ffmpeg_attachment_tests_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir.join(name).to_string_lossy().into_owned()
 }
@@ -103,13 +104,19 @@ unsafe fn dict_get(st: *mut AVStream, key: &str) -> Option<String> {
     if entry.is_null() {
         return None;
     }
-    Some(CStr::from_ptr((*entry).value).to_string_lossy().into_owned())
+    Some(
+        CStr::from_ptr((*entry).value)
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 /// A deterministic opaque payload covering many byte values, with distinctive
 /// sentinel bytes at the tail so a truncation/off-by-one is caught.
 fn sample_blob() -> Vec<u8> {
-    let mut blob: Vec<u8> = (0..97u16).map(|i| (i.wrapping_mul(31).wrapping_add(7)) as u8).collect();
+    let mut blob: Vec<u8> = (0..97u16)
+        .map(|i| (i.wrapping_mul(31).wrapping_add(7)) as u8)
+        .collect();
     blob.extend_from_slice(&[0x00, 0xDE, 0xAD, 0xBE, 0xEF]);
     blob
 }
@@ -134,9 +141,20 @@ fn attachment_roundtrips_into_mkv_with_explicit_mimetype() {
     run(ctx, "mkv attachment roundtrip").expect("job should complete");
 
     let att = read_first_attachment(&out).expect("output .mkv must contain an attachment stream");
-    assert_eq!(att.extradata_size as usize, blob.len(), "extradata_size must equal payload length");
-    assert_eq!(att.extradata, blob, "extradata bytes must equal the source payload");
-    assert_eq!(att.filename.as_deref(), Some("payload.bin"), "filename tag must be the basename");
+    assert_eq!(
+        att.extradata_size as usize,
+        blob.len(),
+        "extradata_size must equal payload length"
+    );
+    assert_eq!(
+        att.extradata, blob,
+        "extradata bytes must equal the source payload"
+    );
+    assert_eq!(
+        att.filename.as_deref(),
+        Some("payload.bin"),
+        "filename tag must be the basename"
+    );
     assert_eq!(
         att.mimetype.as_deref(),
         Some("application/octet-stream"),
@@ -210,7 +228,10 @@ fn missing_attachment_file_errors_without_panic() {
         .build()
         .err(); // FfmpegContext is not Debug; keep only the Error for assertion.
     assert!(
-        matches!(result, Some(Error::OpenOutput(OpenOutputError::AttachmentRead(_, _)))),
+        matches!(
+            result,
+            Some(Error::OpenOutput(OpenOutputError::AttachmentRead(_, _)))
+        ),
         "a missing attachment file must fail the build with AttachmentRead, got {result:?}"
     );
 }
@@ -232,7 +253,10 @@ fn empty_attachment_file_errors() {
         .build()
         .err();
     assert!(
-        matches!(result, Some(Error::OpenOutput(OpenOutputError::AttachmentEmpty(_)))),
+        matches!(
+            result,
+            Some(Error::OpenOutput(OpenOutputError::AttachmentEmpty(_)))
+        ),
         "an empty attachment file must fail the build with AttachmentEmpty, got {result:?}"
     );
 }
@@ -254,7 +278,12 @@ fn empty_explicit_mimetype_errors() {
         .build()
         .err();
     assert!(
-        matches!(result, Some(Error::OpenOutput(OpenOutputError::AttachmentEmptyMimetype(_)))),
+        matches!(
+            result,
+            Some(Error::OpenOutput(OpenOutputError::AttachmentEmptyMimetype(
+                _
+            )))
+        ),
         "an empty explicit mimetype must fail the build, got {result:?}"
     );
 }

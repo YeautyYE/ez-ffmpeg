@@ -151,8 +151,7 @@ fn encode_audio(force: Option<&str>, name: &str) -> String {
     let result = wait_with_watchdog(
         FfmpegContext::builder()
             .input(
-                Input::from("sine=frequency=440:duration=2:sample_rate=44100")
-                    .set_format("lavfi"),
+                Input::from("sine=frequency=440:duration=2:sample_rate=44100").set_format("lavfi"),
             )
             .output(output)
             .build()
@@ -182,7 +181,10 @@ fn set_force_key_frames_is_a_no_op_for_audio_only() {
     let plain_packets = audio_packet_count(&plain);
     let with_packets = audio_packet_count(&with_opt);
 
-    assert!(plain_packets > 0, "baseline audio output should have packets");
+    assert!(
+        plain_packets > 0,
+        "baseline audio output should have packets"
+    );
     assert_eq!(
         with_packets, plain_packets,
         "set_force_key_frames must not change audio output \

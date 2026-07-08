@@ -352,9 +352,8 @@ impl GpuState {
             true => match hw_interop::try_open_dmabuf_device(&adapter, &device_desc) {
                 Some((device, queue, interop)) => (device, queue, Some(interop)),
                 None => {
-                    let (device, queue) =
-                        pollster::block_on(adapter.request_device(&device_desc))
-                            .map_err(|e| format!("Failed to create wgpu device: {e}"))?;
+                    let (device, queue) = pollster::block_on(adapter.request_device(&device_desc))
+                        .map_err(|e| format!("Failed to create wgpu device: {e}"))?;
                     (device, queue, None)
                 }
             },
@@ -412,16 +411,17 @@ impl GpuState {
             count: None,
         };
 
-        let convert_bgl_planar = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("ez_convert_planar_bgl"),
-            entries: &[
-                texture_bgl_entry(0),
-                texture_bgl_entry(1),
-                texture_bgl_entry(2),
-                sampler_entry,
-                uniform_bgl_entry(4, wgpu::ShaderStages::FRAGMENT, 16),
-            ],
-        });
+        let convert_bgl_planar =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("ez_convert_planar_bgl"),
+                entries: &[
+                    texture_bgl_entry(0),
+                    texture_bgl_entry(1),
+                    texture_bgl_entry(2),
+                    sampler_entry,
+                    uniform_bgl_entry(4, wgpu::ShaderStages::FRAGMENT, 16),
+                ],
+            });
         let convert_bgl_nv12 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("ez_convert_nv12_bgl"),
             entries: &[
@@ -447,7 +447,11 @@ impl GpuState {
         });
         let effect_bgl1 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("ez_effect_bgl1"),
-            entries: &[uniform_bgl_entry(0, wgpu::ShaderStages::FRAGMENT, params_size)],
+            entries: &[uniform_bgl_entry(
+                0,
+                wgpu::ShaderStages::FRAGMENT,
+                params_size,
+            )],
         });
 
         let pack_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -661,26 +665,23 @@ impl GpuState {
         let resource_generation = self.resource_generation;
 
         let device = &self.device;
-        let create_tex = |label: &str,
-                          w: u32,
-                          h: u32,
-                          fmt: wgpu::TextureFormat,
-                          usage: wgpu::TextureUsages| {
-            device.create_texture(&wgpu::TextureDescriptor {
-                label: Some(label),
-                size: wgpu::Extent3d {
-                    width: w,
-                    height: h,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: fmt,
-                usage,
-                view_formats: &[],
-            })
-        };
+        let create_tex =
+            |label: &str, w: u32, h: u32, fmt: wgpu::TextureFormat, usage: wgpu::TextureUsages| {
+                device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: fmt,
+                    usage,
+                    view_formats: &[],
+                })
+            };
 
         let (cw, ch) = layout.chroma_size(in_w, in_h);
         let upload = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
@@ -689,7 +690,13 @@ impl GpuState {
         let (tex_u, tex_v) = match layout {
             PlaneLayout::Planar { .. } => (
                 create_tex("ez_u", cw, ch, wgpu::TextureFormat::R8Unorm, upload),
-                Some(create_tex("ez_v", cw, ch, wgpu::TextureFormat::R8Unorm, upload)),
+                Some(create_tex(
+                    "ez_v",
+                    cw,
+                    ch,
+                    wgpu::TextureFormat::R8Unorm,
+                    upload,
+                )),
             ),
             PlaneLayout::Nv12 => (
                 create_tex("ez_uv", cw, ch, wgpu::TextureFormat::Rg8Unorm, upload),

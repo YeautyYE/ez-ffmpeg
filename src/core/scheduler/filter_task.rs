@@ -1,18 +1,20 @@
 use crate::core::context::filter_graph::FilterGraph;
 use crate::core::context::input_filter::{InputFilterOptions, IFILTER_FLAG_AUTOROTATE};
-use crate::core::display::get_rotation;
 use crate::core::context::obj_pool::ObjPool;
 use crate::core::context::output::VSyncMethod;
 use crate::core::context::output::VSyncMethod::{VsyncCfr, VsyncVscfr};
 use crate::core::context::output_filter::OutputFilterOptions;
 use crate::core::context::{null_frame, FrameBox, FrameData, SideDataList};
+use crate::core::display::get_rotation;
 use crate::core::scheduler::ffmpeg_scheduler::{
     frame_is_null, is_stopping, set_scheduler_error, wait_until_not_paused,
 };
 use crate::core::scheduler::input_controller::{InputController, SchNode};
 use crate::error::{Error, FilterGraphError, FilterGraphOperationError, FilterGraphParseError};
 use crate::hwaccel::{hw_device_for_filter, HWDevice};
+use crate::util::ffmpeg_utils::av_err2str;
 use crate::util::ffmpeg_utils::av_rescale_q_rnd;
+use crate::util::thread_synchronizer::{ThreadDoneGuard, ThreadSynchronizer};
 use crossbeam_channel::{RecvTimeoutError, Sender};
 use ffmpeg_next::Frame;
 #[cfg(not(docsrs))]
@@ -36,16 +38,16 @@ use ffmpeg_sys_next::{
     av_buffersrc_parameters_alloc, av_buffersrc_parameters_set, av_color_range_name,
     av_color_space_name, av_dict_free, av_frame_alloc, av_frame_free, av_frame_get_side_data,
     av_frame_ref, av_frame_remove_side_data, av_freep, av_get_pix_fmt_name, av_get_sample_fmt_name,
-    av_inv_q, av_log2, av_malloc, av_opt_find, av_opt_set, av_opt_set_bin, av_opt_set_int,
-    av_q2d, av_rescale_q, av_strdup, avfilter_get_by_name,
-    avfilter_graph_config, avfilter_graph_create_filter,
-    avfilter_graph_request_oldest, avfilter_link, avfilter_pad_get_type,
-    avio_close, avio_closep, avio_open, avio_open2, avio_read, avio_read_to_bprint, avio_size,
-    AVBPrint, AVBufferRef, AVColorRange, AVColorSpace, AVFilterContext, AVFilterGraph,
-    AVFilterInOut, AVFrame, AVMediaType, AVPixelFormat, AVRational, AVSampleFormat, AVERROR,
-    AVERROR_BUG, AVERROR_EOF, AVERROR_OPTION_NOT_FOUND, AVIO_FLAG_READ, AV_BPRINT_SIZE_AUTOMATIC,
-    AV_BUFFERSINK_FLAG_NO_REQUEST, AV_BUFFERSRC_FLAG_PUSH, AV_NOPTS_VALUE, AV_OPT_SEARCH_CHILDREN,
-    AV_PIX_FMT_FLAG_HWACCEL, AV_TIME_BASE_Q, EAGAIN, EINVAL, EIO, ENOMEM,
+    av_inv_q, av_log2, av_malloc, av_opt_find, av_opt_set, av_opt_set_bin, av_opt_set_int, av_q2d,
+    av_rescale_q, av_strdup, avfilter_get_by_name, avfilter_graph_config,
+    avfilter_graph_create_filter, avfilter_graph_request_oldest, avfilter_link,
+    avfilter_pad_get_type, avio_close, avio_closep, avio_open, avio_open2, avio_read,
+    avio_read_to_bprint, avio_size, AVBPrint, AVBufferRef, AVColorRange, AVColorSpace,
+    AVFilterContext, AVFilterGraph, AVFilterInOut, AVFrame, AVMediaType, AVPixelFormat, AVRational,
+    AVSampleFormat, AVERROR, AVERROR_BUG, AVERROR_EOF, AVERROR_OPTION_NOT_FOUND, AVIO_FLAG_READ,
+    AV_BPRINT_SIZE_AUTOMATIC, AV_BUFFERSINK_FLAG_NO_REQUEST, AV_BUFFERSRC_FLAG_PUSH,
+    AV_NOPTS_VALUE, AV_OPT_SEARCH_CHILDREN, AV_PIX_FMT_FLAG_HWACCEL, AV_TIME_BASE_Q, EAGAIN,
+    EINVAL, EIO, ENOMEM,
 };
 #[cfg(not(docsrs))]
 use ffmpeg_sys_next::{
@@ -69,8 +71,6 @@ use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use crate::util::ffmpeg_utils::av_err2str;
-use crate::util::thread_synchronizer::{ThreadDoneGuard, ThreadSynchronizer};
 
 pub(crate) fn filter_graph_init(
     fg_index: usize,
@@ -176,7 +176,7 @@ pub(crate) fn filter_graph_init(
 
                 if input_index < finished_flag_list.len() {
                     if finished_flag_list[input_index].load(Ordering::Acquire) {
-                       continue;
+                        continue;
                     }
                 } else {
                     unreachable!()
@@ -207,7 +207,11 @@ pub(crate) fn filter_graph_init(
                             &frame_pool,
                         ) {
                             match e {
-                                Error::FilterGraph(FilterGraphOperationError::BufferSourceAddFrameError(FilterGraphError::EOF)) => {
+                                Error::FilterGraph(
+                                    FilterGraphOperationError::BufferSourceAddFrameError(
+                                        FilterGraphError::EOF,
+                                    ),
+                                ) => {
                                     debug!("Input {} no longer accepts new data", input_index);
                                     filter_receive_finish(&finished_flag_list, input_index);
                                 }
@@ -230,7 +234,11 @@ pub(crate) fn filter_graph_init(
                         &frame_pool,
                     ) {
                         match e {
-                            Error::FilterGraph(FilterGraphOperationError::BufferSourceAddFrameError(FilterGraphError::EOF)) => {
+                            Error::FilterGraph(
+                                FilterGraphOperationError::BufferSourceAddFrameError(
+                                    FilterGraphError::EOF,
+                                ),
+                            ) => {
                                 debug!("Input {} no longer accepts new data", input_index);
                                 filter_receive_finish(&finished_flag_list, input_index);
                             }
@@ -1135,9 +1143,9 @@ unsafe fn configure_filtergraph(
                 if err < 0 {
                     cleanup_filtergraph(graph, ifps, ofps);
                     return Err(Error::FilterGraph(
-                        FilterGraphOperationError::FrameSideDataCloneError(
-                            FilterGraphError::from(err),
-                        ),
+                        FilterGraphOperationError::FrameSideDataCloneError(FilterGraphError::from(
+                            err,
+                        )),
                     ));
                 }
             }
@@ -1259,10 +1267,8 @@ unsafe fn graph_is_meta(graph: *mut AVFilterGraph) -> bool {
 fn filter_is_buffersrc(f: *mut AVFilterContext) -> bool {
     unsafe {
         (*f).nb_inputs == 0
-            && (CStr::from_ptr((*(*f).filter).name)
-                == c"buffer"
-                || CStr::from_ptr((*(*f).filter).name)
-                    == c"abuffer")
+            && (CStr::from_ptr((*(*f).filter).name) == c"buffer"
+                || CStr::from_ptr((*(*f).filter).name) == c"abuffer")
     }
 }
 
@@ -1567,7 +1573,10 @@ unsafe fn fg_read_frames(
             if ret == AVERROR_EOF {
                 trace!("Filtergraph returned EOF, finishing");
             } else {
-                error!("Error requesting a frame from the filtergraph: {}", av_err2str(ret));
+                error!(
+                    "Error requesting a frame from the filtergraph: {}",
+                    av_err2str(ret)
+                );
             }
             return ret;
         }
@@ -1647,7 +1656,10 @@ unsafe fn fg_output_step(
         return 1;
     } else if ret < 0 {
         frame_pool.release(frame);
-        warn!("Error in retrieving a frame from the filtergraph: {}", av_err2str(ret));
+        warn!(
+            "Error in retrieving a frame from the filtergraph: {}",
+            av_err2str(ret)
+        );
         return ret;
     }
 
@@ -1669,14 +1681,13 @@ unsafe fn fg_output_step(
 
     }*/
 
-    if ofp.media_type == AVMEDIA_TYPE_VIDEO
-        && (*frame.as_ptr()).duration == 0 {
-            let fr = av_buffersink_get_frame_rate(ofp.filter);
-            if fr.num > 0 && fr.den > 0 {
-                (*frame.as_mut_ptr()).duration =
-                    av_rescale_q(1, av_inv_q(fr), (*frame.as_ptr()).time_base);
-            }
+    if ofp.media_type == AVMEDIA_TYPE_VIDEO && (*frame.as_ptr()).duration == 0 {
+        let fr = av_buffersink_get_frame_rate(ofp.filter);
+        if fr.num > 0 && fr.den > 0 {
+            (*frame.as_mut_ptr()).duration =
+                av_rescale_q(1, av_inv_q(fr), (*frame.as_ptr()).time_base);
         }
+    }
 
     ret = fg_output_frame(fgp, ofp, frame, frame_pool);
     if ret < 0 {
@@ -1757,12 +1768,14 @@ unsafe fn fg_output_frame(
     mut frame: Frame,
     frame_pool: &ObjPool<Frame>,
 ) -> i32 {
-    if !ofp.finished_flag_list.is_empty() && ofp.fg_input_index < ofp.finished_flag_list.len()
-        && ofp.finished_flag_list[ofp.fg_input_index].load(Ordering::Acquire) {
-            ofp.eof = true;
-            fgp.nb_outputs_done += 1;
-            return 0;
-        }
+    if !ofp.finished_flag_list.is_empty()
+        && ofp.fg_input_index < ofp.finished_flag_list.len()
+        && ofp.finished_flag_list[ofp.fg_input_index].load(Ordering::Acquire)
+    {
+        ofp.eof = true;
+        fgp.nb_outputs_done += 1;
+        return 0;
+    }
 
     let mut nb_frames = if !frame_is_null(&frame) { 1 } else { 0 };
     let mut nb_frames_prev = 0;
@@ -1873,10 +1886,9 @@ unsafe fn fg_output_frame(
             ofp.fpsconv_context.frame_number += 1;
             ofp.next_pts += 1;
 
-            if i == nb_frames_prev
-                && !frame_is_null(&frame) {
-                    (*frame.as_mut_ptr()).flags &= !AV_FRAME_FLAG_KEY;
-                }
+            if i == nb_frames_prev && !frame_is_null(&frame) {
+                (*frame.as_mut_ptr()).flags &= !AV_FRAME_FLAG_KEY;
+            }
         }
 
         ofp.got_frame = true;
@@ -1906,18 +1918,12 @@ unsafe fn fg_output_frame(
 }
 
 #[cfg(docsrs)]
-unsafe fn close_output(
-    ofp: &mut OutputFilterParameter,
-    frame_pool: &ObjPool<Frame>,
-) -> i32 {
+unsafe fn close_output(ofp: &mut OutputFilterParameter, frame_pool: &ObjPool<Frame>) -> i32 {
     0
 }
 
 #[cfg(not(docsrs))]
-unsafe fn close_output(
-    ofp: &mut OutputFilterParameter,
-    frame_pool: &ObjPool<Frame>,
-) -> i32 {
+unsafe fn close_output(ofp: &mut OutputFilterParameter, frame_pool: &ObjPool<Frame>) -> i32 {
     // we are finished and no frames were ever seen at this output,
     // at least initialize the encoder with a dummy frame
 
@@ -1942,10 +1948,8 @@ unsafe fn close_output(
             // frame's own (empty) layout onto itself left the dummy audio
             // frame without channels (ffmpeg_filter.c close_output copies
             // from ofp->ch_layout).
-            let ret = av_channel_layout_copy(
-                &mut (*frame.as_mut_ptr()).ch_layout,
-                &ofp.opts.ch_layout,
-            );
+            let ret =
+                av_channel_layout_copy(&mut (*frame.as_mut_ptr()).ch_layout, &ofp.opts.ch_layout);
             if ret < 0 {
                 return ret;
             }
@@ -2100,10 +2104,7 @@ unsafe fn video_sync_process(
         // prologue suppresses the initial padding, then FALLS THROUGH into
         // the CFR drop/duplicate logic (ffmpeg_filter.c:2288-2295).
         VSyncMethod::VsyncVscfr | VSyncMethod::VsyncCfr => {
-            if vsync_method == VSyncMethod::VsyncVscfr
-                && fps.frame_number == 0
-                && delta0 >= 0.5
-            {
+            if vsync_method == VSyncMethod::VsyncVscfr && fps.frame_number == 0 && delta0 >= 0.5 {
                 debug!("Not duplicating {} initial frames", delta0.round() as i32);
                 delta = duration;
                 delta0 = 0.0;
@@ -2345,9 +2346,9 @@ fn ifilter_parameters_from_frame(
                 if ret < 0 {
                     error!("Clone side data error: {}", av_err2str(ret));
                     return Err(Error::FilterGraph(
-                        FilterGraphOperationError::FrameSideDataCloneError(
-                            FilterGraphError::from(ret),
-                        ),
+                        FilterGraphOperationError::FrameSideDataCloneError(FilterGraphError::from(
+                            ret,
+                        )),
                     ));
                 }
             }
@@ -2378,9 +2379,9 @@ fn ifilter_parameters_from_frame(
                 if ret < 0 {
                     error!("Clone downmix side data error: {}", av_err2str(ret));
                     return Err(Error::FilterGraph(
-                        FilterGraphOperationError::FrameSideDataCloneError(
-                            FilterGraphError::from(ret),
-                        ),
+                        FilterGraphOperationError::FrameSideDataCloneError(FilterGraphError::from(
+                            ret,
+                        )),
                     ));
                 }
                 std::ptr::copy_nonoverlapping(
@@ -2403,10 +2404,9 @@ fn choose_sample_fmts(
     format: AVSampleFormat,
     formats: Option<Vec<AVSampleFormat>>,
 ) {
-    if format == AV_SAMPLE_FMT_NONE
-        && (formats.is_none() || formats.as_ref().unwrap().is_empty()) {
-            return;
-        }
+    if format == AV_SAMPLE_FMT_NONE && (formats.is_none() || formats.as_ref().unwrap().is_empty()) {
+        return;
+    }
 
     unsafe {
         {
@@ -2444,10 +2444,9 @@ fn choose_sample_rates(bprint: &mut AVBPrint, rate: i32, rates: Option<Vec<i32>>
 
 #[cfg(not(docsrs))]
 fn choose_sample_rates(bprint: &mut AVBPrint, rate: i32, rates: Option<Vec<i32>>) {
-    if rate == 0
-        && (rates.is_none() || rates.as_ref().unwrap().is_empty()) {
-            return;
-        }
+    if rate == 0 && (rates.is_none() || rates.as_ref().unwrap().is_empty()) {
+        return;
+    }
 
     unsafe {
         {
@@ -2820,11 +2819,7 @@ unsafe fn configure_input_audio_filter(
         av_channel_layout_describe_bprint(&ifp.ch_layout, &mut args);
     } else {
         let channels_fmt = CString::new(":channels=%d").unwrap();
-        av_bprintf(
-            &mut args,
-            channels_fmt.as_ptr(),
-            ifp.ch_layout.nb_channels,
-        );
+        av_bprintf(&mut args, channels_fmt.as_ptr(), ifp.ch_layout.nb_channels);
     }
 
     let name = format!("graph_{fg_index}_in_{}", ifp.opts.name);
@@ -2931,8 +2926,7 @@ unsafe fn configure_input_video_filter(
     // So alloc -> av_buffersrc_parameters_set -> avfilter_init_dict, as
     // fftools does since n8.0 (ffmpeg_filter.c, commit 53c71777e193). This
     // ordering behaves identically on FFmpeg 7.x.
-    ifp.filter =
-        ffmpeg_sys_next::avfilter_graph_alloc_filter(graph, buffer_filter, name.as_ptr());
+    ifp.filter = ffmpeg_sys_next::avfilter_graph_alloc_filter(graph, buffer_filter, name.as_ptr());
     if ifp.filter.is_null() {
         av_freep(&mut par as *mut _ as *mut c_void);
         return AVERROR(ENOMEM);
@@ -3014,10 +3008,9 @@ unsafe fn configure_input_video_filter(
         } else if theta.abs() > 1.0 {
             let rotate_buf = format!("{:.6}*PI/180", theta);
             ret = insert_filter(&mut last_filter, &mut pad_idx, "rotate", Some(&rotate_buf));
-        } else if theta.abs() < 1.0
-            && displaymatrix[4] < 0 {
-                ret = insert_filter(&mut last_filter, &mut pad_idx, "vflip", None);
-            }
+        } else if theta.abs() < 1.0 && displaymatrix[4] < 0 {
+            ret = insert_filter(&mut last_filter, &mut pad_idx, "vflip", None);
+        }
 
         if ret < 0 {
             return ret;
@@ -3377,7 +3370,10 @@ mod auto_conv_opts_tests {
     fn non_empty_opt_treats_none_and_empty_as_unset() {
         assert_eq!(non_empty_opt(&None), None);
         assert_eq!(non_empty_opt(&Some(String::new())), None);
-        assert_eq!(non_empty_opt(&Some("flags=lanczos".to_string())), Some("flags=lanczos"));
+        assert_eq!(
+            non_empty_opt(&Some("flags=lanczos".to_string())),
+            Some("flags=lanczos")
+        );
     }
 
     #[test]
@@ -3404,7 +3400,10 @@ mod auto_conv_opts_tests {
         let per_output = vec![Some("flags=bilinear"), Some("flags=bicubic")];
         let err = resolve_auto_conv_opt(None, per_output.into_iter())
             .expect_err("two different output values must be rejected");
-        assert!(is_invalid_argument(&err), "expected InvalidArgument, got {err:?}");
+        assert!(
+            is_invalid_argument(&err),
+            "expected InvalidArgument, got {err:?}"
+        );
     }
 
     #[test]
@@ -3450,8 +3449,8 @@ mod per_output_got_frame_tests {
 
     #[test]
     fn empty_output_emits_its_own_init_dummy() {
-        let frame_pool = ObjPool::new(1, test_new_frame, unref_frame, frame_is_null)
-            .expect("frame pool");
+        let frame_pool =
+            ObjPool::new(1, test_new_frame, unref_frame, frame_is_null).expect("frame pool");
         let (tx, rx) = crossbeam_channel::unbounded::<FrameBox>();
         let mut ofp = make_video_ofp(tx);
         // This output produced nothing; a sibling output may have, but that must
@@ -3463,17 +3462,23 @@ mod per_output_got_frame_tests {
 
         // First: the non-null init dummy that opens this output's encoder.
         let dummy = rx.try_recv().expect("expected an init dummy frame");
-        assert!(!frame_is_null(&dummy.frame), "init dummy must be a real frame");
+        assert!(
+            !frame_is_null(&dummy.frame),
+            "init dummy must be a real frame"
+        );
         // Then: the null EOF marker.
         let marker = rx.try_recv().expect("expected the EOF marker");
-        assert!(frame_is_null(&marker.frame), "EOF marker must be the null frame");
+        assert!(
+            frame_is_null(&marker.frame),
+            "EOF marker must be the null frame"
+        );
         assert!(ofp.eof, "close_output must mark the output EOF");
     }
 
     #[test]
     fn output_with_frames_skips_the_init_dummy() {
-        let frame_pool = ObjPool::new(1, test_new_frame, unref_frame, frame_is_null)
-            .expect("frame pool");
+        let frame_pool =
+            ObjPool::new(1, test_new_frame, unref_frame, frame_is_null).expect("frame pool");
         let (tx, rx) = crossbeam_channel::unbounded::<FrameBox>();
         let mut ofp = make_video_ofp(tx);
         // This output already emitted a frame -> no dummy needed.
@@ -3484,7 +3489,10 @@ mod per_output_got_frame_tests {
 
         // Only the null EOF marker is sent; no dummy precedes it.
         let marker = rx.try_recv().expect("expected the EOF marker");
-        assert!(frame_is_null(&marker.frame), "only the null EOF marker is expected");
+        assert!(
+            frame_is_null(&marker.frame),
+            "only the null EOF marker is expected"
+        );
         assert!(rx.try_recv().is_err(), "no init dummy must be emitted");
         assert!(ofp.eof, "close_output must mark the output EOF");
     }

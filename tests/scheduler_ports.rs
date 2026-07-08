@@ -14,10 +14,8 @@ use ez_ffmpeg::{FfmpegContext, FfmpegScheduler, Input, Output};
 use std::time::Duration;
 
 fn tmp_path(name: &str) -> String {
-    let dir = std::env::temp_dir().join(format!(
-        "ez_ffmpeg_sched_port_tests_{}",
-        std::process::id()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("ez_ffmpeg_sched_port_tests_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir.join(name).to_string_lossy().into_owned()
 }
@@ -96,7 +94,10 @@ fn input_framerate_forces_cfr_grid_through_decode() {
             time_base,
             ..
         } => {
-            assert_eq!(nb_frames, 30, "every input frame must be restamped, not dropped");
+            assert_eq!(
+                nb_frames, 30,
+                "every input frame must be restamped, not dropped"
+            );
             let fps = avg_frame_rate.num as f64 / avg_frame_rate.den as f64;
             assert!(
                 (fps - 60.0).abs() < 0.5,
@@ -350,10 +351,7 @@ fn stream_loop_survives_a_stream_that_finished_in_an_earlier_pass() {
     {
         StreamInfo::Audio { nb_frames, .. } => {
             // 100 encoded frames + the AAC priming packet (CLI parity).
-            assert_eq!(
-                nb_frames, 101,
-                "audio must keep flowing across loop passes"
-            );
+            assert_eq!(nb_frames, 101, "audio must keep flowing across loop passes");
         }
         other => panic!("expected audio stream info, got {other:?}"),
     }

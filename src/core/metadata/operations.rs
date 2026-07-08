@@ -308,11 +308,7 @@ pub unsafe fn copy_metadata(
     // Copy to destination based on type
     match dst_type {
         MetadataType::Global => {
-            av_dict_copy(
-                &mut output_ref.metadata,
-                src_dict,
-                AV_DICT_DONT_OVERWRITE,
-            );
+            av_dict_copy(&mut output_ref.metadata, src_dict, AV_DICT_DONT_OVERWRITE);
         }
 
         MetadataType::Stream(specifier) => {
@@ -323,11 +319,7 @@ pub unsafe fn copy_metadata(
             for stream_ptr in streams {
                 if !stream_ptr.is_null() && specifier.matches(output_ctx, *stream_ptr) {
                     let stream_ref = &mut **stream_ptr;
-                    av_dict_copy(
-                        &mut stream_ref.metadata,
-                        src_dict,
-                        AV_DICT_DONT_OVERWRITE,
-                    );
+                    av_dict_copy(&mut stream_ref.metadata, src_dict, AV_DICT_DONT_OVERWRITE);
                 }
             }
         }
@@ -343,11 +335,7 @@ pub unsafe fn copy_metadata(
             let chapters =
                 std::slice::from_raw_parts(output_ref.chapters, output_ref.nb_chapters as usize);
             let chapter_ref = &mut *chapters[idx];
-            av_dict_copy(
-                &mut chapter_ref.metadata,
-                src_dict,
-                AV_DICT_DONT_OVERWRITE,
-            );
+            av_dict_copy(&mut chapter_ref.metadata, src_dict, AV_DICT_DONT_OVERWRITE);
         }
 
         MetadataType::Program(idx) => {
@@ -361,11 +349,7 @@ pub unsafe fn copy_metadata(
             let programs =
                 std::slice::from_raw_parts(output_ref.programs, output_ref.nb_programs as usize);
             let program_ref = &mut *programs[idx];
-            av_dict_copy(
-                &mut program_ref.metadata,
-                src_dict,
-                AV_DICT_DONT_OVERWRITE,
-            );
+            av_dict_copy(&mut program_ref.metadata, src_dict, AV_DICT_DONT_OVERWRITE);
         }
     }
 

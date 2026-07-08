@@ -16,10 +16,8 @@ use ez_ffmpeg::{FfmpegContext, FfmpegScheduler, Input, Output};
 use std::time::Duration;
 
 fn tmp_path(name: &str) -> String {
-    let dir = std::env::temp_dir().join(format!(
-        "ez_ffmpeg_tail_frame_tests_{}",
-        std::process::id()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("ez_ffmpeg_tail_frame_tests_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir.join(name).to_string_lossy().into_owned()
 }
@@ -139,9 +137,9 @@ fn deferred_write_header_failure_returns_err() {
     let result = wait_with_watchdog(scheduler, 60, "write_header failure");
     match result {
         Err(Error::Muxing(MuxingOperationError::WriteHeader(_))) => {}
-        other => panic!(
-            "write_header failure must surface as Err(Muxing(WriteHeader)), got {other:?}"
-        ),
+        other => {
+            panic!("write_header failure must surface as Err(Muxing(WriteHeader)), got {other:?}")
+        }
     }
 }
 

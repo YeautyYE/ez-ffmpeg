@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use crate::filter::frame_pipeline::FramePipeline;
+use std::collections::HashMap;
 
 // Note: Input is Send if all callback fields are Send.
 // We require `+ Send` on callback types to ensure this.
@@ -559,7 +559,8 @@ impl Input {
     where
         F: FnMut(i64, i32) -> i64 + Send + 'static,
     {
-        self.seek_callback = Some(Box::new(seek_callback) as Box<dyn FnMut(i64, i32) -> i64 + Send>);
+        self.seek_callback =
+            Some(Box::new(seek_callback) as Box<dyn FnMut(i64, i32) -> i64 + Send>);
         self
     }
 
@@ -584,7 +585,12 @@ impl Input {
     ///     ]);
     /// ```
     pub fn set_frame_pipelines(mut self, frame_pipelines: Vec<impl Into<FramePipeline>>) -> Self {
-        self.frame_pipelines = Some(frame_pipelines.into_iter().map(|frame_pipeline| frame_pipeline.into()).collect());
+        self.frame_pipelines = Some(
+            frame_pipelines
+                .into_iter()
+                .map(|frame_pipeline| frame_pipeline.into())
+                .collect(),
+        );
         self
     }
 
@@ -1471,7 +1477,6 @@ impl From<&str> for Input {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use crate::core::context::input::Input;
@@ -1651,7 +1656,9 @@ mod tests {
     #[test]
     fn set_io_buffer_size_valid() {
         assert_eq!(
-            Input::from("test.mp4").set_io_buffer_size(1 << 20).io_buffer_size,
+            Input::from("test.mp4")
+                .set_io_buffer_size(1 << 20)
+                .io_buffer_size,
             1 << 20
         );
     }

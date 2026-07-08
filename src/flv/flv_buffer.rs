@@ -188,7 +188,6 @@ impl FlvBuffer {
                     current_len,
                 );
             }
-
         } else if current_len > 0 {
             let first_part = self.buffer.len() - self.head;
             // new_buffer[..first_part].copy_from_slice(&self.buffer[self.head..]);
@@ -410,13 +409,12 @@ impl FlvBuffer {
                 std::ptr::copy_nonoverlapping(
                     self.buffer.as_ptr(),
                     buffer.as_mut_ptr().add(first_len),
-                    second_len
+                    second_len,
                 );
             }
         }
     }
 }
-
 
 /// A cursor implementation that handles ring buffer wrap-around.
 /// Used for reading FLV tag headers efficiently.

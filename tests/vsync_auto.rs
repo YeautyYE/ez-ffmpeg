@@ -8,10 +8,8 @@ use ez_ffmpeg::{FfmpegContext, FfmpegScheduler, Input, Output};
 use std::time::Duration;
 
 fn tmp_path(name: &str) -> String {
-    let dir = std::env::temp_dir().join(format!(
-        "ez_ffmpeg_vsync_auto_tests_{}",
-        std::process::id()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("ez_ffmpeg_vsync_auto_tests_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir.join(name).to_string_lossy().into_owned()
 }

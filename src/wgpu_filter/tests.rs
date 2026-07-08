@@ -17,7 +17,13 @@ fn make_ctx(map: &mut HashMap<String, Box<dyn std::any::Any + Send>>) -> FrameFi
 /// chroma at extreme luma goes out of the RGB gamut and clamps (physically
 /// correct but not invertible), which would mask grid-alignment bugs behind
 /// gamut error.
-fn make_planar_frame(w: i32, h: i32, fmt: AVPixelFormat, const_luma: Option<u8>, pts: i64) -> Frame {
+fn make_planar_frame(
+    w: i32,
+    h: i32,
+    fmt: AVPixelFormat,
+    const_luma: Option<u8>,
+    pts: i64,
+) -> Frame {
     let (sub_x, sub_y) = match fmt {
         AVPixelFormat::AV_PIX_FMT_YUV420P | AVPixelFormat::AV_PIX_FMT_YUVJ420P => (2usize, 2usize),
         AVPixelFormat::AV_PIX_FMT_YUV422P => (2, 1),
@@ -38,8 +44,7 @@ fn make_planar_frame(w: i32, h: i32, fmt: AVPixelFormat, const_luma: Option<u8>,
         let y = std::slice::from_raw_parts_mut((*p).data[0], ls_y * h as usize);
         for row in 0..h as usize {
             for col in 0..w as usize {
-                y[row * ls_y + col] =
-                    const_luma.unwrap_or(((16 + row * 2 + col) % 220 + 16) as u8);
+                y[row * ls_y + col] = const_luma.unwrap_or(((16 + row * 2 + col) % 220 + 16) as u8);
             }
         }
         let cw = (w as usize).div_ceil(sub_x);
@@ -144,7 +149,10 @@ fn test_identity_roundtrip() {
     unsafe {
         assert_eq!((*out.as_ptr()).width, w);
         assert_eq!((*out.as_ptr()).height, h);
-        assert_eq!((*out.as_ptr()).format, AVPixelFormat::AV_PIX_FMT_YUV420P as i32);
+        assert_eq!(
+            (*out.as_ptr()).format,
+            AVPixelFormat::AV_PIX_FMT_YUV420P as i32
+        );
     }
     // YUV -> RGB -> YUV roundtrip through 8-bit RGBA allows small error.
     let diff = max_luma_diff(&out, &expected, w as usize, h as usize);
@@ -170,7 +178,10 @@ fn test_yuv444p_and_yuv422p_roundtrip() {
             assert_eq!((*out.as_ptr()).width, w);
             assert_eq!((*out.as_ptr()).height, h);
             // 4:2:2/4:4:4 inputs are chroma-downsampled to 4:2:0 on output.
-            assert_eq!((*out.as_ptr()).format, AVPixelFormat::AV_PIX_FMT_YUV420P as i32);
+            assert_eq!(
+                (*out.as_ptr()).format,
+                AVPixelFormat::AV_PIX_FMT_YUV420P as i32
+            );
         }
         let diff = max_luma_diff(&out, &expected, w as usize, h as usize);
         assert!(diff <= 3, "{fmt:?} luma max diff too large: {diff}");
@@ -187,7 +198,9 @@ fn test_async_ordering_and_eof_flush() {
     let mut inputs: Vec<Frame> = lumas
         .iter()
         .enumerate()
-        .map(|(i, &l)| make_planar_frame(64, 48, AVPixelFormat::AV_PIX_FMT_YUV420P, Some(l), i as i64))
+        .map(|(i, &l)| {
+            make_planar_frame(64, 48, AVPixelFormat::AV_PIX_FMT_YUV420P, Some(l), i as i64)
+        })
         .collect();
     // EOF marker arrives while GPU frames are still in flight; it must leave
     // last, after every real frame, in arrival order.
@@ -491,8 +504,7 @@ impl FrameFilter for CountingFilter {
         frame: Frame,
         _ctx: &FrameFilterContext,
     ) -> Result<Option<Frame>, String> {
-        self.seen
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Some(frame))
     }
 }
@@ -512,8 +524,9 @@ fn test_frame_pipeline_driver_semantics() {
             loop {
                 match pipeline.request_frame(i).expect("request_frame") {
                     Some(f) => {
-                        if let Some(f) =
-                            pipeline.run_filters_from(i + 1, f).expect("run_filters_from")
+                        if let Some(f) = pipeline
+                            .run_filters_from(i + 1, f)
+                            .expect("run_filters_from")
                         {
                             out.push(f);
                         }
@@ -577,7 +590,11 @@ fn test_frame_pipeline_driver_semantics() {
     }
     pipeline.uninit_filters();
 
-    assert_eq!(out.len(), expected, "all frames must drain through the chain");
+    assert_eq!(
+        out.len(),
+        expected,
+        "all frames must drain through the chain"
+    );
     for (i, f) in out.iter().enumerate() {
         assert_eq!(unsafe { (*f.as_ptr()).pts }, i as i64, "arrival order");
     }
@@ -805,8 +822,16 @@ fn test_output_frame_pool_copies_planes_and_props() {
         let dv = std::slice::from_raw_parts((*p).data[2], vls * out_ch);
         for row in 0..out_ch {
             for col in 0..cw {
-                assert_eq!(du[row * uls + col], (100 + (row % 40)) as u8, "U[{row}][{col}]");
-                assert_eq!(dv[row * vls + col], (200 + (row % 40)) as u8, "V[{row}][{col}]");
+                assert_eq!(
+                    du[row * uls + col],
+                    (100 + (row % 40)) as u8,
+                    "U[{row}][{col}]"
+                );
+                assert_eq!(
+                    dv[row * vls + col],
+                    (200 + (row % 40)) as u8,
+                    "V[{row}][{col}]"
+                );
             }
         }
     }
