@@ -49,6 +49,7 @@ pub(crate) struct HwVulkanInterop {
 
 /// One plane of a DRM PRIME NV12 frame.
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) struct DrmPlane {
     pub(crate) offset: u64,
     pub(crate) pitch: u64,
@@ -56,6 +57,7 @@ pub(crate) struct DrmPlane {
 
 /// Parsed single-object NV12 dmabuf descriptor.
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) struct DrmNv12 {
     pub(crate) fd: std::os::raw::c_int,
     pub(crate) modifier: u64,
@@ -213,7 +215,8 @@ pub(crate) fn try_open_dmabuf_device(
     None
 }
 
-#[cfg(unix)]
+// Only the Linux dmabuf import path (`import_plane`) dups fds; gated with it.
+#[cfg(target_os = "linux")]
 fn dup_fd(fd: std::os::raw::c_int) -> Result<std::os::raw::c_int, String> {
     // SAFETY: plain fcntl dup of a descriptor owned by the mapped frame.
     let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
@@ -224,11 +227,6 @@ fn dup_fd(fd: std::os::raw::c_int) -> Result<std::os::raw::c_int, String> {
         ));
     }
     Ok(dup)
-}
-
-#[cfg(not(unix))]
-fn dup_fd(_fd: std::os::raw::c_int) -> Result<std::os::raw::c_int, String> {
-    Err("dmabuf import is only supported on unix".to_string())
 }
 
 /// Non-Linux stub: the dmabuf zero-copy path exists only on Linux, so the
