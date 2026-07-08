@@ -448,7 +448,7 @@ pub(crate) fn enc_init(
                         (*pkt).flags |= AV_PKT_FLAG_TRUSTED;
 
                         // Send flushed packet to mux (real data packet, not empty marker)
-                        if let Err(_) = send_to_mux(PacketBox {
+                        match send_to_mux(PacketBox {
                             packet,
                             packet_data: PacketData {
                                 dts_est: 0,
@@ -457,8 +457,23 @@ pub(crate) fn enc_init(
                                 is_copy: false,
                             },
                         }, &pkt_sender, &pre_pkt_sender, &mux_start_gate) {
-                            debug!("send flushed packet failed, mux already finished");
-                            break;
+                            Ok(()) => {}
+                            // Mux receiver gone: the muxer finished. Graceful.
+                            Err(SendToMuxError::Disconnected(_)) => {
+                                debug!("send flushed packet failed, mux already finished");
+                                break;
+                            }
+                            // Pre-mux queue full past the deadline: a hard failure
+                            // on real flushed data, never a silent truncation.
+                            Err(SendToMuxError::QueueFull(_)) => {
+                                error!("flushed packet not delivered: too many packets buffered for output stream");
+                                set_scheduler_error(
+                                    &scheduler_status,
+                                    &scheduler_result,
+                                    Encoding(EncodingOperationError::MuxQueueFull),
+                                );
+                                break;
+                            }
                         }
                     }
                 }
@@ -482,7 +497,7 @@ pub(crate) fn enc_init(
 
             let mut packet = Packet::empty();
             (*packet.as_mut_ptr()).stream_index = stream_index as i32;
-            if let Err(e) = send_to_mux(PacketBox {
+            match send_to_mux(PacketBox {
                 packet,
                 packet_data: PacketData {
                     dts_est: 0,
@@ -491,16 +506,29 @@ pub(crate) fn enc_init(
                     is_copy: false,
                 },
             }, &pkt_sender, &pre_pkt_sender, &mux_start_gate) {
-                if is_stopping(scheduler_status.load(Ordering::Acquire)) {
-                    // Normal shutdown ordering: muxer exits before the encoder's
-                    // end-of-stream marker; not an error and not a task failure.
-                    debug!("end packet not delivered, muxer already finished: {e}");
-                } else {
-                    error!("Error sending end packet: {}", e);
+                Ok(()) => {}
+                Err(SendToMuxError::Disconnected(_)) => {
+                    if is_stopping(scheduler_status.load(Ordering::Acquire)) {
+                        // Normal shutdown ordering: muxer exits before the encoder's
+                        // end-of-stream marker; not an error and not a task failure.
+                        debug!("end packet not delivered, muxer already finished");
+                    } else {
+                        error!("Error sending end packet: muxer already finished");
+                        set_scheduler_error(
+                            &scheduler_status,
+                            &scheduler_result,
+                            Encoding(EncodingOperationError::MuxerFinished),
+                        );
+                    }
+                }
+                // Pre-mux queue full past the deadline: a hard failure, never a
+                // silent truncation (fftools "Too many packets buffered").
+                Err(SendToMuxError::QueueFull(_)) => {
+                    error!("Error sending end packet: too many packets buffered for output stream");
                     set_scheduler_error(
                         &scheduler_status,
                         &scheduler_result,
-                        Encoding(EncodingOperationError::MuxerFinished),
+                        Encoding(EncodingOperationError::MuxQueueFull),
                     );
                 }
             }
@@ -776,15 +804,25 @@ fn receive_frame(
 }
 
 /// `-shortest` (sq_enc): `(end_ts, time_base, nb_samples)` for a frame entering the
-/// sync queue. `end_ts = pts + duration` (FFmpeg `frame_end`), `None` when pts is
-/// unset. `nb_samples` is the audio sample count (0 for video) for the engine's
-/// `frames_max` accounting. Duration is already filled upstream (audio in
-/// `receive_frame`/`process_audio_queue`; video by the filtergraph).
+/// sync queue. For audio, `end_ts` is derived from the sample count
+/// (`pts + nb_samples/sample_rate`) rather than the frame's `duration` field, which
+/// some sources/filters leave at 0 even with `nb_samples > 0` — FFmpeg `frame_end` /
+/// `sq_send` do the same (sync_queue.c:118-128, 352-360). Video keeps
+/// `pts + duration`. `None` when pts is unset. `nb_samples` is the audio sample
+/// count (0 for video) for the engine's `frames_max` accounting.
 unsafe fn sq_frame_end_tb(fb: &FrameBox) -> (Option<i64>, AVRational, i32) {
     let f = fb.frame.as_ptr();
     let pts = (*f).pts;
-    let end_ts = if pts == AV_NOPTS_VALUE { None } else { Some(pts + (*f).duration) };
-    (end_ts, (*f).time_base, (*f).nb_samples)
+    let tb = (*f).time_base;
+    let nb_samples = (*f).nb_samples;
+    let end_ts = if pts == AV_NOPTS_VALUE {
+        None
+    } else if nb_samples > 0 && (*f).sample_rate > 0 {
+        Some(pts + av_rescale_q(nb_samples as i64, AVRational { num: 1, den: (*f).sample_rate }, tb))
+    } else {
+        Some(pts + (*f).duration)
+    };
+    (end_ts, tb, nb_samples)
 }
 
 /// `-shortest` (sq_enc): after a `send`/`heartbeat` under the sync-queue lock,
@@ -1663,7 +1701,7 @@ unsafe fn do_subtitle_out(
         }
         (*pkt).dts = (*pkt).pts;
 
-        if let Err(_) = send_to_mux(PacketBox {
+        match send_to_mux(PacketBox {
             packet,
             packet_data: PacketData {
                 dts_est: 0,
@@ -1672,8 +1710,18 @@ unsafe fn do_subtitle_out(
                 is_copy: false,
             },
         }, pkt_sender, pre_pkt_sender, mux_start_gate) {
-            debug!("send subtitle packet failed, mux already finished");
-            return Err(Encoding(EncodingOperationError::MuxerFinished));
+            Ok(()) => {}
+            // Mux receiver gone: the muxer legitimately finished. Graceful stop
+            // (only recorded as a failure if we were NOT asked to stop).
+            Err(SendToMuxError::Disconnected(_)) => {
+                debug!("send subtitle packet failed, mux already finished");
+                return Err(Encoding(EncodingOperationError::MuxerFinished));
+            }
+            // Pre-mux queue stayed full past the deadline: a hard failure, never
+            // a silent truncation (fftools "Too many packets buffered").
+            Err(SendToMuxError::QueueFull(_)) => {
+                return Err(Encoding(EncodingOperationError::MuxQueueFull));
+            }
         }
     }
 
@@ -1733,7 +1781,7 @@ unsafe fn encode_frame(
 
         (*pkt).flags |= AV_PKT_FLAG_TRUSTED;
 
-        if let Err(_) = send_to_mux(PacketBox {
+        match send_to_mux(PacketBox {
             packet,
             packet_data: PacketData {
                 dts_est: 0,
@@ -1742,23 +1790,56 @@ unsafe fn encode_frame(
                 is_copy: false,
             },
         }, pkt_sender, pre_pkt_sender, mux_start_gate) {
-            debug!("send packet failed, mux already finished");
-            return Err(Encoding(EncodingOperationError::MuxerFinished));
+            Ok(()) => {}
+            // Mux receiver gone: the muxer legitimately finished. Graceful stop.
+            Err(SendToMuxError::Disconnected(_)) => {
+                debug!("send packet failed, mux already finished");
+                return Err(Encoding(EncodingOperationError::MuxerFinished));
+            }
+            // Pre-mux queue stayed full past the deadline: a hard failure, never
+            // a silent truncation (fftools "Too many packets buffered").
+            Err(SendToMuxError::QueueFull(_)) => {
+                return Err(Encoding(EncodingOperationError::MuxQueueFull));
+            }
         }
     }
 }
 
 
-fn send_to_mux(
+/// Classified failure of [`send_to_mux`]. The two cases must be handled
+/// differently: `Disconnected` means the mux receiver is gone (benign — the
+/// muxer legitimately finished, handled as a graceful stop), while `QueueFull`
+/// means the pre-mux queue stayed full past the deadline (FATAL — fftools
+/// `AVERROR_BUFFER_TOO_SMALL`, "Too many packets buffered for output stream").
+/// Collapsing both into one error silently swallowed a real queue-full as a
+/// truncation, so callers must not treat `QueueFull` as `MuxerFinished`.
+///
+/// Each variant carries the undelivered `PacketBox` (the same contract as the
+/// `crossbeam::SendError<PacketBox>` this replaces), so a caller can recover the
+/// packet. Current callers classify by variant and drop it — the packet is then
+/// freed on drop exactly as before — hence the field-level allow.
+pub(crate) enum SendToMuxError {
+    Disconnected(#[allow(dead_code)] PacketBox),
+    QueueFull(#[allow(dead_code)] PacketBox),
+}
+
+/// Route one packet to the muxer, honoring the deferred-start gate: while the
+/// gate is closed the packet parks in the per-stream pre-mux queue; once the
+/// gate opens it goes to the shared live queue. Used by both encoders and, via
+/// `demux_task`, streamcopy destinations — fftools sends both through the same
+/// `sch_send` path (ffmpeg_sched.c:2038-2077).
+pub(crate) fn send_to_mux(
     packet_box: PacketBox,
     pkt_sender: &Sender<PacketBox>,
     pre_pkt_sender: &PreMuxQueueSender,
     mux_start_gate: &Arc<crate::core::context::MuxStartGate>,
-) -> Result<(), SendError<PacketBox>> {
+) -> Result<(), SendToMuxError> {
     use crate::core::context::PreSendOutcome;
 
     if mux_start_gate.is_started() {
-        return pkt_sender.send(packet_box);
+        return pkt_sender
+            .send(packet_box)
+            .map_err(|SendError(pb)| SendToMuxError::Disconnected(pb));
     }
 
     // The gate serializes "started?" with pre-queue admission: without it a
@@ -1783,9 +1864,15 @@ fn send_to_mux(
     loop {
         packet_box = match mux_start_gate.send_pre(pre_pkt_sender, packet_box) {
             PreSendOutcome::Sent => return Ok(()),
-            PreSendOutcome::Started(pb) => return pkt_sender.send(pb),
+            PreSendOutcome::Started(pb) => {
+                return pkt_sender
+                    .send(pb)
+                    .map_err(|SendError(pb)| SendToMuxError::Disconnected(pb));
+            }
             PreSendOutcome::Full(pb) => pb,
-            PreSendOutcome::Disconnected(pb) => return Err(SendError(pb)),
+            PreSendOutcome::Disconnected(pb) => {
+                return Err(SendToMuxError::Disconnected(pb))
+            }
         };
         if Instant::now() >= deadline {
             error!(
@@ -1794,7 +1881,7 @@ fn send_to_mux(
                  or check that every mapped output stream receives data",
                 PRE_MUX_FULL_BACKSTOP.as_secs()
             );
-            return Err(SendError(packet_box));
+            return Err(SendToMuxError::QueueFull(packet_box));
         }
         let size = packet_payload_size(&packet_box);
         pre_pkt_sender.wait_for_space(size, PRE_MUX_FULL_WAIT_SLICE);

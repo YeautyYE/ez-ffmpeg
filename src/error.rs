@@ -323,6 +323,14 @@ pub enum EncodingOperationError {
     #[error(": Muxer already finished")]
     MuxerFinished,
 
+    /// An output stream buffered more packets before the muxer started than the
+    /// pre-mux queue admits (fftools `AVERROR_BUFFER_TOO_SMALL`, "Too many
+    /// packets buffered for output stream"). Unlike `MuxerFinished` this is a
+    /// hard failure — never a silent truncation — so it must reach the
+    /// scheduler error, not the graceful stop path.
+    #[error(": too many packets buffered for an output stream before the muxer started; raise Output::set_max_muxing_queue_size / Output::set_muxing_queue_data_threshold, or check that every mapped output stream receives data")]
+    MuxQueueFull,
+
     #[error("Encode subtitle error: {0}")]
     EncodeSubtitle(#[from] EncodeSubtitleError),
 

@@ -1,4 +1,4 @@
-use crate::core::context::demuxer::Demuxer;
+use crate::core::context::demuxer::{CopyMuxHandle, Demuxer};
 use crate::core::context::ffmpeg_context_builder::FfmpegContextBuilder;
 use crate::core::context::filter_complex::FilterComplex;
 use crate::core::context::filter_graph::FilterGraph;
@@ -859,7 +859,8 @@ fn map_manual(
     match option {
         None => {
             // copy
-            let (packet_sender, _st, output_stream_index) = mux.new_stream(demux_node)?;
+            let (packet_sender, pre_sender, gate, _st, output_stream_index) =
+                mux.new_copy_stream(demux_node)?;
             demux.add_packet_dst(
                 packet_sender,
                 stream_index,
@@ -872,6 +873,7 @@ fn map_manual(
                 } else {
                     None
                 },
+                CopyMuxHandle { pre_sender, gate },
             );
             mux.register_stream_source(output_stream_index, demux_idx, stream_index, false);
 
@@ -894,7 +896,8 @@ fn map_manual(
             // connect input_stream to output
             if stream_map.copy {
                 // copy
-                let (packet_sender, _st, output_stream_index) = mux.new_stream(demux_node)?;
+                let (packet_sender, pre_sender, gate, _st, output_stream_index) =
+                    mux.new_copy_stream(demux_node)?;
                 demux.add_packet_dst(
                 packet_sender,
                 stream_index,
@@ -907,6 +910,7 @@ fn map_manual(
                 } else {
                     None
                 },
+                CopyMuxHandle { pre_sender, gate },
             );
                 mux.register_stream_source(output_stream_index, demux_idx, stream_index, false);
 
@@ -1425,8 +1429,8 @@ unsafe fn map_auto_subtitle(
                 let input_stream_duration = input_stream.duration;
                 let input_stream_time_base = input_stream.time_base;
 
-                let (packet_sender, _st, output_stream_index) =
-                    mux.new_stream(demux.node.clone())?;
+                let (packet_sender, pre_sender, gate, _st, output_stream_index) =
+                    mux.new_copy_stream(demux.node.clone())?;
                 demux.add_packet_dst(
                 packet_sender,
                 stream_index,
@@ -1439,6 +1443,7 @@ unsafe fn map_auto_subtitle(
                 } else {
                     None
                 },
+                CopyMuxHandle { pre_sender, gate },
             );
                 mux.register_stream_source(output_stream_index, demux_idx, stream_index, false);
 
@@ -1532,7 +1537,8 @@ unsafe fn map_auto_data(
             let input_stream_duration = input_stream.duration;
             let input_stream_time_base = input_stream.time_base;
 
-            let (packet_sender, _st, output_stream_index) = mux.new_stream(demux.node.clone())?;
+            let (packet_sender, pre_sender, gate, _st, output_stream_index) =
+                mux.new_copy_stream(demux.node.clone())?;
             demux.add_packet_dst(
                 packet_sender,
                 stream_index,
@@ -1545,6 +1551,7 @@ unsafe fn map_auto_data(
                 } else {
                     None
                 },
+                CopyMuxHandle { pre_sender, gate },
             );
             mux.register_stream_source(output_stream_index, demux_idx, stream_index, false);
 
@@ -1662,7 +1669,8 @@ unsafe fn map_auto_stream(
     let input_stream_duration = input_stream.duration;
     let input_stream_time_base = input_stream.time_base;
 
-    let (packet_sender, _st, output_stream_index) = mux.new_stream(demux.node.clone())?;
+    let (packet_sender, pre_sender, gate, _st, output_stream_index) =
+        mux.new_copy_stream(demux.node.clone())?;
     demux.add_packet_dst(
         packet_sender,
         stream_index,
@@ -1672,6 +1680,7 @@ unsafe fn map_auto_stream(
         } else {
             None
         },
+        CopyMuxHandle { pre_sender, gate },
     );
     mux.register_stream_source(output_stream_index, input_file_idx, stream_index, false);
 
@@ -3756,8 +3765,15 @@ unsafe fn find_stream_info_if_enabled(
     }
     // Probing consumed the options it recognized; whatever is left is a user
     // typo (fftools check_avoptions errors out — we warn, matching the
-    // input_opts leftover handling in open_input_file).
+    // input_opts leftover handling in open_input_file). Exception:
+    // avformat_find_stream_info injects "threads"/"lowres"/"codec_whitelist" into
+    // every per-stream opts dict (FFmpeg demux.c ~2679-2686); a stream it never
+    // opens a decoder for leaves them unconsumed. They are FFmpeg's, not the
+    // user's, so reporting them as unrecognized is a false positive.
     for (stream_index, key) in probe_opts.leftover_keys() {
+        if matches!(key.as_str(), "threads" | "lowres" | "codec_whitelist") {
+            continue;
+        }
         warn!(
             "Option '{key}' was not recognized while probing stream {stream_index} of input {index}"
         );
