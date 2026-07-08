@@ -7,6 +7,7 @@ use std::{io, result};
 pub type Result<T, E = Error> = result::Result<T, E>;
 
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum Error {
     #[error("Scheduler is not started")]
     NotStarted,
@@ -150,6 +151,7 @@ pub enum Error {
 /// Error type for RTMP streaming operations using StreamBuilder
 #[cfg(feature = "rtmp")]
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum StreamError {
     #[error("missing required parameter: {0}")]
     MissingParameter(&'static str),
@@ -190,6 +192,7 @@ impl PartialEq for Error {
 // the relation is not reflexive and claiming Eq would be a lie.
 
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum DemuxingOperationError {
     #[error("while reading frame: {0}")]
     ReadFrameError(DemuxingError),
@@ -205,6 +208,7 @@ pub enum DemuxingOperationError {
 }
 
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum DecodingOperationError {
     #[error("during frame reference creation: {0}")]
     FrameRefError(DecodingError),
@@ -247,6 +251,7 @@ pub enum DecodingOperationError {
 }
 
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum OpenDecoderOperationError {
     #[error("during context allocation: {0}")]
     ContextAllocationError(OpenDecoderError),
@@ -271,6 +276,7 @@ pub enum OpenDecoderOperationError {
 }
 
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum FilterGraphOperationError {
     #[error("during requesting oldest frame: {0}")]
     RequestOldestError(FilterGraphError),
@@ -307,6 +313,7 @@ pub enum FilterGraphOperationError {
 }
 
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum EncodingOperationError {
     #[error("during frame submission: {0}")]
     SendFrameError(EncodingError),
@@ -339,6 +346,7 @@ pub enum EncodingOperationError {
 }
 
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum MuxingOperationError {
     #[error("during write header: {0}")]
     WriteHeader(WriteHeaderError),
@@ -360,6 +368,7 @@ pub enum MuxingOperationError {
 }
 
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum OpenEncoderOperationError {
     #[error("during frame side data cloning: {0}")]
     FrameSideDataCloneError(OpenEncoderError),
@@ -396,6 +405,7 @@ pub enum OpenEncoderOperationError {
 }
 
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum UrlError {
     #[error("Null byte found in string at position {0}")]
     NullByteError(usize),
@@ -408,6 +418,7 @@ impl From<NulError> for Error {
 }
 
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum OpenInputError {
     #[error("Memory allocation error")]
     OutOfMemory,
@@ -484,6 +495,7 @@ const AVERROR_NOT_SOCKET: i32 = AVERROR(ENOTSOCK);
 const AVERROR_AGAIN: i32 = AVERROR(EAGAIN);
 
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum FindStreamError {
     #[error("Memory allocation error")]
     OutOfMemory,
@@ -533,6 +545,7 @@ impl From<i32> for FindStreamError {
 }
 
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum FilterGraphParseError {
     #[error("Memory allocation error")]
     OutOfMemory,
@@ -593,6 +606,7 @@ impl From<i32> for FilterGraphParseError {
 }
 
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum AllocOutputContextError {
     #[error("Memory allocation error")]
     OutOfMemory,
@@ -647,6 +661,7 @@ impl From<i32> for AllocOutputContextError {
 }
 
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum OpenOutputError {
     #[error("Memory allocation error")]
     OutOfMemory,
@@ -744,6 +759,7 @@ impl From<i32> for OpenOutputError {
 }
 
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum FindDevicesError {
     #[error("AVCaptureDevice class not found in macOS")]
     AVCaptureDeviceNotFound,
@@ -792,6 +808,7 @@ impl From<i32> for FindDevicesError {
 }
 
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum WriteHeaderError {
     #[error("Memory allocation error")]
     OutOfMemory,
@@ -846,6 +863,7 @@ impl From<i32> for WriteHeaderError {
 }
 
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum WriteFrameError {
     #[error("Memory allocation error")]
     OutOfMemory,
@@ -904,6 +922,7 @@ impl From<i32> for WriteFrameError {
 }
 
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum EncodeSubtitleError {
     #[error("Memory allocation error while encoding subtitle")]
     OutOfMemory,
@@ -938,18 +957,21 @@ impl From<i32> for EncodeSubtitleError {
 }
 
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum AllocPacketError {
     #[error("Memory allocation error while alloc packet")]
     OutOfMemory,
 }
 
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum AllocFrameError {
     #[error("Memory allocation error while alloc frame")]
     OutOfMemory,
 }
 
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum MuxingError {
     #[error("Memory allocation error")]
     OutOfMemory,
@@ -996,6 +1018,7 @@ impl From<i32> for MuxingError {
 }
 
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum OpenEncoderError {
     #[error("Memory allocation error occurred during encoder initialization")]
     OutOfMemory,
@@ -1042,6 +1065,7 @@ impl From<i32> for OpenEncoderError {
 }
 
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum EncodingError {
     #[error("Memory allocation error during encoding")]
     OutOfMemory,
@@ -1092,6 +1116,7 @@ impl From<i32> for EncodingError {
 }
 
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum FilterGraphError {
     #[error("Memory allocation error during filter graph processing")]
     OutOfMemory,
@@ -1142,6 +1167,7 @@ impl From<i32> for FilterGraphError {
 }
 
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum OpenDecoderError {
     #[error("Memory allocation error during decoder initialization")]
     OutOfMemory,
@@ -1176,6 +1202,7 @@ impl From<i32> for OpenDecoderError {
 }
 
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum DecodingError {
     #[error("Memory allocation error")]
     OutOfMemory,
@@ -1226,12 +1253,14 @@ impl From<i32> for DecodingError {
 }
 
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum DecoderError {
     #[error("decoder '{0}' not found")]
     NotFound(String),
 }
 
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum DemuxingError {
     #[error("Memory allocation error")]
     OutOfMemory,
@@ -1283,6 +1312,7 @@ impl From<i32> for DemuxingError {
 
 /// Errors that can occur during packet scanning operations.
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum PacketScannerError {
     /// Failed to seek to the requested timestamp.
     #[error("while seeking: {0}")]
