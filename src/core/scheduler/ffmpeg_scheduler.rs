@@ -559,9 +559,18 @@ impl FfmpegScheduler<Running> {
     /// # Returns
     /// A new [`FfmpegScheduler<Paused>`] representing the paused job.
     pub fn pause(self) -> FfmpegScheduler<Paused> {
-        if !is_stopping(self.status.load(Ordering::Acquire)) {
-            self.status.store(STATUS_PAUSE, Ordering::Release);
-        }
+        // CAS RUN->PAUSE instead of load-check-then-store: a terminal STATUS_END
+        // /STATUS_ABORT published concurrently (e.g. the last MuxDoneGuard, or
+        // abort()) between a load and a plain store would otherwise be clobbered
+        // back to PAUSE, stranding a demuxer whose only release was that terminal
+        // status. The CAS only transitions from RUN and never overwrites a
+        // stopping (or already-paused) state.
+        let _ = self.status.compare_exchange(
+            STATUS_RUN,
+            STATUS_PAUSE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
         self.into_state()
     }
 
@@ -773,8 +782,19 @@ impl FfmpegScheduler<Paused> {
     /// # Returns
     /// A new [`FfmpegScheduler<Running>`] representing the resumed job.
     pub fn resume(self) -> FfmpegScheduler<Running> {
-        if !is_stopping(self.status.load(Ordering::Acquire)) {
-            self.status.store(STATUS_RUN, Ordering::Release);
+        // CAS PAUSE->RUN (see pause()): never resurrect RUN from a terminal
+        // STATUS_END/STATUS_ABORT that raced in while paused. Only wake workers
+        // when this actually transitioned out of PAUSE.
+        if self
+            .status
+            .compare_exchange(
+                STATUS_PAUSE,
+                STATUS_RUN,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
             // Wake workers parked in wait_until_not_paused so they resume
             // immediately instead of after the safety-net timeout (conc-06).
             notify_pause_waiters();
