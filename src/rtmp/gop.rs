@@ -176,6 +176,7 @@ impl Gops {
     }
 
     /// Whether GOP caching is enabled
+    #[cfg_attr(not(test), allow(dead_code))] // predicate exercised by unit tests
     pub fn is_enabled(&self) -> bool {
         self.max_gops > 0
     }

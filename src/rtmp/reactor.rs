@@ -285,6 +285,7 @@ impl ReactorConnection {
     }
 
     /// Is timed out
+    #[cfg_attr(not(test), allow(dead_code))] // predicate exercised by unit tests
     pub fn is_timed_out(&self, timeout: Duration) -> bool {
         self.is_timed_out_at(Instant::now(), timeout)
     }
@@ -627,6 +628,7 @@ pub struct Reactor {
 }
 
 // Status constants
+#[cfg_attr(not(test), allow(dead_code))] // running state is set via the scheduler-owned status; referenced here only by tests
 const STATUS_RUN: usize = 1;
 const STATUS_END: usize = 2;
 
