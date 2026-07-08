@@ -14,13 +14,13 @@
 //! tests run wherever FFmpeg's `lavfi`, `mpeg4` and `aac` are available.
 
 use ez_ffmpeg::stream_info::{find_audio_stream_info, find_video_stream_info, StreamInfo};
-use ez_ffmpeg::{FfmpegContext, FfmpegScheduler, Input, Output};
-use std::time::Duration;
+use ez_ffmpeg::{FfmpegContext, Input, Output};
+
+mod common;
+use common::{tmp_path_in, wait_with_watchdog};
 
 fn tmp_path(name: &str) -> String {
-    let dir = std::env::temp_dir().join(format!("ez_ffmpeg_shortest_tests_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir.join(name).to_string_lossy().into_owned()
+    tmp_path_in("ez_ffmpeg_shortest_tests", name)
 }
 
 /// An infinite lavfi video source (30 fps): `-shortest` must stop it.
@@ -39,27 +39,6 @@ fn lavfi_audio_secs(secs: u32) -> Input {
         "sine=frequency=440:duration={secs}:sample_rate=44100"
     ))
     .set_format("lavfi")
-}
-
-/// A hang is a test failure, not a suite timeout.
-fn wait_with_watchdog(
-    scheduler: FfmpegScheduler<ez_ffmpeg::core::scheduler::ffmpeg_scheduler::Running>,
-    secs: u64,
-    scenario: &str,
-) -> ez_ffmpeg::error::Result<()> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(scheduler.wait());
-    });
-    match rx.recv_timeout(Duration::from_secs(secs)) {
-        Ok(result) => result,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            panic!("scenario `{scenario}` did not finish within {secs}s (hang)")
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            panic!("scenario `{scenario}`: wait() thread panicked before reporting")
-        }
-    }
 }
 
 fn video_nb_frames(url: &str) -> i64 {
