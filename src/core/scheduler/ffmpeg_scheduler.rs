@@ -324,14 +324,14 @@ impl FfmpegScheduler<Initialization> {
                 // each encoded audio/video stream. The output index resolves this
                 // stream's `source_finished` flag below; collected before the
                 // mutable borrow that attaches the handles.
-                let av: Vec<(usize, usize)> = mux
+                let av: Vec<_> = mux
                     .get_streams()
                     .iter()
                     .enumerate()
                     .filter(|(_, s)| {
                         s.codec_type == AVMEDIA_TYPE_VIDEO || s.codec_type == AVMEDIA_TYPE_AUDIO
                     })
-                    .map(|(i, s)| (i, s.stream_index))
+                    .map(|(i, s)| (i, s.stream_index, s.codec_type))
                     .collect();
                 if av.len() >= 2 {
                     let mut sq = SyncQueue::new(buf_us);
@@ -340,10 +340,27 @@ impl FfmpegScheduler<Initialization> {
                     // each stream's sq_idx; the balancer flag (`SchNode::MuxStream`)
                     // lets a finished producer leave the input balancer before
                     // draining (fftools send_to_enc_sq, ffmpeg_sched.c:1929).
+                    // A per-stream frame cap (-frames:v/a) is wired into the sync
+                    // queue as frames_max so `-shortest` + set_max_{video,audio}_frames
+                    // still bounds this stream (fftools sch_sq_add_enc ->
+                    // sq_limit_frames). Without it the cap is silently ignored while
+                    // sq_enc is active (the enc_task max-frames check only runs on
+                    // the non-sync-queue path).
                     let members: Vec<(usize, usize, Option<Arc<AtomicBool>>)> = av
                         .iter()
-                        .map(|&(pos, osi)| {
-                            (pos, sq.add_stream(true), mux.stream_source_finished(osi))
+                        .map(|&(pos, osi, ct)| {
+                            let sq_idx = sq.add_stream(true);
+                            let max_frames = if ct == AVMEDIA_TYPE_VIDEO {
+                                mux.max_video_frames
+                            } else {
+                                mux.max_audio_frames
+                            };
+                            if let Some(max_frames) = max_frames {
+                                if max_frames >= 0 {
+                                    sq.sq_limit_frames(sq_idx, max_frames as u64);
+                                }
+                            }
+                            (pos, sq_idx, mux.stream_source_finished(osi))
                         })
                         .collect();
                     let sq_finished: Arc<[AtomicBool]> =
