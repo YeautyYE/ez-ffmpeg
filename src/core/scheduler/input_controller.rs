@@ -245,6 +245,22 @@ mod tests {
         }
     }
 
+    fn finish(mux_stream: &Arc<SchNode>) {
+        match mux_stream.as_ref() {
+            SchNode::MuxStream {
+                source_finished, ..
+            } => source_finished.store(true, Ordering::Release),
+            _ => unreachable!("expected a mux stream node"),
+        }
+    }
+
+    fn mark_exited(demux: &Arc<SchNode>) {
+        match demux.as_ref() {
+            SchNode::Demux { task_exited, .. } => task_exited.store(true, Ordering::Release),
+            _ => unreachable!("expected a demux node"),
+        }
+    }
+
     // PERF-6: a single-input job cannot balance, so update_locked must be a
     // no-op and never choke the lone demuxer.
     #[test]
@@ -284,6 +300,93 @@ mod tests {
         assert!(
             waiter_of(&ahead).get_choked(),
             "a source far ahead of the trailing stream must be choked"
+        );
+    }
+
+    // Scheduler-deadlock regression (multi-input trim+concat completing while a
+    // late input is still choked). Once every output stream has finished, the
+    // balancing fallback MUST release EVERY still-choked demuxer in one pass.
+    // 0.11.0 unchoked a single demuxer then `break`, stranding the rest: the
+    // choked demuxers were the only non-exited workers, so STATUS_END (published
+    // only when the worker count hits zero) never fired and
+    // `FfmpegScheduler::wait()` hung forever. The choked demuxer's ONLY other
+    // exit edge is being unchoked — this pass is that edge.
+    #[test]
+    fn all_sources_finished_unchokes_every_live_demuxer() {
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let d0 = demux_node();
+        let d1 = demux_node();
+        let d2 = demux_node();
+        let gone = demux_node();
+        for d in [&d0, &d1, &d2, &gone] {
+            waiter_of(d).set(true); // all choked mid-run
+        }
+        // `gone` has already exited: the fallback must skip it (never notify a
+        // dead worker) and leave its state untouched.
+        mark_exited(&gone);
+
+        // One output stream, already finished — the concat/muxer hit EOF.
+        let m = mux_stream(d0.clone(), 1_000);
+        finish(&m);
+
+        let ctrl = InputController::new(
+            vec![d0.clone(), d1.clone(), d2.clone(), gone.clone()],
+            vec![m],
+        );
+        ctrl.update_locked(&status);
+
+        for d in [&d0, &d1, &d2] {
+            assert!(
+                !waiter_of(d).get_choked(),
+                "every LIVE demuxer must be unchoked once all sources finished"
+            );
+        }
+        assert!(
+            waiter_of(&gone).get_choked(),
+            "an already-exited demuxer must be left untouched"
+        );
+    }
+
+    // Liveness form of the same regression at the SchWaiter boundary: a demuxer
+    // actually parked in `wait_with_scheduler_status` (choked, undelivered tail
+    // packets) while the scheduler is still RUNNING (no STATUS_END, because it is
+    // itself a non-exited worker) must be released by the muxer's
+    // last-stream-finished `update_locked` alone — via the unchoke edge, without
+    // any terminal status flip.
+    #[test]
+    fn parked_choked_demuxer_released_when_all_sources_finish() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let parked = demux_node();
+        let peer = demux_node(); // second input so balancing runs (not PERF-6 short-circuited)
+        waiter_of(&parked).set(true); // choked with work still to deliver
+
+        let (tx, rx) = mpsc::channel();
+        let w = waiter_of(&parked);
+        let st = Arc::clone(&status);
+        thread::spawn(move || {
+            w.wait_with_scheduler_status(&st, false);
+            let _ = tx.send(());
+        });
+
+        // Still parked while the job runs and the output has not finished.
+        thread::sleep(Duration::from_millis(150));
+        assert!(
+            rx.try_recv().is_err(),
+            "the demuxer must stay parked while the scheduler runs"
+        );
+
+        // Muxer's last stream hits EOF -> source_finished -> update_locked.
+        let m = mux_stream(peer.clone(), 0);
+        finish(&m);
+        let ctrl = InputController::new(vec![parked.clone(), peer.clone()], vec![m]);
+        ctrl.update_locked(&status);
+
+        rx.recv_timeout(Duration::from_secs(2)).expect(
+            "a choked demuxer must be released once all sources finished (no STATUS_END needed)",
         );
     }
 }
