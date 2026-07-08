@@ -32,10 +32,11 @@
 //! deliberately no drop-on-finish path (matches `finish_stream`, which only sets
 //! flags); memory is bounded by the cascade-stop + heartbeat, not by dropping.
 
-// The engine's public surface is exercised by the unit tests below and is wired
-// into the encoder / mux workers by the integration pass; until then the
-// cross-module call sites do not exist yet.
-#![allow(dead_code)]
+// The engine is wired into the encoder / mux workers (ffmpeg_scheduler, muxer,
+// enc_task, mux_task, encoder_stream) and exercised by the unit tests below.
+// A handful of engine methods are kept for API symmetry with fftools but are
+// not yet called; those are marked individually so the compiler still flags any
+// genuinely dead code instead of the whole file being silenced.
 
 use ffmpeg_sys_next::{av_compare_ts, av_rescale_q, AVRational, AV_NOPTS_VALUE, AV_TIME_BASE_Q};
 use std::collections::VecDeque;
@@ -366,7 +367,11 @@ impl<T> SyncQueue<T> {
         advanced
     }
 
-    /// Whether every stream is finished (mirrors `sq->finished`).
+    /// Whether every stream is finished (mirrors `sq->finished`). A test-facing
+    /// accessor kept for fftools symmetry: exercised by the unit tests below, but
+    /// the workers read `finished` through the cascade, so it has no production
+    /// caller (hence the non-test allow).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn is_finished(&self) -> bool {
         self.finished
     }
