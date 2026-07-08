@@ -1451,7 +1451,12 @@ unsafe fn drain_bsf_write(
         } else if ret == AVERROR_EOF {
             return BsfDrain::Flushed;
         } else if ret < 0 {
-            return BsfDrain::Err(ret);
+            // A receive error skips this packet's remaining BSF output and continues,
+            // matching FFmpeg's default (ffmpeg_mux.c logs and continues unless
+            // exit_on_error). Only send_packet / write_packet / muxer errors are
+            // fatal. Returning Exhausted (not Err) avoids aborting the whole muxer.
+            error!("Error receiving a packet from a bitstream filter (skipping): ret={ret}");
+            return BsfDrain::Exhausted;
         }
 
         // Move the filtered packet into a pooled shell so it flows through the
