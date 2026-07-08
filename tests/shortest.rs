@@ -231,3 +231,41 @@ fn without_shortest_streams_keep_their_own_length() {
         "without -shortest the 4s video must keep ~120 frames, got {frames}"
     );
 }
+
+/// `-shortest` + `set_max_video_frames(N)` must still bound the output. Two INFINITE
+/// videos have no natural end, so the per-stream frame cap is the ONLY terminator.
+/// The cap is wired into the sync queue (`sq_enc` -> `sq_limit_frames`), so both are
+/// cut at ~N frames and the job ends. Before the cap was wired, `set_max_*_frames`
+/// was silently ignored whenever `sq_enc` was active, so this job ran forever — a
+/// hang the watchdog turns into a failure.
+#[test]
+fn shortest_with_max_frames_bounds_infinite_streams() {
+    let out = tmp_path("shortest_max_frames.mp4");
+    let scheduler = FfmpegContext::builder()
+        .input(lavfi_video_infinite())
+        .input(lavfi_video_infinite())
+        .output(
+            Output::from(out.as_str())
+                .add_stream_map("0:v")
+                .add_stream_map("1:v")
+                .set_video_codec("mpeg4")
+                .set_shortest(true)
+                .set_max_video_frames(30),
+        )
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let result = wait_with_watchdog(scheduler, 60, "shortest + max_video_frames bounds infinite streams");
+    assert!(result.is_ok(), "-shortest + max_frames job failed: {result:?}");
+
+    // Both infinite videos are capped at 30 frames. A bounded count (not thousands)
+    // proves the cap took effect; termination at all proves neither infinite source
+    // ran away.
+    let frames = video_nb_frames(&out);
+    assert!(
+        (20..=45).contains(&frames),
+        "video should be capped near 30 frames, got {frames}"
+    );
+}

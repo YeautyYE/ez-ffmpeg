@@ -337,6 +337,12 @@ impl<T> SyncQueue<T> {
 
         // Signal a fake timestamp for every stream that prevents tail_ts's release.
         tail_ts += 1;
+        // Report whether we actually fake-advanced at least one stream. The C
+        // `overflow_heartbeat` returns 1 unconditionally, but fftools retries the
+        // receive-any scan only once; ez's `drain_all_releasable` loops on this
+        // return, so a heartbeat that skips every stream (all == sidx / finished /
+        // already ahead of tail_ts) must report `false` or the drain spins forever.
+        let mut advanced = false;
         for i in 0..self.streams.len() {
             if i == sidx || self.streams[i].finished {
                 continue;
@@ -351,9 +357,10 @@ impl<T> SyncQueue<T> {
                 ts = ts.max(hts + 1);
             }
             self.stream_update_ts(i, ts);
+            advanced = true;
         }
 
-        true
+        advanced
     }
 
     /// Whether every stream is finished (mirrors `sq->finished`).
