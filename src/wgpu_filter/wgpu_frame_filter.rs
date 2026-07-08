@@ -2,7 +2,7 @@
 //! in-flight output queue that overlaps GPU work with CPU work.
 
 use crate::core::filter::frame_filter_context::FrameFilterContext;
-use crate::filter::frame_filter::FrameFilter;
+use crate::filter::frame_filter::{FrameFilter, FrameFilterError};
 use crate::util::frame_utils::{ensure_software_format, is_hw_format};
 use crate::wgpu_filter::frame_io::{self, HwMappedFrame, PlaneLayout};
 use crate::wgpu_filter::gpu_state::{create_staging, GpuState, OutputGeometry, StagingSlot};
@@ -394,7 +394,7 @@ impl WgpuFrameFilter {
 
     /// Pops the next output frame if one is (or can be made) available while
     /// respecting arrival order.
-    fn next_output(&mut self, block: bool) -> Result<Option<Frame>, String> {
+    fn next_output(&mut self, block: bool) -> Result<Option<Frame>, FrameFilterError> {
         loop {
             match self.pending.front() {
                 None => return Ok(None),
@@ -487,7 +487,7 @@ impl FrameFilter for WgpuFrameFilter {
         AVMediaType::AVMEDIA_TYPE_VIDEO
     }
 
-    fn init(&mut self, _ctx: &FrameFilterContext) -> Result<(), String> {
+    fn init(&mut self, _ctx: &FrameFilterContext) -> Result<(), FrameFilterError> {
         let gpu = GpuState::new(
             &self.fragment_shader,
             self.params.len,
@@ -501,7 +501,7 @@ impl FrameFilter for WgpuFrameFilter {
         &mut self,
         frame: Frame,
         _ctx: &FrameFilterContext,
-    ) -> Result<Option<Frame>, String> {
+    ) -> Result<Option<Frame>, FrameFilterError> {
         // SAFETY: probing only reads pointers/scalars of a live frame.
         // `buf[0]` is the marker signature used across the scheduler
         // (dec_task, send_frame): props-only frames carry no buffer refs.
@@ -594,7 +594,8 @@ impl FrameFilter for WgpuFrameFilter {
                 "Frame size {in_w}x{in_h} (output {out_w}x{out_h}) exceeds the device's \
                  maximum texture dimension of {max_dim}; downscale first, e.g. insert \
                  `scale` in filter_desc before this pipeline"
-            ));
+            )
+            .into());
         }
         gpu.ensure_resources(in_w, in_h, layout, self.output_size, self.frames_in_flight);
 
@@ -624,7 +625,7 @@ impl FrameFilter for WgpuFrameFilter {
                     return Err(
                         "WgpuFrameFilter internal error: staging pool exhausted with no \
                          in-flight frames"
-                            .to_string(),
+                            .into(),
                     );
                 }
                 self.complete_oldest_gpu(true)?;
@@ -680,7 +681,7 @@ impl FrameFilter for WgpuFrameFilter {
                 if let Some(res) = self.gpu.as_mut().and_then(|g| g.resources.as_mut()) {
                     res.staging_pool.push(staging);
                 }
-                return Err(e);
+                return Err(e.into());
             }
         };
         if let Ok(mut stats) = self.stats.lock() {
@@ -702,7 +703,10 @@ impl FrameFilter for WgpuFrameFilter {
         self.next_output(block)
     }
 
-    fn request_frame(&mut self, _ctx: &FrameFilterContext) -> Result<Option<Frame>, String> {
+    fn request_frame(
+        &mut self,
+        _ctx: &FrameFilterContext,
+    ) -> Result<Option<Frame>, FrameFilterError> {
         self.next_output(false)
     }
 

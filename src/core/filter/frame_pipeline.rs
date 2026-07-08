@@ -1,4 +1,4 @@
-use crate::core::filter::frame_filter::{FrameFilter, RequestFrameMode};
+use crate::core::filter::frame_filter::{FrameFilter, FrameFilterError, RequestFrameMode};
 use crate::core::filter::frame_filter_context::FrameFilterContext;
 use crate::filter::frame_pipeline_builder::FramePipelineBuilder;
 use ffmpeg_sys_next::AVMediaType;
@@ -64,7 +64,7 @@ impl FramePipeline {
     }
 
     /// Initializes all filters in order.
-    pub(crate) fn init_filters(&mut self) -> Result<(), String> {
+    pub(crate) fn init_filters(&mut self) -> Result<(), FrameFilterError> {
         for holder in &mut self.filters {
             let ctx = FrameFilterContext::new(&holder.name, &mut self.attribute_map);
             holder.filter.init(&ctx)?;
@@ -86,7 +86,7 @@ impl FramePipeline {
     pub(crate) fn run_filters(
         &mut self,
         mut frame: ffmpeg_next::Frame,
-    ) -> Result<Option<ffmpeg_next::Frame>, String> {
+    ) -> Result<Option<ffmpeg_next::Frame>, FrameFilterError> {
         for holder in &mut self.filters {
             let ctx = FrameFilterContext::new(&holder.name, &mut self.attribute_map);
             match holder.filter.filter_frame(frame, &ctx)? {
@@ -124,7 +124,7 @@ impl FramePipeline {
     pub(crate) fn request_frame(
         &mut self,
         index: usize,
-    ) -> Result<Option<ffmpeg_next::Frame>, String> {
+    ) -> Result<Option<ffmpeg_next::Frame>, FrameFilterError> {
         assert!(index < self.filters.len());
         let holder = &mut self.filters[index];
         let ctx = FrameFilterContext::new(&holder.name, &mut self.attribute_map);
@@ -144,12 +144,12 @@ impl FramePipeline {
     /// # Returns
     /// - `Ok(Some(frame))` if the frame is successfully processed by all remaining filters.
     /// - `Ok(None)` if any filter discards the frame by returning `None`.
-    /// - `Err(String)` if an error occurs in any filter.
+    /// - `Err(e)` (a boxed [`FrameFilterError`]) if an error occurs in any filter.
     pub(crate) fn run_filters_from(
         &mut self,
         start_index: usize,
         mut frame: ffmpeg_next::Frame,
-    ) -> Result<Option<ffmpeg_next::Frame>, String> {
+    ) -> Result<Option<ffmpeg_next::Frame>, FrameFilterError> {
         // If start_index is out of bounds, we can either return an error
         // or treat it as "no filters to run." Here we choose to check bounds explicitly.
         if start_index >= self.filters.len() {

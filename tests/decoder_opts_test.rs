@@ -13,7 +13,7 @@
 //! - An out-of-range `set_find_stream_info_codec_opt` stream index fails at
 //!   build time with an error instead of probing garbage.
 
-use ez_ffmpeg::filter::frame_filter::FrameFilter;
+use ez_ffmpeg::filter::frame_filter::{FrameFilter, FrameFilterError};
 use ez_ffmpeg::filter::frame_filter_context::FrameFilterContext;
 use ez_ffmpeg::filter::frame_pipeline_builder::FramePipelineBuilder;
 use ez_ffmpeg::stream_info::{find_video_stream_info, StreamInfo};
@@ -130,7 +130,7 @@ impl FrameFilter for FrameCounter {
         &mut self,
         frame: Frame,
         _ctx: &FrameFilterContext,
-    ) -> Result<Option<Frame>, String> {
+    ) -> Result<Option<Frame>, FrameFilterError> {
         unsafe {
             if !frame.as_ptr().is_null() && !frame.is_empty() {
                 self.count.fetch_add(1, Ordering::SeqCst);

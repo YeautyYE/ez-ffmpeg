@@ -1,4 +1,4 @@
-use ez_ffmpeg::filter::frame_filter::FrameFilter;
+use ez_ffmpeg::filter::frame_filter::{FrameFilter, FrameFilterError};
 use ez_ffmpeg::filter::frame_filter_context::FrameFilterContext;
 use ez_ffmpeg::util::ffmpeg_utils::av_err2str;
 use ffmpeg_next::Frame;
@@ -122,7 +122,7 @@ impl FrameFilter for Tile2x2Filter {
         AVMediaType::AVMEDIA_TYPE_VIDEO
     }
 
-    fn init(&mut self, ctx: &FrameFilterContext) -> Result<(), String> {
+    fn init(&mut self, ctx: &FrameFilterContext) -> Result<(), FrameFilterError> {
         log::info!("Initializing Tile2x2Filter: {}", ctx.name());
         log::info!("This filter creates a 2x2 tiled output (doubles width and height)");
         log::info!("Requirements: YUV420P format, even dimensions");
@@ -133,7 +133,7 @@ impl FrameFilter for Tile2x2Filter {
         &mut self,
         frame: Frame,
         _ctx: &FrameFilterContext,
-    ) -> Result<Option<Frame>, String> {
+    ) -> Result<Option<Frame>, FrameFilterError> {
         unsafe {
             // If frame is null or empty, return it as-is (this can happen at end of stream)
             if frame.as_ptr().is_null() || frame.is_empty() {
@@ -159,7 +159,7 @@ impl FrameFilter for Tile2x2Filter {
             // Create output frame with doubled dimensions
             let mut output_frame = Frame::empty();
             if output_frame.as_ptr().is_null() {
-                return Err("Failed to create output frame: Out of memory".to_string());
+                return Err("Failed to create output frame: Out of memory".into());
             }
 
             // Set output frame properties
@@ -173,16 +173,14 @@ impl FrameFilter for Tile2x2Filter {
                 return Err(format!(
                     "Failed to allocate buffer for output frame: {}",
                     av_err2str(ret)
-                ));
+                )
+                .into());
             }
 
             // Copy frame properties (pts, time_base, color info, etc.)
             let ret = av_frame_copy_props(output_frame.as_mut_ptr(), frame.as_ptr());
             if ret < 0 {
-                return Err(format!(
-                    "Failed to copy frame properties: {}",
-                    av_err2str(ret)
-                ));
+                return Err(format!("Failed to copy frame properties: {}", av_err2str(ret)).into());
             }
 
             // Process each plane separately

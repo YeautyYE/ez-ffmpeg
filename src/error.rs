@@ -91,13 +91,13 @@ pub enum Error {
 
     // ---- Frame Filter ----
     #[error("Frame filter init failed: {0}")]
-    FrameFilterInit(String),
+    FrameFilterInit(Box<dyn std::error::Error + Send + Sync>),
 
     #[error("Frame filter process failed: {0}")]
-    FrameFilterProcess(String),
+    FrameFilterProcess(Box<dyn std::error::Error + Send + Sync>),
 
     #[error("Frame filter request failed: {0}")]
-    FrameFilterRequest(String),
+    FrameFilterRequest(Box<dyn std::error::Error + Send + Sync>),
 
     #[error("No {0} stream of the type:{1} were found while build frame pipeline")]
     FrameFilterTypeNoMatched(String, String),
