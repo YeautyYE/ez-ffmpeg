@@ -31,7 +31,7 @@ The transcoding pipeline is ported from the FFmpeg CLI sources (`fftools/ffmpeg`
 
 Bitstream filters (`-bsf:v/-bsf:a/-bsf:s`) are supported via `Output::set_video_bsf` / `set_audio_bsf` / `set_subtitle_bsf` (single filter or comma-separated chain, e.g. `h264_mp4toannexb`).
 
-Not every CLI feature is implemented. Notable gaps (unsupported paths fail with explicit errors): progress/stats reporting (`-progress`), sub2video, `-shortest` cross-stream sync, keyframe forcing (`-force_key_frames`), `-fix_sub_duration`, two-pass encoding, and attachments.
+Not every CLI feature is implemented. Notable gaps (unsupported paths fail with explicit errors): progress/stats reporting (`-progress`), sub2video, `-fix_sub_duration`, and two-pass encoding.
 
 ## Version Requirements
 

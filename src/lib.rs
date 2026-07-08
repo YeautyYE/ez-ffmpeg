@@ -127,10 +127,8 @@
 //!
 //! Not every CLI feature is implemented. Notable gaps: progress/stats
 //! reporting (`-progress`), sub2video (rendering bitmap subtitles into
-//! video), `-shortest` cross-stream sync, keyframe forcing
-//! (`-force_key_frames`), `-fix_sub_duration`, two-pass encoding, and
-//! attachments. Unsupported paths fail with explicit errors rather than
-//! approximations.
+//! video), `-fix_sub_duration`, and two-pass encoding. Unsupported paths
+//! fail with explicit errors rather than approximations.
 //!
 //! ## Logging
 //!

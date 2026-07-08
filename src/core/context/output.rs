@@ -1038,13 +1038,17 @@ impl Output {
     /// window (see [`set_shortest_buf_duration_us`](Self::set_shortest_buf_duration_us),
     /// default 10 s). Default: `false`.
     ///
-    /// # Limitation
-    /// With three or more encoded output streams, a cut stream fed by an input
-    /// whose read cannot be interrupted mid-packet — a pipe, a custom IO source,
-    /// a live device, or a readrate-limited (`-re`) input — may keep that
-    /// demuxer alive until its in-flight read returns, delaying termination.
-    /// Ordinary seekable file and network inputs, and the common one/two-stream
-    /// cases, are unaffected.
+    /// # Limitations
+    /// Any cut stream fed by an input whose read cannot be interrupted mid-packet —
+    /// a pipe, a custom IO source, a live device, or a readrate-limited (`-re`)
+    /// input — may keep that demuxer alive until its in-flight read returns,
+    /// delaying termination. Ordinary seekable file and network inputs are
+    /// unaffected, as is a single encoded stream (there is nothing to cut it against).
+    ///
+    /// When a cut stream also has an output bitstream filter that reorders, buffers,
+    /// or rewrites packet timestamps (e.g. `setts`, `pgs_frame_merge`), the
+    /// packet-level cut is decided on the pre-filter timestamps. Timestamp-preserving
+    /// 1:1 filters (`h264_mp4toannexb`, `aac_adtstoasc`, metadata filters) are unaffected.
     ///
     /// # Example
     /// ```rust,ignore
