@@ -30,6 +30,13 @@ impl log::Log for Recorder {
             if msg.contains("too many threads/slices") {
                 return;
             }
+            // Benign, platform-dependent swscale notice: FFmpeg builds without
+            // a SIMD yuv420p->rgb24 path (e.g. some macOS builds) log this once
+            // per slice thread and fall back to the C converter. Machine/build-
+            // dependent, not the kind of "false error" this net guards against.
+            if msg.contains("No accelerated colorspace conversion") {
+                return;
+            }
             self.entries
                 .lock()
                 .unwrap()
