@@ -489,6 +489,30 @@ fn _mux_init(
 
         let mut nb_done = 0;
 
+        // Bundle the stable muxer config and the mutable per-stream state threaded
+        // through the sync-queue mux path. `cfg` holds SHARED refs, so the loop
+        // below still uses `packet_pool` / `scheduler_status` / `mux_stream_nodes`
+        // / `input_controller` / `out_fmt_ctx` directly; `state` holds the
+        // exclusive refs, so every direct access to those five arrays goes through
+        // `state`.
+        let cfg = MuxWriteCfg {
+            has_bsf,
+            oformat_flags,
+            stream_count,
+            out_fmt_ctx: &out_fmt_ctx,
+            packet_pool: &packet_pool,
+            mux_stream_nodes: &mux_stream_nodes,
+            input_controller: &input_controller,
+            scheduler_status: &scheduler_status,
+        };
+        let mut state = MuxWriteState {
+            stream_pkt_templates: &mut stream_pkt_templates,
+            st_rescale_delta_last: &mut st_rescale_delta_last,
+            st_last_dts: &mut st_last_dts,
+            stream_eof: &mut stream_eof,
+            nb_done: &mut nb_done,
+        };
+
         let mut ret = 0;
 
         if let Some(mut sq) = sq_mux {
@@ -515,20 +539,9 @@ fn _mux_init(
                     if let Err(e) = unsafe {
                         sq_finish_output_stream(
                             i,
-                            stream_count,
-                            &mut stream_eof,
-                            &mut nb_done,
-                            has_bsf,
+                            &cfg,
+                            &mut state,
                             &mut stream_bsfs,
-                            &stream_pkt_templates,
-                            &mut st_rescale_delta_last,
-                            &mut st_last_dts,
-                            oformat_flags,
-                            &out_fmt_ctx,
-                            &mux_stream_nodes,
-                            &input_controller,
-                            &scheduler_status,
-                            &packet_pool,
                         )
                     } {
                         ret = e;
@@ -536,7 +549,7 @@ fn _mux_init(
                 }
             }
 
-            while nb_done < stream_count && ret >= 0 {
+            while *state.nb_done < stream_count && ret >= 0 {
                 let result = pkt_receiver.recv_timeout(Duration::from_millis(100));
 
                 if is_stopping(wait_until_not_paused(&scheduler_status)) {
@@ -554,12 +567,7 @@ fn _mux_init(
                         // Idle tick: fire the sync-queue heartbeat so a live-but-
                         // stalled laggard cannot pin releasable followers forever.
                         match sq_mux_pump(
-                            &mut sq, &mut released, &mut nf, stream_count,
-                            &mut stream_eof, &mut nb_done, has_bsf, &mut stream_bsfs,
-                            &mut stream_pkt_templates, &mut st_rescale_delta_last,
-                            &mut st_last_dts, oformat_flags, &out_fmt_ctx,
-                            &mux_stream_nodes, &input_controller, &scheduler_status,
-                            &packet_pool,
+                            &mut sq, &mut released, &mut nf, &cfg, &mut state, &mut stream_bsfs,
                         ) {
                             Ok(true) => break,
                             Ok(false) => continue,
@@ -584,12 +592,7 @@ fn _mux_init(
                         }
                     }
                     match sq_mux_pump(
-                        &mut sq, &mut released, &mut nf, stream_count,
-                        &mut stream_eof, &mut nb_done, has_bsf, &mut stream_bsfs,
-                        &mut stream_pkt_templates, &mut st_rescale_delta_last,
-                        &mut st_last_dts, oformat_flags, &out_fmt_ctx,
-                        &mux_stream_nodes, &input_controller, &scheduler_status,
-                        &packet_pool,
+                        &mut sq, &mut released, &mut nf, &cfg, &mut state, &mut stream_bsfs,
                     ) {
                         Ok(true) => break,
                         Ok(false) => continue,
@@ -618,18 +621,13 @@ fn _mux_init(
                         break;
                     }
                     packet_pool.release(packet_box.packet);
-                    if !stream_eof[stream_index] {
+                    if !state.stream_eof[stream_index] {
                         if let Some(Some(sq_i)) = sq.sq_idx.get(stream_index).copied() {
                             sq.queue.send(sq_i, None, None, fin_tb, 0);
                         }
                     }
                     match sq_mux_pump(
-                        &mut sq, &mut released, &mut nf, stream_count,
-                        &mut stream_eof, &mut nb_done, has_bsf, &mut stream_bsfs,
-                        &mut stream_pkt_templates, &mut st_rescale_delta_last,
-                        &mut st_last_dts, oformat_flags, &out_fmt_ctx,
-                        &mux_stream_nodes, &input_controller, &scheduler_status,
-                        &packet_pool,
+                        &mut sq, &mut released, &mut nf, &cfg, &mut state, &mut stream_bsfs,
                     ) {
                         Ok(true) => break,
                         Ok(false) => continue,
@@ -642,7 +640,7 @@ fn _mux_init(
                 }
 
                 // Already truncated: drop further packets for this stream.
-                if stream_eof[stream_index] {
+                if state.stream_eof[stream_index] {
                     packet_pool.release(packet_box.packet);
                     continue;
                 }
@@ -654,10 +652,7 @@ fn _mux_init(
                     None => {
                         let wret = unsafe {
                             mux_write_released(
-                                &mut packet_box, has_bsf, &mut stream_bsfs,
-                                &mut stream_pkt_templates, &mut st_rescale_delta_last,
-                                &mut st_last_dts, oformat_flags, &out_fmt_ctx,
-                                &packet_pool,
+                                &mut packet_box, &cfg, &mut state, &mut stream_bsfs,
                             )
                         };
                         packet_pool.release(packet_box.packet);
@@ -687,12 +682,7 @@ fn _mux_init(
                         packet_pool.release(packet_box.packet);
                         sq.queue.send(sq_i, None, None, fin_tb, 0);
                         match sq_mux_pump(
-                            &mut sq, &mut released, &mut nf, stream_count,
-                            &mut stream_eof, &mut nb_done, has_bsf, &mut stream_bsfs,
-                            &mut stream_pkt_templates, &mut st_rescale_delta_last,
-                            &mut st_last_dts, oformat_flags, &out_fmt_ctx,
-                            &mux_stream_nodes, &input_controller, &scheduler_status,
-                            &packet_pool,
+                            &mut sq, &mut released, &mut nf, &cfg, &mut state, &mut stream_bsfs,
                         ) {
                             Ok(true) => break,
                             Ok(false) => continue,
@@ -706,12 +696,7 @@ fn _mux_init(
                     unsafe { sq_pkt_end(packet_box.packet.as_ptr()) };
                 sq.queue.send(sq_i, Some(packet_box), end_ts, tb, nb_samples);
                 match sq_mux_pump(
-                    &mut sq, &mut released, &mut nf, stream_count,
-                    &mut stream_eof, &mut nb_done, has_bsf, &mut stream_bsfs,
-                    &mut stream_pkt_templates, &mut st_rescale_delta_last,
-                    &mut st_last_dts, oformat_flags, &out_fmt_ctx,
-                    &mux_stream_nodes, &input_controller, &scheduler_status,
-                    &packet_pool,
+                    &mut sq, &mut released, &mut nf, &cfg, &mut state, &mut stream_bsfs,
                 ) {
                     Ok(true) => break,
                     Ok(false) => {}
@@ -750,20 +735,16 @@ fn _mux_init(
                 let eof_stream = packet_box.packet_data.output_stream_index;
                 if eof_stream >= 0 {
                     let eof_idx = eof_stream as usize;
-                    if eof_idx < stream_count && !stream_eof[eof_idx] {
+                    if eof_idx < stream_count && !state.stream_eof[eof_idx] {
                         // Flush trailing BSF packets before finishing this
                         // stream. Skipped entirely when no mux stream has a BSF.
                         if has_bsf {
                             let fret = unsafe {
                                 flush_stream_bsf(
-                                    &mut st_rescale_delta_last,
-                                    oformat_flags,
-                                    &mut st_last_dts,
-                                    &out_fmt_ctx,
+                                    &cfg,
+                                    &mut state,
                                     &mut stream_bsfs,
-                                    &stream_pkt_templates,
                                     eof_idx,
-                                    &packet_pool,
                                 )
                             };
                             if fret < 0 {
@@ -773,8 +754,8 @@ fn _mux_init(
                                 break;
                             }
                         }
-                        stream_eof[eof_idx] = true;
-                        nb_done += 1;
+                        state.stream_eof[eof_idx] = true;
+                        *state.nb_done += 1;
                         if eof_idx < mux_stream_nodes.len() {
                             let node = mux_stream_nodes[eof_idx].as_ref();
                             let SchNode::MuxStream { src: _, last_dts: _, source_finished } = node else { unreachable!() };
@@ -784,7 +765,7 @@ fn _mux_init(
                     }
                 }
                 packet_pool.release(packet_box.packet);
-                if nb_done == stream_count {
+                if *state.nb_done == stream_count {
                     trace!("All streams finished (demux EOF signal)");
                     break;
                 }
@@ -809,7 +790,7 @@ fn _mux_init(
                     }
 
                     // Guard: skip if this stream already finished via recording_time EOF
-                    if stream_eof[stream_index] {
+                    if state.stream_eof[stream_index] {
                         packet_pool.release(packet_box.packet);
                         continue;
                     }
@@ -819,14 +800,10 @@ fn _mux_init(
                     // inside `unsafe`.
                     if has_bsf {
                         let fret = flush_stream_bsf(
-                            &mut st_rescale_delta_last,
-                            oformat_flags,
-                            &mut st_last_dts,
-                            &out_fmt_ctx,
+                            &cfg,
+                            &mut state,
                             &mut stream_bsfs,
-                            &stream_pkt_templates,
                             stream_index,
-                            &packet_pool,
                         );
                         if fret < 0 {
                             ret = fret;
@@ -836,7 +813,7 @@ fn _mux_init(
                         }
                     }
 
-                    nb_done += 1;
+                    *state.nb_done += 1;
                     packet_pool.release(packet_box.packet);
 
                     let mux_stream_node = mux_stream_node.as_ref();
@@ -844,7 +821,7 @@ fn _mux_init(
                     source_finished.store(true, Ordering::Release);
                     input_controller.update_locked(&scheduler_status);
 
-                    if nb_done == stream_count {
+                    if *state.nb_done == stream_count {
                         trace!("All streams finished");
                         break;
                     } else {
@@ -855,7 +832,7 @@ fn _mux_init(
                 update_last_dts(mux_stream_node, &input_controller, &scheduler_status, pkt);
 
                 // Skip packets for streams that already hit recording_time EOF
-                if stream_eof[stream_index] {
+                if state.stream_eof[stream_index] {
                     packet_pool.release(packet_box.packet);
                     continue;
                 }
@@ -883,14 +860,10 @@ fn _mux_init(
                         // no mux stream has a BSF.
                         if has_bsf {
                             let fret = flush_stream_bsf(
-                                &mut st_rescale_delta_last,
-                                oformat_flags,
-                                &mut st_last_dts,
-                                &out_fmt_ctx,
+                                &cfg,
+                                &mut state,
                                 &mut stream_bsfs,
-                                &stream_pkt_templates,
                                 stream_index,
-                                &packet_pool,
                             );
                             if fret < 0 {
                                 ret = fret;
@@ -899,16 +872,16 @@ fn _mux_init(
                                 break;
                             }
                         }
-                        stream_eof[stream_index] = true;
+                        state.stream_eof[stream_index] = true;
                         packet_pool.release(packet_box.packet);
 
-                        nb_done += 1;
+                        *state.nb_done += 1;
                         let mux_stream_node = mux_stream_node.as_ref();
                         let SchNode::MuxStream { src: _, last_dts: _, source_finished } = mux_stream_node else { unreachable!() };
                         source_finished.store(true, Ordering::Release);
                         input_controller.update_locked(&scheduler_status);
 
-                        if nb_done == stream_count {
+                        if *state.nb_done == stream_count {
                             trace!("All streams finished (recording_time)");
                             break;
                         }
@@ -925,24 +898,19 @@ fn _mux_init(
                         // Snapshot this stream's packet metadata so a later EOF
                         // flush can stamp the BSF's trailing packets correctly.
                         if stream_bsfs[stream_index].is_some() {
-                            stream_pkt_templates[stream_index] =
+                            state.stream_pkt_templates[stream_index] =
                                 Some(packet_box.packet_data);
                         }
                         ret = mux_filter_and_write_packet(
-                            &mut st_rescale_delta_last,
-                            oformat_flags,
-                            &mut st_last_dts,
-                            &out_fmt_ctx,
+                            &cfg,
+                            &mut state,
                             &mut packet_box,
                             stream_bsfs[stream_index].as_mut(),
-                            &packet_pool,
                         );
                     } else {
                         ret = write_packet(
-                            &mut st_rescale_delta_last,
-                            oformat_flags,
-                            &mut st_last_dts,
-                            &out_fmt_ctx,
+                            &cfg,
+                            &mut state,
                             &mut packet_box,
                         );
                     }
@@ -1137,25 +1105,39 @@ unsafe fn streamcopy_rescale(
     0
 }
 
-unsafe fn write_packet(
-    st_rescale_delta_last: &mut [i64],
+/// Immutable muxer context shared by every write in the sync-queue mux path.
+/// Grouping the stable config that used to be threaded as separate params.
+struct MuxWriteCfg<'a> {
+    has_bsf: bool,
     oformat_flags: i32,
-    st_last_dts: &mut [i64],
-    out_fmt_ctx: &FormatContext,
+    stream_count: usize,
+    out_fmt_ctx: &'a FormatContext,
+    packet_pool: &'a ObjPool<Packet>,
+    mux_stream_nodes: &'a [Arc<SchNode>],
+    input_controller: &'a Arc<InputController>,
+    scheduler_status: &'a Arc<AtomicUsize>,
+}
+
+/// Mutable per-stream / progress state threaded through the sync-queue mux path.
+struct MuxWriteState<'a> {
+    stream_pkt_templates: &'a mut [Option<PacketData>],
+    st_rescale_delta_last: &'a mut [i64],
+    st_last_dts: &'a mut [i64],
+    stream_eof: &'a mut [bool],
+    nb_done: &'a mut usize,
+}
+
+unsafe fn write_packet(
+    cfg: &MuxWriteCfg,
+    state: &mut MuxWriteState,
     sq_packet_box: &mut PacketBox,
 ) -> i32 {
-    mux_fixup_ts(
-        st_rescale_delta_last,
-        oformat_flags,
-        st_last_dts,
-        sq_packet_box,
-        out_fmt_ctx.as_ptr(),
-    );
+    mux_fixup_ts(cfg, state, sq_packet_box);
 
     (*sq_packet_box.packet.as_mut_ptr()).stream_index =
         sq_packet_box.packet_data.output_stream_index;
 
-    av_interleaved_write_frame(out_fmt_ctx.as_ptr(), sq_packet_box.packet.as_mut_ptr())
+    av_interleaved_write_frame(cfg.out_fmt_ctx.as_ptr(), sq_packet_box.packet.as_mut_ptr())
 }
 
 /// Write one packet the `sq_mux` released, via the per-stream BSF (or the direct
@@ -1165,37 +1147,18 @@ unsafe fn write_packet(
 /// pool shell (the caller owns the released `PacketBox`).
 unsafe fn mux_write_released(
     packet_box: &mut PacketBox,
-    has_bsf: bool,
+    cfg: &MuxWriteCfg,
+    state: &mut MuxWriteState,
     stream_bsfs: &mut [Option<BitStreamFilter>],
-    stream_pkt_templates: &mut [Option<PacketData>],
-    st_rescale_delta_last: &mut [i64],
-    st_last_dts: &mut [i64],
-    oformat_flags: i32,
-    out_fmt_ctx: &FormatContext,
-    packet_pool: &ObjPool<Packet>,
 ) -> i32 {
     let stream_index = packet_box.packet_data.output_stream_index as usize;
-    if has_bsf {
+    if cfg.has_bsf {
         if stream_bsfs.get(stream_index).is_some_and(|b| b.is_some()) {
-            stream_pkt_templates[stream_index] = Some(packet_box.packet_data);
+            state.stream_pkt_templates[stream_index] = Some(packet_box.packet_data);
         }
-        mux_filter_and_write_packet(
-            st_rescale_delta_last,
-            oformat_flags,
-            st_last_dts,
-            out_fmt_ctx,
-            packet_box,
-            stream_bsfs[stream_index].as_mut(),
-            packet_pool,
-        )
+        mux_filter_and_write_packet(cfg, state, packet_box, stream_bsfs[stream_index].as_mut())
     } else {
-        write_packet(
-            st_rescale_delta_last,
-            oformat_flags,
-            st_last_dts,
-            out_fmt_ctx,
-            packet_box,
-        )
+        write_packet(cfg, state, packet_box)
     }
 }
 
@@ -1206,50 +1169,30 @@ unsafe fn mux_write_released(
 /// counts each stream once. Returns `Err(ret)` on a BSF flush error.
 unsafe fn sq_finish_output_stream(
     ost: usize,
-    stream_count: usize,
-    stream_eof: &mut [bool],
-    nb_done: &mut usize,
-    has_bsf: bool,
+    cfg: &MuxWriteCfg,
+    state: &mut MuxWriteState,
     stream_bsfs: &mut [Option<BitStreamFilter>],
-    stream_pkt_templates: &[Option<PacketData>],
-    st_rescale_delta_last: &mut [i64],
-    st_last_dts: &mut [i64],
-    oformat_flags: i32,
-    out_fmt_ctx: &FormatContext,
-    mux_stream_nodes: &[Arc<SchNode>],
-    input_controller: &Arc<InputController>,
-    scheduler_status: &Arc<AtomicUsize>,
-    packet_pool: &ObjPool<Packet>,
 ) -> Result<(), i32> {
-    if ost >= stream_count || stream_eof[ost] {
+    if ost >= cfg.stream_count || state.stream_eof[ost] {
         return Ok(());
     }
-    if has_bsf {
-        let fret = flush_stream_bsf(
-            st_rescale_delta_last,
-            oformat_flags,
-            st_last_dts,
-            out_fmt_ctx,
-            stream_bsfs,
-            stream_pkt_templates,
-            ost,
-            packet_pool,
-        );
+    if cfg.has_bsf {
+        let fret = flush_stream_bsf(cfg, state, stream_bsfs, ost);
         if fret < 0 {
             return Err(fret);
         }
     }
-    stream_eof[ost] = true;
-    *nb_done += 1;
-    if ost < mux_stream_nodes.len() {
+    state.stream_eof[ost] = true;
+    *state.nb_done += 1;
+    if ost < cfg.mux_stream_nodes.len() {
         if let SchNode::MuxStream {
             source_finished, ..
-        } = mux_stream_nodes[ost].as_ref()
+        } = cfg.mux_stream_nodes[ost].as_ref()
         {
             source_finished.store(true, Ordering::Release);
         }
     }
-    input_controller.update_locked(scheduler_status);
+    cfg.input_controller.update_locked(cfg.scheduler_status);
     Ok(())
 }
 
@@ -1264,39 +1207,16 @@ fn sq_mux_pump(
     sq: &mut SqMux,
     released: &mut Vec<PacketBox>,
     nf: &mut Vec<usize>,
-    stream_count: usize,
-    stream_eof: &mut [bool],
-    nb_done: &mut usize,
-    has_bsf: bool,
+    cfg: &MuxWriteCfg,
+    state: &mut MuxWriteState,
     stream_bsfs: &mut [Option<BitStreamFilter>],
-    stream_pkt_templates: &mut [Option<PacketData>],
-    st_rescale_delta_last: &mut [i64],
-    st_last_dts: &mut [i64],
-    oformat_flags: i32,
-    out_fmt_ctx: &FormatContext,
-    mux_stream_nodes: &[Arc<SchNode>],
-    input_controller: &Arc<InputController>,
-    scheduler_status: &Arc<AtomicUsize>,
-    packet_pool: &ObjPool<Packet>,
 ) -> Result<bool, i32> {
     // 1) Write everything releasable BEFORE any finish drops future packets.
     released.clear();
     sq.queue.drain_all_releasable(released);
     for mut pb in released.drain(..) {
-        let wret = unsafe {
-            mux_write_released(
-                &mut pb,
-                has_bsf,
-                stream_bsfs,
-                stream_pkt_templates,
-                st_rescale_delta_last,
-                st_last_dts,
-                oformat_flags,
-                out_fmt_ctx,
-                packet_pool,
-            )
-        };
-        packet_pool.release(pb.packet);
+        let wret = unsafe { mux_write_released(&mut pb, cfg, state, stream_bsfs) };
+        cfg.packet_pool.release(pb.packet);
         if wret == AVERROR_EOF {
             return Ok(true);
         } else if wret < 0 {
@@ -1310,23 +1230,7 @@ fn sq_mux_pump(
     for &sq_j in nf.iter() {
         let ost = sq.ostream[sq_j];
         unsafe {
-            sq_finish_output_stream(
-                ost,
-                stream_count,
-                stream_eof,
-                nb_done,
-                has_bsf,
-                stream_bsfs,
-                stream_pkt_templates,
-                st_rescale_delta_last,
-                st_last_dts,
-                oformat_flags,
-                out_fmt_ctx,
-                mux_stream_nodes,
-                input_controller,
-                scheduler_status,
-                packet_pool,
-            )?;
+            sq_finish_output_stream(ost, cfg, state, stream_bsfs)?;
         }
     }
 
@@ -1335,7 +1239,7 @@ fn sq_mux_pump(
     // stream in `stream_count`, e.g. a mapped attachment-copy) is pre-finished at
     // worker start (see the `sq_idx == None` pre-finish loop), so `nb_done` can
     // always reach `stream_count`.
-    Ok(*nb_done == stream_count)
+    Ok(*state.nb_done == cfg.stream_count)
 }
 
 /// Build the per-output-stream BSF list, resolving each stream's chain by its
@@ -1411,22 +1315,13 @@ unsafe fn init_bitstream_filters(
 /// (ffmpeg_mux.c): rescale into the BSF input timebase, send, then drain every
 /// output packet to the muxer.
 unsafe fn mux_filter_and_write_packet(
-    st_rescale_delta_last: &mut [i64],
-    oformat_flags: i32,
-    st_last_dts: &mut [i64],
-    out_fmt_ctx: &FormatContext,
+    cfg: &MuxWriteCfg,
+    state: &mut MuxWriteState,
     packet_box: &mut PacketBox,
     bsf: Option<&mut BitStreamFilter>,
-    packet_pool: &ObjPool<Packet>,
 ) -> i32 {
     let Some(bsf) = bsf else {
-        return write_packet(
-            st_rescale_delta_last,
-            oformat_flags,
-            st_last_dts,
-            out_fmt_ctx,
-            packet_box,
-        );
+        return write_packet(cfg, state, packet_box);
     };
 
     // Send every real packet to the filter, exactly like fftools
@@ -1446,15 +1341,7 @@ unsafe fn mux_filter_and_write_packet(
     // send_packet took ownership of pkt's contents (reset to empty); the caller
     // still releases the now-empty shell to the pool.
 
-    match drain_bsf_write(
-        st_rescale_delta_last,
-        oformat_flags,
-        st_last_dts,
-        out_fmt_ctx,
-        bsf,
-        &packet_box.packet_data,
-        packet_pool,
-    ) {
+    match drain_bsf_write(cfg, state, bsf, &packet_box.packet_data) {
         // Normal in-stream drain: input consumed, wait for more.
         BsfDrain::Exhausted => 0,
         // The filter self-EOF'd without a NULL flush (rare): stop the stream
@@ -1486,13 +1373,10 @@ enum BsfDrain {
 /// output timebase, tagged with `template` metadata, and written via
 /// `write_packet`.
 unsafe fn drain_bsf_write(
-    st_rescale_delta_last: &mut [i64],
-    oformat_flags: i32,
-    st_last_dts: &mut [i64],
-    out_fmt_ctx: &FormatContext,
+    cfg: &MuxWriteCfg,
+    state: &mut MuxWriteState,
     bsf: &mut BitStreamFilter,
     template: &PacketData,
-    packet_pool: &ObjPool<Packet>,
 ) -> BsfDrain {
     loop {
         let ret = bsf.receive_packet();
@@ -1512,7 +1396,7 @@ unsafe fn drain_bsf_write(
         // Move the filtered packet into a pooled shell so it flows through the
         // existing write_packet/mux_fixup_ts path; the BSF's own packet is left
         // clean for the next receive.
-        let mut out_pkt = match packet_pool.get() {
+        let mut out_pkt = match cfg.packet_pool.get() {
             Ok(p) => p,
             Err(_) => return BsfDrain::Err(AVERROR(ENOMEM)),
         };
@@ -1523,14 +1407,8 @@ unsafe fn drain_bsf_write(
             packet: out_pkt,
             packet_data: *template,
         };
-        let wret = write_packet(
-            st_rescale_delta_last,
-            oformat_flags,
-            st_last_dts,
-            out_fmt_ctx,
-            &mut out_box,
-        );
-        packet_pool.release(out_box.packet);
+        let wret = write_packet(cfg, state, &mut out_box);
+        cfg.packet_pool.release(out_box.packet);
         if wret < 0 {
             // Includes a muxer-side AVERROR_EOF — an error to propagate, NOT a
             // completed BSF flush.
@@ -1544,14 +1422,10 @@ unsafe fn drain_bsf_write(
 /// stream has no BSF. Returns `0` on success (including the drain's terminal
 /// EOF) or a negative muxing error.
 unsafe fn flush_stream_bsf(
-    st_rescale_delta_last: &mut [i64],
-    oformat_flags: i32,
-    st_last_dts: &mut [i64],
-    out_fmt_ctx: &FormatContext,
+    cfg: &MuxWriteCfg,
+    state: &mut MuxWriteState,
     stream_bsfs: &mut [Option<BitStreamFilter>],
-    stream_pkt_templates: &[Option<PacketData>],
     stream_index: usize,
-    packet_pool: &ObjPool<Packet>,
 ) -> i32 {
     let Some(bsf) = stream_bsfs[stream_index].as_mut() else {
         return 0;
@@ -1559,10 +1433,10 @@ unsafe fn flush_stream_bsf(
 
     // Metadata for the trailing packets: reuse the last real packet's template,
     // or synthesize one from the output stream's codecpar if none was seen.
-    let template = match &stream_pkt_templates[stream_index] {
+    let template = match &state.stream_pkt_templates[stream_index] {
         Some(t) => *t,
         None => {
-            let st = *(*out_fmt_ctx.as_ptr()).streams.add(stream_index);
+            let st = *(*cfg.out_fmt_ctx.as_ptr()).streams.add(stream_index);
             PacketData {
                 dts_est: 0,
                 codec_type: (*(*st).codecpar).codec_type,
@@ -1576,15 +1450,7 @@ unsafe fn flush_stream_bsf(
     if ret < 0 {
         return ret;
     }
-    match drain_bsf_write(
-        st_rescale_delta_last,
-        oformat_flags,
-        st_last_dts,
-        out_fmt_ctx,
-        bsf,
-        &template,
-        packet_pool,
-    ) {
+    match drain_bsf_write(cfg, state, bsf, &template) {
         // The NULL-flush completed (Flushed) or produced no trailing packets
         // (Exhausted): both are success. A write/receive error — including a
         // muxer-side AVERROR_EOF — propagates so the worker terminates.
@@ -1593,13 +1459,8 @@ unsafe fn flush_stream_bsf(
     }
 }
 
-unsafe fn mux_fixup_ts(
-    st_rescale_delta_last: &mut [i64],
-    oformat_flags: i32,
-    st_last_dts: &mut [i64],
-    packet_box: &mut PacketBox,
-    out_fmt_ctx: *mut AVFormatContext,
-) {
+unsafe fn mux_fixup_ts(cfg: &MuxWriteCfg, state: &mut MuxWriteState, packet_box: &mut PacketBox) {
+    let out_fmt_ctx = cfg.out_fmt_ctx.as_ptr();
     let pkt = packet_box.packet.as_mut_ptr();
     let packet_data = &packet_box.packet_data;
     let stream_index = packet_data.output_stream_index;
@@ -1614,7 +1475,7 @@ unsafe fn mux_fixup_ts(
             duration = (*codecpar).frame_size;
         }
 
-        let ts_rescale_delta_last = &mut st_rescale_delta_last[stream_index as usize];
+        let ts_rescale_delta_last = &mut state.st_rescale_delta_last[stream_index as usize];
 
         (*pkt).dts = av_rescale_delta(
             (*pkt).time_base,
@@ -1643,9 +1504,9 @@ unsafe fn mux_fixup_ts(
     }
     (*pkt).time_base = (**(*out_fmt_ctx).streams.add(stream_index as usize)).time_base;
 
-    let last_mux_dts = &mut st_last_dts[stream_index as usize];
+    let last_mux_dts = &mut state.st_last_dts[stream_index as usize];
 
-    if (oformat_flags & AVFMT_NOTIMESTAMPS) == 0 {
+    if (cfg.oformat_flags & AVFMT_NOTIMESTAMPS) == 0 {
         if (*pkt).dts != AV_NOPTS_VALUE && (*pkt).pts != AV_NOPTS_VALUE && (*pkt).dts > (*pkt).pts {
             warn!(
                 "Invalid DTS: {} PTS: {}, replacing by guess",
@@ -1664,7 +1525,7 @@ unsafe fn mux_fixup_ts(
             && (*pkt).dts != AV_NOPTS_VALUE
             && *last_mux_dts != AV_NOPTS_VALUE
         {
-            let max = *last_mux_dts + ((oformat_flags & AVFMT_TS_NONSTRICT) == 0) as i64;
+            let max = *last_mux_dts + ((cfg.oformat_flags & AVFMT_TS_NONSTRICT) == 0) as i64;
             if (*pkt).dts < max {
                 let loglevel =
                     if max - (*pkt).dts > 2 || packet_data.codec_type == AVMEDIA_TYPE_VIDEO {
