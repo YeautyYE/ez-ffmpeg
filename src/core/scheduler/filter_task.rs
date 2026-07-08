@@ -2976,7 +2976,7 @@ unsafe fn configure_input_video_filter(
 
     ifp.displaymatrix_applied = false;
     if ifp.opts.flags & IFILTER_FLAG_AUTOROTATE != 0
-        && (*desc).flags & AV_PIX_FMT_FLAG_HWACCEL as u64 == 0
+        && desc.flags & AV_PIX_FMT_FLAG_HWACCEL as u64 == 0
     {
         let displaymatrix = ifp.displaymatrix;
         let theta = get_rotation(&displaymatrix);

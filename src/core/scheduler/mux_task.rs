@@ -926,7 +926,7 @@ fn _mux_init(
                         // flush can stamp the BSF's trailing packets correctly.
                         if stream_bsfs[stream_index].is_some() {
                             stream_pkt_templates[stream_index] =
-                                Some(packet_box.packet_data.clone());
+                                Some(packet_box.packet_data);
                         }
                         ret = mux_filter_and_write_packet(
                             &mut st_rescale_delta_last,
@@ -1176,8 +1176,8 @@ unsafe fn mux_write_released(
 ) -> i32 {
     let stream_index = packet_box.packet_data.output_stream_index as usize;
     if has_bsf {
-        if stream_bsfs.get(stream_index).map_or(false, |b| b.is_some()) {
-            stream_pkt_templates[stream_index] = Some(packet_box.packet_data.clone());
+        if stream_bsfs.get(stream_index).is_some_and(|b| b.is_some()) {
+            stream_pkt_templates[stream_index] = Some(packet_box.packet_data);
         }
         mux_filter_and_write_packet(
             st_rescale_delta_last,
@@ -1521,7 +1521,7 @@ unsafe fn drain_bsf_write(
 
         let mut out_box = PacketBox {
             packet: out_pkt,
-            packet_data: template.clone(),
+            packet_data: *template,
         };
         let wret = write_packet(
             st_rescale_delta_last,
@@ -1560,7 +1560,7 @@ unsafe fn flush_stream_bsf(
     // Metadata for the trailing packets: reuse the last real packet's template,
     // or synthesize one from the output stream's codecpar if none was seen.
     let template = match &stream_pkt_templates[stream_index] {
-        Some(t) => t.clone(),
+        Some(t) => *t,
         None => {
             let st = *(*out_fmt_ctx.as_ptr()).streams.add(stream_index);
             PacketData {
