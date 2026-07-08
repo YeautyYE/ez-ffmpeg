@@ -477,12 +477,18 @@ fn _mux_init(
         // Move the FormatContext into the worker; it Drops (frees the output
         // context, custom-IO-aware) when this closure ends — the terminal free.
         let out_fmt_ctx = out_fmt_ctx;
-        // This muxer's completion guard rides the worker to the end: it drops
-        // AFTER the loop, trailer, and `thread_done_with` below, so the last
-        // muxer publishes STATUS_END once the output is fully written — covering
-        // the paths (write returning AVERROR_EOF) the balancing pass misses. On
-        // a failed spawn the un-run closure is dropped, so it still counts.
-        let _mux_done = mux_done;
+        // This muxer's completion guard. It is dropped EXPLICITLY below, BEFORE
+        // the encoder join (see that comment): the last muxer must publish
+        // STATUS_END before joining so a parked encoder observes is_stopping and
+        // exits from its recv loop cleanly, rather than being force-fed and
+        // erroring on Disconnected. On the early-return / spawn-failure paths
+        // (outside this closure) it drops there instead — either way, once.
+        let mux_done = mux_done;
+        // Panic-only net for the pre-counted thread slot: the manual
+        // `thread_done_with` below is skipped if this worker unwinds, which would
+        // leak the slot and hang `wait_for_all_threads`. Armed here, disarmed
+        // right after that manual release on the normal path.
+        let mut slot_guard = MuxSlotGuard::armed(thread_sync.clone(), scheduler_status.clone());
         // Per-output-stream BSF chains (None for streams without one), or an
         // empty vec when no output set a BSF at all. Owned by the worker; each
         // `BitStreamFilter` frees its AVBSFContext/AVPacket on drop.
@@ -992,6 +998,40 @@ fn _mux_init(
         // output streams they write into (FFmpeg joins encoder tasks before
         // muxer cleanup in sch_stop, ffmpeg_sched.c:2535-2604).
         drop(pkt_receiver);
+
+        // Mark every mux stream finished (idempotent on the normal exit; each
+        // stream was already marked as it hit EOF). On an AVERROR_EOF early exit
+        // this clears this output's stale `source_finished` so the balancing
+        // pass stops steering to a finished output and starving a live sibling
+        // (F2).
+        for node in &mux_stream_nodes {
+            if let SchNode::MuxStream {
+                source_finished, ..
+            } = node.as_ref()
+            {
+                source_finished.store(true, Ordering::Release);
+            }
+        }
+
+        // Publish the mux-done terminal BEFORE the join (F1). For the LAST muxer
+        // this stores STATUS_END, so a parked-upstream encoder (in its source
+        // recv, filter starved by a choked demuxer — NOT released by
+        // `drop(pkt_receiver)`, which only frees encoders blocked in send_to_mux)
+        // observes is_stopping and exits CLEANLY from its recv loop: it never
+        // sends, so it never records a spurious Disconnected/MuxerFinished error.
+        // Dropping HERE, not at closure end after the join, is the fix — the join
+        // would otherwise block on that parked encoder before STATUS_END is ever
+        // published.
+        drop(mux_done);
+
+        // Rebalance so a finished output stops starving a live sibling (F2). This
+        // early-returns once stopping, so for the last muxer STATUS_END above has
+        // already released everyone; it matters only for a still-running sibling.
+        // Known residual: a sibling with its OWN dedicated input keeps the
+        // balancing pass from running the fallback, so a demuxer feeding ONLY
+        // this finished output can stay choked until the sibling finishes.
+        input_controller.update_locked(&scheduler_status);
+
         while let Ok(handle) = enc_handle_receiver.try_recv() {
             let _ = handle.join();
         }
@@ -1001,6 +1041,9 @@ fn _mux_init(
         thread_sync.thread_done_with(|| {
             scheduler_status.store(STATUS_END, Ordering::Release);
         });
+        // Slot released above on the normal path: disarm the panic-only net so
+        // it does not double-release on drop.
+        slot_guard.disarm();
     });
     if let Err(e) = result {
         error!("Muxer thread exited with error: {e}");
@@ -1109,6 +1152,50 @@ impl Drop for MuxDoneGuard {
                 Err(actual) => current = actual,
             }
         }
+    }
+}
+
+/// Panic-only release net for the mux worker's pre-counted thread slot.
+///
+/// The mux worker uses a MANUAL `thread_done_with` (not `ThreadDoneGuard`) so it
+/// can publish STATUS_END only AFTER writing the trailer and joining its
+/// encoders (the ordered terminal publish). That manual call is skipped if the
+/// worker unwinds (panics) partway through, leaking the slot — then
+/// `wait_for_all_threads` (`RunningGuard::Drop`) hangs forever. This guard
+/// releases the slot on unwind; the normal path calls `disarm()` immediately
+/// after its manual release so the slot is freed exactly once.
+struct MuxSlotGuard {
+    armed: bool,
+    thread_sync: ThreadSynchronizer,
+    scheduler_status: Arc<AtomicUsize>,
+}
+
+impl MuxSlotGuard {
+    fn armed(thread_sync: ThreadSynchronizer, scheduler_status: Arc<AtomicUsize>) -> Self {
+        Self {
+            armed: true,
+            thread_sync,
+            scheduler_status,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for MuxSlotGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Unwind path: release this muxer's thread slot (and publish STATUS_END
+        // best-effort, so choked demuxers exit within one poll) exactly as the
+        // skipped manual release would have.
+        let status = self.scheduler_status.clone();
+        self.thread_sync.thread_done_with(move || {
+            status.store(STATUS_END, Ordering::Release);
+        });
     }
 }
 
@@ -1916,6 +2003,69 @@ mod tests {
 
         rx.recv_timeout(Duration::from_secs(2))
             .expect("the choked demuxer must be released when the last muxer finishes");
+    }
+
+    // BUG A regression: the mux worker releases its pre-counted thread slot via a
+    // MANUAL thread_done_with (not ThreadDoneGuard, so it can publish STATUS_END
+    // only after the trailer/join). A panic before that call would leak the slot
+    // and hang wait_for_all_threads. MuxSlotGuard is the panic-only net: an ARMED
+    // drop (the unwind path) must release the slot.
+    #[test]
+    fn mux_slot_guard_releases_slot_on_armed_drop() {
+        let thread_sync = ThreadSynchronizer::new();
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        thread_sync.thread_start(); // the pre-counted mux slot
+
+        // Simulate a worker unwinding before its manual release: armed guard drops.
+        drop(MuxSlotGuard::armed(thread_sync.clone(), status.clone()));
+
+        // Slot released -> wait_for_all_threads returns instead of hanging.
+        let (tx, rx) = mpsc::channel();
+        let sync = thread_sync.clone();
+        std::thread::spawn(move || {
+            sync.wait_for_all_threads();
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "an armed MuxSlotGuard drop must release the slot (else wait() hangs)"
+        );
+        assert!(
+            is_stopping(status.load(Ordering::Acquire)),
+            "the armed drop also publishes a terminal status"
+        );
+    }
+
+    // The normal path disarms the guard right after its manual thread_done_with;
+    // a disarmed drop must be a no-op (no double-release, no spurious publish).
+    #[test]
+    fn mux_slot_guard_disarmed_drop_is_a_noop() {
+        let thread_sync = ThreadSynchronizer::new();
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        thread_sync.thread_start();
+
+        let mut guard = MuxSlotGuard::armed(thread_sync.clone(), status.clone());
+        guard.disarm();
+        drop(guard);
+
+        // Disarmed: the slot is still counted (the guard released nothing).
+        let (tx, rx) = mpsc::channel();
+        let sync = thread_sync.clone();
+        std::thread::spawn(move || {
+            sync.wait_for_all_threads();
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "a disarmed MuxSlotGuard must NOT release the slot (the manual path owns it)"
+        );
+        assert_eq!(
+            status.load(Ordering::Acquire),
+            STATUS_RUN,
+            "a disarmed guard must not publish a terminal status"
+        );
+        // Clean up: release the slot so the spawned waiter can finish.
+        thread_sync.thread_done_with(|| {});
     }
 
     // build_sq_mux wires the plan into the output-index <-> sq-index maps,
