@@ -1,13 +1,14 @@
 use std::ffi::CStr;
 use crate::core::context::decoder_stream::DecoderStream;
-use crate::core::context::demuxer::Demuxer;
+use crate::core::context::demuxer::{CopyMuxHandle, Demuxer};
 use crate::core::context::obj_pool::ObjPool;
 use crate::core::context::{PacketBox, PacketData};
+use crate::core::scheduler::enc_task::{send_to_mux, SendToMuxError};
 use crate::core::scheduler::ffmpeg_scheduler::{
     is_stopping, packet_is_null, set_scheduler_error, wait_until_not_paused,
 };
-use crate::error::Error::Demuxing;
-use crate::error::{DemuxingError, DemuxingOperationError};
+use crate::error::Error::{Demuxing, Encoding};
+use crate::error::{DemuxingError, DemuxingOperationError, EncodingOperationError};
 use crate::util::ffmpeg_utils::av_rescale_q_rnd;
 use crossbeam_channel::Sender;
 use ffmpeg_next::packet::{Mut, Ref};
@@ -183,7 +184,7 @@ pub(crate) fn demux_init(
                                         is_copy: false,
                                     },
                                 };
-                                demux_send(&mut demux_parameter, packet_box, &packet_pool, 0, &demux_node, &scheduler_status, independent_readrate)
+                                demux_send(&mut demux_parameter, packet_box, &packet_pool, 0, &demux_node, &scheduler_status, &scheduler_result, independent_readrate)
                             };
 
                             // Common seek operation for both cases
@@ -308,7 +309,7 @@ pub(crate) fn demux_init(
                                 is_copy: false,
                             },
                         };
-                        ret = demux_send(&mut demux_parameter, packet_box, &packet_pool, send_flags, &demux_node, &scheduler_status, independent_readrate);
+                        ret = demux_send(&mut demux_parameter, packet_box, &packet_pool, send_flags, &demux_node, &scheduler_status, &scheduler_result, independent_readrate);
 
                         if ret < 0 {
                             break;
@@ -318,7 +319,7 @@ pub(crate) fn demux_init(
             }
 
             if is_started {
-                demux_done(&mut demux_parameter, &packet_pool);
+                demux_done(&mut demux_parameter, &packet_pool, &scheduler_status, &scheduler_result);
             }
 
             let node = demux_node.as_ref();
@@ -336,11 +337,19 @@ pub(crate) fn demux_init(
     Ok(())
 }
 
-fn demux_done(demux_parameter: &mut DemuxerParameter, packet_pool: &ObjPool<Packet>) {
+fn demux_done(
+    demux_parameter: &mut DemuxerParameter,
+    packet_pool: &ObjPool<Packet>,
+    scheduler_status: &Arc<AtomicUsize>,
+    scheduler_result: &Arc<Mutex<Option<crate::error::Result<()>>>>,
+) {
     for ds in &demux_parameter.demux_streams {
         for (i, (packet_dst, input_stream_index, output_stream_index)) in
             demux_parameter.dsts.iter().enumerate()
         {
+            // Disjoint field borrows: `dsts` (shared, the iterator),
+            // `dsts_finished` (mutable, below), and `dst_mux_gate` (shared, at
+            // the call) are different fields, so all coexist.
             let dst_finished = &mut demux_parameter.dsts_finished[i];
 
             if ds.stream_index != *input_stream_index {
@@ -371,7 +380,10 @@ fn demux_done(demux_parameter: &mut DemuxerParameter, packet_pool: &ObjPool<Pack
                     packet_dst,
                     output_stream_index,
                     dst_finished,
+                    demux_parameter.dst_mux_gate[i].as_ref(),
                     0,
+                    scheduler_status,
+                    scheduler_result,
                 )
             };
             if ret == AVERROR_EOF {
@@ -924,6 +936,14 @@ struct DemuxerParameter {
     /// early-outs on this so the common (non-shortest) path pays a single bool
     /// test per iteration.
     has_source_finished_dsts: bool,
+
+    /// Parallel to `dsts`: a streamcopy destination's muxer gate + pre-mux
+    /// queue (`Some`), or `None` for a decoder destination. When set, the demux
+    /// routes that destination's packets through the encoders' deferred-start
+    /// gate instead of blocking on the shared live queue before the muxer
+    /// starts — fftools sends demux->mux copy packets through the same
+    /// `sch_send` path as encoders (ffmpeg_sched.c:2038-2077).
+    dst_mux_gate: Vec<Option<CopyMuxHandle>>,
 }
 
 // SAFETY: all raw pointers live in DemuxStreamParameter (see its SAFETY
@@ -937,6 +957,10 @@ impl DemuxerParameter {
         let dst_source_finished = demux.take_dst_source_finished();
         debug_assert_eq!(dst_source_finished.len(), dsts.len());
         let has_source_finished_dsts = dst_source_finished.iter().any(|x| x.is_some());
+        // Carried in lockstep with `dsts` (built alongside `add_packet_dst` /
+        // `connect_stream`), so `dst_mux_gate[i]` always describes `dsts[i]`.
+        let dst_mux_gate = demux.take_dst_mux_gate();
+        debug_assert_eq!(dst_mux_gate.len(), dsts.len());
 
         let nb_streams = unsafe { (*demux.in_fmt_ctx_ptr()).nb_streams } as usize;
         let mut demux_streams: Vec<DemuxStreamParameter> = Vec::with_capacity(nb_streams);
@@ -1001,6 +1025,7 @@ impl DemuxerParameter {
             nb_streams_finished: 0,
             dst_source_finished,
             has_source_finished_dsts,
+            dst_mux_gate,
         }
     }
 }
@@ -1150,6 +1175,7 @@ unsafe fn demux_send(
     flags: usize,
     demux_node: &Arc<SchNode>,
     scheduler_status: &Arc<AtomicUsize>,
+    scheduler_result: &Arc<Mutex<Option<crate::error::Result<()>>>>,
     independent_readrate: bool,
 ) -> i32 {
     let node = demux_node.as_ref();
@@ -1182,7 +1208,14 @@ unsafe fn demux_send(
     }
 
     let stream_index = (*packet_box.packet.as_ptr()).stream_index as usize;
-    let ret = demux_send_for_stream(demux_parameter, packet_box, packet_pool, flags);
+    let ret = demux_send_for_stream(
+        demux_parameter,
+        packet_box,
+        packet_pool,
+        flags,
+        scheduler_status,
+        scheduler_result,
+    );
     if ret == AVERROR_EOF {
         // One exhausted stream must not stop the demuxer while other streams
         // still have consumers (ffmpeg_demux.c:511-530 do_send).
@@ -1206,20 +1239,24 @@ unsafe fn demux_send_for_stream(
     packet_box: PacketBox,
     packet_pool: &ObjPool<Packet>,
     flags: usize,
+    scheduler_status: &Arc<AtomicUsize>,
+    scheduler_result: &Arc<Mutex<Option<crate::error::Result<()>>>>,
 ) -> i32 {
     let stream_index = (*packet_box.packet.as_ptr()).stream_index as usize;
 
-    // Disjoint field borrows: destination metadata (immutable) and the finished
-    // flags (mutable) are different fields, so the hot path indexes the
-    // precomputed per-stream list instead of scanning + collecting every
-    // destination per packet (PERF-7).
-    let dsts = &demux_parameter.dsts;
-    let dsts_finished = &mut demux_parameter.dsts_finished;
-
+    // The precomputed per-stream destination list is read first, then the
+    // parallel fields are borrowed disjointly: `dsts` / `dst_mux_gate` (shared
+    // metadata) and `dsts_finished` (mutable) are different fields, so the hot
+    // path indexes them instead of scanning + collecting every destination per
+    // packet (PERF-7).
     let Some(send_dsts) = demux_parameter.per_stream_dsts.get(stream_index) else {
         packet_pool.release(packet_box.packet);
         return 0;
     };
+
+    let dsts = &demux_parameter.dsts;
+    let dst_mux_gate = &demux_parameter.dst_mux_gate;
+    let dsts_finished = &mut demux_parameter.dsts_finished;
 
     // Discarded streams are already skipped at the demux loop top
     // (ffmpeg_demux.c:751); this backstop keeps an empty destination list
@@ -1266,7 +1303,10 @@ unsafe fn demux_send_for_stream(
                 packet_dst,
                 output_stream_index,
                 dst_finished,
+                dst_mux_gate[dst_i].as_ref(),
                 flags,
+                scheduler_status,
+                scheduler_result,
             );
             if ret == AVERROR_EOF {
                 nb_done += 1;
@@ -1307,7 +1347,10 @@ unsafe fn demux_send_for_stream(
             packet_dst,
             output_stream_index,
             dst_finished,
+            dst_mux_gate[dst_i].as_ref(),
             flags,
+            scheduler_status,
+            scheduler_result,
         );
         if ret == AVERROR_EOF {
             nb_done += 1;
@@ -1322,12 +1365,63 @@ unsafe fn demux_send_for_stream(
 
 const DEMUX_SEND_STREAMCOPY_EOF: usize = 1 << 0;
 
+/// Non-EOF fatal sentinel: a streamcopy pre-mux queue stayed full past the
+/// deadline. The demux loop must abort the job (the real error is recorded via
+/// `set_scheduler_error` at the send site), NOT treat it as a normal per-stream
+/// EOF — otherwise the copy stream would be silently truncated. Distinct from
+/// `AVERROR_EOF` so `demux_send_for_stream` propagates it as a hard error.
+const DEMUX_SEND_MUX_QUEUE_FULL: i32 = ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO);
+
+/// Outcome of routing one demux->mux packet to its destination.
+enum DstSend {
+    /// Delivered: parked pre-start, drained on the live queue, or accepted by a
+    /// decoder channel.
+    Delivered,
+    /// Receiver gone — downstream completed. Benign: FFmpeg returns
+    /// `AVERROR_EOF` silently here (ffmpeg_sched.c).
+    Finished,
+    /// A streamcopy pre-mux queue stayed full past the deadline: FATAL, the same
+    /// "Too many packets buffered for output stream" an encoder reports.
+    QueueFull,
+}
+
+/// Send `packet_box` to one destination. A streamcopy destination (`mux_gate`
+/// `Some`) routes through the encoders' `MuxStartGate` + pre-mux queue, so a
+/// dense copy stream parks pre-start and drains in DTS order instead of
+/// blocking the shared single-threaded demuxer on the live bounded queue before
+/// the muxer starts (that block was the deadlock: the demuxer could never reach
+/// the packet that opens a co-muxed encoder). A decoder destination (`None`)
+/// keeps the direct bounded send. fftools routes copy and encode through the
+/// same `sch_send` path (ffmpeg_sched.c:2038-2077).
+fn route_dst_send(
+    packet_box: PacketBox,
+    packet_dst: &Sender<PacketBox>,
+    mux_gate: Option<&CopyMuxHandle>,
+) -> DstSend {
+    match mux_gate {
+        Some(handle) => {
+            match send_to_mux(packet_box, packet_dst, &handle.pre_sender, &handle.gate) {
+                Ok(()) => DstSend::Delivered,
+                Err(SendToMuxError::Disconnected(_)) => DstSend::Finished,
+                Err(SendToMuxError::QueueFull(_)) => DstSend::QueueFull,
+            }
+        }
+        None => match packet_dst.send(packet_box) {
+            Ok(()) => DstSend::Delivered,
+            Err(_) => DstSend::Finished,
+        },
+    }
+}
+
 unsafe fn demux_stream_send_to_dst(
     mut packet_box: PacketBox,
     packet_dst: &Sender<PacketBox>,
     output_stream_index: &Option<usize>,
     dst_finished: &mut bool,
+    mux_gate: Option<&CopyMuxHandle>,
     flags: usize,
+    scheduler_status: &Arc<AtomicUsize>,
+    scheduler_result: &Arc<Mutex<Option<crate::error::Result<()>>>>,
 ) -> i32 {
     if *dst_finished {
         return AVERROR_EOF;
@@ -1352,23 +1446,45 @@ unsafe fn demux_stream_send_to_dst(
     }
 
     if *dst_finished {
-        if let Err(_) = packet_dst.send(packet_box) {
+        // Copy EOF marker (a real dts): still routed through the gate so it
+        // drains in DTS order with the stream's data packets.
+        match route_dst_send(packet_box, packet_dst, mux_gate) {
             // Receiver gone = downstream completed; a normal data-flow signal
             // (FFmpeg returns AVERROR_EOF silently here).
-            debug!("Demuxer dst finished, stop sending");
+            DstSend::Delivered | DstSend::Finished => {}
+            DstSend::QueueFull => {
+                set_scheduler_error(
+                    scheduler_status,
+                    scheduler_result,
+                    Encoding(EncodingOperationError::MuxQueueFull),
+                );
+                return DEMUX_SEND_MUX_QUEUE_FULL;
+            }
         }
 
         return AVERROR_EOF;
     }
 
-    if let Err(_) = packet_dst.send(packet_box) {
-        debug!("Demuxer dst finished, stop sending");
-
-        *dst_finished = true;
-        return AVERROR_EOF;
+    match route_dst_send(packet_box, packet_dst, mux_gate) {
+        DstSend::Delivered => 0,
+        DstSend::Finished => {
+            debug!("Demuxer dst finished, stop sending");
+            *dst_finished = true;
+            AVERROR_EOF
+        }
+        DstSend::QueueFull => {
+            // Streamcopy pre-mux queue stayed full past the deadline: FATAL,
+            // never a silent truncation. Record the error and return a non-EOF
+            // fatal so the demux loop aborts the job.
+            *dst_finished = true;
+            set_scheduler_error(
+                scheduler_status,
+                scheduler_result,
+                Encoding(EncodingOperationError::MuxQueueFull),
+            );
+            DEMUX_SEND_MUX_QUEUE_FULL
+        }
     }
-
-    0
 }
 
 unsafe fn demux_flush(

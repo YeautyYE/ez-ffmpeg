@@ -1,7 +1,7 @@
 use crate::core::context::encoder_stream::EncoderStream;
 use crate::core::context::output::{AttachmentSpec, StreamMap, VSyncMethod};
 use crate::core::context::pre_mux_queue::{
-    self, PreMuxQueueConfig, PreMuxQueueReceiver,
+    self, PreMuxQueueConfig, PreMuxQueueReceiver, PreMuxQueueSender,
 };
 use crate::core::context::{FrameBox, PacketBox};
 use crate::core::filter::frame_pipeline::FramePipeline;
@@ -493,6 +493,32 @@ impl Muxer {
             }
             Ok((packet_sender, st, index))
         }
+    }
+
+    /// Streamcopy analog of the stream wiring inside `add_enc_stream`: allocate
+    /// the output stream and the shared live packet sender via `new_stream`,
+    /// then build this stream's own pre-mux queue and register its receiver in
+    /// `src_pre_receivers` — exactly like the encoder path (`add_enc_stream`
+    /// ~L444-446). Returns the live sender, the pre-mux sender, and the shared
+    /// `MuxStartGate` so the demux can route copy packets through the same
+    /// deferred-start gate the encoders use: fftools sends demux->mux packets
+    /// through the same `sch_send` path as encoders (ffmpeg_sched.c:2038-2077),
+    /// so copy and encode park pre-start and drain in DTS order uniformly
+    /// instead of a copy stream blocking the shared demuxer on the live queue.
+    pub(crate) fn new_copy_stream(
+        &mut self,
+        src: Arc<SchNode>,
+    ) -> crate::error::Result<(
+        Sender<PacketBox>,
+        PreMuxQueueSender,
+        Arc<crate::core::context::MuxStartGate>,
+        *mut AVStream,
+        usize,
+    )> {
+        let (packet_sender, st, index) = self.new_stream(src)?;
+        let (pre_sender, pre_receiver) = pre_mux_queue::channel(self.pre_mux_queue_config);
+        self.src_pre_receivers.push(pre_receiver);
+        Ok((packet_sender, pre_sender, self.mux_start_gate.clone(), st, index))
     }
 
     pub(crate) fn is_ready(&self) -> bool {

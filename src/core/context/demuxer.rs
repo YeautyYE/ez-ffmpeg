@@ -1,5 +1,6 @@
 use crate::core::codec::Codec;
 use crate::core::context::decoder_stream::DecoderStream;
+use crate::core::context::pre_mux_queue::PreMuxQueueSender;
 use crate::core::context::PacketBox;
 use crate::core::hwaccel::HWAccelID;
 use crate::raw::FormatContext;
@@ -21,6 +22,17 @@ use std::ffi::{CStr, CString};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+
+/// Muxer-side wiring a streamcopy destination needs to route its packets
+/// through the encoders' deferred-start gate + per-stream pre-mux queue, rather
+/// than blocking the shared demuxer on the live bounded queue before the muxer
+/// starts. Built by `Muxer::new_copy_stream` and carried lockstep with `dsts`.
+/// fftools routes demux->mux copy packets through the same `sch_send` path as
+/// encoders (ffmpeg_sched.c:2038-2077).
+pub(crate) struct CopyMuxHandle {
+    pub(crate) pre_sender: PreMuxQueueSender,
+    pub(crate) gate: Arc<crate::core::context::MuxStartGate>,
+}
 
 pub(crate) struct Demuxer {
     pub(crate) url: String,
@@ -75,6 +87,11 @@ pub(crate) struct Demuxer {
     /// stop producing a follower the muxer's `sq_mux` has cascade-finished
     /// (Architecture Y'). `None` for every non-shortest / non-copy destination.
     dst_source_finished: Vec<Option<Arc<AtomicBool>>>,
+    /// Parallel to `dsts`: a streamcopy destination's muxer gate + pre-mux
+    /// queue, so the demux routes copy packets through the same deferred-start
+    /// path encoders use. `None` for every decoder destination (which keeps the
+    /// direct live send). Kept strictly in lockstep with `dsts`.
+    dst_mux_gate: Vec<Option<CopyMuxHandle>>,
 }
 
 // SAFETY: Demuxer can be sent to another thread. The raw FFmpeg pointers are only
@@ -162,6 +179,7 @@ impl Demuxer {
             streams,
             dsts: vec![],
             dst_source_finished: vec![],
+            dst_mux_gate: vec![],
             start_time_effective: 0,
         })
     }
@@ -271,12 +289,16 @@ impl Demuxer {
         input_stream_index: usize,
         output_stream_index: usize,
         source_finished: Option<Arc<AtomicBool>>,
+        mux_gate: CopyMuxHandle,
     ) {
         self.dsts
             .push((packet_dst, input_stream_index, Some(output_stream_index)));
-        // Kept strictly in lockstep with `dsts` so `dst_source_finished[i]`
-        // always describes `dsts[i]`.
+        // Kept strictly in lockstep with `dsts` so `dst_source_finished[i]` and
+        // `dst_mux_gate[i]` always describe `dsts[i]`.
         self.dst_source_finished.push(source_finished);
+        // Every streamcopy destination carries a gate handle so it routes
+        // through the encoders' pre-mux queue instead of blocking the demuxer.
+        self.dst_mux_gate.push(Some(mux_gate));
     }
 
     pub(crate) fn get_streams(&self) -> &Vec<DecoderStream> {
@@ -301,8 +323,10 @@ impl Demuxer {
         }
         let (sender, receiver) = crossbeam_channel::bounded(8);
         self.dsts.push((sender, index, None));
-        // A decoded (non-copy) destination is never an `sq_mux` follower.
+        // A decoded (non-copy) destination is never an `sq_mux` follower and
+        // never routes through the mux gate (it feeds a decoder, not the mux).
         self.dst_source_finished.push(None);
+        self.dst_mux_gate.push(None);
         self.streams[index].set_src(receiver);
     }
 
@@ -312,6 +336,10 @@ impl Demuxer {
 
     pub(crate) fn take_dst_source_finished(&mut self) -> Vec<Option<Arc<AtomicBool>>> {
         std::mem::take(&mut self.dst_source_finished)
+    }
+
+    pub(crate) fn take_dst_mux_gate(&mut self) -> Vec<Option<CopyMuxHandle>> {
+        std::mem::take(&mut self.dst_mux_gate)
     }
 
     pub(crate) fn destination_is_empty(&mut self) -> bool {
