@@ -19,8 +19,12 @@
 //! that transition preserves texels in practice. Pixel correctness is
 //! verified by an end-to-end test before trusting a new driver.
 
-use ash::{ext, khr, vk};
-use log::{info, warn};
+use ash::{khr, vk};
+#[cfg(target_os = "linux")]
+use ash::ext;
+#[cfg(target_os = "linux")]
+use log::info;
+use log::warn;
 
 /// DRM fourccs accepted for NV12-shaped exports (drm_fourcc.h values).
 const DRM_FORMAT_R8: u32 = 0x2020_3852; // 'R8  '
@@ -31,6 +35,7 @@ const DRM_FORMAT_NV12: u32 = 0x3231_564E; // 'NV12'
 /// All handles are non-owning clones of what wgpu-hal keeps alive; this
 /// struct must not outlive the `wgpu::Device` it was created with (both live
 /// in `GpuState`, dropped together).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) struct HwVulkanInterop {
     ash_instance: ash::Instance,
     ash_device: ash::Device,
@@ -129,6 +134,7 @@ pub(crate) unsafe fn parse_drm_nv12(
 /// device extensions enabled. Returns `None` (with an info log) whenever the
 /// backend or the driver cannot support it, so the caller can fall back to
 /// the plain `request_device` path.
+#[cfg(target_os = "linux")]
 pub(crate) fn try_open_dmabuf_device(
     adapter: &wgpu::Adapter,
     device_desc: &wgpu::DeviceDescriptor,
@@ -196,6 +202,17 @@ pub(crate) fn try_open_dmabuf_device(
     }
 }
 
+/// Non-Linux: the DRM PRIME dmabuf zero-copy path is a Linux/VAAPI feature.
+/// Elsewhere the caller opens the wgpu device normally and hardware frames
+/// take the `av_hwframe_transfer_data` download path.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn try_open_dmabuf_device(
+    _adapter: &wgpu::Adapter,
+    _device_desc: &wgpu::DeviceDescriptor,
+) -> Option<(wgpu::Device, wgpu::Queue, HwVulkanInterop)> {
+    None
+}
+
 #[cfg(unix)]
 fn dup_fd(fd: std::os::raw::c_int) -> Result<std::os::raw::c_int, String> {
     // SAFETY: plain fcntl dup of a descriptor owned by the mapped frame.
@@ -214,6 +231,23 @@ fn dup_fd(_fd: std::os::raw::c_int) -> Result<std::os::raw::c_int, String> {
     Err("dmabuf import is only supported on unix".to_string())
 }
 
+/// Non-Linux stub: the dmabuf zero-copy path exists only on Linux, so the
+/// interop is never constructed off Linux and this is never reached at
+/// runtime; it exists so the shared call sites compile on every platform.
+#[cfg(not(target_os = "linux"))]
+impl HwVulkanInterop {
+    pub(crate) fn import_nv12(
+        &self,
+        _device: &wgpu::Device,
+        _drm: &DrmNv12,
+        _w: u32,
+        _h: u32,
+    ) -> Result<ImportedNv12, String> {
+        Err("dmabuf import is only supported on Linux".to_string())
+    }
+}
+
+#[cfg(target_os = "linux")]
 impl HwVulkanInterop {
     /// Imports both NV12 planes of a single-object dmabuf as wgpu textures.
     /// `w`/`h` are the frame's display dimensions.
