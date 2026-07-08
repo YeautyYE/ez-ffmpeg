@@ -94,6 +94,7 @@ pub(crate) fn mux_init(
     scheduler_status: Arc<AtomicUsize>,
     thread_sync: ThreadSynchronizer,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
+    mux_done_remaining: Arc<AtomicUsize>,
 ) -> crate::error::Result<()> {
     // Compute the `-shortest` packet sync-queue plan while the output context is
     // still owned (it reads each stream's media type); `None` unless the gate
@@ -106,6 +107,9 @@ pub(crate) fn mux_init(
         .out_fmt_ctx
         .take()
         .expect("mux_init called without an output context");
+    // This muxer's completion guard: it flows through the handoff and drops on
+    // whichever exit path this muxer takes (last one publishes STATUS_END).
+    let mux_done = MuxDoneGuard::new(mux_done_remaining, scheduler_status.clone());
     mux_task_start(
         mux_idx,
         out_fmt_ctx,
@@ -125,6 +129,7 @@ pub(crate) fn mux_init(
         scheduler_status,
         thread_sync,
         scheduler_result,
+        mux_done,
     )
 }
 
@@ -136,9 +141,15 @@ pub(crate) fn ready_to_init_mux(
     scheduler_status: Arc<AtomicUsize>,
     thread_sync: ThreadSynchronizer,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
+    mux_done_remaining: Arc<AtomicUsize>,
 ) -> crate::error::Result<Option<crossbeam_channel::Sender<i32>>> {
     if !mux.is_ready() {
         let (sender, receiver) = crossbeam_channel::bounded(1);
+        // This muxer's completion guard (a ready muxer takes the `mux_init` path
+        // and makes its own; the else-branch below drops `mux_done_remaining`
+        // without counting). Moved into the waiter thread so it drops on every
+        // exit — stop/disconnect before init, or through mux_task_start.
+        let mux_done = MuxDoneGuard::new(mux_done_remaining, scheduler_status.clone());
 
         // Take sole ownership of the output context out of the Muxer. It is moved
         // into the waiter thread below; if streams never become ready the waiter
@@ -221,6 +232,7 @@ pub(crate) fn ready_to_init_mux(
                         scheduler_status,
                         thread_sync,
                         scheduler_result,
+                        mux_done,
                     ) {
                         // mux_task_start already logged the root cause and
                         // recorded it via set_scheduler_error.
@@ -259,6 +271,7 @@ fn mux_task_start(
     scheduler_status: Arc<AtomicUsize>,
     thread_sync: ThreadSynchronizer,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
+    mux_done: MuxDoneGuard,
 ) -> crate::error::Result<()> {
     if queue.is_none() {
         // Zero-stream output (e.g. an AVFMT_NOSTREAMS muxer): no mux worker
@@ -269,7 +282,9 @@ fn mux_task_start(
         // is not an error.
         release_mux_slot(&scheduler_status, &thread_sync);
         // `out_fmt_ctx` is owned here: this early return drops it, freeing the
-        // context. Previously the raw pointer was leaked on this zero-stream path.
+        // context. `mux_done` also drops here — a streamless output still counts
+        // toward "all muxers done", so a mix with a real output cannot strand a
+        // choked demuxer. Previously the raw pointer was leaked on this path.
         return Ok(());
     }
 
@@ -292,6 +307,7 @@ fn mux_task_start(
         scheduler_status,
         thread_sync,
         scheduler_result,
+        mux_done,
     )?;
 
     // Drain the pre-queues and open the gate atomically: an encoder that
@@ -363,6 +379,7 @@ fn _mux_init(
     scheduler_status: Arc<AtomicUsize>,
     thread_sync: ThreadSynchronizer,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
+    mux_done: MuxDoneGuard,
 ) -> crate::error::Result<()> {
     // `out_fmt_ctx` (a FormatContext) is the sole owner here; it Drops — freeing
     // the context — on the write_header error return below, and is moved into the
@@ -460,6 +477,12 @@ fn _mux_init(
         // Move the FormatContext into the worker; it Drops (frees the output
         // context, custom-IO-aware) when this closure ends — the terminal free.
         let out_fmt_ctx = out_fmt_ctx;
+        // This muxer's completion guard rides the worker to the end: it drops
+        // AFTER the loop, trailer, and `thread_done_with` below, so the last
+        // muxer publishes STATUS_END once the output is fully written — covering
+        // the paths (write returning AVERROR_EOF) the balancing pass misses. On
+        // a failed spawn the un-run closure is dropped, so it still counts.
+        let _mux_done = mux_done;
         // Per-output-stream BSF chains (None for streams without one), or an
         // empty vec when no output set a BSF at all. Owned by the worker; each
         // `BitStreamFilter` frees its AVBSFContext/AVPacket on drop.
@@ -1021,6 +1044,72 @@ fn fail_mux_init(
 ) {
     set_scheduler_error(scheduler_status, scheduler_result, error);
     release_mux_slot(scheduler_status, thread_sync);
+}
+
+/// Muxer-completion counter — the ez equivalent of fftools
+/// `Scheduler.nb_mux`/`nb_mux_done` (`ffmpeg_sched.c` `mux_done -> sch_wait ->
+/// sch_stop`). One guard per muxer, created at scheduler start; whichever muxer
+/// finishes LAST — every output having finished, failed, or been streamless —
+/// publishes `STATUS_END` directly.
+///
+/// This closes a termination gap the per-thread counter (`ThreadSynchronizer`)
+/// cannot cover on its own: `STATUS_END` was otherwise published only once the
+/// LAST worker exited, yet a demuxer choked by the `InputController` is itself a
+/// non-exited worker parked in `SchWaiter::wait_with_scheduler_status` waiting
+/// for that very status flip. When a muxer exits on a path that never marks all
+/// streams `source_finished` (a write returning `AVERROR_EOF`, a streamless
+/// output), the balancing pass never unchokes that demuxer and the scheduler
+/// hangs forever. Keying the terminal publish on "all muxers done" — a subset of
+/// workers that excludes demuxers — breaks the ring from the output side.
+///
+/// Implemented as an RAII guard rather than a manual call at each exit so the
+/// muxer-completion COUNT is exactly-once on every path — normal finish,
+/// BSF/header/write failure, worker-spawn failure, streamless output, and
+/// unwind (the guard drops on panic): the ownership move into the worker/waiter
+/// closures makes the compiler enforce it (a missed or doubled count would
+/// silently reintroduce the hang). This governs the mux-done count only; the
+/// worker's own per-thread slot (`thread_done_with`) keeps its existing,
+/// separate panic behavior.
+struct MuxDoneGuard {
+    remaining: Arc<AtomicUsize>,
+    scheduler_status: Arc<AtomicUsize>,
+}
+
+impl MuxDoneGuard {
+    fn new(remaining: Arc<AtomicUsize>, scheduler_status: Arc<AtomicUsize>) -> Self {
+        Self {
+            remaining,
+            scheduler_status,
+        }
+    }
+}
+
+impl Drop for MuxDoneGuard {
+    fn drop(&mut self) {
+        // `fetch_sub` returns the PREVIOUS value; 1 means this guard was the last
+        // live muxer. Publishing only stores the atomic (no condvar/waker notify):
+        // a choked demuxer observes it within one 100ms poll and exits, and the
+        // existing per-thread counter then wakes `wait()` on the true last thread.
+        if self.remaining.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+        // Last muxer done -> publish STATUS_END, but NEVER downgrade a terminal
+        // status already in flight: `abort()` owns STATUS_ABORT and
+        // `set_scheduler_error` owns STATUS_END; the `is_stopping` guard below
+        // refuses to overwrite either.
+        let mut current = self.scheduler_status.load(Ordering::Acquire);
+        while !is_stopping(current) {
+            match self.scheduler_status.compare_exchange_weak(
+                current,
+                STATUS_END,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+    }
 }
 
 /// # Safety
@@ -1644,7 +1733,9 @@ fn max3(a: i64, b: i64, c: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::scheduler::ffmpeg_scheduler::{is_stopping, STATUS_RUN};
+    use crate::core::scheduler::ffmpeg_scheduler::{
+        is_stopping, STATUS_ABORT, STATUS_END, STATUS_RUN,
+    };
     use std::sync::mpsc;
 
     /// The delayed-mux failure paths (write_header error, worker spawn
@@ -1710,6 +1801,121 @@ mod tests {
         );
         // Last thread released: STATUS_END published, but no error recorded.
         assert!(is_stopping(scheduler_status.load(Ordering::Acquire)));
+    }
+
+    // Regression for the premature-STATUS_END truncation (found by the SHIP
+    // review): a streamless (AVFMT_NOSTREAMS) output releases its thread slot
+    // synchronously via `release_mux_slot`. The scheduler now pre-counts EVERY
+    // muxer's slot before any `mux_init`, so an early streamless release cannot
+    // drive the thread counter to zero and stop later, still-pending outputs.
+    // Here both slots are pre-counted (as the scheduler does): releasing the
+    // first must NOT publish a terminal status.
+    #[test]
+    fn streamless_release_is_not_premature_with_pre_counted_slots() {
+        let thread_sync = ThreadSynchronizer::new();
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+
+        // Two muxers, both slots claimed up front.
+        thread_sync.thread_start();
+        thread_sync.thread_start();
+
+        // The first (e.g. streamless) output releases its slot.
+        release_mux_slot(&status, &thread_sync);
+        assert_eq!(
+            status.load(Ordering::Acquire),
+            STATUS_RUN,
+            "releasing one of two pre-counted mux slots must not publish a terminal status"
+        );
+
+        // The second output releases -> now the last slot -> terminal.
+        release_mux_slot(&status, &thread_sync);
+        assert!(
+            is_stopping(status.load(Ordering::Acquire)),
+            "the last mux slot release publishes STATUS_END"
+        );
+    }
+
+    // MuxDoneGuard is the fftools nb_mux/nb_mux_done parity: STATUS_END must be
+    // published only when the LAST muxer's guard drops. The RAII move into each
+    // muxer's worker/waiter closure is what guarantees every exit path (normal
+    // finish, write-AVERROR_EOF break, streamless, header/spawn failure, panic)
+    // counts exactly once; this asserts the counting arithmetic itself.
+    #[test]
+    fn mux_done_guard_publishes_end_only_after_last_muxer() {
+        let remaining = Arc::new(AtomicUsize::new(2));
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+
+        let g1 = MuxDoneGuard::new(remaining.clone(), status.clone());
+        let g2 = MuxDoneGuard::new(remaining.clone(), status.clone());
+
+        drop(g1);
+        assert_eq!(
+            status.load(Ordering::Acquire),
+            STATUS_RUN,
+            "one of two muxers finishing must not terminate the scheduler"
+        );
+
+        drop(g2);
+        assert_eq!(
+            status.load(Ordering::Acquire),
+            STATUS_END,
+            "the last muxer finishing must publish STATUS_END"
+        );
+    }
+
+    // A completed muxer must never downgrade an abort already in flight
+    // (abort() owns STATUS_ABORT, set_scheduler_error owns STATUS_END; the CAS
+    // refuses to overwrite either.)
+    #[test]
+    fn mux_done_guard_never_downgrades_abort() {
+        let remaining = Arc::new(AtomicUsize::new(1));
+        let status = Arc::new(AtomicUsize::new(STATUS_ABORT));
+
+        drop(MuxDoneGuard::new(remaining, status.clone()));
+
+        assert_eq!(
+            status.load(Ordering::Acquire),
+            STATUS_ABORT,
+            "the last muxer must not overwrite an abort with STATUS_END"
+        );
+    }
+
+    // Regression for the write-AVERROR_EOF strand the balancing pass misses: a
+    // demuxer parked choked in SchWaiter, scheduler still RUNNING, must be
+    // released when the LAST muxer finishes — via STATUS_END from the guard,
+    // with no update_locked/unchoke. This is the edge (b) the InputController
+    // fallback (edge a) cannot reach when a muxer exits without marking every
+    // stream source_finished (e.g. a write returning AVERROR_EOF).
+    #[test]
+    fn last_mux_done_releases_a_choked_demuxer() {
+        use crate::util::sch_waiter::SchWaiter;
+
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let waiter = Arc::new(SchWaiter::new());
+        waiter.set(true); // choked with undelivered tail packets
+
+        let (tx, rx) = mpsc::channel();
+        let w = Arc::clone(&waiter);
+        let st = Arc::clone(&status);
+        std::thread::spawn(move || {
+            w.wait_with_scheduler_status(&st, false);
+            let _ = tx.send(());
+        });
+
+        // Parked while the scheduler runs and no muxer has finished.
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            rx.try_recv().is_err(),
+            "the demuxer must stay parked until a terminal status is published"
+        );
+
+        // The one (last) muxer exits on a path that never unchoked it: the guard
+        // publishes STATUS_END directly.
+        let remaining = Arc::new(AtomicUsize::new(1));
+        drop(MuxDoneGuard::new(remaining, status.clone()));
+
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("the choked demuxer must be released when the last muxer finishes");
     }
 
     // build_sq_mux wires the plan into the output-index <-> sq-index maps,
