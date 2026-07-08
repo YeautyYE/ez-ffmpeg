@@ -71,6 +71,10 @@ fn build_sq_mux(plan: SqMuxPlan, stream_count: usize) -> SqMux {
 /// `frame_end` for a mux packet (`sync_queue.c:126`): `pts + duration` in the
 /// packet's own time base, or `None` when the packet carries no pts. Packets
 /// have no `frame_samples`, so `nb_samples` is always 0.
+///
+/// # Safety
+/// - `pkt` must be a valid, non-null pointer to an initialized `AVPacket` that
+///   stays alive for the call (dereferenced to read `pts`/`duration`/`time_base`).
 unsafe fn sq_pkt_end(pkt: *const AVPacket) -> (Option<i64>, AVRational, i32) {
     let pts = (*pkt).pts;
     let end = if pts == AV_NOPTS_VALUE {
@@ -1019,6 +1023,9 @@ fn fail_mux_init(
     release_mux_slot(scheduler_status, thread_sync);
 }
 
+/// # Safety
+/// - `pkt` must be a valid, non-null pointer to an initialized `AVPacket` that
+///   stays alive for the call (dereferenced to read `dts`/`duration`/`time_base`).
 unsafe fn update_last_dts(
     mux_stream_node: &Arc<SchNode>,
     input_controller: &Arc<InputController>,
@@ -1045,6 +1052,10 @@ unsafe fn update_last_dts(
     }
 }
 
+/// # Safety
+/// - `pkt` must be a valid, non-null pointer to an initialized `AVPacket`,
+///   exclusively borrowed for the call: it is both read and written in place
+///   (`pts`/`dts` are mutated, `flags` is read).
 unsafe fn streamcopy_rescale(
     pkt: *mut AVPacket,
     packet_data: &PacketData,
@@ -1127,6 +1138,14 @@ struct MuxWriteState<'a> {
     nb_done: &'a mut usize,
 }
 
+/// # Safety
+/// - `cfg.out_fmt_ctx` must reference the live output context (its pointer is
+///   passed to `av_interleaved_write_frame`).
+/// - `sq_packet_box.packet` must wrap a live, writable packet.
+/// - `sq_packet_box.packet_data.output_stream_index` must be a valid stream index
+///   of that context and in bounds for `state`'s per-stream slices: it is used
+///   (via `mux_fixup_ts`) to offset `(*out_fmt_ctx).streams` and to index
+///   `state.st_rescale_delta_last` / `state.st_last_dts`.
 unsafe fn write_packet(
     cfg: &MuxWriteCfg,
     state: &mut MuxWriteState,
@@ -1145,6 +1164,13 @@ unsafe fn write_packet(
 /// an `sq_mux`-ordered packet. Snapshots the BSF template exactly like the plain
 /// path so an EOF flush stamps trailing packets correctly. Does NOT recycle the
 /// pool shell (the caller owns the released `PacketBox`).
+///
+/// # Safety
+/// - `cfg.out_fmt_ctx` must reference the live output context and
+///   `packet_box.packet_data.output_stream_index` must be a valid stream index of
+///   it: this delegates to `write_packet` / `mux_filter_and_write_packet`, which
+///   offset `(*out_fmt_ctx).streams` by that index.
+/// - `packet_box.packet` must wrap a live, writable packet.
 unsafe fn mux_write_released(
     packet_box: &mut PacketBox,
     cfg: &MuxWriteCfg,
@@ -1167,6 +1193,12 @@ unsafe fn mux_write_released(
 /// demux stops producing this follower (Architecture Y'). Mirrors the plain
 /// loop's per-stream EOF handling; the `sq_mux` cascade is the single place that
 /// counts each stream once. Returns `Err(ret)` on a BSF flush error.
+///
+/// # Safety
+/// - `cfg.out_fmt_ctx` must reference the live output context, and the per-stream
+///   slices in `state` and `stream_bsfs` must be sized to `cfg.stream_count`: the
+///   BSF flush this may call dereferences the context and indexes those slices.
+///   (`ost` is itself bounds-checked against `stream_count` inside the function.)
 unsafe fn sq_finish_output_stream(
     ost: usize,
     cfg: &MuxWriteCfg,
@@ -1253,6 +1285,12 @@ fn sq_mux_pump(
 /// Returns one entry per stream (`None` where the stream has no BSF). On any
 /// failure returns `Err((chain_name, averror))`; every `BitStreamFilter`
 /// allocated so far is dropped (freed) as the local vec unwinds.
+///
+/// # Safety
+/// - `out_fmt_ctx` must be a valid, non-null `AVFormatContext` with at least
+///   `stream_count` streams (each carrying a valid `codecpar`), alive for the
+///   call: it is dereferenced and `streams.add(i)` is read for every `i` in
+///   `0..stream_count`.
 unsafe fn init_bitstream_filters(
     out_fmt_ctx: *mut AVFormatContext,
     bsf_chains: &StreamBsfChains,
@@ -1314,6 +1352,14 @@ unsafe fn init_bitstream_filters(
 /// the no-BSF path is unchanged. Mirrors fftools `mux_packet_filter`
 /// (ffmpeg_mux.c): rescale into the BSF input timebase, send, then drain every
 /// output packet to the muxer.
+///
+/// # Safety
+/// - `packet_box.packet` must wrap a live, writable packet: its raw pointer is
+///   dereferenced and handed to the bitstream filter.
+/// - `cfg.out_fmt_ctx` must reference the live output context and
+///   `packet_box.packet_data.output_stream_index` must be a valid stream index of
+///   it — the write it delegates to (`write_packet` / `drain_bsf_write`) offsets
+///   `(*out_fmt_ctx).streams` by that index.
 unsafe fn mux_filter_and_write_packet(
     cfg: &MuxWriteCfg,
     state: &mut MuxWriteState,
@@ -1372,6 +1418,13 @@ enum BsfDrain {
 /// received packet is moved into a pooled `Packet`, stamped with the filter's
 /// output timebase, tagged with `template` metadata, and written via
 /// `write_packet`.
+///
+/// # Safety
+/// - `bsf` must be an initialized bitstream filter.
+/// - `cfg.out_fmt_ctx` must reference the live output context and
+///   `template.output_stream_index` must be a valid stream index of it: every
+///   drained packet is written via `write_packet`, which offsets
+///   `(*out_fmt_ctx).streams` by that index.
 unsafe fn drain_bsf_write(
     cfg: &MuxWriteCfg,
     state: &mut MuxWriteState,
@@ -1421,6 +1474,13 @@ unsafe fn drain_bsf_write(
 /// packets before the stream is marked finished. No-op (returns `0`) when the
 /// stream has no BSF. Returns `0` on success (including the drain's terminal
 /// EOF) or a negative muxing error.
+///
+/// # Safety
+/// - `stream_index` must be in bounds for `stream_bsfs` and
+///   `state.stream_pkt_templates`, and be a valid stream index of
+///   `cfg.out_fmt_ctx`: on the no-template path
+///   `(*out_fmt_ctx).streams.add(stream_index)` and its `codecpar` are read.
+/// - `cfg.out_fmt_ctx` must reference the live output context.
 unsafe fn flush_stream_bsf(
     cfg: &MuxWriteCfg,
     state: &mut MuxWriteState,
@@ -1459,6 +1519,14 @@ unsafe fn flush_stream_bsf(
     }
 }
 
+/// # Safety
+/// - `cfg.out_fmt_ctx` must reference the live output context and
+///   `packet_box.packet_data.output_stream_index` must be a valid stream index of
+///   it: `(*out_fmt_ctx).streams.add(output_stream_index)` is read unchecked.
+/// - `packet_box.packet` must wrap a live, writable packet: its
+///   `pts`/`dts`/`duration`/`time_base` are mutated in place.
+/// - `output_stream_index` must also be in bounds for
+///   `state.st_rescale_delta_last` and `state.st_last_dts`.
 unsafe fn mux_fixup_ts(cfg: &MuxWriteCfg, state: &mut MuxWriteState, packet_box: &mut PacketBox) {
     let out_fmt_ctx = cfg.out_fmt_ctx.as_ptr();
     let pkt = packet_box.packet.as_mut_ptr();
