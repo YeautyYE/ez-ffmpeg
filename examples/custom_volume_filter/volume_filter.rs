@@ -1,4 +1,4 @@
-use ez_ffmpeg::filter::frame_filter::FrameFilter;
+use ez_ffmpeg::filter::frame_filter::{FrameFilter, FrameFilterError};
 use ez_ffmpeg::filter::frame_filter_context::FrameFilterContext;
 use ffmpeg_next::Frame;
 use ffmpeg_sys_next::{av_frame_copy_props, av_frame_get_buffer, AVMediaType};
@@ -26,7 +26,7 @@ impl FrameFilter for VolumeFilter {
         &mut self,
         frame: Frame,              // The input audio frame to be processed
         _ctx: &FrameFilterContext, // Context of the filter (not used here)
-    ) -> Result<Option<Frame>, String> {
+    ) -> Result<Option<Frame>, FrameFilterError> {
         unsafe {
             // Ensure the frame is valid and not empty
             if frame.as_ptr().is_null() || frame.is_empty() {
@@ -65,17 +65,14 @@ impl FrameFilter for VolumeFilter {
                 let mut resample_frame = unsafe { Frame::empty() };
                 unsafe {
                     if resample_frame.as_ptr().is_null() {
-                        return Err(
-                            "failed to create resample_frame frame: Out of memory.".to_string()
-                        );
+                        return Err("failed to create resample_frame frame: Out of memory.".into());
                     }
 
                     let mut ret = av_frame_copy_props(resample_frame.as_mut_ptr(), frame.as_ptr());
                     if ret < 0 {
-                        return Err(format!(
-                            "failed to copy properties. ret:{}",
-                            av_err2str(ret)
-                        ));
+                        return Err(
+                            format!("failed to copy properties. ret:{}", av_err2str(ret)).into(),
+                        );
                     }
 
                     (*resample_frame.as_mut_ptr()).sample_rate = sample_rate;
@@ -90,7 +87,8 @@ impl FrameFilter for VolumeFilter {
                         return Err(format!(
                             "failed to allocate buffer for resample_frame. {}",
                             av_err2str(ret)
-                        ));
+                        )
+                        .into());
                     }
 
                     // Perform resampling
@@ -107,7 +105,8 @@ impl FrameFilter for VolumeFilter {
                             (*frame.as_ptr()).format,
                             (*resample_frame.as_ptr()).format,
                             ez_ffmpeg::util::ffmpeg_utils::av_err2str(ret)
-                        ));
+                        )
+                        .into());
                     }
                     resample_frame
                 }

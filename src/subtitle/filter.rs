@@ -4,7 +4,7 @@ use super::backend::SubtitleRenderer;
 use super::blend::{self, ColorMatrix, ColorRange, OverlayImage, PlaneView, SampleFormat};
 use super::layout::{self, ColorModel, FormatSpec};
 use super::options::SubtitleFilterBuilder;
-use crate::core::filter::frame_filter::FrameFilter;
+use crate::core::filter::frame_filter::{FrameFilter, FrameFilterError};
 use crate::core::filter::frame_filter_context::FrameFilterContext;
 use crate::util::ffmpeg_utils::av_err2str;
 use ffmpeg_next::Frame;
@@ -493,7 +493,7 @@ impl FrameFilter for SubtitleFilter {
         &mut self,
         mut frame: Frame,
         _ctx: &FrameFilterContext,
-    ) -> Result<Option<Frame>, String> {
+    ) -> Result<Option<Frame>, FrameFilterError> {
         // Props-only frames (buf[0] == null EOF markers) and pixel-less frames
         // pass through untouched — and this filter never returns Ok(None),
         // which would starve downstream consumers.
@@ -524,7 +524,7 @@ impl FrameFilter for SubtitleFilter {
             return Err(
                 "SubtitleFilter requires software frames; do not set hwaccel_output_format to a \
                  hardware format (frames must be downloaded before this filter)"
-                    .to_string(),
+                    .into(),
             );
         }
         // `format` is a raw C int; matching it against known `AV_PIX_FMT_*`
@@ -538,7 +538,8 @@ impl FrameFilter for SubtitleFilter {
                  Supported: {}",
                 pix_fmt_name(format),
                 layout::SUPPORTED_LIST
-            ));
+            )
+            .into());
         };
 
         if pts == AV_NOPTS_VALUE || time_base.num <= 0 || time_base.den <= 0 {
@@ -576,10 +577,7 @@ impl FrameFilter for SubtitleFilter {
         // SAFETY: valid owned frame.
         let ret = unsafe { av_frame_make_writable(frame.as_mut_ptr()) };
         if ret < 0 {
-            return Err(format!(
-                "av_frame_make_writable failed: {}",
-                av_err2str(ret)
-            ));
+            return Err(format!("av_frame_make_writable failed: {}", av_err2str(ret)).into());
         }
 
         // Negative linesizes (bottom-up layouts, e.g. produced by vflip) can
@@ -597,7 +595,7 @@ impl FrameFilter for SubtitleFilter {
             return Err(
                 "SubtitleFilter: negative linesize (bottom-up/vertically flipped frames) is \
                  not supported; apply vflip after this filter or convert the frame first"
-                    .to_string(),
+                    .into(),
             );
         }
 

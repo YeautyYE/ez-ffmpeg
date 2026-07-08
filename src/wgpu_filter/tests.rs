@@ -1,5 +1,5 @@
 use crate::core::filter::frame_filter_context::FrameFilterContext;
-use crate::filter::frame_filter::FrameFilter;
+use crate::filter::frame_filter::{FrameFilter, FrameFilterError};
 use crate::wgpu_filter::shaders;
 use crate::wgpu_filter::wgpu_frame_filter::WgpuFrameFilter;
 use ffmpeg_next::Frame;
@@ -81,7 +81,7 @@ fn init_filter(filter: &mut WgpuFrameFilter) -> bool {
     let ctx = make_ctx(&mut map);
     match filter.init(&ctx) {
         Ok(()) => true,
-        Err(e) if e.contains("adapter") || e.contains("device") => {
+        Err(e) if e.to_string().contains("adapter") || e.to_string().contains("device") => {
             eprintln!("skipping wgpu test (no GPU): {e}");
             false
         }
@@ -350,7 +350,7 @@ fn test_oversized_frame_rejected() {
         Ok(_) => panic!("oversized frame must be rejected"),
     };
     assert!(
-        err.contains("maximum texture dimension"),
+        err.to_string().contains("maximum texture dimension"),
         "unexpected error: {err}"
     );
 }
@@ -405,7 +405,10 @@ fn test_rejects_unsupported_and_hw_formats() {
             Err(e) => e,
             Ok(_) => panic!("RGB24 input must be rejected"),
         };
-        assert!(err.contains("format=yuv420p"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("format=yuv420p"),
+            "unexpected error: {err}"
+        );
 
         // Allocate as YUV420P (so buf[0] is non-null) and then relabel as a
         // hardware format: hardware frames now take the download path, and
@@ -418,7 +421,7 @@ fn test_rejects_unsupported_and_hw_formats() {
             Ok(_) => panic!("a fake hardware frame must fail the download"),
         };
         assert!(
-            err.contains("download hardware frame"),
+            err.to_string().contains("download hardware frame"),
             "unexpected error: {err}"
         );
     }
@@ -460,11 +463,11 @@ fn test_params_shader_size_mismatch_fails_at_init() {
     let mut map = HashMap::new();
     let ctx = make_ctx(&mut map);
     match filter.init(&ctx) {
-        Err(e) if e.contains("adapter") || e.contains("device") => {
+        Err(e) if e.to_string().contains("adapter") || e.to_string().contains("device") => {
             eprintln!("skipping wgpu test (no GPU): {e}");
         }
         Err(e) => assert!(
-            e.contains("pipeline") || e.contains("binding"),
+            e.to_string().contains("pipeline") || e.to_string().contains("binding"),
             "expected binding-contract diagnostics, got: {e}"
         ),
         Ok(()) => panic!("init must fail when shader params exceed provided buffer"),
@@ -477,11 +480,13 @@ fn test_bad_shader_fails_at_init_with_diagnostics() {
     let mut map = HashMap::new();
     let ctx = make_ctx(&mut map);
     match filter.init(&ctx) {
-        Err(e) if e.contains("adapter") || e.contains("device") => {
+        Err(e) if e.to_string().contains("adapter") || e.to_string().contains("device") => {
             eprintln!("skipping wgpu test (no GPU): {e}");
         }
         Err(e) => assert!(
-            e.contains("shader") || e.contains("Shader") || e.contains("parse"),
+            e.to_string().contains("shader")
+                || e.to_string().contains("Shader")
+                || e.to_string().contains("parse"),
             "expected shader diagnostics, got: {e}"
         ),
         Ok(()) => panic!("init must fail for invalid WGSL"),
@@ -503,7 +508,7 @@ impl FrameFilter for CountingFilter {
         &mut self,
         frame: Frame,
         _ctx: &FrameFilterContext,
-    ) -> Result<Option<Frame>, String> {
+    ) -> Result<Option<Frame>, FrameFilterError> {
         self.seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Some(frame))
     }
@@ -552,7 +557,7 @@ fn test_frame_pipeline_driver_semantics() {
     );
     match pipeline.init_filters() {
         Ok(()) => {}
-        Err(e) if e.contains("adapter") || e.contains("device") => {
+        Err(e) if e.to_string().contains("adapter") || e.to_string().contains("device") => {
             eprintln!("skipping wgpu test (no GPU): {e}");
             return;
         }

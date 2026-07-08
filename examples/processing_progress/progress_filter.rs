@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use ez_ffmpeg::filter::frame_filter::FrameFilter;
+use ez_ffmpeg::filter::frame_filter::{FrameFilter, FrameFilterError};
 use ez_ffmpeg::filter::frame_filter_context::FrameFilterContext;
 use ez_ffmpeg::AVMediaType;
 use ez_ffmpeg::Frame;
@@ -65,7 +65,7 @@ impl FrameFilter for ProgressCallBackFilter {
         &mut self,
         frame: Frame,
         _ctx: &FrameFilterContext,
-    ) -> Result<Option<Frame>, String> {
+    ) -> Result<Option<Frame>, FrameFilterError> {
         unsafe {
             // Ensure the frame is valid and not empty
             if frame.as_ptr().is_null() || frame.is_empty() {

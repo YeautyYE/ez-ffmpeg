@@ -7,7 +7,7 @@
 #![allow(deprecated)]
 
 use crate::core::filter::frame_filter_context::FrameFilterContext;
-use crate::filter::frame_filter::FrameFilter;
+use crate::filter::frame_filter::{FrameFilter, FrameFilterError};
 use crate::util::ffmpeg_utils::av_err2str;
 use crate::util::frame_utils::ensure_software_format;
 use ffmpeg_next::Frame;
@@ -974,7 +974,7 @@ impl FrameFilter for OpenGLFrameFilter {
         AVMediaType::AVMEDIA_TYPE_VIDEO
     }
 
-    fn init(&mut self, _ctx: &FrameFilterContext) -> Result<(), String> {
+    fn init(&mut self, _ctx: &FrameFilterContext) -> Result<(), FrameFilterError> {
         self.init_opengl()?;
 
         self.print_opengl_info();
@@ -998,7 +998,7 @@ impl FrameFilter for OpenGLFrameFilter {
         &mut self,
         mut frame: Frame,
         _ctx: &FrameFilterContext,
-    ) -> Result<Option<Frame>, String> {
+    ) -> Result<Option<Frame>, FrameFilterError> {
         unsafe {
             if frame.as_ptr().is_null() || frame.is_empty() {
                 return Ok(Some(frame));
@@ -1034,10 +1034,7 @@ impl FrameFilter for OpenGLFrameFilter {
         unsafe {
             let ret = av_frame_make_writable(frame.as_mut_ptr());
             if ret < 0 {
-                return Err(format!(
-                    "Failed to make frame writable: {}",
-                    av_err2str(ret)
-                ));
+                return Err(format!("Failed to make frame writable: {}", av_err2str(ret)).into());
             }
         }
 

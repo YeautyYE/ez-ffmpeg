@@ -22,6 +22,15 @@ pub enum RequestFrameMode {
     MayProduce,
 }
 
+/// Error type returned by [`FrameFilter`] methods.
+///
+/// A boxed error trait object, so an implementation can propagate any error
+/// with `?` or `.into()` (e.g. `return Err("bad config".into())`) instead of
+/// being forced to construct this crate's private error enum. The pipeline
+/// wraps it into [`Error::FrameFilterInit`](crate::error::Error::FrameFilterInit)
+/// / `FrameFilterProcess` / `FrameFilterRequest`, preserving the source.
+pub type FrameFilterError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
 pub trait FrameFilter: Send {
     /// Returns the media type this filter operates on.
     ///
@@ -42,8 +51,8 @@ pub trait FrameFilter: Send {
     ///
     /// # Returns
     /// - `Ok(())` if initialization succeeds.
-    /// - `Err(String)` if there is an error during initialization.
-    fn init(&mut self, ctx: &FrameFilterContext) -> Result<(), String> {
+    /// - `Err(e)` (any [`FrameFilterError`]) if initialization fails.
+    fn init(&mut self, ctx: &FrameFilterContext) -> Result<(), FrameFilterError> {
         log::debug!("Initializing filter:{}", ctx.name());
         Ok(())
     }
@@ -62,7 +71,7 @@ pub trait FrameFilter: Send {
     /// # Returns
     /// - `Ok(Some(frame))` if the filter produces a new frame.
     /// - `Ok(None)` if no frame is produced.
-    /// - `Err(String)` if there is an error during processing.
+    /// - `Err(e)` (any [`FrameFilterError`]) if processing fails.
     ///
     /// # End of stream
     /// The last frame a pipeline delivers may be a props-only marker (no
@@ -78,7 +87,7 @@ pub trait FrameFilter: Send {
         &mut self,
         _frame: Frame,
         _ctx: &FrameFilterContext,
-    ) -> Result<Option<Frame>, String> {
+    ) -> Result<Option<Frame>, FrameFilterError> {
         Ok(None)
     }
 
@@ -95,8 +104,11 @@ pub trait FrameFilter: Send {
     /// # Returns
     /// - `Ok(Some(frame))` if the filter produces a frame.
     /// - `Ok(None)` if no frame is produced.
-    /// - `Err(String)` if there is an error during processing.
-    fn request_frame(&mut self, _ctx: &FrameFilterContext) -> Result<Option<Frame>, String> {
+    /// - `Err(e)` (any [`FrameFilterError`]) if the request fails.
+    fn request_frame(
+        &mut self,
+        _ctx: &FrameFilterContext,
+    ) -> Result<Option<Frame>, FrameFilterError> {
         Ok(None)
     }
 
@@ -141,7 +153,7 @@ impl FrameFilter for NoopFilter {
         &mut self,
         frame: Frame,
         _ctx: &FrameFilterContext,
-    ) -> Result<Option<Frame>, String> {
+    ) -> Result<Option<Frame>, FrameFilterError> {
         Ok(Some(frame))
     }
 

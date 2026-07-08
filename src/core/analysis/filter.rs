@@ -6,7 +6,7 @@
 //! Mount it on an output frame pipeline downstream of the detector filters.
 
 use crate::core::analysis::event::{parse_frame_metadata, MetadataEvent, ParseState, Timestamp};
-use crate::core::filter::frame_filter::{FrameFilter, RequestFrameMode};
+use crate::core::filter::frame_filter::{FrameFilter, FrameFilterError, RequestFrameMode};
 use crate::core::filter::frame_filter_context::FrameFilterContext;
 use ffmpeg_next::Frame;
 use ffmpeg_sys_next::{AVMediaType, AV_NOPTS_VALUE};
@@ -157,7 +157,7 @@ impl FrameFilter for MetadataEventFilter {
         &mut self,
         frame: Frame,
         _ctx: &FrameFilterContext,
-    ) -> Result<Option<Frame>, String> {
+    ) -> Result<Option<Frame>, FrameFilterError> {
         // Props-only / null frames pass straight through (matches SubtitleFilter),
         // and never yield Ok(None), which would starve downstream consumers.
         // SAFETY: the returned raw pointer is null-checked before any deref.

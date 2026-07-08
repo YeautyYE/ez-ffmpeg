@@ -377,7 +377,7 @@ pub mod codec;
 ///         &mut self,
 ///         mut frame: Frame,
 ///         _ctx: &FrameFilterContext,
-///     ) -> Result<Option<Frame>, String> {
+///     ) -> Result<Option<Frame>, Box<dyn std::error::Error + Send + Sync>> {
 ///          unsafe {
 ///             if frame.as_ptr().is_null() || frame.is_empty() {
 ///                 return Ok(Some(frame));
