@@ -26,16 +26,13 @@
 //! the output carries both streams.
 
 use ez_ffmpeg::stream_info::{find_subtitle_stream_info, find_video_stream_info, StreamInfo};
-use ez_ffmpeg::{FfmpegContext, FfmpegScheduler, Input, Output};
-use std::time::Duration;
+use ez_ffmpeg::{FfmpegContext, Input, Output};
+
+mod common;
+use common::{tmp_path_in, wait_with_watchdog};
 
 fn tmp_path(name: &str) -> String {
-    let dir = std::env::temp_dir().join(format!(
-        "ez_ffmpeg_streamcopy_deadlock_tests_{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir.join(name).to_string_lossy().into_owned()
+    tmp_path_in("ez_ffmpeg_streamcopy_deadlock_tests", name)
 }
 
 /// A SubRip fixture whose only cue starts `start_s` seconds in, so the muxed
@@ -53,28 +50,6 @@ fn sparse_srt_fixture(name: &str, start_s: u32) -> String {
     )
     .unwrap();
     path
-}
-
-/// A hang is a test failure, not a suite timeout. (Copied from `shortest.rs` so
-/// a deadlock surfaces as a `panic!` here instead of stalling the whole suite.)
-fn wait_with_watchdog(
-    scheduler: FfmpegScheduler<ez_ffmpeg::core::scheduler::ffmpeg_scheduler::Running>,
-    secs: u64,
-    scenario: &str,
-) -> ez_ffmpeg::error::Result<()> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(scheduler.wait());
-    });
-    match rx.recv_timeout(Duration::from_secs(secs)) {
-        Ok(result) => result,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            panic!("scenario `{scenario}` did not finish within {secs}s (hang)")
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            panic!("scenario `{scenario}`: wait() thread panicked before reporting")
-        }
-    }
 }
 
 /// Build the single-file fixture: a dense `secs`-second mpeg4 video plus a
