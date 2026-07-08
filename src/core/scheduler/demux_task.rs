@@ -1,4 +1,3 @@
-use std::ffi::CStr;
 use crate::core::context::decoder_stream::DecoderStream;
 use crate::core::context::demuxer::{CopyMuxHandle, Demuxer};
 use crate::core::context::obj_pool::ObjPool;
@@ -7,9 +6,12 @@ use crate::core::scheduler::enc_task::{send_to_mux, SendToMuxError};
 use crate::core::scheduler::ffmpeg_scheduler::{
     is_stopping, packet_is_null, set_scheduler_error, wait_until_not_paused,
 };
+use crate::core::scheduler::input_controller::SchNode;
 use crate::error::Error::{Demuxing, Encoding};
 use crate::error::{DemuxingError, DemuxingOperationError, EncodingOperationError};
+use crate::util::ffmpeg_utils::av_err2str;
 use crate::util::ffmpeg_utils::av_rescale_q_rnd;
+use crate::util::thread_synchronizer::{ThreadDoneGuard, ThreadSynchronizer};
 use crossbeam_channel::Sender;
 use ffmpeg_next::packet::{Mut, Ref};
 use ffmpeg_next::Packet;
@@ -19,19 +21,16 @@ use ffmpeg_sys_next::AVRounding::AV_ROUND_NEAR_INF;
 use ffmpeg_sys_next::AV_CODEC_PROP_FIELDS;
 use ffmpeg_sys_next::{
     av_compare_ts, av_gettime_relative, av_inv_q, av_mul_q, av_packet_ref, av_q2d, av_read_frame,
-    av_rescale, av_rescale_q, av_stream_get_parser, av_usleep,
-    avformat_seek_file, AVCodecDescriptor, AVFormatContext, AVMediaType,
-    AVPacket, AVRational, AVStream, AVERROR, AVERROR_EOF, AVFMT_TS_DISCONT,
-    AV_NOPTS_VALUE, AV_PKT_FLAG_CORRUPT, AV_TIME_BASE, AV_TIME_BASE_Q,
-    EAGAIN,
+    av_rescale, av_rescale_q, av_stream_get_parser, av_usleep, avformat_seek_file,
+    AVCodecDescriptor, AVFormatContext, AVMediaType, AVPacket, AVRational, AVStream, AVERROR,
+    AVERROR_EOF, AVFMT_TS_DISCONT, AV_NOPTS_VALUE, AV_PKT_FLAG_CORRUPT, AV_TIME_BASE,
+    AV_TIME_BASE_Q, EAGAIN,
 };
 use libc::{c_int, c_uint};
 use log::{debug, error, info, warn};
+use std::ffi::CStr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use crate::core::scheduler::input_controller::SchNode;
-use crate::util::ffmpeg_utils::av_err2str;
-use crate::util::thread_synchronizer::{ThreadDoneGuard, ThreadSynchronizer};
 
 #[cfg(docsrs)]
 pub(crate) fn demux_init(
@@ -82,7 +81,11 @@ pub(crate) fn demux_init(
     #[cfg(windows)]
     let hwaccel = { demux.hwaccel.take() };
 
-    let format_name = unsafe { CStr::from_ptr((*(*in_fmt_ctx.as_ptr()).iformat).name).to_str().unwrap_or("unknown") };
+    let format_name = unsafe {
+        CStr::from_ptr((*(*in_fmt_ctx.as_ptr()).iformat).name)
+            .to_str()
+            .unwrap_or("unknown")
+    };
 
     // Claim the thread slot before spawning so stop()/wait() can never
     // observe a zero counter while this worker is about to run; the guard
@@ -390,9 +393,7 @@ fn demux_done(
                 // Normal teardown: this destination already finished (max_frames /
                 // recording_time / downstream exit). FFmpeg's demux_done ignores
                 // AVERROR_EOF here as well (fftools/ffmpeg_sched.c).
-                debug!(
-                    "demux_done: dst {i} (input stream {input_stream_index}) already finished"
-                );
+                debug!("demux_done: dst {i} (input stream {input_stream_index}) already finished");
             } else if ret < 0 {
                 warn!(
                     "demux_done: failed to send flush packet for input stream {input_stream_index}, ret={ret}"
@@ -466,7 +467,8 @@ unsafe fn ts_fixup(
     in_fmt_ctx: *mut AVFormatContext,
     pkt: *mut AVPacket,
     copy_ts: bool,
-) {}
+) {
+}
 
 #[cfg(not(docsrs))]
 unsafe fn ts_fixup(
@@ -486,10 +488,7 @@ unsafe fn ts_fixup(
             .get_mut((*pkt).stream_index as usize)
             .unwrap();
 
-        if !ds.wrap_correction_done
-            && start_time != AV_NOPTS_VALUE
-            && (*ist).pts_wrap_bits < 64
-        {
+        if !ds.wrap_correction_done && start_time != AV_NOPTS_VALUE && (*ist).pts_wrap_bits < 64 {
             let stime = av_rescale_q(start_time, AV_TIME_BASE_Q, (*pkt).time_base);
             let stime2 = stime + (1u64 << (*ist).pts_wrap_bits) as i64;
             ds.wrap_correction_done = true;
@@ -593,7 +592,8 @@ unsafe fn ist_dts_update(
     demux_parameter: &mut DemuxerParameter,
     ist: *mut AVStream,
     pkt: *mut AVPacket,
-) {}
+) {
+}
 
 #[cfg(not(docsrs))]
 unsafe fn ist_dts_update(
@@ -650,10 +650,8 @@ unsafe fn ist_dts_update(
         AVMEDIA_TYPE_VIDEO => {
             if framerate.num != 0 {
                 let time_base_q = AV_TIME_BASE_Q;
-                let next_dts =
-                    av_rescale_q(ds.next_dts, time_base_q, av_inv_q(framerate));
-                ds.next_dts =
-                    av_rescale_q(next_dts + 1, av_inv_q(framerate), time_base_q);
+                let next_dts = av_rescale_q(ds.next_dts, time_base_q, av_inv_q(framerate));
+                ds.next_dts = av_rescale_q(next_dts + 1, av_inv_q(framerate), time_base_q);
             } else if (*pkt).duration != 0 {
                 ds.next_dts += av_rescale_q((*pkt).duration, (*pkt).time_base, AV_TIME_BASE_Q);
             } else if (*par).framerate.num != 0 {
@@ -672,7 +670,6 @@ unsafe fn ist_dts_update(
         }
         _ => {}
     }
-
 }
 
 #[cfg(docsrs)]
@@ -681,7 +678,8 @@ unsafe fn ts_discontinuity_process(
     in_fmt_ctx: *mut AVFormatContext,
     ist: *mut AVStream,
     pkt: *mut AVPacket,
-) {}
+) {
+}
 
 #[cfg(not(docsrs))]
 unsafe fn ts_discontinuity_process(
@@ -721,7 +719,8 @@ unsafe fn ts_discontinuity_detect(
     in_fmt_ctx: *mut AVFormatContext,
     ist: *mut AVStream,
     pkt: *mut AVPacket,
-) {}
+) {
+}
 
 #[cfg(not(docsrs))]
 unsafe fn ts_discontinuity_detect(
@@ -813,8 +812,7 @@ unsafe fn ts_discontinuity_detect(
             demux_parameter.ts_offset_discont -= delta;
             debug!(
                 "Inter stream timestamp discontinuity {}, new offset= {}",
-                delta,
-                demux_parameter.ts_offset_discont
+                delta, demux_parameter.ts_offset_discont
             );
             (*pkt).dts -= av_rescale_q(delta, AV_TIME_BASE_Q, (*pkt).time_base);
             if (*pkt).pts != AV_NOPTS_VALUE {
@@ -992,7 +990,6 @@ impl DemuxerParameter {
                 nb_streams_used += 1;
             }
         }
-
 
         Self {
             dsts_finished,
@@ -1179,9 +1176,9 @@ unsafe fn demux_send(
     independent_readrate: bool,
 ) -> i32 {
     let node = demux_node.as_ref();
-    let SchNode::Demux {
-        waiter, ..
-    } = node else { unreachable!() };
+    let SchNode::Demux { waiter, .. } = node else {
+        unreachable!()
+    };
     let wait_time = waiter.wait_with_scheduler_status(scheduler_status, independent_readrate);
     if is_stopping(wait_until_not_paused(scheduler_status)) {
         return ffmpeg_sys_next::AVERROR_EXIT;
@@ -1318,11 +1315,7 @@ unsafe fn demux_send_for_stream(
             // demuxer — otherwise a stream whose consumers had all finished
             // kept the whole demuxer spinning (ffmpeg_sched.c
             // demux_send_for_stream: nb_done == ds->nb_dst).
-            return if nb_done == dst_count {
-                AVERROR_EOF
-            } else {
-                0
-            };
+            return if nb_done == dst_count { AVERROR_EOF } else { 0 };
         }
 
         let Ok(mut to_send) = packet_pool.get() else {
@@ -1532,7 +1525,9 @@ unsafe fn demux_flush(
 
 #[cfg(test)]
 mod tests {
-    use ffmpeg_sys_next::{av_inv_q, av_rescale_q, AVRational, AV_NOPTS_VALUE, AV_TIME_BASE, AV_TIME_BASE_Q};
+    use ffmpeg_sys_next::{
+        av_inv_q, av_rescale_q, AVRational, AV_NOPTS_VALUE, AV_TIME_BASE, AV_TIME_BASE_Q,
+    };
 
     /// Apply ts_scale to a timestamp value.
     /// Returns the scaled timestamp, or AV_NOPTS_VALUE if input is AV_NOPTS_VALUE.
@@ -1731,18 +1726,26 @@ mod tests {
         let next = compute_next_dts_with_framerate(0, fr);
         // Expected: ~33333 us (1/30 of AV_TIME_BASE)
         let expected = AV_TIME_BASE as i64 / 30;
-        assert!((next - expected).abs() <= 1, "30fps: next={next}, expected={expected}");
+        assert!(
+            (next - expected).abs() <= 1,
+            "30fps: next={next}, expected={expected}"
+        );
     }
 
     #[test]
     fn framerate_dts_24000_1001() {
         // 23.976 fps (NTSC film): framerate = 24000/1001
-        let fr = AVRational { num: 24000, den: 1001 };
+        let fr = AVRational {
+            num: 24000,
+            den: 1001,
+        };
         let next = compute_next_dts_with_framerate(0, fr);
         // Expected: 1001/24000 * 1_000_000 = 41708.33.. us
         let expected_us = (1001.0 / 24000.0 * AV_TIME_BASE as f64) as i64;
-        assert!((next - expected_us).abs() <= 1,
-            "23.976fps: next={next}, expected~={expected_us}");
+        assert!(
+            (next - expected_us).abs() <= 1,
+            "23.976fps: next={next}, expected~={expected_us}"
+        );
     }
 
     #[test]
@@ -1768,8 +1771,11 @@ mod tests {
         assert!((dts2 - dts1 - frame_dur).abs() <= 1);
         assert!((dts3 - dts2 - frame_dur).abs() <= 1);
         // After 3 frames, should be close to 3 * frame_dur
-        assert!((dts3 - 3 * frame_dur).abs() <= 3,
-            "3 frames at 30fps: dts3={dts3}, expected~={}", 3 * frame_dur);
+        assert!(
+            (dts3 - 3 * frame_dur).abs() <= 3,
+            "3 frames at 30fps: dts3={dts3}, expected~={}",
+            3 * frame_dur
+        );
     }
 
     #[test]
@@ -1779,8 +1785,10 @@ mod tests {
         let start_dts = AV_TIME_BASE as i64; // 1 second
         let next = compute_next_dts_with_framerate(start_dts, fr);
         let expected = start_dts + AV_TIME_BASE as i64 / 24;
-        assert!((next - expected).abs() <= 1,
-            "24fps from 1s: next={next}, expected~={expected}");
+        assert!(
+            (next - expected).abs() <= 1,
+            "24fps from 1s: next={next}, expected~={expected}"
+        );
     }
 
     #[test]
@@ -1789,7 +1797,10 @@ mod tests {
         let fr = AVRational { num: 60, den: 1 };
         let next = compute_next_dts_with_framerate(0, fr);
         let expected = AV_TIME_BASE as i64 / 60;
-        assert!((next - expected).abs() <= 1, "60fps: next={next}, expected={expected}");
+        assert!(
+            (next - expected).abs() <= 1,
+            "60fps: next={next}, expected={expected}"
+        );
     }
 
     /// Mirrors the initial DTS calculation for first frame:
@@ -1816,8 +1827,10 @@ mod tests {
         let fr = AVRational { num: 30, den: 1 };
         let dts = compute_initial_dts(1, fr);
         let expected = -(AV_TIME_BASE as i64 / 30);
-        assert!((dts - expected).abs() <= 1,
-            "video_delay=1 at 30fps: dts={dts}, expected={expected}");
+        assert!(
+            (dts - expected).abs() <= 1,
+            "video_delay=1 at 30fps: dts={dts}, expected={expected}"
+        );
     }
 
     #[test]
@@ -1846,14 +1859,23 @@ mod tests {
         let f2 = Arc::new(AtomicBool::new(false));
         let dst_source_finished: Vec<Option<Arc<AtomicBool>>> =
             vec![Some(f0.clone()), None, Some(f2.clone())];
-        let dsts: Vec<(Sender<PacketBox>, usize, Option<usize>)> =
-            vec![(sender(), 0, Some(0)), (sender(), 0, Some(1)), (sender(), 1, Some(2))];
+        let dsts: Vec<(Sender<PacketBox>, usize, Option<usize>)> = vec![
+            (sender(), 0, Some(0)),
+            (sender(), 0, Some(1)),
+            (sender(), 1, Some(2)),
+        ];
         let per_stream_dsts: Vec<Vec<usize>> = vec![vec![0, 1], vec![2]];
         let mut dsts_finished = vec![false; 3];
 
         // Nothing signalled: no-op.
         let mut finished = Vec::new();
-        scan_source_finished_dsts(&dst_source_finished, &dsts, &per_stream_dsts, &mut dsts_finished, &mut finished);
+        scan_source_finished_dsts(
+            &dst_source_finished,
+            &dsts,
+            &per_stream_dsts,
+            &mut dsts_finished,
+            &mut finished,
+        );
         assert!(finished.is_empty());
         assert_eq!(dsts_finished, vec![false, false, false]);
 
@@ -1861,14 +1883,29 @@ mod tests {
         // stays live, so stream 0 is NOT finished (per-destination isolation).
         f0.store(true, Ordering::Release);
         let mut finished = Vec::new();
-        scan_source_finished_dsts(&dst_source_finished, &dsts, &per_stream_dsts, &mut dsts_finished, &mut finished);
-        assert!(finished.is_empty(), "co-copy still live -> stream 0 not finished");
+        scan_source_finished_dsts(
+            &dst_source_finished,
+            &dsts,
+            &per_stream_dsts,
+            &mut dsts_finished,
+            &mut finished,
+        );
+        assert!(
+            finished.is_empty(),
+            "co-copy still live -> stream 0 not finished"
+        );
         assert_eq!(dsts_finished, vec![true, false, false]);
 
         // Flag stream 1's follower: its sole dst retires -> stream 1 finishes.
         f2.store(true, Ordering::Release);
         let mut finished = Vec::new();
-        scan_source_finished_dsts(&dst_source_finished, &dsts, &per_stream_dsts, &mut dsts_finished, &mut finished);
+        scan_source_finished_dsts(
+            &dst_source_finished,
+            &dsts,
+            &per_stream_dsts,
+            &mut dsts_finished,
+            &mut finished,
+        );
         assert_eq!(finished, vec![1]);
         assert_eq!(dsts_finished, vec![true, false, true]);
     }
@@ -1895,13 +1932,25 @@ mod tests {
         let mut dsts_finished = vec![false; 2];
 
         let mut finished = Vec::new();
-        scan_source_finished_dsts(&dst_source_finished, &dsts, &per_stream_dsts, &mut dsts_finished, &mut finished);
+        scan_source_finished_dsts(
+            &dst_source_finished,
+            &dsts,
+            &per_stream_dsts,
+            &mut dsts_finished,
+            &mut finished,
+        );
         assert_eq!(finished, vec![0], "stream 0 finished once, not per-dst");
         assert_eq!(dsts_finished, vec![true, true]);
 
         // A second scan reports nothing (both dsts already retired).
         let mut finished = Vec::new();
-        scan_source_finished_dsts(&dst_source_finished, &dsts, &per_stream_dsts, &mut dsts_finished, &mut finished);
+        scan_source_finished_dsts(
+            &dst_source_finished,
+            &dsts,
+            &per_stream_dsts,
+            &mut dsts_finished,
+            &mut finished,
+        );
         assert!(finished.is_empty());
     }
 }

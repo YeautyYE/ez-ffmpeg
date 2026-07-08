@@ -204,9 +204,7 @@ fn raster_area_safe(commands: &[Command], pad: f64) -> bool {
         Some((w, h)) => {
             let side_w = w + 2.0 * pad + 4.0;
             let side_h = h + 2.0 * pad + 4.0;
-            side_w.is_finite()
-                && side_h.is_finite()
-                && side_w * side_h <= MAX_MASK_AREA_PX
+            side_w.is_finite() && side_h.is_finite() && side_w * side_h <= MAX_MASK_AREA_PX
         }
     }
 }
@@ -807,7 +805,10 @@ mod tests {
         // The anisotropic pen route has its own mask sizing on the squeezed
         // path; it must degrade the same way.
         let aniso = border_path(&square(61_440.0), &fill, 7_680.0, 240.0);
-        assert_eq!(aniso, fill, "unsafe aniso stroke must fall back to the fill");
+        assert_eq!(
+            aniso, fill,
+            "unsafe aniso stroke must fall back to the fill"
+        );
     }
 
     #[test]

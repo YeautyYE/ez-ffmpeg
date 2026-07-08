@@ -1,6 +1,6 @@
-use std::sync::atomic::{AtomicU64, Ordering};
 use crate::Output;
 use ffmpeg_sys_next;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Represents the state for the null output, tracking current and maximum positions.
 ///
@@ -73,7 +73,6 @@ pub fn create_null_output() -> Output {
 
     // Create and configure the output
     let mut output: Output = write_callback.into();
-    output = output.set_seek_callback(seek_callback)
-        .set_format("mp4"); // Default format, adjustable as needed
+    output = output.set_seek_callback(seek_callback).set_format("mp4"); // Default format, adjustable as needed
     output
 }

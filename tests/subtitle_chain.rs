@@ -12,10 +12,7 @@ use ez_ffmpeg::{FfmpegContext, FfmpegScheduler, Input, Output};
 use std::time::Duration;
 
 fn tmp_path(name: &str) -> String {
-    let dir = std::env::temp_dir().join(format!(
-        "ez_ffmpeg_subtitle_tests_{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("ez_ffmpeg_subtitle_tests_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir.join(name).to_string_lossy().into_owned()
 }
@@ -148,10 +145,9 @@ fn srt_to_mkv_with_subtitle_copy() {
         .expect("failed to probe mkv")
         .expect("mkv output must contain the copied subtitle stream")
     {
-        StreamInfo::Subtitle { codec_name, .. } => assert_eq!(
-            codec_name, "subrip",
-            "copy must preserve the input codec"
-        ),
+        StreamInfo::Subtitle { codec_name, .. } => {
+            assert_eq!(codec_name, "subrip", "copy must preserve the input codec")
+        }
         other => panic!("expected subtitle stream info, got {other:?}"),
     }
 }

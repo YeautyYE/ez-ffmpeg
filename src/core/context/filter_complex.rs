@@ -14,7 +14,6 @@ pub struct FilterComplex {
 }
 
 impl FilterComplex {
-
     /// Sets sws (libswscale) options for the scale filters libavfilter
     /// **auto-inserts** into this graph to reconcile pixel format / size / color
     /// mismatches.
@@ -96,12 +95,22 @@ impl FilterComplex {
 
 impl From<String> for FilterComplex {
     fn from(filter_descs: String) -> Self {
-        Self { filter_descs, hw_device: None, sws_opts: None, swr_opts: None }
+        Self {
+            filter_descs,
+            hw_device: None,
+            sws_opts: None,
+            swr_opts: None,
+        }
     }
 }
 
 impl From<&str> for FilterComplex {
     fn from(filter_descs: &str) -> Self {
-        Self { filter_descs: filter_descs.to_string(), hw_device: None, sws_opts: None, swr_opts: None }
+        Self {
+            filter_descs: filter_descs.to_string(),
+            hw_device: None,
+            sws_opts: None,
+            swr_opts: None,
+        }
     }
 }

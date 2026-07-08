@@ -10,8 +10,7 @@
 use super::fonts::{FaceRequest, FontStore, LoadedFace};
 use super::raster::{
     be_blur, border_path, drawing_commands, fill_path, fix_outline, gaussian_blur, path_extent,
-    CoverageBitmap,
-    OutlinePath, SharedBitmap,
+    CoverageBitmap, OutlinePath, SharedBitmap,
 };
 use super::shape::{bidi_runs, shape_complex, shape_simple};
 use crate::subtitle::ass::{

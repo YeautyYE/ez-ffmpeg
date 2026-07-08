@@ -31,8 +31,7 @@ fn main() {
         .input("test.mp4") // Input video file (320x240, yuv444p in this case)
         .filter_desc("format=yuv420p") // Convert to YUV420P format (required by Tile2x2Filter)
         .output(
-            Output::from("output.mp4")
-                .add_frame_pipeline(frame_pipeline_builder) // Apply the tile filter
+            Output::from("output.mp4").add_frame_pipeline(frame_pipeline_builder), // Apply the tile filter
         )
         .build()
     {

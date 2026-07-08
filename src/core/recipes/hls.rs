@@ -241,7 +241,9 @@ impl HlsLadder {
 
         create_dir(&out_dir)?;
 
-        let mut builder = FfmpegContext::builder().input(input).filter_desc(filter_desc);
+        let mut builder = FfmpegContext::builder()
+            .input(input)
+            .filter_desc(filter_desc);
 
         for (i, rendition) in renditions.iter().enumerate() {
             let rendition_dir = out_dir.join(rendition.dir_name());
@@ -447,9 +449,7 @@ impl HlsLadder {
         })?;
 
         match info {
-            StreamInfo::Video {
-                avg_frame_rate, ..
-            } => {
+            StreamInfo::Video { avg_frame_rate, .. } => {
                 let (num, den) = (avg_frame_rate.num, avg_frame_rate.den);
                 if num <= 0 || den <= 0 {
                     return Err(Error::InvalidRecipeArg(format!(
@@ -627,7 +627,10 @@ fn path_to_utf8(path: &Path) -> Result<String> {
 /// Creates `dir` (and parents), mapping I/O failures to a recipe argument error.
 fn create_dir(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).map_err(|e| {
-        Error::InvalidRecipeArg(format!("failed to create output directory {}: {e}", dir.display()))
+        Error::InvalidRecipeArg(format!(
+            "failed to create output directory {}: {e}",
+            dir.display()
+        ))
     })
 }
 
@@ -680,7 +683,10 @@ mod tests {
 
     #[test]
     fn split_desc_every_branch_has_yuv420p() {
-        let renditions = vec![Rendition::new(1280, 720, "2800k"), Rendition::new(640, 360, "800k")];
+        let renditions = vec![
+            Rendition::new(1280, 720, "2800k"),
+            Rendition::new(640, 360, "800k"),
+        ];
         let desc = build_split_desc(&renditions);
         assert_eq!(desc.matches("format=yuv420p").count(), 2);
     }
@@ -798,7 +804,11 @@ mod tests {
         let l = ladder().segment_duration(6.0).gop_seconds(4.0);
         assert!(l.validate().is_err());
         // 6s / 2s = 3 -> OK.
-        assert!(ladder().segment_duration(6.0).gop_seconds(2.0).validate().is_ok());
+        assert!(ladder()
+            .segment_duration(6.0)
+            .gop_seconds(2.0)
+            .validate()
+            .is_ok());
     }
 
     #[test]
@@ -830,7 +840,10 @@ mod tests {
 
     #[test]
     fn resolve_fps_uses_override() {
-        assert_eq!(ladder().fps(30000, 1001).resolve_fps().unwrap(), (30000, 1001));
+        assert_eq!(
+            ladder().fps(30000, 1001).resolve_fps().unwrap(),
+            (30000, 1001)
+        );
     }
 
     #[test]

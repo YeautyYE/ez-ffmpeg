@@ -430,11 +430,7 @@ const GPU_COMPLETION_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 
 /// Waits (or polls) for a staging buffer map to complete. Returns `Ok(false)`
 /// when `block` is false and the map is not ready yet.
-fn wait_for_map(
-    device: &wgpu::Device,
-    slot: &InFlightFrame,
-    block: bool,
-) -> Result<bool, String> {
+fn wait_for_map(device: &wgpu::Device, slot: &InFlightFrame, block: bool) -> Result<bool, String> {
     fn check(slot: &InFlightFrame) -> Result<Option<()>, String> {
         match slot.staging.map_result() {
             Ok(Ok(())) => Ok(Some(())),
@@ -492,7 +488,11 @@ impl FrameFilter for WgpuFrameFilter {
     }
 
     fn init(&mut self, _ctx: &FrameFilterContext) -> Result<(), String> {
-        let gpu = GpuState::new(&self.fragment_shader, self.params.len, self.hw_zero_copy_input)?;
+        let gpu = GpuState::new(
+            &self.fragment_shader,
+            self.params.len,
+            self.hw_zero_copy_input,
+        )?;
         self.gpu = Some(gpu);
         Ok(())
     }
@@ -571,8 +571,7 @@ impl FrameFilter for WgpuFrameFilter {
             // carry the same color_range field as software ones.
             Some(_) => (
                 PlaneLayout::Nv12,
-                unsafe { (*raw).color_range }
-                    == ffmpeg_sys_next::AVColorRange::AVCOL_RANGE_JPEG,
+                unsafe { (*raw).color_range } == ffmpeg_sys_next::AVColorRange::AVCOL_RANGE_JPEG,
             ),
             None => {
                 let pix_fmt = ensure_software_format(unsafe { (*raw).format })

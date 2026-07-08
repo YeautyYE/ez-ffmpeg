@@ -11,14 +11,14 @@
 //! `loudnorm print_format=json` are out of scope (use `ebur128` metadata for
 //! loudness instead).
 
-pub mod event;
 pub mod detector;
+pub mod event;
 pub mod filter;
 pub mod report;
 pub mod runner;
 
-pub use event::*;
 pub use detector::*;
+pub use event::*;
 pub use filter::*;
 pub use report::*;
 pub use runner::*;

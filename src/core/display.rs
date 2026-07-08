@@ -141,10 +141,7 @@ mod tests {
         let matrix = matrix_for_clockwise(90.0);
         let mut other = entry(&matrix);
         other.type_ = AV_PKT_DATA_STEREO3D;
-        assert_eq!(
-            rotation_from_side_data(&[other, entry(&matrix)]),
-            Some(90)
-        );
+        assert_eq!(rotation_from_side_data(&[other, entry(&matrix)]), Some(90));
     }
 
     #[test]

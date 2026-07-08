@@ -128,7 +128,10 @@ fn filter_option_value_loaded_from_file() {
         60,
         "option from file",
     );
-    assert!(result.is_ok(), "option-from-file transcode failed: {result:?}");
+    assert!(
+        result.is_ok(),
+        "option-from-file transcode failed: {result:?}"
+    );
 
     match find_video_stream_info(&out)
         .expect("failed to probe output")

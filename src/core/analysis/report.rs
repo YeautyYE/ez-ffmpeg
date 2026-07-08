@@ -94,8 +94,13 @@ pub(crate) fn fold(events: Vec<MetadataEvent>, cfg: &FoldConfig) -> AnalysisRepo
             MetadataEvent::SilenceStart { at, channel_number } => {
                 pending_silence.push((channel_number, at.time_us));
             }
-            MetadataEvent::SilenceEnd { at, channel_number, .. } => {
-                if let Some(pos) = pending_silence.iter().position(|(c, _)| *c == channel_number) {
+            MetadataEvent::SilenceEnd {
+                at, channel_number, ..
+            } => {
+                if let Some(pos) = pending_silence
+                    .iter()
+                    .position(|(c, _)| *c == channel_number)
+                {
                     let (_, start) = pending_silence.remove(pos);
                     report.silence.push(SilenceRange {
                         start_us: start,

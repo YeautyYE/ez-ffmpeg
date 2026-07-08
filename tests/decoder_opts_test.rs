@@ -315,10 +315,11 @@ fn probing_codec_opt_is_applied_without_error() {
     let out = tmp_path("probe_opt_out.mp4");
     let result = run(
         FfmpegContext::builder()
-            .input(
-                Input::from(src.as_str())
-                    .set_find_stream_info_codec_opt(0, "skip_frame", "nokey"),
-            )
+            .input(Input::from(src.as_str()).set_find_stream_info_codec_opt(
+                0,
+                "skip_frame",
+                "nokey",
+            ))
             .output(Output::from(out.as_str()).set_video_codec("mpeg4"))
             .build()
             .unwrap(),
@@ -335,9 +336,7 @@ fn probing_opt_with_out_of_range_stream_index_fails_at_build() {
     // The fixture has a single stream; index 99 must be rejected while the
     // input is opened (FfmpegContext::builder().build()).
     let result = FfmpegContext::builder()
-        .input(
-            Input::from(src.as_str()).set_find_stream_info_codec_opt(99, "skip_frame", "nokey"),
-        )
+        .input(Input::from(src.as_str()).set_find_stream_info_codec_opt(99, "skip_frame", "nokey"))
         .output(Output::from(tmp_path("probe_bad_index_out.mp4").as_str()))
         .build();
     assert!(

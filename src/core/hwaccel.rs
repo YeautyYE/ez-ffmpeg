@@ -60,7 +60,9 @@ pub(crate) fn init_filter_hw_device(hw_device: &str) -> i32 {
     }
     match hw_device_init_from_string(hw_device) {
         (0, Some(dev)) => {
-            FILTER_HW_DEVICE.set(Mutex::new(Some(dev.name.clone()))).ok();
+            FILTER_HW_DEVICE
+                .set(Mutex::new(Some(dev.name.clone())))
+                .ok();
             0
         }
         (_, _) => {
@@ -240,9 +242,7 @@ pub(crate) fn hw_device_init_from_string(arg: &str) -> (i32, Option<HWDevice>) {
     }
 
     let name = if p.starts_with('=') {
-        let name_end = p[1..]
-            .find([':', '@', ','])
-            .unwrap_or(p.len() - 1);
+        let name_end = p[1..].find([':', '@', ',']).unwrap_or(p.len() - 1);
         let name = Some(p[1..=name_end].to_string());
 
         if hw_device_get_by_name(&name.clone().unwrap()).is_some() {

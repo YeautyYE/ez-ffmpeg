@@ -56,10 +56,14 @@ fn tmcd_mov_fixture() -> Option<String> {
     // below would assert on an input that no longer exercises the bug.
     let probe = Command::new("ffprobe")
         .args([
-            "-v", "error",
-            "-select_streams", "d",
-            "-show_entries", "stream=index",
-            "-of", "csv=p=0",
+            "-v",
+            "error",
+            "-select_streams",
+            "d",
+            "-show_entries",
+            "stream=index",
+            "-of",
+            "csv=p=0",
             &path,
         ])
         .output()
@@ -123,9 +127,9 @@ fn data_stream_does_not_abort_transcode() {
     // failure points at the right place, then that the job runs to completion.
     let running = match context.start() {
         Ok(running) => running,
-        Err(e) => panic!(
-            "a decoder-less data stream must not abort the job at start (GitHub #43): {e:?}"
-        ),
+        Err(e) => {
+            panic!("a decoder-less data stream must not abort the job at start (GitHub #43): {e:?}")
+        }
     };
     let result = wait_with_watchdog(running, 60, "data stream transcode");
     assert!(

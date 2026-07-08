@@ -1,11 +1,11 @@
-use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Condvar, Mutex};
 use crate::core::context::output::VSyncMethod;
 use crate::core::context::pre_mux_queue::PreMuxQueueSender;
 use crate::core::context::{FrameBox, PacketBox, Stream};
 use crate::core::scheduler::sync_queue::SyncQueue;
 use crossbeam_channel::{Receiver, Sender};
 use ffmpeg_sys_next::{AVCodec, AVMediaType, AVStream};
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Condvar, Mutex};
 
 /// `-shortest` frame-level sync-queue handle for one encoded-A/V stream.
 ///

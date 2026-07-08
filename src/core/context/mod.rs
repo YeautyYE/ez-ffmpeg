@@ -159,15 +159,12 @@ impl MuxStartGate {
         match pre_sender.try_push(packet_box) {
             pre_mux_queue::PreQueueTryPush::Sent => PreSendOutcome::Sent,
             pre_mux_queue::PreQueueTryPush::Full(pb) => PreSendOutcome::Full(pb),
-            pre_mux_queue::PreQueueTryPush::Disconnected(pb) => {
-                PreSendOutcome::Disconnected(pb)
-            }
+            pre_mux_queue::PreQueueTryPush::Disconnected(pb) => PreSendOutcome::Disconnected(pb),
         }
     }
 }
 
 use ffmpeg_context::{InputOpaque, OutputOpaque};
-
 
 /// The **ffmpeg_context** module is responsible for assembling FFmpeg’s configuration:
 /// inputs, outputs, codecs, filters, and other parameters needed to construct a
@@ -290,7 +287,6 @@ pub mod output;
 /// // my_filters.set_hw_device("cuda");
 /// ```
 pub mod filter_complex;
-
 
 pub(super) mod attachment;
 pub(super) mod decoder_stream;
@@ -457,7 +453,8 @@ impl SideDataList {
 
     #[cfg(ffmpeg_8_0)]
     pub(crate) fn iter(&self) -> impl Iterator<Item = *const AVFrameSideData> + '_ {
-        (0..self.count).map(|i| unsafe { *self.entries.offset(i as isize) as *const AVFrameSideData })
+        (0..self.count)
+            .map(|i| unsafe { *self.entries.offset(i as isize) as *const AVFrameSideData })
     }
 }
 

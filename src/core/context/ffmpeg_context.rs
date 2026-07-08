@@ -6,11 +6,11 @@ use crate::core::context::input::Input;
 use crate::core::context::input_filter::{InputFilter, IFILTER_FLAG_AUTOROTATE};
 use crate::core::context::muxer::Muxer;
 use crate::core::context::output::{Output, StreamMap};
-use crate::core::metadata::StreamSpecifier;
 use crate::core::context::output_filter::{
     OutputFilter, OFILTER_FLAG_AUDIO_24BIT, OFILTER_FLAG_AUTOSCALE, OFILTER_FLAG_DISABLE_CONVERT,
 };
 use crate::core::context::{frame_alloc, CodecContext};
+use crate::core::metadata::StreamSpecifier;
 use crate::core::scheduler::ffmpeg_scheduler;
 use crate::core::scheduler::ffmpeg_scheduler::{FfmpegScheduler, Initialization};
 #[cfg(not(docsrs))]
@@ -29,14 +29,10 @@ use crate::error::{
 };
 use crate::error::{Error, Result};
 use crate::filter::frame_pipeline::FramePipeline;
+use crate::hwaccel::{hw_device_for_filter, init_filter_hw_device};
 use crate::util::ffmpeg_utils::{hashmap_to_avdictionary, DictGuard};
 #[cfg(not(docsrs))]
 use ffmpeg_sys_next::AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC;
-#[cfg(not(docsrs))]
-use ffmpeg_sys_next::{
-    avformat_query_codec, AVSTREAM_EVENT_FLAG_NEW_PACKETS, AV_DISPOSITION_ATTACHED_PIC,
-    AV_DISPOSITION_DEFAULT,
-};
 #[cfg(not(docsrs))]
 use ffmpeg_sys_next::AVCodecConfig::*;
 use ffmpeg_sys_next::AVCodecID::{AV_CODEC_ID_AC3, AV_CODEC_ID_MP3, AV_CODEC_ID_NONE};
@@ -49,30 +45,33 @@ use ffmpeg_sys_next::AVMediaType::{
 use ffmpeg_sys_next::AVPixelFormat::AV_PIX_FMT_NONE;
 use ffmpeg_sys_next::AVSampleFormat::AV_SAMPLE_FMT_NONE;
 use ffmpeg_sys_next::{
-    av_add_q, av_channel_layout_default, av_codec_get_id, av_codec_get_tag2,
-    av_freep, av_get_exact_bits_per_sample, av_get_pix_fmt, av_guess_codec, av_guess_format, av_guess_frame_rate,
-    av_inv_q, av_malloc, av_rescale_q, av_seek_frame, avcodec_alloc_context3,
+    av_add_q, av_channel_layout_default, av_codec_get_id, av_codec_get_tag2, av_freep,
+    av_get_exact_bits_per_sample, av_get_pix_fmt, av_guess_codec, av_guess_format,
+    av_guess_frame_rate, av_inv_q, av_malloc, av_rescale_q, av_seek_frame, avcodec_alloc_context3,
     avcodec_descriptor_get, avcodec_descriptor_get_by_name, avcodec_find_encoder,
     avcodec_find_encoder_by_name, avcodec_get_name, avcodec_parameters_from_context,
-    avcodec_parameters_to_context,
-    avfilter_pad_get_name, avfilter_pad_get_type, avformat_alloc_context,
-    avformat_alloc_output_context2, avformat_close_input, avformat_find_stream_info,
-    avformat_flush, avformat_free_context, avformat_open_input, avio_alloc_context,
-    avio_open2, AVCodec, AVCodecID, AVColorRange, AVColorSpace, AVFilterContext,
-    AVFilterInOut, AVFilterPad, AVFormatContext, AVMediaType, AVOutputFormat, AVPixelFormat,
-    AVRational, AVSampleFormat, AVStream, AVERROR_ENCODER_NOT_FOUND, AVFMT_FLAG_CUSTOM_IO,
-    AVFMT_GLOBALHEADER, AVFMT_NOBINSEARCH, AVFMT_NOFILE, AVFMT_NOGENSEARCH, AVFMT_NOSTREAMS,
-    AVIO_FLAG_WRITE, AVSEEK_FLAG_BACKWARD, AV_CODEC_PROP_BITMAP_SUB, AV_CODEC_PROP_TEXT_SUB,
-    AV_TIME_BASE,
+    avcodec_parameters_to_context, avfilter_pad_get_name, avfilter_pad_get_type,
+    avformat_alloc_context, avformat_alloc_output_context2, avformat_close_input,
+    avformat_find_stream_info, avformat_flush, avformat_free_context, avformat_open_input,
+    avio_alloc_context, avio_open2, AVCodec, AVCodecID, AVColorRange, AVColorSpace,
+    AVFilterContext, AVFilterInOut, AVFilterPad, AVFormatContext, AVMediaType, AVOutputFormat,
+    AVPixelFormat, AVRational, AVSampleFormat, AVStream, AVERROR_ENCODER_NOT_FOUND,
+    AVFMT_FLAG_CUSTOM_IO, AVFMT_GLOBALHEADER, AVFMT_NOBINSEARCH, AVFMT_NOFILE, AVFMT_NOGENSEARCH,
+    AVFMT_NOSTREAMS, AVIO_FLAG_WRITE, AVSEEK_FLAG_BACKWARD, AV_CODEC_PROP_BITMAP_SUB,
+    AV_CODEC_PROP_TEXT_SUB, AV_TIME_BASE,
 };
 #[cfg(not(docsrs))]
 use ffmpeg_sys_next::{
-    av_buffer_ref, av_channel_layout_copy, av_packet_side_data_new,
-    avcodec_get_supported_config, avfilter_graph_segment_apply,
-    avfilter_graph_segment_create_filters, avfilter_graph_segment_free,
-    avfilter_graph_segment_parse, AVChannelLayout, AVFILTER_FLAG_HWDEVICE,
+    av_buffer_ref, av_channel_layout_copy, av_packet_side_data_new, avcodec_get_supported_config,
+    avfilter_graph_segment_apply, avfilter_graph_segment_create_filters,
+    avfilter_graph_segment_free, avfilter_graph_segment_parse, AVChannelLayout,
+    AVFILTER_FLAG_HWDEVICE,
 };
-use crate::hwaccel::{hw_device_for_filter, init_filter_hw_device};
+#[cfg(not(docsrs))]
+use ffmpeg_sys_next::{
+    avformat_query_codec, AVSTREAM_EVENT_FLAG_NEW_PACKETS, AV_DISPOSITION_ATTACHED_PIC,
+    AV_DISPOSITION_DEFAULT,
+};
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::ffi::{c_uint, c_void, CStr, CString};
@@ -202,7 +201,7 @@ impl FfmpegContext {
             if mux.recording_time_us.is_none() {
                 let mapping = mux.stream_input_mapping();
                 if !mapping.is_empty() {
-                    let first_input = mapping[0].1.0;
+                    let first_input = mapping[0].1 .0;
                     let all_same_input = mapping.iter().all(|(_, (idx, _))| *idx == first_input);
                     if all_same_input {
                         if let Some(demux) = demuxs.get(first_input) {
@@ -452,10 +451,9 @@ unsafe fn process_metadata(mux: &Muxer, demuxs: &Vec<Demuxer>) -> Result<()> {
 
     // Step 2: Copy chapters from first input with chapters (if auto copy enabled)
     if mux.auto_copy_metadata && !metadata_chapters_manual {
-        if let Some(source_demux) = demuxs
-            .iter()
-            .find(|d| unsafe { !d.in_fmt_ctx_ptr().is_null() && (*d.in_fmt_ctx_ptr()).nb_chapters > 0 })
-        {
+        if let Some(source_demux) = demuxs.iter().find(|d| unsafe {
+            !d.in_fmt_ctx_ptr().is_null() && (*d.in_fmt_ctx_ptr()).nb_chapters > 0
+        }) {
             if let Err(e) = copy_chapters_from_input(
                 source_demux.in_fmt_ctx_ptr(),
                 source_demux.ts_offset,
@@ -514,10 +512,7 @@ fn is_filter_output_linklabel(linklabel: &str) -> bool {
 /// Parse and expand stream map specifications
 /// This mimics FFmpeg's opt_map() behavior: parse once, expand immediately
 /// FFmpeg reference: ffmpeg_opt.c:478-596
-unsafe fn expand_stream_maps(
-    mux: &mut Muxer,
-    demuxs: &[Demuxer],
-) -> Result<()> {
+unsafe fn expand_stream_maps(mux: &mut Muxer, demuxs: &[Demuxer]) -> Result<()> {
     let stream_map_specs = std::mem::take(&mut mux.stream_map_specs);
 
     for spec in stream_map_specs {
@@ -551,8 +546,8 @@ unsafe fn expand_stream_maps(
 
             // Store pure linklabel (without brackets) for later matching in map_manual()
             mux.stream_maps.push(StreamMap {
-                file_index: 0,  // Not used for filter outputs
-                stream_index: 0,  // Not used for filter outputs
+                file_index: 0,   // Not used for filter outputs
+                stream_index: 0, // Not used for filter outputs
                 linklabel: Some(pure_linklabel.to_string()),
                 copy: spec.copy,
                 disabled: false,
@@ -588,7 +583,7 @@ unsafe fn expand_stream_maps(
         // FFmpeg reference: opt_map line 520 - parse stream specifier
         // FFmpeg reference: opt_map line 533 - handle '?' suffix for allow_unused
         let (spec_str, allow_unused) = if remainder.ends_with('?') {
-            (&remainder[..remainder.len()-1], true)
+            (&remainder[..remainder.len() - 1], true)
         } else {
             (remainder, false)
         };
@@ -614,8 +609,7 @@ unsafe fn expand_stream_maps(
         if is_negative {
             for existing_map in &mut mux.stream_maps {
                 // Only process file-based maps (not filter outputs)
-                if existing_map.linklabel.is_none() &&
-                   existing_map.file_index == file_idx {
+                if existing_map.linklabel.is_none() && existing_map.file_index == file_idx {
                     // Check if stream specifier matches
                     let demux = &demuxs[file_idx];
                     let fmt_ctx = demux.in_fmt_ctx_ptr();
@@ -655,10 +649,7 @@ unsafe fn expand_stream_maps(
         if matched_count == 0 {
             if allow_unused {
                 // FFmpeg line 579: verbose log for optional mappings
-                info!(
-                    "Stream map '{}' matches no streams; ignoring.",
-                    linklabel
-                );
+                info!("Stream map '{}' matches no streams; ignoring.", linklabel);
             } else {
                 // FFmpeg line 586-587: fatal error with hint about '?' suffix
                 warn!(
@@ -666,9 +657,9 @@ unsafe fn expand_stream_maps(
                      To ignore this, add a trailing '?' to the map.",
                     linklabel
                 );
-                return Err(Error::OpenOutput(
-                    OpenOutputError::MatchesNoStreams(linklabel.to_string())
-                ));
+                return Err(Error::OpenOutput(OpenOutputError::MatchesNoStreams(
+                    linklabel.to_string(),
+                )));
             }
         }
     }
@@ -815,7 +806,11 @@ fn map_manual(
     let demux_node = demux.node.clone();
     let (media_type, input_stream_duration, input_stream_time_base) = {
         let input_stream = demux.get_stream_mut(stream_index);
-        (input_stream.codec_type, input_stream.duration, input_stream.time_base)
+        (
+            input_stream.codec_type,
+            input_stream.duration,
+            input_stream.time_base,
+        )
     };
 
     // FFmpeg reference: fftools/ffmpeg_mux_init.c:1761-1768
@@ -843,7 +838,8 @@ fn map_manual(
 
     info!(
         "Binding output stream to input {}:{} ({})",
-        demux_idx, stream_index,
+        demux_idx,
+        stream_index,
         match media_type {
             AVMEDIA_TYPE_VIDEO => "video",
             AVMEDIA_TYPE_AUDIO => "audio",
@@ -899,19 +895,19 @@ fn map_manual(
                 let (packet_sender, pre_sender, gate, _st, output_stream_index) =
                     mux.new_copy_stream(demux_node)?;
                 demux.add_packet_dst(
-                packet_sender,
-                stream_index,
-                output_stream_index,
-                // Architecture Y': a `-shortest` copy follower carries its mux
-                // stream's `source_finished` so the demux can stop producing it
-                // once `sq_mux` cascade-finishes it. `None` otherwise.
-                if mux.shortest {
-                    mux.stream_source_finished(output_stream_index)
-                } else {
-                    None
-                },
-                CopyMuxHandle { pre_sender, gate },
-            );
+                    packet_sender,
+                    stream_index,
+                    output_stream_index,
+                    // Architecture Y': a `-shortest` copy follower carries its mux
+                    // stream's `source_finished` so the demux can stop producing it
+                    // once `sq_mux` cascade-finishes it. `None` otherwise.
+                    if mux.shortest {
+                        mux.stream_source_finished(output_stream_index)
+                    } else {
+                        None
+                    },
+                    CopyMuxHandle { pre_sender, gate },
+                );
                 mux.register_stream_source(output_stream_index, demux_idx, stream_index, false);
 
                 unsafe {
@@ -1392,8 +1388,8 @@ unsafe fn map_auto_subtitle(
             }
             let mut output_props = 0;
             if !output_descriptor.is_null() {
-                output_props =
-                    (*output_descriptor).props & (AV_CODEC_PROP_TEXT_SUB | AV_CODEC_PROP_BITMAP_SUB);
+                output_props = (*output_descriptor).props
+                    & (AV_CODEC_PROP_TEXT_SUB | AV_CODEC_PROP_BITMAP_SUB);
             }
 
             // A user-chosen codec short-circuits the text/bitmap check
@@ -1432,19 +1428,19 @@ unsafe fn map_auto_subtitle(
                 let (packet_sender, pre_sender, gate, _st, output_stream_index) =
                     mux.new_copy_stream(demux.node.clone())?;
                 demux.add_packet_dst(
-                packet_sender,
-                stream_index,
-                output_stream_index,
-                // Architecture Y': a `-shortest` copy follower carries its mux
-                // stream's `source_finished` so the demux can stop producing it
-                // once `sq_mux` cascade-finishes it. `None` otherwise.
-                if mux.shortest {
-                    mux.stream_source_finished(output_stream_index)
-                } else {
-                    None
-                },
-                CopyMuxHandle { pre_sender, gate },
-            );
+                    packet_sender,
+                    stream_index,
+                    output_stream_index,
+                    // Architecture Y': a `-shortest` copy follower carries its mux
+                    // stream's `source_finished` so the demux can stop producing it
+                    // once `sq_mux` cascade-finishes it. `None` otherwise.
+                    if mux.shortest {
+                        mux.stream_source_finished(output_stream_index)
+                    } else {
+                        None
+                    },
+                    CopyMuxHandle { pre_sender, gate },
+                );
                 mux.register_stream_source(output_stream_index, demux_idx, stream_index, false);
 
                 unsafe {
@@ -1604,11 +1600,16 @@ unsafe fn map_auto_stream(
     if (media_type == AVMEDIA_TYPE_VIDEO
         || media_type == AVMEDIA_TYPE_AUDIO
         || media_type == AVMEDIA_TYPE_DATA)
-        && av_guess_codec(oformat, null(), (*mux.out_fmt_ctx_ptr()).url, null(), media_type)
-            == AV_CODEC_ID_NONE
-        {
-            return Ok(());
-        }
+        && av_guess_codec(
+            oformat,
+            null(),
+            (*mux.out_fmt_ctx_ptr()).url,
+            null(),
+            media_type,
+        ) == AV_CODEC_ID_NONE
+    {
+        return Ok(());
+    }
 
     // Mirror ffmpeg_mux_init.c map_auto_video/map_auto_audio: score every
     // stream of every input and map the single global best (video: highest
@@ -1807,8 +1808,7 @@ fn init_simple_filtergraph(
     // graph-level sws/swr value here. The per-output request (Output::set_sws_opts
     // / set_swr_opts) flows in through the bound OutputFilterOptions instead and
     // is resolved in filter_task::configure_filtergraph.
-    let mut filter_graph =
-        init_filter_graph(filter_graphs.len(), filter_desc, None, None, None)?;
+    let mut filter_graph = init_filter_graph(filter_graphs.len(), filter_desc, None, None, None)?;
 
     // filter_graph.inputs[0].media_type = codec_type;
     // filter_graph.outputs[0].media_type = codec_type;
@@ -2353,7 +2353,11 @@ unsafe fn open_output_file(
     let bsf_chains = crate::core::context::muxer::StreamBsfChains {
         video: output.video_bsf.as_deref().map(CString::new).transpose()?,
         audio: output.audio_bsf.as_deref().map(CString::new).transpose()?,
-        subtitle: output.subtitle_bsf.as_deref().map(CString::new).transpose()?,
+        subtitle: output
+            .subtitle_bsf
+            .as_deref()
+            .map(CString::new)
+            .transpose()?,
     };
 
     let out_fmt_ctx = ctx_guard.release();
@@ -2910,9 +2914,8 @@ fn fg_find_input_idx_by_linklabel(
     };
 
     // Parse file index using strtol (FFmpeg reference: ffmpeg_opt.c:512)
-    let (file_idx, remainder) = strtol(new_linklabel).map_err(|_| {
-        FilterGraphParseError::InvalidArgument
-    })?;
+    let (file_idx, remainder) =
+        strtol(new_linklabel).map_err(|_| FilterGraphParseError::InvalidArgument)?;
 
     if file_idx < 0 || file_idx as usize >= demuxs.len() {
         return Err(InvalidFileIndexInFg(file_idx as usize, desc.to_string()).into());
@@ -2937,7 +2940,10 @@ fn fg_find_input_idx_by_linklabel(
     } else {
         // Parse the specifier
         StreamSpecifier::parse(spec_str).map_err(|e| {
-            warn!("Invalid stream specifier in filter linklabel '{}': {}", linklabel, e);
+            warn!(
+                "Invalid stream specifier in filter linklabel '{}': {}",
+                linklabel, e
+            );
             FilterGraphParseError::InvalidArgument
         })?
     };
@@ -2957,9 +2963,7 @@ fn fg_find_input_idx_by_linklabel(
                 if codec_type == filter_media_type {
                     return Ok((file_idx, idx));
                 }
-                if codec_type == AVMEDIA_TYPE_SUBTITLE
-                    && filter_media_type == AVMEDIA_TYPE_VIDEO
-                {
+                if codec_type == AVMEDIA_TYPE_SUBTITLE && filter_media_type == AVMEDIA_TYPE_VIDEO {
                     subtitle_only_match = true;
                 }
             }
@@ -3004,7 +3008,10 @@ fn strtol(input: &str) -> Result<(i64, &str)> {
 
     let number_start = input.len() - chars.clone().collect::<String>().len();
 
-    let number_str: String = chars.by_ref().take_while(|ch| ch.is_ascii_digit()).collect();
+    let number_str: String = chars
+        .by_ref()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
 
     if number_str.is_empty() {
         return Err(ParseInteger);
@@ -3388,8 +3395,12 @@ unsafe fn open_input_file(
             (*in_fmt_ctx).pb = avio_ctx;
             (*in_fmt_ctx).flags = AVFMT_FLAG_CUSTOM_IO;
 
-            let ret =
-                avformat_open_input(&mut in_fmt_ctx, null(), file_iformat, input_opts.as_double_ptr());
+            let ret = avformat_open_input(
+                &mut in_fmt_ctx,
+                null(),
+                file_iformat,
+                input_opts.as_double_ptr(),
+            );
             if ret < 0 {
                 // close_input first: read_close may still touch s->pb. The
                 // helper also reclaims the callback Box, which leaked here.
@@ -3566,9 +3577,10 @@ unsafe fn open_input_file(
         input.hwaccel_device.clone(),
         input.hwaccel_output_format.clone(),
         copy_ts,
-        input.autorotate.unwrap_or(true),  // Default to true (enabled)
-        input.ts_scale.unwrap_or(1.0),     // Default to 1.0 (no scaling)
-        match input.framerate {            // Default to {0, 0} (use packet duration)
+        input.autorotate.unwrap_or(true), // Default to true (enabled)
+        input.ts_scale.unwrap_or(1.0),    // Default to 1.0 (no scaling)
+        match input.framerate {
+            // Default to {0, 0} (use packet duration)
             Some((num, den)) => AVRational { num, den },
             None => AVRational { num: 0, den: 0 },
         },
@@ -3623,9 +3635,9 @@ fn maybe_enable_image2_update(
     }
 
     let mut opts = format_opts.unwrap_or_default();
-    let user_configured = opts.keys().any(|key| {
-        matches!(key.to_bytes(), b"update" | b"strftime" | b"frame_pts")
-    });
+    let user_configured = opts
+        .keys()
+        .any(|key| matches!(key.to_bytes(), b"update" | b"strftime" | b"frame_pts"));
     if !user_configured {
         info!("single-image output detected (max_video_frames=1): enabling image2 'update' mode");
         // Both literals are NUL-free; unwrap cannot fail.
@@ -3819,7 +3831,11 @@ mod find_stream_info_tests {
             if entry.is_null() {
                 None
             } else {
-                Some(CStr::from_ptr((*entry).value).to_string_lossy().into_owned())
+                Some(
+                    CStr::from_ptr((*entry).value)
+                        .to_string_lossy()
+                        .into_owned(),
+                )
             }
         }
     }
@@ -3847,11 +3863,20 @@ mod find_stream_info_tests {
         ]);
         let opts = FindStreamInfoOptions::new(3, Some(&configured)).unwrap();
         assert!(!opts.dicts[0].is_null());
-        assert!(opts.dicts[1].is_null(), "unconfigured stream must stay null");
+        assert!(
+            opts.dicts[1].is_null(),
+            "unconfigured stream must stay null"
+        );
         assert!(!opts.dicts[2].is_null());
-        assert_eq!(dict_value(opts.dicts[0], "skip_frame").as_deref(), Some("nokey"));
+        assert_eq!(
+            dict_value(opts.dicts[0], "skip_frame").as_deref(),
+            Some("nokey")
+        );
         assert_eq!(dict_value(opts.dicts[2], "lowres").as_deref(), Some("1"));
-        assert_eq!(dict_value(opts.dicts[2], "skip_frame").as_deref(), Some("all"));
+        assert_eq!(
+            dict_value(opts.dicts[2], "skip_frame").as_deref(),
+            Some("all")
+        );
         // Before probing runs, every configured entry is still "left over".
         let mut leftovers = opts.leftover_keys();
         leftovers.sort();
@@ -3869,10 +3894,7 @@ mod find_stream_info_tests {
 
     #[test]
     fn out_of_range_stream_index_is_invalid_argument() {
-        let configured = probing_opts(&[
-            (0, &[("skip_frame", "nokey")]),
-            (5, &[("lowres", "1")]),
-        ]);
+        let configured = probing_opts(&[(0, &[("skip_frame", "nokey")]), (5, &[("lowres", "1")])]);
         // Asserts the out-of-range index is rejected. The error path still
         // drops the partially built array (HashMap order decides whether
         // stream 0's dict was built before index 5 tripped the error, so this
@@ -3947,10 +3969,11 @@ unsafe fn input_requires_seek(fmt_ctx: *mut AVFormatContext) -> bool {
                 f,
                 "mp4" | "mkv" | "avi" | "mov" | "flac" | "wav" | "aac" | "ogg" | "mp3" | "webm"
             )
-        })
-            && !no_binsearch && !no_gensearch {
-                return true;
-            }
+        }) && !no_binsearch
+            && !no_gensearch
+        {
+            return true;
+        }
 
         if format_names.iter().any(|&f| {
             matches!(

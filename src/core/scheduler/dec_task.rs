@@ -15,6 +15,8 @@ use crate::hwaccel::{
     hw_device_match_by_codec, HWAccelID,
 };
 use crate::util::ffmpeg_utils::av_rescale_q_rnd;
+use crate::util::ffmpeg_utils::{av_err2str, hashmap_to_avdictionary, DictGuard};
+use crate::util::thread_synchronizer::{ThreadDoneGuard, ThreadSynchronizer};
 use crossbeam_channel::{RecvTimeoutError, Sender};
 use ffmpeg_next::packet::{Mut, Ref};
 use ffmpeg_next::{Frame, Packet};
@@ -22,9 +24,21 @@ use ffmpeg_sys_next::AVHWDeviceType::AV_HWDEVICE_TYPE_QSV;
 use ffmpeg_sys_next::AVMediaType::{AVMEDIA_TYPE_AUDIO, AVMEDIA_TYPE_SUBTITLE, AVMEDIA_TYPE_VIDEO};
 use ffmpeg_sys_next::AVRounding::AV_ROUND_UP;
 use ffmpeg_sys_next::AVSubtitleType::SUBTITLE_BITMAP;
+use ffmpeg_sys_next::{
+    av_buffer_create, av_buffer_ref, av_calloc, av_dict_set, av_frame_apply_cropping,
+    av_frame_copy_props, av_frame_move_ref, av_frame_ref, av_frame_unref, av_free, av_freep,
+    av_gcd, av_hwdevice_get_type_name, av_hwframe_transfer_data, av_inv_q, av_mallocz, av_memdup,
+    av_mul_q, av_opt_set_dict2, av_pix_fmt_desc_get, av_rescale_delta, av_rescale_q, av_strdup,
+    avcodec_alloc_context3, avcodec_decode_subtitle2, avcodec_default_get_buffer2,
+    avcodec_flush_buffers, avcodec_get_hw_config, avcodec_open2, avcodec_parameters_to_context,
+    avcodec_receive_frame, avcodec_send_packet, avsubtitle_free, AVCodec, AVCodecContext, AVFrame,
+    AVHWDeviceType, AVMediaType, AVPixelFormat, AVRational, AVSubtitle, AVSubtitleRect, AVERROR,
+    AVERROR_EOF, AVPALETTE_SIZE, AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX, AV_FRAME_CROP_UNALIGNED,
+    AV_FRAME_FLAG_CORRUPT, AV_NOPTS_VALUE, AV_PIX_FMT_FLAG_HWACCEL, AV_TIME_BASE_Q, EAGAIN, EINVAL,
+    ENOMEM,
+};
 #[cfg(not(docsrs))]
 use ffmpeg_sys_next::{av_channel_layout_copy, AV_CODEC_FLAG_COPY_OPAQUE};
-use ffmpeg_sys_next::{av_buffer_create, av_buffer_ref, av_calloc, av_dict_set, av_frame_apply_cropping, av_frame_copy_props, av_frame_move_ref, av_frame_ref, av_frame_unref, av_free, av_freep, av_gcd, av_hwdevice_get_type_name, av_hwframe_transfer_data, av_inv_q, av_mallocz, av_memdup, av_mul_q, av_opt_set_dict2, av_pix_fmt_desc_get, av_rescale_delta, av_rescale_q, av_strdup, avcodec_alloc_context3, avcodec_decode_subtitle2, avcodec_default_get_buffer2, avcodec_flush_buffers, avcodec_get_hw_config, avcodec_open2, avcodec_parameters_to_context, avcodec_receive_frame, avcodec_send_packet, avsubtitle_free, AVCodec, AVCodecContext, AVFrame, AVHWDeviceType, AVMediaType, AVPixelFormat, AVRational, AVSubtitle, AVSubtitleRect, AVERROR, AVERROR_EOF, AVPALETTE_SIZE, AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX, AV_FRAME_CROP_UNALIGNED, AV_FRAME_FLAG_CORRUPT, AV_NOPTS_VALUE, AV_PIX_FMT_FLAG_HWACCEL, AV_TIME_BASE_Q, EAGAIN, EINVAL, ENOMEM};
 use log::{debug, error, info, trace, warn};
 use std::collections::HashMap;
 use std::ffi::{c_void, CStr, CString};
@@ -32,8 +46,6 @@ use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
-use crate::util::ffmpeg_utils::{av_err2str, hashmap_to_avdictionary, DictGuard};
-use crate::util::thread_synchronizer::{ThreadDoneGuard, ThreadSynchronizer};
 
 #[cfg(docsrs)]
 pub(crate) fn dec_init(
@@ -79,19 +91,27 @@ pub(crate) fn dec_init(
 
     let codec_ptr = dec_stream.codec.as_ptr();
     if codec_ptr.is_null() {
-        error!("Decoder codec pointer is null for stream {}", dec_stream.stream_index);
-        return Err(OpenDecoder(OpenDecoderOperationError::ContextAllocationError(OpenDecoderError::OutOfMemory)));
+        error!(
+            "Decoder codec pointer is null for stream {}",
+            dec_stream.stream_index
+        );
+        return Err(OpenDecoder(
+            OpenDecoderOperationError::ContextAllocationError(OpenDecoderError::OutOfMemory),
+        ));
     }
 
     let codec_name_ptr = unsafe { (*codec_ptr).name };
     if codec_name_ptr.is_null() {
-        error!("Decoder codec name pointer is null for stream {}", dec_stream.stream_index);
-        return Err(OpenDecoder(OpenDecoderOperationError::ContextAllocationError(OpenDecoderError::OutOfMemory)));
+        error!(
+            "Decoder codec name pointer is null for stream {}",
+            dec_stream.stream_index
+        );
+        return Err(OpenDecoder(
+            OpenDecoderOperationError::ContextAllocationError(OpenDecoderError::OutOfMemory),
+        ));
     }
 
-    let decoder_name = unsafe {
-        CStr::from_ptr(codec_name_ptr).to_str().unwrap_or("unknown")
-    };
+    let decoder_name = unsafe { CStr::from_ptr(codec_name_ptr).to_str().unwrap_or("unknown") };
 
     let dp = DecoderParameter::new(dec_stream);
     let dp_arc = Arc::new(Mutex::new(dp));
@@ -99,7 +119,6 @@ pub(crate) fn dec_init(
 
     let senders = dec_stream.take_dsts();
     let exit_on_error = exit_on_error.unwrap_or(false);
-
 
     let dp_arc = dp_arc.clone();
 
@@ -602,11 +621,13 @@ unsafe fn dec_send(
 ) -> crate::error::Result<()> {
     let mut nb_done = 0;
     for (i, (sender, fg_input_index, finished_flag_list)) in senders.iter().enumerate() {
-        if !finished_flag_list.is_empty() && *fg_input_index < finished_flag_list.len()
-            && finished_flag_list[*fg_input_index].load(Ordering::Acquire) {
-                nb_done += 1;
-                continue;
-            }
+        if !finished_flag_list.is_empty()
+            && *fg_input_index < finished_flag_list.len()
+            && finished_flag_list[*fg_input_index].load(Ordering::Acquire)
+        {
+            nb_done += 1;
+            continue;
+        }
         if i < senders.len() - 1 {
             let Ok(mut to_send) = frame_pool.get() else {
                 return Err(Decoding(DecodingOperationError::FrameAllocationError(
@@ -665,7 +686,7 @@ unsafe fn dec_send(
 unsafe fn dec_frame_to_box(dp_arc: Arc<Mutex<DecoderParameter>>, frame: Frame) -> FrameBox {
     let dp = dp_arc.lock().unwrap();
     let dec_ctx = dp.dec_ctx.as_ptr();
-    
+
     FrameBox {
         frame,
         frame_data: FrameData {
@@ -798,10 +819,7 @@ fn dec_open(
         // Per-input decoder log demotion (Input::set_log_level_offset).
         (*dec_ctx).log_level_offset = dec_stream.log_level_offset;
 
-        let mut ret = avcodec_parameters_to_context(
-            dec_ctx,
-            (*dec_stream.stream.inner).codecpar,
-        );
+        let mut ret = avcodec_parameters_to_context(dec_ctx, (*dec_stream.stream.inner).codecpar);
         if ret < 0 {
             error!("Error initializing the decoder context.");
             return Err(OpenDecoder(
@@ -833,7 +851,10 @@ fn dec_open(
             let mut dp = dp_arc_clone.lock().unwrap();
             ret = hw_device_setup_for_decode(&mut dp, dec_stream.codec.as_ptr(), dec_ctx);
             if ret < 0 {
-                error!("Hardware device setup failed for decoder: {}", av_err2str(ret));
+                error!(
+                    "Hardware device setup failed for decoder: {}",
+                    av_err2str(ret)
+                );
                 return Err(OpenDecoder(OpenDecoderOperationError::HwSetupError(
                     OpenDecoderError::from(ret),
                 )));
@@ -910,16 +931,15 @@ fn dec_open(
             // Own a copy of the subtitle header: dec_ctx (and the buffer it
             // points to) is freed when the decoder exits, while encoders read
             // the header later (matches ffmpeg_dec.c owning its own copy).
-            dp.dec.subtitle_header = if (*dec_ctx).subtitle_header.is_null()
-                || (*dec_ctx).subtitle_header_size <= 0
-            {
-                None
-            } else {
-                Some(Arc::from(std::slice::from_raw_parts(
-                    (*dec_ctx).subtitle_header as *const u8,
-                    (*dec_ctx).subtitle_header_size as usize,
-                )))
-            };
+            dp.dec.subtitle_header =
+                if (*dec_ctx).subtitle_header.is_null() || (*dec_ctx).subtitle_header_size <= 0 {
+                    None
+                } else {
+                    Some(Arc::from(std::slice::from_raw_parts(
+                        (*dec_ctx).subtitle_header as *const u8,
+                        (*dec_ctx).subtitle_header_size as usize,
+                    )))
+                };
         }
 
         if !param_out.is_null() {
@@ -927,8 +947,7 @@ fn dec_open(
                 (*param_out).format = (*dec_ctx).sample_fmt as i32;
                 (*param_out).sample_rate = (*dec_ctx).sample_rate;
 
-                ret =
-                    av_channel_layout_copy(&mut (*param_out).ch_layout, &(*dec_ctx).ch_layout);
+                ret = av_channel_layout_copy(&mut (*param_out).ch_layout, &(*dec_ctx).ch_layout);
                 if ret < 0 {
                     return Err(OpenDecoder(
                         OpenDecoderOperationError::ChannelLayoutCopyError(OpenDecoderError::from(
@@ -1263,7 +1282,6 @@ struct DecoderParameter {
     last_filter_in_rescale_delta: i64,
     last_frame_sample_rate: i32,
     // view_map: Vec<ViewMap>,
-
 }
 
 // SAFETY: DecoderParameter contains a raw pointer (dec_ctx) but is safe to
@@ -1319,7 +1337,6 @@ impl DecoderParameter {
             last_frame_tb: AVRational { num: 1, den: 1 },
             last_filter_in_rescale_delta: 0,
             last_frame_sample_rate: 0,
-
             // view_map: vec![],
         }
     }
@@ -1339,12 +1356,17 @@ struct Decoder {
     decode_errors: u64,
 }
 
-fn dec_done(dp_arc: &Arc<Mutex<DecoderParameter>>, senders: &Vec<(Sender<FrameBox>, usize, Arc<[AtomicBool]>)>) {
+fn dec_done(
+    dp_arc: &Arc<Mutex<DecoderParameter>>,
+    senders: &Vec<(Sender<FrameBox>, usize, Arc<[AtomicBool]>)>,
+) {
     for (sender, fg_input_index, finished_flag_list) in senders {
-        if !finished_flag_list.is_empty() && *fg_input_index < finished_flag_list.len()
-            && finished_flag_list[*fg_input_index].load(Ordering::Acquire) {
-                continue;
-            }
+        if !finished_flag_list.is_empty()
+            && *fg_input_index < finished_flag_list.len()
+            && finished_flag_list[*fg_input_index].load(Ordering::Acquire)
+        {
+            continue;
+        }
 
         let mut frame_box = unsafe { dec_frame_to_box(dp_arc.clone(), null_frame()) };
         frame_box.frame_data.fg_input_index = *fg_input_index;
@@ -1805,11 +1827,20 @@ mod tests {
         // SAFETY: the guard owns a valid (possibly null) dict; av_dict_get
         // tolerates null and returns entries owned by the dict.
         unsafe {
-            let entry = av_dict_get(guard.as_ptr(), key.as_ptr(), std::ptr::null(), AV_DICT_MATCH_CASE);
+            let entry = av_dict_get(
+                guard.as_ptr(),
+                key.as_ptr(),
+                std::ptr::null(),
+                AV_DICT_MATCH_CASE,
+            );
             if entry.is_null() {
                 None
             } else {
-                Some(CStr::from_ptr((*entry).value).to_string_lossy().into_owned())
+                Some(
+                    CStr::from_ptr((*entry).value)
+                        .to_string_lossy()
+                        .into_owned(),
+                )
             }
         }
     }

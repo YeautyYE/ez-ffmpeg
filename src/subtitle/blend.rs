@@ -316,14 +316,30 @@ fn blend_typed<S: Sample>(
             if S::BYTES == SampleU8::BYTES {
                 // SAFETY: `simd_available()` just verified the SIMD backend.
                 unsafe {
-                    arch_simd::blend_direct_u8(plane, image, src, alpha, (x0, y0), (xm0, ym0), (w, h))
+                    arch_simd::blend_direct_u8(
+                        plane,
+                        image,
+                        src,
+                        alpha,
+                        (x0, y0),
+                        (xm0, ym0),
+                        (w, h),
+                    )
                 };
                 return;
             }
             if S::BYTES == SampleU16Le::BYTES {
                 // SAFETY: `simd_available()` just verified the SIMD backend.
                 unsafe {
-                    arch_simd::blend_direct_u16(plane, image, src, alpha, (x0, y0), (xm0, ym0), (w, h))
+                    arch_simd::blend_direct_u16(
+                        plane,
+                        image,
+                        src,
+                        alpha,
+                        (x0, y0),
+                        (xm0, ym0),
+                        (w, h),
+                    )
                 };
                 return;
             }

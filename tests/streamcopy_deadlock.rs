@@ -88,9 +88,7 @@ fn wait_with_watchdog(
 fn build_fixture(mkv: &str, secs: u32, sub_start_s: u32) -> bool {
     let srt = sparse_srt_fixture("deadlock_in.srt", sub_start_s);
     let ctx = match FfmpegContext::builder()
-        .input(
-            Input::from(format!("color=c=black:s=320x240:r=30:d={secs}")).set_format("lavfi"),
-        )
+        .input(Input::from(format!("color=c=black:s=320x240:r=30:d={secs}")).set_format("lavfi"))
         .input(Input::from(srt.as_str()))
         .output(
             Output::from(mkv)

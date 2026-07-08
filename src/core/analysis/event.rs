@@ -179,7 +179,9 @@ impl ParseState {
         if let Some(at) = self.last_end_ts.or(self.last_ts) {
             out.push(MetadataEvent::StreamEnd { media, at });
         }
-        if self.last_integrated.is_some() || self.last_lra.is_some() || self.last_true_peak.is_some()
+        if self.last_integrated.is_some()
+            || self.last_lra.is_some()
+            || self.last_true_peak.is_some()
         {
             out.push(MetadataEvent::R128Summary {
                 integrated: self.last_integrated,
@@ -251,10 +253,7 @@ fn parse_silence(md: &DictionaryRef<'_>, out: &mut Vec<MetadataEvent>, state: &m
             let channel_number = parse_channel_suffix(suffix);
             if let Some(at) = parse_secs(value) {
                 state.pending_silence.push((channel_number, at.time_us));
-                out.push(MetadataEvent::SilenceStart {
-                    at,
-                    channel_number,
-                });
+                out.push(MetadataEvent::SilenceStart { at, channel_number });
             }
         } else if let Some(suffix) = key.strip_prefix(SILENCE_END) {
             let channel_number = parse_channel_suffix(suffix);
@@ -345,7 +344,9 @@ fn max_true_peak(md: &DictionaryRef<'_>) -> Option<f64> {
 
 /// Parses a `.N` channel suffix (1-based) into `Some(N)`; `""` yields `None`.
 fn parse_channel_suffix(suffix: &str) -> Option<usize> {
-    suffix.strip_prefix('.').and_then(|n| n.parse::<usize>().ok())
+    suffix
+        .strip_prefix('.')
+        .and_then(|n| n.parse::<usize>().ok())
 }
 
 fn remove_pending(pending: &mut Vec<(Option<usize>, i64)>, channel: Option<usize>) -> Option<i64> {
@@ -389,7 +390,11 @@ mod tests {
         f
     }
 
-    fn parse(pairs: &[(&str, &str)], media: AVMediaType, state: &mut ParseState) -> Vec<MetadataEvent> {
+    fn parse(
+        pairs: &[(&str, &str)],
+        media: AVMediaType,
+        state: &mut ParseState,
+    ) -> Vec<MetadataEvent> {
         let f = md_frame(pairs);
         let mut out = Vec::new();
         parse_frame_metadata(&f.metadata(), None, media, &mut out, state);
@@ -408,12 +413,28 @@ mod tests {
     #[test]
     fn black_start_end_pairs_with_duration() {
         let mut state = ParseState::default();
-        let ev = parse(&[("lavfi.black_start", "1.5")], AVMEDIA_TYPE_VIDEO, &mut state);
-        assert_eq!(ev, vec![MetadataEvent::BlackStart { at: Timestamp::from_secs(1.5).unwrap() }]);
-        let ev = parse(&[("lavfi.black_end", "3.0")], AVMEDIA_TYPE_VIDEO, &mut state);
+        let ev = parse(
+            &[("lavfi.black_start", "1.5")],
+            AVMEDIA_TYPE_VIDEO,
+            &mut state,
+        );
         assert_eq!(
             ev,
-            vec![MetadataEvent::BlackEnd { at: Timestamp::from_secs(3.0).unwrap(), duration_us: 1_500_000 }]
+            vec![MetadataEvent::BlackStart {
+                at: Timestamp::from_secs(1.5).unwrap()
+            }]
+        );
+        let ev = parse(
+            &[("lavfi.black_end", "3.0")],
+            AVMEDIA_TYPE_VIDEO,
+            &mut state,
+        );
+        assert_eq!(
+            ev,
+            vec![MetadataEvent::BlackEnd {
+                at: Timestamp::from_secs(3.0).unwrap(),
+                duration_us: 1_500_000
+            }]
         );
     }
 
@@ -421,7 +442,12 @@ mod tests {
     fn scene_change_only_when_time_present() {
         let mut state = ParseState::default();
         // score alone -> no event
-        assert!(parse(&[("lavfi.scd.score", "12.0")], AVMEDIA_TYPE_VIDEO, &mut state).is_empty());
+        assert!(parse(
+            &[("lavfi.scd.score", "12.0")],
+            AVMEDIA_TYPE_VIDEO,
+            &mut state
+        )
+        .is_empty());
         let ev = parse(
             &[("lavfi.scd.score", "12.0"), ("lavfi.scd.time", "2.0")],
             AVMEDIA_TYPE_VIDEO,
@@ -429,20 +455,33 @@ mod tests {
         );
         assert_eq!(
             ev,
-            vec![MetadataEvent::SceneChange { at: Timestamp::from_secs(2.0).unwrap(), score: 12.0 }]
+            vec![MetadataEvent::SceneChange {
+                at: Timestamp::from_secs(2.0).unwrap(),
+                score: 12.0
+            }]
         );
     }
 
     #[test]
     fn mono_silence_carries_channel_number() {
         let mut state = ParseState::default();
-        let ev = parse(&[("lavfi.silence_start.2", "0.5")], AVMEDIA_TYPE_AUDIO, &mut state);
+        let ev = parse(
+            &[("lavfi.silence_start.2", "0.5")],
+            AVMEDIA_TYPE_AUDIO,
+            &mut state,
+        );
         assert_eq!(
             ev,
-            vec![MetadataEvent::SilenceStart { at: Timestamp::from_secs(0.5).unwrap(), channel_number: Some(2) }]
+            vec![MetadataEvent::SilenceStart {
+                at: Timestamp::from_secs(0.5).unwrap(),
+                channel_number: Some(2)
+            }]
         );
         let ev = parse(
-            &[("lavfi.silence_end.2", "1.5"), ("lavfi.silence_duration.2", "1.0")],
+            &[
+                ("lavfi.silence_end.2", "1.5"),
+                ("lavfi.silence_duration.2", "1.0"),
+            ],
             AVMEDIA_TYPE_AUDIO,
             &mut state,
         );
@@ -459,10 +498,17 @@ mod tests {
     #[test]
     fn combined_silence_has_no_channel() {
         let mut state = ParseState::default();
-        let ev = parse(&[("lavfi.silence_start", "0.5")], AVMEDIA_TYPE_AUDIO, &mut state);
+        let ev = parse(
+            &[("lavfi.silence_start", "0.5")],
+            AVMEDIA_TYPE_AUDIO,
+            &mut state,
+        );
         assert_eq!(
             ev,
-            vec![MetadataEvent::SilenceStart { at: Timestamp::from_secs(0.5).unwrap(), channel_number: None }]
+            vec![MetadataEvent::SilenceStart {
+                at: Timestamp::from_secs(0.5).unwrap(),
+                channel_number: None
+            }]
         );
     }
 
@@ -470,11 +516,19 @@ mod tests {
     fn r128_true_peak_absent_is_none() {
         let mut state = ParseState::default();
         let ts = Some(Timestamp::from_secs(1.0).unwrap());
-        let f = md_frame(&[("lavfi.r128.M", "-20.0"), ("lavfi.r128.I", "-23.0"), ("lavfi.r128.LRA", "5.0")]);
+        let f = md_frame(&[
+            ("lavfi.r128.M", "-20.0"),
+            ("lavfi.r128.I", "-23.0"),
+            ("lavfi.r128.LRA", "5.0"),
+        ]);
         let mut out = Vec::new();
         parse_frame_metadata(&f.metadata(), ts, AVMEDIA_TYPE_AUDIO, &mut out, &mut state);
         match &out[0] {
-            MetadataEvent::R128Frame { true_peak, integrated, .. } => {
+            MetadataEvent::R128Frame {
+                true_peak,
+                integrated,
+                ..
+            } => {
                 assert_eq!(*true_peak, None);
                 assert_eq!(*integrated, Some(-23.0));
             }
@@ -505,7 +559,11 @@ mod tests {
         let flushed = state.flush(AVMEDIA_TYPE_AUDIO);
         assert!(flushed.iter().any(|e| matches!(
             e,
-            MetadataEvent::R128Summary { integrated: Some(_), true_peak: Some(_), .. }
+            MetadataEvent::R128Summary {
+                integrated: Some(_),
+                true_peak: Some(_),
+                ..
+            }
         )));
     }
 }

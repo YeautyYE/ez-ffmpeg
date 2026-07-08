@@ -142,8 +142,7 @@ impl Gops {
         self.current_bytes += frame_len(&data);
         self.current.push(data);
 
-        if self.current.len() > MAX_CURRENT_GOP_FRAMES
-            || self.current_bytes > MAX_CURRENT_GOP_BYTES
+        if self.current.len() > MAX_CURRENT_GOP_FRAMES || self.current_bytes > MAX_CURRENT_GOP_BYTES
         {
             log::warn!(
                 "current GOP exceeded {} frames / {} bytes without a keyframe; \

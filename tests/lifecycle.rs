@@ -39,9 +39,7 @@ fn stop_returns_only_after_all_worker_threads_exited() {
 
     let scheduler = FfmpegContext::builder()
         .input(Input::from("color=c=black:s=320x240:r=30").set_format("lavfi"))
-        .output(
-            Output::from(out.to_string_lossy().as_ref()).set_video_codec("mpeg4"),
-        )
+        .output(Output::from(out.to_string_lossy().as_ref()).set_video_codec("mpeg4"))
         .build()
         .unwrap()
         .start()

@@ -10,7 +10,8 @@ use ffmpeg_next::Frame;
 use ffmpeg_sys_next::{
     av_buffer_create, av_buffer_pool_get, av_buffer_pool_init, av_buffer_pool_uninit,
     av_frame_copy_props, av_frame_get_buffer, av_hwframe_map, av_hwframe_transfer_data, av_q2d,
-    AVBufferPool, AVDRMFrameDescriptor, AVPixelFormat, AV_BUFFER_FLAG_READONLY, AV_HWFRAME_MAP_READ,
+    AVBufferPool, AVDRMFrameDescriptor, AVPixelFormat, AV_BUFFER_FLAG_READONLY,
+    AV_HWFRAME_MAP_READ,
 };
 use std::ptr::NonNull;
 use std::sync::atomic::Ordering;
@@ -189,7 +190,10 @@ fn plane_slice(
     // SAFETY: the caller validated this is a software frame; FFmpeg allocates
     // at least `linesize * rows` bytes per plane and `len` <= that. The
     // returned lifetime is bound to `frame`, so the slice cannot outlive it.
-    Ok((unsafe { std::slice::from_raw_parts(data_ptr, len) }, linesize))
+    Ok((
+        unsafe { std::slice::from_raw_parts(data_ptr, len) },
+        linesize,
+    ))
 }
 
 /// Uploads one validated input frame, encodes the convert/effect/pack passes
@@ -284,8 +288,11 @@ pub(crate) fn encode_and_submit(
     // sharing one uniform buffer across in-flight frames is race-free: the
     // write for frame N+1 executes after frame N's submission.
     let convert_data: [u32; 4] = [matrix_id, full_range as u32, 0, 0];
-    gpu.queue
-        .write_buffer(&gpu.convert_uniforms, 0, bytemuck::cast_slice(&convert_data));
+    gpu.queue.write_buffer(
+        &gpu.convert_uniforms,
+        0,
+        bytemuck::cast_slice(&convert_data),
+    );
 
     // SAFETY: reading scalar fields from a live, validated frame.
     let play_time = unsafe {
@@ -527,8 +534,8 @@ impl OutputFramePool {
         // SAFETY: passing the default alloc callback (None) makes the pool
         // thread-safe per FFmpeg's contract; size came from the template.
         let pool = unsafe { av_buffer_pool_init(layout.pool_buffer_size, None) };
-        let pool = NonNull::new(pool)
-            .ok_or_else(|| "av_buffer_pool_init returned null".to_string())?;
+        let pool =
+            NonNull::new(pool).ok_or_else(|| "av_buffer_pool_init returned null".to_string())?;
         Ok(OutputFramePool { key, layout, pool })
     }
 
@@ -604,7 +611,14 @@ impl OutputFramePool {
             let dst_u = std::slice::from_raw_parts_mut((*p).data[1], dst_u_stride * out_ch);
             let dst_v = std::slice::from_raw_parts_mut((*p).data[2], dst_v_stride * out_ch);
 
-            copy_plane(&mapped[..y_end], geo.y_stride, dst_y, dst_y_stride, out_w, out_h);
+            copy_plane(
+                &mapped[..y_end],
+                geo.y_stride,
+                dst_y,
+                dst_y_stride,
+                out_w,
+                out_h,
+            );
             copy_plane(
                 &mapped[y_end..u_end],
                 geo.c_stride,
@@ -696,9 +710,7 @@ pub(crate) fn build_output_frame_zero_copy(
         drop(mapped);
         staging.buffer.unmap();
         let _ = recycle_tx.send(staging);
-        return Err(format!(
-            "Mapped readback too small: need {v_end} bytes"
-        ));
+        return Err(format!("Mapped readback too small: need {v_end} bytes"));
     }
     let base = mapped.as_ptr() as *mut u8;
     drop(mapped);

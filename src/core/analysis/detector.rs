@@ -213,7 +213,9 @@ mod tests {
 
     #[test]
     fn scene_filter_uses_sc_pass_zero() {
-        let d = VideoDetector::Scene { threshold_pct: 10.0 };
+        let d = VideoDetector::Scene {
+            threshold_pct: 10.0,
+        };
         assert_eq!(d.to_filter(), "scdet=threshold=10:sc_pass=0");
     }
 
@@ -281,7 +283,11 @@ mod tests {
         .validate()
         .is_err());
         // Out-of-documented-range values are rejected too.
-        assert!(VideoDetector::Scene { threshold_pct: 101.0 }.validate().is_err());
+        assert!(VideoDetector::Scene {
+            threshold_pct: 101.0
+        }
+        .validate()
+        .is_err());
         assert!(VideoDetector::Black {
             min_duration_s: -1.0,
             pixel_th: 0.1,

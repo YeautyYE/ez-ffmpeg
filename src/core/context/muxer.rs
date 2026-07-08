@@ -6,14 +6,14 @@ use crate::core::context::pre_mux_queue::{
 use crate::core::context::{FrameBox, PacketBox};
 use crate::core::filter::frame_pipeline::FramePipeline;
 use crate::core::scheduler::input_controller::SchNode;
-use crate::raw::FormatContext;
 use crate::error::OpenOutputError;
+use crate::raw::FormatContext;
 use crossbeam_channel::{Receiver, Sender};
-use log::error;
 use ffmpeg_sys_next::{
     avformat_new_stream, AVCodec, AVFormatContext, AVMediaType, AVRational, AVSampleFormat,
     AVStream, AVFMT_NOTIMESTAMPS, AVFMT_VARIABLE_FPS,
 };
+use log::error;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::ptr::null;
@@ -518,7 +518,13 @@ impl Muxer {
         let (packet_sender, st, index) = self.new_stream(src)?;
         let (pre_sender, pre_receiver) = pre_mux_queue::channel(self.pre_mux_queue_config);
         self.src_pre_receivers.push(pre_receiver);
-        Ok((packet_sender, pre_sender, self.mux_start_gate.clone(), st, index))
+        Ok((
+            packet_sender,
+            pre_sender,
+            self.mux_start_gate.clone(),
+            st,
+            index,
+        ))
     }
 
     pub(crate) fn is_ready(&self) -> bool {
@@ -541,7 +547,9 @@ impl Muxer {
         output_stream_index: usize,
     ) -> Option<Arc<AtomicBool>> {
         match self.mux_stream_nodes.get(output_stream_index)?.as_ref() {
-            SchNode::MuxStream { source_finished, .. } => Some(source_finished.clone()),
+            SchNode::MuxStream {
+                source_finished, ..
+            } => Some(source_finished.clone()),
             _ => None,
         }
     }
@@ -600,8 +608,7 @@ impl Muxer {
             })
             .collect();
 
-        let is_interleaved =
-            |t: AVMediaType| t != AVMediaType::AVMEDIA_TYPE_ATTACHMENT;
+        let is_interleaved = |t: AVMediaType| t != AVMediaType::AVMEDIA_TYPE_ATTACHMENT;
         let nb_interleaved = types.iter().filter(|&&t| is_interleaved(t)).count();
         let nb_av_enc = is_av_enc.iter().filter(|&&b| b).count();
 
@@ -716,31 +723,30 @@ unsafe fn determine_vsync_method(
     }
 
     // 1. -r or -fpsmax both force CFR (ffmpeg_mux_init.c:807-808)
-    let mut vsync_method = if framerate.is_some_and(|fr| fr.num != 0)
-        || framerate_max.is_some_and(|fr| fr.num != 0)
-    {
-        VSyncMethod::VsyncCfr
-    }
-    // 2. If output format is "avi", set VSYNC_VFR
-    else if match CStr::from_ptr((*(*out_fmt_ctx).oformat).name).to_str() {
-        Ok(s) => s == "avi",
-        Err(_) => false,
-    } {
-        VSyncMethod::VsyncVfr
-    }
-    // 3. Otherwise, check the format flags
-    else {
-        let oformat = (*out_fmt_ctx).oformat;
-        if (*oformat).flags & AVFMT_VARIABLE_FPS != 0 {
-            if (*oformat).flags & AVFMT_NOTIMESTAMPS != 0 {
-                VSyncMethod::VsyncPassthrough
-            } else {
-                VSyncMethod::VsyncVfr
-            }
-        } else {
+    let mut vsync_method =
+        if framerate.is_some_and(|fr| fr.num != 0) || framerate_max.is_some_and(|fr| fr.num != 0) {
             VSyncMethod::VsyncCfr
         }
-    };
+        // 2. If output format is "avi", set VSYNC_VFR
+        else if match CStr::from_ptr((*(*out_fmt_ctx).oformat).name).to_str() {
+            Ok(s) => s == "avi",
+            Err(_) => false,
+        } {
+            VSyncMethod::VsyncVfr
+        }
+        // 3. Otherwise, check the format flags
+        else {
+            let oformat = (*out_fmt_ctx).oformat;
+            if (*oformat).flags & AVFMT_VARIABLE_FPS != 0 {
+                if (*oformat).flags & AVFMT_NOTIMESTAMPS != 0 {
+                    VSyncMethod::VsyncPassthrough
+                } else {
+                    VSyncMethod::VsyncVfr
+                }
+            } else {
+                VSyncMethod::VsyncCfr
+            }
+        };
 
     // 4. A stream fed directly by a single-stream input keeps its original
     // grid (ffmpeg_mux_init.c:817-822; input_ts_offset is always 0 here

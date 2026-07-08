@@ -2,22 +2,31 @@ use crate::core::context::muxer::{Muxer, SqMuxPlan, StreamBsfChains};
 use crate::core::context::obj_pool::ObjPool;
 use crate::core::context::pre_mux_queue::PreMuxQueueReceiver;
 use crate::core::context::{PacketBox, PacketData};
-use crate::raw::{BitStreamFilter, FormatContext};
-use crate::core::scheduler::ffmpeg_scheduler::{is_stopping, packet_is_null, set_scheduler_error, wait_until_not_paused, STATUS_ABORT, STATUS_END};
+use crate::core::scheduler::ffmpeg_scheduler::{
+    is_stopping, packet_is_null, set_scheduler_error, wait_until_not_paused, STATUS_ABORT,
+    STATUS_END,
+};
 use crate::core::scheduler::input_controller::{InputController, SchNode};
 use crate::core::scheduler::sync_queue::SyncQueue;
 use crate::error::Error::Muxing;
 use crate::error::{MuxingError, MuxingOperationError, WriteHeaderError};
+use crate::raw::{BitStreamFilter, FormatContext};
 use crate::util::ffmpeg_utils::{av_err2str, hashmap_to_avdictionary, DictGuard};
 use crate::util::thread_synchronizer::ThreadSynchronizer;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use ffmpeg_next::packet::{Mut, Ref};
 use ffmpeg_next::Packet;
 use ffmpeg_sys_next::AVMediaType::{AVMEDIA_TYPE_AUDIO, AVMEDIA_TYPE_SUBTITLE, AVMEDIA_TYPE_VIDEO};
-use ffmpeg_sys_next::{av_compare_ts, av_get_audio_frame_duration2, av_interleaved_write_frame, av_packet_move_ref, av_packet_rescale_ts, av_rescale_delta, av_rescale_q, av_write_trailer, avcodec_parameters_copy, avformat_write_header, AVFormatContext, AVPacket, AVRational, AVERROR, AVERROR_EOF, AVFMT_NOTIMESTAMPS, AVFMT_TS_NONSTRICT, AV_LOG_DEBUG, AV_LOG_WARNING, AV_NOPTS_VALUE, AV_PKT_FLAG_KEY, AV_TIME_BASE_Q, EAGAIN, ENOMEM};
-use std::collections::VecDeque;
+use ffmpeg_sys_next::{
+    av_compare_ts, av_get_audio_frame_duration2, av_interleaved_write_frame, av_packet_move_ref,
+    av_packet_rescale_ts, av_rescale_delta, av_rescale_q, av_write_trailer,
+    avcodec_parameters_copy, avformat_write_header, AVFormatContext, AVPacket, AVRational, AVERROR,
+    AVERROR_EOF, AVFMT_NOTIMESTAMPS, AVFMT_TS_NONSTRICT, AV_LOG_DEBUG, AV_LOG_WARNING,
+    AV_NOPTS_VALUE, AV_PKT_FLAG_KEY, AV_TIME_BASE_Q, EAGAIN, ENOMEM,
+};
 use log::{debug, error, info, trace, warn};
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -227,25 +236,26 @@ pub(crate) fn ready_to_init_mux(
     }
 }
 
-fn mux_task_start(mux_idx: usize,
-                  out_fmt_ctx: FormatContext,
-                  queue: Option<(Sender<PacketBox>, Receiver<PacketBox>)>,
-                  start_time_us: Option<i64>,
-                  recording_time_us: Option<i64>,
-                  stream_count: usize,
-                  format_opts: Option<HashMap<CString, CString>>,
-                  bsf_chains: StreamBsfChains,
-                  src_pre_receivers: Vec<PreMuxQueueReceiver>,
-                  mux_start_gate: Arc<crate::core::context::MuxStartGate>,
-                  enc_handle_receiver: Receiver<std::thread::JoinHandle<()>>,
-                  packet_pool: ObjPool<Packet>,
-                  input_controller: Arc<InputController>,
-                  mux_stream_nodes: Vec<Arc<SchNode>>,
-                  sq_mux_plan: Option<SqMuxPlan>,
-                  scheduler_status: Arc<AtomicUsize>,
-                  thread_sync: ThreadSynchronizer,
-                  scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,) -> crate::error::Result<()> {
-
+fn mux_task_start(
+    mux_idx: usize,
+    out_fmt_ctx: FormatContext,
+    queue: Option<(Sender<PacketBox>, Receiver<PacketBox>)>,
+    start_time_us: Option<i64>,
+    recording_time_us: Option<i64>,
+    stream_count: usize,
+    format_opts: Option<HashMap<CString, CString>>,
+    bsf_chains: StreamBsfChains,
+    src_pre_receivers: Vec<PreMuxQueueReceiver>,
+    mux_start_gate: Arc<crate::core::context::MuxStartGate>,
+    enc_handle_receiver: Receiver<std::thread::JoinHandle<()>>,
+    packet_pool: ObjPool<Packet>,
+    input_controller: Arc<InputController>,
+    mux_stream_nodes: Vec<Arc<SchNode>>,
+    sq_mux_plan: Option<SqMuxPlan>,
+    scheduler_status: Arc<AtomicUsize>,
+    thread_sync: ThreadSynchronizer,
+    scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
+) -> crate::error::Result<()> {
     if queue.is_none() {
         // Zero-stream output (e.g. an AVFMT_NOSTREAMS muxer): no mux worker
         // thread will be spawned to release this muxer's pre-counted thread
@@ -261,7 +271,24 @@ fn mux_task_start(mux_idx: usize,
 
     let (queue_sender, queue_receiver) = queue.unwrap();
 
-    _mux_init(mux_idx, out_fmt_ctx, queue_receiver, start_time_us, recording_time_us, stream_count, format_opts, bsf_chains, enc_handle_receiver, packet_pool, input_controller, mux_stream_nodes, sq_mux_plan, scheduler_status, thread_sync, scheduler_result)?;
+    _mux_init(
+        mux_idx,
+        out_fmt_ctx,
+        queue_receiver,
+        start_time_us,
+        recording_time_us,
+        stream_count,
+        format_opts,
+        bsf_chains,
+        enc_handle_receiver,
+        packet_pool,
+        input_controller,
+        mux_stream_nodes,
+        sq_mux_plan,
+        scheduler_status,
+        thread_sync,
+        scheduler_result,
+    )?;
 
     // Drain the pre-queues and open the gate atomically: an encoder that
     // saw the gate closed cannot park a packet after this drain ran.
@@ -353,45 +380,49 @@ fn _mux_init(
     // When no output sets a BSF, `stream_bsfs` is an empty vec; the worker then
     // gates all BSF work off `has_bsf` and the packet path below is byte-for-
     // byte the pre-BSF path.
-    let stream_bsfs = match unsafe {
-        init_bitstream_filters(out_fmt_ctx_ptr, &bsf_chains, stream_count)
-    } {
-        Ok(bsfs) => bsfs,
-        Err((name, bsf_ret)) => {
-            error!(
-                "Could not initialize bitstream filter chain '{name}': {}",
-                av_err2str(bsf_ret)
-            );
-            // Same terminal ordering as the write_header failure below: publish
-            // the error before releasing this muxer's thread slot.
-            set_scheduler_error(
-                &scheduler_status,
-                &scheduler_result,
-                Muxing(MuxingOperationError::BitstreamFilterInit(
-                    name.clone(),
+    let stream_bsfs =
+        match unsafe { init_bitstream_filters(out_fmt_ctx_ptr, &bsf_chains, stream_count) } {
+            Ok(bsfs) => bsfs,
+            Err((name, bsf_ret)) => {
+                error!(
+                    "Could not initialize bitstream filter chain '{name}': {}",
+                    av_err2str(bsf_ret)
+                );
+                // Same terminal ordering as the write_header failure below: publish
+                // the error before releasing this muxer's thread slot.
+                set_scheduler_error(
+                    &scheduler_status,
+                    &scheduler_result,
+                    Muxing(MuxingOperationError::BitstreamFilterInit(
+                        name.clone(),
+                        MuxingError::from(bsf_ret),
+                    )),
+                );
+                thread_sync.thread_done_with(|| {
+                    scheduler_status.store(STATUS_END, Ordering::Release);
+                });
+                // `out_fmt_ctx` drops here (frees the context); any partially built
+                // `BitStreamFilter`s were already dropped inside the helper.
+                return Err(Muxing(MuxingOperationError::BitstreamFilterInit(
+                    name,
                     MuxingError::from(bsf_ret),
-                )),
-            );
-            thread_sync.thread_done_with(|| {
-                scheduler_status.store(STATUS_END, Ordering::Release);
-            });
-            // `out_fmt_ctx` drops here (frees the context); any partially built
-            // `BitStreamFilter`s were already dropped inside the helper.
-            return Err(Muxing(MuxingOperationError::BitstreamFilterInit(
-                name,
-                MuxingError::from(bsf_ret),
-            )));
-        }
-    };
+                )));
+            }
+        };
 
     let ret = unsafe { avformat_write_header(out_fmt_ctx_ptr, opts.as_double_ptr()) };
     if ret < 0 {
-        error!("Could not write header (incorrect codec parameters ?): {}", av_err2str(ret));
+        error!(
+            "Could not write header (incorrect codec parameters ?): {}",
+            av_err2str(ret)
+        );
         fail_mux_init(
             &scheduler_status,
             &scheduler_result,
             &thread_sync,
-            Muxing(MuxingOperationError::WriteHeader(WriteHeaderError::from(ret))),
+            Muxing(MuxingOperationError::WriteHeader(WriteHeaderError::from(
+                ret,
+            ))),
         );
         // `out_fmt_ctx` drops here, freeing the context.
         return Err(Muxing(MuxingOperationError::WriteHeader(
@@ -408,7 +439,11 @@ fn _mux_init(
         (*oformat).flags
     };
 
-    let format_name = unsafe { CStr::from_ptr((*(*out_fmt_ctx_ptr).oformat).name).to_str().unwrap_or("unknown") };
+    let format_name = unsafe {
+        CStr::from_ptr((*(*out_fmt_ctx_ptr).oformat).name)
+            .to_str()
+            .unwrap_or("unknown")
+    };
 
     // Handles for the spawn-failure branch below: the originals move into the
     // worker closure, and a failed spawn drops that closure without ever
@@ -985,7 +1020,7 @@ fn _mux_init(
             &thread_sync_spawn,
             Muxing(MuxingOperationError::ThreadExited),
         );
-        return Err(MuxingOperationError::ThreadExited.into())
+        return Err(MuxingOperationError::ThreadExited.into());
     }
 
     Ok(())
@@ -1016,11 +1051,27 @@ fn fail_mux_init(
     release_mux_slot(scheduler_status, thread_sync);
 }
 
-unsafe fn update_last_dts(mux_stream_node: &Arc<SchNode>, input_controller: &Arc<InputController>, scheduler_status: &Arc<AtomicUsize>, pkt: *const AVPacket) {
+unsafe fn update_last_dts(
+    mux_stream_node: &Arc<SchNode>,
+    input_controller: &Arc<InputController>,
+    scheduler_status: &Arc<AtomicUsize>,
+    pkt: *const AVPacket,
+) {
     if (*pkt).dts != AV_NOPTS_VALUE {
-        let dts = av_rescale_q((*pkt).dts + (*pkt).duration, (*pkt).time_base, AV_TIME_BASE_Q);
+        let dts = av_rescale_q(
+            (*pkt).dts + (*pkt).duration,
+            (*pkt).time_base,
+            AV_TIME_BASE_Q,
+        );
         let node = mux_stream_node.as_ref();
-        let SchNode::MuxStream { src: _, last_dts, source_finished: _ } = node else { unreachable!() };
+        let SchNode::MuxStream {
+            src: _,
+            last_dts,
+            source_finished: _,
+        } = node
+        else {
+            unreachable!()
+        };
         last_dts.store(dts, Ordering::Release);
         input_controller.update_locked(scheduler_status);
     }
@@ -1125,10 +1176,7 @@ unsafe fn mux_write_released(
 ) -> i32 {
     let stream_index = packet_box.packet_data.output_stream_index as usize;
     if has_bsf {
-        if stream_bsfs
-            .get(stream_index)
-            .map_or(false, |b| b.is_some())
-        {
+        if stream_bsfs.get(stream_index).map_or(false, |b| b.is_some()) {
             stream_pkt_templates[stream_index] = Some(packet_box.packet_data.clone());
         }
         mux_filter_and_write_packet(
@@ -1194,7 +1242,10 @@ unsafe fn sq_finish_output_stream(
     stream_eof[ost] = true;
     *nb_done += 1;
     if ost < mux_stream_nodes.len() {
-        if let SchNode::MuxStream { source_finished, .. } = mux_stream_nodes[ost].as_ref() {
+        if let SchNode::MuxStream {
+            source_finished, ..
+        } = mux_stream_nodes[ost].as_ref()
+        {
             source_finished.store(true, Ordering::Release);
         }
     }
@@ -1310,8 +1361,7 @@ unsafe fn init_bitstream_filters(
         return Ok(Vec::new());
     }
 
-    let mut stream_bsfs: Vec<Option<BitStreamFilter>> =
-        (0..stream_count).map(|_| None).collect();
+    let mut stream_bsfs: Vec<Option<BitStreamFilter>> = (0..stream_count).map(|_| None).collect();
 
     for i in 0..stream_count {
         let st = *(*out_fmt_ctx).streams.add(i);
@@ -1616,11 +1666,12 @@ unsafe fn mux_fixup_ts(
         {
             let max = *last_mux_dts + ((oformat_flags & AVFMT_TS_NONSTRICT) == 0) as i64;
             if (*pkt).dts < max {
-                let loglevel = if max - (*pkt).dts > 2 || packet_data.codec_type == AVMEDIA_TYPE_VIDEO {
-                    AV_LOG_WARNING
-                } else {
-                    AV_LOG_DEBUG
-                };
+                let loglevel =
+                    if max - (*pkt).dts > 2 || packet_data.codec_type == AVMEDIA_TYPE_VIDEO {
+                        AV_LOG_WARNING
+                    } else {
+                        AV_LOG_DEBUG
+                    };
                 if loglevel == AV_LOG_WARNING {
                     warn!(
                         "Non-monotonic DTS; previous: {}, current: {}; ",
@@ -1652,8 +1703,6 @@ unsafe fn mux_fixup_ts(
     }
     *last_mux_dts = (*pkt).dts;
 }
-
-
 
 fn min3(a: i64, b: i64, c: i64) -> i64 {
     std::cmp::min(a, std::cmp::min(b, c))
@@ -1705,10 +1754,7 @@ mod tests {
 
         // Error recorded before the slot release, terminal status published.
         assert!(is_stopping(scheduler_status.load(Ordering::Acquire)));
-        assert!(matches!(
-            &*scheduler_result.lock().unwrap(),
-            Some(Err(_))
-        ));
+        assert!(matches!(&*scheduler_result.lock().unwrap(), Some(Err(_))));
     }
 
     /// The zero-stream (AVFMT_NOSTREAMS) early return must release the

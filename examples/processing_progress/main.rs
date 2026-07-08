@@ -15,7 +15,7 @@ fn main() {
     let mut progress_callbacker = ProgressCallBacker::new();
     progress_callbacker.total_duration = get_duration_us("test.mp4").unwrap();
     println!("Duration: {} us", progress_callbacker.total_duration);
-    
+
     // Retrieve the audio stream information
     let audio_info = ez_ffmpeg::stream_info::find_audio_stream_info("test.mp4").unwrap();
     if let Some(audio_info) = audio_info {
@@ -29,7 +29,6 @@ fn main() {
     } else {
         println!("Warning: Audio stream information not found");
     }
-
 
     let progress_filter = ProgressCallBackFilter::new(Arc::new(progress_callbacker));
     let frame_pipeline_builder =

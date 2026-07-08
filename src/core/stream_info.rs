@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::ptr::{null, null_mut};
 
+use crate::error::{FindStreamError, OpenInputError, Result};
+use crate::raw::FormatContext;
 #[cfg(not(docsrs))]
 use ffmpeg_sys_next::AVChannelOrder;
 use ffmpeg_sys_next::AVMediaType::{
@@ -13,8 +15,6 @@ use ffmpeg_sys_next::{
     avformat_find_stream_info, AVCodecID, AVDictionary, AVDictionaryEntry, AVRational,
 };
 use ffmpeg_sys_next::{avformat_alloc_context, avformat_close_input, avformat_open_input};
-use crate::raw::FormatContext;
-use crate::error::{FindStreamError, OpenInputError, Result};
 
 #[derive(Debug, Clone)]
 pub enum StreamInfo {
@@ -245,9 +245,7 @@ impl StreamInfo {
 ///
 /// # Safety
 /// The caller must ensure `codecpar` points into a live `AVStream`.
-unsafe fn display_matrix_rotation(
-    codecpar: &ffmpeg_sys_next::AVCodecParameters,
-) -> Option<i32> {
+unsafe fn display_matrix_rotation(codecpar: &ffmpeg_sys_next::AVCodecParameters) -> Option<i32> {
     if codecpar.coded_side_data.is_null() || codecpar.nb_coded_side_data <= 0 {
         return None;
     }
@@ -262,7 +260,9 @@ unsafe fn display_matrix_rotation(
 ///
 /// # Safety
 /// The caller must ensure `raw_stream` is a valid, non-null pointer to an `AVStream`.
-unsafe fn extract_stream_info_from_stream(raw_stream: *mut ffmpeg_sys_next::AVStream) -> StreamInfo {
+unsafe fn extract_stream_info_from_stream(
+    raw_stream: *mut ffmpeg_sys_next::AVStream,
+) -> StreamInfo {
     let stream = &*raw_stream;
     let metadata = dict_to_hashmap(stream.metadata);
 
@@ -423,7 +423,11 @@ pub(crate) unsafe fn extract_stream_infos(fmt_ctx_box: &FormatContext) -> Result
         infos.push(extract_stream_info_from_stream(raw_stream));
     }
 
-    if !infos.is_empty() && infos.iter().all(|i| matches!(i, StreamInfo::Unknown { .. })) {
+    if !infos.is_empty()
+        && infos
+            .iter()
+            .all(|i| matches!(i, StreamInfo::Unknown { .. }))
+    {
         return Err(FindStreamError::NoStreamFound.into());
     }
 
@@ -445,14 +449,8 @@ fn find_best_stream_info(
     // We bounds-check best_index against nb_streams and null-check streams_ptr
     // before dereferencing.
     unsafe {
-        let best_index = av_find_best_stream(
-            in_fmt_ctx_box.as_ptr(),
-            media_type,
-            -1,
-            -1,
-            null_mut(),
-            0,
-        );
+        let best_index =
+            av_find_best_stream(in_fmt_ctx_box.as_ptr(), media_type, -1, -1, null_mut(), 0);
         if best_index < 0 {
             return Ok(None);
         }
@@ -773,8 +771,8 @@ mod tests {
     fn rotate_reads_display_matrix_side_data() {
         use ffmpeg_sys_next::AVPacketSideDataType::AV_PKT_DATA_DISPLAYMATRIX;
         use ffmpeg_sys_next::{
-            av_display_rotation_set, av_malloc, av_packet_side_data_add,
-            avformat_alloc_context, avformat_free_context, avformat_new_stream,
+            av_display_rotation_set, av_malloc, av_packet_side_data_add, avformat_alloc_context,
+            avformat_free_context, avformat_new_stream,
         };
 
         unsafe {
@@ -820,17 +818,29 @@ mod tests {
     #[test]
     fn test_is_video() {
         let video = StreamInfo::Video {
-            index: 0, time_base: AVRational { num: 1, den: 30 },
-            start_time: 0, duration: 100, nb_frames: 100,
+            index: 0,
+            time_base: AVRational { num: 1, den: 30 },
+            start_time: 0,
+            duration: 100,
+            nb_frames: 100,
             r_frame_rate: AVRational { num: 30, den: 1 },
             sample_aspect_ratio: AVRational { num: 1, den: 1 },
             avg_frame_rate: AVRational { num: 30, den: 1 },
-            width: 1920, height: 1080, bit_rate: 0, pixel_format: 0,
-            video_delay: 0, fps: 30.0, rotate: 0,
+            width: 1920,
+            height: 1080,
+            bit_rate: 0,
+            pixel_format: 0,
+            video_delay: 0,
+            fps: 30.0,
+            rotate: 0,
             codec_id: AVCodecID::AV_CODEC_ID_H264,
-            codec_name: "h264".to_string(), metadata: HashMap::new(),
+            codec_name: "h264".to_string(),
+            metadata: HashMap::new(),
         };
-        let unknown = StreamInfo::Unknown { index: 1, metadata: HashMap::new() };
+        let unknown = StreamInfo::Unknown {
+            index: 1,
+            metadata: HashMap::new(),
+        };
         assert!(video.is_video());
         assert!(!video.is_audio());
         assert!(!unknown.is_video());
@@ -839,15 +849,22 @@ mod tests {
     #[test]
     fn test_is_audio() {
         let audio = StreamInfo::Audio {
-            index: 1, time_base: AVRational { num: 1, den: 44100 },
-            start_time: 0, duration: 100, nb_frames: 0,
+            index: 1,
+            time_base: AVRational { num: 1, den: 44100 },
+            start_time: 0,
+            duration: 100,
+            nb_frames: 0,
             avg_frame_rate: AVRational { num: 0, den: 1 },
             sample_rate: 44100,
             #[cfg(not(docsrs))]
             order: AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC,
-            nb_channels: 2, bit_rate: 128000, sample_format: 0, frame_size: 1024,
+            nb_channels: 2,
+            bit_rate: 128000,
+            sample_format: 0,
+            frame_size: 1024,
             codec_id: AVCodecID::AV_CODEC_ID_AAC,
-            codec_name: "aac".to_string(), metadata: HashMap::new(),
+            codec_name: "aac".to_string(),
+            metadata: HashMap::new(),
         };
         assert!(audio.is_audio());
         assert!(!audio.is_video());
@@ -856,17 +873,29 @@ mod tests {
     #[test]
     fn test_index() {
         let video = StreamInfo::Video {
-            index: 5, time_base: AVRational { num: 1, den: 30 },
-            start_time: 0, duration: 100, nb_frames: 100,
+            index: 5,
+            time_base: AVRational { num: 1, den: 30 },
+            start_time: 0,
+            duration: 100,
+            nb_frames: 100,
             r_frame_rate: AVRational { num: 30, den: 1 },
             sample_aspect_ratio: AVRational { num: 1, den: 1 },
             avg_frame_rate: AVRational { num: 30, den: 1 },
-            width: 1920, height: 1080, bit_rate: 0, pixel_format: 0,
-            video_delay: 0, fps: 30.0, rotate: 0,
+            width: 1920,
+            height: 1080,
+            bit_rate: 0,
+            pixel_format: 0,
+            video_delay: 0,
+            fps: 30.0,
+            rotate: 0,
             codec_id: AVCodecID::AV_CODEC_ID_H264,
-            codec_name: "h264".to_string(), metadata: HashMap::new(),
+            codec_name: "h264".to_string(),
+            metadata: HashMap::new(),
         };
-        let unknown = StreamInfo::Unknown { index: 42, metadata: HashMap::new() };
+        let unknown = StreamInfo::Unknown {
+            index: 42,
+            metadata: HashMap::new(),
+        };
         assert_eq!(video.index(), 5);
         assert_eq!(unknown.index(), 42);
     }

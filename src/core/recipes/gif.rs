@@ -373,9 +373,8 @@ fn check_capabilities(needs_scale: bool) -> Result<()> {
     // the returned pointers are used solely for null checks, never dereferenced.
     unsafe {
         for name in required {
-            let c_name = CString::new(name).map_err(|_| {
-                Error::InvalidRecipeArg(format!("invalid filter name {name:?}"))
-            })?;
+            let c_name = CString::new(name)
+                .map_err(|_| Error::InvalidRecipeArg(format!("invalid filter name {name:?}")))?;
             if avfilter_get_by_name(c_name.as_ptr()).is_null() {
                 return Err(Error::InvalidRecipeArg(format!(
                     "this FFmpeg build is missing the '{name}' filter required for GIF export"
@@ -383,9 +382,8 @@ fn check_capabilities(needs_scale: bool) -> Result<()> {
             }
         }
 
-        let gif = CString::new("gif").map_err(|_| {
-            Error::InvalidRecipeArg("invalid format name \"gif\"".to_string())
-        })?;
+        let gif = CString::new("gif")
+            .map_err(|_| Error::InvalidRecipeArg("invalid format name \"gif\"".to_string()))?;
 
         if av_guess_format(gif.as_ptr(), null(), null()).is_null() {
             return Err(Error::InvalidRecipeArg(
@@ -590,7 +588,10 @@ mod tests {
                 max_colors: Some(ok),
                 ..GifOptions::default()
             };
-            assert!(validate(&opts).is_ok(), "max_colors={ok} should be accepted");
+            assert!(
+                validate(&opts).is_ok(),
+                "max_colors={ok} should be accepted"
+            );
         }
     }
 

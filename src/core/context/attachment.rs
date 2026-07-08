@@ -20,8 +20,7 @@ use crate::error::{OpenOutputError, Result};
 use ffmpeg_sys_next::AVCodecID::{AV_CODEC_ID_NONE, AV_CODEC_ID_OTF, AV_CODEC_ID_TTF};
 use ffmpeg_sys_next::AVMediaType::AVMEDIA_TYPE_ATTACHMENT;
 use ffmpeg_sys_next::{
-    av_dict_set, av_mallocz, avformat_new_stream, AVCodecID, AVStream,
-    AV_INPUT_BUFFER_PADDING_SIZE,
+    av_dict_set, av_mallocz, avformat_new_stream, AVCodecID, AVStream, AV_INPUT_BUFFER_PADDING_SIZE,
 };
 use std::ffi::{CStr, CString};
 use std::fs::File;
@@ -276,7 +275,10 @@ mod tests {
     fn rejects_non_regular_file_without_hanging() {
         let err = read_attachment_bytes(Path::new("/dev/zero"), "/dev/zero").unwrap_err();
         assert!(
-            matches!(err, Error::OpenOutput(OpenOutputError::AttachmentRead(_, _))),
+            matches!(
+                err,
+                Error::OpenOutput(OpenOutputError::AttachmentRead(_, _))
+            ),
             "expected AttachmentRead for a non-regular file, got {err:?}"
         );
     }
@@ -289,7 +291,10 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, Error::OpenOutput(OpenOutputError::AttachmentRead(_, _))),
+            matches!(
+                err,
+                Error::OpenOutput(OpenOutputError::AttachmentRead(_, _))
+            ),
             "expected AttachmentRead for a missing file, got {err:?}"
         );
     }

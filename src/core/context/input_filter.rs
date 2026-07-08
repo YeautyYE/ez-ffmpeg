@@ -3,8 +3,8 @@
 //! bind-time options, including the `IFILTER_FLAG_*` constants.
 
 use crate::core::context::null_frame;
-use ffmpeg_sys_next::{AVMediaType, AVRational};
 use ffmpeg_next::Frame;
+use ffmpeg_sys_next::{AVMediaType, AVRational};
 
 pub(crate) struct InputFilter {
     pub(crate) linklabel: String,
@@ -17,7 +17,12 @@ pub(crate) struct InputFilter {
 }
 
 impl InputFilter {
-    pub(crate) fn new(linklabel: String, media_type: AVMediaType, name: String, fallback: Frame) -> Self {
+    pub(crate) fn new(
+        linklabel: String,
+        media_type: AVMediaType,
+        name: String,
+        fallback: Frame,
+    ) -> Self {
         Self {
             linklabel,
             media_type,
@@ -39,7 +44,7 @@ pub(crate) const IFILTER_FLAG_CROP: u32 = 1 << 3;
 pub(crate) struct InputFilterOptions {
     pub(crate) trim_start_us: Option<i64>,
     pub(crate) trim_end_us: Option<i64>,
-    
+
     pub(crate) name: String,
     pub(crate) framerate: AVRational,
     #[allow(dead_code)]
@@ -56,7 +61,7 @@ pub(crate) struct InputFilterOptions {
 
     pub(crate) flags: u32,
 
-    pub(crate) fallback:Frame,
+    pub(crate) fallback: Frame,
 }
 
 impl InputFilterOptions {
@@ -89,7 +94,7 @@ impl InputFilterOptions {
             sub2video_width: 0,
             sub2video_height: 0,
             flags: 0,
-            fallback:null_frame(),
+            fallback: null_frame(),
         }
     }
 }
@@ -201,7 +206,8 @@ mod tests {
     #[test]
     fn autorotate_with_all_flags_set() {
         // Test with all flags already set
-        let all_flags = IFILTER_FLAG_AUTOROTATE | IFILTER_FLAG_REINIT | IFILTER_FLAG_CFR | IFILTER_FLAG_CROP;
+        let all_flags =
+            IFILTER_FLAG_AUTOROTATE | IFILTER_FLAG_REINIT | IFILTER_FLAG_CFR | IFILTER_FLAG_CROP;
 
         // autorotate=true should not change anything (already set)
         let result = apply_autorotate_flag(all_flags, true);

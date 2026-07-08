@@ -30,11 +30,10 @@ impl log::Log for Recorder {
             if msg.contains("too many threads/slices") {
                 return;
             }
-            self.entries.lock().unwrap().push((
-                record.level(),
-                record.target().to_string(),
-                msg,
-            ));
+            self.entries
+                .lock()
+                .unwrap()
+                .push((record.level(), record.target().to_string(), msg));
         }
     }
 
@@ -50,7 +49,9 @@ static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// A failed (panicked) test poisons the lock; later tests still need to run.
 fn test_guard() -> std::sync::MutexGuard<'static, ()> {
-    TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn init_logging() {
@@ -107,10 +108,8 @@ fn assert_no_noise(scenario: &str) {
 }
 
 fn tmp_path(name: &str) -> String {
-    let dir = std::env::temp_dir().join(format!(
-        "ez_ffmpeg_log_noise_tests_{}",
-        std::process::id()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("ez_ffmpeg_log_noise_tests_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir.join(name).to_string_lossy().into_owned()
 }
@@ -174,7 +173,9 @@ fn max_frames_screenshot_emits_no_warn_or_error() {
 
     assert!(result.is_ok(), "screenshot task failed: {result:?}");
     assert!(
-        std::fs::metadata(&out).map(|m| m.len() > 0).unwrap_or(false),
+        std::fs::metadata(&out)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false),
         "screenshot output missing or empty"
     );
     assert_no_noise("max_frames=1 screenshot");
@@ -204,7 +205,9 @@ fn pattern_filename_screenshot_keeps_sequence_naming() {
 
     assert!(result.is_ok(), "pattern screenshot task failed: {result:?}");
     assert!(
-        std::fs::metadata(&expanded).map(|m| m.len() > 0).unwrap_or(false),
+        std::fs::metadata(&expanded)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false),
         "expected pattern-expanded output shot_001.png to exist"
     );
     assert!(
