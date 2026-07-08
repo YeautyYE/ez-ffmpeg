@@ -5,26 +5,32 @@ fn main() {
     let mut input: Input = "test.mp4".into();
     let mut output: Output = "output.mp4".into();
 
-    // macOS Hardware Acceleration: Using VideoToolbox for video decoding and encoding
-    input = input.set_hwaccel("videotoolbox"); // Set hardware acceleration for macOS
-    output = output.set_video_codec("h264_videotoolbox"); // Set video codec to h264 with VideoToolbox
+    // Select the hardware acceleration for the current platform. Only the
+    // block matching the build target compiles; the others are shown for
+    // reference. Swap in the vendor variant that matches your GPU.
+    #[cfg(target_os = "macos")]
+    {
+        // macOS: VideoToolbox
+        input = input.set_hwaccel("videotoolbox");
+        output = output.set_video_codec("h264_videotoolbox");
+    }
 
-    // Windows Hardware Acceleration: Using Direct3D 12 Video Acceleration (d3d12va)
-    // for decoding and Media Foundation for encoding
-    input = input.set_hwaccel("d3d12va"); // Set hardware acceleration for Windows (Direct3D 12)
-    output = output.set_video_codec("h264_mf"); // Use Media Foundation codec for encoding
+    #[cfg(target_os = "windows")]
+    {
+        // Windows: Direct3D 12 VA decode + Media Foundation encode.
+        // NVIDIA alternative: set_hwaccel("cuda")/"h264_cuvid" + "h264_nvenc".
+        input = input.set_hwaccel("d3d12va");
+        output = output.set_video_codec("h264_mf");
+    }
 
-    // Nvidia Hardware Acceleration: Using CUDA for decoding and NVENC for encoding
-    input = input.set_hwaccel("cuda").set_video_codec("h264_cuvid"); // CUDA for decoding and cuvid codec
-    output = output.set_video_codec("h264_nvenc"); // Use NVENC for encoding
-
-    // Intel Hardware Acceleration: Using Quick Sync Video (QSV) for decoding and encoding
-    input = input.set_hwaccel("qsv").set_video_codec("h264_qsv"); // Set QSV for Intel hardware
-    output = output.set_video_codec("h264_qsv"); // Use QSV for encoding
-
-    // AMD Hardware Acceleration: Using Vulkan for decoding and AMF for encoding
-    input = input.set_hwaccel("vulkan").set_video_codec("h264_amf"); // Vulkan for decoding
-    output = output.set_video_codec("h264_amf"); // Use AMF for encoding
+    #[cfg(target_os = "linux")]
+    {
+        // Linux: VAAPI (broadly available on Intel/AMD).
+        // NVIDIA: "cuda"/"h264_cuvid" + "h264_nvenc"; Intel: "qsv"/"h264_qsv";
+        // AMD: set_hwaccel("vulkan") + "h264_amf".
+        input = input.set_hwaccel("vaapi");
+        output = output.set_video_codec("h264_vaapi");
+    }
 
     // Build the FFMPEG context, configure input and output, then start the process
     FfmpegContext::builder()
