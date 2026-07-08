@@ -260,10 +260,25 @@ impl FfmpegScheduler<Initialization> {
         let input_controller = InputController::new(demux_nodes, mux_stream_nodes);
         let input_controller = Arc::new(input_controller);
 
+        // Muxer-completion counter (fftools `Scheduler.nb_mux`): one guard per
+        // muxer; the last to finish publishes STATUS_END, releasing any demuxer
+        // still choked by the balancing pass (see MuxDoneGuard in mux_task.rs).
+        let mux_done_remaining = Arc::new(AtomicUsize::new(self.ffmpeg_context.muxs.len()));
+
+        // Pre-count EVERY muxer's thread slot before any `mux_init` runs. A
+        // streamless (AVFMT_NOSTREAMS) output releases its slot synchronously
+        // inside `mux_init` (`release_mux_slot`); counted one-at-a-time, an
+        // early streamless output could drive the thread counter to zero and
+        // publish a premature STATUS_END before later muxers were even counted,
+        // which stops (truncates) those still-pending outputs. Counting all
+        // muxers up front keeps the counter > 0 until every muxer — and every
+        // later worker — is genuinely done.
+        for _ in 0..self.ffmpeg_context.muxs.len() {
+            thread_sync.thread_start();
+        }
+
         // Muxer
         for (mux_idx, mux) in self.ffmpeg_context.muxs.iter_mut().enumerate() {
-            // Even if it's not ready here, it's going to be ready later, so it locks first
-            thread_sync.thread_start();
             if mux.is_ready() {
                 if let Err(e) = mux_init(
                     mux_idx,
@@ -274,6 +289,7 @@ impl FfmpegScheduler<Initialization> {
                     scheduler_status.clone(),
                     thread_sync.clone(),
                     scheduler_result.clone(),
+                    mux_done_remaining.clone(),
                 ) {
                     Self::cleanup(&scheduler_status, &self.ffmpeg_context);
                     return Err(e);
@@ -313,6 +329,7 @@ impl FfmpegScheduler<Initialization> {
                 scheduler_status.clone(),
                 thread_sync.clone(),
                 scheduler_result.clone(),
+                mux_done_remaining.clone(),
             ) {
                 Ok(sender) => sender,
                 Err(e) => {
