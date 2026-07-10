@@ -110,18 +110,29 @@ pub(crate) fn mux_init(
     // This muxer's completion guard: it flows through the handoff and drops on
     // whichever exit path this muxer takes (last one publishes STATUS_END).
     let mux_done = MuxDoneGuard::new(mux_done_remaining, scheduler_status.clone());
+    // Bundle everything whose destruction order is load-bearing into the
+    // teardown guard (unblock -> join encoders -> free ctx) right where the
+    // ownership leaves the Muxer; every path from here flows through it.
+    let (queue_sender, pkt_receiver) = match mux.take_queue() {
+        Some((s, r)) => (Some(s), Some(r)),
+        None => (None, None),
+    };
+    let guard = MuxTeardownGuard::new(
+        pkt_receiver,
+        mux.take_src_pre_recvs(),
+        mux.enc_handle_receiver(),
+        out_fmt_ctx,
+    );
     mux_task_start(
         mux_idx,
-        out_fmt_ctx,
-        mux.take_queue(),
+        guard,
+        queue_sender,
         mux.start_time_us,
         mux.recording_time_us,
         mux.stream_count(),
         mux.format_opts.clone(),
         mux.bsf_chains.clone(),
-        mux.take_src_pre_recvs(),
         mux.mux_start_gate(),
-        mux.enc_handle_receiver(),
         packet_pool,
         input_controller,
         mux_stream_nodes,
@@ -151,50 +162,66 @@ pub(crate) fn ready_to_init_mux(
         // exit — stop/disconnect before init, or through mux_task_start.
         let mux_done = MuxDoneGuard::new(mux_done_remaining, scheduler_status.clone());
 
-        // Take sole ownership of the output context out of the Muxer. It is moved
-        // into the waiter thread below; if streams never become ready the waiter
-        // drops it (freeing once) — the RAII net the old box#1 provided.
-        // Computed while the output context is still owned (reads stream types).
+        // Take sole ownership of the output context out of the Muxer, bundled
+        // with the queue receivers and encoder handles into the teardown guard
+        // (unblock -> join encoders -> free ctx): every early exit of the
+        // waiter below tears down in that order instead of just dropping the
+        // context under live encoders. Computed while the output context is
+        // still owned (reads stream types).
         let sq_mux_plan = mux.sq_mux_plan();
         let out_fmt_ctx = mux
             .out_fmt_ctx
             .take()
             .expect("ready_to_init_mux called without an output context");
         let mux_stream_nodes = mux.mux_stream_nodes.clone();
-        let queue = mux.take_queue();
-        let src_pre_recvs = mux.take_src_pre_recvs();
+        let (queue_sender, pkt_receiver) = match mux.take_queue() {
+            Some((s, r)) => (Some(s), Some(r)),
+            None => (None, None),
+        };
+        let guard = MuxTeardownGuard::new(
+            pkt_receiver,
+            mux.take_src_pre_recvs(),
+            mux.enc_handle_receiver(),
+            out_fmt_ctx,
+        );
         let mux_start_gate = mux.mux_start_gate();
-        let enc_handle_receiver = mux.enc_handle_receiver();
         let start_time_us = mux.start_time_us;
         let recording_time_us = mux.recording_time_us;
         let stream_count = mux.stream_count();
         let nb_streams_ready = mux.nb_streams_ready.clone();
+        let enc_registered = mux.enc_registered.clone();
         let format_opts = mux.format_opts.clone();
         let bsf_chains = mux.bsf_chains.clone();
 
         let result = std::thread::Builder::new().name(format!("ready-to-init-muxer{mux_idx}")).spawn(move || {
-            // Owns the context until streams are ready; drops (frees) if the loop
-            // exits early. Handed to mux_task_start on the all-ready branch.
-            let mut out_fmt_ctx = Some(out_fmt_ctx);
+            // Holds until the start thread finished REGISTERING this muxer's
+            // encoders (every enc_init returned, every JoinHandle queued). Any
+            // teardown or handoff before that could join an incomplete handle
+            // set and free the context under an in-flight encoder. The flag is
+            // set on every start()-side path — after the muxer's enc_init loop,
+            // or in its failure arm BEFORE fail_start joins this waiter — so
+            // this wait is bounded by the registration loop itself.
+            let wait_enc_registered = || {
+                while !enc_registered.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            };
+            // Owns ctx + receivers until the streams are ready; the ordered
+            // teardown (unpark -> join -> free) runs on EVERY early exit via
+            // the post-loop block. Handed to mux_task_start on the all-ready
+            // branch (leaving `None` here).
+            let mut guard = Some(guard);
+            let mut queue_sender = queue_sender;
             loop {
                 let result = receiver.recv_timeout(Duration::from_millis(100));
 
                 if is_stopping(wait_until_not_paused(&scheduler_status)) {
-                    thread_sync.thread_done_with(|| {
-                        scheduler_status.store(STATUS_END, Ordering::Release);
-                    });
                     info!("Init muxer receiver end command, finishing.");
                     break;
                 }
 
                 if let Err(e) = result {
                     if e == RecvTimeoutError::Disconnected {
-                        // Publish the terminal state BEFORE waking waiters
-                        // (a woken wait() must observe it; the async waker
-                        // is consumed by the wake).
-                        thread_sync.thread_done_with(|| {
-                            scheduler_status.store(STATUS_END, Ordering::Release);
-                        });
                         warn!(
                             "mux init aborted: encoder(s) exited before all {stream_count} streams became ready ({} ready)",
                             nb_streams_ready.load(Ordering::Acquire)
@@ -208,29 +235,37 @@ pub(crate) fn ready_to_init_mux(
                 debug!("output_stream: {stream_index} is readied");
                 let nb_streams_ready = nb_streams_ready.fetch_add(1, Ordering::Release);
                 if nb_streams_ready + 1 == stream_count {
-                    // Move the context out to the terminal init; a later drop of
-                    // the (now `None`) local is a no-op.
-                    let out_fmt_ctx = out_fmt_ctx
+                    // All-ready implies every encoder produced a packet, which
+                    // in practice means registration finished long ago — but
+                    // "in practice" is not a proof, and the guard handed over
+                    // below can reach fail_mux_init's join within this call.
+                    wait_enc_registered();
+                    // Move the guard out to the terminal init; the post-loop
+                    // teardown then sees `None` and does nothing — the slot is
+                    // released by the worker or by fail_mux_init, exactly once.
+                    let guard = guard
                         .take()
                         .expect("mux waiter reached all-ready without a context");
                     if let Err(e) = mux_task_start(
                         mux_idx,
-                        out_fmt_ctx,
-                        queue,
+                        guard,
+                        queue_sender.take(),
                         start_time_us,
                         recording_time_us,
                         stream_count,
                         format_opts,
                         bsf_chains,
-                        src_pre_recvs,
                         mux_start_gate,
-                        enc_handle_receiver,
                         packet_pool,
                         input_controller,
                         mux_stream_nodes,
                         sq_mux_plan,
-                        scheduler_status,
-                        thread_sync,
+                        // Clones: the post-loop teardown below still needs the
+                        // originals on the all-ready path's break (where the
+                        // guard is None and the block is a no-op, but the
+                        // borrow checker cannot see that).
+                        scheduler_status.clone(),
+                        thread_sync.clone(),
                         scheduler_result,
                         mux_done,
                     ) {
@@ -240,6 +275,28 @@ pub(crate) fn ready_to_init_mux(
                     }
                     break;
                 }
+            }
+            // Early-exit teardown (stop / disconnect before init): join this
+            // muxer's encoders and free the context FIRST, release the
+            // pre-counted slot LAST — wait()/stop() must not observe "all
+            // threads done" while the context free is still in flight (the
+            // free's custom-IO path dereferences the InterruptState a returned
+            // stop() lets drop). Another stream's enc_open may be concurrently
+            // WRITING (*stream).codecpar when the break fires; the join above
+            // is what makes the free safe. thread_done_with still publishes
+            // STATUS_END before waking any waiter, preserving the old
+            // publish-before-wake contract.
+            if let Some(guard) = guard.take() {
+                // A stop can fire while the start thread is still running
+                // enc_inits for this muxer (an output pipeline publishing an
+                // error, a concurrent stop()): joining before registration
+                // completed would miss the in-flight handle and free the
+                // context under that encoder.
+                wait_enc_registered();
+                drop(guard);
+                thread_sync.thread_done_with(|| {
+                    scheduler_status.store(STATUS_END, Ordering::Release);
+                });
             }
         });
         if let Err(e) = result {
@@ -254,16 +311,14 @@ pub(crate) fn ready_to_init_mux(
 
 fn mux_task_start(
     mux_idx: usize,
-    out_fmt_ctx: FormatContext,
-    queue: Option<(Sender<PacketBox>, Receiver<PacketBox>)>,
+    guard: MuxTeardownGuard,
+    queue_sender: Option<Sender<PacketBox>>,
     start_time_us: Option<i64>,
     recording_time_us: Option<i64>,
     stream_count: usize,
     format_opts: Option<HashMap<CString, CString>>,
     bsf_chains: StreamBsfChains,
-    src_pre_receivers: Vec<PreMuxQueueReceiver>,
     mux_start_gate: Arc<crate::core::context::MuxStartGate>,
-    enc_handle_receiver: Receiver<std::thread::JoinHandle<()>>,
     packet_pool: ObjPool<Packet>,
     input_controller: Arc<InputController>,
     mux_stream_nodes: Vec<Arc<SchNode>>,
@@ -273,33 +328,30 @@ fn mux_task_start(
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
     mux_done: MuxDoneGuard,
 ) -> crate::error::Result<()> {
-    if queue.is_none() {
+    let Some(queue_sender) = queue_sender else {
         // Zero-stream output (e.g. an AVFMT_NOSTREAMS muxer): no mux worker
         // thread will be spawned to release this muxer's pre-counted thread
-        // slot, so release it here — otherwise wait()/stop() hangs forever on
-        // the leaked slot (pre-existing; surfaced by the PERF-12 slot-leak
-        // review). A streamless output is legitimate for such formats, so this
-        // is not an error.
+        // slot. Free the context via the guard first (no encoders exist, so
+        // the join is empty), THEN release the slot — wait()/stop() must not
+        // observe "all threads done" while the free is still in flight. A
+        // streamless output is legitimate for such formats, so this is not an
+        // error.
+        drop(guard);
         release_mux_slot(&scheduler_status, &thread_sync);
-        // `out_fmt_ctx` is owned here: this early return drops it, freeing the
-        // context. `mux_done` also drops here — a streamless output still counts
-        // toward "all muxers done", so a mix with a real output cannot strand a
-        // choked demuxer. Previously the raw pointer was leaked on this path.
+        // `mux_done` also drops here — a streamless output still counts
+        // toward "all muxers done", so a mix with a real output cannot strand
+        // a choked demuxer.
         return Ok(());
-    }
+    };
 
-    let (queue_sender, queue_receiver) = queue.unwrap();
-
-    _mux_init(
+    let src_pre_receivers = _mux_init(
         mux_idx,
-        out_fmt_ctx,
-        queue_receiver,
+        guard,
         start_time_us,
         recording_time_us,
         stream_count,
         format_opts,
         bsf_chains,
-        enc_handle_receiver,
         packet_pool,
         input_controller,
         mux_stream_nodes,
@@ -364,14 +416,12 @@ fn mux_task_start(
 
 fn _mux_init(
     mux_idx: usize,
-    out_fmt_ctx: FormatContext,
-    pkt_receiver: Receiver<PacketBox>,
+    mut guard: MuxTeardownGuard,
     start_time_us: Option<i64>,
     recording_time_us: Option<i64>,
     stream_count: usize,
     format_opts: Option<HashMap<CString, CString>>,
     bsf_chains: StreamBsfChains,
-    enc_handle_receiver: Receiver<std::thread::JoinHandle<()>>,
     packet_pool: ObjPool<Packet>,
     input_controller: Arc<InputController>,
     mux_stream_nodes: Vec<Arc<SchNode>>,
@@ -380,12 +430,15 @@ fn _mux_init(
     thread_sync: ThreadSynchronizer,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
     mux_done: MuxDoneGuard,
-) -> crate::error::Result<()> {
-    // `out_fmt_ctx` (a FormatContext) is the sole owner here; it Drops — freeing
-    // the context — on the write_header error return below, and is moved into the
-    // muxer worker thread on success. `as_ptr()` borrows it for the FFI calls.
+) -> crate::error::Result<Vec<PreMuxQueueReceiver>> {
+    // The teardown guard owns the output context; on every failure return it
+    // moves into fail_mux_init, whose drop joins this muxer's encoders BEFORE
+    // avformat_free_context frees the AVStreams they dereference. On success
+    // the pre-mux receivers are handed back to the caller (the gate drain) and
+    // the rest of the guard moves into the worker. `as_ptr()` borrows the
+    // live context for the FFI calls below.
     // SAFETY: as_ptr yields the live output context pointer.
-    let out_fmt_ctx_ptr = unsafe { out_fmt_ctx.as_ptr() };
+    let out_fmt_ctx_ptr = unsafe { guard.ctx().as_ptr() };
 
     // Guard owns the dict on every path: write_header leaves unrecognized
     // entries behind, which leaked (and were silently swallowed) before.
@@ -409,21 +462,20 @@ fn _mux_init(
                     "Could not initialize bitstream filter chain '{name}': {}",
                     av_err2str(bsf_ret)
                 );
-                // Same terminal ordering as the write_header failure below: publish
-                // the error before releasing this muxer's thread slot.
-                set_scheduler_error(
+                // Publish the error, join this muxer's encoders, free the
+                // context, release the slot — in that order (the delayed-start
+                // encoders are live and parked on the pre-mux queues here; the
+                // `tests/bsf.rs` nonexistent-BSF case hits this arm every run).
+                fail_mux_init(
                     &scheduler_status,
                     &scheduler_result,
+                    &thread_sync,
+                    guard,
                     Muxing(MuxingOperationError::BitstreamFilterInit(
                         name.clone(),
                         MuxingError::from(bsf_ret),
                     )),
                 );
-                thread_sync.thread_done_with(|| {
-                    scheduler_status.store(STATUS_END, Ordering::Release);
-                });
-                // `out_fmt_ctx` drops here (frees the context); any partially built
-                // `BitStreamFilter`s were already dropped inside the helper.
                 return Err(Muxing(MuxingOperationError::BitstreamFilterInit(
                     name,
                     MuxingError::from(bsf_ret),
@@ -441,11 +493,11 @@ fn _mux_init(
             &scheduler_status,
             &scheduler_result,
             &thread_sync,
+            guard,
             Muxing(MuxingOperationError::WriteHeader(WriteHeaderError::from(
                 ret,
             ))),
         );
-        // `out_fmt_ctx` drops here, freeing the context.
         return Err(Muxing(MuxingOperationError::WriteHeader(
             WriteHeaderError::from(ret),
         )));
@@ -473,10 +525,43 @@ fn _mux_init(
     let thread_sync_spawn = thread_sync.clone();
     let scheduler_result_spawn = scheduler_result.clone();
 
+    // Hand the pre-mux receivers back to the caller's gate drain; unpark duty
+    // for parked encoders transfers with them. The rest of the guard rides to
+    // the worker through a reclaim slot rather than the closure itself: if the
+    // spawn FAILS, dropping the closure would run the guard's join while these
+    // pre-mux receivers are still open — encoders parked on a full pre-queue
+    // would only wake at the 60s backstop. The slot lets the failure branch
+    // reclaim the guard and order the teardown correctly.
+    let src_pre_receivers = guard.take_pre_receivers();
+    let guard_slot = Arc::new(Mutex::new(Some(guard)));
+    let worker_guard_slot = Arc::clone(&guard_slot);
+
     let result = std::thread::Builder::new().name(format!("muxer{mux_idx}:{format_name}")).spawn(move || {
-        // Move the FormatContext into the worker; it Drops (frees the output
-        // context, custom-IO-aware) when this closure ends — the terminal free.
-        let out_fmt_ctx = out_fmt_ctx;
+        // Declaration order is load-bearing for UNWIND (locals drop in reverse
+        // order on panic):
+        //   pkt_receiver (drops first: unblock senders) -> ... -> mux_done
+        //   (publish mux-done terminal) -> guard (join encoders, free ctx) ->
+        //   slot_guard (release the thread slot LAST, after the free).
+        //
+        // Panic-only net for the pre-counted thread slot: the manual
+        // `thread_done_with` below is skipped if this worker unwinds, which
+        // would leak the slot and hang `wait_for_all_threads`. Armed here,
+        // disarmed right after that manual release on the normal path.
+        let mut slot_guard = MuxSlotGuard::armed(thread_sync.clone(), scheduler_status.clone());
+        // Ordered-teardown guard (close queue -> join encoders -> free ctx).
+        // Dropped explicitly on the normal path below; by unwind on panic.
+        let mut guard = worker_guard_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("mux worker started without its teardown guard");
+        // Unwind-only: publishes the terminal status BEFORE the guard's join
+        // runs (dropping after `guard` in declaration order = before it on
+        // unwind), so encoders parked on their sources exit and the join
+        // terminates. No-op unless this worker is panicking.
+        let _panic_status = MuxPanicStatusGuard {
+            scheduler_status: scheduler_status.clone(),
+        };
         // This muxer's completion guard. It is dropped EXPLICITLY below, BEFORE
         // the encoder join (see that comment): the last muxer must publish
         // STATUS_END before joining so a parked encoder observes is_stopping and
@@ -484,11 +569,16 @@ fn _mux_init(
         // erroring on Disconnected. On the early-return / spawn-failure paths
         // (outside this closure) it drops there instead — either way, once.
         let mux_done = mux_done;
-        // Panic-only net for the pre-counted thread slot: the manual
-        // `thread_done_with` below is skipped if this worker unwinds, which would
-        // leak the slot and hang `wait_for_all_threads`. Armed here, disarmed
-        // right after that manual release on the normal path.
-        let mut slot_guard = MuxSlotGuard::armed(thread_sync.clone(), scheduler_status.clone());
+        // Live queue receiver, taken out of the guard for direct recv use.
+        // Declared after everything above => drops FIRST on unwind, unblocking
+        // encoders parked in send() before the guard's join runs.
+        let pkt_receiver = guard
+            .take_pkt_receiver()
+            .expect("mux worker without a packet queue");
+        // Borrow of the guard-owned output context for the FFI calls below;
+        // NLL ends this borrow at its last use (the trailer), before the
+        // explicit drop(guard) in the teardown block.
+        let out_fmt_ctx: &FormatContext = guard.ctx();
         // Per-output-stream BSF chains (None for streams without one), or an
         // empty vec when no output set a BSF at all. Owned by the worker; each
         // `BitStreamFilter` frees its AVBSFContext/AVPacket on drop.
@@ -1032,9 +1122,11 @@ fn _mux_init(
         // this finished output can stay choked until the sibling finishes.
         input_controller.update_locked(&scheduler_status);
 
-        while let Ok(handle) = enc_handle_receiver.try_recv() {
-            let _ = handle.join();
-        }
+        // Ordered teardown: join this muxer's encoders, THEN free the output
+        // context (the guard's Drop). Freeing before the slot release below
+        // also closes the old window where wait()/stop() could return while
+        // the context free was still running under a live InterruptState.
+        drop(guard);
 
         // Publish the terminal state BEFORE waking waiters (a woken wait()
         // must observe it; the async waker is consumed by the wake).
@@ -1047,21 +1139,31 @@ fn _mux_init(
     });
     if let Err(e) = result {
         error!("Muxer thread exited with error: {e}");
-        // The mux slot was pre-counted at scheduler start and the worker that
-        // would release it never ran: record the error and release the slot
-        // here, or wait()/stop() hangs forever on the leaked slot. The caller
-        // (the ready-to-init thread) only logs this error — it must not
-        // release again.
-        fail_mux_init(
+        // The worker never ran: reclaim the guard from the handoff slot and
+        // run the ordered teardown here. Error first (the encoders woken below
+        // must observe a terminal status), then unpark the pre-mux senders
+        // (their receivers are still local at this point), then close the live
+        // queue / join / free via the guard, then release the pre-counted slot
+        // — or wait()/stop() hangs forever on the leaked slot. The caller (the
+        // ready-to-init thread) only logs this error; it must not release
+        // again.
+        set_scheduler_error(
             &scheduler_status_spawn,
             &scheduler_result_spawn,
-            &thread_sync_spawn,
             Muxing(MuxingOperationError::ThreadExited),
         );
+        drop(src_pre_receivers);
+        let guard = guard_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("mux worker spawn failed but the closure consumed the guard");
+        drop(guard);
+        release_mux_slot(&scheduler_status_spawn, &thread_sync_spawn);
         return Err(MuxingOperationError::ThreadExited.into());
     }
 
-    Ok(())
+    Ok(src_pre_receivers)
 }
 
 /// Releases a muxer's pre-counted thread slot, publishing STATUS_END if this
@@ -1075,17 +1177,23 @@ pub(crate) fn release_mux_slot(scheduler_status: &Arc<AtomicUsize>, thread_sync:
     });
 }
 
-/// Records a mux-init failure and releases this muxer's pre-counted thread
-/// slot, in that order: the error must be visible before wait() can observe
-/// "all threads done" (set_scheduler_error also publishes STATUS_END, which
-/// unwinds the encoders still feeding the pre-mux queues).
+/// Records a mux-init failure, runs the ordered teardown (unpark -> join ->
+/// free the output context), and ONLY THEN releases this muxer's pre-counted
+/// thread slot. The order is load-bearing twice over: the error must be
+/// published before the encoders wake (so they classify their Disconnected
+/// as a graceful stop, and wait() cannot observe "all threads done" without
+/// the error), and the slot must stay held until the context free completed
+/// (a woken wait()/stop() drops the InterruptState that the free's custom-IO
+/// callbacks dereference).
 fn fail_mux_init(
     scheduler_status: &Arc<AtomicUsize>,
     scheduler_result: &Arc<Mutex<Option<crate::error::Result<()>>>>,
     thread_sync: &ThreadSynchronizer,
+    guard: MuxTeardownGuard,
     error: crate::error::Error,
 ) {
     set_scheduler_error(scheduler_status, scheduler_result, error);
+    drop(guard);
     release_mux_slot(scheduler_status, thread_sync);
 }
 
@@ -1196,6 +1304,153 @@ impl Drop for MuxSlotGuard {
         self.thread_sync.thread_done_with(move || {
             status.store(STATUS_END, Ordering::Release);
         });
+    }
+}
+
+/// Panic-only terminal publisher for the mux worker (C2 companion).
+///
+/// On a worker PANIC in a multi-output job, `MuxDoneGuard` does not publish
+/// STATUS_END (other muxers are still live), yet `MuxTeardownGuard`'s unwind
+/// drop joins this muxer's encoders — an encoder parked in its source
+/// `recv_timeout` (or the `-shortest` drain wait) only exits on a terminal
+/// status, so the join would deadlock and the slot release behind it never
+/// runs. This guard, declared between the teardown guard and `mux_done`,
+/// drops BEFORE the join on unwind and publishes the terminal status (a
+/// panicking muxer ends the whole job — data loss is already certain). It
+/// publishes only when actually unwinding (`std::thread::panicking()`), so
+/// the normal path needs no disarm and a normally-finishing muxer of a
+/// multi-output job never terminates its siblings.
+struct MuxPanicStatusGuard {
+    scheduler_status: Arc<AtomicUsize>,
+}
+
+impl Drop for MuxPanicStatusGuard {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        // Same no-downgrade CAS as MuxDoneGuard: never overwrite an abort.
+        let mut current = self.scheduler_status.load(Ordering::Acquire);
+        while !is_stopping(current) {
+            match self.scheduler_status.compare_exchange_weak(
+                current,
+                STATUS_END,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+        // Paused workers wait on a condvar, not a poll: wake them so they
+        // observe the terminal state and unwind promptly.
+        crate::core::scheduler::ffmpeg_scheduler::notify_pause_waiters();
+    }
+}
+
+/// Ordered teardown of one muxer's output side (C2): unblock -> join -> free.
+///
+/// `avformat_free_context` frees every `AVStream` of the output, and this
+/// muxer's encoder threads dereference those streams (`enc_open` writes
+/// `(*stream).codecpar`, `encode_frame` reads `(*stream)` fields). Every
+/// teardown path — init failure, waiter stop/disconnect, worker exit, panic —
+/// must therefore join the encoders BEFORE the context drops (fftools joins
+/// encoder tasks before muxer cleanup in `sch_stop`). Instead of hand-writing
+/// that ordering at each site, this guard owns exactly the resources whose
+/// destruction order is load-bearing and encodes the order in `Drop`:
+///
+///  1. `pkt_receiver` — the live mux queue receiver (crossbeam bounded, sole
+///     receiver: `Muxer::take_queue` moves it out). Dropping it disconnects
+///     the queue, so an encoder blocked in `send()` wakes with `SendError`.
+///  2. `pre_receivers` — the per-stream pre-mux queues. Their `Drop` sets
+///     `closed` + `notify_all`, so a sender parked on a full queue wakes and
+///     resolves `Disconnected`.
+///  3. `enc_handle_receiver` — this muxer's encoder `JoinHandle`s, queued by
+///     `enc_init` on the scheduler start thread synchronously after each
+///     spawn. Drained with `try_recv` (NOT `recv`: the Muxer keeps a sender
+///     clone alive, so the channel never disconnects and `recv` would hang);
+///     every handle is provably queued before any drop site can run — each
+///     teardown path is sequenced after the whole `enc_init` loop.
+///  4. `out_fmt_ctx` — freed LAST, after every encoder above has exited.
+///
+/// The guard NEVER touches `ThreadSynchronizer` or `scheduler_status`: slot
+/// release and status publication stay with their existing owners, which is
+/// what lets it compose with `fail_start`/`mux_handed` without double-release.
+struct MuxTeardownGuard {
+    pkt_receiver: Option<Receiver<PacketBox>>,
+    pre_receivers: Vec<PreMuxQueueReceiver>,
+    enc_handle_receiver: Receiver<std::thread::JoinHandle<()>>,
+    out_fmt_ctx: Option<FormatContext>,
+}
+
+impl MuxTeardownGuard {
+    fn new(
+        pkt_receiver: Option<Receiver<PacketBox>>,
+        pre_receivers: Vec<PreMuxQueueReceiver>,
+        enc_handle_receiver: Receiver<std::thread::JoinHandle<()>>,
+        out_fmt_ctx: FormatContext,
+    ) -> Self {
+        Self {
+            pkt_receiver,
+            pre_receivers,
+            enc_handle_receiver,
+            out_fmt_ctx: Some(out_fmt_ctx),
+        }
+    }
+
+    /// Borrows the owned output context (alive until Drop frees it).
+    fn ctx(&self) -> &FormatContext {
+        self.out_fmt_ctx
+            .as_ref()
+            .expect("mux teardown guard lost its output context")
+    }
+
+    /// Worker only: takes the live-queue receiver to recv on directly. The
+    /// worker binds it AFTER the guard in declaration order, so on unwind it
+    /// still drops FIRST — unblocking senders before the guard's join.
+    fn take_pkt_receiver(&mut self) -> Option<Receiver<PacketBox>> {
+        self.pkt_receiver.take()
+    }
+
+    /// Success path only (the worker spawned and is consuming): hands the
+    /// pre-mux receivers to the gate drain; unpark duty transfers with them.
+    fn take_pre_receivers(&mut self) -> Vec<PreMuxQueueReceiver> {
+        std::mem::take(&mut self.pre_receivers)
+    }
+
+    #[cfg(test)]
+    fn for_test() -> Self {
+        Self {
+            pkt_receiver: None,
+            pre_receivers: Vec::new(),
+            enc_handle_receiver: crossbeam_channel::unbounded().1,
+            out_fmt_ctx: None,
+        }
+    }
+}
+
+impl Drop for MuxTeardownGuard {
+    fn drop(&mut self) {
+        // (a) UNPARK. Close the live queue first (a blocked crossbeam send()
+        // returns SendError the moment the sole receiver drops), then every
+        // pre-mux queue (their Drop wakes parked senders into Disconnected).
+        // Both must precede the join; their mutual order is irrelevant — an
+        // encoder is parked on at most one of them at a time.
+        drop(self.pkt_receiver.take());
+        self.pre_receivers.clear();
+
+        // (b) JOIN every encoder worker of this muxer. try_recv, NOT recv —
+        // see the struct docs. Join errors (a panicked encoder) are swallowed
+        // like the pre-existing normal-exit join; panic surfacing is a
+        // separate concern (H4).
+        while let Ok(handle) = self.enc_handle_receiver.try_recv() {
+            let _ = handle.join();
+        }
+
+        // (c) FREE the output context last (FormatContext::drop ->
+        // avformat_free_context, custom-IO-aware). `None` in tests / after a
+        // manual take is a no-op.
+        drop(self.out_fmt_ctx.take());
     }
 }
 
@@ -1844,6 +2099,7 @@ mod tests {
             &scheduler_status,
             &scheduler_result,
             &thread_sync,
+            MuxTeardownGuard::for_test(),
             Muxing(MuxingOperationError::ThreadExited),
         );
 
@@ -2066,6 +2322,98 @@ mod tests {
         );
         // Clean up: release the slot so the spawned waiter can finish.
         thread_sync.thread_done_with(|| {});
+    }
+
+    // MuxTeardownGuard's drop order is the C2 contract: closing the pre-mux
+    // queues must WAKE a sender parked in wait_for_space (unpark), and the
+    // encoder handles must be joined — all before the context free (freeing is
+    // exercised by the integration/ASAN lanes; a test guard carries no ctx).
+    // A parked "encoder" that is only released by the guard proves both: the
+    // join can only complete because the unpark happened first.
+    #[test]
+    fn teardown_guard_unparks_pre_mux_sender_and_joins_encoder() {
+        use crate::core::context::pre_mux_queue::{channel, PreMuxQueueConfig, PreQueueTryPush};
+        use crate::core::context::PacketData;
+        use ffmpeg_sys_next::AVMediaType::AVMEDIA_TYPE_VIDEO;
+        use std::sync::atomic::AtomicBool;
+
+        let (pre_sender, pre_receiver) = channel(PreMuxQueueConfig {
+            max_packets: 1,
+            data_threshold: 1,
+        });
+
+        // Fill the queue to capacity so the next admission genuinely PARKS —
+        // an empty queue's wait_for_space returns immediately and would let a
+        // guard that joins before closing pass this test.
+        let first = PacketBox {
+            packet: Packet::empty(),
+            packet_data: PacketData {
+                dts_est: 0,
+                codec_type: AVMEDIA_TYPE_VIDEO,
+                output_stream_index: 0,
+                is_copy: false,
+            },
+        };
+        assert!(
+            matches!(pre_sender.try_push(first), PreQueueTryPush::Sent),
+            "the first packet must be admitted (queue below max_packets)"
+        );
+
+        let parked = Arc::new(AtomicBool::new(false));
+        let joined_cleanly = Arc::new(AtomicBool::new(false));
+        let parked_probe = Arc::clone(&parked);
+        let joined_probe = Arc::clone(&joined_cleanly);
+
+        // The "encoder": parks on the now-full queue with a long timeout; only
+        // the guard closing the queue can release it within the test bound.
+        // Fullness needs BOTH limits exceeded (FFmpeg parity: packet cap AND
+        // byte threshold), so the waited-for size must overshoot the
+        // threshold too — the parked empty packet contributes 0 bytes.
+        let handle = std::thread::spawn(move || {
+            parked_probe.store(true, Ordering::SeqCst);
+            pre_sender.wait_for_space(2, Duration::from_secs(30));
+            joined_probe.store(true, Ordering::SeqCst);
+        });
+
+        // Queue the handle the way enc_init does, keeping a sender clone alive
+        // (the real Muxer does too — this is why the guard must try_recv).
+        let (handle_tx, handle_rx) = crossbeam_channel::unbounded();
+        handle_tx.send(handle).unwrap();
+
+        // Wait until the encoder reached the park call, give it a beat to
+        // enter the condvar wait, then prove it is genuinely blocked.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !parked.load(Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < deadline, "encoder never parked");
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !joined_cleanly.load(Ordering::SeqCst),
+            "the encoder was supposed to be parked on the full queue, \
+             but it already ran to completion"
+        );
+
+        let guard = MuxTeardownGuard {
+            pkt_receiver: None,
+            pre_receivers: vec![pre_receiver],
+            enc_handle_receiver: handle_rx,
+            out_fmt_ctx: None,
+        };
+
+        let start = std::time::Instant::now();
+        drop(guard);
+        let elapsed = start.elapsed();
+
+        assert!(
+            joined_cleanly.load(Ordering::SeqCst),
+            "the guard's join completed without the encoder having run to completion"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the guard's drop took {elapsed:?}: the parked sender was not woken by the \
+             pre-mux close (join waited out the 30s park timeout instead)"
+        );
     }
 
     // build_sq_mux wires the plan into the output-index <-> sq-index maps,

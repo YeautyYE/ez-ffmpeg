@@ -229,6 +229,16 @@ pub(crate) struct Muxer {
     pub(crate) nb_streams: usize,
     pub(crate) nb_streams_ready: Arc<AtomicUsize>,
 
+    /// Set by the scheduler start thread once EVERY `enc_init` for this muxer
+    /// has returned — meaning every encoder `JoinHandle` this output will ever
+    /// have is queued on `enc_handles`. The delayed-start waiter must observe
+    /// this before tearing down (its `try_recv` join drains only what is
+    /// queued; dropping the output context while an `enc_init` is mid-flight
+    /// would leave that encoder dereferencing freed `AVStream`s). Also set on
+    /// the `enc_init` failure path BEFORE `fail_start` joins the waiter, so
+    /// the wait cannot cycle with the join.
+    pub(crate) enc_registered: Arc<std::sync::atomic::AtomicBool>,
+
     pub(crate) mux_stream_nodes: Vec<Arc<SchNode>>,
 }
 
@@ -345,6 +355,7 @@ impl Muxer {
             enc_handles: crossbeam_channel::unbounded(),
             nb_streams: 0,
             nb_streams_ready: Arc::new(Default::default()),
+            enc_registered: Arc::new(Default::default()),
             mux_stream_nodes: vec![],
             global_metadata,
             stream_metadata,
