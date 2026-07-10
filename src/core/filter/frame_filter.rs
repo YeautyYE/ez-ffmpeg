@@ -74,13 +74,28 @@ pub trait FrameFilter: Send {
     /// - `Err(e)` (any [`FrameFilterError`]) if processing fails.
     ///
     /// # End of stream
-    /// The last frame a pipeline delivers may be a props-only marker (no
-    /// data buffers, carrying e.g. the EOF timestamp). Shortly after, the
-    /// source disconnects and the pipeline runs one final [`request_frame`]
-    /// sweep before shutting down — output still pending after that sweep
-    /// is discarded. A filter that holds frames back (asynchronous or
-    /// GPU-based) must therefore release ALL remaining output, blocking if
-    /// necessary, when it sees such a marker.
+    /// At end of stream the pipeline flushes the chain as an ordered
+    /// cascade: each filter receives a props-only marker (a valid frame
+    /// with no data buffers) as its flush cue and is then drained dry via
+    /// [`request_frame`], in chain order — so a filter sees its cue only
+    /// AFTER every filter before it has fully drained through it, and no
+    /// real frame follows a filter's own cue. Only then does end of stream
+    /// propagate downstream. A filter that holds frames back must release
+    /// ALL remaining output when its cue arrives:
+    /// - a producing filter (GPU/asynchronous) should resolve its pending
+    ///   work — blocking if necessary — so the following [`request_frame`]
+    ///   drain can pull everything out before returning `None`;
+    /// - a non-producing filter ([`RequestFrameMode::Never`]) that delays
+    ///   frames may instead return its held frame from `filter_frame`,
+    ///   consuming the marker; passing an unneeded marker through is
+    ///   equally fine (the pipeline recycles it).
+    ///
+    /// A filter can still see more than one props-only frame per stream —
+    /// e.g. a source-side EOF-timestamp marker traversing the already
+    /// drained chain after the flush. Treat every marker as a flush point,
+    /// never as a terminal signal or an error. As a safety net against
+    /// runaway generators, the end-of-stream drain forwards at most 1024
+    /// frames per filter; a backlog beyond that is discarded.
     ///
     /// [`request_frame`]: FrameFilter::request_frame
     fn filter_frame(

@@ -18,6 +18,11 @@ use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::Duration;
 
+/// Downstream destinations of one pipeline: the frame channel, the
+/// filtergraph input index it feeds, and that graph's per-input finished
+/// flags (empty when the destination is an encoder).
+type FrameSenders = Vec<(Sender<FrameBox>, usize, Arc<[AtomicBool]>)>;
+
 pub(crate) fn input_pipeline_init(
     demux_idx: usize,
     pipeline: FramePipeline,
@@ -202,7 +207,7 @@ fn pipeline_init(
     mut pipeline: FramePipeline,
     stream_index: usize,
     frame_receiver: Receiver<FrameBox>,
-    frame_senders: Vec<(Sender<FrameBox>, usize, Arc<[AtomicBool]>)>,
+    frame_senders: FrameSenders,
     frame_pool: ObjPool<Frame>,
     scheduler_status: Arc<AtomicUsize>,
     thread_sync: ThreadSynchronizer,
@@ -263,11 +268,16 @@ fn pipeline_init(
 fn run_pipeline(
     pipeline: &mut FramePipeline,
     frame_receiver: Receiver<FrameBox>,
-    mut frame_senders: Vec<(Sender<FrameBox>, usize, Arc<[AtomicBool]>)>,
+    mut frame_senders: FrameSenders,
     frame_pool: &ObjPool<Frame>,
     scheduler_status: &Arc<AtomicUsize>,
 ) -> crate::error::Result<()> {
     let mut src_finished_flag = false;
+    // True while the most recent frame the source delivered was a props-only
+    // flush cue (input-side pipelines: the decoder sends one right before the
+    // EOF sentinel). The EOF flush then skips synthesizing a duplicate — a
+    // filter that finalizes on the cue should see it once per stream.
+    let mut cue_since_last_real = false;
 
     // PERF-8: only filters that can produce frames on their own need the
     // request_frame poll. When none can — the common case of a pipeline built
@@ -309,19 +319,91 @@ fn run_pipeline(
                     }
                 }
                 Ok(frame_box) => {
-                    // filter frame
-                    match pipeline.run_filters(frame_box.frame) {
-                        Ok(tmp_frame) => {
-                            send_frame(pipeline, &mut frame_senders, frame_pool, tmp_frame)?
+                    // EOF sentinel: dec_done / close_output push a Frame that
+                    // wraps a NULL AVFrame as the end-of-stream marker. It must
+                    // NEVER reach user FrameFilter code: ffmpeg_next's Frame
+                    // accessors (pts/width/is_key/...) are safe fns that
+                    // unconditionally deref as_ptr(), so a filter that reads any
+                    // property would hit a null deref (UB/SIGSEGV) at every
+                    // stream end. Forward it straight downstream — send_frame
+                    // already treats the null sentinel as the EOF signal.
+                    //
+                    // Before the sentinel moves on, flush the chain: an async
+                    // filter (the GPU pipeline) resolves its in-flight frames
+                    // only on a props-only flush cue, and an output-side
+                    // pipeline gets no such marker from the filtergraph when
+                    // frames flowed (close_output synthesizes one only for the
+                    // never-got-a-frame init case). Skipping the flush would
+                    // hand the encoder EOF first and drop the late frames.
+                    if crate::core::scheduler::ffmpeg_scheduler::frame_is_null(&frame_box.frame) {
+                        if !cue_since_last_real {
+                            // Aborted or not, the sentinel below still goes
+                            // out: EOF must reach downstream either way.
+                            let _ = flush_pipeline_for_eof(
+                                pipeline,
+                                &mut frame_senders,
+                                frame_pool,
+                                &poll_indices,
+                                scheduler_status,
+                            )?;
                         }
-                        Err(e) => {
-                            error!(
-                                "Pipeline [index:{}] failed, during filter frame. error: {e}",
-                                pipeline.stream_index.unwrap_or(usize::MAX),
+                        send_frame(pipeline, &mut frame_senders, frame_pool, Some(frame_box.frame))?;
+                    } else {
+                        // SAFETY: non-null (frame_is_null was false); probing
+                        // buf[0] reads one pointer field of a live frame.
+                        let is_cue =
+                            unsafe { (*frame_box.frame.as_ptr()).buf[0].is_null() };
+                        if is_cue {
+                            // A source-delivered flush cue (the decoder's EOF
+                            // timestamp marker). Run the ordered flush protocol
+                            // FIRST — every filter drains in chain order — and
+                            // only then let the source marker itself traverse
+                            // the dry chain below: downstream still needs its
+                            // props (the EOF timestamp), and on a drained chain
+                            // it passes straight through. An aborted flush
+                            // (stop / downstream gone) must not push the
+                            // marker through user filters either.
+                            // Belt-and-braces terminal re-check after the
+                            // flush: `completed` must reflect the very last
+                            // callback's aftermath before the marker enters
+                            // user code again.
+                            let completed = flush_pipeline_for_eof(
+                                pipeline,
+                                &mut frame_senders,
+                                frame_pool,
+                                &poll_indices,
+                                scheduler_status,
+                            )? && !crate::core::scheduler::ffmpeg_scheduler::is_stopping(
+                                scheduler_status.load(std::sync::atomic::Ordering::Acquire),
                             );
-                            return Err(FrameFilterProcess(e));
+                            if !completed {
+                                frame_pool.release(frame_box.frame);
+                                if frame_senders.is_empty() {
+                                    debug!("All frame sender finished, finishing.");
+                                    return Ok(());
+                                }
+                                // Stopping: the loop's top-of-iteration status
+                                // check exits on the next pass.
+                                continue;
+                            }
+                            cue_since_last_real = true;
+                        } else {
+                            cue_since_last_real = false;
                         }
-                    };
+                        // filter frame
+                        match pipeline.run_filters(frame_box.frame) {
+                            Ok(tmp_frame) => {
+                                send_frame(pipeline, &mut frame_senders, frame_pool, tmp_frame)?
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Pipeline [index:{}] failed, during filter frame. error: {e}",
+                                    pipeline.stream_index.unwrap_or(usize::MAX),
+                                );
+                                return Err(FrameFilterProcess(e));
+                            }
+                        };
+                    }
 
                     if frame_senders.is_empty() {
                         debug!("All frame sender finished, finishing.");
@@ -342,6 +424,22 @@ fn run_pipeline(
         let mut produced_frame = false;
         for &i in &poll_indices {
             loop {
+                // A saturating MayProduce generator (request_frame always
+                // returns Some) would otherwise spin here forever: is_stopping
+                // and the empty-senders check live only outside this inner
+                // loop, so on stop/abort the downstream encoder exits, every
+                // send fails, senders empty out — and the loop keeps producing
+                // frames into the void at 100% CPU, never releasing the
+                // pipeline thread's slot and hanging stop()/wait(). Re-check
+                // both each iteration.
+                if crate::core::scheduler::ffmpeg_scheduler::is_stopping(
+                    scheduler_status.load(std::sync::atomic::Ordering::Acquire),
+                ) {
+                    return Ok(());
+                }
+                if frame_senders.is_empty() {
+                    return Ok(());
+                }
                 let result = pipeline.request_frame(i);
                 if let Err(e) = result {
                     error!(
@@ -393,9 +491,201 @@ fn run_pipeline(
     }
 }
 
+/// Upper bound on frames one EOF flush drain will forward PER FILTER. The
+/// flush exists to release the FINITE backlog a filter holds at end of stream
+/// (a handful of in-flight GPU readbacks). A filter whose `request_frame`
+/// never returns `None` (a saturating generator) must not hold the EOF
+/// sentinel hostage; past the cap its output reverts to the previous
+/// end-of-stream behavior — produced after EOF and dropped once the
+/// downstream consumer leaves. Documented in [`FrameFilter::filter_frame`]'s
+/// "End of stream" section; keep the two in sync.
+///
+/// [`FrameFilter::filter_frame`]: crate::filter::frame_filter::FrameFilter::filter_frame
+const EOF_FLUSH_FRAME_CAP: usize = 1024;
+
+/// Flushes the filter chain right before the EOF sentinel is forwarded.
+///
+/// Ordered cascade, one stage per filter: stage `k` hands filter `k` a
+/// synthesized props-only cue (a fresh pooled shell — the scheduler-wide
+/// marker signature) and then drains it dry through `request_frame`. Because
+/// stages run in chain order, by the time a filter receives its cue every
+/// filter before it has already drained THROUGH it — no real frame arrives
+/// after a filter's cue. Each filter gets its cue exactly once: the cue goes
+/// to filter `k` alone (`run_filter_at`), a real frame it releases continues
+/// down the chain like any frame, and a passed-back marker is recycled so it
+/// cannot cue the filters behind `k` early or out of order. The downstream
+/// sequence stays exactly "…real frames, EOF".
+/// Returns `Ok(true)` when every stage ran to completion, `Ok(false)` when a
+/// gate (stopping scheduler / departed downstream) aborted the flush early —
+/// the caller must not push more work through the chain in that case.
+fn flush_pipeline_for_eof(
+    pipeline: &mut FramePipeline,
+    frame_senders: &mut FrameSenders,
+    frame_pool: &ObjPool<Frame>,
+    poll_indices: &[usize],
+    scheduler_status: &Arc<AtomicUsize>,
+) -> crate::error::Result<bool> {
+    for k in 0..pipeline.filters.len() {
+        // Per-stage gate, BEFORE the cue enters user code: a stage can run
+        // arbitrarily expensive filter work (the GPU filter blocks until
+        // every in-flight frame completes), which a stopping scheduler must
+        // not pay for, and a fully departed downstream could not receive.
+        if crate::core::scheduler::ffmpeg_scheduler::is_stopping(
+            scheduler_status.load(std::sync::atomic::Ordering::Acquire),
+        ) || frame_senders.is_empty()
+        {
+            return Ok(false);
+        }
+
+        let marker = frame_pool.get()?;
+        match pipeline.run_filter_at(k, marker) {
+            Ok(out) => {
+                if !forward_from(pipeline, frame_senders, frame_pool, k + 1, out, scheduler_status)? {
+                    return Ok(false);
+                }
+            }
+            Err(e) => {
+                error!(
+                    "Pipeline [index:{}] failed, during EOF flush cue. error: {e}",
+                    pipeline.stream_index.unwrap_or(usize::MAX),
+                );
+                return Err(FrameFilterProcess(e));
+            }
+        }
+
+        if !poll_indices.contains(&k) {
+            continue;
+        }
+
+        // Drain stage k dry. Per-filter cap: one runaway generator must not
+        // eat the drain budget of the filters after it.
+        let mut flushed = 0usize;
+        loop {
+            // Mirror the main drain loop's exit conditions: a stopping
+            // scheduler or a fully departed downstream must end the flush.
+            if crate::core::scheduler::ffmpeg_scheduler::is_stopping(
+                scheduler_status.load(std::sync::atomic::Ordering::Acquire),
+            ) {
+                return Ok(false);
+            }
+            if frame_senders.is_empty() {
+                return Ok(false);
+            }
+            if flushed >= EOF_FLUSH_FRAME_CAP {
+                warn!(
+                    "Pipeline [index:{}] EOF flush hit the {EOF_FLUSH_FRAME_CAP}-frame cap \
+                     on filter {k}; its remaining output stays unflushed",
+                    pipeline.stream_index.unwrap_or(usize::MAX),
+                );
+                break;
+            }
+            let result = pipeline.request_frame(k);
+            let tmp_frame = match result {
+                Ok(tmp_frame) => tmp_frame,
+                Err(e) => {
+                    error!(
+                        "Pipeline [index:{}] failed, during EOF flush request frame.",
+                        pipeline.stream_index.unwrap_or(usize::MAX)
+                    );
+                    return Err(FrameFilterRequest(e));
+                }
+            };
+            let Some(tmp_frame) = tmp_frame else {
+                break;
+            };
+            flushed += 1;
+            if !forward_from(
+                pipeline,
+                frame_senders,
+                frame_pool,
+                k + 1,
+                Some(tmp_frame),
+                scheduler_status,
+            )? {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Routes one flush-stage output: props-only shells (a marker echoed back)
+/// are recycled on the spot — they must not cue later filters early — while
+/// a real frame continues through the rest of the chain and downstream.
+///
+/// The terminal gate is evaluated FIRST and its verdict is returned from
+/// every branch — the callback that produced this output may have run for a
+/// while, and a stop that became observable during it must abort the flush
+/// no matter what the callback returned (frame, marker, or nothing), so no
+/// NEW user code starts afterwards. No gate runs between the suffix filters
+/// themselves — one chain traversal is the same indivisible unit it is on
+/// the streaming path, and aborting mid-chain would strand a frame a filter
+/// already owns.
+fn forward_from(
+    pipeline: &mut FramePipeline,
+    frame_senders: &mut FrameSenders,
+    frame_pool: &ObjPool<Frame>,
+    next_index: usize,
+    out: Option<Frame>,
+    scheduler_status: &Arc<AtomicUsize>,
+) -> crate::error::Result<bool> {
+    let proceed = !crate::core::scheduler::ffmpeg_scheduler::is_stopping(
+        scheduler_status.load(std::sync::atomic::Ordering::Acquire),
+    ) && !frame_senders.is_empty();
+    let Some(frame) = out else {
+        return Ok(proceed);
+    };
+    // SAFETY: pointer/scalar probe only; a null pointer is never dereferenced.
+    if unsafe { frame.as_ptr().is_null() } {
+        return Ok(proceed);
+    }
+    if unsafe { (*frame.as_ptr()).buf[0].is_null() } {
+        frame_pool.release(frame);
+        return Ok(proceed);
+    }
+    if !proceed {
+        frame_pool.release(frame);
+        return Ok(false);
+    }
+    match pipeline.run_filters_from(next_index, frame) {
+        Ok(out) => forward_flushed(pipeline, frame_senders, frame_pool, out).map(|()| true),
+        Err(e) => {
+            error!(
+                "Pipeline [index:{}] failed, during EOF flush filter frame. error: {e}",
+                pipeline.stream_index.unwrap_or(usize::MAX)
+            );
+            Err(FrameFilterProcess(e))
+        }
+    }
+}
+
+/// Forwards one flushed chain output downstream; props-only shells (the
+/// synthesized flush marker resurfacing) go back to the pool instead so the
+/// consumer never sees a frame that did not exist before the flush.
+fn forward_flushed(
+    pipeline: &mut FramePipeline,
+    frame_senders: &mut FrameSenders,
+    frame_pool: &ObjPool<Frame>,
+    out: Option<Frame>,
+) -> crate::error::Result<()> {
+    let Some(frame) = out else {
+        return Ok(());
+    };
+    // SAFETY: pointer/scalar probe only; a null pointer is never dereferenced.
+    if unsafe { frame.as_ptr().is_null() } {
+        // A null shell echoed back; the real EOF sentinel follows separately.
+        return Ok(());
+    }
+    if unsafe { (*frame.as_ptr()).buf[0].is_null() } {
+        frame_pool.release(frame);
+        return Ok(());
+    }
+    send_frame(pipeline, frame_senders, frame_pool, Some(frame))
+}
+
 fn send_frame(
     pipeline: &mut FramePipeline,
-    frame_senders: &mut Vec<(Sender<FrameBox>, usize, Arc<[AtomicBool]>)>,
+    frame_senders: &mut FrameSenders,
     frame_pool: &ObjPool<Frame>,
     tmp_frame: Option<Frame>,
 ) -> crate::error::Result<()> {
