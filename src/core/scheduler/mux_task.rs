@@ -1069,7 +1069,7 @@ fn _mux_init(
 /// every path where the slot was counted at scheduler start but no (further)
 /// worker will release it: streamless output, write_header failure, worker
 /// spawn failure. Without this the slot leaks and wait()/stop() hangs forever.
-fn release_mux_slot(scheduler_status: &Arc<AtomicUsize>, thread_sync: &ThreadSynchronizer) {
+pub(crate) fn release_mux_slot(scheduler_status: &Arc<AtomicUsize>, thread_sync: &ThreadSynchronizer) {
     thread_sync.thread_done_with(|| {
         scheduler_status.store(STATUS_END, Ordering::Release);
     });
