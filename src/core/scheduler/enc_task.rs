@@ -446,7 +446,6 @@ pub(crate) fn enc_init(
             if status != STATUS_ABORT {
                 // Actively flush encoder: send NULL frame and drain all buffered packets
                 let enc_ctx = enc_ctx_box.as_mut_ptr();
-                let stream = stream_box.inner;
 
                 // Send NULL frame to signal EOF
                 let ret = avcodec_send_frame(enc_ctx, null_mut());
@@ -489,7 +488,13 @@ pub(crate) fn enc_init(
                             packet_data: PacketData {
                                 dts_est: 0,
                                 codec_type: (*enc_ctx).codec_type,
-                                output_stream_index: (*stream).index,
+                                // The spawn-time stream index, NOT a deref of the
+                                // AVStream pointer: by the time this tail runs, a
+                                // failed mux init may already have freed the
+                                // output context (and with it every AVStream).
+                                // Muxer::new_stream allocates indices in lockstep
+                                // with avformat_new_stream, so they are equal.
+                                output_stream_index: stream_index as i32,
                                 is_copy: false,
                             },
                         }, &pkt_sender, &pre_pkt_sender, &mux_start_gate) {
@@ -529,7 +534,6 @@ pub(crate) fn enc_init(
         // so we must send an explicit empty packet to signal "no more data from this encoder".
         {
             let enc_ctx = enc_ctx_box.as_mut_ptr();
-            let stream = stream_box.inner;
 
             let mut packet = Packet::empty();
             (*packet.as_mut_ptr()).stream_index = stream_index as i32;
@@ -538,7 +542,9 @@ pub(crate) fn enc_init(
                 packet_data: PacketData {
                     dts_est: 0,
                     codec_type: (*enc_ctx).codec_type,
-                    output_stream_index: (*stream).index,
+                    // Spawn-time index, not (*stream).index — see the flush
+                    // block above.
+                    output_stream_index: stream_index as i32,
                     is_copy: false,
                 },
             }, &pkt_sender, &pre_pkt_sender, &mux_start_gate) {
@@ -617,7 +623,7 @@ fn receive_from(
             }
             Ok(frame_box)
         }
-        Err(e) if e == RecvTimeoutError::Disconnected => {
+        Err(RecvTimeoutError::Disconnected) => {
             debug!("Source[decoder/filtergraph/pipeline] thread exit.");
             Err(SyncFrame::Break)
         }

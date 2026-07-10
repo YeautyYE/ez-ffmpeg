@@ -442,10 +442,19 @@ impl FfmpegScheduler<Initialization> {
                     scheduler_result.clone(),
                     input_controller.clone(),
                 ) {
+                    // Registration is over for this muxer (nothing more will
+                    // be spawned) — signal it BEFORE fail_start joins the
+                    // delayed-start waiter, whose teardown waits for the flag
+                    // so its encoder join cannot miss an in-flight handle.
+                    mux.enc_registered.store(true, Ordering::Release);
                     Self::fail_start(&scheduler_status, &thread_sync, ffmpeg_context, &mux_handed);
                     return Err(e);
                 }
             }
+            // Every enc_init for this muxer returned: every encoder handle it
+            // will ever have is queued. The delayed-start waiter's teardown
+            // holds for this flag before joining/freeing.
+            mux.enc_registered.store(true, Ordering::Release);
         }
 
         // Filter graph
