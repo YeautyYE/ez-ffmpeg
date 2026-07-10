@@ -621,7 +621,17 @@ fn receive_from(
             debug!("Source[decoder/filtergraph/pipeline] thread exit.");
             Err(SyncFrame::Break)
         }
-        Err(_) => Err(SyncFrame::Continue),
+        Err(_) => {
+            // Timeout: also honor a terminal status. An encoder whose source
+            // never disconnects (a mid-start() failure leaves un-spawned
+            // upstream workers holding the frame senders inside the context)
+            // must still exit so the failure path can join it.
+            if is_stopping(wait_until_not_paused(scheduler_status)) {
+                info!("Encoder receiver end command, finishing.");
+                return Err(SyncFrame::Break);
+            }
+            Err(SyncFrame::Continue)
+        }
     }
 }
 

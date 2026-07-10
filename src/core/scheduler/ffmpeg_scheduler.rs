@@ -276,10 +276,19 @@ impl FfmpegScheduler<Initialization> {
         for _ in 0..self.ffmpeg_context.muxs.len() {
             thread_sync.thread_start();
         }
+        // Tracks which muxer's pre-counted thread slot has been handed to a
+        // worker/waiter (so it will be released on STATUS_END). On a failure
+        // path, fail_start() releases the slots still marked false and joins
+        // every spawned worker before self.ffmpeg_context (and the
+        // InterruptState it owns) drops.
+        let mut mux_handed = vec![false; self.ffmpeg_context.muxs.len()];
 
         // Muxer
         for (mux_idx, mux) in self.ffmpeg_context.muxs.iter_mut().enumerate() {
             if mux.is_ready() {
+                // Calling mux_init hands this slot off: on success a worker
+                // releases it, on failure fail_mux_init releases it internally.
+                mux_handed[mux_idx] = true;
                 if let Err(e) = mux_init(
                     mux_idx,
                     mux,
@@ -291,7 +300,7 @@ impl FfmpegScheduler<Initialization> {
                     scheduler_result.clone(),
                     mux_done_remaining.clone(),
                 ) {
-                    Self::cleanup(&scheduler_status, &self.ffmpeg_context);
+                    Self::fail_start(&scheduler_status, &thread_sync, &self.ffmpeg_context, &mux_handed);
                     return Err(e);
                 }
             }
@@ -311,7 +320,7 @@ impl FfmpegScheduler<Initialization> {
                         thread_sync.clone(),
                         scheduler_result.clone(),
                     ) {
-                        Self::cleanup(&scheduler_status, ffmpeg_context);
+                        Self::fail_start(&scheduler_status, &thread_sync, ffmpeg_context, &mux_handed);
                         return Err(e);
                     }
                 }
@@ -331,9 +340,15 @@ impl FfmpegScheduler<Initialization> {
                 scheduler_result.clone(),
                 mux_done_remaining.clone(),
             ) {
-                Ok(sender) => sender,
+                Ok(sender) => {
+                    // A not-ready muxer's slot is now owned by the spawned
+                    // waiter thread; a ready muxer was already marked handed in
+                    // the loop above (setting it again is idempotent).
+                    mux_handed[mux_idx] = true;
+                    sender
+                }
                 Err(e) => {
-                    Self::cleanup(&scheduler_status, ffmpeg_context);
+                    Self::fail_start(&scheduler_status, &thread_sync, ffmpeg_context, &mux_handed);
                     return Err(e);
                 }
             };
@@ -427,7 +442,7 @@ impl FfmpegScheduler<Initialization> {
                     scheduler_result.clone(),
                     input_controller.clone(),
                 ) {
-                    Self::cleanup(&scheduler_status, ffmpeg_context);
+                    Self::fail_start(&scheduler_status, &thread_sync, ffmpeg_context, &mux_handed);
                     return Err(e);
                 }
             }
@@ -446,7 +461,7 @@ impl FfmpegScheduler<Initialization> {
                 thread_sync.clone(),
                 scheduler_result.clone(),
             ) {
-                Self::cleanup(&scheduler_status, ffmpeg_context);
+                Self::fail_start(&scheduler_status, &thread_sync, ffmpeg_context, &mux_handed);
                 return Err(e);
             }
         }
@@ -465,7 +480,7 @@ impl FfmpegScheduler<Initialization> {
                         thread_sync.clone(),
                         scheduler_result.clone(),
                     ) {
-                        Self::cleanup(&scheduler_status, ffmpeg_context);
+                        Self::fail_start(&scheduler_status, &thread_sync, ffmpeg_context, &mux_handed);
                         return Err(e);
                     }
                 }
@@ -487,7 +502,7 @@ impl FfmpegScheduler<Initialization> {
                     thread_sync.clone(),
                     scheduler_result.clone(),
                 ) {
-                    Self::cleanup(&scheduler_status, ffmpeg_context);
+                    Self::fail_start(&scheduler_status, &thread_sync, ffmpeg_context, &mux_handed);
                     return Err(e);
                 }
             }
@@ -505,7 +520,7 @@ impl FfmpegScheduler<Initialization> {
                 thread_sync.clone(),
                 scheduler_result.clone(),
             ) {
-                Self::cleanup(&scheduler_status, ffmpeg_context);
+                Self::fail_start(&scheduler_status, &thread_sync, ffmpeg_context, &mux_handed);
                 return Err(e);
             }
         }
@@ -540,12 +555,50 @@ impl FfmpegScheduler<Initialization> {
     /// Cleans up Muxers/Demuxers and signals the job to end if an error occurs
     /// during initialization. This is invoked internally when `start()` fails.
     fn cleanup(scheduler_status: &Arc<AtomicUsize>, _ffmpeg_context: &FfmpegContext) {
-        // Contexts still owned by Demuxer/Muxer are freed by their Drop when
-        // the FfmpegContext goes down with the failed scheduler; contexts
-        // already handed to worker threads are freed by those threads
-        // (STATUS_END makes them exit).
+        // Early-failure path with no worker threads spawned yet (object-pool
+        // allocation): just publish the terminal state. Contexts still owned by
+        // Demuxer/Muxer are freed by their Drop when the FfmpegContext goes down
+        // with the failed scheduler.
         scheduler_status.store(STATUS_END, Ordering::Release);
         notify_pause_waiters();
+    }
+
+    /// Failure path once one or more worker threads may already be running:
+    /// publish the terminal state, wake every blocking wait, release any
+    /// pre-counted muxer thread slot no worker will free, and JOIN all workers
+    /// before returning.
+    ///
+    /// Joining before `start()` drops `self.ffmpeg_context` is what prevents a
+    /// use-after-free: that context is the sole owner of the `InterruptState`
+    /// the workers' AVIO interrupt callbacks dereference (via a refcount-free
+    /// raw pointer). A worker finishing its trailer I/O after the context was
+    /// freed would otherwise read and write freed memory. `mux_handed[i]` is
+    /// true once muxer `i`'s pre-counted slot has been handed to a worker or
+    /// waiter (which will release it on STATUS_END); the rest are released here
+    /// so `wait_for_all_threads` cannot block forever on a slot no thread owns.
+    fn fail_start(
+        scheduler_status: &Arc<AtomicUsize>,
+        thread_sync: &ThreadSynchronizer,
+        ffmpeg_context: &FfmpegContext,
+        mux_handed: &[bool],
+    ) {
+        scheduler_status.store(STATUS_END, Ordering::Release);
+        notify_pause_waiters();
+        // Wake choked demuxers so they observe the terminal state and exit
+        // (mirrors RunningGuard::drop).
+        for demux in &ffmpeg_context.demuxs {
+            if let crate::core::scheduler::input_controller::SchNode::Demux { waiter, .. } =
+                demux.node.as_ref()
+            {
+                waiter.set(false);
+            }
+        }
+        for &handed in mux_handed {
+            if !handed {
+                crate::core::scheduler::mux_task::release_mux_slot(scheduler_status, thread_sync);
+            }
+        }
+        thread_sync.wait_for_all_threads();
     }
 }
 
