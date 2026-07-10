@@ -2210,6 +2210,7 @@ unsafe fn open_output_file(
             let input_opaque = Box::new(OutputOpaque {
                 write: write_callback,
                 seek: output.seek_callback.take(),
+                poisoned: false,
             });
             let opaque = Box::into_raw(input_opaque) as *mut libc::c_void;
 
@@ -2515,11 +2516,19 @@ unsafe fn output_requires_seek(fmt_ctx: *mut AVFormatContext) -> bool {
 pub(super) struct InputOpaque {
     pub(super) read: Box<dyn FnMut(&mut [u8]) -> i32 + Send>,
     pub(super) seek: Option<Box<dyn FnMut(i64, i32) -> i64 + Send>>,
+    /// Set when a user callback panicked. `catch_unwind` keeps the panic from
+    /// crossing the extern "C" boundary, but the closure's captured state is
+    /// torn mid-update; calling it again could silently corrupt the stream
+    /// (e.g. a cursor advanced before the panic). Once poisoned, every later
+    /// callback fails with EIO so the job errors out instead.
+    pub(super) poisoned: bool,
 }
 
 pub(super) struct OutputOpaque {
     pub(super) write: Box<dyn FnMut(&[u8]) -> i32 + Send>,
     pub(super) seek: Option<Box<dyn FnMut(i64, i32) -> i64 + Send>>,
+    /// See [`InputOpaque::poisoned`].
+    pub(super) poisoned: bool,
 }
 
 unsafe extern "C" fn write_packet_wrapper(
@@ -2533,10 +2542,25 @@ unsafe extern "C" fn write_packet_wrapper(
         return ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO);
     }
     let context = &mut *(opaque as *mut OutputOpaque);
+    if context.poisoned {
+        return ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO);
+    }
 
     let slice = std::slice::from_raw_parts(buf, buf_size as usize);
 
-    (context.write)(slice)
+    // The user write closure runs across the extern "C" boundary: an unwinding
+    // panic here is UB (or a hard process abort under the default Rust ABI), so
+    // contain it and surface a normal I/O error to FFmpeg instead. The panic
+    // also poisons the opaque: the closure's state is torn, and some muxers
+    // ignore individual I/O failures (mov ignores the trailer seek result), so
+    // only failing every subsequent callback reliably fails the job.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (context.write)(slice))) {
+        Ok(ret) => ret,
+        Err(_) => {
+            context.poisoned = true;
+            ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO)
+        }
+    }
 }
 
 unsafe extern "C" fn read_packet_wrapper(
@@ -2551,10 +2575,30 @@ unsafe extern "C" fn read_packet_wrapper(
     }
 
     let context = &mut *(opaque as *mut InputOpaque);
+    if context.poisoned {
+        return ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO);
+    }
 
     let slice = std::slice::from_raw_parts_mut(buf, buf_size as usize);
 
-    (context.read)(slice)
+    // Contain panics across the extern "C" boundary and poison the opaque
+    // (see write_packet_wrapper).
+    let ret = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (context.read)(slice)))
+    {
+        Ok(ret) => ret,
+        Err(_) => {
+            context.poisoned = true;
+            return ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO);
+        }
+    };
+    // A read callback that reports more bytes than the buffer holds would make
+    // FFmpeg advance buf_end past the allocation and read out of bounds; clamp
+    // a bogus positive length to an I/O error. Negative error codes and any
+    // length within the buffer pass through unchanged.
+    if ret > buf_size {
+        return ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO);
+    }
+    ret
 }
 
 unsafe extern "C" fn seek_input_packet_wrapper(
@@ -2563,9 +2607,23 @@ unsafe extern "C" fn seek_input_packet_wrapper(
     whence: libc::c_int,
 ) -> i64 {
     let context = &mut *(opaque as *mut InputOpaque);
+    if context.poisoned {
+        return ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO) as i64;
+    }
 
     if let Some(seek_func) = &mut context.seek {
-        (*seek_func)(offset, whence)
+        // Contain panics across the extern "C" boundary and poison the opaque
+        // (see write_packet_wrapper). A panic maps to EIO, not ESPIPE: ESPIPE
+        // means "not seekable" and lets FFmpeg fall back to non-seeking modes,
+        // which would mask the torn closure state instead of failing the job.
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (*seek_func)(offset, whence)))
+        {
+            Ok(ret) => ret,
+            Err(_) => {
+                context.poisoned = true;
+                ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO) as i64
+            }
+        }
     } else {
         ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::ESPIPE) as i64
     }
@@ -2577,9 +2635,21 @@ unsafe extern "C" fn seek_output_packet_wrapper(
     whence: libc::c_int,
 ) -> i64 {
     let context = &mut *(opaque as *mut OutputOpaque);
+    if context.poisoned {
+        return ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO) as i64;
+    }
 
     if let Some(seek_func) = &mut context.seek {
-        (*seek_func)(offset, whence)
+        // Contain panics across the extern "C" boundary and poison the opaque;
+        // EIO instead of ESPIPE for the same reasons as the input-side seek.
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (*seek_func)(offset, whence)))
+        {
+            Ok(ret) => ret,
+            Err(_) => {
+                context.poisoned = true;
+                ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO) as i64
+            }
+        }
     } else {
         ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::ESPIPE) as i64
     }
@@ -3368,6 +3438,7 @@ unsafe fn open_input_file(
             let input_opaque = Box::new(InputOpaque {
                 read: input.read_callback.take().unwrap(),
                 seek: input.seek_callback.take(),
+                poisoned: false,
             });
             let opaque = Box::into_raw(input_opaque) as *mut libc::c_void;
 
@@ -4059,6 +4130,10 @@ mod tests {
     use crate::core::context::ffmpeg_context::{strtol, FfmpegContext, Output};
     use ffmpeg_sys_next::avfilter_graph_parse_ptr;
 
+    use crate::core::context::ffmpeg_context::{
+        read_packet_wrapper, seek_input_packet_wrapper, write_packet_wrapper, InputOpaque,
+        OutputOpaque,
+    };
     use crate::core::context::ffmpeg_context::{bind_fg_inputs_by_fg, fg_complex_bind_input};
     use crate::core::context::filter_graph::FilterGraph;
     use crate::core::context::input_filter::InputFilter;
@@ -4345,5 +4420,175 @@ mod tests {
         let input = "abc";
         let result = strtol(input);
         assert!(result.is_err())
+    }
+
+    // ---- custom-IO wrapper hardening (deterministic, no FFmpeg involved) ----
+    //
+    // The wrappers are plain extern "C" fns; driving them directly with a
+    // fabricated opaque pins their exact contract: oversized read lengths are
+    // clamped to EIO, a panicking closure is contained AND poisons the
+    // context, and a poisoned context never re-enters user code.
+
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::Arc;
+
+    fn eio() -> libc::c_int {
+        ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO)
+    }
+
+    #[test]
+    fn read_wrapper_clamps_oversized_length_and_allows_exact_fit() {
+        let opaque = Box::into_raw(Box::new(InputOpaque {
+            read: Box::new(|buf| buf.len() as i32 + 64),
+            seek: None,
+            poisoned: false,
+        }));
+        let mut buf = [0u8; 32];
+        let ret = unsafe {
+            read_packet_wrapper(
+                opaque as *mut libc::c_void,
+                buf.as_mut_ptr(),
+                buf.len() as libc::c_int,
+            )
+        };
+        assert_eq!(ret, eio(), "a forged over-length must clamp to EIO");
+        unsafe {
+            // Not poisoned by a bogus length: an exact-fit read stays legal.
+            (*opaque).read = Box::new(|buf| buf.len() as i32);
+            let ret = read_packet_wrapper(
+                opaque as *mut libc::c_void,
+                buf.as_mut_ptr(),
+                buf.len() as libc::c_int,
+            );
+            assert_eq!(
+                ret,
+                buf.len() as libc::c_int,
+                "ret == buf_size is within bounds and must pass through"
+            );
+            drop(Box::from_raw(opaque));
+        }
+    }
+
+    #[test]
+    fn read_wrapper_contains_panic_and_poisons() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let probe = Arc::clone(&calls);
+        let opaque = Box::into_raw(Box::new(InputOpaque {
+            read: Box::new(move |_buf| {
+                probe.fetch_add(1, AtomicOrdering::SeqCst);
+                panic!("test-injected read panic");
+            }),
+            seek: None,
+            poisoned: false,
+        }));
+        let mut buf = [0u8; 32];
+        for _ in 0..3 {
+            let ret = unsafe {
+                read_packet_wrapper(
+                    opaque as *mut libc::c_void,
+                    buf.as_mut_ptr(),
+                    buf.len() as libc::c_int,
+                )
+            };
+            assert_eq!(ret, eio());
+        }
+        assert_eq!(
+            calls.load(AtomicOrdering::SeqCst),
+            1,
+            "the panicking closure must never be re-entered once poisoned"
+        );
+        unsafe { drop(Box::from_raw(opaque)) };
+    }
+
+    #[test]
+    fn write_wrapper_contains_panic_and_poisons() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let probe = Arc::clone(&calls);
+        let opaque = Box::into_raw(Box::new(OutputOpaque {
+            write: Box::new(move |_buf| {
+                probe.fetch_add(1, AtomicOrdering::SeqCst);
+                panic!("test-injected write panic");
+            }),
+            seek: None,
+            poisoned: false,
+        }));
+        let buf = [0u8; 32];
+        for _ in 0..3 {
+            let ret = unsafe {
+                write_packet_wrapper(
+                    opaque as *mut libc::c_void,
+                    buf.as_ptr(),
+                    buf.len() as libc::c_int,
+                )
+            };
+            assert_eq!(ret, eio());
+        }
+        assert_eq!(
+            calls.load(AtomicOrdering::SeqCst),
+            1,
+            "the panicking closure must never be re-entered once poisoned"
+        );
+        unsafe { drop(Box::from_raw(opaque)) };
+    }
+
+    #[test]
+    fn seek_panic_poisons_the_whole_input_context() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let read_probe = Arc::clone(&reads);
+        let opaque = Box::into_raw(Box::new(InputOpaque {
+            read: Box::new(move |buf| {
+                read_probe.fetch_add(1, AtomicOrdering::SeqCst);
+                buf.len() as i32
+            }),
+            seek: Some(Box::new(|_offset, _whence| {
+                panic!("test-injected seek panic")
+            })),
+            poisoned: false,
+        }));
+        let mut buf = [0u8; 32];
+        unsafe {
+            // Healthy read before the panic.
+            let ret = read_packet_wrapper(
+                opaque as *mut libc::c_void,
+                buf.as_mut_ptr(),
+                buf.len() as libc::c_int,
+            );
+            assert_eq!(ret, buf.len() as libc::c_int);
+
+            // The panicking seek is contained as EIO (not ESPIPE, which
+            // would let FFmpeg fall back to non-seeking modes and mask it).
+            let ret = seek_input_packet_wrapper(opaque as *mut libc::c_void, 0, 0);
+            assert_eq!(ret, eio() as i64);
+
+            // Cross-callback poison: the read closure must not run again.
+            let ret = read_packet_wrapper(
+                opaque as *mut libc::c_void,
+                buf.as_mut_ptr(),
+                buf.len() as libc::c_int,
+            );
+            assert_eq!(ret, eio());
+            drop(Box::from_raw(opaque));
+        }
+        assert_eq!(
+            reads.load(AtomicOrdering::SeqCst),
+            1,
+            "a seek panic must poison reads on the same context"
+        );
+    }
+
+    #[test]
+    fn absent_seek_callback_stays_espipe() {
+        let opaque = Box::into_raw(Box::new(InputOpaque {
+            read: Box::new(|buf| buf.len() as i32),
+            seek: None,
+            poisoned: false,
+        }));
+        let ret = unsafe { seek_input_packet_wrapper(opaque as *mut libc::c_void, 0, 0) };
+        assert_eq!(
+            ret,
+            ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::ESPIPE) as i64,
+            "no seek callback means genuinely unseekable, not an I/O fault"
+        );
+        unsafe { drop(Box::from_raw(opaque)) };
     }
 }
