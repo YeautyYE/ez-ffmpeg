@@ -131,6 +131,22 @@ impl FramePipeline {
         holder.filter.request_frame(&ctx)
     }
 
+    /// Runs `filter_frame` on the single filter at `index`, returning ITS
+    /// output without pushing it further down the chain. The end-of-stream
+    /// flush uses this to hand each filter its cue exactly once — routing a
+    /// released real frame onward is the caller's decision, and a passed-back
+    /// marker must not cue the filters behind it out of order.
+    pub(crate) fn run_filter_at(
+        &mut self,
+        index: usize,
+        frame: ffmpeg_next::Frame,
+    ) -> Result<Option<ffmpeg_next::Frame>, FrameFilterError> {
+        assert!(index < self.filters.len());
+        let holder = &mut self.filters[index];
+        let ctx = FrameFilterContext::new(&holder.name, &mut self.attribute_map);
+        holder.filter.filter_frame(frame, &ctx)
+    }
+
     /// Passes the given `frame` through the filters starting at `start_index`.
     ///
     /// For example, if `start_index` is 2, we will call `filter_frame` on the 2nd filter,
