@@ -5,6 +5,7 @@ use crate::flv::flv_tag::FlvTag;
 use crate::rtmp::poller::{waker_pair, WakeHandle, Waker};
 use crate::rtmp::reactor::{
     effective_max_connections, PublisherFeed, PublisherSource, Reactor, CHANNEL_HEADROOM,
+    PUBLISHER_CHANNEL_CAPACITY,
 };
 use bytes::{BufMut, Bytes};
 use log::{debug, error, info, warn};
@@ -30,7 +31,11 @@ pub struct EmbedRtmpServer<S> {
     address: String,
     bound_addr: Option<std::net::SocketAddr>,
     status: Arc<AtomicUsize>,
-    stream_keys: dashmap::DashSet<String>,
+    // Arc-shared with the reactor: the duplicate-key check in create_* reads
+    // the keys the reactor inserts. DashSet's Clone is a deep copy, so a
+    // non-Arc field cloned into the worker thread would split server and
+    // reactor onto two disjoint sets and disable the check entirely.
+    stream_keys: Arc<dashmap::DashSet<String>>,
     // stream_key -> publisher source (raw byte path or media-bypass feed)
     publisher_sender: Option<crossbeam_channel::Sender<(String, PublisherSource)>>,
     /// Producer-side wakeup for the reactor (PERF-3), set in `start()`.
@@ -59,15 +64,40 @@ impl<S: 'static> EmbedRtmpServer<S> {
         }
     }
 
-    /// Checks whether the RTMP server has been stopped. This returns `true` after
-    /// [`stop`](EmbedRtmpServer<Running>::stop) has been called and the server has exited its main loop, otherwise `false`.
+    /// Checks whether the RTMP server has been signaled to stop. This returns
+    /// `true` once [`stop`](EmbedRtmpServer<Running>::stop) has been called
+    /// (or a fatal internal error stopped the server), otherwise `false`.
+    ///
+    /// Note this reports the *signal*, not thread teardown: the worker threads
+    /// observe the flag and exit shortly after (the reactor on its next
+    /// wakeup, the accept thread within its ~100ms accept cycle).
     ///
     /// # Returns
     ///
-    /// * `true` if the server has been signaled to stop (and is no longer listening/accepting).
+    /// * `true` if the server has been signaled to stop (and will no longer accept connections).
     /// * `false` if the server is still running.
     pub fn is_stopped(&self) -> bool {
         self.status.load(Ordering::Acquire) == STATUS_END
+    }
+
+    /// Signal the server threads to stop without consuming the server.
+    ///
+    /// Idempotent: storing `STATUS_END` again and re-waking an already-woken
+    /// reactor are both no-ops. The wake matters — without it the reactor
+    /// notices the flag only on its next poll timeout, and a reactor parked
+    /// in `poll()` would otherwise hold the shutdown for up to 100ms. When no
+    /// wake handle exists (waker_pair creation failed at start), that 100ms
+    /// poll fallback is exactly the degraded path the reactor already runs on.
+    ///
+    /// This exists because `EmbedRtmpServer` cannot implement `Drop` itself:
+    /// `into_state()` moves fields out of `self`, which the compiler forbids
+    /// for types with a `Drop` impl (E0509). Shared owners that only hold a
+    /// reference (e.g. [`StreamHandle`]) stop the server through this instead.
+    fn signal_stop(&self) {
+        self.status.store(STATUS_END, Ordering::Release);
+        if let Some(wake_handle) = &self.wake_handle {
+            wake_handle.wake();
+        }
     }
 }
 
@@ -206,6 +236,10 @@ impl EmbedRtmpServer<Initialization> {
             });
         if let Err(e) = result {
             error!("Thread[rtmp-server-worker] exited with error: {e}");
+            // Nothing has spawned yet: no worker observes STATUS_RUN, and the
+            // listener is still owned here (moved into the io closure only
+            // below), so it drops on return and releases the port. No stop
+            // signal is needed.
             return Err(crate::error::Error::RtmpThreadExited);
         }
 
@@ -266,6 +300,12 @@ impl EmbedRtmpServer<Initialization> {
             });
         if let Err(e) = result {
             error!("Thread[rtmp-server-io] exited with error: {e}");
+            // The worker thread spawned successfully above and is now polling
+            // `status` (still STATUS_RUN); without this it would run forever and
+            // keep the port bound. Signal STATUS_END (and wake the reactor) so
+            // it exits. The listener was moved into the failed io closure and
+            // drops with it, releasing the port.
+            self.signal_stop();
             return Err(crate::error::Error::RtmpThreadExited);
         }
 
@@ -477,7 +517,7 @@ impl EmbedRtmpServer<Running> {
             return Err(RtmpStreamAlreadyExists(stream_key));
         }
 
-        let (sender, receiver) = crossbeam_channel::bounded(1024);
+        let (sender, receiver) = crossbeam_channel::bounded(PUBLISHER_CHANNEL_CAPACITY);
         self.register_publisher(stream_key.clone(), PublisherSource::Raw(receiver))?;
 
         // Prime the raw byte channel with the connect / createStream / publish
@@ -507,7 +547,7 @@ impl EmbedRtmpServer<Running> {
             return Err(RtmpStreamAlreadyExists(stream_key));
         }
 
-        let (sender, receiver) = crossbeam_channel::bounded(1024);
+        let (sender, receiver) = crossbeam_channel::bounded(PUBLISHER_CHANNEL_CAPACITY);
         self.register_publisher(stream_key.clone(), PublisherSource::Feed(receiver))?;
 
         // Prime the feed with the same connect / createStream / publish bytes
@@ -558,7 +598,7 @@ impl EmbedRtmpServer<Running> {
     /// assert!(server.is_stopped());
     /// ```
     pub fn stop(self) -> EmbedRtmpServer<Ended> {
-        self.status.store(STATUS_END, Ordering::Release);
+        self.signal_stop();
         self.into_state()
     }
 }
@@ -592,7 +632,7 @@ fn is_fd_exhaustion(e: &std::io::Error) -> bool {
 fn handle_connections(
     connection_receiver: crossbeam_channel::Receiver<TcpStream>,
     publisher_receiver: crossbeam_channel::Receiver<(String, PublisherSource)>,
-    stream_keys: dashmap::DashSet<String>,
+    stream_keys: Arc<dashmap::DashSet<String>>,
     gop_limit: usize,
     max_connections: Option<usize>,
     status: Arc<AtomicUsize>,
@@ -763,6 +803,37 @@ use std::path::{Path, PathBuf};
 ///
 /// handle.wait()?;
 /// ```
+/// RAII guard that stops a started server unless explicitly disarmed.
+///
+/// `EmbedRtmpServer` cannot implement `Drop` (`into_state` moves out of `self`,
+/// which `Drop` forbids), so a partially-built [`StreamHandle`] would otherwise
+/// leak the running server on any post-start failure: the two worker threads
+/// keep polling `status` and hold the listener port bound. This guard is armed
+/// right after `server.start()` and disarmed only once the server is handed to
+/// a `StreamHandle`; any early return drops it and calls `signal_stop`.
+struct ServerStopGuard {
+    server: Option<Arc<EmbedRtmpServer<Running>>>,
+}
+
+impl Drop for ServerStopGuard {
+    fn drop(&mut self) {
+        if let Some(server) = &self.server {
+            server.signal_stop();
+        }
+    }
+}
+
+impl ServerStopGuard {
+    /// Take ownership of the server out of the guard, so its `Drop` becomes a
+    /// no-op. Called on the success path where a `StreamHandle` assumes the
+    /// stop responsibility.
+    fn disarm(mut self) -> Arc<EmbedRtmpServer<Running>> {
+        self.server
+            .take()
+            .expect("ServerStopGuard is armed exactly once before disarm")
+    }
+}
+
 pub struct StreamBuilder {
     address: Option<String>,
     app_name: Option<String>,
@@ -898,12 +969,22 @@ impl StreamBuilder {
             server = server.set_max_connections(max_conn);
         }
 
-        // Start the server
+        // Start the server, then immediately arm a stop guard. EmbedRtmpServer
+        // has no Drop, so any `?` failure below (create_rtmp_input, FFmpeg
+        // build/start) would otherwise drop the Arc without stopping the two
+        // server threads: they leak forever and the port stays AddrInUse. The
+        // guard is disarmed only once ownership passes to the StreamHandle,
+        // whose own Drop then owns the stop.
         let server = server.start().map_err(StreamError::Ffmpeg)?;
-        let server = Arc::new(server);
+        let guard = ServerStopGuard {
+            server: Some(Arc::new(server)),
+        };
 
-        // Create the RTMP output
-        let output = server
+        // Create the RTMP output (a `?` here drops the guard -> signal_stop).
+        let output = guard
+            .server
+            .as_ref()
+            .unwrap()
             .create_rtmp_input(&app_name, &stream_key)
             .map_err(StreamError::Ffmpeg)?;
 
@@ -914,7 +995,7 @@ impl StreamBuilder {
             input = input.set_readrate(rate);
         }
 
-        // Build and start the FFmpeg context
+        // Build and start the FFmpeg context (a `?` here drops the guard too).
         let scheduler = FfmpegContext::builder()
             .input(input)
             .output(output)
@@ -923,8 +1004,11 @@ impl StreamBuilder {
             .start()
             .map_err(StreamError::Ffmpeg)?;
 
+        // Success: hand the server to the StreamHandle and disarm the guard so
+        // the handle's Drop (not the guard's) owns the stop from here on.
+        let server = guard.disarm();
         Ok(StreamHandle {
-            _server: server,
+            server,
             scheduler: Some(scheduler),
         })
     }
@@ -949,7 +1033,7 @@ impl StreamBuilder {
 /// handle.wait()?;
 /// ```
 pub struct StreamHandle {
-    _server: Arc<EmbedRtmpServer<Running>>,
+    server: Arc<EmbedRtmpServer<Running>>,
     scheduler: Option<FfmpegScheduler<SchedulerRunning>>,
 }
 
@@ -969,17 +1053,32 @@ impl StreamHandle {
         }
         Ok(())
     }
+
+    /// The actual bound socket address of the underlying RTMP server.
+    ///
+    /// Useful when the builder was given `"127.0.0.1:0"`: the OS assigns a real
+    /// port, and this surfaces it (delegating to
+    /// [`EmbedRtmpServer::local_addr`]) so tests and callers can observe the
+    /// port without a bind/drop/rebind race on a pre-probed one.
+    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.server.local_addr()
+    }
 }
 
 impl Drop for StreamHandle {
     fn drop(&mut self) {
-        // Best-effort cleanup: if scheduler wasn't consumed by wait(),
-        // we attempt to stop it gracefully here.
-        // The server will be stopped when the Arc is dropped.
+        // Wait-then-signal. Waiting first preserves the drain semantics: a
+        // handle dropped mid-stream still delivers the remaining frames to
+        // connected watchers before the server goes away (cancelling the
+        // FFmpeg job instead is a separate concern, out of scope here). The
+        // explicit stop after it is what actually releases the listener port
+        // and the worker threads — dropping the Arc alone never did: the
+        // threads own clones of the status flag and keep running (and keep
+        // the port bound) until the flag flips.
         if let Some(scheduler) = self.scheduler.take() {
-            // Attempt to wait for graceful shutdown, but don't block forever
             let _ = scheduler.wait();
         }
+        self.server.signal_stop();
     }
 }
 
@@ -1149,6 +1248,153 @@ mod tests {
     use ffmpeg_next::time::current;
     use std::thread::sleep;
     use std::time::Duration;
+
+    /// Poll (up to ~2s) until `addr` can be bound again. The accept thread
+    /// releases the listener within one ~100ms accept cycle of the stop
+    /// signal, so a successful rebind proves the stop actually tore the
+    /// server down rather than merely flipping a flag.
+    fn wait_for_port_release(addr: std::net::SocketAddr) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match std::net::TcpListener::bind(addr) {
+                Ok(_) => return true,
+                Err(_) if std::time::Instant::now() < deadline => sleep(Duration::from_millis(20)),
+                Err(_) => return false,
+            }
+        }
+    }
+
+    // H7 regression: stop() used to only flip the status flag; the accept
+    // thread parked on the listener kept the port bound, so a start-stop-start
+    // cycle on the same address failed with AddrInUse.
+    #[test]
+    fn stopped_server_releases_its_port_for_rebind() {
+        let server = EmbedRtmpServer::new("127.0.0.1:0").start().expect("start");
+        let addr = server.local_addr().expect("bound address");
+
+        // Sanity: while the server runs, the port is genuinely held.
+        assert!(
+            std::net::TcpListener::bind(addr).is_err(),
+            "the running server must hold its port"
+        );
+
+        let stopped = server.stop();
+        assert!(stopped.is_stopped());
+        assert!(
+            wait_for_port_release(addr),
+            "the port must be rebindable within 2s of stop()"
+        );
+    }
+
+    // H7: a StreamHandle drop must stop the server it holds. Before the fix
+    // its Drop only waited on the scheduler and let the Arc'd server leak its
+    // threads and port forever.
+    #[test]
+    fn stream_handle_drop_stops_the_server() {
+        let server = EmbedRtmpServer::new("127.0.0.1:0").start().expect("start");
+        let addr = server.local_addr().expect("bound address");
+        let server = Arc::new(server);
+        let observer = server.clone();
+
+        let handle = StreamHandle {
+            server,
+            scheduler: None,
+        };
+        drop(handle);
+
+        assert!(
+            observer.is_stopped(),
+            "dropping the handle must signal the server to stop"
+        );
+        assert!(
+            wait_for_port_release(addr),
+            "the port must be rebindable within 2s of the handle drop"
+        );
+    }
+
+    // F6: the post-start failure path — a StreamBuilder that starts the server
+    // but then fails to build the FFmpeg job must not leak it. Rather than a
+    // racy probe/drop/rebind on a fixed port (which a parallel test could steal
+    // between the drop and the builder's bind), drive the exact RAII path
+    // directly: start on port 0, read the OS-assigned address, arm the
+    // ServerStopGuard, then drop it as any post-start `?` would — no
+    // reserve/drop/rebind window.
+    #[test]
+    fn server_stop_guard_drop_releases_the_port() {
+        let server = EmbedRtmpServer::new("127.0.0.1:0").start().expect("start");
+        let addr = server.local_addr().expect("bound address");
+
+        // The port is genuinely held while the guard owns the running server.
+        assert!(
+            std::net::TcpListener::bind(addr).is_err(),
+            "the running server must hold its port while the guard is armed"
+        );
+
+        // Arm the guard exactly as StreamBuilder::start does, then simulate the
+        // post-start failure by dropping it — its Drop must signal_stop.
+        let guard = ServerStopGuard {
+            server: Some(Arc::new(server)),
+        };
+        drop(guard);
+
+        assert!(
+            wait_for_port_release(addr),
+            "dropping the armed guard (a post-start failure) must release the port"
+        );
+    }
+
+    // H8.b regression: the reactor used to receive a `.clone()` of the
+    // DashSet — a deep copy — so keys it inserted never became visible to the
+    // duplicate-key check in create_* and RtmpStreamAlreadyExists was dead
+    // code: two publishers could claim the same stream key.
+    #[test]
+    fn duplicate_stream_key_is_rejected_once_registered() {
+        let server = EmbedRtmpServer::new("127.0.0.1:0").start().expect("start");
+        // Keep the Output alive: dropping it drops the feed sender, which
+        // deregisters the publisher and frees the key again.
+        let _output = server
+            .create_rtmp_input("app", "dup-key")
+            .expect("first create must succeed");
+
+        // Registration travels over a channel to the reactor thread; poll
+        // until the shared key set reflects it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !server.stream_keys.contains("dup-key") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stream key must appear in the shared set within 1s"
+            );
+            sleep(Duration::from_millis(10));
+        }
+
+        let second = server.create_rtmp_input("app", "dup-key");
+        assert!(
+            matches!(
+                second,
+                Err(crate::error::Error::RtmpStreamAlreadyExists(ref key)) if key == "dup-key"
+            ),
+            "a second create for a registered key must fail with RtmpStreamAlreadyExists"
+        );
+
+        server.stop();
+    }
+
+    // H7: signal_stop is idempotent — a second signal (or a stop() after a
+    // signal) must be a harmless no-op.
+    #[test]
+    fn double_stop_signal_is_idempotent() {
+        let server = EmbedRtmpServer::new("127.0.0.1:0").start().expect("start");
+        let addr = server.local_addr().expect("bound address");
+
+        server.signal_stop();
+        assert!(server.is_stopped());
+        server.signal_stop();
+        assert!(server.is_stopped());
+
+        let ended = server.stop();
+        assert!(ended.is_stopped());
+        assert!(wait_for_port_release(addr));
+    }
 
     #[test]
     #[ignore] // Integration test: requires exclusive port 1935 and test.mp4

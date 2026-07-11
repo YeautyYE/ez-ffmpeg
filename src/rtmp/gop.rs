@@ -39,18 +39,36 @@ pub(crate) enum FrameData {
 #[derive(Clone)]
 pub struct FrozenGop {
     frames: Arc<[FrameData]>,
+    /// Total payload bytes across `frames`, computed once at freeze time so
+    /// per-joiner replay budgeting does not rescan every cached frame.
+    byte_size: usize,
 }
 
 impl FrozenGop {
     fn new(frames: Vec<FrameData>) -> Self {
+        let byte_size = frames.iter().map(frame_len).sum();
         Self {
             frames: Arc::from(frames.into_boxed_slice()),
+            byte_size,
         }
     }
 
     /// Get frame data slice - zero-copy
     pub fn frames(&self) -> &[FrameData] {
         &self.frames
+    }
+
+    /// Total media payload bytes across the GOP's frames.
+    pub(crate) fn byte_size(&self) -> usize {
+        self.byte_size
+    }
+
+    /// Number of frames in the GOP. Used by the join-replay budget to add the
+    /// per-frame RTMP chunk framing (one message header per frame) on top of
+    /// the raw payload, so the budget reflects real wire bytes. The `len()`
+    /// below is test-only; this accessor is needed by production code.
+    pub(crate) fn frame_count(&self) -> usize {
+        self.frames.len()
     }
 
     #[cfg(test)]
@@ -155,6 +173,21 @@ impl Gops {
         }
     }
 
+    /// Drop every cached frame — the frozen history and the open GOP alike.
+    ///
+    /// Used when an incoming sequence header differs from the cached one: the
+    /// cached GOPs were encoded under the OLD codec configuration, and a late
+    /// joiner that received the NEW header followed by those OLD-config frames
+    /// would decode garbage. Live watchers already received the old frames in
+    /// real time (the fanout sends each incoming frame directly, not from this
+    /// cache), so clearing only resets what future joiners replay. Leaves
+    /// `max_gops` intact so `save_frame_data` keeps caching afterwards.
+    pub(crate) fn clear(&mut self) {
+        self.frozen.clear();
+        self.current.clear();
+        self.current_bytes = 0;
+    }
+
     /// Get reference iterator for all frozen GOPs (test only)
     #[cfg(test)]
     #[allow(dead_code)]
@@ -169,10 +202,18 @@ impl Gops {
         self.frozen.iter().cloned()
     }
 
-    /// Get frames of currently writing GOP (test only)
-    #[cfg(test)]
-    pub fn get_current_frames(&self) -> &[FrameData] {
+    /// Frames of the currently-writing (open) GOP. Replayed to joining
+    /// watchers as the final segment of the join burst: live delta frames a
+    /// joiner receives afterwards reference this GOP's IDR, so omitting it
+    /// leaves the picture smeared until the next keyframe.
+    pub(crate) fn current_frames(&self) -> &[FrameData] {
         &self.current
+    }
+
+    /// Total payload bytes of the currently-writing GOP, companion to
+    /// [`FrozenGop::byte_size`] for replay budgeting.
+    pub(crate) fn current_byte_size(&self) -> usize {
+        self.current_bytes
     }
 
     /// Whether GOP caching is enabled
@@ -365,6 +406,37 @@ mod tests {
     }
 
     #[test]
+    fn clear_drops_frozen_and_current_and_keeps_caching() {
+        let mut gops = Gops::new(3);
+
+        gops.save_frame_data(make_video_frame(0, b"k1"), true);
+        gops.save_frame_data(make_video_frame(33, b"p1"), false);
+        gops.save_frame_data(make_video_frame(66, b"k2"), true); // freezes GOP 1
+        gops.save_frame_data(make_video_frame(99, b"p2"), false);
+        assert_eq!(gops.frozen_count(), 1);
+        assert_eq!(gops.current_frame_count(), 2);
+        assert!(gops.current_byte_size() > 0);
+
+        gops.clear();
+        assert_eq!(gops.frozen_count(), 0, "clear must drop the frozen history");
+        assert_eq!(
+            gops.current_frame_count(),
+            0,
+            "clear must drop the open GOP"
+        );
+        assert_eq!(
+            gops.current_byte_size(),
+            0,
+            "clear must reset the byte counter"
+        );
+
+        // Caching still works after a clear (a codec change starts fresh).
+        gops.save_frame_data(make_video_frame(132, b"k3"), true);
+        assert_eq!(gops.current_frames().len(), 1);
+        assert!(gops.is_enabled());
+    }
+
+    #[test]
     fn test_empty_current_gop_on_first_keyframe() {
         let mut gops = Gops::new(2);
 
@@ -372,6 +444,6 @@ mod tests {
         gops.save_frame_data(make_video_frame(0, b"k1"), true);
 
         assert_eq!(gops.frozen_count(), 0);
-        assert_eq!(gops.get_current_frames().len(), 1);
+        assert_eq!(gops.current_frames().len(), 1);
     }
 }
