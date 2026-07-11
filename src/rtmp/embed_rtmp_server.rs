@@ -313,6 +313,33 @@ impl EmbedRtmpServer<Initialization> {
     }
 }
 
+/// Handle for feeding raw, pre-packaged RTMP chunk bytes to a stream published
+/// via [`EmbedRtmpServer::<Running>::create_stream_sender`]. Wraps the internal
+/// channel so callers do not depend on the channel implementation.
+///
+/// Cloneable and multi-producer: every clone feeds the same stream, so several
+/// producers can push chunks to one stream concurrently.
+#[derive(Clone)]
+pub struct RtmpStreamSender {
+    inner: crossbeam_channel::Sender<Vec<u8>>,
+}
+
+impl RtmpStreamSender {
+    /// Sends one already-RTMP-chunk-packaged byte buffer to the stream.
+    ///
+    /// The underlying channel is bounded, so this **blocks** while the stream's
+    /// queue is full (the server applying backpressure) and returns once space
+    /// frees up. Returns
+    /// [`Error::RtmpStreamClosed`](crate::error::Error::RtmpStreamClosed) if the
+    /// stream has been torn down — its receiver was dropped because the server
+    /// stopped or the stream was removed.
+    pub fn send(&self, chunk: Vec<u8>) -> crate::error::Result<()> {
+        self.inner
+            .send(chunk)
+            .map_err(|_| crate::error::Error::RtmpStreamClosed)
+    }
+}
+
 impl EmbedRtmpServer<Running> {
     /// Returns the actual bound socket address of the RTMP server.
     ///
@@ -487,8 +514,8 @@ impl EmbedRtmpServer<Running> {
     }
 
     /// Creates a sender channel for an RTMP stream, identified by `app_name` and `stream_key`.
-    /// This method is used internally by [`create_rtmp_input`](EmbedRtmpServer<Running>::create_rtmp_input) but can also be called directly
-    /// if you need more control over how the stream is handled.
+    /// Call this to publish an in-process stream directly by feeding raw,
+    /// pre-packaged RTMP chunk bytes into the server's handling pipeline.
     ///
     /// # Parameters
     ///
@@ -497,8 +524,8 @@ impl EmbedRtmpServer<Running> {
     ///
     /// # Returns
     ///
-    /// * `crossbeam_channel::Sender<Vec<u8>>` - A sender that allows you to send raw RTMP bytes
-    ///   into the server's handling pipeline.
+    /// * [`RtmpStreamSender`] - A handle whose [`send`](RtmpStreamSender::send) feeds
+    ///   raw RTMP bytes into the server's handling pipeline.
     /// * [`crate::error::Error`] - If a stream with the same key already exists or other
     ///   internal issues occur, an error is returned.
     ///
@@ -511,7 +538,7 @@ impl EmbedRtmpServer<Running> {
         &self,
         app_name: impl Into<String>,
         stream_key: impl Into<String>,
-    ) -> crate::error::Result<crossbeam_channel::Sender<Vec<u8>>> {
+    ) -> crate::error::Result<RtmpStreamSender> {
         let stream_key = stream_key.into();
         if self.stream_keys.contains(&stream_key) {
             return Err(RtmpStreamAlreadyExists(stream_key));
@@ -528,7 +555,7 @@ impl EmbedRtmpServer<Running> {
                 return Err(RtmpCreateStream.into());
             }
         }
-        Ok(sender)
+        Ok(RtmpStreamSender { inner: sender })
     }
 
     /// Registers an in-process publisher whose steady-state audio/video is
@@ -737,7 +764,7 @@ pub(crate) fn build_publish_control(
     ])
 }
 
-pub fn flv_tag_to_message_payload(flv_tag: FlvTag) -> MessagePayload {
+pub(crate) fn flv_tag_to_message_payload(flv_tag: FlvTag) -> MessagePayload {
     let timestamp = flv_tag.header.timestamp | ((flv_tag.header.timestamp_ext as u32) << 24);
 
     let type_id = flv_tag.header.tag_type;
@@ -1262,6 +1289,31 @@ mod tests {
                 Err(_) => return false,
             }
         }
+    }
+
+    // API-hygiene regression: the stream sender must report a *stream*-scoped
+    // close (not a server-thread exit) when its consumer is gone, and stay
+    // multi-producer like the `crossbeam_channel::Sender` it used to be.
+    #[test]
+    fn stream_sender_reports_stream_closed_and_clones_share_the_stream() {
+        let (tx, rx) = crossbeam_channel::bounded::<Vec<u8>>(4);
+        let sender = RtmpStreamSender { inner: tx };
+
+        // A clone feeds the same stream: a chunk pushed through the clone is
+        // observed on the single receiver (the old handle was `Clone`).
+        let clone = sender.clone();
+        clone
+            .send(b"chunk".to_vec())
+            .expect("send on a live stream");
+        assert_eq!(rx.recv().unwrap(), b"chunk".to_vec());
+
+        // Dropping the consumer is a stream close, not a server-thread exit:
+        // the error must be RtmpStreamClosed, never RtmpThreadExited.
+        drop(rx);
+        assert_eq!(
+            sender.send(b"late".to_vec()),
+            Err(crate::error::Error::RtmpStreamClosed),
+        );
     }
 
     // H7 regression: stop() used to only flip the status flag; the accept
