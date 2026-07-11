@@ -381,9 +381,11 @@ fn run_pipeline(
                             Some(frame_box.frame),
                         )?;
                     } else {
-                        // SAFETY: non-null (frame_is_null was false); probing
-                        // buf[0] reads one pointer field of a live frame.
-                        let is_cue = unsafe { (*frame_box.frame.as_ptr()).buf[0].is_null() };
+                        // A source flush cue is a props-only marker; a real
+                        // frame — refcounted OR non-refcounted (buf[0] null but
+                        // data present) — is not, so probe both buf and data.
+                        let is_cue =
+                            crate::util::ffmpeg_utils::frame_is_eof_marker(&frame_box.frame);
                         if is_cue {
                             // A source-delivered flush cue (the decoder's EOF
                             // timestamp marker). Run the ordered flush protocol
@@ -674,11 +676,11 @@ fn forward_from(
     let Some(frame) = out else {
         return Ok(proceed);
     };
-    // SAFETY: pointer/scalar probe only; a null pointer is never dereferenced.
+    // SAFETY: pointer probe only; a null pointer is never dereferenced.
     if unsafe { frame.as_ptr().is_null() } {
         return Ok(proceed);
     }
-    if unsafe { (*frame.as_ptr()).buf[0].is_null() } {
+    if crate::util::ffmpeg_utils::frame_is_eof_marker(&frame) {
         frame_pool.release(frame);
         return Ok(proceed);
     }
@@ -710,12 +712,12 @@ fn forward_flushed(
     let Some(frame) = out else {
         return Ok(());
     };
-    // SAFETY: pointer/scalar probe only; a null pointer is never dereferenced.
+    // SAFETY: pointer probe only; a null pointer is never dereferenced.
     if unsafe { frame.as_ptr().is_null() } {
         // A null shell echoed back; the real EOF sentinel follows separately.
         return Ok(());
     }
-    if unsafe { (*frame.as_ptr()).buf[0].is_null() } {
+    if crate::util::ffmpeg_utils::frame_is_eof_marker(&frame) {
         frame_pool.release(frame);
         return Ok(());
     }
@@ -761,24 +763,26 @@ fn send_frame(
                     } else {
                         let mut to_send = frame_pool.get()?;
 
-                        // frame may sometimes contain props only,
-                        // e.g. to signal EOF timestamp
-                        unsafe {
-                            if !(*frame_box.frame.as_ptr()).buf[0].is_null() {
-                                let ret =
-                                    av_frame_ref(to_send.as_mut_ptr(), frame_box.frame.as_ptr());
-                                if ret < 0 {
-                                    return Err(FrameFilterSendOOM);
-                                }
-                            } else {
-                                let ret = av_frame_copy_props(
-                                    to_send.as_mut_ptr(),
-                                    frame_box.frame.as_ptr(),
-                                );
-                                if ret < 0 {
-                                    return Err(FrameFilterSendOOM);
-                                }
+                        // A real frame — refcounted or non-refcounted — is
+                        // ref'd: av_frame_ref allocates and copies a
+                        // non-refcounted source, so its data is not lost. Only a
+                        // props-only marker forwards props alone.
+                        if !crate::util::ffmpeg_utils::frame_is_eof_marker(&frame_box.frame) {
+                            // SAFETY: non-marker frame is live for the call.
+                            let ret = unsafe {
+                                av_frame_ref(to_send.as_mut_ptr(), frame_box.frame.as_ptr())
                             };
+                            if ret < 0 {
+                                return Err(FrameFilterSendOOM);
+                            }
+                        } else {
+                            // SAFETY: frame is live for the call.
+                            let ret = unsafe {
+                                av_frame_copy_props(to_send.as_mut_ptr(), frame_box.frame.as_ptr())
+                            };
+                            if ret < 0 {
+                                return Err(FrameFilterSendOOM);
+                            }
                         }
                         to_send
                     };
