@@ -64,7 +64,7 @@ impl FrameFilter for ProgressCallBackFilter {
     fn filter_frame(
         &mut self,
         frame: Frame,
-        _ctx: &FrameFilterContext,
+        _ctx: &mut FrameFilterContext,
     ) -> Result<Option<Frame>, FrameFilterError> {
         unsafe {
             // Ensure the frame is valid and not empty

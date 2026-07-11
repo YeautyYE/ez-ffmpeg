@@ -24,8 +24,8 @@ impl FrameFilter for VolumeFilter {
 
     fn filter_frame(
         &mut self,
-        frame: Frame,              // The input audio frame to be processed
-        _ctx: &FrameFilterContext, // Context of the filter (not used here)
+        frame: Frame,                  // The input audio frame to be processed
+        _ctx: &mut FrameFilterContext, // Context of the filter (not used here)
     ) -> Result<Option<Frame>, FrameFilterError> {
         unsafe {
             // Ensure the frame is valid and not empty

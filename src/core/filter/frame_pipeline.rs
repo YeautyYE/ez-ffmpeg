@@ -66,8 +66,8 @@ impl FramePipeline {
     /// Initializes all filters in order.
     pub(crate) fn init_filters(&mut self) -> Result<(), FrameFilterError> {
         for holder in &mut self.filters {
-            let ctx = FrameFilterContext::new(&holder.name, &mut self.attribute_map);
-            holder.filter.init(&ctx)?;
+            let mut ctx = FrameFilterContext::new(&holder.name, &mut self.attribute_map);
+            holder.filter.init(&mut ctx)?;
         }
         Ok(())
     }
@@ -76,8 +76,8 @@ impl FramePipeline {
     /// (You can reverse the order if needed, but typically it's not strict.)
     pub(crate) fn uninit_filters(&mut self) {
         for holder in &mut self.filters {
-            let ctx = FrameFilterContext::new(&holder.name, &mut self.attribute_map);
-            holder.filter.uninit(&ctx);
+            let mut ctx = FrameFilterContext::new(&holder.name, &mut self.attribute_map);
+            holder.filter.uninit(&mut ctx);
         }
     }
 
@@ -88,8 +88,8 @@ impl FramePipeline {
         mut frame: ffmpeg_next::Frame,
     ) -> Result<Option<ffmpeg_next::Frame>, FrameFilterError> {
         for holder in &mut self.filters {
-            let ctx = FrameFilterContext::new(&holder.name, &mut self.attribute_map);
-            match holder.filter.filter_frame(frame, &ctx)? {
+            let mut ctx = FrameFilterContext::new(&holder.name, &mut self.attribute_map);
+            match holder.filter.filter_frame(frame, &mut ctx)? {
                 Some(f) => {
                     frame = f;
                 }
@@ -127,8 +127,8 @@ impl FramePipeline {
     ) -> Result<Option<ffmpeg_next::Frame>, FrameFilterError> {
         assert!(index < self.filters.len());
         let holder = &mut self.filters[index];
-        let ctx = FrameFilterContext::new(&holder.name, &mut self.attribute_map);
-        holder.filter.request_frame(&ctx)
+        let mut ctx = FrameFilterContext::new(&holder.name, &mut self.attribute_map);
+        holder.filter.request_frame(&mut ctx)
     }
 
     /// Runs `filter_frame` on the single filter at `index`, returning ITS
@@ -143,8 +143,8 @@ impl FramePipeline {
     ) -> Result<Option<ffmpeg_next::Frame>, FrameFilterError> {
         assert!(index < self.filters.len());
         let holder = &mut self.filters[index];
-        let ctx = FrameFilterContext::new(&holder.name, &mut self.attribute_map);
-        holder.filter.filter_frame(frame, &ctx)
+        let mut ctx = FrameFilterContext::new(&holder.name, &mut self.attribute_map);
+        holder.filter.filter_frame(frame, &mut ctx)
     }
 
     /// Passes the given `frame` through the filters starting at `start_index`.
@@ -178,10 +178,10 @@ impl FramePipeline {
             let holder = &mut self.filters[i];
 
             // Build a temporary context, giving the filter its name and the attribute map.
-            let ctx = FrameFilterContext::new(&holder.name, &mut self.attribute_map);
+            let mut ctx = FrameFilterContext::new(&holder.name, &mut self.attribute_map);
 
             // Call `filter_frame` on the filter. If `None`, discard the frame and stop.
-            match holder.filter.filter_frame(frame, &ctx)? {
+            match holder.filter.filter_frame(frame, &mut ctx)? {
                 Some(f) => {
                     frame = f; // Continue to the next filter
                 }
@@ -207,6 +207,8 @@ impl From<FramePipelineBuilder> for FramePipeline {
 mod tests {
     use super::*;
     use crate::core::filter::frame_filter::NoopFilter;
+    use ffmpeg_next::Frame;
+    use std::sync::{Arc, Mutex};
 
     // Keeps the default request_frame_mode (MayProduce): a generator source.
     struct GeneratorFilter;
@@ -238,6 +240,84 @@ mod tests {
             with_generator.request_frame_indices(),
             vec![1],
             "only the producing filter (index 1) must be polled"
+        );
+    }
+
+    // A filter that writes a shared attribute, and one that reads it back — proving
+    // the &mut FrameFilterContext plumbing reaches user code, so an attribute set by
+    // one filter is visible to a later filter in the same run.
+    struct SetAttrFilter {
+        media: AVMediaType,
+    }
+    impl FrameFilter for SetAttrFilter {
+        fn media_type(&self) -> AVMediaType {
+            self.media
+        }
+        fn filter_frame(
+            &mut self,
+            frame: Frame,
+            ctx: &mut FrameFilterContext,
+        ) -> Result<Option<Frame>, FrameFilterError> {
+            ctx.set_attribute("shared_counter", 42i32);
+            Ok(Some(frame))
+        }
+        fn request_frame_mode(&self) -> RequestFrameMode {
+            RequestFrameMode::Never
+        }
+    }
+
+    struct GetAttrFilter {
+        media: AVMediaType,
+        seen: Arc<Mutex<Option<i32>>>,
+    }
+    impl FrameFilter for GetAttrFilter {
+        fn media_type(&self) -> AVMediaType {
+            self.media
+        }
+        fn filter_frame(
+            &mut self,
+            frame: Frame,
+            ctx: &mut FrameFilterContext,
+        ) -> Result<Option<Frame>, FrameFilterError> {
+            *self.seen.lock().unwrap() = ctx.get_attribute::<i32>("shared_counter").copied();
+            Ok(Some(frame))
+        }
+        fn request_frame_mode(&self) -> RequestFrameMode {
+            RequestFrameMode::Never
+        }
+    }
+
+    // Before this change the FrameFilter hooks took `&FrameFilterContext`, so
+    // `set_attribute` (which needs `&mut self`) was uncallable and the attribute API
+    // was dead. With `&mut FrameFilterContext`, a value one filter writes must reach a
+    // later filter through the shared pipeline map.
+    #[test]
+    fn ctx_attribute_written_by_one_filter_is_read_by_a_later_one() {
+        let media = AVMediaType::AVMEDIA_TYPE_VIDEO;
+        let seen = Arc::new(Mutex::new(None));
+
+        let mut pipeline = FramePipeline::new(media, Some(0));
+        pipeline.add_filter("setter", Box::new(SetAttrFilter { media }));
+        pipeline.add_filter(
+            "getter",
+            Box::new(GetAttrFilter {
+                media,
+                seen: seen.clone(),
+            }),
+        );
+
+        // SAFETY: `Frame::empty()` allocates a valid but buffer-less frame; the two
+        // passthrough filters only forward it and never read its planes, so the absent
+        // data buffers cause no undefined behavior here.
+        let frame = unsafe { Frame::empty() };
+        let out = pipeline
+            .run_filters(frame)
+            .expect("run_filters should succeed");
+        assert!(out.is_some(), "both passthrough filters forward the frame");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(42),
+            "the getter must read the attribute the setter wrote via &mut ctx"
         );
     }
 }

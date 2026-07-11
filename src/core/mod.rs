@@ -376,7 +376,7 @@ pub mod codec;
 ///     fn filter_frame(
 ///         &mut self,
 ///         mut frame: Frame,
-///         _ctx: &FrameFilterContext,
+///         _ctx: &mut FrameFilterContext,
 ///     ) -> Result<Option<Frame>, Box<dyn std::error::Error + Send + Sync>> {
 ///         // Forward an end-of-stream flush marker straight through.
 ///         if ez_ffmpeg::util::ffmpeg_utils::frame_is_eof_marker(&frame) {

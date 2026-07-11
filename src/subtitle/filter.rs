@@ -499,7 +499,7 @@ impl FrameFilter for SubtitleFilter {
     fn filter_frame(
         &mut self,
         mut frame: Frame,
-        _ctx: &FrameFilterContext,
+        _ctx: &mut FrameFilterContext,
     ) -> Result<Option<Frame>, FrameFilterError> {
         // An end-of-stream flush marker passes through untouched — this filter
         // never returns Ok(None), which would starve downstream consumers. The
@@ -624,7 +624,7 @@ impl FrameFilter for SubtitleFilter {
         Ok(Some(frame))
     }
 
-    fn uninit(&mut self, _ctx: &FrameFilterContext) {
+    fn uninit(&mut self, _ctx: &mut FrameFilterContext) {
         // Idempotent; Drop covers the paths where uninit never runs.
         self.renderer.teardown();
     }

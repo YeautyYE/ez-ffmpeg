@@ -78,8 +78,8 @@ fn make_marker_frame(pts: i64) -> Frame {
 
 fn init_filter(filter: &mut WgpuFrameFilter) -> bool {
     let mut map = HashMap::new();
-    let ctx = make_ctx(&mut map);
-    match filter.init(&ctx) {
+    let mut ctx = make_ctx(&mut map);
+    match filter.init(&mut ctx) {
         Ok(()) => true,
         Err(e) if e.to_string().contains("adapter") || e.to_string().contains("device") => {
             eprintln!("skipping wgpu test (no GPU): {e}");
@@ -93,18 +93,18 @@ fn init_filter(filter: &mut WgpuFrameFilter) -> bool {
 /// polling after each input and until all expected outputs have drained.
 fn drive(filter: &mut WgpuFrameFilter, inputs: Vec<Frame>, expected: usize) -> Vec<Frame> {
     let mut map = HashMap::new();
-    let ctx = make_ctx(&mut map);
+    let mut ctx = make_ctx(&mut map);
     let mut out = Vec::new();
     for frame in inputs {
-        if let Some(f) = filter.filter_frame(frame, &ctx).expect("filter_frame") {
+        if let Some(f) = filter.filter_frame(frame, &mut ctx).expect("filter_frame") {
             out.push(f);
         }
-        while let Some(f) = filter.request_frame(&ctx).expect("request_frame") {
+        while let Some(f) = filter.request_frame(&mut ctx).expect("request_frame") {
             out.push(f);
         }
     }
     for _ in 0..2000 {
-        while let Some(f) = filter.request_frame(&ctx).expect("request_frame") {
+        while let Some(f) = filter.request_frame(&mut ctx).expect("request_frame") {
             out.push(f);
         }
         if out.len() >= expected {
@@ -237,7 +237,7 @@ fn test_eof_marker_drains_in_flight_without_polling() {
         return;
     }
     let mut map = HashMap::new();
-    let ctx = make_ctx(&mut map);
+    let mut ctx = make_ctx(&mut map);
     let mut out = Vec::new();
     for i in 0..3i64 {
         let frame = make_planar_frame(
@@ -247,19 +247,19 @@ fn test_eof_marker_drains_in_flight_without_polling() {
             Some(40 + 40 * i as u8),
             i,
         );
-        if let Some(f) = filter.filter_frame(frame, &ctx).expect("filter_frame") {
+        if let Some(f) = filter.filter_frame(frame, &mut ctx).expect("filter_frame") {
             out.push(f);
         }
     }
     // The marker is the last send before the source drops its channel.
     if let Some(f) = filter
-        .filter_frame(make_marker_frame(100), &ctx)
+        .filter_frame(make_marker_frame(100), &mut ctx)
         .expect("marker filter_frame")
     {
         out.push(f);
     }
     // Exactly one non-blocking sweep, like run_pipeline's final pass.
-    while let Some(f) = filter.request_frame(&ctx).expect("request_frame") {
+    while let Some(f) = filter.request_frame(&mut ctx).expect("request_frame") {
         out.push(f);
     }
     assert_eq!(
@@ -324,10 +324,10 @@ fn test_frames_in_flight_one_is_synchronous() {
         return;
     }
     let mut map = HashMap::new();
-    let ctx = make_ctx(&mut map);
+    let mut ctx = make_ctx(&mut map);
     for i in 0..2 {
         let out = filter
-            .filter_frame(make_yuv420p_frame(160, 90), &ctx)
+            .filter_frame(make_yuv420p_frame(160, 90), &mut ctx)
             .expect("filter_frame");
         assert!(out.is_some(), "sync mode must return its own frame ({i})");
     }
@@ -340,12 +340,12 @@ fn test_oversized_frame_rejected() {
         return;
     }
     let mut map = HashMap::new();
-    let ctx = make_ctx(&mut map);
+    let mut ctx = make_ctx(&mut map);
     // The device is created with wgpu's default limits, which cap 2D
     // textures at 8192; exceeding that must be a clean Err, not a panic
     // from wgpu's uncaptured-error handler.
     let frame = make_planar_frame(8200, 16, AVPixelFormat::AV_PIX_FMT_YUV420P, Some(60), 0);
-    let err = match filter.filter_frame(frame, &ctx) {
+    let err = match filter.filter_frame(frame, &mut ctx) {
         Err(e) => e,
         Ok(_) => panic!("oversized frame must be rejected"),
     };
@@ -392,7 +392,7 @@ fn test_rejects_unsupported_and_hw_formats() {
         return;
     }
     let mut map = HashMap::new();
-    let ctx = make_ctx(&mut map);
+    let mut ctx = make_ctx(&mut map);
 
     unsafe {
         let mut rgb = Frame::empty();
@@ -401,7 +401,7 @@ fn test_rejects_unsupported_and_hw_formats() {
         (*p).height = 64;
         (*p).format = AVPixelFormat::AV_PIX_FMT_RGB24 as i32;
         assert!(av_frame_get_buffer(p, 1) >= 0);
-        let err = match filter.filter_frame(rgb, &ctx) {
+        let err = match filter.filter_frame(rgb, &mut ctx) {
             Err(e) => e,
             Ok(_) => panic!("RGB24 input must be rejected"),
         };
@@ -416,7 +416,7 @@ fn test_rejects_unsupported_and_hw_formats() {
         // cleanly without anything dereferencing the misdescribed planes.
         let mut hw = make_yuv420p_frame(64, 64);
         (*hw.as_mut_ptr()).format = AVPixelFormat::AV_PIX_FMT_CUDA as i32;
-        let err = match filter.filter_frame(hw, &ctx) {
+        let err = match filter.filter_frame(hw, &mut ctx) {
             Err(e) => e,
             Ok(_) => panic!("a fake hardware frame must fail the download"),
         };
@@ -461,8 +461,8 @@ fn test_params_shader_size_mismatch_fails_at_init() {
         .build()
         .unwrap();
     let mut map = HashMap::new();
-    let ctx = make_ctx(&mut map);
-    match filter.init(&ctx) {
+    let mut ctx = make_ctx(&mut map);
+    match filter.init(&mut ctx) {
         Err(e) if e.to_string().contains("adapter") || e.to_string().contains("device") => {
             eprintln!("skipping wgpu test (no GPU): {e}");
         }
@@ -478,8 +478,8 @@ fn test_params_shader_size_mismatch_fails_at_init() {
 fn test_bad_shader_fails_at_init_with_diagnostics() {
     let mut filter = WgpuFrameFilter::new_simple("not valid wgsl at all").unwrap();
     let mut map = HashMap::new();
-    let ctx = make_ctx(&mut map);
-    match filter.init(&ctx) {
+    let mut ctx = make_ctx(&mut map);
+    match filter.init(&mut ctx) {
         Err(e) if e.to_string().contains("adapter") || e.to_string().contains("device") => {
             eprintln!("skipping wgpu test (no GPU): {e}");
         }
@@ -507,7 +507,7 @@ impl FrameFilter for CountingFilter {
     fn filter_frame(
         &mut self,
         frame: Frame,
-        _ctx: &FrameFilterContext,
+        _ctx: &mut FrameFilterContext,
     ) -> Result<Option<Frame>, FrameFilterError> {
         self.seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Some(frame))
@@ -645,8 +645,8 @@ fn test_drain_without_marker() {
         assert_eq!(unsafe { (*f.as_ptr()).pts }, i as i64, "arrival order");
     }
     let mut map = HashMap::new();
-    let ctx = make_ctx(&mut map);
-    filter.uninit(&ctx);
+    let mut ctx = make_ctx(&mut map);
+    filter.uninit(&mut ctx);
 }
 
 /// Zero-copy readback: output planes point into the mapped staging buffer.
@@ -669,7 +669,7 @@ fn test_zero_copy_readback_roundtrip_and_recycle() {
 
     let n = 12usize;
     let mut map = HashMap::new();
-    let ctx = make_ctx(&mut map);
+    let mut ctx = make_ctx(&mut map);
     let mut seen = 0usize;
     for i in 0..n {
         let mut frame = make_yuv420p_frame(w, h);
@@ -677,19 +677,19 @@ fn test_zero_copy_readback_roundtrip_and_recycle() {
         // Frames are dropped right after checking, exercising the recycle
         // path: later iterations must reuse returned buffers instead of
         // growing GPU memory without bound.
-        if let Some(out) = filter.filter_frame(frame, &ctx).expect("filter_frame") {
+        if let Some(out) = filter.filter_frame(frame, &mut ctx).expect("filter_frame") {
             assert_eq!(unsafe { (*out.as_ptr()).pts }, seen as i64, "order");
             let diff = max_luma_diff(&out, &expected, w as usize, h as usize);
             assert!(diff <= 3, "luma diff too large at frame {seen}: {diff}");
             seen += 1;
         }
-        while let Some(out) = filter.request_frame(&ctx).expect("request_frame") {
+        while let Some(out) = filter.request_frame(&mut ctx).expect("request_frame") {
             assert_eq!(unsafe { (*out.as_ptr()).pts }, seen as i64, "order");
             seen += 1;
         }
     }
     for _ in 0..2000 {
-        while let Some(out) = filter.request_frame(&ctx).expect("request_frame") {
+        while let Some(out) = filter.request_frame(&mut ctx).expect("request_frame") {
             assert_eq!(unsafe { (*out.as_ptr()).pts }, seen as i64, "order");
             seen += 1;
         }
@@ -699,7 +699,7 @@ fn test_zero_copy_readback_roundtrip_and_recycle() {
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
     assert_eq!(seen, n, "all zero-copy frames must drain");
-    filter.uninit(&ctx);
+    filter.uninit(&mut ctx);
 }
 
 /// Zero-copy frames must survive their filter: uninit while a frame is still
@@ -723,8 +723,8 @@ fn test_zero_copy_frame_outlives_filter() {
         .unwrap();
 
     let mut map = HashMap::new();
-    let ctx = make_ctx(&mut map);
-    filter.uninit(&ctx);
+    let mut ctx = make_ctx(&mut map);
+    filter.uninit(&mut ctx);
     drop(filter);
 
     // The staging buffer behind `out` must still be mapped and readable.

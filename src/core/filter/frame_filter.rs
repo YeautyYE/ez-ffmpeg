@@ -52,7 +52,7 @@ pub trait FrameFilter: Send {
     /// # Returns
     /// - `Ok(())` if initialization succeeds.
     /// - `Err(e)` (any [`FrameFilterError`]) if initialization fails.
-    fn init(&mut self, ctx: &FrameFilterContext) -> Result<(), FrameFilterError> {
+    fn init(&mut self, ctx: &mut FrameFilterContext) -> Result<(), FrameFilterError> {
         log::debug!("Initializing filter:{}", ctx.name());
         Ok(())
     }
@@ -121,7 +121,7 @@ pub trait FrameFilter: Send {
     fn filter_frame(
         &mut self,
         _frame: Frame,
-        _ctx: &FrameFilterContext,
+        _ctx: &mut FrameFilterContext,
     ) -> Result<Option<Frame>, FrameFilterError> {
         Ok(None)
     }
@@ -142,7 +142,7 @@ pub trait FrameFilter: Send {
     /// - `Err(e)` (any [`FrameFilterError`]) if the request fails.
     fn request_frame(
         &mut self,
-        _ctx: &FrameFilterContext,
+        _ctx: &mut FrameFilterContext,
     ) -> Result<Option<Frame>, FrameFilterError> {
         Ok(None)
     }
@@ -164,7 +164,7 @@ pub trait FrameFilter: Send {
     ///
     /// # Parameters
     /// - `ctx`: The context that provides metadata and dynamic modification capabilities.
-    fn uninit(&mut self, ctx: &FrameFilterContext) {
+    fn uninit(&mut self, ctx: &mut FrameFilterContext) {
         log::debug!("Uninitialized filter:{}", ctx.name());
     }
 }
@@ -187,7 +187,7 @@ impl FrameFilter for NoopFilter {
     fn filter_frame(
         &mut self,
         frame: Frame,
-        _ctx: &FrameFilterContext,
+        _ctx: &mut FrameFilterContext,
     ) -> Result<Option<Frame>, FrameFilterError> {
         Ok(Some(frame))
     }
