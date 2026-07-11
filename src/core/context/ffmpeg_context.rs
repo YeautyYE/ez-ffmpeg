@@ -2417,6 +2417,7 @@ unsafe fn open_output_file(
         output.sws_opts.clone(),
         output.swr_opts.clone(),
         std::mem::take(&mut output.attachments),
+        interrupt_state.clone(),
     );
 
     Ok(mux)
@@ -2554,13 +2555,36 @@ unsafe extern "C" fn write_packet_wrapper(
     // also poisons the opaque: the closure's state is torn, and some muxers
     // ignore individual I/O failures (mov ignores the trailer seek result), so
     // only failing every subsequent callback reliably fails the job.
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (context.write)(slice))) {
-        Ok(ret) => ret,
-        Err(_) => {
-            context.poisoned = true;
-            ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO)
+    //
+    // Short writes are resubmitted: avio treats any non-negative return as
+    // "the whole buffer went out", so a closure that wrote only part of the
+    // slice (an io::Write-style sink, a socket under pressure) used to lose
+    // the remainder SILENTLY — a corrupt file that still reports success.
+    // Loop on the remainder like io::Write::write_all; zero-progress and
+    // over-claimed returns become EIO.
+    let mut written = 0usize;
+    while written < slice.len() {
+        let remaining = &slice[written..];
+        let ret = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (context.write)(remaining)
+        })) {
+            Ok(ret) => ret,
+            Err(_) => {
+                context.poisoned = true;
+                return ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO);
+            }
+        };
+        if ret < 0 {
+            return ret;
         }
+        if ret == 0 || ret as usize > remaining.len() {
+            // No progress (write_all semantics: a Ok(0) sink is broken) or a
+            // forged length past the buffer: both are I/O faults.
+            return ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO);
+        }
+        written += ret as usize;
     }
+    buf_size
 }
 
 unsafe extern "C" fn read_packet_wrapper(
@@ -2616,8 +2640,9 @@ unsafe extern "C" fn seek_input_packet_wrapper(
         // (see write_packet_wrapper). A panic maps to EIO, not ESPIPE: ESPIPE
         // means "not seekable" and lets FFmpeg fall back to non-seeking modes,
         // which would mask the torn closure state instead of failing the job.
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (*seek_func)(offset, whence)))
-        {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (*seek_func)(offset, whence)
+        })) {
             Ok(ret) => ret,
             Err(_) => {
                 context.poisoned = true;
@@ -2642,8 +2667,9 @@ unsafe extern "C" fn seek_output_packet_wrapper(
     if let Some(seek_func) = &mut context.seek {
         // Contain panics across the extern "C" boundary and poison the opaque;
         // EIO instead of ESPIPE for the same reasons as the input-side seek.
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (*seek_func)(offset, whence)))
-        {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (*seek_func)(offset, whence)
+        })) {
             Ok(ret) => ret,
             Err(_) => {
                 context.poisoned = true;
@@ -4130,11 +4156,11 @@ mod tests {
     use crate::core::context::ffmpeg_context::{strtol, FfmpegContext, Output};
     use ffmpeg_sys_next::avfilter_graph_parse_ptr;
 
+    use crate::core::context::ffmpeg_context::{bind_fg_inputs_by_fg, fg_complex_bind_input};
     use crate::core::context::ffmpeg_context::{
         read_packet_wrapper, seek_input_packet_wrapper, write_packet_wrapper, InputOpaque,
         OutputOpaque,
     };
-    use crate::core::context::ffmpeg_context::{bind_fg_inputs_by_fg, fg_complex_bind_input};
     use crate::core::context::filter_graph::FilterGraph;
     use crate::core::context::input_filter::InputFilter;
     use crate::core::context::null_frame;
@@ -4574,6 +4600,81 @@ mod tests {
             1,
             "a seek panic must poison reads on the same context"
         );
+    }
+
+    /// H12: a short-writing sink (io::Write-style) must not lose the
+    /// remainder — the wrapper resubmits until the whole buffer went out.
+    #[test]
+    fn write_wrapper_resubmits_short_writes() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let probe = Arc::clone(&seen);
+        let opaque = Box::into_raw(Box::new(OutputOpaque {
+            write: Box::new(move |buf| {
+                // Write at most 10 bytes per call, recording each chunk.
+                let n = buf.len().min(10);
+                probe.lock().unwrap().extend_from_slice(&buf[..n]);
+                n as i32
+            }),
+            seek: None,
+            poisoned: false,
+        }));
+        let data: Vec<u8> = (0..64u8).collect();
+        let ret = unsafe {
+            write_packet_wrapper(
+                opaque as *mut libc::c_void,
+                data.as_ptr(),
+                data.len() as libc::c_int,
+            )
+        };
+        assert_eq!(
+            ret,
+            data.len() as libc::c_int,
+            "the whole buffer must report written"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            data,
+            "no byte may be lost or reordered"
+        );
+        unsafe { drop(Box::from_raw(opaque)) };
+    }
+
+    /// H12: zero progress and over-claimed lengths are I/O faults, not
+    /// silent success.
+    #[test]
+    fn write_wrapper_rejects_zero_progress_and_over_claims() {
+        let opaque = Box::into_raw(Box::new(OutputOpaque {
+            write: Box::new(|_buf| 0),
+            seek: None,
+            poisoned: false,
+        }));
+        let data = [7u8; 16];
+        let ret = unsafe { write_packet_wrapper(opaque as *mut libc::c_void, data.as_ptr(), 16) };
+        assert_eq!(
+            ret,
+            eio(),
+            "a zero-progress sink must fail, not spin or succeed"
+        );
+        unsafe {
+            (*opaque).write = Box::new(|buf| buf.len() as i32 + 4);
+            let ret = write_packet_wrapper(opaque as *mut libc::c_void, data.as_ptr(), 16);
+            assert_eq!(ret, eio(), "an over-claimed write length must fail");
+            drop(Box::from_raw(opaque));
+        }
+    }
+
+    /// A negative error from the sink passes through unchanged.
+    #[test]
+    fn write_wrapper_passes_sink_errors_through() {
+        let opaque = Box::into_raw(Box::new(OutputOpaque {
+            write: Box::new(|_buf| ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::ENOSPC)),
+            seek: None,
+            poisoned: false,
+        }));
+        let data = [7u8; 8];
+        let ret = unsafe { write_packet_wrapper(opaque as *mut libc::c_void, data.as_ptr(), 8) };
+        assert_eq!(ret, ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::ENOSPC));
+        unsafe { drop(Box::from_raw(opaque)) };
     }
 
     #[test]

@@ -113,8 +113,14 @@ impl FrameFilter for VolumeFilter {
             }
         };
 
-        // Apply volume adjustment on both channels (in place)
+        // Apply volume adjustment on both channels (in place). Decoded frames
+        // wrap refcounted buffers that may be shared with the decoder's frame
+        // pool: make the frame writable first (a cheap refcount check when
+        // already exclusive, a copy when shared) so the in-place edit cannot
+        // corrupt data another consumer still reads. The resampled frame from
+        // above is freshly allocated, so for it this is just the cheap check.
         let mut frame = frame;
+        ez_ffmpeg::util::ffmpeg_utils::make_frame_writable(&mut frame)?;
         adjust_volume_in_place_f32(plane_mut(&mut frame, 0), self.volume);
         adjust_volume_in_place_f32(plane_mut(&mut frame, 1), self.volume);
 

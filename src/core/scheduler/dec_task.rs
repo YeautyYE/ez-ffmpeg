@@ -120,11 +120,24 @@ pub(crate) fn dec_init(
     let senders = dec_stream.take_dsts();
     let exit_on_error = exit_on_error.unwrap_or(false);
 
-    let dp_arc = dp_arc.clone();
+    let dp_arc_worker = dp_arc.clone();
 
     // Slot claimed before spawn; the guard releases it on any exit path.
     thread_sync.thread_start();
-    let thread_done_guard = ThreadDoneGuard::adopt(thread_sync.clone(), scheduler_status.clone());
+    let thread_done_guard = ThreadDoneGuard::adopt(
+        thread_sync.clone(),
+        scheduler_status.clone(),
+        scheduler_result.clone(),
+    );
+    // The AVCodecContext's opaque holds one raw Arc refcount (installed by
+    // dec_open for get_format). Constructed BEFORE the spawn and moved into
+    // the closure: a failed spawn drops the closure — and with it this guard
+    // — so the reclaim happens on spawn failure, worker unwind, and normal
+    // exit alike, with no reliance on any code (even a log call) running
+    // after the failure. drop_opaque_ptr is idempotent.
+    let opaque_reclaim = DecOpaqueReclaimGuard {
+        dp_arc: dp_arc.clone(),
+    };
 
     let result = std::thread::Builder::new()
         .name(format!(
@@ -133,7 +146,17 @@ pub(crate) fn dec_init(
         ))
         .spawn(move || {
             let _thread_done = thread_done_guard;
-            let dp_arc = dp_arc;
+            let dp_arc = dp_arc_worker;
+            let _opaque_reclaim = opaque_reclaim;
+            // `receiver`/`senders` are `move`-closure CAPTURES; rebind them as
+            // body locals declared AFTER the guard so they drop BEFORE it. For a
+            // `crossbeam_channel::bounded` channel the queued items are freed only when
+            // the LAST endpoint drops, so an undrained HW `FrameBox` in the
+            // decoder->filter channel (whose `AVBufferRef` release callback can block)
+            // would otherwise be torn down after this worker released its slot — i.e.
+            // after the sync counter that stop()/wait() gate on already hit zero.
+            let receiver = receiver;
+            let senders = senders;
             let input_status = false;
             let mut err_exit = false;
 
@@ -277,15 +300,35 @@ pub(crate) fn dec_init(
 
             dec_done(&dp_arc, &senders);
 
-            dp_arc.lock().unwrap().drop_opaque_ptr();
+            // The opaque refcount is reclaimed by _opaque_reclaim at scope end
+            // (normal and unwind alike).
             debug!("Decoder finished.");
         });
     if let Err(e) = result {
         error!("Decoder thread exited with error: {e}");
+        // The closure (and the reclaim guard inside it) was already dropped
+        // by the failed spawn — the opaque refcount is reclaimed by then.
         return Err(OpenDecoderOperationError::ThreadExited.into());
     }
 
     Ok(())
+}
+
+/// Reclaims the decoder context's `opaque` Arc refcount when the worker exits
+/// — by return or by unwind. Without the unwind half, a panicking decoder
+/// leaked its `DecoderParameter` (and the `AVCodecContext`, hardware frame
+/// contexts, and buffers it owns) forever.
+struct DecOpaqueReclaimGuard {
+    dp_arc: Arc<Mutex<DecoderParameter>>,
+}
+
+impl Drop for DecOpaqueReclaimGuard {
+    fn drop(&mut self) {
+        self.dp_arc
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drop_opaque_ptr();
+    }
 }
 
 #[cfg(docsrs)]
@@ -1160,8 +1203,12 @@ unsafe extern "C" fn get_format_callback(
     s: *mut AVCodecContext,
     pix_fmts: *const AVPixelFormat,
 ) -> AVPixelFormat {
-    if s.is_null() || pix_fmts.is_null() {
-        trace!("get pixel format: none");
+    // Everything — including the trace! for the null-argument case, which
+    // runs a user-installed log hook that can panic — must stay inside a
+    // catch_unwind: unwinding across this extern "C" boundary is undefined
+    // behavior.
+    if s.is_null() || pix_fmts.is_null() || (*s).opaque.is_null() {
+        let _ = std::panic::catch_unwind(|| trace!("get pixel format: none"));
         return AVPixelFormat::AV_PIX_FMT_NONE;
     }
 
@@ -1178,46 +1225,62 @@ unsafe extern "C" fn get_format_callback(
     let dp_ptr = Arc::into_raw(dp_arc.clone());
     (*s).opaque = dp_ptr as *mut libc::c_void;
 
-    let mut dp = dp_arc.lock().unwrap();
+    // This callback runs across the extern "C" boundary: a panic unwinding out
+    // of it is undefined behavior. The scan below can panic through the log
+    // hook (a user-installed logger backs trace!), so contain it and report
+    // "no usable format" instead. The mutex recovers from poisoning rather
+    // than panicking — a worker that died elsewhere must not cascade here.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut dp = dp_arc
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    let mut i = 0;
-    while *pix_fmts.add(i) != AVPixelFormat::AV_PIX_FMT_NONE {
-        let mut config = null();
-        let desc = av_pix_fmt_desc_get(*pix_fmts.add(i));
+        let mut i = 0;
+        while *pix_fmts.add(i) != AVPixelFormat::AV_PIX_FMT_NONE {
+            let mut config = null();
+            let desc = av_pix_fmt_desc_get(*pix_fmts.add(i));
 
-        if desc.is_null() || (*desc).flags & AV_PIX_FMT_FLAG_HWACCEL as u64 == 0 {
-            break;
-        }
-        if dp.hwaccel_id == HwaccelGeneric || dp.hwaccel_id == HwaccelAuto {
-            let mut j = 0;
-            loop {
-                config = avcodec_get_hw_config((*s).codec, j);
-                if config.is_null() {
-                    break;
-                }
-                if (*config).methods as u32 & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as u32 == 0 {
-                    j += 1;
-                    continue;
-                }
-                if (*config).pix_fmt == *pix_fmts.add(i) {
-                    break;
-                }
-                j += 1;
+            if desc.is_null() || (*desc).flags & AV_PIX_FMT_FLAG_HWACCEL as u64 == 0 {
+                break;
             }
+            if dp.hwaccel_id == HwaccelGeneric || dp.hwaccel_id == HwaccelAuto {
+                let mut j = 0;
+                loop {
+                    config = avcodec_get_hw_config((*s).codec, j);
+                    if config.is_null() {
+                        break;
+                    }
+                    if (*config).methods as u32 & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as u32
+                        == 0
+                    {
+                        j += 1;
+                        continue;
+                    }
+                    if (*config).pix_fmt == *pix_fmts.add(i) {
+                        break;
+                    }
+                    j += 1;
+                }
+            }
+
+            if !config.is_null() && (*config).device_type == dp.hwaccel_device_type {
+                dp.hwaccel_pix_fmt = *pix_fmts.add(i);
+                break;
+            }
+
+            i += 1;
         }
 
-        if !config.is_null() && (*config).device_type == dp.hwaccel_device_type {
-            dp.hwaccel_pix_fmt = *pix_fmts.add(i);
-            break;
-        }
+        let format = *pix_fmts.add(i);
+        trace!("get pixel format: {:?}", format);
 
-        i += 1;
+        format
+    }));
+
+    match result {
+        Ok(format) => format,
+        Err(_) => AVPixelFormat::AV_PIX_FMT_NONE,
     }
-
-    let format = *pix_fmts.add(i);
-    trace!("get pixel format: {:?}", format);
-
-    format
 }
 
 unsafe extern "C" fn get_buffer_callback(
@@ -1304,9 +1367,14 @@ impl DecoderParameter {
         let dec_ctx = self.dec_ctx.as_ptr();
         if !dec_ctx.is_null() {
             unsafe {
+                let dec_ctx = dec_ctx as *mut ffmpeg_sys_next::AVCodecContext;
                 let dp_ptr = (*dec_ctx).opaque as *const Mutex<DecoderParameter>;
                 if !dp_ptr.is_null() {
                     let _dp_arc = Arc::from_raw(dp_ptr);
+                    // Null it out so the reclaim is idempotent: the worker's
+                    // RAII guard and any failure-path caller must never turn
+                    // a second call into a refcount underflow.
+                    (*dec_ctx).opaque = null_mut();
                 }
             }
         }

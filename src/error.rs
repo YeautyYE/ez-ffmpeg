@@ -114,6 +114,9 @@ pub enum Error {
     #[error("Frame filter pipeline thread exited")]
     FrameFilterThreadExited,
 
+    #[error("Worker thread '{0}' panicked; output may be incomplete")]
+    WorkerPanicked(String),
+
     #[cfg(feature = "rtmp")]
     #[error("Rtmp stream already exists with key: {0}")]
     RtmpStreamAlreadyExists(String),
@@ -307,6 +310,25 @@ pub enum FilterGraphOperationError {
 
     #[error("The data in the frame is invalid or corrupted")]
     InvalidData,
+
+    #[error(
+        "graph input '{0}' already holds {1} buffered frames and admitting the next \
+         one would raise the best-effort retained-memory estimate to ~{2} bytes, \
+         while another input has not yet delivered its first frame, so the filter \
+         graph cannot be configured; check that every graph input actually produces \
+         data (or produces it within the buffering window)"
+    )]
+    PreConfigQueueOverflow(String, usize, usize),
+
+    // Only constructed on the FFmpeg 8+ buffersrc side-data clone path.
+    #[cfg_attr(not(ffmpeg_8_0), allow(dead_code))]
+    #[error(
+        "graph input '{0}' would deep-copy an estimated {1} bytes of side-data \
+         metadata into the buffersrc parameters, exceeding the side-data clone \
+         estimate threshold; the frame's combined side-data metadata (across its \
+         global and downmix entries) is pathologically large"
+    )]
+    OversizedSideDataClone(String, usize),
 
     #[error("Thread exited")]
     ThreadExited,

@@ -942,7 +942,25 @@ unsafe fn frame_plane(frame: *const AVFrame, index: usize) -> Result<(*mut u8, u
         return Err(format!("Invalid frame height {height}"));
     }
 
-    Ok((data_ptr, linesize * height as usize))
+    // Rows in THIS plane, not the frame height: the chroma planes (1 and 2)
+    // of a subsampled format hold AV_CEIL_RSHIFT(height, log2_chroma_h) rows,
+    // so sizing every plane by the full height reaches past the chroma
+    // allocations — an out-of-bounds read on upload and an out-of-bounds
+    // WRITE on readback (libavutil imgutils parity).
+    let rows = if index == 1 || index == 2 {
+        let fmt = crate::util::format_convert::pix_fmt_from_raw((*frame).format)
+            .ok_or_else(|| format!("Unknown pixel format {}", (*frame).format))?;
+        let desc = ffmpeg_sys_next::av_pix_fmt_desc_get(fmt);
+        if desc.is_null() {
+            return Err(format!("No descriptor for pixel format {fmt:?}"));
+        }
+        let shift = (*desc).log2_chroma_h as usize;
+        ((height as usize) + (1 << shift) - 1) >> shift
+    } else {
+        height as usize
+    };
+
+    Ok((data_ptr, linesize * rows))
 }
 
 /// Shared view of a frame plane, for reading pixels (GL upload).

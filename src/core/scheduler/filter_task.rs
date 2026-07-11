@@ -127,12 +127,33 @@ pub(crate) fn filter_graph_init(
 
     // Slot claimed before spawn; the guard releases it on any exit path.
     thread_sync.thread_start();
-    let thread_done_guard = ThreadDoneGuard::adopt(thread_sync.clone(), scheduler_status.clone());
+    let thread_done_guard = ThreadDoneGuard::adopt(
+        thread_sync.clone(),
+        scheduler_status.clone(),
+        scheduler_result.clone(),
+    );
 
     let result = std::thread::Builder::new()
         .name(format!("filtergraph{fg_index}"))
         .spawn(move || {
             let _thread_done = thread_done_guard;
+            // the frame-owning resources below are `move`-closure CAPTURES,
+            // but `_thread_done` (which releases the thread slot, zeroing the sync
+            // counter that stop()/wait()/the async Future gate on) is a body local.
+            // Rust drops body locals BEFORE captures, so without this rebind the
+            // guard would release the slot BEFORE these dropped: a buffered frame
+            // carrying a blocking (or panicking) AVBufferRef free callback — an
+            // `ifps[i].frame_queue` pre-config backlog frame, an `ofps` held frame,
+            // an unconsumed `src` frame, or a pooled frame — would then run its
+            // teardown AFTER the caller already observed completion, violating
+            // counter==0 => teardown complete (the same teardown-drop-order class,
+            // in this worker).
+            // Rebinding them as body locals declared AFTER the guard makes them drop
+            // BEFORE it on EVERY exit path (break, error, normal completion).
+            let mut ifps = ifps;
+            let mut ofps = ofps;
+            let src = src;
+            let frame_pool = frame_pool;
             let mut graph: Option<crate::raw::FilterGraph> = None;
             let mut fgp = FilterGraphParameter::default();
             fgp.sws_opts = graph_sws_opts;
@@ -325,6 +346,210 @@ unsafe fn ifilter_has_all_input_formats(ifps: &Vec<InputFilterParameter>) -> boo
     true
 }
 
+/// Per-graph-input best-effort retained-byte cap for the pre-config buffering
+/// queue, paired with the frame-COUNT cap. This 256 MiB cap keeps a single stalled
+/// input's NORMAL frames to ~82 1080p / ~20 4K frames while leaving a real
+/// startup-skew window. It is best-effort, not exact (see `frame_retained_bytes`):
+/// an adversarial FrameFilter can retain memory the estimate misses, and the
+/// frame-COUNT cap bounds only the queue LENGTH, not per-frame memory — so this is
+/// NOT a strict memory bound against self-crafted frames. It does bound the
+/// ORIGINAL threat (unbalanced input timing flooding with normal decoder frames)
+/// well. For small frames the count cap trips first. Multiple stalled pads stack,
+/// and there is no fixed upper bound on the input-pad count, so the aggregate
+/// pressure grows with the user-configured graph width (this cap is per graph input).
+const PRE_CONFIG_QUEUE_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+/// Conservative fixed cost charged per side-data entry, on top of its payload.
+/// FFmpeg allows unlimited duplicate side-data of the same type (flags=0), and a
+/// zero-length entry still allocates an `AVFrameSideData` struct, an
+/// `AVBufferRef` + backing `AVBuffer`, a pointer slot in the frame's `side_data`
+/// table, and allocator overhead (~176 B/entry measured). Without charging it, a
+/// `FrameFilter` could attach millions of empty side-data entries per frame and pin
+/// substantial memory while the payload-only count reads ~0. Set above the measured
+/// per-entry footprint so a flood trips the byte threshold.
+const SIDE_DATA_ENTRY_OVERHEAD: usize = 256;
+
+/// A best-effort ESTIMATE of the heap a frame pins while it sits in the pre-config
+/// queue — NOT an exact ceiling. Sums the allocations that dominate a normal
+/// decoder frame, as two components that are DISTINCT allocations and therefore
+/// ADD:
+/// - plane bytes: the image/audio `AVBufferRef`s (`buf` + `extended_buf`). For a
+///   hardware frame the tiny opaque `buf[0]` under-represents the real footprint,
+///   so a conservative software-surface estimate (from the hw-frames context's
+///   sw_format/width/height) replaces it as a floor.
+/// - extra bytes: attached side data (`AVBufferRef` payloads, e.g. a large
+///   ICC/SEI blob) with a fixed per-entry structural cost, the user-settable
+///   `opaque_ref`, and the frame-owned `AVDictionary` metadata (the frame's
+///   `metadata` plus every side-data `metadata`). The libav-internal
+///   `private_ref` is deliberately excluded (not user-reachable; a RefStruct
+///   handle rather than an `AVBufferRef` on FFmpeg 8).
+/// The HW surface floor and the extras combine additively, never max'd: a 3 MiB HW
+/// surface carrying a 4 MiB side-data blob pins 7 MiB.
+///
+/// Deliberately NOT a precise byte ceiling, and NOT a memory bound against an
+/// adversarial `FrameFilter`. A filter can craft frames whose real footprint this
+/// estimate misses by an UNBOUNDED amount — most sharply the un-shrunk
+/// `side_data`/`extended_data` table CAPACITY (a filter can grow the table to N
+/// entries then remove all but one: the queued frame reports `nb_side_data == 1`
+/// while the table still holds N slots), plus per-plane `AVBuffer` structs on
+/// many-channel audio and allocator rounding on huge dictionaries. The
+/// per-media-type frame-COUNT cap (256 video / 4096 audio) bounds only the queue
+/// LENGTH (cardinality), NOT the per-frame memory — so self-inflicted pathological
+/// frames are NOT strictly memory-bounded. That is a known limitation outside the
+/// original threat model (unbalanced input TIMING flooding the queue with NORMAL
+/// decoder frames, which this estimate bounds well). `FrameBox.frame_data` is
+/// intentionally NOT counted (small bounded pre-config metadata). `null` counts 0.
+///
+/// # Safety
+/// `frame` must be null or a valid `AVFrame` pointer whose buffer table is live.
+unsafe fn frame_retained_bytes(frame: *const AVFrame) -> usize {
+    if frame.is_null() {
+        return 0;
+    }
+    // Plane component: image/audio buffers. A HW frame replaces this with a
+    // software-surface floor below.
+    let mut plane_bytes = 0usize;
+    for &buf in (*frame).buf.iter() {
+        if !buf.is_null() {
+            plane_bytes = plane_bytes.saturating_add((*buf).size);
+        }
+    }
+    let nb_extended = (*frame).nb_extended_buf;
+    if nb_extended > 0 && !(*frame).extended_buf.is_null() {
+        for i in 0..nb_extended as isize {
+            let buf = *(*frame).extended_buf.offset(i);
+            if !buf.is_null() {
+                plane_bytes = plane_bytes.saturating_add((*buf).size);
+            }
+        }
+    }
+
+    // Extra component: distinct allocations that add on top of the planes/surface.
+    let mut extra_bytes = 0usize;
+    // Side-data buffers (a large ICC profile / SEI / user-data blob), each
+    // side-data metadata dictionary, and a fixed per-entry structural cost so a
+    // flood of zero-length entries cannot slip under the byte cap.
+    let nb_side = (*frame).nb_side_data;
+    if nb_side > 0 && !(*frame).side_data.is_null() {
+        for i in 0..nb_side as isize {
+            let sd = *(*frame).side_data.offset(i);
+            if !sd.is_null() {
+                extra_bytes = extra_bytes.saturating_add(SIDE_DATA_ENTRY_OVERHEAD);
+                if !(*sd).buf.is_null() {
+                    extra_bytes = extra_bytes.saturating_add((*(*sd).buf).size);
+                }
+                extra_bytes = extra_bytes.saturating_add(av_dict_retained_bytes((*sd).metadata));
+            }
+        }
+    }
+    // Other owned refs. `opaque_ref` is user-settable, so a FrameFilter can pin a
+    // large buffer there and it belongs in the estimate. `private_ref` is
+    // libav-INTERNAL — the headers forbid external code from inspecting it, and on
+    // FFmpeg 8 its type is an internal RefStruct handle, not an `AVBufferRef` (so
+    // treating it as one is both a type error and undefined behavior). It is not
+    // user-reachable, hence outside the threat model and deliberately not counted.
+    let opaque_ref = (*frame).opaque_ref;
+    if !opaque_ref.is_null() {
+        extra_bytes = extra_bytes.saturating_add((*opaque_ref).size);
+    }
+    // Frame-level metadata dictionary.
+    extra_bytes = extra_bytes.saturating_add(av_dict_retained_bytes((*frame).metadata));
+
+    // Hardware surface floor: buf[0] is a small handle whose release callback
+    // owns the GPU surface, so charge at least a conservative software-surface
+    // estimate for the PLANE component — a queue of tiny HW handles must not slip
+    // under the byte cap and exhaust the device pool first.
+    let mut hw_estimate = 0usize;
+    if !(*frame).hw_frames_ctx.is_null() {
+        let hwfc = (*(*frame).hw_frames_ctx).data as *const ffmpeg_sys_next::AVHWFramesContext;
+        if !hwfc.is_null() {
+            let sw_estimate = ffmpeg_sys_next::av_image_get_buffer_size(
+                (*hwfc).sw_format,
+                (*hwfc).width,
+                (*hwfc).height,
+                1,
+            );
+            if sw_estimate > 0 {
+                hw_estimate = sw_estimate as usize;
+            }
+        }
+    }
+    combine_retained_bytes(plane_bytes, hw_estimate, extra_bytes)
+}
+
+/// Combine the plane/HW-surface component with the additive extras. The surface
+/// floor MAXes the plane bytes (buf[0] under-represents a HW surface, so take the
+/// larger of the two for the plane component); the extras (side data, refs,
+/// metadata dicts) are DISTINCT allocations and are ADDED. Pure arithmetic, split
+/// out so the max-vs-add boundary is unit-testable without a live HW frame.
+fn combine_retained_bytes(
+    plane_bytes: usize,
+    hw_surface_estimate: usize,
+    extra_bytes: usize,
+) -> usize {
+    plane_bytes
+        .max(hw_surface_estimate)
+        .saturating_add(extra_bytes)
+}
+
+/// Retained bytes of an `AVDictionary` — the summed key/value string lengths plus
+/// a per-entry struct overhead. A frame's `metadata` dict and each side-data
+/// `metadata` dict are frame-owned heap allocations a custom `FrameFilter` can
+/// grow arbitrarily, so they count toward the pre-config queue's byte cap.
+///
+/// # Safety
+/// `dict` must be null or a valid `AVDictionary` pointer.
+unsafe fn av_dict_retained_bytes(dict: *const ffmpeg_sys_next::AVDictionary) -> usize {
+    if dict.is_null() {
+        return 0;
+    }
+    let mut total = 0usize;
+    let mut prev: *const ffmpeg_sys_next::AVDictionaryEntry = std::ptr::null();
+    loop {
+        // Empty key + AV_DICT_IGNORE_SUFFIX iterates every entry.
+        let entry = ffmpeg_sys_next::av_dict_get(
+            dict,
+            c"".as_ptr(),
+            prev,
+            ffmpeg_sys_next::AV_DICT_IGNORE_SUFFIX,
+        );
+        if entry.is_null() {
+            break;
+        }
+        let key_len = if (*entry).key.is_null() {
+            0
+        } else {
+            std::ffi::CStr::from_ptr((*entry).key).to_bytes().len()
+        };
+        let val_len = if (*entry).value.is_null() {
+            0
+        } else {
+            std::ffi::CStr::from_ptr((*entry).value).to_bytes().len()
+        };
+        total = total
+            .saturating_add(key_len)
+            .saturating_add(val_len)
+            .saturating_add(2) // the two NUL terminators
+            .saturating_add(std::mem::size_of::<ffmpeg_sys_next::AVDictionaryEntry>());
+        prev = entry as *const _;
+    }
+    total
+}
+
+/// Whether admitting a frame of `incoming_bytes` would push the pre-config
+/// buffering queue past EITHER cap: the per-media-type frame COUNT (`frame_cap`)
+/// or the estimated retained-BYTE threshold (`PRE_CONFIG_QUEUE_MAX_BYTES`). Split out so the
+/// dual-cap logic is unit-testable without a live filtergraph.
+fn pre_config_queue_full(
+    queued_frames: usize,
+    frame_cap: usize,
+    queued_bytes: usize,
+    incoming_bytes: usize,
+) -> bool {
+    queued_frames >= frame_cap
+        || queued_bytes.saturating_add(incoming_bytes) > PRE_CONFIG_QUEUE_MAX_BYTES
+}
+
 struct InputFilterParameter {
     input_filter_index: usize,
     name: String,
@@ -359,6 +584,15 @@ struct InputFilterParameter {
     filter: *mut AVFilterContext,
 
     frame_queue: VecDeque<FrameBox>,
+    /// Best-effort retained-memory estimate across `frame_queue` — the sum of
+    /// `frame_retained_bytes` over the queued frames (plane/side-data payloads plus
+    /// the per-entry structural, dictionary, `opaque_ref` and HW-surface
+    /// components), NOT the frame count. Kept in sync on every push/pop so the
+    /// pre-config overflow guard can pressure on MEMORY, not just frame count — a
+    /// 256-frame cap is ~800 MiB at 1080p and ~3.2 GiB at 4K, so the count cap alone
+    /// would let normal frames grow large. It is not an exact memory bound (see
+    /// `frame_retained_bytes`).
+    frame_queue_bytes: usize,
 
     eof: bool,
 }
@@ -403,6 +637,7 @@ impl InputFilterParameter {
             downmixinfo: unsafe { std::mem::zeroed() },
             filter: null_mut(),
             frame_queue: Default::default(),
+            frame_queue_bytes: 0,
             eof: false,
         }
     }
@@ -734,7 +969,52 @@ unsafe fn fg_send_frame(
         ifilter_parameters_from_frame(&mut ifps[input_filter_index], frame, media_type)?;
 
         if !ifilter_has_all_input_formats(ifps) {
-            let _ = &mut ifps[input_filter_index].frame_queue.push_back(frame_box);
+            // The graph cannot be configured until EVERY input pad has seen a
+            // frame; until then this pad's frames park here. A fast pad paired
+            // with an input that never produces (a data-only stream mapped by
+            // mistake, a live source that never starts) used to grow this
+            // queue without bound — decoded 1080p video is ~3 MiB a frame, so
+            // that is an OOM in minutes. Cap it per media type (video frames
+            // are large, audio frames tiny) and fail the graph with a
+            // diagnosable error instead of silently dropping frames (dropping
+            // would corrupt overlay/xfade semantics). Belt-and-braces: the
+            // frame-COUNT cap (256 video / 4096 audio) bounds the queue LENGTH
+            // (cardinality only, NOT per-frame memory), and the best-effort
+            // retained-BYTE cap (PRE_CONFIG_QUEUE_MAX_BYTES) keeps NORMAL frames far
+            // tighter than the count cap would (256 video frames is ~800 MiB at
+            // 1080p and ~3.2 GiB at 4K). The byte figure is an estimate, not exact
+            // and not a strict memory bound against self-crafted frames (see
+            // `frame_retained_bytes`); the count cap guarantees only a finite queue
+            // length.
+            // Whichever trips first
+            // fails the graph with a diagnosable error carrying both figures. A
+            // user-configurable limit is future builder-API work. fftools has
+            // the same queue but the CLI's lockstep demuxing keeps it shallow;
+            // this crate's independently-paced inputs make the overflow reachable.
+            let frame_bytes = unsafe { frame_retained_bytes(frame) };
+            let ifp = &mut ifps[input_filter_index];
+            let cap = match ifp.media_type {
+                AVMediaType::AVMEDIA_TYPE_VIDEO => 256,
+                _ => 4096,
+            };
+            if pre_config_queue_full(
+                ifp.frame_queue.len(),
+                cap,
+                ifp.frame_queue_bytes,
+                frame_bytes,
+            ) {
+                return Err(Error::FilterGraph(
+                    FilterGraphOperationError::PreConfigQueueOverflow(
+                        ifp.name.clone(),
+                        ifp.frame_queue.len(),
+                        // Projected total: the already-queued bytes plus the
+                        // incoming frame that tipped the cap.
+                        ifp.frame_queue_bytes.saturating_add(frame_bytes),
+                    ),
+                ));
+            }
+            ifp.frame_queue.push_back(frame_box);
+            ifp.frame_queue_bytes = ifp.frame_queue_bytes.saturating_add(frame_bytes);
             return Ok(());
         }
 
@@ -1160,6 +1440,10 @@ unsafe fn configure_filtergraph(
                 break;
             }
             let tmp_frame_box = option.unwrap();
+            // Keep the retained-byte counter in sync with the queue as it drains.
+            ifp.frame_queue_bytes = ifp
+                .frame_queue_bytes
+                .saturating_sub(unsafe { frame_retained_bytes(tmp_frame_box.frame.as_ptr()) });
             if ifp.media_type == AVMEDIA_TYPE_SUBTITLE {
                 // sub2video is not supported: drop the queued frame instead
                 // of silently keeping a dead branch.
@@ -2331,6 +2615,23 @@ fn ifilter_parameters_from_frame(
         // The display matrix is excluded — autorotate consumes it (and strips
         // it from frames), so forwarding it too would rotate twice (fftools
         // ifilter_parameters_from_frame, n8.1 / 7b18beb477).
+        // bound ONLY the clone's OWN deep-copied metadata, not the
+        // incoming frame. push_clone shares the payload buffer (refcounted) but
+        // av_dict_copy deep-copies each entry's metadata dict, so a FrameFilter
+        // attaching a pathologically large metadata dict on a global OR downmix
+        // side-data would otherwise force an unbounded copy here. `cloned_meta_bytes`
+        // accumulates across BOTH clone sites (global loop + downmix below) and is
+        // capped at the estimated-byte threshold (`PRE_CONFIG_QUEUE_MAX_BYTES`); the
+        // ifp.side_data snapshot is
+        // non-accumulating (cleared each reinit). The frame's OWN queue admission
+        // (count + byte cap) is handled separately by the caller — charging the
+        // full frame here would wrongly reject a legit large frame that carries a
+        // tiny global side-data on the non-queue (single-input / already-configured)
+        // path. The stricter queue-admission-BEFORE-clone ordering needs splitting
+        // this reinit, which is FFmpeg-8-only code that neither the local build nor
+        // CI can compile (both link FFmpeg 7) — deferred to an FFmpeg-8 CI lane.
+        #[cfg(ffmpeg_8_0)]
+        let mut cloned_meta_bytes = 0usize;
         #[cfg(ffmpeg_8_0)]
         {
             ifp.side_data.clear();
@@ -2341,6 +2642,16 @@ fn ifilter_parameters_from_frame(
                     || (*sd).type_ == AV_FRAME_DATA_DISPLAYMATRIX
                 {
                     continue;
+                }
+                cloned_meta_bytes =
+                    cloned_meta_bytes.saturating_add(av_dict_retained_bytes((*sd).metadata));
+                if cloned_meta_bytes > PRE_CONFIG_QUEUE_MAX_BYTES {
+                    return Err(Error::FilterGraph(
+                        FilterGraphOperationError::OversizedSideDataClone(
+                            ifp.name.clone(),
+                            cloned_meta_bytes,
+                        ),
+                    ));
                 }
                 let ret = ifp.side_data.push_clone(sd, 0);
                 if ret < 0 {
@@ -2375,6 +2686,19 @@ fn ifilter_parameters_from_frame(
         {
             let sd = av_frame_get_side_data(frame, AV_FRAME_DATA_DOWNMIX_INFO);
             if !sd.is_null() {
+                // Same clone-only bound as the global loop (the downmix side-data
+                // is fixed-size but its metadata dict is not); `cloned_meta_bytes`
+                // carries over the global clones already made this reinit.
+                cloned_meta_bytes =
+                    cloned_meta_bytes.saturating_add(av_dict_retained_bytes((*sd).metadata));
+                if cloned_meta_bytes > PRE_CONFIG_QUEUE_MAX_BYTES {
+                    return Err(Error::FilterGraph(
+                        FilterGraphOperationError::OversizedSideDataClone(
+                            ifp.name.clone(),
+                            cloned_meta_bytes,
+                        ),
+                    ));
+                }
                 let ret = ifp.side_data.push_clone(sd, 0);
                 if ret < 0 {
                     error!("Clone downmix side data error: {}", av_err2str(ret));
@@ -3412,6 +3736,202 @@ mod auto_conv_opts_tests {
         let resolved = resolve_auto_conv_opt(None, per_output.into_iter())
             .expect("no values must resolve to None (default behavior)");
         assert_eq!(resolved, None);
+    }
+}
+
+// the pre-config buffering queue must weigh MEMORY (best-effort), not
+// just frame count. A 256-frame cap is ~800 MiB at 1080p and ~3.2 GiB at 4K, so a
+// companion estimated-retained-byte threshold is required. These exercise the byte
+// measurement and the dual-cap predicate directly (no live filtergraph).
+#[cfg(all(test, not(docsrs)))]
+mod pre_config_queue_cap_tests {
+    use super::*;
+
+    fn video_frame_with_buffer(w: i32, h: i32) -> Frame {
+        unsafe {
+            let f = av_frame_alloc();
+            assert!(!f.is_null(), "av_frame_alloc failed in test");
+            (*f).format = ffmpeg_sys_next::AVPixelFormat::AV_PIX_FMT_YUV420P as i32;
+            (*f).width = w;
+            (*f).height = h;
+            let ret = ffmpeg_sys_next::av_frame_get_buffer(f, 0);
+            assert_eq!(ret, 0, "av_frame_get_buffer failed in test");
+            Frame::wrap(f)
+        }
+    }
+
+    #[test]
+    fn frame_retained_bytes_sums_buffer_allocations() {
+        let frame = video_frame_with_buffer(1920, 1080);
+        let bytes = unsafe { frame_retained_bytes(frame.as_ptr()) };
+        // YUV420P 1080p is ~3.1 MiB; at least the luma plane, well under 8 MiB.
+        assert!(
+            bytes >= (1920 * 1080) as usize,
+            "expected >= luma-plane bytes, got {bytes}"
+        );
+        assert!(
+            bytes < 8 * 1024 * 1024,
+            "1080p retained bytes unexpectedly large: {bytes}"
+        );
+        // A bare frame with no ref-counted buffers retains nothing; null is 0.
+        let bare = unsafe { Frame::wrap(av_frame_alloc()) };
+        assert_eq!(unsafe { frame_retained_bytes(bare.as_ptr()) }, 0);
+        assert_eq!(unsafe { frame_retained_bytes(std::ptr::null()) }, 0);
+    }
+
+    // a large side-data blob owned by the frame must be charged too — the
+    // image planes alone under-count the memory the queue pins.
+    #[test]
+    fn frame_retained_bytes_includes_side_data() {
+        let frame = video_frame_with_buffer(320, 240);
+        let base = unsafe { frame_retained_bytes(frame.as_ptr()) };
+        let side_bytes = 4 * 1024 * 1024usize;
+        unsafe {
+            let sd = ffmpeg_sys_next::av_frame_new_side_data(
+                frame.as_ptr() as *mut _,
+                ffmpeg_sys_next::AVFrameSideDataType::AV_FRAME_DATA_SEI_UNREGISTERED,
+                side_bytes as _,
+            );
+            assert!(!sd.is_null(), "av_frame_new_side_data failed in test");
+        }
+        let with_side = unsafe { frame_retained_bytes(frame.as_ptr()) };
+        assert!(
+            with_side >= base + side_bytes,
+            "attached side data ({side_bytes} B) must be charged: base={base}, with_side={with_side}"
+        );
+    }
+
+    // a HW surface and the extras it carries are DISTINCT allocations, so
+    // the byte charge must ADD them, never max them together. Exercised on the
+    // pure combiner because a real hw_frames_ctx needs a device absent in CI.
+    #[test]
+    fn hw_surface_floor_adds_to_extras_and_never_maxes_them() {
+        let mib = 1024 * 1024;
+        // 3 MiB HW surface (tiny plane handle) + 4 MiB side data = 7 MiB, not 4.
+        assert_eq!(
+            combine_retained_bytes(4 * 1024, 3 * mib, 4 * mib),
+            3 * mib + 4 * mib,
+            "HW surface floor and extras must add, not max"
+        );
+        // SW frame: no HW estimate, plane + extra.
+        assert_eq!(combine_retained_bytes(2 * mib, 0, 1024), 2 * mib + 1024);
+        // Large plane, no HW estimate, no extra: the plane stands alone.
+        assert_eq!(combine_retained_bytes(2 * mib, 0, 0), 2 * mib);
+        // Tiny plane, large surface floor, no extra: the floor wins the max.
+        assert_eq!(combine_retained_bytes(4 * 1024, 3 * mib, 0), 3 * mib);
+    }
+
+    // a frame-owned AVDictionary (metadata a custom FrameFilter can stuff)
+    // is heap the queue pins and must be charged — the image planes miss it.
+    #[test]
+    fn frame_retained_bytes_includes_metadata_dictionary() {
+        let frame = video_frame_with_buffer(320, 240);
+        let base = unsafe { frame_retained_bytes(frame.as_ptr()) };
+        let blob = 512 * 1024usize;
+        let value = std::ffi::CString::new(vec![b'x'; blob]).unwrap();
+        unsafe {
+            let ret = ffmpeg_sys_next::av_dict_set(
+                &mut (*(frame.as_ptr() as *mut AVFrame)).metadata,
+                c"blob".as_ptr(),
+                value.as_ptr(),
+                0,
+            );
+            assert!(ret >= 0, "av_dict_set failed in test");
+        }
+        let with_meta = unsafe { frame_retained_bytes(frame.as_ptr()) };
+        assert!(
+            with_meta >= base + blob,
+            "frame metadata dict ({blob} B) must be charged: base={base}, with_meta={with_meta}"
+        );
+    }
+
+    // side-data metadata dicts are frame-owned too. A tiny side-data
+    // buffer with a big metadata dict must still be charged for the dict.
+    #[test]
+    fn frame_retained_bytes_includes_side_data_metadata() {
+        let frame = video_frame_with_buffer(320, 240);
+        let blob = 256 * 1024usize;
+        let value = std::ffi::CString::new(vec![b'y'; blob]).unwrap();
+        let (base, with_meta) = unsafe {
+            let sd = ffmpeg_sys_next::av_frame_new_side_data(
+                frame.as_ptr() as *mut _,
+                ffmpeg_sys_next::AVFrameSideDataType::AV_FRAME_DATA_SEI_UNREGISTERED,
+                8,
+            );
+            assert!(!sd.is_null(), "av_frame_new_side_data failed in test");
+            let base = frame_retained_bytes(frame.as_ptr());
+            let ret = ffmpeg_sys_next::av_dict_set(
+                &mut (*sd).metadata,
+                c"blob".as_ptr(),
+                value.as_ptr(),
+                0,
+            );
+            assert!(ret >= 0, "av_dict_set failed in test");
+            (base, frame_retained_bytes(frame.as_ptr()))
+        };
+        assert!(
+            with_meta >= base + blob,
+            "side-data metadata ({blob} B) must be charged: base={base}, with_meta={with_meta}"
+        );
+    }
+
+    // FFmpeg's av_frame_new_side_data appends without limit; a flood of
+    // ZERO-length entries pins real per-entry struct/ref memory the payload-only
+    // count misses. Each entry must be charged the structural overhead so the
+    // estimate crosses the byte threshold rather than slipping under it at ~0 bytes.
+    #[test]
+    fn frame_retained_bytes_charges_empty_side_data_entries() {
+        let frame = video_frame_with_buffer(64, 64);
+        let base = unsafe { frame_retained_bytes(frame.as_ptr()) };
+        let n = 1000usize;
+        unsafe {
+            for _ in 0..n {
+                let sd = ffmpeg_sys_next::av_frame_new_side_data(
+                    frame.as_ptr() as *mut _,
+                    ffmpeg_sys_next::AVFrameSideDataType::AV_FRAME_DATA_SEI_UNREGISTERED,
+                    0, // zero-length payload — only the structural overhead remains
+                );
+                assert!(!sd.is_null(), "av_frame_new_side_data(0) failed in test");
+            }
+        }
+        let with_entries = unsafe { frame_retained_bytes(frame.as_ptr()) };
+        assert!(
+            with_entries >= base + n * SIDE_DATA_ENTRY_OVERHEAD,
+            "each of {n} empty side-data entries must be charged the structural \
+             overhead: base={base}, with={with_entries}"
+        );
+    }
+
+    #[test]
+    fn byte_cap_trips_before_the_frame_cap_for_large_frames() {
+        // A handful of 4K-sized frames (~12 MiB each) blow the 256 MiB byte
+        // threshold long before the 256-frame count cap (which alone would allow
+        // ~3.2 GiB).
+        let four_k = 12 * 1024 * 1024usize;
+        let queued_bytes = 250 * 1024 * 1024; // just under the threshold
+        assert!(
+            pre_config_queue_full(20, 256, queued_bytes, four_k),
+            "the byte threshold must trip while the frame count (20) is far under the cap"
+        );
+        // The same low frame count with negligible bytes trips neither cap.
+        assert!(
+            !pre_config_queue_full(20, 256, 1024, 1024),
+            "20 small frames must not trip either cap"
+        );
+    }
+
+    #[test]
+    fn frame_cap_trips_for_many_small_frames() {
+        // Tiny frames stay far under the byte threshold but must still be bounded
+        // by the frame-count cap.
+        assert!(
+            pre_config_queue_full(4096, 4096, 1024, 128),
+            "the frame-count cap must trip for many tiny frames"
+        );
+        assert!(
+            !pre_config_queue_full(4095, 4096, 1024, 128),
+            "one below the frame cap with negligible bytes must not trip"
+        );
     }
 }
 

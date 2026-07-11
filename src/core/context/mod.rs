@@ -24,6 +24,9 @@ use std::sync::Arc;
 /// How long output I/O may continue after STATUS_END before the interrupt
 /// callback cuts it: long enough for a healthy muxer to finish its trailer,
 /// short enough that stop() on a dead network peer returns within a second.
+/// While a muxer holds an [`OutputFinalizeGuard`] the window does not apply
+/// at all — a `movflags=+faststart` trailer rewrites the whole file and can
+/// legitimately take far longer than any fixed grace.
 const OUTPUT_END_GRACE_US: i64 = 500_000;
 
 /// Default size of the AVIO buffer backing a custom read/write callback. FFmpeg
@@ -46,6 +49,12 @@ pub(crate) struct InterruptState {
     // Microsecond timestamp of the first output callback that observed
     // STATUS_END; 0 = not observed yet.
     end_grace_start_us: AtomicI64,
+    /// Number of mux workers currently inside their finalize window
+    /// (av_write_trailer through the output-context free). While > 0,
+    /// STATUS_END does not interrupt output I/O — only STATUS_ABORT does: a
+    /// graceful stop() must not corrupt a trailer that is being written
+    /// (H3), and abort() stays the hard-cancel escape hatch.
+    finalizing_outputs: AtomicUsize,
 }
 
 impl InterruptState {
@@ -53,6 +62,15 @@ impl InterruptState {
         Self {
             scheduler_status,
             end_grace_start_us: AtomicI64::new(0),
+            finalizing_outputs: AtomicUsize::new(0),
+        }
+    }
+
+    /// Marks one output as finalizing for the guard's lifetime.
+    pub(crate) fn begin_output_finalize(self: &Arc<Self>) -> OutputFinalizeGuard {
+        self.finalizing_outputs.fetch_add(1, Ordering::AcqRel);
+        OutputFinalizeGuard {
+            state: Arc::clone(self),
         }
     }
 
@@ -70,6 +88,14 @@ impl InterruptState {
         if status != crate::core::scheduler::ffmpeg_scheduler::STATUS_END {
             return false;
         }
+        if self.finalizing_outputs.load(Ordering::Acquire) > 0 {
+            // A trailer (e.g. a faststart moov rewrite) is in flight somewhere
+            // on this scheduler; only abort() may cut output I/O now. Checked
+            // BEFORE the grace CAS so the clock does not even start while a
+            // finalize is running; once the last guard drops, a still-blocked
+            // OTHER output starts its grace normally.
+            return false;
+        }
         let now = unsafe { av_gettime_relative() };
         let start = match self.end_grace_start_us.compare_exchange(
             0,
@@ -81,6 +107,19 @@ impl InterruptState {
             Err(previous) => previous,
         };
         now - start > OUTPUT_END_GRACE_US
+    }
+}
+
+/// RAII finalize marker. The decrement is mandatory even on unwind — a stuck
+/// counter would exempt every later STATUS_END grace cut for this scheduler,
+/// and stop() on a blocked sibling output would hang forever.
+pub(crate) struct OutputFinalizeGuard {
+    state: Arc<InterruptState>,
+}
+
+impl Drop for OutputFinalizeGuard {
+    fn drop(&mut self) {
+        self.state.finalizing_outputs.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -649,5 +688,75 @@ pub(crate) fn type_to_linklabel(media_type: AVMediaType, index: usize) -> Option
         AVMEDIA_TYPE_SUBTITLE => Some(format!("{index}:s")),
         AVMEDIA_TYPE_ATTACHMENT => Some(format!("{index}:t")),
         AVMediaType::AVMEDIA_TYPE_NB => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::scheduler::ffmpeg_scheduler::{STATUS_ABORT, STATUS_END, STATUS_RUN};
+
+    fn state_with(status: usize) -> Arc<InterruptState> {
+        Arc::new(InterruptState::new(Arc::new(AtomicUsize::new(status))))
+    }
+
+    /// Rewinds the grace clock so the window is already expired — no sleeps.
+    fn expire_grace(state: &InterruptState) {
+        let past = unsafe { av_gettime_relative() } - OUTPUT_END_GRACE_US - 1;
+        state.end_grace_start_us.store(past, Ordering::Release);
+    }
+
+    #[test]
+    fn output_grace_cut_fires_after_the_window() {
+        let state = state_with(STATUS_END);
+        expire_grace(&state);
+        assert!(state.should_interrupt_output());
+    }
+
+    #[test]
+    fn finalize_guard_holds_the_grace_cut_open() {
+        let state = state_with(STATUS_END);
+        expire_grace(&state);
+        let guard = state.begin_output_finalize();
+        assert!(
+            !state.should_interrupt_output(),
+            "a finalizing output must not be cut by the STATUS_END grace"
+        );
+        drop(guard);
+        assert!(
+            state.should_interrupt_output(),
+            "after the last finalize guard drops, the expired grace cuts again"
+        );
+    }
+
+    #[test]
+    fn abort_cuts_through_a_finalize_window() {
+        let state = state_with(STATUS_ABORT);
+        let _guard = state.begin_output_finalize();
+        assert!(
+            state.should_interrupt_output(),
+            "abort() is the hard cancel: it must cut even a finalizing output"
+        );
+    }
+
+    #[test]
+    fn running_scheduler_never_cuts_output() {
+        let state = state_with(STATUS_RUN);
+        assert!(!state.should_interrupt_output());
+    }
+
+    #[test]
+    fn overlapping_finalize_windows_hold_until_the_last_drops() {
+        let state = state_with(STATUS_END);
+        expire_grace(&state);
+        let g1 = state.begin_output_finalize();
+        let g2 = state.begin_output_finalize();
+        drop(g1);
+        assert!(
+            !state.should_interrupt_output(),
+            "one of two overlapping finalize windows dropping must keep the hold"
+        );
+        drop(g2);
+        assert!(state.should_interrupt_output());
     }
 }

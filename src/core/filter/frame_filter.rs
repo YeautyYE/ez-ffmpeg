@@ -73,6 +73,17 @@ pub trait FrameFilter: Send {
     /// - `Ok(None)` if no frame is produced.
     /// - `Err(e)` (any [`FrameFilterError`]) if processing fails.
     ///
+    /// # In-place mutation
+    /// The frame's data buffers are usually REFCOUNTED and shared (the
+    /// decoder's frame pool, other consumers of the same source): mutating
+    /// them in place corrupts data someone else still reads. Before any
+    /// in-place edit, call
+    /// [`make_frame_writable`](crate::util::ffmpeg_utils::make_frame_writable)
+    /// (cheap when already exclusive, copies when shared) or probe with
+    /// [`frame_is_writable`](crate::util::ffmpeg_utils::frame_is_writable).
+    /// Building a fresh output frame (`av_frame_get_buffer` +
+    /// `av_frame_copy_props`) needs neither.
+    ///
     /// # End of stream
     /// At end of stream the pipeline flushes the chain as an ordered
     /// cascade: each filter receives a props-only marker (a valid frame
