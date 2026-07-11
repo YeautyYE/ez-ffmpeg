@@ -36,7 +36,29 @@ const CONNECTION_TIMEOUT_SECS: u64 = 60; // Connection timeout
 /// A 60s timeout tolerates being detected up to this much late.
 const TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 5; // Graceful shutdown timeout
+/// How long a server-condemned connection may linger to drain its final queued
+/// bytes (typically the finish-status packet) before it is force-removed even
+/// if the peer never reads. Bounds the lingering so a stuck watcher cannot pin
+/// a connection slot forever. `check_timeouts` runs at most ~1/sec, so this is
+/// kept a few seconds for that granularity to be harmless; it mirrors the
+/// graceful-shutdown drain window.
+const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(GRACEFUL_SHUTDOWN_TIMEOUT_SECS);
 const MAX_READ_PER_POLL: usize = 512 * 1024; // 512KB max read per poll to prevent memory DoS
+/// Capacity of the bounded channel between an in-process publisher and the
+/// reactor. Shared with `embed_rtmp_server`'s sender constructors so the
+/// per-round item budget below always matches what a producer can queue ahead
+/// of one drain.
+pub(crate) const PUBLISHER_CHANNEL_CAPACITY: usize = 1024;
+/// Per-publisher, per-round byte budget for `process_publishers`. Mirrors
+/// MAX_READ_PER_POLL so an in-process publisher cannot out-rank a socket
+/// reader: an unbounded drain keeps the loop inside step 6 while the local
+/// packets_to_write buffer grows by (drained bytes x watcher fanout) and
+/// flush_pending never runs — watchers stall at zero bytes written.
+const MAX_PUBLISH_BYTES_PER_POLL: usize = MAX_READ_PER_POLL;
+/// Per-publisher, per-round item budget, companion to the byte budget above
+/// for streams of tiny packets whose byte total stays low. Equal to the
+/// channel capacity: one round can at most clear a full backlog.
+const MAX_PUBLISH_ITEMS_PER_POLL: usize = PUBLISHER_CHANNEL_CAPACITY;
 const DEFAULT_MAX_CONNECTIONS: usize = 10000; // Default max connections (auto-adjusted by system FD limit)
 #[cfg(windows)]
 const DEFAULT_MAX_CONNECTIONS_WINDOWS: usize = 8000; // Conservative default for Windows (no direct FD limit API)
@@ -222,6 +244,11 @@ pub struct ReactorConnection {
     last_write_activity: Instant,
     /// Currently registered interest
     current_interest: Interest,
+    /// Set when the connection has been condemned (server-initiated close) but
+    /// still has a queued tail to drain. `None` = not condemned. The connection
+    /// is force-removed once this deadline passes even if the peer never reads,
+    /// so lingering is bounded (see [`Self::condemn`]).
+    close_deadline: Option<Instant>,
 }
 
 impl ReactorConnection {
@@ -271,6 +298,7 @@ impl ReactorConnection {
             last_read_activity: now,
             last_write_activity: now,
             current_interest: Interest::READABLE,
+            close_deadline: None,
         })
     }
 
@@ -485,6 +513,29 @@ impl ReactorConnection {
         self.state = ConnectionState::Closing;
     }
 
+    /// Condemn the connection: mark it `Closing` and arm a drain deadline. Used
+    /// when a server-initiated close still has a queued tail that could not be
+    /// flushed in one pass (WouldBlock). The connection is kept — its remaining
+    /// bytes are drained by later writable events — until either the queue
+    /// empties or `deadline` passes, whichever comes first. Idempotent for the
+    /// deadline: re-condemning does not extend an existing one (the caller only
+    /// arms it when not already condemned), so the linger stays bounded.
+    pub fn condemn(&mut self, deadline: Instant) {
+        self.state = ConnectionState::Closing;
+        self.close_deadline = Some(deadline);
+    }
+
+    /// Whether the connection has been condemned (a drain deadline is armed).
+    pub fn is_condemned(&self) -> bool {
+        self.close_deadline.is_some()
+    }
+
+    /// Whether a condemned connection's drain deadline has passed at `now`.
+    /// Always false for a connection that was never condemned.
+    pub fn condemn_expired(&self, now: Instant) -> bool {
+        self.close_deadline.is_some_and(|deadline| now >= deadline)
+    }
+
     /// Mark as closed
     pub fn mark_closed(&mut self) {
         self.state = ConnectionState::Closed;
@@ -505,6 +556,18 @@ impl ReactorConnection {
     #[cfg(test)]
     fn nodelay(&self) -> io::Result<bool> {
         self.socket.nodelay()
+    }
+
+    /// Bytes currently queued for writing ahead of any new data. Seeds the
+    /// scheduler's join-replay budget so a `play` accounts for an existing backlog.
+    fn pending_bytes(&self) -> usize {
+        self.write_queue.pending_bytes()
+    }
+
+    /// Bytes currently queued for writing (test only)
+    #[cfg(test)]
+    fn queued_bytes(&self) -> usize {
+        self.write_queue.pending_bytes()
     }
 }
 
@@ -604,8 +667,11 @@ pub struct Reactor {
     scheduler: RtmpScheduler,
     /// Publishers
     publishers: slab::Slab<PublisherState>,
-    /// stream_key set
-    stream_keys: dashmap::DashSet<String>,
+    /// stream_key set, shared with the owning `EmbedRtmpServer`. Must be the
+    /// `Arc` the server also reads: `DashSet`'s `Clone` is a deep copy, so a
+    /// by-value set here would leave the server's duplicate-key check reading
+    /// a set nobody writes to and `RtmpStreamAlreadyExists` dead code.
+    stream_keys: Arc<dashmap::DashSet<String>>,
     /// Stop flag
     status: Arc<AtomicUsize>,
     /// Maximum allowed connections (auto-adjusted by system FD limit)
@@ -646,7 +712,7 @@ impl Reactor {
     pub fn new(
         gop_limit: usize,
         max_connections: Option<usize>,
-        stream_keys: dashmap::DashSet<String>,
+        stream_keys: Arc<dashmap::DashSet<String>>,
         status: Arc<AtomicUsize>,
     ) -> io::Result<Self> {
         let poller = Poller::new()?;
@@ -708,6 +774,60 @@ impl Reactor {
 
         debug!("Connection {} added (generation {})", id, token.generation);
         Ok(token)
+    }
+
+    /// Close a connection, first trying to deliver its queued tail without
+    /// blocking or truncating.
+    ///
+    /// A server-initiated close often queues a final packet in the same round
+    /// — most visibly the `finish_playing` status a watcher gets when the
+    /// publisher ends — and a raw close would discard it: nothing between the
+    /// enqueue and the removal ever writes to the socket. One `try_flush`
+    /// usually drains the tail (the kernel send buffer is rarely full at this
+    /// point) and the connection is removed immediately. But if the flush
+    /// short-writes (WouldBlock with a partial entry left), dropping the socket
+    /// now would emit a TRUNCATED RTMP message to the peer and lose the final
+    /// status. In that case the connection is condemned instead: kept alive
+    /// with a bounded deadline while the remaining bytes drain on later
+    /// writable events (`handle_writable` / `flush_pending` close it once the
+    /// queue empties; `check_timeouts` force-removes it if the deadline passes).
+    fn close_connection_after_flush(&mut self, id: usize) {
+        let now = Instant::now();
+        let remove = match self.connections.get_mut(id) {
+            None => true, // already gone; remove_connection is a no-op
+            Some(conn) => {
+                // A condemned connection whose drain window already elapsed is
+                // force-removed even if a tail remains: lingering is bounded.
+                if conn.condemn_expired(now) {
+                    true
+                } else {
+                    match conn.try_flush() {
+                        // Socket error or orderly close: nothing left to save.
+                        Err(_) | Ok(true) => true,
+                        // Flushed; if the queue is now empty the tail was fully
+                        // delivered (the common case) and we remove now.
+                        Ok(false) if !conn.has_pending_writes() => true,
+                        // A tail remains (WouldBlock). Condemn for a bounded
+                        // drain rather than truncate the message. Keep an
+                        // existing condemnation's deadline so it is not extended.
+                        Ok(false) => {
+                            if !conn.is_condemned() {
+                                conn.condemn(now + CLOSE_DRAIN_TIMEOUT);
+                            }
+                            false
+                        }
+                    }
+                }
+            }
+        };
+
+        if remove {
+            self.remove_connection(id);
+        } else {
+            // (Re)register writable interest so the poller drives the drain;
+            // desired_interest() adds writable while has_pending_writes().
+            self.interest_dirty.insert(id);
+        }
     }
 
     /// Remove connection
@@ -907,7 +1027,18 @@ impl Reactor {
 
     /// Process scheduler results
     fn process_scheduler_results(&mut self, id: usize, data: &[u8]) {
-        match self.scheduler.bytes_received(id, data) {
+        // The connection's current write-queue backlog seeds the join-replay
+        // budget for any `play` handled in this batch (bytes already queued ahead
+        // of the burst). 0 if the connection has already vanished.
+        let backlog = self
+            .connections
+            .get(id)
+            .map(|conn| conn.pending_bytes())
+            .unwrap_or(0);
+        match self
+            .scheduler
+            .bytes_received_with_backlog(id, data, backlog)
+        {
             Ok(server_results) => {
                 for result in server_results {
                     match result {
@@ -950,6 +1081,16 @@ impl Reactor {
             self.packets_buffer.drain(..)
         {
             if let Some(target_conn) = self.connections.get_mut(target_id) {
+                // A condemned connection is lingering only to drain the final
+                // tail queued before it was condemned. Appending new live media
+                // would keep its queue from ever emptying, so it would never
+                // close on drain and be force-closed at the deadline instead —
+                // possibly truncating this freshly-appended packet, and wasting
+                // serialization / queue memory / fanout CPU. Skip the
+                // post-condemn append; the pre-condemn tail still drains.
+                if target_conn.is_condemned() {
+                    continue;
+                }
                 let enqueued = target_conn.enqueue_data(
                     Bytes::from(data),
                     is_keyframe,
@@ -982,9 +1123,15 @@ impl Reactor {
         match conn.try_flush() {
             Ok(true) => Some(HandleResult::Disconnect(id)),
             Ok(false) => {
-                // Queue drained - update interest to clear writable flag
-                // Prevents CPU churn on level-triggered systems (Windows WSAPoll)
                 if !conn.has_pending_writes() {
+                    // Queue drained. A condemned connection was only lingering
+                    // to deliver this tail — now safe to close it (the message
+                    // is complete, no truncation). Otherwise just clear the
+                    // writable interest to avoid CPU churn on level-triggered
+                    // systems (Windows WSAPoll).
+                    if conn.is_condemned() {
+                        return Some(HandleResult::Disconnect(id));
+                    }
                     self.interest_dirty.insert(id);
                 }
                 None
@@ -1016,10 +1163,19 @@ impl Reactor {
     }
 
     /// Handle publishers data
-    fn process_publishers(&mut self) -> Vec<usize> {
+    ///
+    /// Each publisher's channel is drained under a per-round item + byte
+    /// budget. Both inner loops consume an item first and only then check the
+    /// budgets, so nothing pulled off the channel is ever discarded; a budget
+    /// hit is a flat `break` with no removal or other state effect. Returns
+    /// the publishers to remove and whether any budget was exhausted — the
+    /// latter tells `run()` data may still be queued so the next poll must
+    /// not sleep.
+    fn process_publishers(&mut self) -> (Vec<usize>, bool) {
         let mut publisher_ids_to_remove = Vec::new();
         let mut packets_to_write = Vec::new();
         let mut ids_to_close = Vec::new();
+        let mut budget_exhausted = false;
 
         let publisher_ids: Vec<usize> = self.publishers.iter().map(|(id, _)| id).collect();
 
@@ -1032,17 +1188,41 @@ impl Reactor {
                 pub_state.source.clone()
             };
 
+            // Budgets are per publisher per round, so one flooding publisher
+            // cannot consume the whole round of its slower peers either.
+            let mut items = 0usize;
+            let mut bytes_drained = 0usize;
+
             match source {
                 PublisherSource::Raw(receiver) => loop {
                     match receiver.try_recv() {
                         Ok(bytes) => {
+                            items += 1;
+                            bytes_drained += bytes.len();
                             if !self.dispatch_publish_bytes(
                                 pub_id,
                                 bytes,
                                 &mut packets_to_write,
                                 &mut ids_to_close,
                             ) {
+                                // Fatal publisher error (e.g. an oversized sequence
+                                // header rejected at ingest): finalize the watchers
+                                // before removal so none is orphaned in Watching.
+                                // Unlike the Disconnected arm, this does NOT re-feed
+                                // the just-errored session.
+                                let results = self.scheduler.abort_publisher_watchers(pub_id);
+                                collect_server_results(
+                                    results,
+                                    &mut packets_to_write,
+                                    &mut ids_to_close,
+                                );
                                 publisher_ids_to_remove.push(pub_id);
+                                break;
+                            }
+                            if items >= MAX_PUBLISH_ITEMS_PER_POLL
+                                || bytes_drained >= MAX_PUBLISH_BYTES_PER_POLL
+                            {
+                                budget_exhausted = true;
                                 break;
                             }
                         }
@@ -1066,13 +1246,32 @@ impl Reactor {
                         // Control / metadata bytes stay on the session path so
                         // ordering with the bypassed media stays FIFO.
                         Ok(PublisherFeed::Raw(bytes)) => {
+                            items += 1;
+                            bytes_drained += bytes.len();
                             if !self.dispatch_publish_bytes(
                                 pub_id,
                                 bytes,
                                 &mut packets_to_write,
                                 &mut ids_to_close,
                             ) {
+                                // Fatal publisher error (e.g. an oversized sequence
+                                // header rejected at ingest): finalize the watchers
+                                // before removal so none is orphaned in Watching.
+                                // Unlike the Disconnected arm, this does NOT re-feed
+                                // the just-errored session.
+                                let results = self.scheduler.abort_publisher_watchers(pub_id);
+                                collect_server_results(
+                                    results,
+                                    &mut packets_to_write,
+                                    &mut ids_to_close,
+                                );
                                 publisher_ids_to_remove.push(pub_id);
+                                break;
+                            }
+                            if items >= MAX_PUBLISH_ITEMS_PER_POLL
+                                || bytes_drained >= MAX_PUBLISH_BYTES_PER_POLL
+                            {
+                                budget_exhausted = true;
                                 break;
                             }
                         }
@@ -1083,6 +1282,8 @@ impl Reactor {
                             timestamp,
                             data,
                         }) => {
+                            items += 1;
+                            bytes_drained += data.len();
                             let results = self
                                 .scheduler
                                 .publish_media_received(pub_id, tag_type, timestamp, data);
@@ -1091,6 +1292,12 @@ impl Reactor {
                                 &mut packets_to_write,
                                 &mut ids_to_close,
                             );
+                            if items >= MAX_PUBLISH_ITEMS_PER_POLL
+                                || bytes_drained >= MAX_PUBLISH_BYTES_PER_POLL
+                            {
+                                budget_exhausted = true;
+                                break;
+                            }
                         }
                         Err(crossbeam_channel::TryRecvError::Empty) => break,
                         Err(crossbeam_channel::TryRecvError::Disconnected) => {
@@ -1112,6 +1319,12 @@ impl Reactor {
         let mut enqueued_ids = Vec::new();
         for (target_id, data, is_keyframe, is_sequence_header, is_video) in packets_to_write {
             if let Some(target_conn) = self.connections.get_mut(target_id) {
+                // Same rule as the readable-path fanout: never append new live
+                // media to a condemned connection — its final tail must drain and
+                // close, not be reopened by a post-condemn packet.
+                if target_conn.is_condemned() {
+                    continue;
+                }
                 let enqueued = target_conn.enqueue_data(
                     Bytes::from(data),
                     is_keyframe,
@@ -1133,12 +1346,13 @@ impl Reactor {
             self.interest_dirty.insert(id);
         }
 
-        // Close connections that need closing
+        // Close connections that need closing, flushing the status packet
+        // (e.g. finish_playing) enqueued just above in the same round.
         for close_id in ids_to_close {
-            self.remove_connection(close_id);
+            self.close_connection_after_flush(close_id);
         }
 
-        publisher_ids_to_remove
+        (publisher_ids_to_remove, budget_exhausted)
     }
 
     /// Send deleteStream command
@@ -1215,6 +1429,12 @@ impl Reactor {
                             // Connection should be closed
                             ids_to_close.push(id);
                         }
+                        Ok(false) if !conn.has_pending_writes() && conn.is_condemned() => {
+                            // A condemned connection's tail is fully delivered —
+                            // close it now (the message is complete). Same
+                            // drain-then-close as handle_writable.
+                            ids_to_close.push(id);
+                        }
                         Ok(false) => {
                             // NEW-RS-01: do NOT reinsert into pending_flush. A
                             // still-non-empty queue here means try_flush stopped
@@ -1228,6 +1448,11 @@ impl Reactor {
                             self.interest_dirty.insert(id);
                         }
                     }
+                } else if conn.is_condemned() {
+                    // Condemned and already drained (a media enqueue that then
+                    // flushed elsewhere): close now rather than wait for the
+                    // deadline.
+                    ids_to_close.push(id);
                 } else {
                     // No pending writes, ensure writable interest is cleared
                     self.interest_dirty.insert(id);
@@ -1257,6 +1482,12 @@ impl Reactor {
         for (id, conn) in self.connections.iter() {
             if conn.is_timed_out_at(now, timeout) {
                 debug!("Connection {} timed out", id);
+                timed_out.push(id);
+            } else if conn.condemn_expired(now) {
+                // A condemned connection whose peer never drained the tail:
+                // remove it once the bounded drain window elapses. The ~1/sec
+                // sweep granularity is fine given the multi-second deadline.
+                debug!("Connection {} close-drain deadline expired", id);
                 timed_out.push(id);
             }
         }
@@ -1320,6 +1551,11 @@ impl Reactor {
 
         let poll_timeout = Duration::from_millis(POLL_TIMEOUT_MS);
 
+        // Set when the previous round's process_publishers stopped on a
+        // budget, i.e. publisher channels may still hold data no IO event
+        // will ever announce.
+        let mut publishers_pending = false;
+
         loop {
             // 1. Check stop signal
             if self.status.load(Ordering::Acquire) == STATUS_END {
@@ -1357,7 +1593,14 @@ impl Reactor {
             // was just added, poll non-blocking and fall straight through to
             // process_publishers, delivering the handshake and first media
             // immediately instead of stalling on the poll timeout (PERF-5a).
-            let poll_wait = if new_publisher_added {
+            //
+            // The same applies when the previous round's publisher drain hit
+            // its budget: the leftover items sit on a channel the poller
+            // cannot see, so a blocking poll would add up to POLL_TIMEOUT_MS
+            // of latency per excess batch. Poll non-blocking and let steps
+            // 5-10 run in between, which is exactly what the budget exists
+            // to guarantee.
+            let poll_wait = if new_publisher_added || publishers_pending {
                 Duration::ZERO
             } else {
                 poll_timeout
@@ -1414,7 +1657,8 @@ impl Reactor {
             }
 
             // 6. Handle publishers data
-            let publisher_ids_to_remove = self.process_publishers();
+            let (publisher_ids_to_remove, budget_exhausted) = self.process_publishers();
+            publishers_pending = budget_exhausted;
             for pub_id in publisher_ids_to_remove {
                 self.remove_publisher(pub_id);
             }
@@ -1431,11 +1675,13 @@ impl Reactor {
             let timed_out = self.check_timeouts();
             ids_to_close.extend(timed_out);
 
-            // 10. Clean up disconnected connections (deduplicate)
+            // 10. Clean up disconnected connections (deduplicate). Same
+            // flush-then-close as the publisher path: a scheduler-driven
+            // disconnect may have queued a final control packet this round.
             ids_to_close.sort_unstable();
             ids_to_close.dedup();
             for id in ids_to_close {
-                self.remove_connection(id);
+                self.close_connection_after_flush(id);
             }
         }
 
@@ -1667,7 +1913,7 @@ mod tests {
 
     #[test]
     fn test_check_timeouts_throttle_and_detection() {
-        let stream_keys = dashmap::DashSet::new();
+        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
         let mut reactor =
             Reactor::new(3, None, stream_keys, status).expect("Failed to create reactor");
@@ -1716,7 +1962,7 @@ mod tests {
 
     #[test]
     fn test_reactor_creation() {
-        let stream_keys = dashmap::DashSet::new();
+        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
 
         let reactor = Reactor::new(3, None, stream_keys, status);
@@ -1725,7 +1971,7 @@ mod tests {
 
     #[test]
     fn test_connection_generation_increments() {
-        let stream_keys = dashmap::DashSet::new();
+        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
 
         let mut reactor =
@@ -1763,7 +2009,7 @@ mod tests {
 
     #[test]
     fn test_token_validation() {
-        let stream_keys = dashmap::DashSet::new();
+        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
 
         let mut reactor =
@@ -1800,7 +2046,7 @@ mod tests {
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn test_generation_prevents_aba_problem() {
-        let stream_keys = dashmap::DashSet::new();
+        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
 
         let mut reactor =
@@ -1849,7 +2095,7 @@ mod tests {
     /// Note: This test creates connections but doesn't run the full RTMP handshake
     #[test]
     fn test_many_connections_creation() {
-        let stream_keys = dashmap::DashSet::new();
+        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
 
         let mut reactor =
@@ -1896,7 +2142,7 @@ mod tests {
     fn perf_connection_scaling() {
         use std::time::Instant;
 
-        let stream_keys = dashmap::DashSet::new();
+        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
 
         let mut reactor =
@@ -1972,7 +2218,7 @@ mod tests {
         use std::io::Write;
         use std::time::Instant;
 
-        let stream_keys = dashmap::DashSet::new();
+        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
 
         let mut reactor =
@@ -2044,7 +2290,7 @@ mod tests {
     fn test_handle_writable_marks_interest_dirty_on_queue_drain() {
         use std::io::Read;
 
-        let stream_keys = dashmap::DashSet::new();
+        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
 
         let mut reactor =
@@ -2109,7 +2355,7 @@ mod tests {
     fn test_flush_pending_marks_interest_dirty_on_queue_drain() {
         use std::io::Read;
 
-        let stream_keys = dashmap::DashSet::new();
+        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
 
         let mut reactor =
@@ -2194,7 +2440,7 @@ mod tests {
     fn test_flush_pending_wouldblock_registers_writable_not_pending_flush() {
         use std::os::unix::io::AsRawFd;
 
-        let stream_keys = dashmap::DashSet::new();
+        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
         let mut reactor =
             Reactor::new(3, None, stream_keys, status).expect("Failed to create reactor");
@@ -2253,7 +2499,7 @@ mod tests {
     /// Test that flush_pending marks interest_dirty when connection has no pending writes
     #[test]
     fn test_flush_pending_marks_interest_dirty_when_no_pending_writes() {
-        let stream_keys = dashmap::DashSet::new();
+        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
 
         let mut reactor =
@@ -2309,7 +2555,7 @@ mod tests {
     fn feed_publisher_drains_mixed_raw_and_media() {
         use crate::rtmp::embed_rtmp_server::build_publish_control;
 
-        let stream_keys = dashmap::DashSet::new();
+        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
         let mut reactor = Reactor::new(3, None, stream_keys, status).expect("reactor");
 
@@ -2359,7 +2605,7 @@ mod tests {
             .unwrap();
 
         // Drain the mixed feed; a healthy publisher must not be removed.
-        let removed = reactor.process_publishers();
+        let (removed, _) = reactor.process_publishers();
         assert!(removed.is_empty(), "healthy publisher must not be removed");
 
         // The Media items were dispatched through publish_media_received (not the
@@ -2390,10 +2636,460 @@ mod tests {
 
         // Dropping the sender disconnects the publisher; the next drain removes it.
         drop(feed_tx);
-        let removed = reactor.process_publishers();
+        let (removed, _) = reactor.process_publishers();
         assert!(
             removed.contains(&pub_id),
             "a disconnected publisher must be scheduled for removal"
+        );
+    }
+
+    // H8.c: a server-initiated close must first try to flush what was queued
+    // in the same round — most visibly the finish_playing status a watcher
+    // gets when the publisher ends. A raw remove_connection dropped it: the
+    // enqueue marked pending_flush, but the close ran before any flush step.
+    #[test]
+    fn close_connection_after_flush_delivers_the_queued_tail() {
+        use std::io::Read;
+
+        let stream_keys = Arc::new(dashmap::DashSet::new());
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let mut reactor = Reactor::new(3, None, stream_keys, status).expect("reactor");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to get address");
+        let mut client = TcpStream::connect(addr).expect("Failed to connect");
+        let (server, _) = listener.accept().expect("Failed to accept");
+        let token = reactor
+            .add_connection(server)
+            .expect("Failed to add connection");
+
+        // Queue a final status packet and close, as process_publishers does
+        // for a watcher after its publisher finished.
+        if let Some(conn) = reactor.connections.get_mut(token.id) {
+            conn.state = ConnectionState::Active;
+            assert!(conn.enqueue_data(Bytes::from_static(b"final status"), false, false, false));
+        }
+        reactor.close_connection_after_flush(token.id);
+        assert!(
+            reactor.connections.get(token.id).is_none(),
+            "the connection must still be removed"
+        );
+
+        // The queued tail must reach the peer, followed by an orderly EOF.
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set timeout");
+        let mut received = Vec::new();
+        let mut buf = [0u8; 64];
+        loop {
+            match client.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => received.extend_from_slice(&buf[..n]),
+                Err(e) => panic!("read failed before EOF: {e:?}"),
+            }
+        }
+        assert_eq!(
+            received, b"final status",
+            "the tail queued in the closing round must be delivered"
+        );
+    }
+
+    // F2: a server-initiated close whose tail cannot flush in one pass must
+    // NOT drop the socket mid-message (that truncates the RTMP message and
+    // loses the final status). It must linger (condemned), drain on later
+    // writable events, and only then close — delivering a byte-exact prefix.
+    #[cfg(unix)]
+    #[test]
+    fn close_lingers_then_drains_an_undeliverable_tail() {
+        use std::io::Read;
+        use std::os::unix::io::AsRawFd;
+
+        let stream_keys = Arc::new(dashmap::DashSet::new());
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let mut reactor = Reactor::new(3, None, stream_keys, status).expect("reactor");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to get address");
+        let mut client = TcpStream::connect(addr).expect("Failed to connect");
+        let (server, _) = listener.accept().expect("Failed to accept");
+
+        // Tiny buffers + a peer that does not read yet => the single flush in
+        // close_connection_after_flush WouldBlocks with a tail remaining.
+        set_small_socket_buffer(server.as_raw_fd(), libc::SO_SNDBUF);
+        set_small_socket_buffer(client.as_raw_fd(), libc::SO_RCVBUF);
+
+        let token = reactor
+            .add_connection(server)
+            .expect("Failed to add connection");
+
+        // 64KB single sequence-header entry: far larger than the shrunk buffers
+        // (so the first flush WouldBlocks), but small enough that the byte-by-
+        // byte drain over the tiny pipe completes well within the watchdog.
+        let payload = vec![0xABu8; 64 * 1024];
+        if let Some(conn) = reactor.connections.get_mut(token.id) {
+            conn.state = ConnectionState::Active;
+            assert!(conn.enqueue_data(Bytes::from(payload.clone()), false, true, true));
+        }
+
+        reactor.close_connection_after_flush(token.id);
+        assert!(
+            reactor.connections.get(token.id).is_some(),
+            "a half-written tail must not be dropped (that truncates the RTMP message)"
+        );
+        assert!(
+            reactor.connections.get(token.id).unwrap().is_condemned(),
+            "the connection must be condemned for a bounded drain"
+        );
+
+        // Drain from the peer while driving writable events; the queue empties,
+        // the connection is removed, and every byte arrives in order.
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set timeout");
+        let mut received = Vec::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            assert!(Instant::now() < deadline, "drain watchdog expired");
+            if reactor.connections.get(token.id).is_some() {
+                if let Some(HandleResult::Disconnect(cid)) = reactor.handle_writable(token.id) {
+                    reactor.close_connection_after_flush(cid);
+                }
+            }
+            match client.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => received.extend_from_slice(&buf[..n]),
+                Err(ref e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(e) => panic!("read failed before EOF: {e:?}"),
+            }
+        }
+        assert_eq!(
+            received.len(),
+            payload.len(),
+            "the whole tail must be delivered before the close"
+        );
+        assert!(
+            received.iter().all(|&b| b == 0xAB),
+            "the delivered stream must be a byte-exact prefix, no corruption"
+        );
+        assert!(
+            reactor.connections.get(token.id).is_none(),
+            "the connection is removed once its tail has drained"
+        );
+    }
+
+    // F2: bounded lingering — a peer that never drains the tail must not pin the
+    // slot forever. Once the drain deadline passes, check_timeouts collects the
+    // connection and close_connection_after_flush force-removes it.
+    #[cfg(unix)]
+    #[test]
+    fn condemn_deadline_backstops_a_peer_that_never_reads() {
+        use std::os::unix::io::AsRawFd;
+
+        let stream_keys = Arc::new(dashmap::DashSet::new());
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let mut reactor = Reactor::new(3, None, stream_keys, status).expect("reactor");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to get address");
+        // The peer connects but never reads, so the tail can never flush.
+        let client = TcpStream::connect(addr).expect("Failed to connect");
+        let (server, _) = listener.accept().expect("Failed to accept");
+
+        set_small_socket_buffer(server.as_raw_fd(), libc::SO_SNDBUF);
+        set_small_socket_buffer(client.as_raw_fd(), libc::SO_RCVBUF);
+
+        let token = reactor
+            .add_connection(server)
+            .expect("Failed to add connection");
+
+        let payload = vec![0u8; 1024 * 1024];
+        if let Some(conn) = reactor.connections.get_mut(token.id) {
+            conn.state = ConnectionState::Active;
+            assert!(conn.enqueue_data(Bytes::from(payload), false, true, true));
+        }
+        reactor.close_connection_after_flush(token.id);
+        assert!(
+            reactor.connections.get(token.id).unwrap().is_condemned(),
+            "an undrainable tail must condemn the connection"
+        );
+
+        // Simulate the drain window elapsing: move the deadline into the past
+        // and force a timeout sweep past its ~1/sec throttle.
+        let past = Instant::now();
+        if let Some(conn) = reactor.connections.get_mut(token.id) {
+            conn.condemn(past);
+        }
+        reactor.last_timeout_check = past
+            .checked_sub(TIMEOUT_CHECK_INTERVAL + Duration::from_secs(1))
+            .expect("monotonic clock has headroom");
+        let expired = reactor.check_timeouts();
+        assert!(
+            expired.contains(&token.id),
+            "check_timeouts must collect a condemnation whose deadline passed"
+        );
+
+        // Closing it now force-removes it instead of re-lingering forever.
+        reactor.close_connection_after_flush(token.id);
+        assert!(
+            reactor.connections.get(token.id).is_none(),
+            "an expired condemnation must be force-removed (bounded lingering)"
+        );
+
+        drop(client);
+    }
+
+    // F3: a condemned connection (lingering only to drain its final tail) must
+    // stop receiving live fanout. Appending new media would keep its queue from
+    // ever emptying, so it would never close on drain and be force-closed at the
+    // deadline instead — possibly truncating the fresh packet. Here the
+    // readable-path fanout (write_pending_packets) targets a condemned
+    // connection: the append is skipped, the queue stays at exactly the
+    // pre-condemn tail, and the connection closes on drain, delivering only the
+    // tail bytes. The publisher-path fanout (process_publishers) carries the
+    // identical is_condemned() guard.
+    #[test]
+    fn condemned_connection_is_skipped_by_live_fanout_and_closes_on_drain() {
+        use std::io::Read;
+
+        let stream_keys = Arc::new(dashmap::DashSet::new());
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let mut reactor = Reactor::new(3, None, stream_keys, status).expect("reactor");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to get address");
+        let mut client = TcpStream::connect(addr).expect("Failed to connect");
+        let (server, _) = listener.accept().expect("Failed to accept");
+
+        let token = reactor
+            .add_connection(server)
+            .expect("Failed to add connection");
+
+        // Queue a known final tail while Active, then condemn it.
+        let tail = 4096usize;
+        if let Some(conn) = reactor.connections.get_mut(token.id) {
+            conn.state = ConnectionState::Active;
+            assert!(conn.enqueue_data(Bytes::from(vec![0xABu8; tail]), false, true, true));
+            conn.condemn(Instant::now() + Duration::from_secs(30));
+            assert!(conn.is_condemned());
+        }
+
+        // Live fanout targets the condemned connection with a large media
+        // packet. It must be skipped, so the queue stays at the pre-condemn tail.
+        reactor
+            .packets_buffer
+            .push((token.id, vec![0xCDu8; 1024 * 1024], true, false, true));
+        reactor.write_pending_packets();
+
+        let conn = reactor.connections.get(token.id).expect("still present");
+        assert_eq!(
+            conn.queued_bytes(),
+            tail,
+            "post-condemn media must not grow a condemned connection's queue"
+        );
+        assert!(
+            !reactor.is_pending_flush(token.id),
+            "a skipped condemned target must not be re-queued for flush"
+        );
+
+        // Drain the tail: the connection closes on drain (not at the deadline),
+        // and the peer receives exactly the tail bytes — never the skipped media.
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set timeout");
+        let mut received = Vec::new();
+        let mut buf = vec![0u8; 8192];
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            assert!(Instant::now() < deadline, "drain watchdog expired");
+            if reactor.connections.get(token.id).is_some() {
+                if let Some(HandleResult::Disconnect(cid)) = reactor.handle_writable(token.id) {
+                    reactor.close_connection_after_flush(cid);
+                }
+            }
+            match client.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => received.extend_from_slice(&buf[..n]),
+                Err(ref e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    if reactor.connections.get(token.id).is_none() {
+                        break;
+                    }
+                }
+                Err(e) => panic!("read failed before EOF: {e:?}"),
+            }
+        }
+        assert_eq!(
+            received.len(),
+            tail,
+            "only the pre-condemn tail must be delivered"
+        );
+        assert!(
+            received.iter().all(|&b| b == 0xAB),
+            "the skipped media must never appear in the delivered stream"
+        );
+        assert!(
+            reactor.connections.get(token.id).is_none(),
+            "the connection closes once its tail drains, not at the deadline"
+        );
+    }
+
+    // H6: one process_publishers round must consume at most
+    // MAX_PUBLISH_ITEMS_PER_POLL items per publisher and report the leftover
+    // via the pending flag, so run() re-polls with a zero timeout instead of
+    // spinning inside the drain while flush_pending starves.
+    #[test]
+    fn publisher_drain_item_budget_bounds_one_round() {
+        let stream_keys = Arc::new(dashmap::DashSet::new());
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let mut reactor = Reactor::new(3, None, stream_keys, status).expect("reactor");
+
+        // Channel larger than the budget so the backlog fits in one send burst.
+        let (feed_tx, feed_rx) = crossbeam_channel::bounded(MAX_PUBLISH_ITEMS_PER_POLL + 64);
+        reactor
+            .add_publisher("live".to_string(), PublisherSource::Feed(feed_rx))
+            .expect("publisher registered");
+
+        // Budget + 6 tiny audio tags queued ahead of a single drain.
+        for i in 0..(MAX_PUBLISH_ITEMS_PER_POLL + 6) {
+            feed_tx
+                .send(PublisherFeed::Media {
+                    tag_type: 0x08,
+                    timestamp: RtmpTimestamp { value: i as u32 },
+                    data: Bytes::from_static(&[0xaf, 0x01, 0x00]),
+                })
+                .unwrap();
+        }
+
+        let (removed, pending) = reactor.process_publishers();
+        assert!(
+            removed.is_empty(),
+            "a budget stop must not remove the publisher"
+        );
+        assert!(pending, "hitting the item budget must report pending work");
+        assert_eq!(
+            feed_tx.len(),
+            6,
+            "exactly the item budget must be consumed in one round"
+        );
+
+        let (removed, pending) = reactor.process_publishers();
+        assert!(removed.is_empty());
+        assert!(!pending, "a drained channel must clear the pending flag");
+        assert_eq!(feed_tx.len(), 0, "the second round must clear the backlog");
+    }
+
+    // H6: the byte budget caps a round of few-but-large items the same way.
+    #[test]
+    fn publisher_drain_byte_budget_bounds_one_round() {
+        let stream_keys = Arc::new(dashmap::DashSet::new());
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let mut reactor = Reactor::new(3, None, stream_keys, status).expect("reactor");
+
+        let (feed_tx, feed_rx) = crossbeam_channel::bounded(16);
+        reactor
+            .add_publisher("live".to_string(), PublisherSource::Feed(feed_rx))
+            .expect("publisher registered");
+
+        // 3 x 200KiB crosses the 512KiB byte budget on the third item
+        // (consume-then-check), leaving the fourth for the next round.
+        let big = Bytes::from(vec![0u8; 200 * 1024]);
+        for i in 0..3u32 {
+            feed_tx
+                .send(PublisherFeed::Media {
+                    tag_type: 0x08,
+                    timestamp: RtmpTimestamp { value: i },
+                    data: big.clone(),
+                })
+                .unwrap();
+        }
+        feed_tx
+            .send(PublisherFeed::Media {
+                tag_type: 0x08,
+                timestamp: RtmpTimestamp { value: 3 },
+                data: Bytes::from_static(&[0xaf, 0x01, 0x00]),
+            })
+            .unwrap();
+
+        let (removed, pending) = reactor.process_publishers();
+        assert!(removed.is_empty());
+        assert!(pending, "hitting the byte budget must report pending work");
+        assert_eq!(
+            feed_tx.len(),
+            1,
+            "the item that crossed the byte budget is still consumed; only the next one waits"
+        );
+
+        let (removed, pending) = reactor.process_publishers();
+        assert!(removed.is_empty());
+        assert!(!pending);
+        assert_eq!(feed_tx.len(), 0);
+    }
+
+    // H6: consume-then-check means an item pulled off the channel is always
+    // processed, even when it alone exceeds the byte budget — the budget only
+    // ends the round, it never discards data.
+    #[test]
+    fn publisher_drain_oversized_item_is_consumed_not_dropped() {
+        let stream_keys = Arc::new(dashmap::DashSet::new());
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let mut reactor = Reactor::new(3, None, stream_keys, status).expect("reactor");
+
+        let (feed_tx, feed_rx) = crossbeam_channel::bounded(4);
+        reactor
+            .add_publisher("live".to_string(), PublisherSource::Feed(feed_rx))
+            .expect("publisher registered");
+
+        // A single 600KiB audio sequence header (> byte budget), then a small
+        // video sequence header. Sequence headers land in the scheduler's
+        // channel cache, which proves each item was processed, not dropped.
+        let mut oversized = vec![0u8; 600 * 1024];
+        oversized[0] = 0xaf;
+        oversized[1] = 0x00;
+        let oversized = Bytes::from(oversized);
+        feed_tx
+            .send(PublisherFeed::Media {
+                tag_type: 0x08,
+                timestamp: RtmpTimestamp { value: 0 },
+                data: oversized.clone(),
+            })
+            .unwrap();
+        let video_seq: &[u8] = &[0x17, 0x00, 0x00, 0x00, 0x00, 0x01, 0x64];
+        feed_tx
+            .send(PublisherFeed::Media {
+                tag_type: 0x09,
+                timestamp: RtmpTimestamp { value: 1 },
+                data: Bytes::from_static(video_seq),
+            })
+            .unwrap();
+
+        let (removed, pending) = reactor.process_publishers();
+        assert!(removed.is_empty());
+        assert!(pending, "an oversized item exhausts the byte budget");
+        assert_eq!(
+            reactor.scheduler.channel_audio_sequence_header("live"),
+            Some(oversized),
+            "the oversized item must reach the scheduler in the round that consumed it"
+        );
+        assert_eq!(
+            feed_tx.len(),
+            1,
+            "the follow-up item waits for the next round"
+        );
+
+        let (_, pending) = reactor.process_publishers();
+        assert!(!pending);
+        assert_eq!(
+            reactor
+                .scheduler
+                .channel_video_sequence_header("live")
+                .as_deref(),
+            Some(video_seq),
+            "the next round must deliver the remaining item"
         );
     }
 }

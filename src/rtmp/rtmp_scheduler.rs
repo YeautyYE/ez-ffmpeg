@@ -1,4 +1,5 @@
 use crate::rtmp::gop::{FrameData, Gops};
+use crate::rtmp::write_queue::QUEUE_WARN_BYTES;
 use bytes::Bytes;
 use log::{debug, warn};
 use rml_rtmp::chunk_io::Packet;
@@ -18,7 +19,79 @@ pub(super) enum SchedulerError {
     /// Error from RTMP session handling
     #[error("RTMP session error: {0}")]
     Session(#[from] ServerSessionError),
+
+    /// A publisher sent a sequence header larger than the cacheable limit. A
+    /// real AVC/AAC config is well under 1 KiB, so this is protocol abuse, not
+    /// normal traffic. Returned from the ingest path to terminate the abusing
+    /// publisher via the reactor's existing scheduler-error removal path.
+    #[error("oversized sequence header: {size} bytes exceeds the {limit}-byte cacheable limit")]
+    OversizedSequenceHeader { size: usize, limit: usize },
 }
+
+/// Headroom subtracted from the write queue's Warning threshold when
+/// budgeting a join burst. `WriteQueue::enqueue` classifies each item on the
+/// pre-push total, so a burst that stays under Warning is accepted entirely
+/// in the Normal band; the headroom additionally absorbs live frames that
+/// land on the fresh queue in the same reactor round as the burst.
+const JOIN_REPLAY_HEADROOM: usize = 64 * 1024;
+
+/// Byte budget for the GOP segments of one join burst (sequence headers are
+/// sent outside it). A joining watcher's queue is empty, so a burst within
+/// this budget suffers zero policy drops. Without the cap, a large replay
+/// pushes the queue into the Warning/High bands where correctly-flagged
+/// delta frames — most of the burst — are dropped, and the watcher decodes
+/// garbage from the surviving fragments.
+const JOIN_REPLAY_BUDGET_BYTES: usize = QUEUE_WARN_BYTES - JOIN_REPLAY_HEADROOM;
+
+/// The server's negotiated OUTBOUND chunk size, in bytes. `new_channel` builds
+/// every session from `ServerSessionConfig::new()`, whose `chunk_size` is 4096;
+/// `ServerSession::new` pins the outbound serializer to it once at construction
+/// (`set_max_chunk_size`) and the server never renegotiates the outbound
+/// direction afterwards. A payload larger than this is split into continuation
+/// chunks, each carrying its own (small) chunk header on the wire.
+const OUTBOUND_CHUNK_SIZE: usize = 4096;
+
+/// Upper bound on a type-0 RTMP chunk header: 3-byte basic header + 11-byte
+/// message header + 4-byte extended timestamp. Every media frame is serialized
+/// as its own packet, and droppable A/V frames are forced back to a type-0
+/// header by the serializer, so budget one full message header per frame.
+const MSG_HEADER_MAX: usize = 18;
+
+/// Upper bound on a type-3 continuation chunk header (basic header only). Added
+/// once per outbound chunk a payload is split across. The join budget caps the
+/// replayed payload well under 1 MiB, so the rare extended-timestamp bytes a
+/// continuation may also carry stay far inside the 64 KiB headroom.
+const CONT_HEADER_MAX: usize = 3;
+
+/// Conservative upper bound on the serialized wire size of one GOP: its raw
+/// payload plus the RTMP chunk framing the write queue actually enqueues. The
+/// replay budget must count wire bytes, not raw payload — a burst of many small
+/// frames (per-frame headers) or a large metadata/sequence-header prefix can
+/// otherwise push the real queue past the Warning threshold, where correctly
+/// flagged delta frames are dropped and the joiner decodes garbage.
+///
+/// `frame_count * MSG_HEADER_MAX` covers the per-frame message header;
+/// `ceil(payload / OUTBOUND_CHUNK_SIZE) * CONT_HEADER_MAX` covers continuation
+/// headers for payloads split across chunks. Saturating arithmetic keeps an
+/// absurd/corrupt size from wrapping (the caller's `select_replay_start` then
+/// fails that segment closed).
+fn gop_wire_size(payload: usize, frame_count: usize) -> usize {
+    let per_frame = frame_count.saturating_mul(MSG_HEADER_MAX);
+    let continuation = payload
+        .div_ceil(OUTBOUND_CHUNK_SIZE)
+        .saturating_mul(CONT_HEADER_MAX);
+    payload
+        .saturating_add(per_frame)
+        .saturating_add(continuation)
+}
+
+/// Largest sequence header (AVC/AAC codec config) the channel will cache and
+/// replay. A real config is well under 1 KiB; 256 KiB is generous while staying
+/// far below `write_queue::QUEUE_MAX_BYTES` (4 MiB). A header at or above the
+/// queue-critical threshold, cached and then replayed in a join burst, would be
+/// rejected by `WriteQueue::enqueue` and disconnect every late joiner — so an
+/// oversized header is refused at ingest instead of poisoning the cache.
+const MAX_CACHEABLE_SEQUENCE_HEADER_BYTES: usize = 256 * 1024;
 
 enum ClientAction {
     Waiting,
@@ -103,6 +176,23 @@ pub(super) struct RtmpScheduler {
     publisher_to_client_map: HashMap<usize, usize>,
     channels: HashMap<String, MediaChannel>,
     gop_limit: usize,
+    /// Write-queue backlog of the connection whose input is currently being
+    /// serviced, supplied by the reactor at the top of `bytes_received_with_backlog`.
+    /// A `play` seeds its join-replay budget with this so a connection that still
+    /// has undrained bytes (e.g. a rapid stream switch) does not overfill its queue
+    /// into the frame-dropping Warning band. Zero outside a serviced `bytes_received`
+    /// (handlers driven directly by tests see no phantom backlog).
+    serving_connection_backlog_bytes: usize,
+    /// Amortized-O(1) cursor for the same-batch join-replay prefix. All `play`s
+    /// in one input batch share the serviced connection, so instead of rescanning
+    /// the growing `server_results` per play (quadratic on a batch stuffed with
+    /// repeated `play`s — a reachable reactor-stall), `advance_serving_prefix`
+    /// folds only the entries added since the previous play into a running total.
+    /// `serving_prefix_scan_pos` is how far it has scanned; `serving_prefix_bytes`
+    /// is the accumulated bytes targeting the serviced connection. Both reset per
+    /// batch.
+    serving_prefix_scan_pos: usize,
+    serving_prefix_bytes: usize,
 }
 
 impl RtmpScheduler {
@@ -161,6 +251,9 @@ impl RtmpScheduler {
             publisher_to_client_map: HashMap::with_capacity(32),
             channels: HashMap::new(),
             gop_limit,
+            serving_connection_backlog_bytes: 0,
+            serving_prefix_scan_pos: 0,
+            serving_prefix_bytes: 0,
         }
     }
 
@@ -196,6 +289,21 @@ impl RtmpScheduler {
             publisher_results
         };
 
+        // pre-scan the whole batch for a fatal oversized sequence header
+        // BEFORE processing any event. Otherwise an earlier PublishStreamFinished
+        // in the same batch would finalize its watchers, then the later fatal `?`
+        // would discard those results — stranding the watcher's finish status and
+        // forcing abort_publisher_watchers to double-finalize an already-Completed
+        // watcher session. Rejecting up front keeps every watcher side effect out
+        // of a batch that is going to abort (server_results stays empty here).
+        for result in &publisher_results {
+            if let ServerSessionResult::RaisedEvent(event) = result {
+                if let Some(err) = oversized_sequence_header_error(event) {
+                    return Err(err);
+                }
+            }
+        }
+
         for result in publisher_results {
             match result {
                 ServerSessionResult::OutboundResponse(_packet) => {
@@ -209,7 +317,10 @@ impl RtmpScheduler {
                     | ServerSessionEvent::AcknowledgementReceived { .. }
                     | ServerSessionEvent::PingResponseReceived { .. }
                     | ServerSessionEvent::PublishStreamFinished { .. } => {
-                        self.handle_raised_event(usize::MAX, event, &mut server_results);
+                        // `?` routes an oversized-sequence-header abort out of
+                        // publish_bytes_received; the reactor then removes this
+                        // misbehaving publisher (the existing abort path).
+                        self.handle_raised_event(usize::MAX, event, &mut server_results)?;
                     }
                     ServerSessionEvent::ConnectionRequested {
                         request_id,
@@ -317,6 +428,12 @@ impl RtmpScheduler {
             None => return server_results,
         };
 
+        // The oversized-sequence-header bound (F2) lives on the untrusted socket
+        // ingest path (`handle_raised_event`, driven by rml_rtmp deserialization
+        // of remote bytes). This bypass carries only in-process FFmpeg muxer
+        // output — a trusted source that never emits an oversized header — so it
+        // needs no gate here (and, returning no Result, could not terminate the
+        // feed anyway).
         self.handle_audio_video_data_received(
             stream_key,
             timestamp,
@@ -333,6 +450,24 @@ impl RtmpScheduler {
         connection_id: usize,
         bytes: &[u8],
     ) -> Result<Vec<ServerResult>, SchedulerError> {
+        self.bytes_received_with_backlog(connection_id, bytes, 0)
+    }
+
+    /// Like `bytes_received`, but told the connection's current write-queue
+    /// backlog so a `play` handled in this batch can budget its join-replay burst
+    /// against the bytes already queued ahead of it (see
+    /// `serving_connection_backlog_bytes`). The reactor supplies the real value;
+    /// the plain `bytes_received` wrapper passes 0.
+    pub(super) fn bytes_received_with_backlog(
+        &mut self,
+        connection_id: usize,
+        bytes: &[u8],
+        connection_backlog_bytes: usize,
+    ) -> Result<Vec<ServerResult>, SchedulerError> {
+        self.serving_connection_backlog_bytes = connection_backlog_bytes;
+        // Reset the same-batch join-replay prefix cursor for this input batch.
+        self.serving_prefix_scan_pos = 0;
+        self.serving_prefix_bytes = 0;
         let mut server_results = Vec::new();
 
         if !self.connection_to_client_map.contains_key(&connection_id) {
@@ -406,6 +541,35 @@ impl RtmpScheduler {
         }
     }
 
+    /// Finalize the watchers of a publisher that must be torn down due to a fatal
+    /// protocol error (e.g. an oversized sequence header rejected at ingest).
+    /// Unlike a graceful `deleteStream`, this does NOT re-feed the publisher's
+    /// session (which just errored on the untrusted byte path); it ends every
+    /// watcher of the publisher's channel exactly as `handle_publish_finished`
+    /// does — a final `finish_playing` status plus a Disconnect — so no watcher is
+    /// left orphaned in `Watching` with a stale keyframe gate when a new publisher
+    /// later reclaims the same stream key. The caller must still invoke
+    /// `notify_publisher_closed` afterward to release the publisher-scoped state.
+    pub(super) fn abort_publisher_watchers(
+        &mut self,
+        publisher_connection_id: usize,
+    ) -> Vec<ServerResult> {
+        let mut server_results = Vec::new();
+        let stream_key = match self
+            .publisher_to_client_map
+            .get(&publisher_connection_id)
+            .and_then(|client_id| self.clients.get(*client_id))
+        {
+            Some(client) => match &client.current_action {
+                ClientAction::Publishing(stream_key) => stream_key.clone(),
+                _ => return server_results,
+            },
+            None => return server_results,
+        };
+        self.handle_publish_finished(String::new(), stream_key, &mut server_results);
+        server_results
+    }
+
     fn handle_session_results(
         &mut self,
         executed_connection_id: usize,
@@ -426,7 +590,20 @@ impl RtmpScheduler {
                 }
 
                 ServerSessionResult::RaisedEvent(event) => {
-                    self.handle_raised_event(executed_connection_id, event, server_results)
+                    // A media event never reaches this watcher-side path, but if
+                    // one ever did and tripped the oversized-header gate, drop
+                    // that connection rather than swallow the abort.
+                    if let Err(e) =
+                        self.handle_raised_event(executed_connection_id, event, server_results)
+                    {
+                        debug!(
+                            "Rtmp connection {} aborted during event handling: {}",
+                            executed_connection_id, e
+                        );
+                        server_results.push(ServerResult::DisconnectConnection {
+                            connection_id: executed_connection_id,
+                        });
+                    }
                 }
 
                 x => debug!("Server result received: {:?}", x),
@@ -439,7 +616,14 @@ impl RtmpScheduler {
         executed_connection_id: usize,
         event: ServerSessionEvent,
         server_results: &mut Vec<ServerResult>,
-    ) {
+    ) -> Result<(), SchedulerError> {
+        // Ingest bound (F2): reject a fatal oversized sequence header BEFORE
+        // dispatching the event, so no watcher side effect is applied for a batch
+        // that is going to abort. The publisher byte path additionally pre-scans
+        // the whole batch, so this is also its belt-and-braces gate.
+        if let Some(err) = oversized_sequence_header_error(&event) {
+            return Err(err);
+        }
         match event {
             ServerSessionEvent::ConnectionRequested {
                 request_id,
@@ -515,6 +699,10 @@ impl RtmpScheduler {
                 data,
                 timestamp,
             } => {
+                // The oversized-video-sequence-header ingest bound (F2) — caching
+                // one would push every late joiner's burst past the 4 MiB
+                // queue-critical threshold — is enforced at the top of this
+                // function via oversized_sequence_header_error.
                 self.handle_audio_video_data_received(
                     stream_key,
                     timestamp,
@@ -530,6 +718,8 @@ impl RtmpScheduler {
                 data,
                 timestamp,
             } => {
+                // Same ingest bound for an oversized audio sequence header,
+                // enforced at the top via oversized_sequence_header_error.
                 self.handle_audio_video_data_received(
                     stream_key,
                     timestamp,
@@ -544,6 +734,7 @@ impl RtmpScheduler {
                 event
             ),
         }
+        Ok(())
     }
 
     fn handle_connection_requested(
@@ -645,6 +836,30 @@ impl RtmpScheduler {
         }
     }
 
+    /// Fold the `server_results` entries added since the previous `play` in this
+    /// batch into the running same-batch prefix for `target`, advancing the scan
+    /// cursor. Every entry is visited at most once across all plays in a batch
+    /// (all of which share the serviced connection), so N repeated plays cost
+    /// O(N) total rather than the O(N^2) of rescanning the whole vec each time.
+    /// Saturating so a pathological batch cannot wrap the accumulator.
+    fn advance_serving_prefix(&mut self, server_results: &[ServerResult], target: usize) -> usize {
+        while self.serving_prefix_scan_pos < server_results.len() {
+            if let ServerResult::OutboundPacket {
+                target_connection_id,
+                packet,
+                ..
+            } = &server_results[self.serving_prefix_scan_pos]
+            {
+                if *target_connection_id == target {
+                    self.serving_prefix_bytes =
+                        self.serving_prefix_bytes.saturating_add(packet.bytes.len());
+                }
+            }
+            self.serving_prefix_scan_pos += 1;
+        }
+        self.serving_prefix_bytes
+    }
+
     fn handle_play_requested(
         &mut self,
         requested_connection_id: usize,
@@ -681,7 +896,25 @@ impl RtmpScheduler {
             self.play_ended(client_id, old_stream_key);
         }
 
+        // Two phases: (1) register the watcher and accept the request while
+        // the client/channel borrows are alive, building the media burst as
+        // pre-flagged ServerResults; (2) run the accept's control results
+        // through handle_session_results (which needs &mut self) and only
+        // then append the burst, preserving control-before-media ordering.
+        // The old single-phase shape funneled the burst through the control
+        // path, which stamped every replayed frame is_video:false — the write
+        // queue then applied the wrong backpressure tier to the entire replay.
+        // Captured before the borrow block (both touch `self`, which the
+        // client/channel borrows below would conflict with):
+        // - the connection's current write-queue backlog, and
+        // - the same-batch prefix already targeting this watcher, folded in
+        //   amortized-O(1) (only entries added since the previous play) so a batch
+        //   of repeated plays stays linear rather than rescanning quadratically.
+        let serving_backlog = self.serving_connection_backlog_bytes;
+        let same_batch_prefix =
+            self.advance_serving_prefix(server_results.as_slice(), requested_connection_id);
         let accept_result;
+        let mut join_burst = Vec::new();
         {
             let client_id = self
                 .connection_to_client_map
@@ -706,151 +939,32 @@ impl RtmpScheduler {
                 .or_insert(MediaChannel::new(self.gop_limit));
 
             channel.watching_client_ids.insert(*client_id);
-            accept_result = match client.session.accept_request(request_id) {
-                Err(error) => Err(error),
-                Ok(mut results) => {
-                    // If the channel already has existing metadata, send that to the new client
-                    // so they have up to date info
-                    match channel.metadata {
-                        None => (),
-                        Some(ref metadata) => {
-                            let packet = match client.session.send_metadata(stream_id, &metadata) {
-                                Ok(packet) => packet,
-                                Err(error) => {
-                                    debug!("Rtmp client error occurred sending existing metadata to new client: {:?}", error);
-                                    server_results.push(ServerResult::DisconnectConnection {
-                                        connection_id: requested_connection_id,
-                                    });
-
-                                    return;
-                                }
-                            };
-
-                            results.push(ServerSessionResult::OutboundResponse(packet));
-                        }
-                    }
-
-                    // If the channel already has sequence headers, send them
-                    match channel.video_sequence_header {
-                        None => (),
-                        Some(ref data) => {
-                            let packet = match client.session.send_video_data(
-                                stream_id,
-                                data.clone(),
-                                channel.video_timestamp,
-                                false,
-                            ) {
-                                Ok(packet) => packet,
-                                Err(error) => {
-                                    debug!("Rtmp client error occurred sending video header to new client: {:?}", error);
-                                    server_results.push(ServerResult::DisconnectConnection {
-                                        connection_id: requested_connection_id,
-                                    });
-
-                                    return;
-                                }
-                            };
-
-                            results.push(ServerSessionResult::OutboundResponse(packet));
-                        }
-                    }
-
-                    match channel.audio_sequence_header {
-                        None => (),
-                        Some(ref data) => {
-                            let packet = match client.session.send_audio_data(
-                                stream_id,
-                                data.clone(),
-                                channel.audio_timestamp,
-                                false,
-                            ) {
-                                Ok(packet) => packet,
-                                Err(error) => {
-                                    debug!("Rtmp client error occurred sending audio header to new client: {:?}", error);
-                                    server_results.push(ServerResult::DisconnectConnection {
-                                        connection_id: requested_connection_id,
-                                    });
-
-                                    return;
-                                }
-                            };
-
-                            results.push(ServerSessionResult::OutboundResponse(packet));
-                        }
-                    }
-
-                    // Use zero-copy API to get frozen GOPs
-                    // FrozenGop clone is O(1), only increments Arc reference count
-                    //
-                    // A watcher must receive a real IDR before any delta frame it
-                    // is expected to decode. Only the first frozen GOP can be
-                    // keyframeless — either the pre-first-IDR headers+audio, or
-                    // (mid-GOP publish start) a run of deltas with no IDR. Replay
-                    // only audio from such a GOP and do not flip the gate until a
-                    // GOP that actually carries an IDR is reached; from then on
-                    // every frame is decodable (normal GOPs start with their IDR).
-                    let mut replayed_idr = false;
-                    for frozen_gop in channel.gops.get_frozen_gops() {
-                        let frames = frozen_gop.frames();
-                        if !replayed_idr && gop_contains_video_keyframe(frames) {
-                            replayed_idr = true;
-                            client.has_received_video_keyframe = true;
-                        }
-                        for frame_data in frames {
-                            match frame_data {
-                                FrameData::Video { timestamp, data } => {
-                                    // Skip undecodable pre-IDR video; the AVC
-                                    // sequence header is already sent separately
-                                    // before this loop.
-                                    if !replayed_idr {
-                                        continue;
-                                    }
-                                    let packet = match client.session.send_video_data(
-                                        stream_id,
-                                        data.clone(),
-                                        *timestamp,
-                                        false,
-                                    ) {
-                                        Ok(packet) => packet,
-                                        Err(error) => {
-                                            debug!("Rtmp client error occurred sending video data to new client: {:?}", error);
-                                            server_results.push(
-                                                ServerResult::DisconnectConnection {
-                                                    connection_id: requested_connection_id,
-                                                },
-                                            );
-
-                                            return;
-                                        }
-                                    };
-                                    results.push(ServerSessionResult::OutboundResponse(packet));
-                                }
-                                FrameData::Audio { timestamp, data } => {
-                                    let packet = match client.session.send_audio_data(
-                                        stream_id,
-                                        data.clone(),
-                                        *timestamp,
-                                        false,
-                                    ) {
-                                        Ok(packet) => packet,
-                                        Err(error) => {
-                                            debug!("Rtmp client error occurred sending audio data to new client: {:?}", error);
-                                            server_results.push(
-                                                ServerResult::DisconnectConnection {
-                                                    connection_id: requested_connection_id,
-                                                },
-                                            );
-
-                                            return;
-                                        }
-                                    };
-                                    results.push(ServerSessionResult::OutboundResponse(packet));
-                                }
-                            }
-                        }
-                    }
-                    Ok(results)
-                }
+            accept_result = client.session.accept_request(request_id);
+            if let Ok(ref accept_results) = accept_result {
+                // The play-accept control packets (Stream Begin,
+                // NetStream.Play.Reset/Start, |RtmpSampleAccess, ...) are
+                // enqueued to THIS watcher's queue BEFORE the burst. Play.Start
+                // echoes the stream key, and a legal key can be ~65 KiB, so one
+                // accept packet alone can rival the 64 KiB headroom. Charge
+                // their real serialized size against the join budget so a
+                // near-full replay plus a fat accept prefix stays under the
+                // Warning threshold instead of dropping delta frames.
+                // Bytes already queued ahead of the replay burst: the connection's
+                // existing backlog, the packets emitted earlier in THIS input batch
+                // that target this watcher (e.g. a createStream flood just before the
+                // play), and this play's own accept-control packets. Charging all
+                // three keeps a near-full GOP under the Warning threshold instead of
+                // shedding delta frames.
+                let accept_prefix_bytes =
+                    join_replay_prefix_bytes(serving_backlog, same_batch_prefix, accept_results);
+                build_join_burst(
+                    channel,
+                    client,
+                    requested_connection_id,
+                    stream_id,
+                    accept_prefix_bytes,
+                    &mut join_burst,
+                );
             }
         }
 
@@ -869,6 +983,10 @@ impl RtmpScheduler {
 
             Ok(results) => {
                 self.handle_session_results(requested_connection_id, results, server_results);
+                // A burst that failed mid-build ends with its own
+                // DisconnectConnection, so appending it verbatim keeps the
+                // error recovery of the old inline path.
+                server_results.extend(join_burst);
             }
         }
     }
@@ -1003,6 +1121,20 @@ impl RtmpScheduler {
         match data_type {
             ReceivedDataType::Video => {
                 if is_sequence_header {
+                    // A codec-config change (a video sequence header whose bytes
+                    // differ from the cached one) invalidates every cached GOP:
+                    // they were encoded under the OLD header, and a late joiner
+                    // that gets the NEW header followed by those OLD-config
+                    // frames decodes garbage. Drop the stale history so replay
+                    // restarts from the new-config GOPs. A byte-identical resend
+                    // (the common keepalive case) leaves the cache untouched.
+                    if channel
+                        .video_sequence_header
+                        .as_ref()
+                        .is_some_and(|cached| cached != &data)
+                    {
+                        channel.gops.clear();
+                    }
                     channel.video_sequence_header = Some(data.clone());
                     channel.video_timestamp = timestamp;
                 }
@@ -1017,6 +1149,19 @@ impl RtmpScheduler {
 
             ReceivedDataType::Audio => {
                 if is_sequence_header {
+                    // Same reasoning as the video path. Audio frames share this
+                    // channel's single GOP cache, so an audio codec change also
+                    // clears the cached video GOPs. That is safe (a joiner just
+                    // replays fewer frames and catches up on the next live IDR)
+                    // and audio-config changes are rare; correctness over a
+                    // marginally longer catch-up.
+                    if channel
+                        .audio_sequence_header
+                        .as_ref()
+                        .is_some_and(|cached| cached != &data)
+                    {
+                        channel.gops.clear();
+                    }
                     channel.audio_sequence_header = Some(data.clone());
                     channel.audio_timestamp = timestamp;
                 }
@@ -1123,8 +1268,24 @@ impl RtmpScheduler {
 
     fn publishing_ended(&mut self, stream_key: String) {
         let should_remove = if let Some(channel) = self.channels.get_mut(&stream_key) {
+            // Reset the FULL publisher-scoped state, not just metadata. During
+            // the close linger the channel outlives its publisher (lingering
+            // watchers keep it), yet `stream_keys` is released at once, so a NEW
+            // publisher can reclaim the same key immediately. If it reuses the
+            // same sequence header, the clear-on-change in
+            // `handle_audio_video_data_received` never fires — without this, a
+            // fresh joiner would replay the PREVIOUS session's cached GOPs and
+            // the new publisher's first IDR would freeze the old open GOP,
+            // mixing two sessions. Watchers already mid-delivery are unaffected:
+            // `build_join_burst` snapshots at join time, so a cleared cache only
+            // means a FUTURE joiner replays fewer frames.
             channel.publishing_client_id = None;
             channel.metadata = None;
+            channel.video_sequence_header = None;
+            channel.audio_sequence_header = None;
+            channel.video_timestamp = RtmpTimestamp { value: 0 };
+            channel.audio_timestamp = RtmpTimestamp { value: 0 };
+            channel.gops.clear();
             channel.should_remove()
         } else {
             return;
@@ -1203,6 +1364,273 @@ fn should_send_to_watcher(
     }
 }
 
+/// The index of the first GOP segment to replay to a joining watcher: the
+/// longest suffix of `sizes` whose byte total stays within `budget`. Whole
+/// segments only — a GOP entered mid-way hands the watcher delta frames whose
+/// IDR was trimmed away, which decodes as a smeared picture.
+///
+/// The accumulation uses `checked_add` so a corrupt or absurd segment size
+/// fails closed (older segments dropped) instead of wrapping around and
+/// admitting the entire cache.
+fn select_replay_start(sizes: &[usize], budget: usize) -> usize {
+    let mut total: usize = 0;
+    let mut start = sizes.len();
+    for (i, &size) in sizes.iter().enumerate().rev() {
+        match total.checked_add(size) {
+            Some(sum) if sum <= budget => {
+                total = sum;
+                start = i;
+            }
+            _ => break,
+        }
+    }
+    start
+}
+
+/// Build the media burst a joining watcher receives, pushing fully-flagged
+/// [`ServerResult::OutboundPacket`]s into `out` (and a
+/// [`ServerResult::DisconnectConnection`], stopping early, if a session send
+/// fails — the same recovery the live fanout uses).
+///
+/// Order: metadata, video sequence header, audio sequence header, then the
+/// GOP segments selected by [`select_replay_start`] oldest -> newest, with
+/// the open (current) GOP as the final segment. The current GOP must be
+/// included: the live delta frames the watcher receives right after joining
+/// reference the current GOP's IDR, so skipping it smears the picture until
+/// the next keyframe arrives.
+///
+/// The sequence headers are sent outside (before) the budget trim,
+/// unconditionally: they are required to decode anything at all and are
+/// enqueued with `is_sequence_header: true`, which the write queue never
+/// drops. Every media frame carries the flags the live path would compute
+/// for it, so downstream backpressure applies the same keep/drop policy to
+/// replayed frames as to live ones (previously the whole burst was
+/// mislabelled as non-video and slipped through the wrong policy tier).
+///
+/// Saturating sum of the bytes already committed to a joining watcher's write
+/// queue AHEAD of the replay burst, which the join-replay budget must subtract so
+/// the burst stays under the frame-dropping Warning threshold:
+/// - `connection_backlog`: bytes already queued on the connection (e.g. an
+///   undrained prior play's replay on a rapid stream switch),
+/// - `same_batch_prefix`: bytes of packets emitted earlier in THIS input batch
+///   that already target the watcher (e.g. a flood of `createStream` responses,
+///   or prior repeated plays' bursts) — accumulated incrementally by
+///   `advance_serving_prefix`, so this helper stays O(1) instead of rescanning,
+/// - this play's own accept-control packets (`OutboundResponse`s).
+/// Every add saturates so a pathological batch cannot wrap the total.
+fn join_replay_prefix_bytes(
+    connection_backlog: usize,
+    same_batch_prefix: usize,
+    accept_results: &[ServerSessionResult],
+) -> usize {
+    let accept_packet_bytes = accept_results
+        .iter()
+        .fold(0usize, |acc, result| match result {
+            ServerSessionResult::OutboundResponse(packet) => acc.saturating_add(packet.bytes.len()),
+            _ => acc,
+        });
+    connection_backlog
+        .saturating_add(same_batch_prefix)
+        .saturating_add(accept_packet_bytes)
+}
+
+/// A watcher must receive a real IDR before any delta frame it is expected
+/// to decode. Only the first replayed segment can be keyframeless — either
+/// the pre-first-IDR headers+audio, or (mid-GOP publish start) a run of
+/// deltas with no IDR. Replay only audio from such a segment and do not flip
+/// the keyframe gate until a segment that actually carries an IDR is reached;
+/// from then on every frame is decodable (normal GOPs start with their IDR).
+fn build_join_burst(
+    channel: &MediaChannel,
+    client: &mut Client,
+    connection_id: usize,
+    stream_id: u32,
+    accept_prefix_bytes: usize,
+    out: &mut Vec<ServerResult>,
+) {
+    // Real serialized wire bytes of everything enqueued to the joiner's queue
+    // ahead of the replayed GOPs. `accept_prefix_bytes` is the play-accept
+    // control burst already enqueued before this call (F1); the metadata and
+    // sequence headers below add to it. All of it is sent OUTSIDE the GOP
+    // replay budget but still occupies the joiner's write queue, so the GOP
+    // budget is reduced by their true size. Without this, a large accept prefix
+    // (a ~65 KiB stream key echoed by NetStream.Play.Start), a large metadata
+    // (encoder string up to ~64 KiB), or a large sequence header could sit on
+    // top of a full-budget GOP burst and push the real queue past the Warning
+    // threshold, dropping delta frames.
+    let mut prefix_wire_bytes = accept_prefix_bytes;
+
+    // If the channel already has existing metadata, send that to the new
+    // client so they have up to date info.
+    if let Some(ref metadata) = channel.metadata {
+        match client.session.send_metadata(stream_id, metadata) {
+            Ok(packet) => {
+                prefix_wire_bytes = prefix_wire_bytes.saturating_add(packet.bytes.len());
+                out.push(ServerResult::OutboundPacket {
+                    target_connection_id: connection_id,
+                    packet,
+                    is_keyframe: false,
+                    is_sequence_header: false,
+                    is_video: false,
+                });
+            }
+            Err(error) => {
+                debug!(
+                    "Rtmp client error occurred sending existing metadata to new client: {:?}",
+                    error
+                );
+                out.push(ServerResult::DisconnectConnection { connection_id });
+                return;
+            }
+        }
+    }
+
+    if let Some(ref data) = channel.video_sequence_header {
+        match client.session.send_video_data(
+            stream_id,
+            data.clone(),
+            channel.video_timestamp,
+            false,
+        ) {
+            Ok(packet) => {
+                prefix_wire_bytes = prefix_wire_bytes.saturating_add(packet.bytes.len());
+                out.push(ServerResult::OutboundPacket {
+                    target_connection_id: connection_id,
+                    packet,
+                    is_keyframe: false,
+                    is_sequence_header: true,
+                    is_video: true,
+                });
+            }
+            Err(error) => {
+                debug!(
+                    "Rtmp client error occurred sending video header to new client: {:?}",
+                    error
+                );
+                out.push(ServerResult::DisconnectConnection { connection_id });
+                return;
+            }
+        }
+    }
+
+    if let Some(ref data) = channel.audio_sequence_header {
+        match client.session.send_audio_data(
+            stream_id,
+            data.clone(),
+            channel.audio_timestamp,
+            false,
+        ) {
+            Ok(packet) => {
+                prefix_wire_bytes = prefix_wire_bytes.saturating_add(packet.bytes.len());
+                out.push(ServerResult::OutboundPacket {
+                    target_connection_id: connection_id,
+                    packet,
+                    is_keyframe: false,
+                    is_sequence_header: true,
+                    is_video: false,
+                });
+            }
+            Err(error) => {
+                debug!(
+                    "Rtmp client error occurred sending audio header to new client: {:?}",
+                    error
+                );
+                out.push(ServerResult::DisconnectConnection { connection_id });
+                return;
+            }
+        }
+    }
+
+    // FrozenGop clone is O(1) (Arc refcount). The segment list is the frozen
+    // GOPs oldest -> newest plus the open GOP as the final segment. Each size
+    // is the segment's real wire size (payload + RTMP chunk framing), and the
+    // budget is the base budget minus the prefix already enqueued above. If the
+    // prefix alone meets/exceeds the budget (an oversized metadata or sequence
+    // header) the budget saturates to zero, so no delta GOP is replayed — the
+    // headers still went out, they are just the whole burst.
+    let budget = JOIN_REPLAY_BUDGET_BYTES.saturating_sub(prefix_wire_bytes);
+    let frozen: Vec<_> = channel.gops.get_frozen_gops().collect();
+    let current_frames = channel.gops.current_frames();
+    let mut sizes: Vec<usize> = frozen
+        .iter()
+        .map(|gop| gop_wire_size(gop.byte_size(), gop.frame_count()))
+        .collect();
+    sizes.push(gop_wire_size(
+        channel.gops.current_byte_size(),
+        current_frames.len(),
+    ));
+    let start = select_replay_start(&sizes, budget);
+
+    let mut replayed_idr = false;
+    for segment_index in start..sizes.len() {
+        let frames = if segment_index < frozen.len() {
+            frozen[segment_index].frames()
+        } else {
+            current_frames
+        };
+        if !replayed_idr && gop_contains_video_keyframe(frames) {
+            replayed_idr = true;
+            client.has_received_video_keyframe = true;
+        }
+        for frame_data in frames {
+            match frame_data {
+                FrameData::Video { timestamp, data } => {
+                    // Skip undecodable pre-IDR video; the AVC sequence header
+                    // is already sent separately above.
+                    if !replayed_idr {
+                        continue;
+                    }
+                    let is_keyframe = is_video_keyframe(data);
+                    let is_sequence_header = is_video_sequence_header(data);
+                    match client
+                        .session
+                        .send_video_data(stream_id, data.clone(), *timestamp, false)
+                    {
+                        Ok(packet) => out.push(ServerResult::OutboundPacket {
+                            target_connection_id: connection_id,
+                            packet,
+                            is_keyframe,
+                            is_sequence_header,
+                            is_video: true,
+                        }),
+                        Err(error) => {
+                            debug!(
+                                "Rtmp client error occurred sending video data to new client: {:?}",
+                                error
+                            );
+                            out.push(ServerResult::DisconnectConnection { connection_id });
+                            return;
+                        }
+                    }
+                }
+                FrameData::Audio { timestamp, data } => {
+                    let is_sequence_header = is_audio_sequence_header(data);
+                    match client
+                        .session
+                        .send_audio_data(stream_id, data.clone(), *timestamp, false)
+                    {
+                        Ok(packet) => out.push(ServerResult::OutboundPacket {
+                            target_connection_id: connection_id,
+                            packet,
+                            is_keyframe: false,
+                            is_sequence_header,
+                            is_video: false,
+                        }),
+                        Err(error) => {
+                            debug!(
+                                "Rtmp client error occurred sending audio data to new client: {:?}",
+                                error
+                            );
+                            out.push(ServerResult::DisconnectConnection { connection_id });
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Whether replaying `frames` gives a watcher a decodable starting point, i.e.
 /// the GOP contains a real IDR (not merely the AVC sequence header or audio).
 /// Used to gate has_received_video_keyframe during GOP replay: a GOP frozen
@@ -1222,6 +1650,43 @@ fn is_video_sequence_header(data: &Bytes) -> bool {
 fn is_audio_sequence_header(data: &Bytes) -> bool {
     // This is assuming aac.
     data.len() >= 2 && data[0] == 0xaf && data[1] == 0x00
+}
+
+/// Whether `data` is a sequence header (of `data_type`) too large to cache.
+/// Only sequence headers are cached and replayed in the join burst, so only
+/// they carry the "poison the cache and disconnect every late joiner" risk; a
+/// large ordinary keyframe is left to the write queue's backpressure policy.
+/// See [`MAX_CACHEABLE_SEQUENCE_HEADER_BYTES`].
+fn is_oversized_sequence_header(data: &Bytes, data_type: ReceivedDataType) -> bool {
+    let is_sequence_header = match data_type {
+        ReceivedDataType::Video => is_video_sequence_header(data),
+        ReceivedDataType::Audio => is_audio_sequence_header(data),
+    };
+    is_sequence_header && data.len() > MAX_CACHEABLE_SEQUENCE_HEADER_BYTES
+}
+
+/// The fatal `OversizedSequenceHeader` error for a raised media event whose
+/// sequence-header data exceeds the cache cap, or `None`. Shared by the
+/// per-event ingest gate in `handle_raised_event` and the publisher-batch
+/// PRE-scan in `publish_bytes_received`, so both reject identically: the pre-scan
+/// stops a fatal header from being applied only AFTER an earlier event in the
+/// same batch (e.g. a `PublishStreamFinished`) already produced watcher side
+/// effects that the abort would then discard, stranding the watcher's finish
+/// status and forcing a double-finalize.
+fn oversized_sequence_header_error(event: &ServerSessionEvent) -> Option<SchedulerError> {
+    let (data, data_type) = match event {
+        ServerSessionEvent::VideoDataReceived { data, .. } => (data, ReceivedDataType::Video),
+        ServerSessionEvent::AudioDataReceived { data, .. } => (data, ReceivedDataType::Audio),
+        _ => return None,
+    };
+    if is_oversized_sequence_header(data, data_type) {
+        Some(SchedulerError::OversizedSequenceHeader {
+            size: data.len(),
+            limit: MAX_CACHEABLE_SEQUENCE_HEADER_BYTES,
+        })
+    } else {
+        None
+    }
 }
 
 fn is_video_keyframe(data: &Bytes) -> bool {
@@ -2433,7 +2898,7 @@ mod tests {
         // Deliver the finish through the real scheduler event path to prove
         // it no longer lands in the `_ => debug!` catch-all.
         let mut results = Vec::new();
-        scheduler.handle_raised_event(
+        let _ = scheduler.handle_raised_event(
             watcher_conn,
             ServerSessionEvent::PlayStreamFinished {
                 app_name: "app".to_string(),
@@ -2472,7 +2937,7 @@ mod tests {
         assert!(scheduler.channels.contains_key("stream_a"));
 
         let mut results = Vec::new();
-        scheduler.handle_raised_event(
+        let _ = scheduler.handle_raised_event(
             watcher_conn,
             ServerSessionEvent::PlayStreamFinished {
                 app_name: "app".to_string(),
@@ -2529,7 +2994,7 @@ mod tests {
         // membership removed and action reset. The channel is NOT GC'd because
         // the publisher still holds it.
         let mut results = Vec::new();
-        scheduler.handle_raised_event(
+        let _ = scheduler.handle_raised_event(
             watcher_conn,
             ServerSessionEvent::PlayStreamFinished {
                 app_name: "app".to_string(),
@@ -2565,7 +3030,7 @@ mod tests {
         // A finish for a stream the client is not watching must not disturb
         // the current play.
         let mut results = Vec::new();
-        scheduler.handle_raised_event(
+        let _ = scheduler.handle_raised_event(
             watcher_conn,
             ServerSessionEvent::PlayStreamFinished {
                 app_name: "app".to_string(),
@@ -2782,6 +3247,973 @@ mod tests {
                 .unwrap()
                 .has_received_video_keyframe,
             "a mismatched channel must not open the client's keyframe gate"
+        );
+    }
+
+    // ---- H8: join burst (flags, budget trim, current-GOP inclusion) ----
+
+    fn make_watching_client(connection_id: usize, stream_key: &str, stream_id: u32) -> Client {
+        let (session, _) = ServerSession::new(ServerSessionConfig::new()).expect("server session");
+        Client {
+            session,
+            connection_id,
+            current_action: ClientAction::Watching {
+                stream_key: stream_key.to_string(),
+                stream_id,
+            },
+            has_received_video_keyframe: false,
+        }
+    }
+
+    fn video_frame(timestamp: u32, data: Bytes) -> FrameData {
+        FrameData::Video {
+            timestamp: RtmpTimestamp { value: timestamp },
+            data,
+        }
+    }
+
+    fn audio_frame(timestamp: u32, data: Bytes) -> FrameData {
+        FrameData::Audio {
+            timestamp: RtmpTimestamp { value: timestamp },
+            data,
+        }
+    }
+
+    /// (is_keyframe, is_sequence_header, is_video) per burst packet; panics on
+    /// any non-packet result so tests fail loudly on unexpected disconnects.
+    fn burst_flags(out: &[ServerResult]) -> Vec<(bool, bool, bool)> {
+        out.iter()
+            .map(|result| match result {
+                ServerResult::OutboundPacket {
+                    is_keyframe,
+                    is_sequence_header,
+                    is_video,
+                    ..
+                } => (*is_keyframe, *is_sequence_header, *is_video),
+                other => panic!("expected OutboundPacket, got {:?}", other),
+            })
+            .collect()
+    }
+
+    /// Whether a burst packet's serialized chunk bytes carry `needle`.
+    /// Frame payloads start inside the first RTMP chunk, so a marker placed
+    /// in a frame's opening bytes is contiguous in the packet.
+    fn packet_contains(result: &ServerResult, needle: &[u8]) -> bool {
+        match result {
+            ServerResult::OutboundPacket { packet, .. } => {
+                packet.bytes.windows(needle.len()).any(|w| w == needle)
+            }
+            _ => false,
+        }
+    }
+
+    /// Total serialized wire bytes of a burst — the real number the write queue
+    /// would enqueue. Used to prove a burst stays under the Warning threshold.
+    fn serialized_burst_len(out: &[ServerResult]) -> usize {
+        out.iter()
+            .map(|result| match result {
+                ServerResult::OutboundPacket { packet, .. } => packet.bytes.len(),
+                _ => 0,
+            })
+            .sum()
+    }
+
+    #[test]
+    fn join_burst_flags_every_packet_like_the_live_path() {
+        let mut channel = MediaChannel::new(10);
+        channel.metadata = Some(Rc::new(StreamMetadata {
+            video_width: None,
+            video_height: None,
+            video_codec_id: Some(7), // AVC
+            video_frame_rate: None,
+            video_bitrate_kbps: None,
+            audio_codec_id: Some(10), // AAC
+            audio_bitrate_kbps: None,
+            audio_sample_rate: None,
+            audio_channels: None,
+            audio_is_stereo: None,
+            encoder: None,
+        }));
+        channel.video_sequence_header = Some(Bytes::from_static(VIDEO_SEQ));
+        channel.audio_sequence_header = Some(Bytes::from_static(AUDIO_SEQ));
+
+        // Frozen GOP: IDR + audio + delta; the second IDR freezes it and
+        // opens the current GOP.
+        channel
+            .gops
+            .save_frame_data(video_frame(0, Bytes::from_static(IDR)), true);
+        channel
+            .gops
+            .save_frame_data(audio_frame(10, Bytes::from_static(AUDIO_FRAME)), false);
+        channel
+            .gops
+            .save_frame_data(video_frame(33, Bytes::from_static(DELTA)), false);
+        channel
+            .gops
+            .save_frame_data(video_frame(66, Bytes::from_static(IDR)), true);
+
+        let mut client = make_watching_client(7, "live", 1);
+        let mut out = Vec::new();
+        build_join_burst(&channel, &mut client, 7, 1, 0, &mut out);
+
+        for result in &out {
+            if let ServerResult::OutboundPacket {
+                target_connection_id,
+                ..
+            } = result
+            {
+                assert_eq!(*target_connection_id, 7);
+            }
+        }
+        assert_eq!(
+            burst_flags(&out),
+            vec![
+                (false, false, false), // metadata
+                (false, true, true),   // video sequence header
+                (false, true, false),  // audio sequence header
+                (true, false, true),   // frozen GOP IDR
+                (false, false, false), // frozen GOP audio
+                (false, false, true),  // frozen GOP delta
+                (true, false, true),   // current GOP IDR
+            ],
+            "every replayed packet must carry the flags the live path computes"
+        );
+        assert!(
+            client.has_received_video_keyframe,
+            "replaying a real IDR must open the keyframe gate"
+        );
+    }
+
+    #[test]
+    fn join_burst_trims_whole_oldest_gops_to_the_byte_budget() {
+        let mut channel = MediaChannel::new(10);
+        channel.video_sequence_header = Some(Bytes::from_static(VIDEO_SEQ));
+        channel.audio_sequence_header = Some(Bytes::from_static(AUDIO_SEQ));
+
+        // Three ~400KiB single-IDR GOPs (marker at data[2]) plus a small
+        // current GOP. Newest-first the 960KiB budget admits current + GOP3 +
+        // GOP2 (~800KiB) but not GOP1.
+        let make_idr = |marker: u8| {
+            let mut data = vec![0u8; 400 * 1024];
+            data[0] = 0x17;
+            data[1] = 0x01;
+            data[2] = marker;
+            Bytes::from(data)
+        };
+        for (i, marker) in [1u8, 2, 3].into_iter().enumerate() {
+            channel
+                .gops
+                .save_frame_data(video_frame(i as u32 * 100, make_idr(marker)), true);
+        }
+        // The fourth IDR freezes GOP3 and becomes the (small) current GOP.
+        channel
+            .gops
+            .save_frame_data(video_frame(300, Bytes::from_static(IDR)), true);
+
+        let mut client = make_watching_client(7, "live", 1);
+        let mut out = Vec::new();
+        build_join_burst(&channel, &mut client, 7, 1, 0, &mut out);
+
+        // vseq + aseq + GOP2 + GOP3 + current — GOP1 trimmed as a whole.
+        assert_eq!(out.len(), 5, "the burst must trim the oldest GOP entirely");
+        assert_eq!(
+            burst_flags(&out)[..2],
+            [(false, true, true), (false, true, false)],
+            "sequence headers are sent outside the budget trim"
+        );
+        assert!(
+            out.iter().all(|p| !packet_contains(p, &[0x17, 0x01, 1])),
+            "no fragment of the trimmed GOP1 may be replayed"
+        );
+        assert!(
+            packet_contains(&out[2], &[0x17, 0x01, 2]),
+            "the replay must start at GOP2's IDR"
+        );
+        assert!(packet_contains(&out[3], &[0x17, 0x01, 3]));
+        assert!(client.has_received_video_keyframe);
+    }
+
+    #[test]
+    fn join_burst_with_only_oversized_gops_sends_headers_only() {
+        let mut channel = MediaChannel::new(10);
+        channel.video_sequence_header = Some(Bytes::from_static(VIDEO_SEQ));
+        channel.audio_sequence_header = Some(Bytes::from_static(AUDIO_SEQ));
+
+        // One frozen GOP and a current GOP, each alone above the budget: no
+        // segment fits, so the burst degrades to the sequence headers.
+        let huge = {
+            let mut data = vec![0u8; JOIN_REPLAY_BUDGET_BYTES + 1];
+            data[0] = 0x17;
+            data[1] = 0x01;
+            Bytes::from(data)
+        };
+        channel
+            .gops
+            .save_frame_data(video_frame(0, huge.clone()), true);
+        channel.gops.save_frame_data(video_frame(100, huge), true);
+
+        let mut client = make_watching_client(7, "live", 1);
+        let mut out = Vec::new();
+        build_join_burst(&channel, &mut client, 7, 1, 0, &mut out);
+
+        assert_eq!(
+            burst_flags(&out),
+            vec![(false, true, true), (false, true, false)],
+            "an oversized cache must degrade to sequence headers only"
+        );
+        assert!(
+            !client.has_received_video_keyframe,
+            "no IDR was replayed, so live deltas must stay gated until a live IDR"
+        );
+    }
+
+    // H8.a regression: the replay used to iterate frozen GOPs only. A joiner
+    // then received live deltas referencing the open GOP's IDR it never got —
+    // a smeared picture until the next keyframe.
+    #[test]
+    fn join_burst_includes_the_open_current_gop_as_the_last_segment() {
+        const CURRENT_IDR: &[u8] = &[0x17, 0x01, 0xB2, 0x00, 0x00];
+        const CURRENT_DELTA: &[u8] = &[0x27, 0x01, 0xB3, 0x00, 0x00];
+
+        let mut channel = MediaChannel::new(10);
+        channel.video_sequence_header = Some(Bytes::from_static(VIDEO_SEQ));
+
+        // Frozen GOP: IDR + delta. Open GOP: a second IDR + delta not yet
+        // frozen by any later keyframe.
+        channel
+            .gops
+            .save_frame_data(video_frame(0, Bytes::from_static(IDR)), true);
+        channel
+            .gops
+            .save_frame_data(video_frame(33, Bytes::from_static(DELTA)), false);
+        channel
+            .gops
+            .save_frame_data(video_frame(66, Bytes::from_static(CURRENT_IDR)), true);
+        channel
+            .gops
+            .save_frame_data(video_frame(99, Bytes::from_static(CURRENT_DELTA)), false);
+
+        let mut client = make_watching_client(7, "live", 1);
+        let mut out = Vec::new();
+        build_join_burst(&channel, &mut client, 7, 1, 0, &mut out);
+
+        // vseq + frozen (IDR, delta) + current (IDR, delta).
+        assert_eq!(
+            out.len(),
+            5,
+            "the open GOP must be replayed after the frozen ones"
+        );
+        assert!(
+            packet_contains(&out[3], CURRENT_IDR),
+            "the open GOP's IDR must be replayed — live deltas reference it"
+        );
+        assert!(packet_contains(&out[4], CURRENT_DELTA));
+        assert_eq!(
+            burst_flags(&out)[3..],
+            [(true, false, true), (false, false, true)]
+        );
+    }
+
+    #[test]
+    fn keyframeless_current_gop_replays_audio_only_and_keeps_the_gate_closed() {
+        let mut channel = MediaChannel::new(10);
+        channel.video_sequence_header = Some(Bytes::from_static(VIDEO_SEQ));
+        channel.audio_sequence_header = Some(Bytes::from_static(AUDIO_SEQ));
+
+        // Publish started mid-GOP: the open GOP holds deltas and audio, no
+        // IDR, and nothing is frozen yet.
+        channel
+            .gops
+            .save_frame_data(video_frame(0, Bytes::from_static(DELTA)), false);
+        channel
+            .gops
+            .save_frame_data(audio_frame(10, Bytes::from_static(AUDIO_FRAME)), false);
+        channel
+            .gops
+            .save_frame_data(video_frame(33, Bytes::from_static(DELTA)), false);
+        channel
+            .gops
+            .save_frame_data(audio_frame(43, Bytes::from_static(AUDIO_FRAME)), false);
+
+        let mut client = make_watching_client(7, "live", 1);
+        let mut out = Vec::new();
+        build_join_burst(&channel, &mut client, 7, 1, 0, &mut out);
+
+        assert_eq!(
+            burst_flags(&out),
+            vec![
+                (false, true, true),   // video sequence header
+                (false, true, false),  // audio sequence header
+                (false, false, false), // audio
+                (false, false, false), // audio
+            ],
+            "undecodable pre-IDR deltas must be skipped while audio still flows"
+        );
+        assert!(
+            !client.has_received_video_keyframe,
+            "a keyframeless replay must not open the gate"
+        );
+    }
+
+    #[test]
+    fn select_replay_start_picks_the_longest_fitting_suffix() {
+        let cases: &[(&[usize], usize, usize)] = &[
+            (&[], 100, 0),    // nothing cached
+            (&[10], 100, 0),  // everything fits
+            (&[100], 100, 0), // exactly the budget fits (<=)
+            (&[101], 100, 1), // a single oversized segment -> none
+            (&[100, 200, 300], 600, 0),
+            (&[100, 200, 300], 599, 1),
+            (&[100, 200, 300], 500, 1),
+            (&[100, 200, 300], 499, 2),
+            (&[100, 200, 300], 300, 2),
+            (&[100, 200, 300], 299, 3),
+            (&[0, 0, 0], 0, 0), // zero-size segments always fit
+            // Overflowing older segments must fail closed — keep the newest
+            // fitting suffix, never wrap around and admit everything.
+            (&[usize::MAX, 100], usize::MAX, 1),
+            (&[usize::MAX - 50, 100], usize::MAX, 1),
+        ];
+        for &(sizes, budget, expected) in cases {
+            assert_eq!(
+                select_replay_start(sizes, budget),
+                expected,
+                "sizes={sizes:?} budget={budget}"
+            );
+        }
+    }
+
+    // ---- F1: the replay budget must count real wire bytes, not raw payload ----
+
+    /// gop_wire_size adds the RTMP chunk framing on top of the raw payload.
+    #[test]
+    fn gop_wire_size_adds_per_frame_and_continuation_framing() {
+        // Empty GOP: no payload, no frames -> no framing.
+        assert_eq!(gop_wire_size(0, 0), 0);
+        // One 100-byte frame -> payload + one type-0 header + one chunk's cont.
+        assert_eq!(
+            gop_wire_size(100, 1),
+            100 + MSG_HEADER_MAX + CONT_HEADER_MAX
+        );
+        // Many small frames: the per-frame header dominates the payload.
+        // 1000 bytes spans a single 4096-byte chunk (one continuation header).
+        assert_eq!(
+            gop_wire_size(1000, 100),
+            1000 + 100 * MSG_HEADER_MAX + CONT_HEADER_MAX
+        );
+        // A payload spanning several chunks accrues one cont header per chunk.
+        let payload = OUTBOUND_CHUNK_SIZE * 3 + 1;
+        assert_eq!(
+            gop_wire_size(payload, 1),
+            payload + MSG_HEADER_MAX + 4 * CONT_HEADER_MAX
+        );
+    }
+
+    /// A metadata packet near the 64 KiB headroom must reduce the GOP budget so
+    /// a GOP that fits the raw-payload budget is trimmed, keeping the real
+    /// serialized burst under the Warning threshold.
+    #[test]
+    fn join_burst_oversized_metadata_trims_gops_below_the_warning_threshold() {
+        const GOP_MARKER: &[u8] = &[0x17, 0x01, 0xC1];
+        let warn = crate::rtmp::write_queue::QUEUE_WARN_BYTES;
+
+        let mut channel = MediaChannel::new(10);
+        // A large-but-legal encoder string (AMF0 UTF8 tops out at 65535 bytes).
+        channel.metadata = Some(Rc::new(StreamMetadata {
+            video_width: None,
+            video_height: None,
+            video_codec_id: Some(7),
+            video_frame_rate: None,
+            video_bitrate_kbps: None,
+            audio_codec_id: None,
+            audio_bitrate_kbps: None,
+            audio_sample_rate: None,
+            audio_channels: None,
+            audio_is_stereo: None,
+            encoder: Some("x".repeat(60_000)),
+        }));
+        channel.video_sequence_header = Some(Bytes::from_static(VIDEO_SEQ));
+        channel.audio_sequence_header = Some(Bytes::from_static(AUDIO_SEQ));
+
+        // A single ~950 KiB IDR GOP: it fits the raw 960 KiB budget, but not
+        // once ~60 KiB of metadata is subtracted.
+        let mut idr = vec![0u8; 950 * 1024];
+        idr[0] = 0x17;
+        idr[1] = 0x01;
+        idr[2] = 0xC1;
+        channel
+            .gops
+            .save_frame_data(video_frame(0, Bytes::from(idr)), true);
+
+        let mut client = make_watching_client(7, "live", 1);
+        let mut out = Vec::new();
+        build_join_burst(&channel, &mut client, 7, 1, 0, &mut out);
+
+        assert!(
+            !out.iter().any(|p| packet_contains(p, GOP_MARKER)),
+            "the oversized-metadata prefix must trim the GOP that the raw budget would have kept"
+        );
+        assert!(
+            serialized_burst_len(&out) <= warn,
+            "the real serialized burst must stay within the Warning threshold ({} <= {})",
+            serialized_burst_len(&out),
+            warn
+        );
+    }
+
+    /// A high-frame-count GOP whose payload alone fits must still be trimmed
+    /// once per-frame chunk framing is counted.
+    #[test]
+    fn join_burst_many_small_frames_framing_trims_older_gops() {
+        const OLD_IDR: &[u8] = &[0x17, 0x01, 0xD1];
+        const NEW_IDR: &[u8] = &[0x17, 0x01, 0xD2];
+        let warn = crate::rtmp::write_queue::QUEUE_WARN_BYTES;
+
+        let mut channel = MediaChannel::new(10);
+        channel.video_sequence_header = Some(Bytes::from_static(VIDEO_SEQ));
+        channel.audio_sequence_header = Some(Bytes::from_static(AUDIO_SEQ));
+
+        // Two GOPs of 3000 x 150-byte frames each. Payload sum (~880 KiB) fits
+        // the 960 KiB budget, but the per-frame framing (3000 x 18 bytes/GOP)
+        // pushes the pair over it, so the older GOP is trimmed as a whole.
+        let idr = |marker: u8| {
+            let mut d = vec![0u8; 150];
+            d[0] = 0x17;
+            d[1] = 0x01;
+            d[2] = marker;
+            Bytes::from(d)
+        };
+        let delta = || {
+            let mut d = vec![0u8; 150];
+            d[0] = 0x27;
+            d[1] = 0x01;
+            Bytes::from(d)
+        };
+        channel
+            .gops
+            .save_frame_data(video_frame(0, idr(0xD1)), true);
+        for i in 0..2999u32 {
+            channel
+                .gops
+                .save_frame_data(video_frame(i + 1, delta()), false);
+        }
+        // The second IDR freezes the first GOP and opens the second.
+        channel
+            .gops
+            .save_frame_data(video_frame(3000, idr(0xD2)), true);
+        for i in 0..2999u32 {
+            channel
+                .gops
+                .save_frame_data(video_frame(3001 + i, delta()), false);
+        }
+
+        let mut client = make_watching_client(7, "live", 1);
+        let mut out = Vec::new();
+        build_join_burst(&channel, &mut client, 7, 1, 0, &mut out);
+
+        assert!(
+            out.iter().any(|p| packet_contains(p, NEW_IDR)),
+            "the newest GOP must be replayed"
+        );
+        assert!(
+            !out.iter().any(|p| packet_contains(p, OLD_IDR)),
+            "framing must trim the older GOP even though its payload alone fits"
+        );
+        assert!(
+            serialized_burst_len(&out) <= warn,
+            "the real serialized burst must stay within the Warning threshold"
+        );
+    }
+
+    /// An oversized sequence header exhausts the budget by itself: the prefix
+    /// subtraction saturates to zero and no delta GOP is replayed — no panic,
+    /// no underflow.
+    #[test]
+    fn join_burst_oversized_sequence_header_replays_zero_gops() {
+        const GOP_MARKER: &[u8] = &[0x17, 0x01, 0xE1];
+
+        let mut channel = MediaChannel::new(10);
+        // A 2 MiB sequence header (adversarial but legal), far over the budget.
+        let mut header = vec![0u8; 2 * 1024 * 1024];
+        header[0] = 0x17;
+        header[1] = 0x00;
+        channel.video_sequence_header = Some(Bytes::from(header));
+
+        let mut idr = vec![0u8; 4096];
+        idr[0] = 0x17;
+        idr[1] = 0x01;
+        idr[2] = 0xE1;
+        channel
+            .gops
+            .save_frame_data(video_frame(0, Bytes::from(idr)), true);
+
+        let mut client = make_watching_client(7, "live", 1);
+        let mut out = Vec::new();
+        // Must not panic on the budget subtraction (saturating to zero).
+        build_join_burst(&channel, &mut client, 7, 1, 0, &mut out);
+
+        assert!(
+            !out.iter().any(|p| packet_contains(p, GOP_MARKER)),
+            "a prefix that exhausts the budget must replay zero GOPs"
+        );
+        assert!(
+            !client.has_received_video_keyframe,
+            "no IDR was replayed, so the keyframe gate must stay closed"
+        );
+    }
+
+    /// F1: the play-accept control packets enqueued ahead of the burst count
+    /// against the GOP budget. A ~64 KiB accept prefix (an oversized stream key
+    /// echoed by NetStream.Play.Start) must trim a GOP the raw budget would
+    /// keep, so the real enqueued bytes (accept prefix + burst) stay under the
+    /// Warning threshold and no delta frame is dropped by backpressure.
+    #[test]
+    fn join_burst_counts_the_accept_prefix_against_the_gop_budget() {
+        const GOP_MARKER: &[u8] = &[0x17, 0x01, 0xF1];
+        let warn = crate::rtmp::write_queue::QUEUE_WARN_BYTES;
+
+        // A single ~950 KiB IDR GOP: it fits the raw 960 KiB budget on its own.
+        let make_channel = || {
+            let mut channel = MediaChannel::new(10);
+            channel.video_sequence_header = Some(Bytes::from_static(VIDEO_SEQ));
+            let mut idr = vec![0u8; 950 * 1024];
+            idr[0] = 0x17;
+            idr[1] = 0x01;
+            idr[2] = 0xF1;
+            channel
+                .gops
+                .save_frame_data(video_frame(0, Bytes::from(idr)), true);
+            channel
+        };
+
+        // Sanity: with no accept prefix the GOP fits and is replayed.
+        let channel = make_channel();
+        let mut client = make_watching_client(7, "live", 1);
+        let mut out = Vec::new();
+        build_join_burst(&channel, &mut client, 7, 1, 0, &mut out);
+        assert!(
+            out.iter().any(|p| packet_contains(p, GOP_MARKER)),
+            "the GOP fits the budget when no accept prefix is charged"
+        );
+
+        // With a ~64 KiB accept prefix the same GOP no longer fits and is
+        // trimmed as a whole, degrading the burst to the sequence header.
+        let channel = make_channel();
+        let accept_prefix = 64 * 1024;
+        let mut client = make_watching_client(7, "live", 1);
+        let mut out = Vec::new();
+        build_join_burst(&channel, &mut client, 7, 1, accept_prefix, &mut out);
+        assert!(
+            !out.iter().any(|p| packet_contains(p, GOP_MARKER)),
+            "the accept prefix must trim the GOP the raw budget would have kept"
+        );
+        assert!(
+            accept_prefix + serialized_burst_len(&out) <= warn,
+            "accept prefix + burst must stay within the Warning threshold ({} + {} <= {})",
+            accept_prefix,
+            serialized_burst_len(&out),
+            warn
+        );
+    }
+
+    // the join-replay budget subtracts backlog + same-batch
+    // prefix + accept packets, every add saturating. The same-batch prefix is now
+    // a pre-accumulated scalar (see the incremental scan test below).
+    #[test]
+    fn join_replay_prefix_sums_backlog_prefix_and_accept_bytes() {
+        let accept = vec![ServerSessionResult::OutboundResponse(Packet {
+            bytes: vec![0u8; 40],
+            can_be_dropped: false,
+        })];
+        // backlog 500 + same-batch prefix 350 + accept 40.
+        assert_eq!(join_replay_prefix_bytes(500, 350, &accept), 500 + 350 + 40);
+        // No accept packets → backlog + prefix only.
+        assert_eq!(join_replay_prefix_bytes(0, 350, &[]), 350);
+        // Nothing queued ahead → zero.
+        assert_eq!(join_replay_prefix_bytes(0, 0, &[]), 0);
+        // Every add saturates: a pathological backlog cannot wrap.
+        assert_eq!(
+            join_replay_prefix_bytes(usize::MAX, 350, &accept),
+            usize::MAX
+        );
+    }
+
+    // repeated plays in one batch must fold the same-batch prefix
+    // INCREMENTALLY (each server_results entry visited once) rather than rescan
+    // the growing vec per play (quadratic — a reachable reactor stall).
+    // advance_serving_prefix advances a cursor and a running total.
+    #[test]
+    fn serving_prefix_scan_is_incremental_and_targeted() {
+        let mut scheduler = RtmpScheduler::new(10);
+        let target = 7usize;
+        let other = 9usize;
+        let outbound = |conn: usize, n: usize| ServerResult::OutboundPacket {
+            target_connection_id: conn,
+            packet: Packet {
+                bytes: vec![0u8; n],
+                can_be_dropped: false,
+            },
+            is_keyframe: false,
+            is_sequence_header: false,
+            is_video: false,
+        };
+        // First play folds the createStream prefix — only target packets count
+        // (100 + 50); the other watcher's 999 is ignored.
+        let mut results = vec![
+            outbound(target, 100),
+            outbound(other, 999),
+            outbound(target, 50),
+        ];
+        assert_eq!(scheduler.advance_serving_prefix(&results, target), 150);
+        assert_eq!(
+            scheduler.serving_prefix_scan_pos, 3,
+            "all three entries consumed exactly once"
+        );
+        // The play appended its accept+burst to the target; the NEXT play sees it
+        // without rescanning the earlier entries.
+        results.push(outbound(target, 200));
+        assert_eq!(scheduler.advance_serving_prefix(&results, target), 350);
+        assert_eq!(
+            scheduler.serving_prefix_scan_pos, 4,
+            "only the newly-appended entry is consumed"
+        );
+        // No new entries → unchanged, cursor stable (idempotent).
+        assert_eq!(scheduler.advance_serving_prefix(&results, target), 350);
+        assert_eq!(scheduler.serving_prefix_scan_pos, 4);
+    }
+
+    // a publisher torn down by a fatal ingest error (an oversized sequence
+    // header rejected on the untrusted byte path) must still finalize its watchers,
+    // or they are orphaned in Watching with a stale keyframe gate when a new
+    // publisher reclaims the key. `abort_publisher_watchers` ends each watcher
+    // (Disconnect) WITHOUT re-feeding the just-errored publisher session.
+    #[test]
+    fn abort_publisher_watchers_disconnects_every_watcher() {
+        let mut scheduler = RtmpScheduler::new(10);
+        let stream_key = "live".to_string();
+        let publisher_connection_id = 1;
+        let watcher_connection_id = 2;
+
+        assert!(scheduler.new_channel(stream_key.clone(), publisher_connection_id));
+        // Register the watcher and move it into Watching on the channel (the accept
+        // fails on the fresh synthetic session, but Watching + membership are set
+        // before that early return — the exact orphan state F2 must finalize).
+        let _ = scheduler.bytes_received(watcher_connection_id, &[]);
+        let mut sink = Vec::new();
+        scheduler.handle_play_requested(
+            watcher_connection_id,
+            1,
+            "app".to_string(),
+            stream_key.clone(),
+            1,
+            &mut sink,
+        );
+        assert_eq!(
+            scheduler
+                .channels
+                .get(&stream_key)
+                .unwrap()
+                .watching_client_ids
+                .len(),
+            1,
+            "watcher must be registered before the abort"
+        );
+
+        let results = scheduler.abort_publisher_watchers(publisher_connection_id);
+        assert!(
+            results.iter().any(|r| matches!(
+                r,
+                ServerResult::DisconnectConnection { connection_id }
+                    if *connection_id == watcher_connection_id
+            )),
+            "the aborted publisher's watcher must receive a Disconnect, not be orphaned"
+        );
+    }
+
+    // ---- F2: bound the cacheable sequence-header size at ingest ----
+
+    /// The size-gate predicate: only a sequence header (not a large ordinary
+    /// keyframe) over the cap is flagged, for both audio and video.
+    #[test]
+    fn oversized_sequence_header_size_gate_predicate() {
+        let over = |first: u8, second: u8| {
+            let mut d = vec![0u8; MAX_CACHEABLE_SEQUENCE_HEADER_BYTES + 1];
+            d[0] = first;
+            d[1] = second;
+            Bytes::from(d)
+        };
+
+        // Normal small headers: never flagged.
+        assert!(!is_oversized_sequence_header(
+            &Bytes::from_static(VIDEO_SEQ),
+            ReceivedDataType::Video
+        ));
+        assert!(!is_oversized_sequence_header(
+            &Bytes::from_static(AUDIO_SEQ),
+            ReceivedDataType::Audio
+        ));
+        // Over-cap sequence headers: flagged for both media types.
+        assert!(is_oversized_sequence_header(
+            &over(0x17, 0x00),
+            ReceivedDataType::Video
+        ));
+        assert!(is_oversized_sequence_header(
+            &over(0xaf, 0x00),
+            ReceivedDataType::Audio
+        ));
+        // A huge NON-header video frame (keyframe 0x17 0x01) is left to the
+        // write queue's backpressure policy, not gated here.
+        assert!(!is_oversized_sequence_header(
+            &over(0x17, 0x01),
+            ReceivedDataType::Video
+        ));
+        // Exactly at the cap is still cacheable (strict `>`).
+        let mut at_cap = vec![0u8; MAX_CACHEABLE_SEQUENCE_HEADER_BYTES];
+        at_cap[0] = 0x17;
+        at_cap[1] = 0x00;
+        assert!(!is_oversized_sequence_header(
+            &Bytes::from(at_cap),
+            ReceivedDataType::Video
+        ));
+    }
+
+    // the event-level predicate shared by the per-event ingest gate and the
+    // publisher-batch pre-scan. Flags only oversized media sequence headers.
+    #[test]
+    fn oversized_sequence_header_error_flags_only_oversized_media() {
+        let media = |video: bool, first: u8, second: u8, len: usize| {
+            let mut d = vec![0u8; len];
+            if len >= 2 {
+                d[0] = first;
+                d[1] = second;
+            }
+            let data = Bytes::from(d);
+            let timestamp = RtmpTimestamp { value: 0 };
+            if video {
+                ServerSessionEvent::VideoDataReceived {
+                    app_name: "a".to_string(),
+                    stream_key: "k".to_string(),
+                    data,
+                    timestamp,
+                }
+            } else {
+                ServerSessionEvent::AudioDataReceived {
+                    app_name: "a".to_string(),
+                    stream_key: "k".to_string(),
+                    data,
+                    timestamp,
+                }
+            }
+        };
+        let over = MAX_CACHEABLE_SEQUENCE_HEADER_BYTES + 1;
+        // Oversized video (0x17 0x00) and audio (0xaf 0x00) sequence headers → fatal.
+        assert!(oversized_sequence_header_error(&media(true, 0x17, 0x00, over)).is_some());
+        assert!(oversized_sequence_header_error(&media(false, 0xaf, 0x00, over)).is_some());
+        // A same-size NON-sequence-header video keyframe (0x17 0x01) is not gated.
+        assert!(oversized_sequence_header_error(&media(true, 0x17, 0x01, over)).is_none());
+        // A small sequence header is fine.
+        assert!(oversized_sequence_header_error(&media(true, 0x17, 0x00, 64)).is_none());
+        // A non-media event is never gated.
+        assert!(
+            oversized_sequence_header_error(&ServerSessionEvent::PublishStreamFinished {
+                app_name: "a".to_string(),
+                stream_key: "k".to_string(),
+            })
+            .is_none()
+        );
+    }
+
+    /// An over-cap sequence header on the untrusted socket ingest path must be
+    /// refused: the publisher is aborted (Err → the reactor's misbehaving-
+    /// publisher removal) and the header is NEVER cached, so a late joiner's
+    /// replay can never carry a header that trips the queue-critical threshold
+    /// and disconnects it.
+    #[test]
+    fn oversized_sequence_header_rejected_at_ingest_not_cached() {
+        let mut scheduler = RtmpScheduler::new(10);
+        let publisher_conn = 100;
+        assert!(scheduler.new_channel("live".to_string(), publisher_conn));
+
+        let mut header = vec![0u8; MAX_CACHEABLE_SEQUENCE_HEADER_BYTES + 1];
+        header[0] = 0x17;
+        header[1] = 0x00;
+        let mut results = Vec::new();
+        let outcome = scheduler.handle_raised_event(
+            usize::MAX,
+            ServerSessionEvent::VideoDataReceived {
+                app_name: "app".to_string(),
+                stream_key: "live".to_string(),
+                data: Bytes::from(header),
+                timestamp: RtmpTimestamp { value: 1 },
+            },
+            &mut results,
+        );
+
+        assert!(
+            matches!(outcome, Err(SchedulerError::OversizedSequenceHeader { .. })),
+            "an over-cap sequence header must abort the publisher at ingest"
+        );
+        assert!(
+            results.is_empty(),
+            "a rejected header must not be cached or fanned out"
+        );
+        assert!(
+            scheduler.channel_video_sequence_header("live").is_none(),
+            "an over-cap sequence header must never enter the cache"
+        );
+        assert_eq!(
+            scheduler.channel_frozen_gop_count("live"),
+            0,
+            "an over-cap header must not be saved into the GOP cache either"
+        );
+    }
+
+    // ---- F4: a codec-config change must not replay old-config GOPs ----
+
+    /// After a video sequence-header change, cached GOPs from the old config are
+    /// dropped: a joiner arriving after the change never receives an old IDR.
+    #[test]
+    fn codec_config_change_clears_stale_gops_from_the_replay() {
+        const VIDEO_SEQ_A: &[u8] = &[0x17, 0x00, 0x00, 0x00, 0x00, 0x01, 0x64];
+        const VIDEO_SEQ_B: &[u8] = &[0x17, 0x00, 0x00, 0x00, 0x00, 0x01, 0x2a];
+        const IDR_A1: &[u8] = &[0x17, 0x01, 0xa1, 0x00, 0x00];
+        const IDR_A2: &[u8] = &[0x17, 0x01, 0xa2, 0x00, 0x00];
+        const IDR_B: &[u8] = &[0x17, 0x01, 0xb1, 0x00, 0x00];
+
+        let mut scheduler = RtmpScheduler::new(10);
+        let publisher_conn = 100;
+        assert!(scheduler.new_channel("live".to_string(), publisher_conn));
+
+        // Old config: header A then two IDRs, so a GOP-A is frozen and one is open.
+        feed_media(&mut scheduler, publisher_conn, 0x09, 0, VIDEO_SEQ_A);
+        feed_media(&mut scheduler, publisher_conn, 0x09, 33, IDR_A1);
+        feed_media(&mut scheduler, publisher_conn, 0x09, 66, IDR_A2);
+        assert!(
+            scheduler.channels.get("live").unwrap().gops.frozen_count() >= 1,
+            "a GOP-A must be frozen before the config change"
+        );
+
+        // Config change: a DIFFERENT header B, then a new-config IDR.
+        feed_media(&mut scheduler, publisher_conn, 0x09, 99, VIDEO_SEQ_B);
+        feed_media(&mut scheduler, publisher_conn, 0x09, 132, IDR_B);
+
+        let channel = scheduler.channels.get("live").unwrap();
+        assert_eq!(
+            channel.video_sequence_header.as_deref(),
+            Some(VIDEO_SEQ_B),
+            "the latest header must be cached"
+        );
+
+        let mut client = make_watching_client(7, "live", 1);
+        let mut out = Vec::new();
+        build_join_burst(channel, &mut client, 7, 1, 0, &mut out);
+
+        assert!(
+            out.iter().any(|p| packet_contains(p, IDR_B)),
+            "the new-config IDR must be replayable to a joiner"
+        );
+        assert!(
+            !out.iter().any(|p| packet_contains(p, &[0x17, 0x01, 0xa1])),
+            "the old-config IDR A1 must have been cleared on the header change"
+        );
+        assert!(
+            !out.iter().any(|p| packet_contains(p, &[0x17, 0x01, 0xa2])),
+            "the old-config IDR A2 must have been cleared on the header change"
+        );
+    }
+
+    /// A byte-identical sequence-header resend (keepalive) must NOT clear the
+    /// cache — otherwise every duplicate header would wipe the replay history.
+    #[test]
+    fn identical_sequence_header_resend_keeps_the_gop_cache() {
+        const IDR_1: &[u8] = &[0x17, 0x01, 0x51, 0x00, 0x00];
+        const IDR_2: &[u8] = &[0x17, 0x01, 0x52, 0x00, 0x00];
+
+        let mut scheduler = RtmpScheduler::new(10);
+        let publisher_conn = 100;
+        assert!(scheduler.new_channel("live".to_string(), publisher_conn));
+
+        feed_media(&mut scheduler, publisher_conn, 0x09, 0, VIDEO_SEQ);
+        feed_media(&mut scheduler, publisher_conn, 0x09, 33, IDR_1);
+        feed_media(&mut scheduler, publisher_conn, 0x09, 66, IDR_2);
+        let frozen_before = scheduler.channels.get("live").unwrap().gops.frozen_count();
+        assert!(frozen_before >= 1);
+
+        // Re-send the SAME header: a keepalive, not a config change.
+        feed_media(&mut scheduler, publisher_conn, 0x09, 99, VIDEO_SEQ);
+
+        let channel = scheduler.channels.get("live").unwrap();
+        assert_eq!(
+            channel.gops.frozen_count(),
+            frozen_before,
+            "an identical header resend must not clear the GOP cache"
+        );
+        let mut client = make_watching_client(7, "live", 1);
+        let mut out = Vec::new();
+        build_join_burst(channel, &mut client, 7, 1, 0, &mut out);
+        assert!(
+            out.iter().any(|p| packet_contains(p, &[0x17, 0x01, 0x51])),
+            "the cached IDR must survive an identical header resend"
+        );
+    }
+
+    /// F4: when publisher A ends while a slow watcher lingers (the channel
+    /// survives), a NEW publisher B that reclaims the same key with the SAME
+    /// sequence header must not replay A's cached GOPs. The clear-on-change gate
+    /// cannot fire for an identical header, so publisher-end must reset the full
+    /// channel state (headers, timestamps, GOP cache) — a fresh joiner then sees
+    /// only B's session.
+    #[test]
+    fn publisher_end_resets_channel_so_same_key_reuse_replays_only_the_new_session() {
+        const IDR_A: &[u8] = &[0x17, 0x01, 0xa1, 0x00, 0x00];
+        const IDR_B: &[u8] = &[0x17, 0x01, 0xb1, 0x00, 0x00];
+
+        let mut scheduler = RtmpScheduler::new(10);
+        let publisher_a = 100;
+        let publisher_b = 101;
+        let lingering_watcher = 2;
+
+        // Publisher A publishes header H and IDR-A while a watcher is attached
+        // (so the channel outlives A's departure).
+        assert!(scheduler.new_channel("live".to_string(), publisher_a));
+        play(&mut scheduler, lingering_watcher, "live");
+        feed_media(&mut scheduler, publisher_a, 0x09, 0, VIDEO_SEQ);
+        feed_media(&mut scheduler, publisher_a, 0x09, 33, IDR_A);
+        assert_eq!(
+            scheduler.channel_video_sequence_header("live").as_deref(),
+            Some(VIDEO_SEQ),
+            "publisher A's header must be cached before it ends"
+        );
+
+        // Publisher A ends. The lingering watcher keeps the channel alive, but
+        // its publisher-scoped state must be fully reset.
+        scheduler.notify_publisher_closed(publisher_a);
+        assert!(
+            scheduler.channels.contains_key("live"),
+            "the lingering watcher must keep the channel alive"
+        );
+        assert!(
+            scheduler.channel_video_sequence_header("live").is_none(),
+            "publisher-end must clear the cached sequence header"
+        );
+
+        // Publisher B reclaims the same key with the SAME header and its own IDR.
+        assert!(scheduler.new_channel("live".to_string(), publisher_b));
+        feed_media(&mut scheduler, publisher_b, 0x09, 0, VIDEO_SEQ);
+        feed_media(&mut scheduler, publisher_b, 0x09, 33, IDR_B);
+
+        // A fresh joiner must receive ONLY publisher B's IDR, never A's.
+        let channel = scheduler.channels.get("live").unwrap();
+        let mut joiner = make_watching_client(7, "live", 1);
+        let mut out = Vec::new();
+        build_join_burst(channel, &mut joiner, 7, 1, 0, &mut out);
+        assert!(
+            out.iter().any(|p| packet_contains(p, IDR_B)),
+            "the new session's IDR must be replayable"
+        );
+        assert!(
+            !out.iter().any(|p| packet_contains(p, IDR_A)),
+            "the previous session's IDR must never leak into the new session"
         );
     }
 }
