@@ -287,6 +287,8 @@ fn abort_emits_no_warn_or_error() {
     std::thread::sleep(Duration::from_millis(200));
     scheduler.abort();
 
-    // abort() returns immediately; detached threads wind down on their own.
+    // abort() signals a hard abort, then blocks until every tracked worker
+    // releases its slot (the scheduler guard waits on drop); a worker that sees
+    // the abort at its cleanup gate skips its flush/trailer.
     assert_no_noise("abort()");
 }

@@ -42,12 +42,20 @@ impl Drop for SetEncRegisteredOnDrop {
 
 // Internal wrapper for Running state to enable Drop implementation.
 //
-// This guard ensures that when a FfmpegScheduler<Running> (or Paused) is dropped,
-// all worker threads are properly terminated and output files are finalized.
+// When a FfmpegScheduler<Running> (or Paused) is dropped, this guard signals the
+// job to terminate and blocks until every tracked worker has released its slot.
+// A released slot does not mean the OS thread has fully unwound (a detached
+// closure can keep destructing its captures afterward); lifetime safety relies on
+// each worker finishing its dangerous resource access before releasing its slot,
+// and on this guard keeping `_interrupt_state` alive until then. It does NOT by
+// itself guarantee a finalized output: a normal (non-abort) mux teardown only
+// ATTEMPTS the trailer, and abort, a spawn failure, a failing trailer, or a
+// streamless output can leave an output unfinalized.
 //
-// IMPORTANT: Drop only runs when the scheduler goes out of scope normally.
-// If the process exits abruptly (e.g., via std::process::exit() or panic in main),
-// Drop will NOT run and files may be corrupted.
+// IMPORTANT: Drop runs whenever the scheduler is dropped, including while a panic
+// unwinds. It is skipped only on non-unwinding termination — `panic = "abort"`,
+// std::process::abort(), or std::process::exit() — where workers may be left
+// mid-write and files corrupted.
 //
 // The guard is passed through state transitions (Running -> Paused -> Running)
 // via into_state() to maintain Drop protection across all active states.
@@ -57,16 +65,18 @@ struct RunningGuard {
     // Demuxer choke waiters: a stopping scheduler must notify them or a
     // choked demuxer sleeps through the shutdown and joining hangs.
     demux_waiters: Vec<Arc<crate::util::sch_waiter::SchWaiter>>,
-    // Keeps the interrupt-callback state alive until every worker thread has
-    // exited: FfmpegScheduler's ffmpeg_context field (the other Arc holder)
+    // Keeps the interrupt-callback state alive until every tracked worker has
+    // released its slot: FfmpegScheduler's ffmpeg_context field (the other Arc holder)
     // drops BEFORE this guard, while threads may still be inside blocking
     // I/O whose AVIOInterruptCB points into this allocation.
     _interrupt_state: Arc<crate::core::context::InterruptState>,
 }
 
 impl Drop for RunningGuard {
-    /// Ensures graceful shutdown when scheduler is dropped.
-    /// Blocks until all threads complete to prevent data corruption.
+    /// Signals termination and blocks until every tracked worker releases its
+    /// slot, keeping `_interrupt_state` alive until then so a worker still inside
+    /// a blocking custom-IO callback never dereferences freed state. Finalization
+    /// on a normal teardown is best-effort, not guaranteed here.
     fn drop(&mut self) {
         // Always ensure STATUS_END is set
         if !is_stopping(self.status.load(Ordering::Acquire)) {
@@ -84,11 +94,11 @@ impl Drop for RunningGuard {
             waiter.set(false);
         }
 
-        // Always wait for all threads to complete
-        // This is safe to call multiple times - if threads are already done (counter==0),
+        // Always wait for all tracked workers to release their slots
+        // This is safe to call multiple times - if the counter is already zero,
         // wait_for_all_threads() returns immediately without blocking.
         // This ensures cleanup works correctly after both abort() and stop().
-        log::debug!("Drop waiting for all threads to finish");
+        log::debug!("Drop waiting for tracked workers to release their slots");
         self.thread_sync.wait_for_all_threads();
     }
 }
@@ -711,43 +721,39 @@ impl FfmpegScheduler<Running> {
         take_scheduler_result(&self.result)
     }
 
-    /// **WARNING: Immediately aborts the FFmpeg job without waiting for threads to complete.**
+    /// **WARNING: Hard-aborts the FFmpeg job. A worker that observes the abort at
+    /// its cleanup gate skips its flush/trailer, and an in-progress finalize can
+    /// be interrupted, so output usability is not guaranteed.**
     ///
-    /// This method signals all threads to stop and returns **immediately**. It does NOT wait
-    /// for threads to finish their work, which means:
+    /// This publishes a hard-abort signal, then blocks until every tracked worker
+    /// releases its slot (the scheduler's guard waits on drop). A
+    /// worker samples the status at its cleanup gate: if it observes
+    /// `STATUS_ABORT` there, it skips its encoder flush / muxer trailer. Already
+    /// written data is not removed, but a finalize already in flight can be cut
+    /// short — `STATUS_ABORT` trips the output interrupt callback immediately,
+    /// bypassing the trailer grace window, so an in-progress write may fail or
+    /// truncate. It is NOT a non-blocking call, and the wait has no fixed time
+    /// bound — a codec, filter, or blocking custom-IO callback that is mid-call
+    /// must still return first. Relative to `stop()`:
     ///
-    /// - **Output files WILL BE UNUSABLE** (missing trailer, encoder buffers not flushed)
-    /// - **Encoded data in buffers will be lost** (B-frames, delayed frames)
-    /// - **Files will NOT be seekable or playable** in most media players
-    /// - Only use this when you **do not need the output files at all**
+    /// - Encoder-buffered frames (B-frames / delayed frames) may be lost
+    /// - A muxer left without its trailer may not be seekable/playable — this
+    ///   depends on the format (a streamable one like MPEG-TS may still play; an
+    ///   MP4 needs its moov atom)
+    /// - Data already written to disk is NOT removed: aborting a job whose workers
+    ///   had already finished naturally leaves the finalized files intact
     ///
     /// # When to Use
     ///
-    /// - Emergency shutdown scenarios where speed is critical
+    /// - Emergency shutdown where you do not need the (possibly partial) output
     /// - Preview/test runs where output is discarded
     /// - User cancellation where output is not needed
     ///
-    /// # When NOT to Use
-    ///
-    /// - **NEVER** when you need valid output files → **Use [`stop()`](Self::stop) instead**
-    ///
-    /// # Why Files Are Unusable
-    ///
-    /// `abort()` causes:
-    /// 1. Encoder to skip flush -> buffered frames lost
-    /// 2. Muxer to skip trailer -> no seeking, no playback in most players
-    ///
-    /// **The ONLY way to get valid files is to use `stop()` instead of `abort()`.**
-    ///
-    /// # Comparison
-    ///
-    /// ```rust,ignore
-    /// // WRONG: Files will be unusable
-    /// scheduler.abort();
-    ///
-    /// // CORRECT: Files will be valid and playable
-    /// scheduler.stop();
-    /// ```
+    /// For finalized files, use [`stop()`](Self::stop), or let a finite input
+    /// finish naturally and check [`wait()`](Self::wait) returns `Ok` — both let
+    /// the normal encoder drain and post-header finalization run (and report a
+    /// failure), which `abort()` can short-circuit when it observes the abort at
+    /// its cleanup gate.
     ///
     /// # Example
     /// ```rust,ignore
@@ -761,58 +767,83 @@ impl FfmpegScheduler<Running> {
         self.wake_demux_waiters();
     }
 
-    /// Gracefully stops the FFmpeg job and waits for all threads to complete.
+    /// Gracefully stops the FFmpeg job, blocking until every tracked worker has
+    /// released its slot, then returns any error a worker recorded.
     ///
-    /// This method **blocks** until all processing is finished and ensures **complete data integrity**.
-    /// All encoder buffers are flushed, all output files are properly finalized with trailers,
-    /// and all threads are cleanly terminated.
+    /// # What is finalized
     ///
-    /// # Guarantees
+    /// On the normal (non-abort) mux-worker teardown, an output that has already
+    /// written its header has `av_write_trailer` attempted on it — usually
+    /// producing a well-formed container (e.g. the MP4 moov atom, MKV Cues),
+    /// though a failing trailer write surfaces as `Err` and a worker panic before
+    /// the trailer can leave the output without one. A streamless
+    /// (`AVFMT_NOSTREAMS`) output writes no header or trailer at all. If `stop()`
+    /// is called after `start()` succeeds but BEFORE an output's muxer has
+    /// initialized, that output may be left empty or never created while `stop()`
+    /// can still return `Ok(())` (a mux-worker spawn failure instead records
+    /// `Err`). Whether a finalized file is seekable/playable then depends on the
+    /// format and, for custom-IO / URL outputs, the sink — not an unconditional
+    /// guarantee.
     ///
-    /// - All buffered frames are encoded and written
-    /// - Output files contain proper headers and trailers (e.g., MP4 moov atom, MKV Cues)
-    /// - Files are seekable and playable in all media players
-    /// - No data loss or corruption
+    /// # In-flight frames are NOT drained into the output
     ///
-    /// # When to Use
+    /// `stop()` is a prompt teardown, not a pipeline flush. An opened, unfinished,
+    /// non-subtitle encoder attempts a lookahead flush on a graceful stop
+    /// (`avcodec_send_frame(NULL)`),
+    /// but by then the muxer may already have torn down — the first flushed packet
+    /// meeting a disconnected receiver ends the drain — so those packets, together
+    /// with anything still queued toward the muxer when `stop()` was called, may
+    /// be discarded and the media tail may end earlier than it would after a full
+    /// drain. How much is lost depends on queue occupancy, the stream time base,
+    /// and filter and encoder delay; there is no fixed media-duration bound.
     ///
-    /// - **Always use this** when you need valid output files
-    /// - Production transcoding workflows
-    /// - Before exiting the application
-    /// - Any scenario where output quality matters
+    /// To avoid the extra tail loss `stop()` introduces, let a finite input
+    /// reach its natural end and confirm [`wait()`](Self::wait) returns `Ok`
+    /// rather than calling `stop()` mid-stream. (Natural completion still omits
+    /// whatever `-shortest`, frame/time limits, filters, or errors drop.)
     ///
     /// # Comparison with abort()
     ///
-    /// | Method | Blocks? | Data Integrity | Use Case |
-    /// |--------|---------|----------------|----------|
-    /// | `stop()` | Yes | Guaranteed | Production, need valid files |
-    /// | `abort()` | No | Not guaranteed | Emergency, don't care about files |
+    /// | Method | Signal | Blocks | Trailer | In-flight frames |
+    /// |--------|--------|----------------|---------|------------------|
+    /// | `stop()`  | graceful | Yes | attempted (normal teardown) | tail may be dropped |
+    /// | `abort()` | hard     | Yes | not guaranteed              | may be lost |
+    ///
+    /// Both block until every tracked worker releases its slot (the scheduler's
+    /// guard waits on drop), with no fixed time bound. A worker that observes the
+    /// abort at its cleanup gate skips its flush/trailer, and an in-progress
+    /// finalize may be interrupted, so `abort()`'s output is not guaranteed
+    /// usable — but it usually returns faster with nothing left to finalize.
     ///
     /// # Returns
     ///
-    /// - `Ok(())` — the job wound down cleanly and every output was fully
-    ///   finalized.
+    /// - `Ok(())` — no worker recorded an error. Only an output that wrote a
+    ///   header AND reached the normal mux-worker trailer path completed a
+    ///   trailer; a streamless (`AVFMT_NOSTREAMS`) or pre-init output finishes
+    ///   without one, and a mux-worker spawn failure records `Err` instead.
     /// - `Err(...)` — the first error any worker recorded, including trailer
-    ///   write failures that were previously swallowed (a stop() used to
-    ///   return `()` and could not report them).
+    ///   write failures a `()`-returning stop() previously could not report.
     ///
     /// # Blocking caveat
     ///
     /// While an output is finalizing (e.g. a `movflags=+faststart` trailer
     /// rewriting the file), `stop()` blocks without a timeout rather than
-    /// cutting the write and corrupting the output. [`abort()`](Self::abort)
-    /// remains the hard-cancel escape hatch.
+    /// cutting the write and corrupting the output. `stop()` consumes the
+    /// scheduler, so no handle is left to `abort()` a slow finalize; choosing
+    /// `abort()` up front lets a worker skip any finalization it has not reached
+    /// at its cleanup gate, though its own wait can still block indefinitely (see
+    /// [`abort()`](Self::abort)).
     ///
     /// # Example
     /// ```rust,ignore
     /// let running_scheduler = scheduler.start().unwrap();
     /// // ... processing ...
-    /// running_scheduler.stop()?; // Blocks until complete, files are valid
+    /// running_scheduler.stop()?; // Blocks; normal teardown attempts finalization
     /// ```
     pub fn stop(self) -> crate::error::Result<()> {
         self.signal_stop();
         self.thread_sync.wait_for_all_threads();
-        log::debug!("stop() completed, all threads finished");
+        log::debug!("stop() completed, all tracked workers released their slots");
         take_scheduler_result(&self.result)
     }
 }
@@ -874,7 +905,7 @@ impl std::future::Future for FfmpegScheduler<Running> {
 
         let this = self.get_mut();
 
-        // Gate readiness on every worker thread having finished, NOT on the
+        // Gate readiness on every tracked worker having released its slot, NOT on the
         // terminal status: on a mux panic the status and the error can be
         // published in either order, so a status-only check can complete the
         // Future with a mid-unwind Ok(()). The counter reaching 0 means every
@@ -888,7 +919,7 @@ impl std::future::Future for FfmpegScheduler<Running> {
         let waker = cx.waker().clone();
         thread_sync.set_waker(waker);
 
-        // Re-check after registering the waker: the last thread may have finished
+        // Re-check after registering the waker: the last tracked slot may be released
         // (and consumed a previous waker) between the check above and set_waker,
         // in which case no further wake ever comes for the waker just installed.
         if this.thread_sync.all_threads_done() {
@@ -928,18 +959,20 @@ impl FfmpegScheduler<Paused> {
         self.into_state()
     }
 
-    /// **WARNING: Immediately aborts the paused FFmpeg job without waiting for threads to complete.**
+    /// **WARNING: Hard-aborts the paused FFmpeg job. A worker that observes the
+    /// abort at its cleanup gate skips its flush/trailer, and an in-progress
+    /// finalize can be interrupted, so output usability is not guaranteed.**
     ///
-    /// This method has the **exact same behavior and consequences** as [`FfmpegScheduler<Running>::abort()`]:
+    /// Same behavior and consequences as [`FfmpegScheduler<Running>::abort()`],
+    /// including that it blocks until every tracked worker releases its slot (via
+    /// the scheduler guard) — it is NOT a non-blocking call. In short: encoder-buffered frames
+    /// may be lost and a muxer may be left without its trailer, so the output is
+    /// not guaranteed seekable/playable. For finalized files,
+    /// [`resume()`](Self::resume) first; then either call
+    /// [`stop()`](FfmpegScheduler::stop), or let a finite input finish naturally
+    /// and check `wait()` (a paused job cannot advance on its own).
     ///
-    /// - **Output files WILL BE UNUSABLE** (missing trailer, encoder buffers not flushed)
-    /// - **Encoded data in buffers will be lost** (B-frames, delayed frames)
-    /// - **Files will NOT be seekable or playable** in most media players
-    /// - Only use this when you **do not need the output files at all**
-    ///
-    /// **The ONLY way to get valid files is to use [`stop()`](FfmpegScheduler::stop) instead of `abort()`.**
-    ///
-    /// See [`FfmpegScheduler<Running>::abort()`] for complete documentation.
+    /// See [`FfmpegScheduler<Running>::abort()`] for the full contract.
     ///
     /// # Example
     /// ```rust,ignore
@@ -1730,7 +1763,7 @@ mod tests {
             sleep(Duration::from_millis(50));
         }
 
-        // stop() should block until all threads complete
+        // stop() should block until all tracked workers release their slots
         scheduler.stop().expect("graceful stop must succeed");
 
         // Verify output file exists and has content
