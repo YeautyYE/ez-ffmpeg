@@ -264,7 +264,7 @@ fn graceful_stop_emits_no_warn_or_error() {
         .unwrap();
 
     std::thread::sleep(Duration::from_millis(200));
-    scheduler.stop();
+    scheduler.stop().expect("graceful stop() must return Ok");
 
     assert_no_noise("graceful stop()");
 }

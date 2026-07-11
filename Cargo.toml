@@ -91,6 +91,9 @@ features = ["async", "opengl", "rtmp", "flv", "subtitle", "wgpu"]
 [dev-dependencies]
 env_logger = "0.10"
 tokio = { version = "1", features = ["full"] }
+# Integration tests shrink socket buffers (SO_RCVBUF) via setsockopt to make
+# backpressure deterministic; libc is already a normal dependency.
+libc = "0.2.159"
 # Integration tests re-open output files and inspect raw AVStream fields
 # (extradata / codec_type) that the public StreamInfo API does not expose.
 ffmpeg-sys-next = "8.1.0"

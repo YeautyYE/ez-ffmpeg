@@ -271,3 +271,159 @@ fn shortest_with_max_frames_bounds_infinite_streams() {
         "video should be capped near 30 frames, got {frames}"
     );
 }
+
+/// H1 regression: an encoder that stops at `recording_time` (LimitReached)
+/// must still tell the sync queue its stream is finished. Coarse video frames
+/// (2 fps: half-second end timestamps) plus fine audio frames pin the queue
+/// head at the audio's boundary; without the finish, the video's post-limit
+/// frames gate forever, its EOF marker never reaches the muxer, and the job
+/// hangs — the heartbeat mathematically cannot fire with a stuck window this
+/// far below the 10s default buffer.
+#[test]
+fn shortest_recording_time_finishes_sibling_with_coarse_frames() {
+    let out = tmp_path("shortest_recording_time.mp4");
+    let scheduler = FfmpegContext::builder()
+        .input(Input::from("sine=frequency=440:sample_rate=44100").set_format("lavfi"))
+        .input(Input::from("color=c=black:s=320x240:r=2:d=4").set_format("lavfi"))
+        .output(
+            Output::from(out.as_str())
+                .add_stream_map("0:a")
+                .add_stream_map("1:v")
+                .set_audio_codec("aac")
+                .set_video_codec("mpeg4")
+                .set_shortest(true)
+                .set_recording_time_us(2_000_000),
+        )
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let result = wait_with_watchdog(scheduler, 60, "recording_time under -shortest");
+    assert!(result.is_ok(), "recording_time job failed: {result:?}");
+
+    let frames = video_nb_frames(&out);
+    assert!(
+        (3..=6).contains(&frames),
+        "2 fps video cut at ~2s should hold 3..=6 frames, got {frames}"
+    );
+    let audio_secs = audio_duration_secs(&out);
+    assert!(
+        (1.5..=2.6).contains(&audio_secs),
+        "audio should stop near the 2s recording_time, got {audio_secs}"
+    );
+}
+
+/// H1 with three sync-queue members: the encoder-side finish must cascade
+/// through N>2 streams too.
+#[test]
+fn shortest_recording_time_cascades_across_three_streams() {
+    let out = tmp_path("shortest_recording_time_three.mp4");
+    let scheduler = FfmpegContext::builder()
+        .input(Input::from("sine=frequency=440:sample_rate=44100").set_format("lavfi"))
+        .input(Input::from("color=c=black:s=320x240:r=2:d=4").set_format("lavfi"))
+        .input(Input::from("color=c=white:s=320x240:r=30").set_format("lavfi"))
+        .output(
+            Output::from(out.as_str())
+                .add_stream_map("0:a")
+                .add_stream_map("1:v")
+                .add_stream_map("2:v")
+                .set_audio_codec("aac")
+                .set_video_codec("mpeg4")
+                .set_shortest(true)
+                .set_recording_time_us(2_000_000),
+        )
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let result = wait_with_watchdog(scheduler, 60, "recording_time cascade across three");
+    assert!(
+        result.is_ok(),
+        "three-member recording_time job failed: {result:?}"
+    );
+
+    // The first video stream is the 2 fps one: bounded by the 2s limit.
+    let frames = video_nb_frames(&out);
+    assert!(
+        (3..=6).contains(&frames),
+        "2 fps video cut at ~2s should hold 3..=6 frames, got {frames}"
+    );
+}
+
+/// H2 regression: a cascade-cut encoder must hand its input channel back to a
+/// SHARED filtergraph before waiting out its drain. The graph is paced to
+/// wall clock and its `[slow]` branch dries up at 1.5s without reaching EOF,
+/// so pre-fix the graph parks in send() on the cut `[fast]` encoder's full
+/// channel while `[fast]` waits on a head only `[slow]` could advance — a
+/// three-party deadlock the heartbeat cannot break.
+#[test]
+fn shortest_shared_graph_survives_cascade_cut() {
+    let out = tmp_path("shortest_shared_graph.mp4");
+    let scheduler = FfmpegContext::builder()
+        .input(
+            Input::from("color=c=black:s=320x240:r=30:d=6")
+                .set_format("lavfi")
+                .set_readrate(1.0),
+        )
+        .input(Input::from("sine=frequency=440:duration=2").set_format("lavfi"))
+        .filter_desc("[0:v]split=2[fast][pre];[pre]select='lt(n,45)'[slow]")
+        .output(
+            Output::from(out.as_str())
+                .add_stream_map("[fast]")
+                .add_stream_map("[slow]")
+                .add_stream_map("1:a")
+                .set_video_codec("mpeg4")
+                .set_audio_codec("aac")
+                .set_shortest(true),
+        )
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let result = wait_with_watchdog(scheduler, 60, "shared-graph cascade cut");
+    assert!(result.is_ok(), "shared-graph job failed: {result:?}");
+
+    let frames = video_nb_frames(&out);
+    assert!(
+        (30..=75).contains(&frames),
+        "the fast branch should truncate near the 2s audio, got {frames}"
+    );
+}
+
+/// H1 + H2 composed: an encoder-side finish (recording_time) on streams fed
+/// by one shared graph — the finish must reach the queue AND the graph must
+/// get both channels back.
+#[test]
+fn shortest_recording_time_with_shared_graph_composes() {
+    let out = tmp_path("shortest_rt_shared_graph.mp4");
+    let scheduler = FfmpegContext::builder()
+        .input(Input::from("color=c=black:s=320x240:r=30:d=6").set_format("lavfi"))
+        .input(Input::from("sine=frequency=440:sample_rate=44100").set_format("lavfi"))
+        .filter_desc("[0:v]split=2[a][b]")
+        .output(
+            Output::from(out.as_str())
+                .add_stream_map("[a]")
+                .add_stream_map("[b]")
+                .add_stream_map("1:a")
+                .set_video_codec("mpeg4")
+                .set_audio_codec("aac")
+                .set_shortest(true)
+                .set_recording_time_us(2_000_000),
+        )
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let result = wait_with_watchdog(scheduler, 60, "recording_time + shared graph");
+    assert!(result.is_ok(), "composed job failed: {result:?}");
+
+    let frames = video_nb_frames(&out);
+    assert!(
+        (40..=75).contains(&frames),
+        "30 fps video cut at ~2s should hold 40..=75 frames, got {frames}"
+    );
+}
