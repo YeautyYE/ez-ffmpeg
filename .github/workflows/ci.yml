@@ -28,7 +28,22 @@
 # on a GPU-less runner. The macOS-only `videotoolbox` scheduler tests are
 # `#[cfg(target_os = "macos")]`, so they do not run on Linux.
 #
-# `build` + `clippy` + `test` are all enforced gates, per lane.
+# The `build` job (all-features build + a default-features build + clippy) and
+# the `test` job run per FFmpeg lane. Two lanes run once, not per FFmpeg:
+#
+#   * `docs` — compiles the crate under `--cfg docsrs` (`DOCS_RS=1`), which stubs
+#     ez-ffmpeg's own FFI call sites; the gate catches docsrs-stub compile gaps.
+#     ffmpeg-sys-next still needs a real FFmpeg for its bindings, so this job builds
+#     one via `ffmpeg-sys-next/build` (not a literal docs.rs run — docs.rs has no
+#     network to clone FFmpeg — but it exercises the same `--cfg docsrs` paths).
+#   * `asan` — AddressSanitizer over the lifecycle/teardown integration tests,
+#     guarding the use-after-free fixes. FFmpeg is statically linked via
+#     ffmpeg-sys-next/build; ASan's interceptors see its alloc/free, so a UAF where
+#     instrumented Rust touches FFmpeg-freed memory is caught (one entirely inside
+#     un-instrumented FFmpeg C is not reliably covered — those regressions are
+#     Rust-side here).
+#
+# All jobs are enforced gates.
 
 name: CI
 
@@ -106,6 +121,13 @@ jobs:
       - name: Build
         run: cargo build --all-features ${{ matrix.ffmpeg-features }} --verbose
 
+      # The crate's default feature set is empty (`default = []`), yet every job
+      # here builds `--all-features`; this proves the no-feature build and its cfg
+      # gates still compile. The ffmpeg-features flag only controls how FFmpeg is
+      # provisioned, so "default features" still carries it.
+      - name: Build (default features)
+        run: cargo build ${{ matrix.ffmpeg-features }} --verbose
+
       # Safety-hygiene lints surface here. Not `-D warnings` yet: the crate has a
       # pre-existing unused-import / undocumented-unsafe backlog to clear first.
       - name: Clippy
@@ -173,3 +195,81 @@ jobs:
 
       - name: Test
         run: cargo test --lib --features async,rtmp,flv,subtitle ${{ matrix.ffmpeg-features }}
+
+  docs:
+    name: Docs (docsrs cfg compile)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install FFmpeg build toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            nasm yasm clang pkg-config make git zlib1g-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-docs-${{ hashFiles('**/Cargo.toml') }}
+
+      # `DOCS_RS=1` makes ez-ffmpeg's build.rs pass `--cfg docsrs`, compiling its FFI
+      # call sites as stubs; this gate catches a docsrs-stub compile gap (a fn that
+      # takes a `#[cfg(not(docsrs))]` type but is itself ungated). ffmpeg-sys-next's
+      # build.rs does NOT honor DOCS_RS, so it still needs a real FFmpeg for its
+      # bindings; `ffmpeg-sys-next/build` compiles one from source (the runner has
+      # the network docs.rs lacks), keeping the job self-contained. The features
+      # otherwise match `[package.metadata.docs.rs]`. Not `-D warnings`: docs.rs does
+      # not, and the crate has a pre-existing intra-doc-link backlog (a separate
+      # task); this lane is the stub-compile gate, not doc-link cleanup.
+      - name: cargo doc (docsrs cfg)
+        env:
+          DOCS_RS: "1"
+        run: cargo doc --no-deps --features ffmpeg-sys-next/build,async,opengl,rtmp,flv,subtitle,wgpu
+
+  asan:
+    name: ASAN (UAF, FFmpeg 8.1)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install FFmpeg build toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            nasm yasm clang pkg-config make git zlib1g-dev
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-asan-${{ hashFiles('**/Cargo.toml') }}
+
+      # `-Zsanitizer=address` instruments the target crates' Rust code. The explicit
+      # `--target` scopes the sanitizer to those crates and off the host build
+      # scripts / proc-macros; std is reused un-instrumented from the sysroot (so no
+      # `-Zbuild-std`), which suffices because the UAF regressions here are detected
+      # on the Rust side. `detect_leaks=0` because FFmpeg's one-time global
+      # allocations are not leaks. GPU features (opengl/wgpu) are omitted like the
+      # test job; the lifecycle/teardown suites do not need them.
+      - name: ASAN UAF tests
+        env:
+          RUSTFLAGS: "-Zsanitizer=address"
+          RUSTDOCFLAGS: "-Zsanitizer=address"
+          ASAN_OPTIONS: "detect_leaks=0"
+        run: |
+          cargo +nightly test --target x86_64-unknown-linux-gnu \
+            --features ffmpeg-sys-next/build,async,rtmp,flv,subtitle \
+            --test bsf --test mux_teardown --test lifecycle \
+            --test start_failure_join --test shortest --test frame_pipeline_hardening
