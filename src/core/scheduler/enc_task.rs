@@ -1006,6 +1006,7 @@ fn sq_propagate_and_notify(q: &mut SyncQueue<FrameBox>, sq_finished: &[AtomicBoo
 /// handling; returns `true` when the encoder should stop feeding (natural EOF,
 /// recording_time limit, or a real error) so the caller proceeds to the shared
 /// flush, and sets `finished` on a natural EOF.
+#[cfg(not(docsrs))]
 unsafe fn sq_encode_drained(
     enc_ctx: *mut AVCodecContext,
     mut fb: FrameBox,
