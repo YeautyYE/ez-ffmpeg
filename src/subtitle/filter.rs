@@ -4,7 +4,7 @@ use super::backend::SubtitleRenderer;
 use super::blend::{self, ColorMatrix, ColorRange, OverlayImage, PlaneView, SampleFormat};
 use super::layout::{self, ColorModel, FormatSpec};
 use super::options::SubtitleFilterBuilder;
-use crate::core::filter::frame_filter::{FrameFilter, FrameFilterError};
+use crate::core::filter::frame_filter::{FrameFilter, FrameFilterError, RequestFrameMode};
 use crate::core::filter::frame_filter_context::FrameFilterContext;
 use crate::util::ffmpeg_utils::av_err2str;
 use ffmpeg_next::Frame;
@@ -489,19 +489,24 @@ impl FrameFilter for SubtitleFilter {
         AVMediaType::AVMEDIA_TYPE_VIDEO
     }
 
+    /// Synchronous: every frame is rendered and returned inside `filter_frame`
+    /// and no frames are held back, so the pipeline never needs to poll this
+    /// filter for deferred output (PERF-8).
+    fn request_frame_mode(&self) -> RequestFrameMode {
+        RequestFrameMode::Never
+    }
+
     fn filter_frame(
         &mut self,
         mut frame: Frame,
         _ctx: &FrameFilterContext,
     ) -> Result<Option<Frame>, FrameFilterError> {
-        // Props-only frames (buf[0] == null EOF markers) and pixel-less frames
-        // pass through untouched — and this filter never returns Ok(None),
-        // which would starve downstream consumers.
-        // SAFETY: pointer null-checked before any field read.
-        unsafe {
-            if frame.as_ptr().is_null() || frame.is_empty() {
-                return Ok(Some(frame));
-            }
+        // An end-of-stream flush marker passes through untouched — this filter
+        // never returns Ok(None), which would starve downstream consumers. The
+        // buf[0] test correctly leaves a hardware frame (data[0] == null but
+        // buf[0] set) to be caught by the software-frame check below.
+        if crate::util::ffmpeg_utils::frame_is_eof_marker(&frame) {
+            return Ok(Some(frame));
         }
         // SAFETY: non-null software frame owned by us for the duration.
         let (width, height, format, pts, time_base, is_hw, colorspace, color_range) = unsafe {

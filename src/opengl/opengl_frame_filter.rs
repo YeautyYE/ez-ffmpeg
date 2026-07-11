@@ -7,7 +7,7 @@
 #![allow(deprecated)]
 
 use crate::core::filter::frame_filter_context::FrameFilterContext;
-use crate::filter::frame_filter::{FrameFilter, FrameFilterError};
+use crate::filter::frame_filter::{FrameFilter, FrameFilterError, RequestFrameMode};
 use crate::util::ffmpeg_utils::av_err2str;
 use crate::util::frame_utils::ensure_software_format;
 use ffmpeg_next::Frame;
@@ -992,6 +992,13 @@ impl FrameFilter for OpenGLFrameFilter {
         AVMediaType::AVMEDIA_TYPE_VIDEO
     }
 
+    /// Synchronous: the GL round-trip completes inside `filter_frame`, which
+    /// always returns the processed frame; nothing is deferred, so the pipeline
+    /// need not poll this filter for produced frames (PERF-8).
+    fn request_frame_mode(&self) -> RequestFrameMode {
+        RequestFrameMode::Never
+    }
+
     fn init(&mut self, _ctx: &FrameFilterContext) -> Result<(), FrameFilterError> {
         self.init_opengl()?;
 
@@ -1017,10 +1024,8 @@ impl FrameFilter for OpenGLFrameFilter {
         mut frame: Frame,
         _ctx: &FrameFilterContext,
     ) -> Result<Option<Frame>, FrameFilterError> {
-        unsafe {
-            if frame.as_ptr().is_null() || frame.is_empty() {
-                return Ok(Some(frame));
-            }
+        if crate::util::ffmpeg_utils::frame_is_eof_marker(&frame) {
+            return Ok(Some(frame));
         }
 
         // Validated conversion: a raw transmute of an arbitrary int into

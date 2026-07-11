@@ -73,6 +73,15 @@ pub trait FrameFilter: Send {
     /// - `Ok(None)` if no frame is produced.
     /// - `Err(e)` (any [`FrameFilterError`]) if processing fails.
     ///
+    /// # Default
+    /// The provided default returns `Ok(None)`, which the pipeline treats as
+    /// "drop this frame and stop the chain" — so a filter that does NOT override
+    /// `filter_frame` silently discards every frame. A pass-through filter must
+    /// return `Ok(Some(frame))`; only a filter that genuinely consumes frames
+    /// (e.g. a terminal sink) should rely on the dropping default. To forward an
+    /// end-of-stream flush marker untouched, probe it with
+    /// [`frame_is_eof_marker`](crate::util::ffmpeg_utils::frame_is_eof_marker).
+    ///
     /// # In-place mutation
     /// The frame's data buffers are usually REFCOUNTED and shared (the
     /// decoder's frame pool, other consumers of the same source): mutating
