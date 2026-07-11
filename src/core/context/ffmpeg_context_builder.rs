@@ -303,6 +303,17 @@ impl FfmpegContextBuilder {
     /// Returns an error if any configuration issues are found (e.g., invalid URL syntax,
     /// conflicting filter settings, etc.).
     ///
+    /// # Side effects
+    /// `build()` opens and probes the **inputs** (to read their stream layout), but it
+    /// does **not** create, open, or truncate any **output** file. A URL-backed output
+    /// is created (and an existing file at that path truncated) by the running job,
+    /// during its mux initialization — so building a context you never start, or a
+    /// build that fails a later check, leaves existing output files untouched. An error
+    /// from opening an output (e.g. a missing directory or a permission failure)
+    /// therefore surfaces at run time — from `start()` for a synchronously-initialized
+    /// muxer, otherwise from [`wait`](crate::FfmpegScheduler::wait) — not from
+    /// `build()`.
+    ///
     /// # Example
     /// ```rust,ignore
     /// let context = FfmpegContextBuilder::new()
