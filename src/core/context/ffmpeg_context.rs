@@ -2981,7 +2981,18 @@ fn ifilter_bind_ist(
         let SchNode::Filter { inputs, .. } = node else {
             unreachable!()
         };
-        inputs.insert(input_index, demux.node.clone());
+        // Assign into the pad-indexed slot (pre-sized to the pad count in
+        // FilterGraph::new, so `input_index` is always in range — the function
+        // already indexed `filter_graph.inputs[input_index]` above). A
+        // `Vec::insert` here used to panic when a cross-graph-bound pad earlier
+        // in the list was skipped, leaving `input_index` past the list length;
+        // pads that stay cross-graph-bound remain `None` holes. A length
+        // mismatch here would be an internal invariant break, so surface it as a
+        // bug rather than silently leaving a hole.
+        let Some(slot) = inputs.get_mut(input_index) else {
+            return Err(Error::Bug);
+        };
+        *slot = Some(demux.node.clone());
 
         demux.connect_stream(stream_idx);
         Ok(())
@@ -4188,6 +4199,47 @@ mod tests {
 
     fn test_graph(inputs: Vec<InputFilter>, outputs: Vec<OutputFilter>) -> FilterGraph {
         FilterGraph::new("null".to_string(), inputs, outputs, None, None)
+    }
+
+    // The REAL builder must leave a cross-graph-bound pad as a `None` hole in the
+    // consumer node's pad-indexed scheduler-input list, with the demuxer-bound
+    // pad in its own slot — not a shifted/dense list. FC0 outputs `[mid]` (the
+    // consumer's pad 0, cross-graph); `[1:v]` is a demuxer stream (pad 1). This
+    // pins the structure the runtime relies on (a shifted list would mis-route
+    // demuxer choke-balancing).
+    #[test]
+    fn builder_leaves_cross_graph_pad_as_a_hole_in_scheduler_inputs() {
+        use crate::core::context::input::Input;
+        use crate::core::scheduler::input_controller::SchNode;
+
+        let out = std::env::temp_dir().join(format!(
+            "ez_ffmpeg_xgraph_struct_{}.mp4",
+            std::process::id()
+        ));
+        let ctx = FfmpegContext::builder()
+            .input(Input::from("color=c=red:s=64x64:r=15:d=0.2").set_format("lavfi"))
+            .input(Input::from("color=c=blue:s=64x64:r=15:d=0.2").set_format("lavfi"))
+            .filter_desc("[0:v]hue=s=0[mid]")
+            .filter_desc("[mid][1:v]overlay[vout]")
+            .output(
+                Output::from(out.to_str().unwrap())
+                    .add_stream_map("vout")
+                    .set_video_codec("mpeg4"),
+            )
+            .build()
+            .expect("cross-graph build");
+
+        let consumer = ctx
+            .filter_graphs
+            .iter()
+            .find(|fg| fg.graph_desc.contains("overlay"))
+            .expect("consumer graph present");
+        let SchNode::Filter { inputs, .. } = consumer.node.as_ref() else {
+            panic!("consumer node must be a Filter");
+        };
+        assert_eq!(inputs.len(), 2, "one scheduler-input slot per filter pad");
+        assert!(inputs[0].is_none(), "pad 0 ([mid]) is a cross-graph hole");
+        assert!(inputs[1].is_some(), "pad 1 ([1:v]) binds a demuxer");
     }
 
     #[test]

@@ -42,6 +42,10 @@ impl FilterGraph {
         let (sender, receiver) = crossbeam_channel::bounded(8);
         let finished_flag_list: Vec<AtomicBool> =
             inputs.iter().map(|_| AtomicBool::new(false)).collect();
+        // One scheduler-input slot per filter pad, pre-sized so a cross-graph-
+        // bound pad is left as an explicit hole (None) rather than shifting the
+        // demuxer-bound entries out of pad-index alignment (see ifilter_bind_ist).
+        let pad_count = inputs.len();
 
         Self {
             graph_desc,
@@ -51,7 +55,7 @@ impl FilterGraph {
             sws_opts,
             swr_opts,
             node: Arc::new(SchNode::Filter {
-                inputs: Vec::new(),
+                inputs: (0..pad_count).map(|_| None).collect(),
                 best_input: Arc::new(AtomicUsize::from(0)),
             }),
         }
