@@ -487,7 +487,7 @@ impl FrameFilter for WgpuFrameFilter {
         AVMediaType::AVMEDIA_TYPE_VIDEO
     }
 
-    fn init(&mut self, _ctx: &FrameFilterContext) -> Result<(), FrameFilterError> {
+    fn init(&mut self, _ctx: &mut FrameFilterContext) -> Result<(), FrameFilterError> {
         let gpu = GpuState::new(
             &self.fragment_shader,
             self.params.len,
@@ -500,15 +500,16 @@ impl FrameFilter for WgpuFrameFilter {
     fn filter_frame(
         &mut self,
         frame: Frame,
-        _ctx: &FrameFilterContext,
+        _ctx: &mut FrameFilterContext,
     ) -> Result<Option<Frame>, FrameFilterError> {
         // A props-only marker (buf[0] null — see frame_is_eof_marker, which
         // avoids the data[0] check that would misclassify hardware frames whose
         // surface lives in data[3]) or a degenerate frame bypasses GPU work.
-        let bypass = crate::util::ffmpeg_utils::frame_is_eof_marker(&frame) || unsafe {
-            // SAFETY: not a marker, so the frame is non-null with live buffers.
-            (*frame.as_ptr()).width <= 0 || (*frame.as_ptr()).height <= 0
-        };
+        let bypass = crate::util::ffmpeg_utils::frame_is_eof_marker(&frame)
+            || unsafe {
+                // SAFETY: not a marker, so the frame is non-null with live buffers.
+                (*frame.as_ptr()).width <= 0 || (*frame.as_ptr()).height <= 0
+            };
         if bypass {
             // Props-only frames (e.g. the EOF timestamp marker decoders send
             // through pipelines) pass through untouched. They are queued so
@@ -700,12 +701,12 @@ impl FrameFilter for WgpuFrameFilter {
 
     fn request_frame(
         &mut self,
-        _ctx: &FrameFilterContext,
+        _ctx: &mut FrameFilterContext,
     ) -> Result<Option<Frame>, FrameFilterError> {
         self.next_output(false)
     }
 
-    fn uninit(&mut self, _ctx: &FrameFilterContext) {
+    fn uninit(&mut self, _ctx: &mut FrameFilterContext) {
         // Abandon any in-flight readbacks; wgpu unmaps and frees buffers on
         // drop, and pass-through frames are simply released. Zero-copy
         // frames still alive downstream keep their staging buffer through

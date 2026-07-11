@@ -156,7 +156,7 @@ impl FrameFilter for MetadataEventFilter {
     fn filter_frame(
         &mut self,
         frame: Frame,
-        _ctx: &FrameFilterContext,
+        _ctx: &mut FrameFilterContext,
     ) -> Result<Option<Frame>, FrameFilterError> {
         // Props-only / null frames pass straight through (matches SubtitleFilter),
         // and never yield Ok(None), which would starve downstream consumers.
@@ -203,7 +203,7 @@ impl FrameFilter for MetadataEventFilter {
         Ok(Some(frame)) // passthrough (NoopFilter pattern)
     }
 
-    fn uninit(&mut self, _ctx: &FrameFilterContext) {
+    fn uninit(&mut self, _ctx: &mut FrameFilterContext) {
         // Best-effort end-of-stream flush: `uninit` returns `()`, so we cannot
         // abort on failure. But under `Block` we still wait for room so the
         // final `R128Summary` / `StreamEnd` (the actual measurement result) is

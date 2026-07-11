@@ -97,7 +97,7 @@ impl FrameFilter for RecordingFilter {
     fn filter_frame(
         &mut self,
         frame: Frame,
-        _ctx: &FrameFilterContext,
+        _ctx: &mut FrameFilterContext,
     ) -> Result<Option<Frame>, FrameFilterError> {
         if unsafe { frame.as_ptr().is_null() } {
             self.saw_null.store(true, Ordering::SeqCst);
@@ -148,7 +148,7 @@ impl FrameFilter for SaturatingGenerator {
     fn filter_frame(
         &mut self,
         frame: Frame,
-        _ctx: &FrameFilterContext,
+        _ctx: &mut FrameFilterContext,
     ) -> Result<Option<Frame>, FrameFilterError> {
         unsafe {
             if frame.as_ptr().is_null() || (*frame.as_ptr()).buf[0].is_null() {
@@ -179,7 +179,7 @@ impl FrameFilter for SaturatingGenerator {
 
     fn request_frame(
         &mut self,
-        _ctx: &FrameFilterContext,
+        _ctx: &mut FrameFilterContext,
     ) -> Result<Option<Frame>, FrameFilterError> {
         if !self.armed.load(Ordering::SeqCst) {
             return Ok(None);
@@ -353,7 +353,7 @@ impl FrameFilter for AsyncBufferingFilter {
     fn filter_frame(
         &mut self,
         frame: Frame,
-        _ctx: &FrameFilterContext,
+        _ctx: &mut FrameFilterContext,
     ) -> Result<Option<Frame>, FrameFilterError> {
         let props_only = unsafe { frame.as_ptr().is_null() || (*frame.as_ptr()).buf[0].is_null() };
         if props_only {
@@ -372,7 +372,7 @@ impl FrameFilter for AsyncBufferingFilter {
 
     fn request_frame(
         &mut self,
-        _ctx: &FrameFilterContext,
+        _ctx: &mut FrameFilterContext,
     ) -> Result<Option<Frame>, FrameFilterError> {
         if !self.saw_flush_cue.load(Ordering::SeqCst) {
             return Ok(None);
@@ -403,7 +403,7 @@ impl FrameFilter for DelayOneFilter {
     fn filter_frame(
         &mut self,
         frame: Frame,
-        _ctx: &FrameFilterContext,
+        _ctx: &mut FrameFilterContext,
     ) -> Result<Option<Frame>, FrameFilterError> {
         let props_only = unsafe { frame.as_ptr().is_null() || (*frame.as_ptr()).buf[0].is_null() };
         if props_only {
@@ -666,7 +666,7 @@ impl FrameFilter for CueOrderSentinel {
     fn filter_frame(
         &mut self,
         frame: Frame,
-        _ctx: &FrameFilterContext,
+        _ctx: &mut FrameFilterContext,
     ) -> Result<Option<Frame>, FrameFilterError> {
         let props_only = unsafe { frame.as_ptr().is_null() || (*frame.as_ptr()).buf[0].is_null() };
         if props_only {
@@ -849,7 +849,7 @@ impl FrameFilter for StopSignalingHolder {
     fn filter_frame(
         &mut self,
         frame: Frame,
-        _ctx: &FrameFilterContext,
+        _ctx: &mut FrameFilterContext,
     ) -> Result<Option<Frame>, FrameFilterError> {
         let props_only = unsafe { frame.as_ptr().is_null() || (*frame.as_ptr()).buf[0].is_null() };
         if !props_only {
@@ -894,7 +894,7 @@ impl FrameFilter for PostStopRecorder {
     fn filter_frame(
         &mut self,
         frame: Frame,
-        _ctx: &FrameFilterContext,
+        _ctx: &mut FrameFilterContext,
     ) -> Result<Option<Frame>, FrameFilterError> {
         if self.stop_initiated.load(Ordering::SeqCst) {
             self.calls_after_stop.fetch_add(1, Ordering::SeqCst);
@@ -1132,7 +1132,7 @@ impl FrameFilter for PanicOnNthFrame {
     fn filter_frame(
         &mut self,
         frame: Frame,
-        _ctx: &FrameFilterContext,
+        _ctx: &mut FrameFilterContext,
     ) -> Result<Option<Frame>, FrameFilterError> {
         let props_only = unsafe { frame.as_ptr().is_null() || (*frame.as_ptr()).buf[0].is_null() };
         if !props_only {
@@ -1205,7 +1205,7 @@ impl FrameFilter for PanicOnDropFilter {
     fn filter_frame(
         &mut self,
         frame: Frame,
-        _ctx: &FrameFilterContext,
+        _ctx: &mut FrameFilterContext,
     ) -> Result<Option<Frame>, FrameFilterError> {
         Ok(Some(frame))
     }
@@ -1335,7 +1335,7 @@ impl FrameFilter for BlockingBufferInjector {
     fn filter_frame(
         &mut self,
         frame: Frame,
-        _ctx: &FrameFilterContext,
+        _ctx: &mut FrameFilterContext,
     ) -> Result<Option<Frame>, FrameFilterError> {
         let props_only = unsafe { frame.as_ptr().is_null() || (*frame.as_ptr()).buf[0].is_null() };
         if props_only {
@@ -1374,7 +1374,7 @@ impl FrameFilter for SwallowAllFrames {
     fn filter_frame(
         &mut self,
         frame: Frame,
-        _ctx: &FrameFilterContext,
+        _ctx: &mut FrameFilterContext,
     ) -> Result<Option<Frame>, FrameFilterError> {
         let props_only = unsafe { frame.as_ptr().is_null() || (*frame.as_ptr()).buf[0].is_null() };
         if props_only {
@@ -1537,7 +1537,7 @@ impl FrameFilter for FailInitOnCue {
         AVMediaType::AVMEDIA_TYPE_VIDEO
     }
 
-    fn init(&mut self, _ctx: &FrameFilterContext) -> Result<(), FrameFilterError> {
+    fn init(&mut self, _ctx: &mut FrameFilterContext) -> Result<(), FrameFilterError> {
         let deadline = Instant::now() + Duration::from_secs(30);
         while !self.proceed.load(Ordering::SeqCst) {
             if Instant::now() >= deadline {
@@ -1551,7 +1551,7 @@ impl FrameFilter for FailInitOnCue {
     fn filter_frame(
         &mut self,
         frame: Frame,
-        _ctx: &FrameFilterContext,
+        _ctx: &mut FrameFilterContext,
     ) -> Result<Option<Frame>, FrameFilterError> {
         // Never reached: init() fails, so the pipeline never enters run_pipeline.
         Ok(Some(frame))
@@ -1581,7 +1581,7 @@ impl FrameFilter for AttachFirstDropSignal {
     fn filter_frame(
         &mut self,
         frame: Frame,
-        _ctx: &FrameFilterContext,
+        _ctx: &mut FrameFilterContext,
     ) -> Result<Option<Frame>, FrameFilterError> {
         let props_only = unsafe { frame.as_ptr().is_null() || (*frame.as_ptr()).buf[0].is_null() };
         if !props_only && !self.attached {

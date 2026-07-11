@@ -1002,7 +1002,7 @@ impl FrameFilter for OpenGLFrameFilter {
         RequestFrameMode::Never
     }
 
-    fn init(&mut self, _ctx: &FrameFilterContext) -> Result<(), FrameFilterError> {
+    fn init(&mut self, _ctx: &mut FrameFilterContext) -> Result<(), FrameFilterError> {
         self.init_opengl()?;
 
         self.print_opengl_info();
@@ -1025,7 +1025,7 @@ impl FrameFilter for OpenGLFrameFilter {
     fn filter_frame(
         &mut self,
         mut frame: Frame,
-        _ctx: &FrameFilterContext,
+        _ctx: &mut FrameFilterContext,
     ) -> Result<Option<Frame>, FrameFilterError> {
         if crate::util::ffmpeg_utils::frame_is_eof_marker(&frame) {
             return Ok(Some(frame));
@@ -1082,7 +1082,7 @@ impl FrameFilter for OpenGLFrameFilter {
         Ok(Some(frame))
     }
 
-    fn uninit(&mut self, _ctx: &FrameFilterContext) {
+    fn uninit(&mut self, _ctx: &mut FrameFilterContext) {
         // init may have failed halfway and uninit may run twice: take() each
         // resource so missing ones are skipped and none is deleted twice.
         self.release_frame_resources();

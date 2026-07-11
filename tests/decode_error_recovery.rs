@@ -104,7 +104,7 @@ impl FrameFilter for FrameCounter {
     fn filter_frame(
         &mut self,
         frame: Frame,
-        _ctx: &FrameFilterContext,
+        _ctx: &mut FrameFilterContext,
     ) -> Result<Option<Frame>, FrameFilterError> {
         unsafe {
             if !frame.as_ptr().is_null() && !frame.is_empty() {

@@ -122,7 +122,7 @@ impl FrameFilter for Tile2x2Filter {
         AVMediaType::AVMEDIA_TYPE_VIDEO
     }
 
-    fn init(&mut self, ctx: &FrameFilterContext) -> Result<(), FrameFilterError> {
+    fn init(&mut self, ctx: &mut FrameFilterContext) -> Result<(), FrameFilterError> {
         log::info!("Initializing Tile2x2Filter: {}", ctx.name());
         log::info!("This filter creates a 2x2 tiled output (doubles width and height)");
         log::info!("Requirements: YUV420P format, even dimensions");
@@ -132,7 +132,7 @@ impl FrameFilter for Tile2x2Filter {
     fn filter_frame(
         &mut self,
         frame: Frame,
-        _ctx: &FrameFilterContext,
+        _ctx: &mut FrameFilterContext,
     ) -> Result<Option<Frame>, FrameFilterError> {
         unsafe {
             // If frame is null or empty, return it as-is (this can happen at end of stream)
@@ -223,7 +223,7 @@ impl FrameFilter for Tile2x2Filter {
         }
     }
 
-    fn uninit(&mut self, ctx: &FrameFilterContext) {
+    fn uninit(&mut self, ctx: &mut FrameFilterContext) {
         log::info!("Uninitializing Tile2x2Filter: {}", ctx.name());
     }
 }
