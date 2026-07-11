@@ -152,6 +152,26 @@ pub enum Error {
 
     #[error("Invalid recipe argument: {0}")]
     InvalidRecipeArg(String),
+
+    #[error("Container info error: {0}")]
+    ContainerInfo(#[from] ContainerInfoError),
+}
+
+/// Errors from the `container_info` queries where the caller asked for an index
+/// outside the container's range. These are caller/argument errors — a bad index
+/// into an otherwise valid container — kept distinct from an open/probe failure
+/// (`OpenInputError` / `FindStreamError`) so retry logic, telemetry, and user
+/// messages can tell "you asked for chapter 5 of a 3-chapter file" apart from
+/// "the file is corrupt or unreadable". Each variant carries the offending
+/// `index` and the container's actual `count`.
+#[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
+pub enum ContainerInfoError {
+    #[error("chapter index {index} out of range: the container has {count} chapter(s)")]
+    ChapterIndexOutOfRange { index: usize, count: usize },
+
+    #[error("stream index {index} out of range: the container has {count} stream(s)")]
+    StreamIndexOutOfRange { index: usize, count: usize },
 }
 
 /// Error type for RTMP streaming operations using StreamBuilder
