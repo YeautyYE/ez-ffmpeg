@@ -53,12 +53,11 @@ use ffmpeg_sys_next::{
     avcodec_parameters_to_context, avfilter_pad_get_name, avfilter_pad_get_type,
     avformat_alloc_context, avformat_alloc_output_context2, avformat_close_input,
     avformat_find_stream_info, avformat_flush, avformat_free_context, avformat_open_input,
-    avio_alloc_context, avio_open2, AVCodec, AVCodecID, AVColorRange, AVColorSpace,
-    AVFilterContext, AVFilterInOut, AVFilterPad, AVFormatContext, AVMediaType, AVOutputFormat,
-    AVPixelFormat, AVRational, AVSampleFormat, AVStream, AVERROR_ENCODER_NOT_FOUND,
-    AVFMT_FLAG_CUSTOM_IO, AVFMT_GLOBALHEADER, AVFMT_NOBINSEARCH, AVFMT_NOFILE, AVFMT_NOGENSEARCH,
-    AVFMT_NOSTREAMS, AVIO_FLAG_WRITE, AVSEEK_FLAG_BACKWARD, AV_CODEC_PROP_BITMAP_SUB,
-    AV_CODEC_PROP_TEXT_SUB, AV_TIME_BASE,
+    avio_alloc_context, AVCodec, AVCodecID, AVColorRange, AVColorSpace, AVFilterContext,
+    AVFilterInOut, AVFilterPad, AVFormatContext, AVMediaType, AVOutputFormat, AVPixelFormat,
+    AVRational, AVSampleFormat, AVStream, AVERROR_ENCODER_NOT_FOUND, AVFMT_FLAG_CUSTOM_IO,
+    AVFMT_GLOBALHEADER, AVFMT_NOBINSEARCH, AVFMT_NOFILE, AVFMT_NOGENSEARCH, AVFMT_NOSTREAMS,
+    AVSEEK_FLAG_BACKWARD, AV_CODEC_PROP_BITMAP_SUB, AV_CODEC_PROP_TEXT_SUB, AV_TIME_BASE,
 };
 #[cfg(not(docsrs))]
 use ffmpeg_sys_next::{
@@ -2267,28 +2266,24 @@ unsafe fn open_output_file(
             }
             ctx_guard.arm(out_fmt_ctx, crate::raw::Mode::Output);
 
-            // Interrupt callback before avio_open: stop()/abort() can break
-            // a blocking network open and any later write on this output
-            // (matches ffmpeg_mux_init.c:3326,3371).
+            // Install the interrupt callback now so it is already in place when the
+            // output file is opened at runtime mux initialization: stop()/abort()
+            // must be able to break a blocking network open and any later write on
+            // this output (matches ffmpeg_mux_init.c:3326,3371).
             (*out_fmt_ctx).interrupt_callback = ffmpeg_sys_next::AVIOInterruptCB {
                 callback: Some(crate::core::context::output_interrupt_cb),
                 opaque: Arc::as_ptr(interrupt_state) as *mut c_void,
             };
 
-            let output_format = (*out_fmt_ctx).oformat;
-            if (*output_format).flags & AVFMT_NOFILE == 0 {
-                let ret = avio_open2(
-                    &mut (*out_fmt_ctx).pb,
-                    url_cstr.as_ptr(),
-                    AVIO_FLAG_WRITE,
-                    &(*out_fmt_ctx).interrupt_callback,
-                    null_mut(),
-                );
-                if ret < 0 {
-                    warn!("Error opening output {url}");
-                    return Err(OpenOutputError::from(ret).into());
-                }
-            }
+            // The output file is NOT opened here. avio_open2(AVIO_FLAG_WRITE) creates
+            // and truncates the target (the file protocol opens O_CREAT|O_TRUNC), so
+            // opening at build() time would destroy an existing output file even when
+            // the caller only builds to validate a config, or when a later build
+            // check fails. It is opened during runtime mux initialization instead
+            // (see open_muxer_output in mux_task — from the mux worker for a streamed
+            // output, or from the streamless dispatch for a zero-stream one), keeping
+            // build() free of output-file side effects; the still-null `pb` closes as
+            // a no-op if the job is torn down before it is opened.
         }
     }
 

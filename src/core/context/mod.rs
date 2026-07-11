@@ -562,7 +562,10 @@ pub(crate) fn out_fmt_ctx_free(out_fmt_ctx: *mut AVFormatContext, is_set_write_c
     unsafe {
         if is_set_write_callback {
             free_output_opaque((*out_fmt_ctx).pb);
-        } else if (*out_fmt_ctx).flags & AVFMT_NOFILE == 0 {
+        } else if (*(*out_fmt_ctx).oformat).flags & AVFMT_NOFILE == 0 {
+            // AVFMT_NOFILE lives on the *output format* flags, not the context flags
+            // (where the same bit 0x1 is AVFMT_FLAG_GENPTS). Reading it off the
+            // context could skip avio_closep and leak the pb when GENPTS is set.
             let mut pb = (*out_fmt_ctx).pb;
             if !pb.is_null() {
                 avio_closep(&mut pb);

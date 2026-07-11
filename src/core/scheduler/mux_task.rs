@@ -9,7 +9,7 @@ use crate::core::scheduler::ffmpeg_scheduler::{
 use crate::core::scheduler::input_controller::{InputController, SchNode};
 use crate::core::scheduler::sync_queue::SyncQueue;
 use crate::error::Error::Muxing;
-use crate::error::{MuxingError, MuxingOperationError, WriteHeaderError};
+use crate::error::{MuxingError, MuxingOperationError, OpenOutputError, WriteHeaderError};
 use crate::raw::{BitStreamFilter, FormatContext};
 use crate::util::ffmpeg_utils::{av_err2str, hashmap_to_avdictionary, DictGuard};
 use crate::util::thread_synchronizer::ThreadSynchronizer;
@@ -20,9 +20,10 @@ use ffmpeg_sys_next::AVMediaType::{AVMEDIA_TYPE_AUDIO, AVMEDIA_TYPE_SUBTITLE, AV
 use ffmpeg_sys_next::{
     av_compare_ts, av_get_audio_frame_duration2, av_interleaved_write_frame, av_packet_move_ref,
     av_packet_rescale_ts, av_rescale_delta, av_rescale_q, av_write_trailer,
-    avcodec_parameters_copy, avformat_write_header, AVFormatContext, AVPacket, AVRational, AVERROR,
-    AVERROR_EOF, AVFMT_NOTIMESTAMPS, AVFMT_TS_NONSTRICT, AV_LOG_DEBUG, AV_LOG_WARNING,
-    AV_NOPTS_VALUE, AV_PKT_FLAG_KEY, AV_TIME_BASE_Q, EAGAIN, ENOMEM,
+    avcodec_parameters_copy, avformat_write_header, avio_open2, AVFormatContext, AVPacket,
+    AVRational, AVERROR, AVERROR_EOF, AVFMT_NOFILE, AVFMT_NOTIMESTAMPS, AVFMT_TS_NONSTRICT,
+    AVIO_FLAG_WRITE, AV_LOG_DEBUG, AV_LOG_WARNING, AV_NOPTS_VALUE, AV_PKT_FLAG_KEY, AV_TIME_BASE_Q,
+    EAGAIN, ENOMEM,
 };
 use log::{debug, error, info, trace, warn};
 use std::collections::HashMap;
@@ -383,13 +384,38 @@ fn mux_task_start(
     mux_done: MuxDoneGuard,
 ) -> crate::error::Result<()> {
     let Some(queue_sender) = queue_sender else {
-        // Zero-stream output (e.g. an AVFMT_NOSTREAMS muxer): no mux worker
-        // thread will be spawned to release this muxer's pre-counted thread
-        // slot. Free the context via the guard first (no encoders exist, so
-        // the join is empty), THEN release the slot — wait()/stop() must not
-        // observe "all threads done" while the free is still in flight. A
-        // streamless output is legitimate for such formats, so this is not an
-        // error.
+        // Zero-stream output (e.g. an AVFMT_NOSTREAMS muxer like ffmetadata): no mux
+        // worker thread is spawned, so this branch — not `_mux_init` — is the only
+        // place a file-backed streamless output gets opened. Open it here (deferred
+        // from build() like every other output), so the file is created and a bad
+        // path surfaces `OpenOutput` instead of a silent success; AVFMT_NOFILE and
+        // custom-IO outputs are no-ops.
+        if let Err(open_ret) = unsafe { open_muxer_output(guard.ctx().as_ptr()) } {
+            // Run the ordered teardown BEFORE any panic-capable logging. A user
+            // logger that panics inside `error!` would otherwise unwind with the
+            // error still unpublished: on that unwind `slot_guard` releases the slot
+            // and can publish STATUS_END while `guard` separately frees the context,
+            // so wait() observes "all threads done" with no error recorded and
+            // returns Ok — the exact silent success this open exists to prevent.
+            // fail_mux_init instead publishes the error, frees the context, and
+            // releases the slot in the load-bearing order, panic-free (mirroring the
+            // worker-spawn-failure path).
+            fail_mux_init(
+                &scheduler_status,
+                &scheduler_result,
+                guard,
+                slot_guard,
+                crate::error::Error::OpenOutput(OpenOutputError::from(open_ret)),
+            );
+            error!("Error opening output: {}", av_err2str(open_ret));
+            return Err(crate::error::Error::OpenOutput(OpenOutputError::from(
+                open_ret,
+            )));
+        }
+        // Free the context via the guard first (no encoders exist, so the join is
+        // empty), THEN release the slot — wait()/stop() must not observe "all threads
+        // done" while the free is still in flight. A streamless output is legitimate
+        // for such formats, so this is not an error.
         drop(guard);
         // Consuming release: disarm before the (waker-capable) manual release
         // so an unwind cannot double-release the slot.
@@ -563,6 +589,26 @@ fn _mux_init(
                 )));
             }
         };
+
+    // Open the url-backed output file now (deferred from build() so build() neither
+    // creates nor truncates it; see open_output_file). Custom-IO and AVFMT_NOFILE
+    // outputs are no-ops. On failure, publish and tear down exactly like the
+    // write_header error path below (encoders parked on the pre-mux queues are joined
+    // before the context is freed). The error type is the same OpenOutput the build
+    // path used to return, only surfaced at run time now.
+    if let Err(open_ret) = unsafe { open_muxer_output(out_fmt_ctx_ptr) } {
+        error!("Error opening output: {}", av_err2str(open_ret));
+        fail_mux_init(
+            &scheduler_status,
+            &scheduler_result,
+            guard,
+            slot_guard,
+            crate::error::Error::OpenOutput(OpenOutputError::from(open_ret)),
+        );
+        return Err(crate::error::Error::OpenOutput(OpenOutputError::from(
+            open_ret,
+        )));
+    }
 
     let ret = unsafe { avformat_write_header(out_fmt_ctx_ptr, opts.as_double_ptr()) };
     if ret < 0 {
@@ -1331,6 +1377,41 @@ fn fail_mux_worker_spawn(
     };
     drop(guard);
     slot_guard.release();
+}
+
+/// Open the url-backed output file for a muxer during runtime mux initialization
+/// (for a streamed output, just before its header is written).
+///
+/// Deferred here from `build()` (see `open_output_file` in `ffmpeg_context`): opening
+/// with `AVIO_FLAG_WRITE` creates and truncates the target (the file protocol uses
+/// `O_CREAT|O_TRUNC`), so doing it at build time would clobber an existing output file
+/// before the job ever runs. Custom-IO outputs — whose `pb` was installed at build —
+/// and `AVFMT_NOFILE` formats manage their own IO and are left untouched. On failure
+/// `pb` is left null, which teardown's `avio_closep` handles as a no-op.
+///
+/// SAFETY: `out_fmt_ctx` must be the live output context; its `url` and
+/// `interrupt_callback` were populated at build time.
+unsafe fn open_muxer_output(out_fmt_ctx: *mut AVFormatContext) -> std::result::Result<(), i32> {
+    if !(*out_fmt_ctx).pb.is_null() {
+        // Custom IO: pb already installed at build time.
+        return Ok(());
+    }
+    if (*(*out_fmt_ctx).oformat).flags & AVFMT_NOFILE != 0 {
+        // The format manages its own IO (no avio file to open).
+        return Ok(());
+    }
+    let ret = avio_open2(
+        &mut (*out_fmt_ctx).pb,
+        (*out_fmt_ctx).url,
+        AVIO_FLAG_WRITE,
+        &(*out_fmt_ctx).interrupt_callback,
+        std::ptr::null_mut(),
+    );
+    if ret < 0 {
+        Err(ret)
+    } else {
+        Ok(())
+    }
 }
 
 /// Records a mux-init failure, runs the ordered teardown (unpark -> join ->
