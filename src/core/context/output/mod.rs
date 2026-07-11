@@ -434,6 +434,7 @@ pub struct Output {
 }
 
 #[derive(Copy, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum VSyncMethod {
     VsyncAuto,
     VsyncCfr,
