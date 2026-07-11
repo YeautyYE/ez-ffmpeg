@@ -1,9 +1,9 @@
 use crate::util::ffmpeg_utils::av_err2str;
 use ffmpeg_sys_next::{
-    av_buffer_unref, av_dict_parse_string, av_hwdevice_ctx_create, av_hwdevice_ctx_create_derived,
-    av_hwdevice_find_type_by_name, av_hwdevice_get_type_name, av_hwdevice_iterate_types,
-    avcodec_get_hw_config, avfilter_get_by_name, AVBufferRef, AVCodec, AVHWDeviceType, AVERROR,
-    AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX, EINVAL, ENOMEM,
+    av_buffer_unref, av_dict_free, av_dict_parse_string, av_hwdevice_ctx_create,
+    av_hwdevice_ctx_create_derived, av_hwdevice_find_type_by_name, av_hwdevice_get_type_name,
+    av_hwdevice_iterate_types, avcodec_get_hw_config, avfilter_get_by_name, AVBufferRef, AVCodec,
+    AVDictionary, AVHWDeviceType, AVERROR, AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX, EINVAL, ENOMEM,
 };
 use log::{error, warn};
 use std::ffi::{CStr, CString};
@@ -44,6 +44,13 @@ pub fn get_hwaccels() -> Vec<HWAccelInfo> {
 }
 
 static HW_DEVICES: OnceLock<Mutex<Vec<HWDevice>>> = OnceLock::new();
+// Serializes `hw_device_init_from_string` end-to-end so the reuse check and the
+// registration cannot interleave across threads (see the function comment).
+static INIT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn init_lock() -> &'static Mutex<()> {
+    INIT_LOCK.get_or_init(|| Mutex::new(()))
+}
 // Stores only the device NAME: the device itself lives in HW_DEVICES,
 // mirroring ffmpeg_hw.c where filter_hw_device is a borrowed pointer into
 // hw_devices — one owner, freed exactly once.
@@ -86,6 +93,10 @@ pub(crate) struct HWDevice {
     pub(crate) name: String,
     pub(crate) device_type: AVHWDeviceType,
     pub(crate) device_ref: *mut AVBufferRef,
+    /// The exact spec string this device was created from (`hw_device_init_from_string`),
+    /// used to reuse it for an identical spec instead of creating a new context.
+    /// `None` for devices created by other paths (e.g. `hw_device_init_from_type`).
+    pub(crate) init_arg: Option<String>,
 }
 
 // SAFETY: device_ref is an owned AVBufferRef handed between threads as a
@@ -226,7 +237,43 @@ fn split_device_and_options(p: &str) -> (Option<&str>, Option<&str>) {
     }
 }
 
+/// Frees an `AVDictionary` on drop. `av_hwdevice_ctx_create` reads (and may
+/// partially consume) the options dict but never takes ownership, so every caller
+/// must free it -- on success AND on every error path. The parsed options
+/// previously leaked on all paths; wrapping the pointer here closes that leak.
+struct DictGuard(*mut AVDictionary);
+
+impl Drop for DictGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { av_dict_free(&mut self.0) };
+        }
+    }
+}
+
 pub(crate) fn hw_device_init_from_string(arg: &str) -> (i32, Option<HWDevice>) {
+    // Serialize the whole reuse-check -> create -> register sequence: two
+    // concurrent calls with the same spec must not both miss the reuse check and
+    // each create (and permanently register) a device, which would leak a context
+    // and mint a duplicate auto name. Hardware-device setup is per-job, not
+    // per-frame, so this coarse lock is off every hot path.
+    let _init_guard = init_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    // A long-running service re-runs the same hwaccel spec on every job. Auto
+    // device names (vaapi0, vaapi1, ...) never match on lookup, so each call used
+    // to create and permanently retain a new device context; after enough jobs
+    // av_hwdevice_default_name exhausts its names and hardware init returns ENOMEM.
+    // Reuse the device created for an identical spec (the context is a refcounted
+    // AVBufferRef shared safely across jobs; the list is still freed once at
+    // process cleanup, so no per-job free can dangle a shared ref). Reuse moves the
+    // entry to the BACK of the list so it stays the "last-initialized" default
+    // filter device (hw_device_for_filter picks `devices.last()`).
+    if let Some(existing) = reuse_by_init_arg_move_to_back(arg) {
+        return (0, Some(existing));
+    }
+
     let mut device_ref = null_mut();
 
     let (type_str, mut p) = split_device_type(arg);
@@ -271,7 +318,8 @@ pub(crate) fn hw_device_init_from_string(arg: &str) -> (i32, Option<HWDevice>) {
     } else if p.starts_with(':') {
         // New device with some parameters.
         let (device_name, options_str) = split_device_and_options(p);
-        let mut options = null_mut();
+        // Freed on every path below (parse error, create error, success).
+        let mut options = DictGuard(null_mut());
 
         if let Some(v) = options_str {
             unsafe {
@@ -283,7 +331,7 @@ pub(crate) fn hw_device_init_from_string(arg: &str) -> (i32, Option<HWDevice>) {
                 let eq_cstr = CString::new("=").unwrap();
                 let comma_cstr = CString::new(",").unwrap();
                 let err = av_dict_parse_string(
-                    &mut options,
+                    &mut options.0,
                     v_cstr.as_ptr(),
                     eq_cstr.as_ptr(),
                     comma_cstr.as_ptr(),
@@ -299,7 +347,7 @@ pub(crate) fn hw_device_init_from_string(arg: &str) -> (i32, Option<HWDevice>) {
 
         let err = unsafe {
             match device_name {
-                None => av_hwdevice_ctx_create(&mut device_ref, device_type, null(), options, 0),
+                None => av_hwdevice_ctx_create(&mut device_ref, device_type, null(), options.0, 0),
                 Some(device_name) => {
                     let Ok(device_name_cstr) = CString::new(device_name) else {
                         error!("Device creation failed: device_name:{device_name} can't convert to CString");
@@ -310,7 +358,7 @@ pub(crate) fn hw_device_init_from_string(arg: &str) -> (i32, Option<HWDevice>) {
                         &mut device_ref,
                         device_type,
                         device_name_cstr.as_ptr(),
-                        options,
+                        options.0,
                         0,
                     )
                 }
@@ -344,7 +392,8 @@ pub(crate) fn hw_device_init_from_string(arg: &str) -> (i32, Option<HWDevice>) {
         }
     } else if let Some(v) = p.strip_prefix(',') {
         unsafe {
-            let mut options = null_mut();
+            // Freed on every path below (parse error, create error, success).
+            let mut options = DictGuard(null_mut());
             let Ok(v_cstr) = CString::new(v) else {
                 error!("Device creation failed: option:{v} can't convert to CString");
                 av_buffer_unref(&mut device_ref);
@@ -353,7 +402,7 @@ pub(crate) fn hw_device_init_from_string(arg: &str) -> (i32, Option<HWDevice>) {
             let eq_cstr = CString::new("=").unwrap();
             let comma_cstr = CString::new(",").unwrap();
             let mut err = av_dict_parse_string(
-                &mut options,
+                &mut options.0,
                 v_cstr.as_ptr(),
                 eq_cstr.as_ptr(),
                 comma_cstr.as_ptr(),
@@ -364,7 +413,7 @@ pub(crate) fn hw_device_init_from_string(arg: &str) -> (i32, Option<HWDevice>) {
                 av_buffer_unref(&mut device_ref);
                 return (AVERROR(EINVAL), None);
             }
-            err = av_hwdevice_ctx_create(&mut device_ref, device_type, null(), options, 0);
+            err = av_hwdevice_ctx_create(&mut device_ref, device_type, null(), options.0, 0);
             if err < 0 {
                 error!("Device creation failed: {err}.");
                 av_buffer_unref(&mut device_ref);
@@ -380,6 +429,7 @@ pub(crate) fn hw_device_init_from_string(arg: &str) -> (i32, Option<HWDevice>) {
         name: name.unwrap(),
         device_type,
         device_ref,
+        init_arg: Some(arg.to_string()),
     };
     add_hw_device(dev.clone());
 
@@ -430,6 +480,7 @@ pub(crate) fn hw_device_init_from_type(
         name: name.unwrap(),
         device_type,
         device_ref,
+        init_arg: None,
     };
 
     add_hw_device(dev.clone());
@@ -470,6 +521,31 @@ pub(crate) fn hw_device_get_by_name(name: &str) -> Option<HWDevice> {
     }
 
     None
+}
+
+/// Reuses the device already created from the exact same spec string, if any, so
+/// an identical `hw_device_init_from_string` request reuses it instead of leaking
+/// a fresh context — moving the matched entry to the back of the process-global
+/// list so it stays the last-initialized default filter device.
+fn reuse_by_init_arg_move_to_back(arg: &str) -> Option<HWDevice> {
+    let devices = HW_DEVICES.get_or_init(new_hw_devices);
+    let mut devices = devices.lock().unwrap();
+    reuse_move_to_back(&mut devices, arg)
+}
+
+/// Pure reuse over a device list: a device is reusable for `arg` only if it was
+/// created from that exact spec string (devices with `init_arg == None`, e.g.
+/// `hw_device_init_from_type`, never match). On a hit the entry is moved to the
+/// BACK of the list — `hw_device_for_filter` picks `devices.last()`, so reuse must
+/// preserve the "last-initialized wins" default-filter semantics. Split out so the
+/// reuse behavior is unit-testable without the process-global list.
+fn reuse_move_to_back(devices: &mut Vec<HWDevice>, arg: &str) -> Option<HWDevice> {
+    let idx = devices
+        .iter()
+        .position(|device| device.init_arg.as_deref() == Some(arg))?;
+    let device = devices.remove(idx);
+    devices.push(device.clone());
+    Some(device)
 }
 
 fn add_hw_device(device: HWDevice) {
@@ -670,6 +746,74 @@ mod tests {
         assert!(is_filter_available("scale"));
         assert!(!is_filter_available("definitely_not_a_filter_xyz"));
         assert!(!is_filter_available("bad\0name"));
+    }
+
+    fn dev(name: &str, init_arg: Option<&str>) -> HWDevice {
+        HWDevice {
+            name: name.to_string(),
+            device_type: AVHWDeviceType::AV_HWDEVICE_TYPE_NONE,
+            device_ref: null_mut(),
+            init_arg: init_arg.map(str::to_string),
+        }
+    }
+
+    // A repeated hwaccel spec must reuse the device created for that exact spec
+    // (otherwise a long-running service leaks a context per job and eventually
+    // exhausts device names -> ENOMEM). Devices created by other paths
+    // (`init_arg == None`) must never be reused by spec.
+    #[test]
+    fn reuse_only_matches_the_exact_init_spec() {
+        let mut devices = vec![
+            dev("vaapi0", Some("vaapi:/dev/dri/renderD128")),
+            dev("vaapi1", Some("vaapi:/dev/dri/renderD129")),
+            dev("cuda0", None),
+        ];
+
+        assert_eq!(
+            reuse_move_to_back(&mut devices, "vaapi:/dev/dri/renderD128")
+                .map(|d| d.name)
+                .as_deref(),
+            Some("vaapi0"),
+            "an identical spec must reuse its device"
+        );
+        assert!(
+            reuse_move_to_back(&mut devices, "vaapi:/dev/dri/renderD130").is_none(),
+            "a different spec must not reuse an unrelated device"
+        );
+        assert!(
+            reuse_move_to_back(&mut devices, "cuda0").is_none(),
+            "a device with no init spec (init_arg None) must never be reused by spec"
+        );
+        assert!(
+            reuse_move_to_back(&mut Vec::new(), "vaapi:/dev/dri/renderD128").is_none(),
+            "an empty list reuses nothing"
+        );
+    }
+
+    // Reuse must keep the reused device as the LAST entry, because
+    // hw_device_for_filter picks devices.last() as the default filter device.
+    // Sequence A -> B -> A: after reusing A it must be last again (not B).
+    #[test]
+    fn reuse_moves_the_device_to_the_back_for_default_filter_selection() {
+        let mut devices = vec![dev("A", Some("spec-a")), dev("B", Some("spec-b"))];
+        assert_eq!(
+            devices.last().map(|d| d.name.as_str()),
+            Some("B"),
+            "precondition: B was initialized last"
+        );
+
+        let reused = reuse_move_to_back(&mut devices, "spec-a").expect("A must be reused");
+        assert_eq!(reused.name, "A");
+        assert_eq!(
+            devices.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+            vec!["B", "A"],
+            "reusing A must move it to the back so it is the default filter device"
+        );
+        assert_eq!(
+            devices.len(),
+            2,
+            "reuse must not add a duplicate entry (no leaked context)"
+        );
     }
 
     #[test]
