@@ -38,7 +38,7 @@ use ffmpeg_sys_next::{
     ENOMEM,
 };
 #[cfg(not(docsrs))]
-use ffmpeg_sys_next::{av_channel_layout_copy, AV_CODEC_FLAG_COPY_OPAQUE};
+use ffmpeg_sys_next::{av_channel_layout_copy, AV_CODEC_FLAG_COPY_OPAQUE, FF_THREAD_FRAME};
 use log::{debug, error, info, trace, warn};
 use std::collections::HashMap;
 use std::ffi::{c_void, CStr, CString};
@@ -208,6 +208,7 @@ pub(crate) fn dec_init(
                         &packet_pool,
                         &frame_pool,
                         &senders,
+                        &scheduler_status,
                     ) {
                         if e == Error::Exit {
                             flush_buffers = false;
@@ -1462,6 +1463,99 @@ enum FrameOpaque {
     FrameOpaqueSendCommand,
 }
 
+/// Generous flat floor for the consecutive *no-progress* decode-error ceiling (see
+/// [`decode_stall_limit`]). It is the whole ceiling for every decoder except one
+/// running FFmpeg's own frame threading, and is set far above any realistic
+/// undelivered backlog we cannot otherwise read (an external decoder's reorder plus
+/// internal pipeline is at most a few dozen to low hundreds of pictures). It is a
+/// fixed constant rather than a per-decoder size because the one field that could
+/// size it — `thread_count` — is not trustworthy for an external decoder (see
+/// [`decode_stall_limit`]); `AVCodecContext.delay` is unused for the same reason.
+#[cfg(not(docsrs))]
+const DECODE_STALL_FLOOR: u32 = 1024;
+
+/// Head-room added above `thread_count` for a native frame-thread drain, covering
+/// the reorder delay and end-of-drain slack a decoder can hold beyond its raw worker
+/// count. Its only cost is that a wedged frame-threaded decoder spins this many extra
+/// no-op receives before terminating.
+#[cfg(not(docsrs))]
+const DECODE_STALL_MARGIN: u32 = 32;
+
+/// Per-decoder ceiling on consecutive no-progress decode errors before the drain
+/// declares the decoder wedged. It is a HEURISTIC: its only job is to stop a decoder
+/// that returns a persistent error without ever consuming input (e.g. a libjxl or
+/// libdav1d build that keeps returning the same error without clearing its buffered
+/// data) from looping forever, without mis-firing on one still draining a legitimate
+/// burst of errors.
+///
+/// The ceiling is gated on the *active* threading type:
+///   * **Native frame threading** (`active_thread_type & FF_THREAD_FRAME`): FFmpeg
+///     runs `thread_count` of its own frame-thread workers, each holding at most one
+///     in-flight picture, so a drain can legitimately return up to ~`thread_count`
+///     consecutive error results (e.g. a batch of invalid frames flushed at EOF).
+///     Here `thread_count` is FFmpeg's real worker count, so the ceiling grows with
+///     it: `thread_count + DECODE_STALL_MARGIN`.
+///   * **Everything else** (external decoders, slice threading, no threading): the
+///     flat [`DECODE_STALL_FLOOR`]. An external decoder does its own threading and
+///     may report an *inflated* `thread_count` — larger than the workers it truly
+///     runs, up to the requested `INT_MAX` — while `active_thread_type` stays 0, so
+///     trusting the raw field there would balloon the ceiling to billions and reduce
+///     the guard to the very hang it exists to prevent. The gate excludes that case.
+///
+/// A negative or zero `thread_count` clamps to the floor; the add is saturating.
+#[cfg(not(docsrs))]
+fn decode_stall_limit(active_thread_type: i32, thread_count: i32) -> u32 {
+    if active_thread_type & FF_THREAD_FRAME != 0 {
+        (thread_count.max(0) as u32)
+            .saturating_add(DECODE_STALL_MARGIN)
+            .max(DECODE_STALL_FLOOR)
+    } else {
+        DECODE_STALL_FLOOR
+    }
+}
+
+#[cfg(not(docsrs))]
+struct DecodeErrorBudget {
+    stalls: u32,
+    last_frame_num: i64,
+    limit: u32,
+}
+
+#[cfg(not(docsrs))]
+impl DecodeErrorBudget {
+    fn new(frame_num: i64, active_thread_type: i32, thread_count: i32) -> Self {
+        Self {
+            stalls: 0,
+            last_frame_num: frame_num,
+            limit: decode_stall_limit(active_thread_type, thread_count),
+        }
+    }
+
+    /// A successfully decoded frame is progress, so the stall run resets.
+    fn on_frame(&mut self, frame_num: i64) {
+        self.last_frame_num = frame_num;
+        self.stalls = 0;
+    }
+
+    /// Record an ignored decode error; returns whether the drain must give up.
+    /// `exit_on_error` gives up on the first error. Otherwise an error that still
+    /// advanced `frame_num` is progress (resets the run); the drain tolerates
+    /// `self.limit` consecutive no-progress errors and gives up on the next one
+    /// (matching FFmpeg's `> limit` guard).
+    fn on_error(&mut self, exit_on_error: bool, frame_num: i64) -> bool {
+        if exit_on_error {
+            return true;
+        }
+        if frame_num != self.last_frame_num {
+            self.last_frame_num = frame_num;
+            self.stalls = 0;
+        } else {
+            self.stalls += 1;
+        }
+        self.stalls > self.limit
+    }
+}
+
 #[cfg(not(docsrs))]
 unsafe fn packet_decode(
     dp_arc: &Arc<Mutex<DecoderParameter>>,
@@ -1470,6 +1564,7 @@ unsafe fn packet_decode(
     packet_pool: &ObjPool<Packet>,
     frame_pool: &ObjPool<Frame>,
     senders: &Vec<(Sender<FrameBox>, usize, Arc<[AtomicBool]>)>,
+    scheduler_status: &Arc<AtomicUsize>,
 ) -> crate::error::Result<()> {
     let dec_ctx = {
         let dp = dp_arc.clone();
@@ -1540,7 +1635,24 @@ unsafe fn packet_decode(
 
     packet_pool.release(packet_box.packet);
 
+    // Bound consecutive no-progress decode errors within this packet's drain so
+    // a decoder stuck returning errors without consuming input cannot spin
+    // forever (reset whenever the decoder advances; see DecodeErrorBudget).
+    let mut error_budget = DecodeErrorBudget::new(
+        (*dec_ctx).frame_num,
+        (*dec_ctx).active_thread_type,
+        (*dec_ctx).thread_count,
+    );
+
     loop {
+        // Bail out of the drain if a stop was requested. The worker's own stop
+        // check only runs between packets, so without this a decoder that keeps
+        // producing (or erroring on) frames from one packet could not be
+        // interrupted mid-drain.
+        if is_stopping(scheduler_status.load(Ordering::Acquire)) {
+            return Ok(());
+        }
+
         let mut outputs_mask = 1;
 
         let Ok(mut frame) = frame_pool.get() else {
@@ -1562,19 +1674,31 @@ unsafe fn packet_decode(
             return Err(Error::EOF);
         } else if ret < 0 {
             error!("Decoding error: {}", av_err2str(ret));
-            let dp = dp_arc.clone();
-            let mut dp = dp.lock().unwrap();
-            dp.dec.decode_errors += 1;
-
+            {
+                let dp = dp_arc.clone();
+                let mut dp = dp.lock().unwrap();
+                dp.dec.decode_errors += 1;
+            }
             frame_pool.release(frame);
-            if exit_on_error {
+
+            // `exit_on_error` fails on the first error. Otherwise keep draining:
+            // a transient error clears on the next receive, and the drain must
+            // still reach EAGAIN/EOF so a frame-threaded decoder's already
+            // decoded frames and the EOF-flush reset (dec_init's stream_loop
+            // path) are not skipped. An error that still advanced the decoder
+            // (e.g. AV_CODEC_FLAG_DROPCHANGED dropping a frame) is progress; only
+            // a genuine stall — a decoder that never consumes input on error —
+            // is bounded and gives up here rather than spinning forever.
+            if error_budget.on_error(exit_on_error, (*dec_ctx).frame_num) {
                 return Err(Decoding(DecodingOperationError::ReceiveFrameError(
                     DecodingError::from(ret),
                 )));
-            };
-
+            }
             continue;
         }
+
+        // A successfully received frame is progress, so the stall budget resets.
+        error_budget.on_frame((*dec_ctx).frame_num);
 
         if (*frame.as_ptr()).decode_error_flags != 0
             || ((*frame.as_ptr()).flags & AV_FRAME_FLAG_CORRUPT != 0)
@@ -1886,9 +2010,141 @@ unsafe fn audio_samplerate_update(
 #[cfg(all(test, not(docsrs)))]
 mod tests {
     use super::build_decoder_opts;
-    use ffmpeg_sys_next::{av_dict_count, av_dict_get, AV_DICT_MATCH_CASE};
+    use super::{decode_stall_limit, DecodeErrorBudget};
+    use ffmpeg_sys_next::{
+        av_dict_count, av_dict_get, AV_DICT_MATCH_CASE, FF_THREAD_FRAME, FF_THREAD_SLICE,
+    };
     use std::collections::HashMap;
     use std::ffi::{CStr, CString};
+
+    // The ceiling grows with thread_count ONLY under native frame threading;
+    // everything else (external decoders, slice threading, none) pins to the flat
+    // floor. Literal asserts pin both the value and the gate, so shrinking the floor
+    // OR dropping the FF_THREAD_FRAME gate fails here.
+    #[test]
+    fn decode_stall_limit_floors_then_grows_with_frame_threads() {
+        // Native frame threading expands with the (real) worker count...
+        assert_eq!(decode_stall_limit(FF_THREAD_FRAME, 1200), 1232);
+        // ...but a small / zero / negative count still pins to the floor (a negative
+        // clamps without underflowing u32).
+        assert_eq!(decode_stall_limit(FF_THREAD_FRAME, 0), 1024);
+        assert_eq!(decode_stall_limit(FF_THREAD_FRAME, -7), 1024);
+        // i32::MAX + 32 stays within u32 (no overflow within the i32 input domain).
+        assert_eq!(
+            decode_stall_limit(FF_THREAD_FRAME, i32::MAX),
+            i32::MAX as u32 + 32
+        );
+        // The gate itself: an external decoder reporting an inflated thread_count
+        // while active_thread_type is 0 must NOT balloon the ceiling — it stays at the
+        // floor. Dropping the gate makes this ~2.1 billion.
+        assert_eq!(decode_stall_limit(0, i32::MAX), 1024);
+        // Slice threading is not frame threading, so it also uses the floor.
+        assert_eq!(decode_stall_limit(FF_THREAD_SLICE, 1200), 1024);
+    }
+
+    // `new` wires the ceiling through `decode_stall_limit(active_thread_type,
+    // thread_count)` — the real production path, not a bypassed constant.
+    #[test]
+    fn new_budget_uses_the_thread_count_ceiling() {
+        assert_eq!(DecodeErrorBudget::new(0, FF_THREAD_FRAME, 1200).limit, 1232);
+        // An inflated external thread_count is gated down to the floor.
+        assert_eq!(DecodeErrorBudget::new(0, 0, i32::MAX).limit, 1024);
+    }
+
+    // exit_on_error gives up on the very first error, regardless of progress.
+    #[test]
+    fn exit_on_error_gives_up_on_the_first_error() {
+        // Explicit tiny limit: exit_on_error must fire before the budget matters.
+        let mut budget = DecodeErrorBudget {
+            stalls: 0,
+            last_frame_num: 0,
+            limit: 3,
+        };
+        assert!(budget.on_error(true, 0));
+    }
+
+    // An error that still advanced `frame_num` is progress, not a stall — e.g.
+    // AV_CODEC_FLAG_DROPCHANGED drops a frame and returns AVERROR_INPUT_CHANGED.
+    // No number of such errors may ever trip the budget, even far past the limit.
+    #[test]
+    fn advancing_frame_num_is_progress_not_a_stall() {
+        let mut budget = DecodeErrorBudget {
+            stalls: 0,
+            last_frame_num: 0,
+            limit: 3,
+        };
+        for i in 1..=(3 * 10) {
+            assert!(
+                !budget.on_error(false, i),
+                "an error that advanced frame_num is progress, not a stall"
+            );
+        }
+    }
+
+    // A genuine stall (frame_num never advances) gives up only PAST the limit, and
+    // a decoded frame in between resets the run (a full run of tolerated stalls, a
+    // frame, another full run, then one over). An explicit tiny limit pins the
+    // off-by-one and reset independently of the production floor.
+    #[test]
+    fn stall_budget_fires_only_on_a_true_stall_and_resets_on_a_frame() {
+        let mut budget = DecodeErrorBudget {
+            stalls: 0,
+            last_frame_num: 0,
+            limit: 3,
+        };
+
+        for _ in 0..3 {
+            assert!(
+                !budget.on_error(false, 0),
+                "up to the limit the drain keeps going"
+            );
+        }
+        // A decoded frame resets the stall run.
+        budget.on_frame(1);
+        for _ in 0..3 {
+            assert!(!budget.on_error(false, 1), "the frame reset the stall run");
+        }
+        // The (limit + 1)-th consecutive no-progress error finally gives up.
+        assert!(
+            budget.on_error(false, 1),
+            "a true stall past the limit gives up"
+        );
+    }
+
+    // A frame_num-advancing error resets a run that has ALREADY accrued stalls (the
+    // reset lives in on_error's advancing branch, not only in on_frame). Without it,
+    // the first no-progress error after the advance would fire immediately.
+    #[test]
+    fn an_advancing_error_resets_an_existing_stall_run() {
+        let mut budget = DecodeErrorBudget {
+            stalls: 0,
+            last_frame_num: 0,
+            limit: 3,
+        };
+        // Accrue a partial run at frame_num 0.
+        for _ in 0..3 {
+            assert!(
+                !budget.on_error(false, 0),
+                "within the budget at frame_num 0"
+            );
+        }
+        // An error that advanced frame_num is progress: it must reset the run (and is
+        // itself tolerated), NOT count as the fatal (limit + 1)-th stall.
+        assert!(
+            !budget.on_error(false, 1),
+            "the advancing error resets the run and is tolerated"
+        );
+        // A full fresh run of `limit` is now tolerated again...
+        for _ in 0..3 {
+            assert!(!budget.on_error(false, 1), "fresh run after the reset");
+        }
+        // ...and only the next one gives up. (Drop the reset and the first
+        // post-advance error would already have fired, failing the loop above.)
+        assert!(
+            budget.on_error(false, 1),
+            "past the limit after the reset gives up"
+        );
+    }
 
     fn dict_value(guard: &crate::util::ffmpeg_utils::DictGuard, key: &str) -> Option<String> {
         let key = CString::new(key).unwrap();
