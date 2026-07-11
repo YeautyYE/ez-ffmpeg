@@ -240,8 +240,13 @@ pub(crate) fn enc_init(
 
             // ---- producer + live drain ----
             while !stop {
-                // (0) cascade-finish: a shorter peer truncated this stream.
-                if sq_finished[sq_idx].load(Ordering::Acquire) {
+                // (0) cascade-finish: a shorter peer truncated this stream — but
+                // only once this encoder has opened. Opening publishes the ready
+                // signal the muxer waits on, so breaking before enc_open would
+                // strand the muxer on a stream that never becomes ready (a
+                // 0-frame cap finished at sync-queue setup, or a heartbeat-then-
+                // cascade, can set sq_finished before the first frame arrives).
+                if should_cascade_break(opened, sq_finished[sq_idx].load(Ordering::Acquire)) {
                     break; // -> drain phase (the peer already signalled the finish)
                 }
                 let sync_frame = receive_frame(&mut opened, &receiver, &frame_pool, enc_ctx_box.as_mut_ptr(), stream_box.inner,
@@ -775,6 +780,18 @@ fn process_audio_queue(
         }
     }
     Ok(None)
+}
+
+/// Whether the encoder loop should honor a sync-queue cascade-finish now. A
+/// cascade-finish is ignored until the encoder has `opened`, because opening is
+/// what publishes the ready signal the muxer waits on. Breaking out of the loop
+/// before `enc_open` runs — e.g. a 0-frame cap that finished the stream at
+/// sync-queue setup, or a heartbeat-then-cascade on a still-zero-frame stream,
+/// set `sq_finished` before this encoder ever received a frame — would strand
+/// the muxer waiting forever on a ready signal that is never sent.
+#[cfg(not(docsrs))]
+fn should_cascade_break(opened: bool, sq_finished: bool) -> bool {
+    opened && sq_finished
 }
 
 fn receive_frame(
@@ -2089,3 +2106,26 @@ const PRE_MUX_FULL_BACKSTOP: Duration = Duration::from_secs(60);
 /// Purely a lost-notify safety net (mirrors the conc-06 pause gate); real
 /// wakes come from the drain and from receiver drop.
 const PRE_MUX_FULL_WAIT_SLICE: Duration = Duration::from_millis(200);
+
+#[cfg(all(test, not(docsrs)))]
+mod tests {
+    use super::should_cascade_break;
+
+    // A sync-queue cascade-finish must be ignored until the encoder has opened,
+    // because opening is what publishes the ready signal the muxer waits on. If
+    // the stream was finished before its first frame — e.g. a 0-frame cap
+    // applied at sync-queue setup, or a heartbeat-then-cascade on a zero-frame
+    // stream — breaking here would strand the muxer on a stream that never
+    // becomes ready.
+    #[test]
+    fn cascade_break_waits_until_the_encoder_has_opened() {
+        // Finished but not yet opened: must NOT break — the encoder has to open
+        // (and signal ready) first.
+        assert!(!should_cascade_break(false, true));
+        // Opened and finished: honor the cascade-finish.
+        assert!(should_cascade_break(true, true));
+        // Not finished: never break for a cascade, regardless of opened.
+        assert!(!should_cascade_break(false, false));
+        assert!(!should_cascade_break(true, false));
+    }
+}
