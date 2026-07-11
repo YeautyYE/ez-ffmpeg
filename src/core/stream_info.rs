@@ -17,6 +17,7 @@ use ffmpeg_sys_next::{
 use ffmpeg_sys_next::{avformat_alloc_context, avformat_close_input, avformat_open_input};
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum StreamInfo {
     /// Video stream information
     Video {
