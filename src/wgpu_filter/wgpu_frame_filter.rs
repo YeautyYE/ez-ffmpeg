@@ -502,17 +502,12 @@ impl FrameFilter for WgpuFrameFilter {
         frame: Frame,
         _ctx: &FrameFilterContext,
     ) -> Result<Option<Frame>, FrameFilterError> {
-        // SAFETY: probing only reads pointers/scalars of a live frame.
-        // `buf[0]` is the marker signature used across the scheduler
-        // (dec_task, send_frame): props-only frames carry no buffer refs.
-        // Checking `data[0]` instead would misclassify hardware frames,
-        // whose data pointers are API handles (VAAPI keeps the surface in
-        // data[3] and leaves data[0] null).
-        let bypass = unsafe {
-            frame.as_ptr().is_null()
-                || (*frame.as_ptr()).buf[0].is_null()
-                || (*frame.as_ptr()).width <= 0
-                || (*frame.as_ptr()).height <= 0
+        // A props-only marker (buf[0] null — see frame_is_eof_marker, which
+        // avoids the data[0] check that would misclassify hardware frames whose
+        // surface lives in data[3]) or a degenerate frame bypasses GPU work.
+        let bypass = crate::util::ffmpeg_utils::frame_is_eof_marker(&frame) || unsafe {
+            // SAFETY: not a marker, so the frame is non-null with live buffers.
+            (*frame.as_ptr()).width <= 0 || (*frame.as_ptr()).height <= 0
         };
         if bypass {
             // Props-only frames (e.g. the EOF timestamp marker decoders send

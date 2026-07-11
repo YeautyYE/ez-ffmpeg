@@ -208,16 +208,19 @@ pub fn frame_is_writable(frame: &ffmpeg_next::Frame) -> bool {
 /// Call this before mutating frame data in place inside a
 /// [`FrameFilter`](crate::filter::frame_filter::FrameFilter): if the buffers
 /// are already exclusive it is a cheap refcount check, otherwise it clones
-/// the data so the shared original stays untouched. Props-only frames (no
-/// data buffers) and the null EOF shell pass through unchanged — there is
-/// nothing to copy.
+/// the data so the shared original stays untouched. Props-only frames (no data
+/// planes) and the null EOF shell pass through unchanged — there is nothing to
+/// copy. A non-refcounted software frame (`buf[0] == null` but real data in
+/// `data[0]`) is NOT skipped: `av_frame_make_writable` allocates owned buffers
+/// and copies its data, so an in-place edit cannot corrupt the caller's memory.
 pub fn make_frame_writable(frame: &mut ffmpeg_next::Frame) -> Result<(), String> {
-    // SAFETY: null/props-only frames are skipped; otherwise the frame owns a
-    // live AVFrame for the whole call.
+    // A null shell or props-only frame has nothing to copy; everything else,
+    // non-refcounted frames included, is handed to av_frame_make_writable.
+    if frame_is_eof_marker(frame) {
+        return Ok(());
+    }
+    // SAFETY: not a props-only frame, so it owns a live AVFrame with data.
     unsafe {
-        if frame.as_ptr().is_null() || (*frame.as_ptr()).buf[0].is_null() {
-            return Ok(());
-        }
         let ret = ffmpeg_sys_next::av_frame_make_writable(frame.as_mut_ptr());
         if ret < 0 {
             return Err(format!(
@@ -227,6 +230,31 @@ pub fn make_frame_writable(frame: &mut ffmpeg_next::Frame) -> Result<(), String>
         }
     }
     Ok(())
+}
+
+/// Returns `true` if `frame` is an end-of-stream flush marker rather than a
+/// frame carrying pixel/sample data: either a null frame shell or a props-only
+/// frame that owns no buffers AND has no data planes set.
+///
+/// The test requires BOTH `buf[0] == null` AND every `data[]` pointer null,
+/// because neither alone is sufficient:
+/// - a hardware frame (e.g. VAAPI) keeps its surface handle in a later `data[]`
+///   slot with `data[0] == null`, so a `data[0]`-only check (`Frame::is_empty`)
+///   would misclassify it as a marker;
+/// - a non-refcounted software frame has `buf[0] == null` but real pixel data in
+///   `data[0]`, so a `buf[0]`-only check would misclassify IT as a marker.
+///
+/// Requiring no buffers and no data leaves only the genuine props-only marker
+/// (and the null shell). A
+/// [`FrameFilter`](crate::filter::frame_filter::FrameFilter) that passes flush
+/// markers straight through should probe its cue with this instead of an
+/// open-coded `unsafe` read.
+pub fn frame_is_eof_marker(frame: &ffmpeg_next::Frame) -> bool {
+    // SAFETY: null-checked; only reads buf[0] and the data plane pointers.
+    unsafe {
+        let p = frame.as_ptr();
+        p.is_null() || ((*p).buf[0].is_null() && (*p).data.iter().all(|d| d.is_null()))
+    }
 }
 
 /// Rust implementation of FFmpeg's `av_rescale_q_rnd`.
@@ -465,5 +493,112 @@ mod tests {
 
         // Test invalid rounding mode (4 is invalid)
         assert_eq!(av_rescale_rnd(100, 100, 100, 4), i64::MIN);
+    }
+
+    /// frame_is_eof_marker must treat ONLY a null shell or a props-only frame
+    /// (no buffers AND no data) as a marker — never a VAAPI-shaped hardware
+    /// frame (buf set, data[0] null, surface in data[3]) nor a non-refcounted
+    /// software frame (buf null, data[0] set). The last two are the shapes the
+    /// old data[0]-only and the interim buf[0]-only tests each got wrong.
+    #[test]
+    fn frame_is_eof_marker_classifies_every_buffer_shape() {
+        use ffmpeg_next::Frame;
+        use ffmpeg_sys_next::{av_buffer_alloc, av_frame_alloc, av_frame_get_buffer, AVPixelFormat};
+        unsafe {
+            // null shell.
+            assert!(
+                frame_is_eof_marker(&Frame::wrap(std::ptr::null_mut())),
+                "null frame is a marker"
+            );
+
+            // props-only marker: fresh AVFrame, no buffers, no data.
+            let marker = av_frame_alloc();
+            assert!(
+                frame_is_eof_marker(&Frame::wrap(marker)),
+                "props-only frame is a marker"
+            );
+
+            // normal refcounted software frame: buf[0] and data[0] set.
+            let sw = av_frame_alloc();
+            (*sw).format = AVPixelFormat::AV_PIX_FMT_RGBA as i32;
+            (*sw).width = 4;
+            (*sw).height = 4;
+            assert!(av_frame_get_buffer(sw, 0) >= 0);
+            assert!(
+                !frame_is_eof_marker(&Frame::wrap(sw)),
+                "a normal software frame is not a marker"
+            );
+
+            // VAAPI-shaped frame: buf[0] set, data[0] null, surface in data[3].
+            let hw = av_frame_alloc();
+            let hw_buf = av_buffer_alloc(16);
+            (*hw).buf[0] = hw_buf;
+            (*hw).data[3] = (*hw_buf).data;
+            assert!(
+                !frame_is_eof_marker(&Frame::wrap(hw)),
+                "a hardware frame (data in data[3]) is not a marker"
+            );
+
+            // non-refcounted software frame: buf[0] null, data[0] points at
+            // caller memory. `pixels` is declared first so it outlives the
+            // Frame's drop; av_frame_free leaves non-owned data[] untouched.
+            let mut pixels = [0u8; 16];
+            let nrc = av_frame_alloc();
+            (*nrc).data[0] = pixels.as_mut_ptr();
+            let nrc_frame = Frame::wrap(nrc);
+            let nrc_is_marker = frame_is_eof_marker(&nrc_frame);
+            drop(nrc_frame);
+            let _ = &pixels;
+            assert!(
+                !nrc_is_marker,
+                "a non-refcounted software frame (data but no buf) is not a marker"
+            );
+        }
+    }
+
+    /// make_frame_writable must NOT skip a non-refcounted software frame: it
+    /// defers to av_frame_make_writable, which allocates owned buffers and
+    /// copies, so buf[0] is non-null afterwards and an in-place edit cannot
+    /// corrupt the caller's memory. The old buf[0]-null skip wrongly returned
+    /// early and left it un-copied.
+    #[test]
+    fn make_frame_writable_copies_a_non_refcounted_frame() {
+        use ffmpeg_next::Frame;
+        use ffmpeg_sys_next::{av_frame_alloc, AVPixelFormat};
+        unsafe {
+            let raw = av_frame_alloc();
+            (*raw).format = AVPixelFormat::AV_PIX_FMT_GRAY8 as i32;
+            (*raw).width = 4;
+            (*raw).height = 4;
+            (*raw).linesize[0] = 4;
+            // Distinctive non-zero payload so the copy can be verified byte for byte.
+            let mut pixels: Vec<u8> = (1..=16).collect();
+            let src_ptr = pixels.as_mut_ptr();
+            (*raw).data[0] = src_ptr;
+            assert!((*raw).buf[0].is_null(), "precondition: non-refcounted");
+            let mut f = Frame::wrap(raw);
+            make_frame_writable(&mut f).expect("make_frame_writable must copy, not skip");
+
+            let out = f.as_ptr();
+            assert!(
+                !(*out).buf[0].is_null(),
+                "a non-refcounted frame must be given owned buffers"
+            );
+            // The data was copied to a fresh buffer, not aliased to the caller's.
+            assert_ne!((*out).data[0], src_ptr, "data must point at a new buffer");
+            // ...and the bytes match, honoring the (possibly padded) new linesize.
+            let new_ls = (*out).linesize[0] as usize;
+            for row in 0..4usize {
+                let copied = std::slice::from_raw_parts((*out).data[0].add(row * new_ls), 4);
+                assert_eq!(
+                    copied,
+                    &pixels[row * 4..row * 4 + 4],
+                    "row {row} must be copied verbatim"
+                );
+            }
+            // Mutating the copy must leave the caller's memory untouched.
+            *(*out).data[0] = 0xAB;
+            assert_eq!(pixels[0], 1, "the source must be untouched by an in-place edit");
+        }
     }
 }

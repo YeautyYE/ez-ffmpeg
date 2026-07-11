@@ -378,11 +378,10 @@ pub mod codec;
 ///         mut frame: Frame,
 ///         _ctx: &FrameFilterContext,
 ///     ) -> Result<Option<Frame>, Box<dyn std::error::Error + Send + Sync>> {
-///          unsafe {
-///             if frame.as_ptr().is_null() || frame.is_empty() {
-///                 return Ok(Some(frame));
-///             }
-///          }
+///         // Forward an end-of-stream flush marker straight through.
+///         if ez_ffmpeg::util::ffmpeg_utils::frame_is_eof_marker(&frame) {
+///             return Ok(Some(frame));
+///         }
 ///
 ///         // Here you would implement the logic to transform the frame.
 ///         // As a trivial example, we just return the original frame.
