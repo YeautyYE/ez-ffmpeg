@@ -4,7 +4,7 @@ use crate::core::context::obj_pool::ObjPool;
 use crate::core::context::{FrameBox, FrameData};
 use crate::core::scheduler::type_to_symbol;
 use crate::error::Error::{
-    FrameFilterInit, FrameFilterProcess, FrameFilterRequest, FrameFilterSendOOM,
+    FrameFilterFrameDuplicateFailed, FrameFilterInit, FrameFilterProcess, FrameFilterRequest,
     FrameFilterStreamTypeNoMatched, FrameFilterThreadExited, FrameFilterTypeNoMatched,
 };
 use crate::filter::frame_pipeline::FramePipeline;
@@ -773,7 +773,7 @@ fn send_frame(
                                 av_frame_ref(to_send.as_mut_ptr(), frame_box.frame.as_ptr())
                             };
                             if ret < 0 {
-                                return Err(FrameFilterSendOOM);
+                                return Err(FrameFilterFrameDuplicateFailed);
                             }
                         } else {
                             // SAFETY: frame is live for the call.
@@ -781,7 +781,7 @@ fn send_frame(
                                 av_frame_copy_props(to_send.as_mut_ptr(), frame_box.frame.as_ptr())
                             };
                             if ret < 0 {
-                                return Err(FrameFilterSendOOM);
+                                return Err(FrameFilterFrameDuplicateFailed);
                             }
                         }
                         to_send
@@ -833,4 +833,94 @@ fn frame_filter_init(pipeline: &mut FramePipeline) -> crate::error::Result<()> {
         return Err(FrameFilterInit(e));
     };
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::scheduler::ffmpeg_scheduler::{frame_is_null, unref_frame};
+    use ffmpeg_next::Frame;
+    use ffmpeg_sys_next::{av_frame_alloc, AVMediaType, AVPixelFormat};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    fn test_new_frame() -> crate::error::Result<Frame> {
+        // SAFETY: av_frame_alloc returns an owned empty frame or null; null-check it
+        // (extreme OOM) before wrapping so no null frame is dereferenced later. The
+        // empty frame is a valid destination for the av_frame_ref clone in send_frame.
+        let f = unsafe { av_frame_alloc() };
+        assert!(!f.is_null(), "av_frame_alloc must not fail");
+        Ok(unsafe { Frame::wrap(f) })
+    }
+
+    // send_frame fans one frame to N destinations: every destination EXCEPT the
+    // last gets its own av_frame_ref clone, so a single-destination pipeline never
+    // exercises that clone path. For a NON-refcounted source (buf[0] null, pixels
+    // in data[0] — what a user FrameFilter can emit), av_frame_ref must allocate
+    // owned buffers and COPY the data so the clone is not left empty. This pins the
+    // two-destination path and the non-refcounted copy.
+    #[test]
+    fn send_frame_clones_a_non_refcounted_frame_for_a_second_destination() {
+        let (tx0, rx0) = crossbeam_channel::unbounded::<FrameBox>();
+        let (tx1, rx1) = crossbeam_channel::unbounded::<FrameBox>();
+        let no_flags: Arc<[AtomicBool]> = Arc::from(Vec::<AtomicBool>::new());
+        let mut senders: FrameSenders =
+            vec![(tx0, 0usize, no_flags.clone()), (tx1, 0usize, no_flags)];
+
+        let mut pipeline = FramePipeline::new(AVMediaType::AVMEDIA_TYPE_VIDEO, Some(0));
+        let pool = ObjPool::new(2, test_new_frame, unref_frame, frame_is_null).expect("pool");
+
+        // A non-refcounted 4x4 RGBA frame: buf[0] null, real pixels in data[0].
+        // `pixels` is declared first so it outlives the frames below (destination 1
+        // aliases it; av_frame_free leaves non-owned data[] untouched).
+        let mut pixels = vec![0u8; 4 * 4 * 4];
+        pixels[0] = 0xAB;
+        let pixels_ptr = pixels.as_mut_ptr();
+        let src = unsafe {
+            let f = av_frame_alloc();
+            assert!(!f.is_null(), "av_frame_alloc must not fail");
+            (*f).format = AVPixelFormat::AV_PIX_FMT_RGBA as i32;
+            (*f).width = 4;
+            (*f).height = 4;
+            (*f).data[0] = pixels_ptr;
+            (*f).linesize[0] = 4 * 4;
+            Frame::wrap(f)
+        };
+
+        send_frame(&mut pipeline, &mut senders, &pool, Some(src)).expect("send_frame");
+
+        // Destination 0 got the av_frame_ref clone: a non-refcounted source forces
+        // av_frame_ref to allocate owned buffers (buf[0] non-null) and copy the data.
+        let got0 = rx0.try_recv().expect("destination 0 must receive a frame");
+        unsafe {
+            let p = got0.frame.as_ptr();
+            assert!(!(*p).buf[0].is_null(), "the clone must own its buffers");
+            assert!(!(*p).data[0].is_null());
+            assert_eq!(
+                *(*p).data[0],
+                0xAB,
+                "the pixel data must be copied, not lost"
+            );
+        }
+        // Destination 1 got the moved original: still the non-refcounted frame, its
+        // data[0] aliasing the caller's pixels and with no owned buffer.
+        let got1 = rx1.try_recv().expect("destination 1 must receive a frame");
+        unsafe {
+            let p = got1.frame.as_ptr();
+            assert_eq!(
+                (*p).data[0],
+                pixels_ptr,
+                "destination 1 must get the moved original, still aliasing the caller's pixels"
+            );
+            assert!(
+                (*p).buf[0].is_null(),
+                "the moved original stays non-refcounted (no owned buffer)"
+            );
+        }
+
+        // Drop the frames while `pixels` is still alive (destination 1 aliases it).
+        drop(got0);
+        drop(got1);
+        let _ = &pixels;
+    }
 }

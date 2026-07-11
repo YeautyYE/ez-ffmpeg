@@ -111,8 +111,8 @@ pub enum Error {
     #[error("Frame filter pipeline destination already finished")]
     FrameFilterDstFinished,
 
-    #[error("Frame filter pipeline send frame failed, out of memory")]
-    FrameFilterSendOOM,
+    #[error("Frame filter pipeline failed to duplicate a frame for an additional destination")]
+    FrameFilterFrameDuplicateFailed,
 
     #[error("Frame filter pipeline thread exited")]
     FrameFilterThreadExited,
@@ -203,7 +203,7 @@ impl PartialEq for Error {
             | (FilterZeroInputs, FilterZeroInputs)
             | (ParseInteger, ParseInteger)
             | (FrameFilterDstFinished, FrameFilterDstFinished)
-            | (FrameFilterSendOOM, FrameFilterSendOOM)
+            | (FrameFilterFrameDuplicateFailed, FrameFilterFrameDuplicateFailed)
             | (FrameFilterThreadExited, FrameFilterThreadExited)
             | (EOF, EOF)
             | (Exit, Exit)
