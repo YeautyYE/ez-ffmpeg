@@ -968,7 +968,10 @@ unsafe fn frame_plane(frame: *const AVFrame, index: usize) -> Result<(*mut u8, u
 /// # Safety
 /// `frame` must point to a valid AVFrame whose plane buffers outlive the
 /// returned slice, with no concurrent writer.
-pub unsafe fn frame_data<'a>(frame: *const AVFrame, index: usize) -> Result<&'a [u8], String> {
+pub(crate) unsafe fn frame_data<'a>(
+    frame: *const AVFrame,
+    index: usize,
+) -> Result<&'a [u8], String> {
     let (data_ptr, len) = frame_plane(frame, index)?;
     Ok(std::slice::from_raw_parts(data_ptr, len))
 }
@@ -979,7 +982,7 @@ pub unsafe fn frame_data<'a>(frame: *const AVFrame, index: usize) -> Result<&'a 
 /// `frame` must point to a valid, writable AVFrame (`av_frame_make_writable`)
 /// with no other reference to the plane while the slice lives; taking
 /// `*mut AVFrame` keeps the exclusivity requirement visible at the call site.
-pub unsafe fn frame_data_mut<'a>(
+pub(crate) unsafe fn frame_data_mut<'a>(
     frame: *mut AVFrame,
     index: usize,
 ) -> Result<&'a mut [u8], String> {

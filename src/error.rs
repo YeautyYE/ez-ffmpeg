@@ -129,12 +129,12 @@ pub enum Error {
     RtmpCreateStream,
 
     #[cfg(feature = "rtmp")]
-    #[error("Rtmp server session error: {0}")]
-    RtmpServerSession(#[from] rml_rtmp::sessions::ServerSessionError),
-
-    #[cfg(feature = "rtmp")]
     #[error("Rtmp server thread exited")]
     RtmpThreadExited,
+
+    #[cfg(feature = "rtmp")]
+    #[error("Rtmp stream closed: the server is no longer consuming this stream")]
+    RtmpStreamClosed,
 
     #[cfg(feature = "subtitle")]
     #[error("Subtitle error: {0}")]
@@ -209,7 +209,9 @@ impl PartialEq for Error {
             | (Exit, Exit)
             | (Bug, Bug) => true,
             #[cfg(feature = "rtmp")]
-            (RtmpCreateStream, RtmpCreateStream) | (RtmpThreadExited, RtmpThreadExited) => true,
+            (RtmpCreateStream, RtmpCreateStream)
+            | (RtmpThreadExited, RtmpThreadExited)
+            | (RtmpStreamClosed, RtmpStreamClosed) => true,
             _ => false,
         }
     }
