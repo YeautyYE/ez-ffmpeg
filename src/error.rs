@@ -646,6 +646,11 @@ impl From<i32> for FilterGraphParseError {
             AVERROR_INVALIDDATA => FilterGraphParseError::InvalidData,
             AVERROR_NOT_IMPLEMENTED => FilterGraphParseError::NotImplemented,
             AVERROR_OPTION_NOT_FOUND => FilterGraphParseError::OptionNotFound,
+            // EACCES/ENOTSOCK reach here from filters that touch files or
+            // sockets (e.g. `movie=`); map them to the variants this enum
+            // already declares instead of degrading to UnknownError.
+            AVERROR_PERMISSION_DENIED => FilterGraphParseError::PermissionDenied,
+            AVERROR_NOT_SOCKET => FilterGraphParseError::NotSocket,
             _ => FilterGraphParseError::UnknownError(err_code),
         }
     }
@@ -904,65 +909,6 @@ impl From<i32> for WriteHeaderError {
             AVERROR_PERMISSION_DENIED => WriteHeaderError::PermissionDenied,
             AVERROR_TIMEOUT => WriteHeaderError::Timeout,
             _ => WriteHeaderError::UnknownError(err_code),
-        }
-    }
-}
-
-#[derive(thiserror::Error, Debug)]
-#[non_exhaustive]
-pub enum WriteFrameError {
-    #[error("Memory allocation error")]
-    OutOfMemory,
-
-    #[error("Invalid argument provided")]
-    InvalidArgument,
-
-    #[error("Reached end of file while writing data")]
-    EndOfFile,
-
-    #[error("Timeout occurred while writing data")]
-    Timeout,
-
-    #[error("I/O error occurred while writing data")]
-    IOError,
-
-    #[error("Bad file descriptor")]
-    BadFileDescriptor,
-
-    #[error("Pipe error occurred")]
-    PipeError,
-
-    #[error("Functionality not implemented or unsupported operation")]
-    NotImplemented,
-
-    #[error("Operation not permitted")]
-    OperationNotPermitted,
-
-    #[error("Permission denied")]
-    PermissionDenied,
-
-    #[error("Not a valid socket")]
-    NotSocket,
-
-    #[error("An unknown error occurred. ret: {0}")]
-    UnknownError(i32),
-}
-
-impl From<i32> for WriteFrameError {
-    fn from(err_code: i32) -> Self {
-        match err_code {
-            AVERROR_OUT_OF_MEMORY => WriteFrameError::OutOfMemory,
-            AVERROR_INVALID_ARGUMENT => WriteFrameError::InvalidArgument,
-            AVERROR_EOF => WriteFrameError::EndOfFile,
-            AVERROR_TIMEOUT => WriteFrameError::Timeout,
-            AVERROR_IO_ERROR => WriteFrameError::IOError,
-            AVERROR_BAD_FILE_DESCRIPTOR => WriteFrameError::BadFileDescriptor,
-            AVERROR_PIPE_ERROR => WriteFrameError::PipeError,
-            AVERROR_NOT_IMPLEMENTED => WriteFrameError::NotImplemented,
-            AVERROR_OPERATION_NOT_PERMITTED => WriteFrameError::OperationNotPermitted,
-            AVERROR_PERMISSION_DENIED => WriteFrameError::PermissionDenied,
-            AVERROR_NOT_SOCKET => WriteFrameError::NotSocket,
-            _ => WriteFrameError::UnknownError(err_code),
         }
     }
 }
@@ -1367,4 +1313,24 @@ pub enum PacketScannerError {
     /// Failed to read the next packet from the demuxer.
     #[error("while reading packet: {0}")]
     ReadError(DemuxingError),
+}
+
+#[cfg(test)]
+mod tests {
+    // Regression: FilterGraphParseError declares PermissionDenied and NotSocket,
+    // but its From<i32> once omitted them, so an EACCES/ENOTSOCK filtergraph
+    // error degraded to UnknownError and the two declared variants were
+    // unreachable. Map the codes to the variants the enum already exposes.
+    #[test]
+    fn filter_graph_parse_error_maps_permission_and_socket_codes() {
+        use super::{FilterGraphParseError, AVERROR_NOT_SOCKET, AVERROR_PERMISSION_DENIED};
+        assert!(matches!(
+            FilterGraphParseError::from(AVERROR_PERMISSION_DENIED),
+            FilterGraphParseError::PermissionDenied
+        ));
+        assert!(matches!(
+            FilterGraphParseError::from(AVERROR_NOT_SOCKET),
+            FilterGraphParseError::NotSocket
+        ));
+    }
 }
