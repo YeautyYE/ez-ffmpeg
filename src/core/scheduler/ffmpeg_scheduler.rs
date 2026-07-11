@@ -106,6 +106,8 @@ impl Drop for RunningGuard {
 pub struct FfmpegScheduler<S> {
     ffmpeg_context: FfmpegContext,
     status: Arc<AtomicUsize>,
+    /// Per-scheduler seqlock pause parity: settled even = running, odd = paused. pause() bumps even->odd BEFORE flipping status and resume() bumps odd->even AFTER its CAS, so the epoch is odd across both transition windows and `status == PAUSE` never coexists with an even epoch. A pre-mux worker charges a wait slice only when this is even and unchanged across it, so paused time never advances the backstop.
+    pause_epoch: Arc<AtomicUsize>,
     thread_sync: ThreadSynchronizer,
     result: Arc<Mutex<Option<crate::error::Result<()>>>>,
     state: PhantomData<S>,
@@ -159,6 +161,7 @@ impl<S: 'static> FfmpegScheduler<S> {
         FfmpegScheduler {
             ffmpeg_context: self.ffmpeg_context,
             status: self.status,
+            pause_epoch: self.pause_epoch,
             thread_sync: self.thread_sync,
             result: self.result,
             state: Default::default(),
@@ -229,6 +232,7 @@ impl FfmpegScheduler<Initialization> {
             state: Default::default(),
             thread_sync: ThreadSynchronizer::new(),
             status,
+            pause_epoch: Arc::new(AtomicUsize::new(0)),
             result: Arc::new(Mutex::new(None)),
             _guard: None,
         }
@@ -266,6 +270,7 @@ impl FfmpegScheduler<Initialization> {
             }
         };
         let scheduler_status = self.status.clone();
+        let pause_epoch = self.pause_epoch.clone();
         scheduler_status.store(STATUS_RUN, Ordering::Release);
         let thread_sync = self.thread_sync.clone();
         let scheduler_result = self.result.clone();
@@ -481,6 +486,7 @@ impl FfmpegScheduler<Initialization> {
                     frame_pool.clone(),
                     packet_pool.clone(),
                     scheduler_status.clone(),
+                    pause_epoch.clone(),
                     thread_sync.clone(),
                     mux.enc_handle_sender(),
                     scheduler_result.clone(),
@@ -575,6 +581,7 @@ impl FfmpegScheduler<Initialization> {
                 packet_pool.clone(),
                 demux.node.clone(),
                 scheduler_status.clone(),
+                pause_epoch.clone(),
                 thread_sync.clone(),
                 scheduler_result.clone(),
             ) {
@@ -670,6 +677,15 @@ impl FfmpegScheduler<Running> {
     /// # Returns
     /// A new [`FfmpegScheduler<Paused>`] representing the paused job.
     pub fn pause(self) -> FfmpegScheduler<Paused> {
+        // Seqlock-style pause epoch: even = running, odd = paused. Bump it
+        // even->odd to mark entering pause BEFORE flipping status, so any pre-mux
+        // wait slice overlapping this pause sees an odd (or moved) epoch and is
+        // excluded from the deferred-start backstop — there is never a window where
+        // status reads PAUSE while the epoch still reads even. A failed CAS (a
+        // terminal state raced in) leaves the epoch odd, which is harmless either
+        // way: a stopping worker returns Disconnected via is_stopping before the
+        // backstop is ever consulted, so the parity need not be restored.
+        self.pause_epoch.fetch_add(1, Ordering::Release);
         // CAS RUN->PAUSE instead of load-check-then-store: a terminal STATUS_END
         // /STATUS_ABORT published concurrently (e.g. the last MuxDoneGuard, or
         // abort()) between a load and a plain store would otherwise be clobbered
@@ -952,6 +968,16 @@ impl FfmpegScheduler<Paused> {
             )
             .is_ok()
         {
+            // Seqlock parity (see pause()): flip the epoch odd->even AFTER the status
+            // CAS, so the transition window is (status RUN, epoch odd) — a pre-mux
+            // worker reads that odd baseline as still-paused and conservatively
+            // EXCLUDES the slice rather than mischarging it. pause() is the mirror: it
+            // bumps even->odd BEFORE its CAS, so its window is odd too. The bump
+            // precedes the notify below, so a woken worker already reads an even
+            // baseline. A failed CAS is terminal-only and leaves the epoch odd, which
+            // is harmless — a stopping worker exits via is_stopping before the
+            // backstop is ever consulted.
+            self.pause_epoch.fetch_add(1, Ordering::Release);
             // Wake workers parked in wait_until_not_paused so they resume
             // immediately instead of after the safety-net timeout (conc-06).
             notify_pause_waiters();
@@ -1646,10 +1672,38 @@ mod tests {
 
         let scheduler = FfmpegScheduler::new(context);
         let scheduler = scheduler.start().unwrap();
+        // Exercise the real pause()/resume() protocol and pin BOTH the status
+        // transition and the seqlock pause parity: a running scheduler is even and
+        // STATUS_RUN; pause() publishes STATUS_PAUSE and bumps the epoch to the next
+        // (odd) value; resume() bumps to the next (even) value.
+        let e_run = scheduler.pause_epoch.load(Ordering::Acquire);
+        assert_eq!(
+            e_run & 1,
+            0,
+            "a running scheduler's pause epoch must be even"
+        );
         let scheduler = scheduler.pause();
+        assert_eq!(
+            scheduler.status.load(Ordering::Acquire),
+            STATUS_PAUSE,
+            "pause() must publish STATUS_PAUSE, not merely bump the epoch"
+        );
+        let e_paused = scheduler.pause_epoch.load(Ordering::Acquire);
+        assert_eq!(e_paused, e_run + 1, "pause() must bump the epoch even->odd");
         assert!(scheduler.is_state::<Paused>());
         sleep(Duration::from_secs(1));
+        assert_eq!(
+            scheduler.status.load(Ordering::Acquire),
+            STATUS_PAUSE,
+            "the job must stay paused (STATUS_PAUSE) until resume()"
+        );
         let scheduler = scheduler.resume();
+        let e_resumed = scheduler.pause_epoch.load(Ordering::Acquire);
+        assert_eq!(
+            e_resumed,
+            e_paused + 1,
+            "resume() must bump the epoch odd->even"
+        );
         let result = scheduler.wait();
         assert!(result.is_ok());
     }

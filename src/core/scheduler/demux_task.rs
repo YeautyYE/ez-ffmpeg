@@ -40,6 +40,7 @@ pub(crate) fn demux_init(
     packet_pool: ObjPool<Packet>,
     demux_node: Arc<SchNode>,
     scheduler_status: Arc<AtomicUsize>,
+    pause_epoch: Arc<AtomicUsize>,
     thread_sync: ThreadSynchronizer,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
 ) -> crate::error::Result<()> {
@@ -54,6 +55,7 @@ pub(crate) fn demux_init(
     packet_pool: ObjPool<Packet>,
     demux_node: Arc<SchNode>,
     scheduler_status: Arc<AtomicUsize>,
+    pause_epoch: Arc<AtomicUsize>,
     thread_sync: ThreadSynchronizer,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
 ) -> crate::error::Result<()> {
@@ -198,7 +200,7 @@ pub(crate) fn demux_init(
                                         is_copy: false,
                                     },
                                 };
-                                demux_send(&mut demux_parameter, packet_box, &packet_pool, 0, &demux_node, &scheduler_status, &scheduler_result, independent_readrate)
+                                demux_send(&mut demux_parameter, packet_box, &packet_pool, 0, &demux_node, &scheduler_status, &pause_epoch, &scheduler_result, independent_readrate)
                             };
 
                             // Common seek operation for both cases
@@ -323,7 +325,7 @@ pub(crate) fn demux_init(
                                 is_copy: false,
                             },
                         };
-                        ret = demux_send(&mut demux_parameter, packet_box, &packet_pool, send_flags, &demux_node, &scheduler_status, &scheduler_result, independent_readrate);
+                        ret = demux_send(&mut demux_parameter, packet_box, &packet_pool, send_flags, &demux_node, &scheduler_status, &pause_epoch, &scheduler_result, independent_readrate);
 
                         if ret < 0 {
                             break;
@@ -333,7 +335,7 @@ pub(crate) fn demux_init(
             }
 
             if is_started {
-                demux_done(&mut demux_parameter, &packet_pool, &scheduler_status, &scheduler_result);
+                demux_done(&mut demux_parameter, &packet_pool, &scheduler_status, &pause_epoch, &scheduler_result);
             }
 
             let node = demux_node.as_ref();
@@ -355,6 +357,7 @@ fn demux_done(
     demux_parameter: &mut DemuxerParameter,
     packet_pool: &ObjPool<Packet>,
     scheduler_status: &Arc<AtomicUsize>,
+    pause_epoch: &Arc<AtomicUsize>,
     scheduler_result: &Arc<Mutex<Option<crate::error::Result<()>>>>,
 ) {
     for ds in &demux_parameter.demux_streams {
@@ -397,6 +400,7 @@ fn demux_done(
                     demux_parameter.dst_mux_gate[i].as_ref(),
                     0,
                     scheduler_status,
+                    pause_epoch,
                     scheduler_result,
                 )
             };
@@ -1183,6 +1187,7 @@ unsafe fn demux_send(
     flags: usize,
     demux_node: &Arc<SchNode>,
     scheduler_status: &Arc<AtomicUsize>,
+    pause_epoch: &Arc<AtomicUsize>,
     scheduler_result: &Arc<Mutex<Option<crate::error::Result<()>>>>,
     independent_readrate: bool,
 ) -> i32 {
@@ -1222,6 +1227,7 @@ unsafe fn demux_send(
         packet_pool,
         flags,
         scheduler_status,
+        pause_epoch,
         scheduler_result,
     );
     if ret == AVERROR_EOF {
@@ -1248,6 +1254,7 @@ unsafe fn demux_send_for_stream(
     packet_pool: &ObjPool<Packet>,
     flags: usize,
     scheduler_status: &Arc<AtomicUsize>,
+    pause_epoch: &Arc<AtomicUsize>,
     scheduler_result: &Arc<Mutex<Option<crate::error::Result<()>>>>,
 ) -> i32 {
     let stream_index = (*packet_box.packet.as_ptr()).stream_index as usize;
@@ -1314,6 +1321,7 @@ unsafe fn demux_send_for_stream(
                 dst_mux_gate[dst_i].as_ref(),
                 flags,
                 scheduler_status,
+                pause_epoch,
                 scheduler_result,
             );
             if ret == AVERROR_EOF {
@@ -1354,6 +1362,7 @@ unsafe fn demux_send_for_stream(
             dst_mux_gate[dst_i].as_ref(),
             flags,
             scheduler_status,
+            pause_epoch,
             scheduler_result,
         );
         if ret == AVERROR_EOF {
@@ -1401,10 +1410,19 @@ fn route_dst_send(
     packet_box: PacketBox,
     packet_dst: &Sender<PacketBox>,
     mux_gate: Option<&CopyMuxHandle>,
+    scheduler_status: &Arc<AtomicUsize>,
+    pause_epoch: &Arc<AtomicUsize>,
 ) -> DstSend {
     match mux_gate {
         Some(handle) => {
-            match send_to_mux(packet_box, packet_dst, &handle.pre_sender, &handle.gate) {
+            match send_to_mux(
+                packet_box,
+                packet_dst,
+                &handle.pre_sender,
+                &handle.gate,
+                scheduler_status,
+                pause_epoch,
+            ) {
                 Ok(()) => DstSend::Delivered,
                 Err(SendToMuxError::Disconnected(_)) => DstSend::Finished,
                 Err(SendToMuxError::QueueFull(_)) => DstSend::QueueFull,
@@ -1425,6 +1443,7 @@ unsafe fn demux_stream_send_to_dst(
     mux_gate: Option<&CopyMuxHandle>,
     flags: usize,
     scheduler_status: &Arc<AtomicUsize>,
+    pause_epoch: &Arc<AtomicUsize>,
     scheduler_result: &Arc<Mutex<Option<crate::error::Result<()>>>>,
 ) -> i32 {
     if *dst_finished {
@@ -1452,7 +1471,13 @@ unsafe fn demux_stream_send_to_dst(
     if *dst_finished {
         // Copy EOF marker (a real dts): still routed through the gate so it
         // drains in DTS order with the stream's data packets.
-        match route_dst_send(packet_box, packet_dst, mux_gate) {
+        match route_dst_send(
+            packet_box,
+            packet_dst,
+            mux_gate,
+            scheduler_status,
+            pause_epoch,
+        ) {
             // Receiver gone = downstream completed; a normal data-flow signal
             // (FFmpeg returns AVERROR_EOF silently here).
             DstSend::Delivered | DstSend::Finished => {}
@@ -1469,7 +1494,13 @@ unsafe fn demux_stream_send_to_dst(
         return AVERROR_EOF;
     }
 
-    match route_dst_send(packet_box, packet_dst, mux_gate) {
+    match route_dst_send(
+        packet_box,
+        packet_dst,
+        mux_gate,
+        scheduler_status,
+        pause_epoch,
+    ) {
         DstSend::Delivered => 0,
         DstSend::Finished => {
             debug!("Demuxer dst finished, stop sending");

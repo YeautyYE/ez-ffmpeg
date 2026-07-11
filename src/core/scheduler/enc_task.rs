@@ -78,6 +78,7 @@ pub(crate) fn enc_init(
     frame_pool: ObjPool<Frame>,
     packet_pool: ObjPool<Packet>,
     scheduler_status: Arc<AtomicUsize>,
+    pause_epoch: Arc<AtomicUsize>,
     thread_sync: ThreadSynchronizer,
     enc_handle_sender: Sender<std::thread::JoinHandle<()>>,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
@@ -104,6 +105,7 @@ pub(crate) fn enc_init(
     frame_pool: ObjPool<Frame>,
     packet_pool: ObjPool<Packet>,
     scheduler_status: Arc<AtomicUsize>,
+    pause_epoch: Arc<AtomicUsize>,
     thread_sync: ThreadSynchronizer,
     enc_handle_sender: Sender<std::thread::JoinHandle<()>>,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
@@ -305,7 +307,7 @@ pub(crate) fn enc_init(
                     match sq_encode_drained(enc_ctx_box.as_mut_ptr(), fb, start_time_us, recording_time_us,
                                             &pkt_sender, &pre_pkt_sender, &mux_start_gate, stream_box.inner,
                                             &packet_pool, &mut forced_kf, &frame_pool,
-                                            &scheduler_status, &scheduler_result, &mut finished) {
+                                            &scheduler_status, &pause_epoch, &scheduler_result, &mut finished) {
                         SqEncodeOutcome::Continue => {}
                         SqEncodeOutcome::Finished => enc_done = true,
                         SqEncodeOutcome::Aborted => stop = true,
@@ -375,7 +377,7 @@ pub(crate) fn enc_init(
                         match sq_encode_drained(enc_ctx_box.as_mut_ptr(), fb, start_time_us, recording_time_us,
                                                 &pkt_sender, &pre_pkt_sender, &mux_start_gate, stream_box.inner,
                                                 &packet_pool, &mut forced_kf, &frame_pool,
-                                                &scheduler_status, &scheduler_result, &mut finished) {
+                                                &scheduler_status, &pause_epoch, &scheduler_result, &mut finished) {
                             SqEncodeOutcome::Continue => {}
                             SqEncodeOutcome::Finished => enc_done = true,
                             SqEncodeOutcome::Aborted => stop = true,
@@ -413,7 +415,7 @@ pub(crate) fn enc_init(
                         match sq_encode_drained(enc_ctx_box.as_mut_ptr(), fb, start_time_us, recording_time_us,
                                                 &pkt_sender, &pre_pkt_sender, &mux_start_gate, stream_box.inner,
                                                 &packet_pool, &mut forced_kf, &frame_pool,
-                                                &scheduler_status, &scheduler_result, &mut finished) {
+                                                &scheduler_status, &pause_epoch, &scheduler_result, &mut finished) {
                             SqEncodeOutcome::Continue => {}
                             SqEncodeOutcome::Finished => enc_done = true,
                             SqEncodeOutcome::Aborted => stop = true,
@@ -447,6 +449,8 @@ pub(crate) fn enc_init(
                 &pkt_sender,
                 &pre_pkt_sender,
                 &mux_start_gate,
+                &scheduler_status,
+                &pause_epoch,
                 stream_box.inner,
                 &packet_pool,
                 &mut forced_kf,
@@ -578,7 +582,7 @@ pub(crate) fn enc_init(
                                 output_stream_index: stream_index as i32,
                                 is_copy: false,
                             },
-                        }, &pkt_sender, &pre_pkt_sender, &mux_start_gate) {
+                        }, &pkt_sender, &pre_pkt_sender, &mux_start_gate, &scheduler_status, &pause_epoch) {
                             Ok(()) => {}
                             // Mux receiver gone: the muxer finished. Graceful.
                             Err(SendToMuxError::Disconnected(_)) => {
@@ -628,7 +632,7 @@ pub(crate) fn enc_init(
                     output_stream_index: stream_index as i32,
                     is_copy: false,
                 },
-            }, &pkt_sender, &pre_pkt_sender, &mux_start_gate) {
+            }, &pkt_sender, &pre_pkt_sender, &mux_start_gate, &scheduler_status, &pause_epoch) {
                 Ok(()) => {}
                 Err(SendToMuxError::Disconnected(_)) => {
                     if is_stopping(scheduler_status.load(Ordering::Acquire)) {
@@ -1015,6 +1019,7 @@ unsafe fn sq_encode_drained(
     forced_kf: &mut ForcedKeyframes,
     frame_pool: &ObjPool<Frame>,
     scheduler_status: &Arc<AtomicUsize>,
+    pause_epoch: &Arc<AtomicUsize>,
     scheduler_result: &Arc<Mutex<Option<crate::error::Result<()>>>>,
     finished: &mut bool,
 ) -> SqEncodeOutcome {
@@ -1026,6 +1031,8 @@ unsafe fn sq_encode_drained(
         pkt_sender,
         pre_pkt_sender,
         mux_start_gate,
+        scheduler_status,
+        pause_epoch,
         stream,
         packet_pool,
         forced_kf,
@@ -1709,6 +1716,8 @@ fn frame_encode(
     pkt_sender: &Sender<PacketBox>,
     pre_pkt_sender: &PreMuxQueueSender,
     mux_start_gate: &Arc<crate::core::context::MuxStartGate>,
+    scheduler_status: &Arc<AtomicUsize>,
+    pause_epoch: &Arc<AtomicUsize>,
     stream: *mut AVStream,
     packet_pool: &ObjPool<Packet>,
     forced_kf: &mut ForcedKeyframes,
@@ -1730,6 +1739,8 @@ fn frame_encode(
                     pkt_sender,
                     pre_pkt_sender,
                     mux_start_gate,
+                    scheduler_status,
+                    pause_epoch,
                     stream,
                 )
             } else {
@@ -1787,6 +1798,8 @@ fn frame_encode(
             pkt_sender,
             pre_pkt_sender,
             mux_start_gate,
+            scheduler_status,
+            pause_epoch,
             stream,
             packet_pool,
         )
@@ -1809,6 +1822,8 @@ unsafe fn do_subtitle_out(
     pkt_sender: &Sender<PacketBox>,
     pre_pkt_sender: &PreMuxQueueSender,
     mux_start_gate: &Arc<crate::core::context::MuxStartGate>,
+    scheduler_status: &Arc<AtomicUsize>,
+    pause_epoch: &Arc<AtomicUsize>,
     stream: *mut AVStream,
 ) -> crate::error::Result<EncodeStatus> {
     let subtitle_out_max_size = 1024 * 1024;
@@ -1916,6 +1931,8 @@ unsafe fn do_subtitle_out(
             pkt_sender,
             pre_pkt_sender,
             mux_start_gate,
+            scheduler_status,
+            pause_epoch,
         ) {
             Ok(()) => {}
             // Mux receiver gone: the muxer legitimately finished. Graceful stop
@@ -1942,6 +1959,8 @@ unsafe fn encode_frame(
     pkt_sender: &Sender<PacketBox>,
     pre_pkt_sender: &PreMuxQueueSender,
     mux_start_gate: &Arc<crate::core::context::MuxStartGate>,
+    scheduler_status: &Arc<AtomicUsize>,
+    pause_epoch: &Arc<AtomicUsize>,
     stream: *mut AVStream,
     packet_pool: &ObjPool<Packet>,
 ) -> crate::error::Result<bool> {
@@ -2000,6 +2019,8 @@ unsafe fn encode_frame(
             pkt_sender,
             pre_pkt_sender,
             mux_start_gate,
+            scheduler_status,
+            pause_epoch,
         ) {
             Ok(()) => {}
             // Mux receiver gone: the muxer legitimately finished. Graceful stop.
@@ -2017,10 +2038,13 @@ unsafe fn encode_frame(
 }
 
 /// Classified failure of [`send_to_mux`]. The two cases must be handled
-/// differently: `Disconnected` means the mux receiver is gone (benign — the
-/// muxer legitimately finished, handled as a graceful stop), while `QueueFull`
-/// means the pre-mux queue stayed full past the deadline (FATAL — fftools
-/// `AVERROR_BUFFER_TOO_SMALL`, "Too many packets buffered for output stream").
+/// differently: `Disconnected` is a benign graceful stop — either the mux
+/// receiver is gone (the muxer legitimately finished) or the scheduler reached a
+/// terminal stop/abort state while a packet was still parked pre-mux (teardown
+/// will drop the receiver shortly, so we exit now rather than wait for it). Both
+/// are handled as a graceful stop. `QueueFull` means the pre-mux queue stayed
+/// full past the active backstop (FATAL — fftools `AVERROR_BUFFER_TOO_SMALL`,
+/// "Too many packets buffered for output stream").
 /// Collapsing both into one error silently swallowed a real queue-full as a
 /// truncation, so callers must not treat `QueueFull` as `MuxerFinished`.
 ///
@@ -2043,34 +2067,75 @@ pub(crate) fn send_to_mux(
     pkt_sender: &Sender<PacketBox>,
     pre_pkt_sender: &PreMuxQueueSender,
     mux_start_gate: &Arc<crate::core::context::MuxStartGate>,
+    scheduler_status: &Arc<AtomicUsize>,
+    pause_epoch: &Arc<AtomicUsize>,
 ) -> Result<(), SendToMuxError> {
-    use crate::core::context::PreSendOutcome;
-
     if mux_start_gate.is_started() {
         return pkt_sender
             .send(packet_box)
             .map_err(|SendError(pb)| SendToMuxError::Disconnected(pb));
     }
 
-    // The gate serializes "started?" with pre-queue admission: without it a
-    // packet parked between the muxer's drain and its gate flip would never
-    // be delivered.
-    //
-    // A full pre-queue parks on the queue condvar (PERF-12; replaces the old
-    // 10ms sleep ticks) and re-runs the gated send_pre — the authoritative
-    // admission / gate-started / disconnected check — after every wake.
-    // Wakes come from the mux-start drain and from the receiver dropping
-    // (stop or mux-init failure promptly resolves Disconnected, handled as
-    // MuxerFinished, not a job failure); the bounded wait slice is only a
-    // lost-notify safety net. The deadline guards a muxer that never starts
-    // and is never stopped — e.g. a single-input job where this very
-    // backpressure keeps the demuxer from ever reaching a sparse stream's
-    // first packet, so no drain can ever come. FFmpeg fails such jobs
-    // immediately ("Too many packets buffered for output stream"); parking
-    // ~60s first keeps multi-input slow starts (a second input taking
-    // seconds to open) succeeding, then fails with the same remedy.
+    park_pre_mux(
+        packet_box,
+        pkt_sender,
+        pre_pkt_sender,
+        mux_start_gate,
+        scheduler_status,
+        PRE_MUX_FULL_BACKSTOP,
+        pause_epoch,
+    )
+}
+
+/// Park a packet on the still-closed deferred-start gate until it opens, the
+/// receiver disconnects, or `backstop` elapses of ACTIVE (non-paused) wait.
+///
+/// The gate serializes "started?" with pre-queue admission: without it a packet
+/// parked between the muxer's drain and its gate flip would never be delivered.
+///
+/// A full pre-queue parks on the queue condvar (PERF-12; replaces the old 10ms
+/// sleep ticks) and re-runs the gated send_pre — the authoritative admission /
+/// gate-started / disconnected check — after every wake. Wakes come from the
+/// mux-start drain and from the receiver dropping (mux-init failure promptly
+/// resolves Disconnected, handled as MuxerFinished, not a job failure); the
+/// bounded wait slice is only a lost-notify safety net. The backstop guards a
+/// muxer that never starts and is never stopped — e.g. a single-input job where
+/// this very backpressure keeps the demuxer from ever reaching a sparse stream's
+/// first packet, so no drain can ever come. FFmpeg fails such jobs immediately
+/// ("Too many packets buffered for output stream"); parking ~60s first keeps
+/// multi-input slow starts (a second input taking seconds to open) succeeding,
+/// then fails with the same remedy.
+///
+/// Two refinements keep the backstop honest:
+///
+/// * **Pause is off-the-clock.** The backstop counts only ACTIVE (non-paused)
+///   wait: each queue-full slice is bracketed by the per-scheduler pause epoch
+///   (a seqlock parity — even = running, odd = paused — that pause() and resume()
+///   each bump) and charged only when that epoch is even and held steady across
+///   the whole slice. A pause — even one arriving inside a slice — makes the
+///   baseline odd or moves the epoch and excludes that slice, so paused time never
+///   advances the backstop and no resume can retroactively trip a spurious
+///   `QueueFull`.
+/// * **Stop is a graceful exit, not a failure.** stop()/abort() publish a
+///   terminal status before mux teardown drops the receiver, so a woken worker
+///   could otherwise still see `Full` and, with the budget spent, mis-report
+///   `QueueFull`. Instead a terminal status returns `Disconnected` directly
+///   (handled as MuxerFinished), without waiting for the receiver to close.
+///
+/// Split out so tests inject a short backstop instead of the 60s production value.
+fn park_pre_mux(
+    packet_box: PacketBox,
+    pkt_sender: &Sender<PacketBox>,
+    pre_pkt_sender: &PreMuxQueueSender,
+    mux_start_gate: &Arc<crate::core::context::MuxStartGate>,
+    scheduler_status: &Arc<AtomicUsize>,
+    backstop: Duration,
+    pause_epoch: &Arc<AtomicUsize>,
+) -> Result<(), SendToMuxError> {
+    use crate::core::context::PreSendOutcome;
+
     let mut packet_box = packet_box;
-    let deadline = Instant::now() + PRE_MUX_FULL_BACKSTOP;
+    let mut active_wait = Duration::ZERO;
     loop {
         packet_box = match mux_start_gate.send_pre(pre_pkt_sender, packet_box) {
             PreSendOutcome::Sent => return Ok(()),
@@ -2082,17 +2147,66 @@ pub(crate) fn send_to_mux(
             PreSendOutcome::Full(pb) => pb,
             PreSendOutcome::Disconnected(pb) => return Err(SendToMuxError::Disconnected(pb)),
         };
-        if Instant::now() >= deadline {
+        // Drain a pause off-the-clock. wait_until_not_paused returns the status
+        // once it leaves STATUS_PAUSE — a resume, or a terminal state. Reading the
+        // per-scheduler status keeps another scheduler's pauses out of this job.
+        let status = wait_until_not_paused(scheduler_status);
+        if is_stopping(status) {
+            // stop()/abort(): the muxer is tearing down and will drop the
+            // receiver. Exit gracefully now (handled as MuxerFinished) rather
+            // than wait for that drop and risk a spurious QueueFull.
+            return Err(SendToMuxError::Disconnected(packet_box));
+        }
+        if active_wait >= backstop {
             error!(
                 "pre-mux queue stayed full for {}s before the muxer started; raise \
                  Output::set_max_muxing_queue_size / Output::set_muxing_queue_data_threshold, \
                  or check that every mapped output stream receives data",
-                PRE_MUX_FULL_BACKSTOP.as_secs()
+                backstop.as_secs()
             );
             return Err(SendToMuxError::QueueFull(packet_box));
         }
+        // Bracket the wait slice with the per-scheduler seqlock pause epoch (even =
+        // running, odd = paused). pause() bumps it even->odd BEFORE flipping status
+        // and resume() bumps it odd->even, so any pause overlapping this slice makes
+        // the baseline odd or moves the epoch — there is no window in which status
+        // reads PAUSE while the epoch still reads even. account_slice therefore
+        // charges the slice only when the epoch is even and unchanged. Per-scheduler
+        // and a single atomic: no other job's pauses, no cross-atomic race.
+        let epoch_before = pause_epoch.load(Ordering::Acquire);
         let size = packet_payload_size(&packet_box);
+        let slice_start = Instant::now();
         pre_pkt_sender.wait_for_space(size, PRE_MUX_FULL_WAIT_SLICE);
+        // Snapshot elapsed the instant the wait returns, THEN read the epoch, so a
+        // pause landing in between is caught by the epoch (slice excluded) instead
+        // of silently inflating the charge.
+        let slice_elapsed = slice_start.elapsed();
+        let epoch_after = pause_epoch.load(Ordering::Acquire);
+        active_wait = account_slice(active_wait, epoch_before, epoch_after, slice_elapsed);
+    }
+}
+
+/// New running backstop total after one pre-mux wait slice. The per-scheduler pause
+/// epoch is a seqlock parity: even = running, odd = paused; pause() bumps it
+/// even->odd (before it flips status) and resume() bumps it odd->even. A slice is
+/// charged only when the epoch is EVEN at the baseline and UNCHANGED across the
+/// slice — i.e. the scheduler was running at the sample and no pause boundary fell
+/// in the slice. Any pause overlapping the slice makes the baseline odd or moves the
+/// epoch, so the slice is excluded (paused time never advances the backstop) while
+/// the budget from earlier unpaused slices is kept (cumulative active time). A
+/// charged slice is capped at one wait slice so a descheduled worker's long
+/// `elapsed()` cannot over-count. Reading the one epoch atomic keeps the decision
+/// free of any cross-atomic race.
+fn account_slice(
+    active_wait: Duration,
+    epoch_before: usize,
+    epoch_after: usize,
+    slice_elapsed: Duration,
+) -> Duration {
+    if epoch_before == epoch_after && (epoch_before & 1) == 0 {
+        active_wait + slice_elapsed.min(PRE_MUX_FULL_WAIT_SLICE)
+    } else {
+        active_wait
     }
 }
 
@@ -2110,6 +2224,41 @@ const PRE_MUX_FULL_WAIT_SLICE: Duration = Duration::from_millis(200);
 #[cfg(all(test, not(docsrs)))]
 mod tests {
     use super::should_cascade_break;
+    use super::{account_slice, park_pre_mux, SendToMuxError, PRE_MUX_FULL_WAIT_SLICE};
+    use crate::core::context::pre_mux_queue::{channel, PreMuxQueueConfig, PreQueueTryPush};
+    use crate::core::context::{MuxStartGate, PacketBox, PacketData};
+    use crate::core::scheduler::ffmpeg_scheduler::{
+        notify_pause_waiters, STATUS_END, STATUS_PAUSE, STATUS_RUN,
+    };
+    use ffmpeg_sys_next::AVMediaType::AVMEDIA_TYPE_VIDEO;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    fn park_test_packet(payload: usize) -> PacketBox {
+        let packet = if payload == 0 {
+            ffmpeg_next::Packet::empty()
+        } else {
+            ffmpeg_next::Packet::new(payload)
+        };
+        PacketBox {
+            packet,
+            packet_data: PacketData {
+                dts_est: 0,
+                codec_type: AVMEDIA_TYPE_VIDEO,
+                output_stream_index: 0,
+                is_copy: false,
+            },
+        }
+    }
+
+    // cap 1 / threshold 0: one sized packet fills the queue, the next is rejected.
+    fn park_test_cfg() -> PreMuxQueueConfig {
+        PreMuxQueueConfig {
+            max_packets: 1,
+            data_threshold: 0,
+        }
+    }
 
     // A sync-queue cascade-finish must be ignored until the encoder has opened,
     // because opening is what publishes the ready signal the muxer waits on. If
@@ -2127,5 +2276,218 @@ mod tests {
         // Not finished: never break for a cascade, regardless of opened.
         assert!(!should_cascade_break(false, false));
         assert!(!should_cascade_break(true, false));
+    }
+
+    // A full pre-mux queue whose deferred-start gate never opens and whose
+    // scheduler never pauses must give up after the backstop with QueueFull.
+    #[test]
+    fn park_pre_mux_backstop_fires_when_the_gate_never_opens() {
+        let (pre_tx, _pre_rx) = channel(park_test_cfg());
+        // Fill the queue: with cap 1 / threshold 0 one sized packet parks and
+        // the next is rejected, so the parked send below can never make space.
+        assert!(matches!(
+            pre_tx.try_push(park_test_packet(8)),
+            PreQueueTryPush::Sent
+        ));
+        let gate = Arc::new(MuxStartGate::new());
+        let (pkt_tx, _pkt_rx) = crossbeam_channel::unbounded();
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        // Epoch never moves: every slice is charged, so the backstop fires.
+        let pause_epoch = Arc::new(AtomicUsize::new(0));
+
+        let started = Instant::now();
+        let result = park_pre_mux(
+            park_test_packet(8),
+            &pkt_tx,
+            &pre_tx,
+            &gate,
+            &status,
+            Duration::from_millis(200),
+            &pause_epoch,
+        );
+        assert!(
+            matches!(result, Err(SendToMuxError::QueueFull(_))),
+            "an un-draining gate must fail with QueueFull past the backstop"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
+            "must have waited out the full backstop"
+        );
+    }
+
+    // A terminal status (stop/abort) must exit gracefully as Disconnected —
+    // WITHOUT waiting for the muxer to drop the receiver. stop() publishes the
+    // terminal status before teardown closes the pre-mux queue, so here the
+    // receiver stays connected across STATUS_END (production ordering). Buggy code
+    // that lacks the terminal check would keep parking and mis-report QueueFull.
+    #[test]
+    fn park_pre_mux_stop_during_pause_exits_gracefully() {
+        let (pre_tx, _pre_rx) = channel(park_test_cfg());
+        assert!(matches!(
+            pre_tx.try_push(park_test_packet(8)),
+            PreQueueTryPush::Sent
+        ));
+        let gate = Arc::new(MuxStartGate::new());
+        let (pkt_tx, _pkt_rx) = crossbeam_channel::unbounded();
+        let status = Arc::new(AtomicUsize::new(STATUS_PAUSE));
+
+        let status_bg = status.clone();
+        let worker = std::thread::spawn(move || {
+            // A terminal status exits before any slice is charged, so the epoch
+            // is irrelevant here.
+            let pause_epoch = Arc::new(AtomicUsize::new(0));
+            park_pre_mux(
+                park_test_packet(8),
+                &pkt_tx,
+                &pre_tx,
+                &gate,
+                &status_bg,
+                Duration::from_millis(200),
+                &pause_epoch,
+            )
+        });
+
+        // Let the worker park in the pause, then publish a terminal status with
+        // the receiver STILL open (status first, teardown later).
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            !worker.is_finished(),
+            "the worker must be parked in the pause, not finished"
+        );
+        status.store(STATUS_END, Ordering::Release);
+        notify_pause_waiters();
+
+        let result = worker.join().expect("worker thread panicked");
+        assert!(
+            matches!(result, Err(SendToMuxError::Disconnected(_))),
+            "a terminal status must resolve gracefully as Disconnected, not QueueFull, \
+             even while the receiver is still connected"
+        );
+    }
+
+    // Deterministic truth table for the per-slice accounting. The epoch is a seqlock
+    // parity (even = running, odd = paused): a slice is charged only when the epoch is
+    // even at the baseline AND unchanged across it. A moved epoch (a pause boundary in
+    // the slice) OR an odd baseline (already paused when sampled — the window where the
+    // baseline is read after a pause's bump) excludes it; a charged slice is capped at
+    // one wait slice so a stalled `elapsed()` cannot over-charge.
+    #[test]
+    fn account_slice_charges_only_even_unchanged_slices() {
+        let acc = Duration::from_millis(59_800);
+        let slice = Duration::from_millis(150);
+        // Even and unchanged (running throughout, no pause boundary): charged in full.
+        assert_eq!(account_slice(acc, 2, 2, slice), acc + slice);
+        // Even -> odd (a pause began in the slice): excluded, accrued budget kept.
+        // This is the reviewed false-positive case — 59.8s plus a pause-touched 150ms
+        // slice does NOT reach the 60s backstop.
+        assert_eq!(account_slice(acc, 2, 3, slice), acc);
+        // Odd baseline (a pause was already active when the slice began — the window
+        // where the baseline is read after the pause's bump): excluded even though the
+        // epoch did not move.
+        assert_eq!(account_slice(acc, 3, 3, slice), acc);
+        // Odd -> even (a resume fell in the slice): excluded.
+        assert_eq!(account_slice(acc, 3, 4, slice), acc);
+        // Even but a full pause+resume cycle happened in the slice (epoch +2): moved,
+        // so excluded.
+        assert_eq!(account_slice(acc, 2, 4, slice), acc);
+        // Even and unchanged but `elapsed()` ran long (worker descheduled across the
+        // wait): capped at one slice.
+        assert_eq!(
+            account_slice(Duration::ZERO, 2, 2, Duration::from_secs(600)),
+            PRE_MUX_FULL_WAIT_SLICE
+        );
+    }
+
+    // Integration: exclusion is driven by the seqlock epoch parity, verified end to end
+    // through park_pre_mux (the pure account_slice test pins the logic; this pins the
+    // wiring). Phase A charges an EVEN epoch to a QueueFull — which also proves a worker
+    // thread is scheduled and loops promptly in this environment. Phase B runs an
+    // identical worker with the epoch held ODD (paused): it must NOT fire even after
+    // several times the backstop Phase A needed, because every slice has an odd
+    // baseline; closing the queue then exits it as Disconnected (never QueueFull). The
+    // identical spawn/backstop makes the odd epoch the only difference, so a vacuous
+    // "Phase B's worker never ran" is implausible (Phase A shows these workers are
+    // scheduled promptly) — though the deterministic guarantee is the pure account_slice
+    // test, not this timing check. recv_timeout bounds every wait so a regression fails
+    // the test instead of hanging it.
+    #[test]
+    fn park_pre_mux_charges_even_but_excludes_odd_epoch() {
+        // Phase A: EVEN epoch -> every slice charged -> QueueFull (also proves the
+        // worker runs and loops here).
+        {
+            let (pre_tx, _pre_rx) = channel(park_test_cfg());
+            assert!(matches!(
+                pre_tx.try_push(park_test_packet(8)),
+                PreQueueTryPush::Sent
+            ));
+            let gate = Arc::new(MuxStartGate::new());
+            let (pkt_tx, _pkt_rx) = crossbeam_channel::unbounded();
+            let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+            let pause_epoch = Arc::new(AtomicUsize::new(0)); // even = running
+            let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+            std::thread::spawn(move || {
+                let r = park_pre_mux(
+                    park_test_packet(8),
+                    &pkt_tx,
+                    &pre_tx,
+                    &gate,
+                    &status,
+                    Duration::from_millis(100),
+                    &pause_epoch,
+                );
+                let _ = done_tx.send(r);
+            });
+            let result = done_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("an even epoch must let the backstop advance and fire");
+            assert!(
+                matches!(result, Err(SendToMuxError::QueueFull(_))),
+                "an even, unchanging epoch charges every slice -> QueueFull"
+            );
+        }
+
+        // Phase B: an identical worker with the epoch held ODD -> every slice excluded
+        // -> no QueueFull; closing the queue exits it gracefully.
+        {
+            let (pre_tx, pre_rx) = channel(park_test_cfg());
+            assert!(matches!(
+                pre_tx.try_push(park_test_packet(8)),
+                PreQueueTryPush::Sent
+            ));
+            let gate = Arc::new(MuxStartGate::new());
+            let (pkt_tx, _pkt_rx) = crossbeam_channel::unbounded();
+            let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+            let pause_epoch = Arc::new(AtomicUsize::new(1)); // odd = paused
+            let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+            std::thread::spawn(move || {
+                let r = park_pre_mux(
+                    park_test_packet(8),
+                    &pkt_tx,
+                    &pre_tx,
+                    &gate,
+                    &status,
+                    Duration::from_millis(100),
+                    &pause_epoch,
+                );
+                let _ = done_tx.send(r);
+            });
+            // 500ms is 5x the 100ms backstop and well past the ~one slice Phase A took
+            // to fire: an odd baseline must exclude every slice, so nothing arrives.
+            assert!(
+                done_rx.recv_timeout(Duration::from_millis(500)).is_err(),
+                "an odd (paused) epoch must exclude every slice — no QueueFull"
+            );
+            // Close the queue: the parked worker wakes and exits gracefully as
+            // Disconnected — a worker that had (wrongly) fired would have returned
+            // QueueFull already.
+            drop(pre_rx);
+            let result = done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("closing the queue must let the parked worker exit");
+            assert!(
+                matches!(result, Err(SendToMuxError::Disconnected(_))),
+                "a closed pre-mux queue exits the worker as Disconnected, not QueueFull"
+            );
+        }
     }
 }
