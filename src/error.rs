@@ -36,6 +36,9 @@ pub enum Error {
     #[error("A filtergraph has zero outputs, this is not supported")]
     FilterZeroOutputs,
 
+    #[error("A filtergraph has zero inputs, this is not supported")]
+    FilterZeroInputs,
+
     #[error("Input is not a valid number")]
     ParseInteger,
 
@@ -177,6 +180,7 @@ impl PartialEq for Error {
             | (FilterDescUtf8, FilterDescUtf8)
             | (FilterNameUtf8, FilterNameUtf8)
             | (FilterZeroOutputs, FilterZeroOutputs)
+            | (FilterZeroInputs, FilterZeroInputs)
             | (ParseInteger, ParseInteger)
             | (FrameFilterDstFinished, FrameFilterDstFinished)
             | (FrameFilterSendOOM, FrameFilterSendOOM)

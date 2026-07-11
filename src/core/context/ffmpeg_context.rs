@@ -17,7 +17,7 @@ use crate::core::scheduler::ffmpeg_scheduler::{FfmpegScheduler, Initialization};
 use crate::core::scheduler::filter_task::graph_opts_apply;
 use crate::core::scheduler::input_controller::SchNode;
 use crate::error::Error::{
-    FileSameAsInput, FilterDescUtf8, FilterNameUtf8, FilterZeroOutputs,
+    FileSameAsInput, FilterDescUtf8, FilterNameUtf8, FilterZeroInputs, FilterZeroOutputs,
     FrameFilterStreamTypeNoMatched, FrameFilterTypeNoMatched, ParseInteger,
 };
 use crate::error::FilterGraphParseError::{
@@ -3242,8 +3242,18 @@ fn init_filter_graph(
         let input_filters = inouts_to_input_filters(fg_index, inputs.as_ptr())?;
         let output_filters = inouts_to_output_filters(outputs.as_ptr())?;
 
+        // Keep the zero-OUTPUTS check first so a closed zero-in/zero-out graph
+        // (e.g. `color=...,nullsink`) keeps returning FilterZeroOutputs as before.
         if output_filters.is_empty() {
             return Err(FilterZeroOutputs);
+        }
+
+        // A source-only graph (e.g. `color=...`) has no input pads, so nothing
+        // binds it to a demuxer and `unchoke_for_stream` would later index an empty
+        // input list. Reject it up front, mirroring the zero-outputs guard (use a
+        // lavfi Input for a pure generator instead of a filter_complex).
+        if input_filters.is_empty() {
+            return Err(FilterZeroInputs);
         }
 
         let filter_graph = FilterGraph::new(

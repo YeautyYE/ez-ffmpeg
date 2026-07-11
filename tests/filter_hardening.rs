@@ -143,3 +143,23 @@ fn filter_option_value_loaded_from_file() {
         other => panic!("expected video stream info, got {other:?}"),
     }
 }
+
+/// A source-only filter_desc (no input pads, e.g. `color`) yields a filtergraph
+/// with zero inputs. Nothing binds it to a demuxer, and the scheduler's unchoke
+/// walk would index an empty input list and panic. build() must reject it up front
+/// with FilterZeroInputs (use a lavfi Input for a pure generator instead), mirroring
+/// the existing zero-outputs guard.
+#[test]
+fn source_only_filter_complex_is_rejected_not_panicked() {
+    let out = tmp_path("zero_input_out.mp4");
+    let result = FfmpegContext::builder()
+        .input(Input::from("testsrc=size=64x64:rate=15:duration=1").set_format("lavfi"))
+        .filter_desc("color=c=red:s=64x64")
+        .output(Output::from(out.as_str()).set_video_codec("mpeg4"))
+        .build();
+    match result {
+        Err(ez_ffmpeg::error::Error::FilterZeroInputs) => {}
+        Err(other) => panic!("expected Err(FilterZeroInputs), got Err({other:?})"),
+        Ok(_) => panic!("expected Err(FilterZeroInputs), but build() succeeded"),
+    }
+}

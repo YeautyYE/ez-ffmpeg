@@ -83,6 +83,11 @@ impl InputController {
         }
 
         let mut have_unchoked = false;
+        // Set when any eligible stream resolves to NO demuxer (an empty/OOB
+        // scheduler input list). Even if another stream unchoked a demuxer, the
+        // unresolved one's demuxer would stay choked, so the fallback must still
+        // run — `have_unchoked` alone would wrongly suppress it and hang the job.
+        let mut resolution_failed = false;
 
         let dts = self.trailing_dts();
 
@@ -121,9 +126,14 @@ impl InputController {
                 continue;
             }
 
-            // resolve the source to unchoke
-            Self::unchoke_for_stream(src);
-            have_unchoked = true;
+            // resolve the source to unchoke; only count it as progress if a
+            // demuxer was actually reached, so the all-live-demuxer fallback below
+            // still runs when a stream resolves to no demuxer.
+            if Self::unchoke_for_stream(src) {
+                have_unchoked = true;
+            } else {
+                resolution_failed = true;
+            }
         }
 
         // No stream steered a source this pass — every mux stream is either
@@ -137,7 +147,7 @@ impl InputController {
         // a demuxer this pass left choked). Over-unchoking is safe: the next
         // balancing pass re-chokes anything that runs ahead, and the pre-mux queue
         // still bounds memory.
-        if !have_unchoked {
+        if !have_unchoked || resolution_failed {
             for demux in self.demuxs.iter() {
                 let node = demux.as_ref();
                 let SchNode::Demux {
@@ -165,13 +175,19 @@ impl InputController {
         }
     }
 
-    fn unchoke_for_stream(mut src: &Arc<SchNode>) {
+    /// Walks up from a mux stream to the demuxer feeding its selected input and
+    /// unchokes it. Returns whether a demuxer was actually reached: a stray
+    /// empty/out-of-range scheduler input list (a zero-input graph is rejected at
+    /// build, but a short/unbound cross-graph list could still occur) unchokes
+    /// nothing, so the caller must NOT count it as progress — otherwise the
+    /// all-live-demuxer fallback is skipped and a multi-demuxer job hangs.
+    fn unchoke_for_stream(mut src: &Arc<SchNode>) -> bool {
         loop {
             let node = src.as_ref();
             // fed directly by a demuxer (i.e. not through a filtergraph)
             if let SchNode::Demux { waiter, .. } = node {
                 waiter.set_choked_next(false);
-                return;
+                return true;
             }
 
             assert!(matches!(node, SchNode::Filter { .. }));
@@ -180,7 +196,11 @@ impl InputController {
                 unreachable!()
             };
 
-            src = &inputs[best_input.load(Ordering::Acquire)];
+            // No upstream to walk to: reached no demuxer.
+            let Some(next) = inputs.get(best_input.load(Ordering::Acquire)) else {
+                return false;
+            };
+            src = next;
         }
     }
 
@@ -259,6 +279,75 @@ mod tests {
             SchNode::Demux { task_exited, .. } => task_exited.store(true, Ordering::Release),
             _ => unreachable!("expected a demux node"),
         }
+    }
+
+    fn filter_node(inputs: Vec<Arc<SchNode>>, best_input: usize) -> Arc<SchNode> {
+        Arc::new(SchNode::Filter {
+            inputs,
+            best_input: Arc::new(AtomicUsize::new(best_input)),
+        })
+    }
+
+    // unchoke_for_stream must report whether it actually reached a demuxer. An
+    // empty/out-of-range scheduler input list unchokes nothing (and used to PANIC
+    // on the index); the caller relies on the `false` return to still run the
+    // all-live-demuxer fallback, otherwise a multi-demuxer job hangs.
+    #[test]
+    fn unchoke_for_stream_reports_whether_a_demuxer_was_reached() {
+        // Direct demuxer: reached and unchoked.
+        let d = demux_node();
+        waiter_of(&d).set_choked_next(true);
+        assert!(InputController::unchoke_for_stream(&d));
+        assert!(
+            !waiter_of(&d).get_choked_next(),
+            "the reached demuxer must be unchoked"
+        );
+
+        // Filter -> demuxer: reached through the graph.
+        let d2 = demux_node();
+        waiter_of(&d2).set_choked_next(true);
+        let f = filter_node(vec![d2.clone()], 0);
+        assert!(InputController::unchoke_for_stream(&f));
+        assert!(!waiter_of(&d2).get_choked_next());
+
+        // Empty scheduler inputs: no demuxer reached (would have panicked before).
+        assert!(!InputController::unchoke_for_stream(&filter_node(
+            vec![],
+            0
+        )));
+
+        // Out-of-range best_input: no demuxer reached.
+        let d3 = demux_node();
+        assert!(!InputController::unchoke_for_stream(&filter_node(
+            vec![d3],
+            5
+        )));
+    }
+
+    // A mix of resolved and unresolved eligible streams must STILL run the
+    // all-live-demuxer fallback: one stream unchoking a demuxer must not suppress
+    // unchoking the demuxer behind a stream that resolved to none (an empty/OOB
+    // filter). Otherwise the unresolved stream's demuxer stays choked and the job
+    // hangs. Exercises update_locked end-to-end, not just unchoke_for_stream.
+    #[test]
+    fn mixed_resolved_and_unresolved_streams_still_run_the_fallback() {
+        let d1 = demux_node();
+        let d2 = demux_node();
+        let mux_ok = mux_stream(d2.clone(), 1_000);
+        let mux_unresolved = mux_stream(filter_node(vec![], 0), 1_000);
+        let ctrl = InputController::new(vec![d1.clone(), d2.clone()], vec![mux_ok, mux_unresolved]);
+        assert!(ctrl.balancing_possible, "two demuxers can balance");
+
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        ctrl.update_locked(&status);
+
+        // Without the fallback (the pre-fix mixed case), d1 -- fed to no resolved
+        // stream -- would stay choked. The fallback unchokes EVERY live demuxer.
+        assert!(
+            !waiter_of(&d1).get_choked(),
+            "d1 must be unchoked by the fallback despite another stream resolving"
+        );
+        assert!(!waiter_of(&d2).get_choked(), "d2 must be unchoked");
     }
 
     // PERF-6: a single-input job cannot balance, so update_locked must be a
