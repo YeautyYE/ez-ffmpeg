@@ -173,12 +173,25 @@ pub(crate) fn enc_init(
 
     // Slot claimed before spawn; the guard releases it on any exit path.
     thread_sync.thread_start();
-    let thread_done_guard = ThreadDoneGuard::adopt(thread_sync.clone(), scheduler_status.clone());
+    let thread_done_guard = ThreadDoneGuard::adopt(
+        thread_sync.clone(),
+        scheduler_status.clone(),
+        scheduler_result.clone(),
+    );
 
     let result = std::thread::Builder::new().name(format!("encoder{stream_index}:{mux_idx}:{encoder_name}")).spawn(move || unsafe {
         let _thread_done = thread_done_guard;
         let enc_ctx_box = enc_ctx_box;
         let stream_box = stream_box;
+        // rebind the frame-owning channel CAPTURES as body locals declared
+        // AFTER the guard so they drop BEFORE it (the same drop-order invariant the
+        // other workers hold). The muxer's teardown join already backstops a late
+        // encoder teardown, but this keeps the local `counter==0 => this worker is
+        // fully torn down` invariant true here too: an undrained `FrameBox` in
+        // `receiver` (a `crossbeam_channel::bounded` endpoint) is released before the
+        // slot, not after.
+        let receiver = receiver;
+        let enc_sync = enc_sync;
 
         let mut opened = false;
         let mut finished = false;
@@ -216,8 +229,13 @@ pub(crate) fn enc_init(
             const DRAIN_TICK: Duration = Duration::from_millis(100);
             let mut last_tb = AVRational { num: 1, den: 1 };
             let mut producer_eof = false;
-            // stop feeding: recording_time limit, encode error, natural encoder EOF,
-            // or external abort -> skip further draining, proceed to the shared flush.
+            // recording_time hit or natural encoder EOF while the job is
+            // HEALTHY: stop feeding, but the sync queue must still be told
+            // this stream is finished (H1) — unlike `stop`, which is only
+            // for hard errors / shutdown, where is_stopping unblocks peers.
+            let mut enc_done = false;
+            // hard error or shutdown -> skip the queue EOF and the drain
+            // wait entirely, proceed straight to the shared flush.
             let mut stop = false;
 
             // ---- producer + live drain ----
@@ -271,14 +289,40 @@ pub(crate) fn enc_init(
                     sq_propagate_and_notify(&mut q, sq_finished, sq_cv);
                 }
                 for fb in local {
-                    if sq_encode_drained(enc_ctx_box.as_mut_ptr(), fb, start_time_us, recording_time_us,
-                                         &pkt_sender, &pre_pkt_sender, &mux_start_gate, stream_box.inner,
-                                         &packet_pool, &mut forced_kf, &frame_pool,
-                                         &scheduler_status, &scheduler_result, &mut finished) {
-                        stop = true;
+                    if enc_done || stop {
+                        // Terminal already hit mid-batch: a flushed encoder
+                        // must not be fed again (send_frame -> AVERROR_EOF ->
+                        // spurious SendFrameError), and past-limit frames are
+                        // discardable by FIFO/pts order. Recycle, don't feed.
+                        frame_pool.release(fb.frame);
+                        continue;
+                    }
+                    match sq_encode_drained(enc_ctx_box.as_mut_ptr(), fb, start_time_us, recording_time_us,
+                                            &pkt_sender, &pre_pkt_sender, &mux_start_gate, stream_box.inner,
+                                            &packet_pool, &mut forced_kf, &frame_pool,
+                                            &scheduler_status, &scheduler_result, &mut finished) {
+                        SqEncodeOutcome::Continue => {}
+                        SqEncodeOutcome::Finished => enc_done = true,
+                        SqEncodeOutcome::Aborted => stop = true,
                     }
                 }
+                if enc_done {
+                    break; // healthy finish: the drain phase still runs below
+                }
             }
+
+            // H2: this encoder will never receive again — producer-EOF,
+            // cascade-cut, limit, encoder EOF, or error alike. Hand the input
+            // channel back BEFORE any drain wait: a SHARED filtergraph parked
+            // in send() on this stream's full bounded channel wakes with
+            // SendError, marks this output EOF, and keeps producing for the
+            // live peers this drain is waiting on; an output-side frame
+            // pipeline likewise retires the sender. Holding it wedges the
+            // trio: graph->this send, this->peer head-advance, peer->graph
+            // starvation. fftools closes the encoder's input thread-queue
+            // when the enc task returns (ffmpeg_sched.c task_cleanup); this
+            // is the same edge, taken before the drain instead of after it.
+            drop(receiver);
 
             // ---- drain phase: my producer is done — I hit producer-EOF or a
             // shorter peer cascade-cut me — but I may still hold frames a slower
@@ -300,24 +344,46 @@ pub(crate) fn enc_init(
                     input_controller.update_locked(&scheduler_status);
                 }
 
-                if producer_eof && !sq_finished[sq_idx].load(Ordering::Acquire) {
+                // H1: an encoder-side finish (recording_time / natural EOF)
+                // must ALSO finish this SqStream — the engine only learns of
+                // finishes through send(None) or a peer's cascade; a frozen
+                // unfinished head gates every sibling's packets forever and
+                // the heartbeat cannot rescue a stuck window smaller than
+                // buf_size_us (or a tail==head single-frame FIFO).
+                if (producer_eof || enc_done) && !sq_finished[sq_idx].load(Ordering::Acquire) {
                     let mut local: Vec<FrameBox> = Vec::new();
                     {
                         let mut q = sq_lock.lock().unwrap();
                         q.send(sq_idx, None, None, last_tb, 0); // finish + cascade
-                        q.drain_releasable_into(sq_idx, &mut local);
+                        if !enc_done {
+                            // A closed encoder must not be fed its own
+                            // leftovers; they are all at-or-past the boundary.
+                            q.drain_releasable_into(sq_idx, &mut local);
+                        }
                         sq_propagate_and_notify(&mut q, sq_finished, sq_cv);
                     }
                     for fb in local {
-                        if sq_encode_drained(enc_ctx_box.as_mut_ptr(), fb, start_time_us, recording_time_us,
-                                             &pkt_sender, &pre_pkt_sender, &mux_start_gate, stream_box.inner,
-                                             &packet_pool, &mut forced_kf, &frame_pool,
-                                             &scheduler_status, &scheduler_result, &mut finished) {
-                            stop = true;
+                        if stop {
+                            frame_pool.release(fb.frame);
+                            continue;
+                        }
+                        match sq_encode_drained(enc_ctx_box.as_mut_ptr(), fb, start_time_us, recording_time_us,
+                                                &pkt_sender, &pre_pkt_sender, &mux_start_gate, stream_box.inner,
+                                                &packet_pool, &mut forced_kf, &frame_pool,
+                                                &scheduler_status, &scheduler_result, &mut finished) {
+                            SqEncodeOutcome::Continue => {}
+                            SqEncodeOutcome::Finished => enc_done = true,
+                            SqEncodeOutcome::Aborted => stop = true,
                         }
                     }
                 }
-                while !stop {
+                // A closed encoder skips the wait too: its remaining FIFO
+                // frames would each re-return LimitReached (send order ==
+                // presentation order) or be rejected by a flushed encoder;
+                // abandoning them is the engine's documented over-bound
+                // doctrine. Peers only need the queue STATE (finished flag +
+                // heads), never this thread — each runs its own heartbeat.
+                while !stop && !enc_done {
                     let mut local: Vec<FrameBox> = Vec::new();
                     let done;
                     {
@@ -335,18 +401,27 @@ pub(crate) fn enc_init(
                         }
                     }
                     for fb in local {
-                        if sq_encode_drained(enc_ctx_box.as_mut_ptr(), fb, start_time_us, recording_time_us,
-                                             &pkt_sender, &pre_pkt_sender, &mux_start_gate, stream_box.inner,
-                                             &packet_pool, &mut forced_kf, &frame_pool,
-                                             &scheduler_status, &scheduler_result, &mut finished) {
-                            stop = true;
+                        if enc_done || stop {
+                            frame_pool.release(fb.frame);
+                            continue;
+                        }
+                        match sq_encode_drained(enc_ctx_box.as_mut_ptr(), fb, start_time_us, recording_time_us,
+                                                &pkt_sender, &pre_pkt_sender, &mux_start_gate, stream_box.inner,
+                                                &packet_pool, &mut forced_kf, &frame_pool,
+                                                &scheduler_status, &scheduler_result, &mut finished) {
+                            SqEncodeOutcome::Continue => {}
+                            SqEncodeOutcome::Finished => enc_done = true,
+                            SqEncodeOutcome::Aborted => stop = true,
                         }
                     }
                     if done { break; }
                 }
             }
-        }
-
+        } else {
+        // Non-`-shortest` path, byte-for-byte the pre-sync-queue loop; the
+        // `enc_sync.is_none()` condition is loop-invariant here, the arm just
+        // makes the receiver ownership split explicit for the borrow checker
+        // (the sq arm above drops it before its drain wait).
         while enc_sync.is_none() {
             let sync_frame = receive_frame(&mut opened, &receiver, &frame_pool, enc_ctx_box.as_mut_ptr(), stream_box.inner,
                                                &ready_sender, &bits_per_raw_sample, &mut frame_samples, &mut align_mask, &mut samples_queued, &mut audio_frame_queue,
@@ -413,6 +488,7 @@ pub(crate) fn enc_init(
                     break;
                 }
             }
+        }
         }
 
         // Encoder flush logic - handles three different exit scenarios:
@@ -924,7 +1000,7 @@ unsafe fn sq_encode_drained(
     scheduler_status: &Arc<AtomicUsize>,
     scheduler_result: &Arc<Mutex<Option<crate::error::Result<()>>>>,
     finished: &mut bool,
-) -> bool {
+) -> SqEncodeOutcome {
     let result = frame_encode(
         enc_ctx,
         fb.frame.as_mut_ptr(),
@@ -948,16 +1024,38 @@ unsafe fn sq_encode_drained(
                 error!("Error encoding a frame: {}", e);
                 set_scheduler_error(scheduler_status, scheduler_result, e);
             }
-            true
+            SqEncodeOutcome::Aborted
         }
         Ok(EncodeStatus::Eof) => {
             trace!("Encoder returned EOF, finishing");
             *finished = true;
-            true
+            SqEncodeOutcome::Finished
         }
-        Ok(EncodeStatus::LimitReached) => true,
-        Ok(EncodeStatus::Continue) => false,
+        // recording_time hit: `finished` stays false so the shared flush
+        // still drains the in-limit frames buffered inside the encoder.
+        Ok(EncodeStatus::LimitReached) => SqEncodeOutcome::Finished,
+        Ok(EncodeStatus::Continue) => SqEncodeOutcome::Continue,
     }
+}
+
+/// Outcome of feeding one sync-queue-released frame to the encoder
+/// (`-shortest` sq_enc path only).
+enum SqEncodeOutcome {
+    /// Frame consumed; keep draining.
+    Continue,
+    /// This encoder accepts no more frames — recording_time boundary or
+    /// natural encoder EOF — but the job is HEALTHY. The sync queue must
+    /// still learn the stream is finished (fftools close_output_stream ->
+    /// sq_send(..., NULL)), or a sibling's packets stay gated behind this
+    /// stream's frozen head forever and the muxer never completes. Feeding
+    /// further released frames is forbidden: a flushed encoder turns them
+    /// into a spurious SendFrameError.
+    Finished,
+    /// Hard error (already recorded via set_scheduler_error) or graceful
+    /// MuxerFinished-while-stopping: the scheduler status is terminal and
+    /// every peer exits via its is_stopping poll — skip the queue EOF and
+    /// go straight to the shared flush.
+    Aborted,
 }
 
 fn set_encoder_opts(

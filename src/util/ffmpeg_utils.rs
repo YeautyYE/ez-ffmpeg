@@ -182,6 +182,53 @@ pub fn av_err2str(err: i32) -> String {
     }
 }
 
+/// Whether a frame's data buffers are exclusively owned, i.e. safe to mutate
+/// in place.
+///
+/// Frames handed to a [`FrameFilter`]'s `filter_frame` usually wrap
+/// REFCOUNTED buffers shared with the decoder's frame pool or other
+/// consumers; writing into a shared buffer corrupts data someone else is
+/// still reading. Probe with this, or skip straight to
+/// [`make_frame_writable`], before any in-place edit.
+///
+/// A null or empty frame reports `false`.
+///
+/// [`FrameFilter`]: crate::filter::frame_filter::FrameFilter
+pub fn frame_is_writable(frame: &ffmpeg_next::Frame) -> bool {
+    // SAFETY: null-checked; av_frame_is_writable only reads buffer refcounts.
+    unsafe {
+        !frame.as_ptr().is_null()
+            && ffmpeg_sys_next::av_frame_is_writable(frame.as_ptr() as *mut _) > 0
+    }
+}
+
+/// Ensures exclusive ownership of a frame's data buffers, copying them first
+/// if they are shared (FFmpeg's `av_frame_make_writable`).
+///
+/// Call this before mutating frame data in place inside a
+/// [`FrameFilter`](crate::filter::frame_filter::FrameFilter): if the buffers
+/// are already exclusive it is a cheap refcount check, otherwise it clones
+/// the data so the shared original stays untouched. Props-only frames (no
+/// data buffers) and the null EOF shell pass through unchanged — there is
+/// nothing to copy.
+pub fn make_frame_writable(frame: &mut ffmpeg_next::Frame) -> Result<(), String> {
+    // SAFETY: null/props-only frames are skipped; otherwise the frame owns a
+    // live AVFrame for the whole call.
+    unsafe {
+        if frame.as_ptr().is_null() || (*frame.as_ptr()).buf[0].is_null() {
+            return Ok(());
+        }
+        let ret = ffmpeg_sys_next::av_frame_make_writable(frame.as_mut_ptr());
+        if ret < 0 {
+            return Err(format!(
+                "av_frame_make_writable failed: {}",
+                av_err2str(ret)
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Rust implementation of FFmpeg's `av_rescale_q_rnd`.
 ///
 /// This function is reimplemented in Rust rather than using FFmpeg's C version because:

@@ -204,7 +204,7 @@ fn match_encoder_stream(
 fn pipeline_init(
     is_input: bool,
     demux_mux_idx: usize,
-    mut pipeline: FramePipeline,
+    pipeline: FramePipeline,
     stream_index: usize,
     frame_receiver: Receiver<FrameBox>,
     frame_senders: FrameSenders,
@@ -221,7 +221,11 @@ fn pipeline_init(
 
     // Slot claimed before spawn; the guard releases it on any exit path.
     thread_sync.thread_start();
-    let thread_done_guard = ThreadDoneGuard::adopt(thread_sync.clone(), scheduler_status.clone());
+    let thread_done_guard = ThreadDoneGuard::adopt(
+        thread_sync.clone(),
+        scheduler_status.clone(),
+        scheduler_result.clone(),
+    );
 
     let result = std::thread::Builder::new()
         .name(format!(
@@ -230,6 +234,29 @@ fn pipeline_init(
         ))
         .spawn(move || {
             let _thread_done = thread_done_guard;
+            // Move every frame-owning CAPTURE into a body local declared AFTER the
+            // guard so it drops BEFORE the guard on EVERY exit path. A closure's
+            // captures otherwise drop AFTER its body locals (i.e. after the
+            // guard), which would release the thread slot BEFORE the user's
+            // `FrameFilter`s are torn down: a filter whose `Drop` panics would
+            // then go UNRECORDED (job reports Ok over a failure), and a filter
+            // whose `Drop` blocks would let the caller free the scheduler context
+            // while this thread is still alive. Dropping the pipeline while the
+            // guard is still armed records a Drop panic as the job error and keeps
+            // the slot counted until the filters are fully gone.
+            //
+            // `frame_receiver`/`frame_senders`/`frame_pool` are only MOVED
+            // into `run_pipeline` on the SUCCESS path; if `frame_filter_init`
+            // returns Err (or it or `pipeline_uninit` panics) the early return would
+            // otherwise leave them as captures dropping AFTER the guard — so a frame
+            // already buffered in `frame_receiver` carrying a blocking `AVBufferRef`
+            // free callback (an upstream pipeline can attach one) would run its
+            // teardown after the caller observed completion. Rebinding them here
+            // makes them drop before the guard on the init-error path too.
+            let mut pipeline = pipeline;
+            let frame_receiver = frame_receiver;
+            let frame_senders = frame_senders;
+            let frame_pool = frame_pool;
             if let Err(e) = frame_filter_init(&mut pipeline) {
                 pipeline_uninit(&mut pipeline);
                 crate::core::scheduler::ffmpeg_scheduler::set_scheduler_error(
@@ -347,12 +374,16 @@ fn run_pipeline(
                                 scheduler_status,
                             )?;
                         }
-                        send_frame(pipeline, &mut frame_senders, frame_pool, Some(frame_box.frame))?;
+                        send_frame(
+                            pipeline,
+                            &mut frame_senders,
+                            frame_pool,
+                            Some(frame_box.frame),
+                        )?;
                     } else {
                         // SAFETY: non-null (frame_is_null was false); probing
                         // buf[0] reads one pointer field of a live frame.
-                        let is_cue =
-                            unsafe { (*frame_box.frame.as_ptr()).buf[0].is_null() };
+                        let is_cue = unsafe { (*frame_box.frame.as_ptr()).buf[0].is_null() };
                         if is_cue {
                             // A source-delivered flush cue (the decoder's EOF
                             // timestamp marker). Run the ordered flush protocol
@@ -373,9 +404,10 @@ fn run_pipeline(
                                 frame_pool,
                                 &poll_indices,
                                 scheduler_status,
-                            )? && !crate::core::scheduler::ffmpeg_scheduler::is_stopping(
-                                scheduler_status.load(std::sync::atomic::Ordering::Acquire),
-                            );
+                            )?
+                                && !crate::core::scheduler::ffmpeg_scheduler::is_stopping(
+                                    scheduler_status.load(std::sync::atomic::Ordering::Acquire),
+                                );
                             if !completed {
                                 frame_pool.release(frame_box.frame);
                                 if frame_senders.is_empty() {
@@ -540,7 +572,14 @@ fn flush_pipeline_for_eof(
         let marker = frame_pool.get()?;
         match pipeline.run_filter_at(k, marker) {
             Ok(out) => {
-                if !forward_from(pipeline, frame_senders, frame_pool, k + 1, out, scheduler_status)? {
+                if !forward_from(
+                    pipeline,
+                    frame_senders,
+                    frame_pool,
+                    k + 1,
+                    out,
+                    scheduler_status,
+                )? {
                     return Ok(false);
                 }
             }

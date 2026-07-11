@@ -25,6 +25,21 @@ pub struct Running;
 pub struct Paused;
 pub struct Ended;
 
+// publishes a muxer's `enc_registered` flag on Drop — including on UNWIND.
+// start() sets the flag explicitly on the normal and enc_init-error paths (before
+// fail_start joins the waiter), but a PANIC inside an enc_init (e.g. a panicking log
+// hook) mid-registration would skip both, leaving the delayed-start mux waiter's
+// registration barrier (MuxRegistrationBarrier) blocked forever. This RAII, held
+// across a muxer's enc_init loop, republishes the flag as the stack unwinds so that
+// barrier can never hang.
+struct SetEncRegisteredOnDrop(Arc<AtomicBool>);
+
+impl Drop for SetEncRegisteredOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 // Internal wrapper for Running state to enable Drop implementation.
 //
 // This guard ensures that when a FfmpegScheduler<Running> (or Paused) is dropped,
@@ -300,7 +315,12 @@ impl FfmpegScheduler<Initialization> {
                     scheduler_result.clone(),
                     mux_done_remaining.clone(),
                 ) {
-                    Self::fail_start(&scheduler_status, &thread_sync, &self.ffmpeg_context, &mux_handed);
+                    Self::fail_start(
+                        &scheduler_status,
+                        &thread_sync,
+                        &self.ffmpeg_context,
+                        &mux_handed,
+                    );
                     return Err(e);
                 }
             }
@@ -320,7 +340,12 @@ impl FfmpegScheduler<Initialization> {
                         thread_sync.clone(),
                         scheduler_result.clone(),
                     ) {
-                        Self::fail_start(&scheduler_status, &thread_sync, ffmpeg_context, &mux_handed);
+                        Self::fail_start(
+                            &scheduler_status,
+                            &thread_sync,
+                            ffmpeg_context,
+                            &mux_handed,
+                        );
                         return Err(e);
                     }
                 }
@@ -330,6 +355,15 @@ impl FfmpegScheduler<Initialization> {
         // Encoder
         let ffmpeg_context = &mut self.ffmpeg_context;
         for (mux_idx, mux) in &mut ffmpeg_context.muxs.iter_mut().enumerate() {
+            // republish registration-complete on unwind. Armed at the
+            // very TOP of this muxer's iteration — BEFORE ready_to_init_mux spawns the
+            // delayed-start waiter — so it covers the whole window: waiter handoff, the
+            // -shortest sync-queue setup, AND the enc_init loop below. A panic anywhere
+            // after the waiter is spawned would otherwise leave the waiter's registration
+            // barrier (MuxRegistrationBarrier) blocked forever, retaining the output
+            // context and its pre-counted slot. The explicit stores (enc_init error arm;
+            // after the loop) still run first on the normal and error paths.
+            let _enc_registered_on_unwind = SetEncRegisteredOnDrop(mux.enc_registered.clone());
             let ready_sender = match ready_to_init_mux(
                 mux_idx,
                 mux,
@@ -489,7 +523,12 @@ impl FfmpegScheduler<Initialization> {
                         thread_sync.clone(),
                         scheduler_result.clone(),
                     ) {
-                        Self::fail_start(&scheduler_status, &thread_sync, ffmpeg_context, &mux_handed);
+                        Self::fail_start(
+                            &scheduler_status,
+                            &thread_sync,
+                            ffmpeg_context,
+                            &mux_handed,
+                        );
                         return Err(e);
                     }
                 }
@@ -655,28 +694,21 @@ impl FfmpegScheduler<Running> {
     /// assert!(result.is_ok());
     /// ```
     pub fn wait(self) -> crate::error::Result<()> {
+        // Always drain the thread counter before reading the result — the same
+        // discipline as stop(). On a mux panic the terminal status and the error
+        // can be published in either order (a normal unwind records the error
+        // first via _panic_status; a sibling/stop, or a teardown-destructor panic
+        // after mux_done was dropped, can flip the status first), so reading the
+        // result on status alone can capture a mid-unwind Ok(()). Every worker
+        // releases its thread slot only AFTER recording its terminal state, so
+        // counter==0 means the result is fully settled. Storing STATUS_END is
+        // still gated so it never clobbers a terminal ABORT.
+        self.thread_sync.wait_for_all_threads();
         if !is_stopping(self.status.load(Ordering::Acquire)) {
-            self.thread_sync.wait_for_all_threads();
             self.status.store(STATUS_END, Ordering::Release);
         }
 
-        // A worker that panicked while holding the lock must surface as an
-        // error on the caller's thread, not as a second panic.
-        let option = self
-            .result
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        match option {
-            None => {
-                log::info!("FFmpeg task succeeded.");
-                Ok(())
-            }
-            Some(result) => {
-                log::error!("FFmpeg task failed.");
-                result
-            }
-        }
+        take_scheduler_result(&self.result)
     }
 
     /// **WARNING: Immediately aborts the FFmpeg job without waiting for threads to complete.**
@@ -756,16 +788,56 @@ impl FfmpegScheduler<Running> {
     /// | `stop()` | Yes | Guaranteed | Production, need valid files |
     /// | `abort()` | No | Not guaranteed | Emergency, don't care about files |
     ///
+    /// # Returns
+    ///
+    /// - `Ok(())` — the job wound down cleanly and every output was fully
+    ///   finalized.
+    /// - `Err(...)` — the first error any worker recorded, including trailer
+    ///   write failures that were previously swallowed (a stop() used to
+    ///   return `()` and could not report them).
+    ///
+    /// # Blocking caveat
+    ///
+    /// While an output is finalizing (e.g. a `movflags=+faststart` trailer
+    /// rewriting the file), `stop()` blocks without a timeout rather than
+    /// cutting the write and corrupting the output. [`abort()`](Self::abort)
+    /// remains the hard-cancel escape hatch.
+    ///
     /// # Example
     /// ```rust,ignore
     /// let running_scheduler = scheduler.start().unwrap();
     /// // ... processing ...
-    /// running_scheduler.stop(); // Blocks until complete, files are valid
+    /// running_scheduler.stop()?; // Blocks until complete, files are valid
     /// ```
-    pub fn stop(self) {
+    pub fn stop(self) -> crate::error::Result<()> {
         self.signal_stop();
         self.thread_sync.wait_for_all_threads();
         log::debug!("stop() completed, all threads finished");
+        take_scheduler_result(&self.result)
+    }
+}
+
+/// Takes the recorded scheduler outcome exactly once: `None` means no worker
+/// recorded an error — success. A worker that panicked while holding the
+/// lock must surface as an error on the caller's thread, not as a second
+/// panic, hence the poison recovery. Shared by wait(), stop(), and the async
+/// Future.
+fn take_scheduler_result(
+    result: &Arc<Mutex<Option<crate::error::Result<()>>>>,
+) -> crate::error::Result<()> {
+    let option = result
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    match option {
+        None => {
+            log::info!("FFmpeg task succeeded.");
+            Ok(())
+        }
+        Some(result) => {
+            log::error!("FFmpeg task failed.");
+            result
+        }
     }
 }
 
@@ -797,25 +869,18 @@ impl std::future::Future for FfmpegScheduler<Running> {
         fn ready(
             result: &Arc<Mutex<Option<crate::error::Result<()>>>>,
         ) -> std::task::Poll<crate::error::Result<()>> {
-            let option = result
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-            std::task::Poll::Ready(match option {
-                None => {
-                    log::info!("FFmpeg task succeeded.");
-                    Ok(())
-                }
-                Some(result) => {
-                    log::error!("FFmpeg task failed.");
-                    result
-                }
-            })
+            std::task::Poll::Ready(take_scheduler_result(result))
         }
 
         let this = self.get_mut();
 
-        if is_stopping(this.status.load(Ordering::Acquire)) {
+        // Gate readiness on every worker thread having finished, NOT on the
+        // terminal status: on a mux panic the status and the error can be
+        // published in either order, so a status-only check can complete the
+        // Future with a mid-unwind Ok(()). The counter reaching 0 means every
+        // worker released its slot AFTER recording its terminal state; the
+        // thread-done waker fires exactly then.
+        if this.thread_sync.all_threads_done() {
             return ready(&this.result);
         }
 
@@ -823,11 +888,10 @@ impl std::future::Future for FfmpegScheduler<Running> {
         let waker = cx.waker().clone();
         thread_sync.set_waker(waker);
 
-        // Re-check after registering the waker: the last thread may have
-        // published the terminal state and consumed a previous waker between
-        // the check above and set_waker, in which case no further wake ever
-        // comes for the waker just installed.
-        if is_stopping(this.status.load(Ordering::Acquire)) {
+        // Re-check after registering the waker: the last thread may have finished
+        // (and consumed a previous waker) between the check above and set_waker,
+        // in which case no further wake ever comes for the waker just installed.
+        if this.thread_sync.all_threads_done() {
             return ready(&this.result);
         }
 
@@ -986,6 +1050,22 @@ pub(crate) fn notify_pause_waiters() {
     cond.notify_all();
 }
 
+/// Records `error` as the scheduler result if none is set, WITHOUT touching
+/// the scheduler status — for panic paths whose status publication is owned
+/// by a no-downgrade guard (the mux panic guard must never overwrite
+/// STATUS_ABORT, which plain set_scheduler_error would).
+pub(crate) fn set_scheduler_result_only(
+    scheduler_result: &Arc<Mutex<Option<crate::error::Result<()>>>>,
+    error: impl Into<crate::error::Error>,
+) {
+    let mut scheduler_result = scheduler_result
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if scheduler_result.is_none() {
+        scheduler_result.replace(Err(error.into()));
+    }
+}
+
 pub(crate) fn set_scheduler_error(
     scheduler_status: &Arc<AtomicUsize>,
     scheduler_result: &Arc<Mutex<Option<crate::error::Result<()>>>>,
@@ -999,7 +1079,23 @@ pub(crate) fn set_scheduler_error(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if scheduler_result.is_none() {
         scheduler_result.replace(Err(error.into()));
-        scheduler_status.store(STATUS_END, Ordering::Release);
+        // Publish STATUS_END WITHOUT downgrading an abort: a worker error (or
+        // panic) racing abort() used to overwrite STATUS_ABORT, and a muxer
+        // observing the downgraded state would flush encoders and write a
+        // trailer — the very I/O abort() exists to skip. Same no-downgrade
+        // CAS as MuxDoneGuard.
+        let mut current = scheduler_status.load(Ordering::Acquire);
+        while !is_stopping(current) {
+            match scheduler_status.compare_exchange_weak(
+                current,
+                STATUS_END,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
         // Wake paused workers so they observe the terminal state and exit,
         // rather than sleeping until the safety-net timeout (conc-06). The error
         // result is already recorded above, so a woken wait() sees it.
@@ -1023,6 +1119,39 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread::sleep;
     use std::time::Duration;
+
+    /// `SetEncRegisteredOnDrop` must publish `enc_registered` on Drop —
+    /// including on UNWIND — so a panic inside an `enc_init` mid-registration cannot
+    /// leave the mux waiter's `MuxRegistrationBarrier` blocked forever.
+    #[test]
+    fn set_enc_registered_publishes_on_drop_and_on_unwind() {
+        use super::SetEncRegisteredOnDrop;
+        use std::sync::atomic::AtomicBool;
+
+        let normal = Arc::new(AtomicBool::new(false));
+        {
+            let _g = SetEncRegisteredOnDrop(normal.clone());
+            assert!(
+                !normal.load(Ordering::Acquire),
+                "must not publish before drop"
+            );
+        }
+        assert!(
+            normal.load(Ordering::Acquire),
+            "must publish on normal drop"
+        );
+
+        let unwind = Arc::new(AtomicBool::new(false));
+        let f = unwind.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _g = SetEncRegisteredOnDrop(f);
+            panic!("simulated start() panic mid-registration");
+        }));
+        assert!(
+            unwind.load(Ordering::Acquire),
+            "must publish enc_registered on unwind"
+        );
+    }
 
     // conc-06: workers parked in wait_until_not_paused must all wake and observe
     // the new status when a transition out of STATUS_PAUSE notifies the gate —
@@ -1602,7 +1731,7 @@ mod tests {
         }
 
         // stop() should block until all threads complete
-        scheduler.stop();
+        scheduler.stop().expect("graceful stop must succeed");
 
         // Verify output file exists and has content
         let metadata = std::fs::metadata("output_stop.mp4").unwrap();

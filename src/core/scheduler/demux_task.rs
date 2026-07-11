@@ -66,7 +66,7 @@ pub(crate) fn demux_init(
     }
 
     let copy_ts = demux.copy_ts;
-    let mut demux_parameter = DemuxerParameter::new(demux);
+    let demux_parameter = DemuxerParameter::new(demux);
 
     // Take sole ownership of the input context out of the Demuxer. Moving the
     // `FormatContext` into the worker closure below IS the ownership transfer —
@@ -91,7 +91,11 @@ pub(crate) fn demux_init(
     // observe a zero counter while this worker is about to run; the guard
     // releases it on any exit path, including panic.
     thread_sync.thread_start();
-    let thread_done_guard = ThreadDoneGuard::adopt(thread_sync.clone(), scheduler_status.clone());
+    let thread_done_guard = ThreadDoneGuard::adopt(
+        thread_sync.clone(),
+        scheduler_status.clone(),
+        scheduler_result.clone(),
+    );
 
     let result = std::thread::Builder::new()
         .name(format!("demuxer{demux_idx}:{format_name}"))
@@ -100,6 +104,13 @@ pub(crate) fn demux_init(
             // Move the FormatContext into the worker; it Drops (frees the input
             // context, custom-IO-aware) when this closure ends — the terminal free.
             let in_fmt_ctx = in_fmt_ctx;
+            // `demux_parameter` (a `move`-closure CAPTURE) owns the packet-channel
+            // senders (`dsts`). Rebind it as a body local declared AFTER the guard so it
+            // drops BEFORE it — for a `crossbeam_channel::bounded` channel the queued
+            // `PacketBox`es are freed only when the LAST endpoint drops, so leaving these
+            // senders as captures would tear the packets down after this worker already
+            // released its slot (after the counter stop()/wait() gate on hit zero).
+            let mut demux_parameter = demux_parameter;
             let mut is_started = false;
             // Mirrors FFmpeg's Demuxer.nb_streams_warn: warn once per unexpected stream id.
             let mut nb_streams_warn = demux_parameter.demux_streams.len();

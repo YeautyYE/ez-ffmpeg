@@ -239,6 +239,11 @@ pub(crate) struct Muxer {
     /// the wait cannot cycle with the join.
     pub(crate) enc_registered: Arc<std::sync::atomic::AtomicBool>,
 
+    /// The scheduler's interrupt-callback state: the mux worker holds a
+    /// finalize window open on it around the trailer write (H3), so a
+    /// graceful stop() cannot cut a healthy trailer mid-rewrite.
+    pub(crate) interrupt_state: Arc<crate::core::context::InterruptState>,
+
     pub(crate) mux_stream_nodes: Vec<Arc<SchNode>>,
 }
 
@@ -309,6 +314,7 @@ impl Muxer {
         sws_opts: Option<String>,
         swr_opts: Option<String>,
         attachments: Vec<AttachmentSpec>,
+        interrupt_state: Arc<crate::core::context::InterruptState>,
     ) -> Self {
         // Read oformat flags via the pointer BEFORE moving `out_fmt_ctx` into the
         // struct (the field can no longer be the access path once it's moved).
@@ -356,6 +362,7 @@ impl Muxer {
             nb_streams: 0,
             nb_streams_ready: Arc::new(Default::default()),
             enc_registered: Arc::new(Default::default()),
+            interrupt_state,
             mux_stream_nodes: vec![],
             global_metadata,
             stream_metadata,
