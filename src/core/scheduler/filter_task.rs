@@ -786,13 +786,26 @@ unsafe fn fg_send_eof(
 
     let frame = frame_box.frame.as_mut_ptr();
     if !ifp.filter.is_null() {
-        let pts = av_rescale_q_rnd(
-            (*frame).pts,
-            (*frame).time_base,
-            ifp.time_base,
-            AV_ROUND_NEAR_INF as u32 | AV_ROUND_PASS_MINMAX as u32,
-        );
-        let ret = av_buffersrc_close(ifp.filter, pts, AV_BUFFERSRC_FLAG_PUSH as u32);
+        // A NULL EOF frame reaches here from a cross-graph producer's EOF marker,
+        // and from a healthy pipeline whose cue frame was consumed or could not
+        // be allocated (only the final NULL sentinel arrives). Signal EOF with
+        // av_buffersrc_add_frame_flags(NULL), which closes the source at its own
+        // accumulated frame-end time (mirrors the reconfiguration EOF path). A
+        // fixed AV_NOPTS_VALUE would drop the tail timing, and dereferencing the
+        // null frame for a pts would crash. A decoder EOF marker instead carries an
+        // estimated frame-end timestamp (last_frame_pts + duration_est) when a last
+        // pts is known, else AV_NOPTS_VALUE, so close at that pts.
+        let ret = if frame.is_null() {
+            av_buffersrc_add_frame_flags(ifp.filter, null_mut(), AV_BUFFERSRC_FLAG_PUSH as i32)
+        } else {
+            let pts = av_rescale_q_rnd(
+                (*frame).pts,
+                (*frame).time_base,
+                ifp.time_base,
+                AV_ROUND_NEAR_INF as u32 | AV_ROUND_PASS_MINMAX as u32,
+            );
+            av_buffersrc_close(ifp.filter, pts, AV_BUFFERSRC_FLAG_PUSH as u32)
+        };
         frame_pool.release(frame_box.frame);
         if ret < 0 {
             return Err(Error::FilterGraph(

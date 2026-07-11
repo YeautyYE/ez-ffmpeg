@@ -22,7 +22,11 @@ pub(crate) enum SchNode {
         task_exited: Arc<AtomicBool>,
     },
     Filter {
-        inputs: Vec<Arc<SchNode>>,
+        /// One slot per filter pad, pad-indexed. A pad fed by a demuxer holds
+        /// `Some(demux_node)`; a cross-graph-bound pad (fed by another graph's
+        /// output) stays `None` — an explicit hole, so demuxer-bound entries
+        /// keep their pad index instead of being shifted.
+        inputs: Vec<Option<Arc<SchNode>>>,
         best_input: Arc<AtomicUsize>,
     },
     MuxStream {
@@ -196,8 +200,9 @@ impl InputController {
                 unreachable!()
             };
 
-            // No upstream to walk to: reached no demuxer.
-            let Some(next) = inputs.get(best_input.load(Ordering::Acquire)) else {
+            // No upstream to walk to — out of range, or a cross-graph hole
+            // (`Some(None)`): reached no demuxer.
+            let Some(Some(next)) = inputs.get(best_input.load(Ordering::Acquire)) else {
                 return false;
             };
             src = next;
@@ -281,7 +286,7 @@ mod tests {
         }
     }
 
-    fn filter_node(inputs: Vec<Arc<SchNode>>, best_input: usize) -> Arc<SchNode> {
+    fn filter_node(inputs: Vec<Option<Arc<SchNode>>>, best_input: usize) -> Arc<SchNode> {
         Arc::new(SchNode::Filter {
             inputs,
             best_input: Arc::new(AtomicUsize::new(best_input)),
@@ -306,7 +311,7 @@ mod tests {
         // Filter -> demuxer: reached through the graph.
         let d2 = demux_node();
         waiter_of(&d2).set_choked_next(true);
-        let f = filter_node(vec![d2.clone()], 0);
+        let f = filter_node(vec![Some(d2.clone())], 0);
         assert!(InputController::unchoke_for_stream(&f));
         assert!(!waiter_of(&d2).get_choked_next());
 
@@ -319,9 +324,29 @@ mod tests {
         // Out-of-range best_input: no demuxer reached.
         let d3 = demux_node();
         assert!(!InputController::unchoke_for_stream(&filter_node(
-            vec![d3],
+            vec![Some(d3)],
             5
         )));
+    }
+
+    // A cross-graph-bound pad is a `None` hole in the scheduler-input list.
+    // Selecting a hole reaches no demuxer (like an empty/out-of-range list), and
+    // a hole before a demuxer-bound pad must NOT shift that pad's index.
+    #[test]
+    fn unchoke_for_stream_treats_a_cross_graph_hole_as_no_demuxer() {
+        // best_input points at a hole -> no demuxer reached.
+        assert!(!InputController::unchoke_for_stream(&filter_node(
+            vec![None],
+            0
+        )));
+
+        // Hole at pad 0, demuxer at pad 1: selecting pad 1 still reaches the
+        // demuxer (pad indices preserved, not collapsed).
+        let d = demux_node();
+        waiter_of(&d).set_choked_next(true);
+        let f = filter_node(vec![None, Some(d.clone())], 1);
+        assert!(InputController::unchoke_for_stream(&f));
+        assert!(!waiter_of(&d).get_choked_next());
     }
 
     // A mix of resolved and unresolved eligible streams must STILL run the
