@@ -23,7 +23,10 @@ use ez_ffmpeg::filter::frame_filter_context::FrameFilterContext;
 use ez_ffmpeg::filter::frame_pipeline_builder::FramePipelineBuilder;
 use ez_ffmpeg::stream_info::{find_video_stream_info, StreamInfo};
 use ez_ffmpeg::{AVMediaType, FfmpegContext, Frame, Input, Output};
-use ffmpeg_sys_next::{av_frame_ref, AVRational};
+use ffmpeg_sys_next::{
+    av_buffer_create, av_frame_new_side_data_from_buf, av_frame_ref, av_free, av_malloc,
+    AVFrameSideDataType, AVRational,
+};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -239,7 +242,10 @@ fn eof_sentinel_never_reaches_user_frame_filters() {
         60,
         "sentinel transcode",
     );
-    assert!(result.is_ok(), "transcode with recorders failed: {result:?}");
+    assert!(
+        result.is_ok(),
+        "transcode with recorders failed: {result:?}"
+    );
 
     assert!(
         input_seen.load(Ordering::SeqCst) > 0,
@@ -283,10 +289,7 @@ fn recording_filter_keeps_output_frame_count() {
     );
     assert!(result.is_ok(), "baseline transcode failed: {result:?}");
     let baseline_frames = probe_video_frames(&baseline_out);
-    assert!(
-        baseline_frames > 0,
-        "baseline transcode produced no frames"
-    );
+    assert!(baseline_frames > 0, "baseline transcode produced no frames");
 
     let filtered_out = tmp_path("drain_filtered.mp4");
     let input_seen = Arc::new(AtomicUsize::new(0));
@@ -352,9 +355,7 @@ impl FrameFilter for AsyncBufferingFilter {
         frame: Frame,
         _ctx: &FrameFilterContext,
     ) -> Result<Option<Frame>, FrameFilterError> {
-        let props_only = unsafe {
-            frame.as_ptr().is_null() || (*frame.as_ptr()).buf[0].is_null()
-        };
+        let props_only = unsafe { frame.as_ptr().is_null() || (*frame.as_ptr()).buf[0].is_null() };
         if props_only {
             // Flush cue: everything held is now ready; the backlog drains
             // through request_frame. Pass the cue itself along untouched.
@@ -404,9 +405,7 @@ impl FrameFilter for DelayOneFilter {
         frame: Frame,
         _ctx: &FrameFilterContext,
     ) -> Result<Option<Frame>, FrameFilterError> {
-        let props_only = unsafe {
-            frame.as_ptr().is_null() || (*frame.as_ptr()).buf[0].is_null()
-        };
+        let props_only = unsafe { frame.as_ptr().is_null() || (*frame.as_ptr()).buf[0].is_null() };
         if props_only {
             // Flush cue: release the delayed frame (consuming the marker),
             // or pass the cue along if nothing is held.
@@ -669,9 +668,7 @@ impl FrameFilter for CueOrderSentinel {
         frame: Frame,
         _ctx: &FrameFilterContext,
     ) -> Result<Option<Frame>, FrameFilterError> {
-        let props_only = unsafe {
-            frame.as_ptr().is_null() || (*frame.as_ptr()).buf[0].is_null()
-        };
+        let props_only = unsafe { frame.as_ptr().is_null() || (*frame.as_ptr()).buf[0].is_null() };
         if props_only {
             self.cue_seen.store(true, Ordering::SeqCst);
         } else {
@@ -854,9 +851,7 @@ impl FrameFilter for StopSignalingHolder {
         frame: Frame,
         _ctx: &FrameFilterContext,
     ) -> Result<Option<Frame>, FrameFilterError> {
-        let props_only = unsafe {
-            frame.as_ptr().is_null() || (*frame.as_ptr()).buf[0].is_null()
-        };
+        let props_only = unsafe { frame.as_ptr().is_null() || (*frame.as_ptr()).buf[0].is_null() };
         if !props_only {
             return Ok(self.held.replace(frame));
         }
@@ -949,9 +944,7 @@ fn stop_during_last_stage_marker_echo_blocks_source_marker_traversal() {
     // marker before the sentinel, which is exactly the source-marker path
     // under test.
     let scheduler = FfmpegContext::builder()
-        .input(
-            Input::from(fixture.as_str()).add_frame_pipeline(pipeline),
-        )
+        .input(Input::from(fixture.as_str()).add_frame_pipeline(pipeline))
         .output(Output::from(out.as_str()).set_video_codec("mpeg4"))
         .build()
         .unwrap()
@@ -966,7 +959,9 @@ fn stop_during_last_stage_marker_echo_blocks_source_marker_traversal() {
     let flag = stop_initiated.clone();
     std::thread::spawn(move || {
         flag.store(true, Ordering::SeqCst);
-        scheduler.stop();
+        // Liveness tests: the stop() result is locked elsewhere
+        // (lifecycle/log_noise); only the return itself matters here.
+        let _ = scheduler.stop();
         let _ = stopped_tx.send(());
     });
 
@@ -1032,7 +1027,9 @@ fn stop_during_flush_does_not_start_new_filter_calls() {
     let flag = stop_initiated.clone();
     std::thread::spawn(move || {
         flag.store(true, Ordering::SeqCst);
-        scheduler.stop();
+        // Liveness tests: the stop() result is locked elsewhere
+        // (lifecycle/log_noise); only the return itself matters here.
+        let _ = scheduler.stop();
         let _ = stopped_tx.send(());
     });
 
@@ -1105,7 +1102,9 @@ fn stop_releases_saturating_generator_drain_loop() {
 
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        scheduler.stop();
+        // Liveness tests: the stop() result is locked elsewhere
+        // (lifecycle/log_noise); only the return itself matters here.
+        let _ = scheduler.stop();
         let _ = tx.send(());
     });
 
@@ -1116,4 +1115,596 @@ fn stop_releases_saturating_generator_drain_loop() {
         "stop() did not return within 15s: the request_frame drain loop is not \
          honoring stop/abort while a generator filter keeps producing"
     );
+}
+
+/// Panics on the Nth REAL frame (props-only cues are passed through, not
+/// counted) — the worker-panic surfacing probe.
+struct PanicOnNthFrame {
+    seen: usize,
+    panic_at: usize,
+}
+
+impl FrameFilter for PanicOnNthFrame {
+    fn media_type(&self) -> AVMediaType {
+        AVMediaType::AVMEDIA_TYPE_VIDEO
+    }
+
+    fn filter_frame(
+        &mut self,
+        frame: Frame,
+        _ctx: &FrameFilterContext,
+    ) -> Result<Option<Frame>, FrameFilterError> {
+        let props_only = unsafe { frame.as_ptr().is_null() || (*frame.as_ptr()).buf[0].is_null() };
+        if !props_only {
+            self.seen += 1;
+            if self.seen >= self.panic_at {
+                panic!("test-injected filter panic on frame {}", self.seen);
+            }
+        }
+        Ok(Some(frame))
+    }
+
+    fn request_frame_mode(&self) -> RequestFrameMode {
+        RequestFrameMode::Never
+    }
+}
+
+/// A panicking FrameFilter used to be swallowed: the pipeline thread died,
+/// downstream read the disconnect as EOF, and wait() returned Ok(()) over a
+/// truncated output. It must now surface as WorkerPanicked — and the job
+/// must still wind down within a bound (the panic teardown cannot hang).
+#[test]
+fn filter_panic_surfaces_as_worker_panicked() {
+    let fixture = mpegts_fixture("panic_in.ts", 30);
+    let out = tmp_path("panic_out.mp4");
+
+    let pipeline = FramePipelineBuilder::new(AVMediaType::AVMEDIA_TYPE_VIDEO).filter(
+        "panic-on-nth",
+        Box::new(PanicOnNthFrame {
+            seen: 0,
+            panic_at: 5,
+        }),
+    );
+
+    let result = wait_with_watchdog(
+        FfmpegContext::builder()
+            .input(Input::from(fixture.as_str()))
+            .output(
+                Output::from(out.as_str())
+                    .set_video_codec("mpeg4")
+                    .add_frame_pipeline(pipeline),
+            )
+            .build()
+            .unwrap()
+            .start()
+            .unwrap(),
+        60,
+        "panicking filter job",
+    );
+
+    match result {
+        Err(ez_ffmpeg::error::Error::WorkerPanicked(name)) => {
+            assert!(
+                name.contains("pipeline"),
+                "the recorded thread should be the pipeline worker, got '{name}'"
+            );
+        }
+        other => panic!("expected Err(WorkerPanicked), got {other:?}"),
+    }
+}
+
+/// A FrameFilter whose `Drop` panics (distinct from a `filter_frame` panic: the
+/// Drop runs at pipeline TEARDOWN, not during processing).
+struct PanicOnDropFilter;
+
+impl FrameFilter for PanicOnDropFilter {
+    fn media_type(&self) -> AVMediaType {
+        AVMediaType::AVMEDIA_TYPE_VIDEO
+    }
+
+    fn filter_frame(
+        &mut self,
+        frame: Frame,
+        _ctx: &FrameFilterContext,
+    ) -> Result<Option<Frame>, FrameFilterError> {
+        Ok(Some(frame))
+    }
+
+    fn request_frame_mode(&self) -> RequestFrameMode {
+        RequestFrameMode::Never
+    }
+}
+
+impl Drop for PanicOnDropFilter {
+    fn drop(&mut self) {
+        panic!("test-injected FrameFilter Drop panic");
+    }
+}
+
+/// a FrameFilter's `Drop` panic used to be LOST — the pipeline (which owns
+/// the user filters) is a closure CAPTURE and dropped AFTER the ThreadDoneGuard
+/// (a body local) had already released the thread slot, so the Drop panic went
+/// unrecorded and wait() returned Ok(()) over a failed job. With the pipeline now
+/// rebound as a body local that drops BEFORE the guard, the Drop panic surfaces as
+/// WorkerPanicked, exactly like a filter_frame panic.
+#[test]
+fn filter_drop_panic_surfaces_as_worker_panicked() {
+    let fixture = mpegts_fixture("drop_panic_in.ts", 30);
+    let out = tmp_path("drop_panic_out.mp4");
+
+    let pipeline = FramePipelineBuilder::new(AVMediaType::AVMEDIA_TYPE_VIDEO)
+        .filter("panic-on-drop", Box::new(PanicOnDropFilter));
+
+    let result = wait_with_watchdog(
+        FfmpegContext::builder()
+            .input(Input::from(fixture.as_str()))
+            .output(
+                Output::from(out.as_str())
+                    .set_video_codec("mpeg4")
+                    .add_frame_pipeline(pipeline),
+            )
+            .build()
+            .unwrap()
+            .start()
+            .unwrap(),
+        60,
+        "drop-panicking filter job",
+    );
+
+    match result {
+        Err(ez_ffmpeg::error::Error::WorkerPanicked(name)) => {
+            assert!(
+                name.contains("pipeline"),
+                "the recorded thread should be the pipeline worker, got '{name}'"
+            );
+        }
+        other => panic!("expected Err(WorkerPanicked) from the Drop panic, got {other:?}"),
+    }
+}
+
+/// Shared state for the blocking side-data free callback below.
+struct BlockingFreeState {
+    entered: AtomicBool,
+    release: AtomicBool,
+}
+
+/// An `AVBufferRef` free callback (invoked by libav's C teardown when the frame
+/// is unref'd) that announces it started, then PARKS until the test releases it.
+/// It must never panic — it runs across the `extern "C"` boundary.
+unsafe extern "C" fn blocking_side_data_free(opaque: *mut std::ffi::c_void, data: *mut u8) {
+    // Reclaim the Arc ref leaked into `opaque` (balances the Arc::into_raw in the
+    // injector); it drops at the end of this fn.
+    let state = Arc::from_raw(opaque as *const BlockingFreeState);
+    state.entered.store(true, Ordering::SeqCst);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !state.release.load(Ordering::SeqCst) {
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    if !data.is_null() {
+        av_free(data as *mut std::ffi::c_void);
+    }
+}
+
+/// Attaches a side-data buffer to `frame` whose free callback is `blocking_side_data_free`
+/// bound to `state`. When the frame is later unref'd, the callback parks until the test
+/// releases `state` — a controllable proxy for a real hwaccel surface / custom-IO buffer
+/// whose free callback blocks.
+unsafe fn attach_blocking_side_data(frame: &Frame, state: &Arc<BlockingFreeState>) {
+    let data = av_malloc(64) as *mut u8;
+    assert!(!data.is_null(), "av_malloc failed in test");
+    // Leak one Arc ref into the buffer's opaque; the callback reclaims it.
+    let raw = Arc::into_raw(state.clone()) as *mut std::ffi::c_void;
+    let buf = av_buffer_create(data, 64, Some(blocking_side_data_free), raw, 0);
+    assert!(!buf.is_null(), "av_buffer_create failed in test");
+    let sd = av_frame_new_side_data_from_buf(
+        frame.as_ptr() as *mut _,
+        AVFrameSideDataType::AV_FRAME_DATA_SEI_UNREGISTERED,
+        buf,
+    );
+    assert!(
+        !sd.is_null(),
+        "av_frame_new_side_data_from_buf failed in test"
+    );
+}
+
+/// Tags the first `states.len()` real frames with a blocking free callback (one
+/// `state` each) and FORWARDS the first `forward_until` real frames, then swallows the
+/// rest. It fires `barrier` once real frame `forward_until + 1` arrives — proof the
+/// pipeline already returned from `send_frame` for frames 1..=`forward_until` (the
+/// pipeline calls `filter_frame(N+1)` only AFTER `send_frame(N)` returned), a genuine
+/// happens-before rather than a fixed sleep. Forwarding MORE frames than the
+/// downstream `bounded(8)` channel holds forces the receiver to dequeue the earliest
+/// (tagged) frame, so it provably lands in the target worker's own queue, not merely
+/// the shared channel buffer (which a `crossbeam` bounded channel frees only when its
+/// LAST endpoint drops).
+struct BlockingBufferInjector {
+    states: Vec<Arc<BlockingFreeState>>,
+    real_seen: usize,
+    forward_until: usize,
+    barrier: Option<std::sync::mpsc::Sender<()>>,
+}
+
+impl FrameFilter for BlockingBufferInjector {
+    fn media_type(&self) -> AVMediaType {
+        AVMediaType::AVMEDIA_TYPE_VIDEO
+    }
+
+    fn filter_frame(
+        &mut self,
+        frame: Frame,
+        _ctx: &FrameFilterContext,
+    ) -> Result<Option<Frame>, FrameFilterError> {
+        let props_only = unsafe { frame.as_ptr().is_null() || (*frame.as_ptr()).buf[0].is_null() };
+        if props_only {
+            return Ok(Some(frame));
+        }
+        self.real_seen += 1;
+        if self.real_seen <= self.states.len() {
+            unsafe { attach_blocking_side_data(&frame, &self.states[self.real_seen - 1]) };
+            return Ok(Some(frame));
+        }
+        if self.real_seen <= self.forward_until {
+            return Ok(Some(frame));
+        }
+        if self.real_seen == self.forward_until + 1 {
+            if let Some(tx) = self.barrier.take() {
+                let _ = tx.send(());
+            }
+        }
+        Ok(None)
+    }
+
+    fn request_frame_mode(&self) -> RequestFrameMode {
+        RequestFrameMode::Never
+    }
+}
+
+/// Swallows every real frame so this graph input never delivers a format, keeping
+/// the filtergraph forever in its pre-config (buffering) state.
+struct SwallowAllFrames;
+
+impl FrameFilter for SwallowAllFrames {
+    fn media_type(&self) -> AVMediaType {
+        AVMediaType::AVMEDIA_TYPE_VIDEO
+    }
+
+    fn filter_frame(
+        &mut self,
+        frame: Frame,
+        _ctx: &FrameFilterContext,
+    ) -> Result<Option<Frame>, FrameFilterError> {
+        let props_only = unsafe { frame.as_ptr().is_null() || (*frame.as_ptr()).buf[0].is_null() };
+        if props_only {
+            return Ok(Some(frame));
+        }
+        Ok(None)
+    }
+
+    fn request_frame_mode(&self) -> RequestFrameMode {
+        RequestFrameMode::Never
+    }
+}
+
+/// the filtergraph worker's frame-owning resources (an `ifps[i].frame_queue`
+/// pre-config backlog frame, an unconsumed `src` frame, an `ofps` held frame, a
+/// pooled frame) are `move`-closure CAPTURES. They must be torn down BEFORE the
+/// ThreadDoneGuard releases the thread slot — which zeroes the sync counter that
+/// stop()/wait()/the async Future gate on — otherwise a queued frame whose
+/// `AVBufferRef` free callback BLOCKS runs its teardown AFTER the caller already
+/// observed completion, violating counter==0 => teardown complete.
+///
+/// Construction: a two-input overlay graph whose second input delivers NOTHING (its
+/// pipeline swallows every frame), so the graph never configures and input 0's tagged
+/// frames — each carrying a side-data buffer whose free callback blocks — accumulate in
+/// the worker's pre-config path. The injector FORWARDS 10 frames (tagging the first two)
+/// and fires its barrier on FRAME 11. Because the input->filtergraph channel is
+/// `bounded(8)`, 10 accepted sends prove the filtergraph DEQUEUED at least two
+/// frames, and since the worker pushes each frame into `ifps` before recv'ing the next,
+/// frame 1 (the first dequeued) is PROVABLY in the worker's OWN `ifps` queue (a rebound
+/// capture), not merely the shared channel buffer (which a `crossbeam` bounded channel
+/// frees only when its last endpoint drops).
+///
+/// Frame 2 at barrier time may be in one of three states: (a) already pushed to `ifps`;
+/// (b) the worker's `frame_box` local, past the stop check but not yet pushed; or (c)
+/// still the recv'd `result` local, before the stop check — where a stop breaks the loop
+/// and frame 2 drops from `result` WITHOUT ever entering `ifps`. The proof does not rely
+/// on which: in all three, frame 2 drops BEFORE the guard — states (a) and (b) end up in
+/// the rebound `ifps` ((b)'s `frame_box` is moved into `fg_send_frame`, which pushes it
+/// into `ifps`, or drops it if that call returns/unwinds), while (c)'s `result` local
+/// drops at the stop `break`. The barrier is also a genuine happens-before (the pipeline
+/// calls `filter_frame(11)` only after `send_frame(10)` returned), not a fixed sleep.
+///
+/// The two callbacks park sequentially on the single worker (the first blocks teardown
+/// until released). We release the first-parked, then assert with the still-parked SECOND
+/// that stop() has not returned. That second callback is always a frame that drops before
+/// the guard: in state (c) frame 2's local callback parks first and, once released, frame
+/// 1's `ifps` capture callback parks second; otherwise both tagged frames are in `ifps`
+/// and drain in order. With the captures rebound as body locals (the fix) the guard is
+/// downstream of the frame teardown, so stop() stays blocked; before the fix the guard
+/// released
+/// first, so stop() returned while the callback was still parked.
+#[test]
+fn filtergraph_worker_drops_captured_frames_before_releasing_its_slot() {
+    let make_state = || {
+        Arc::new(BlockingFreeState {
+            entered: AtomicBool::new(false),
+            release: AtomicBool::new(false),
+        })
+    };
+    let s1 = make_state();
+    let s2 = make_state();
+    let (barrier_tx, barrier_rx) = std::sync::mpsc::channel();
+
+    let input0 = Input::from("color=c=red:s=320x240:r=30")
+        .set_format("lavfi")
+        .add_frame_pipeline(
+            FramePipelineBuilder::new(AVMediaType::AVMEDIA_TYPE_VIDEO).filter(
+                "blocking-injector",
+                Box::new(BlockingBufferInjector {
+                    states: vec![s1.clone(), s2.clone()],
+                    real_seen: 0,
+                    forward_until: 10,
+                    barrier: Some(barrier_tx),
+                }),
+            ),
+        );
+    let input1 = Input::from("color=c=blue:s=320x240:r=30")
+        .set_format("lavfi")
+        .add_frame_pipeline(
+            FramePipelineBuilder::new(AVMediaType::AVMEDIA_TYPE_VIDEO)
+                .filter("swallow-all", Box::new(SwallowAllFrames)),
+        );
+
+    let out = tmp_path("fg_worker_teardown_out.mp4");
+    let scheduler = FfmpegContext::builder()
+        .input(input0)
+        .input(input1)
+        .filter_desc("[0:v][1:v]overlay")
+        .output(Output::from(out.as_str()).set_video_codec("mpeg4"))
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    // Happens-before: the barrier fires on FRAME 11, i.e. after the pipeline returned
+    // from send_frame for the first 10 frames. Ten accepted sends through the
+    // input->filtergraph bounded(8) channel prove the filtergraph dequeued at least two,
+    // so the earliest tagged frame is provably in its own pre-config queue.
+    barrier_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("input 0 never had 10 frames accepted by the filtergraph");
+
+    let stop_returned = Arc::new(AtomicBool::new(false));
+    let sr = stop_returned.clone();
+    std::thread::spawn(move || {
+        // Liveness test: the stop() result value is asserted elsewhere; only the
+        // return itself matters here.
+        let _ = scheduler.stop();
+        sr.store(true, Ordering::SeqCst);
+    });
+
+    // The callbacks run sequentially on this single worker, so exactly one parks
+    // first; which one depends on drop order, so stay agnostic.
+    wait_until(
+        15,
+        "the filtergraph teardown to reach a buffered frame",
+        || s1.entered.load(Ordering::SeqCst) || s2.entered.load(Ordering::SeqCst),
+    );
+    let (first, second) = if s1.entered.load(Ordering::SeqCst) {
+        (&s1, &s2)
+    } else {
+        (&s2, &s1)
+    };
+    // Release the first-parked callback so teardown advances to the second frame.
+    first.release.store(true, Ordering::SeqCst);
+    wait_until(15, "teardown to reach the second buffered frame", || {
+        second.entered.load(Ordering::SeqCst)
+    });
+
+    // The second callback is now parked on an unambiguous capture frame. Give stop()
+    // ample time to return IF it is going to: before the fix the guard released the
+    // slot before the captured frames dropped, so stop() returns despite the parked
+    // callback; with the fix the guard is downstream, so stop() stays blocked.
+    std::thread::sleep(Duration::from_secs(2));
+    let returned_while_blocked = stop_returned.load(Ordering::SeqCst);
+    // Release unconditionally so nothing lingers, even on failure.
+    second.release.store(true, Ordering::SeqCst);
+    assert!(
+        !returned_while_blocked,
+        "stop() returned while a buffered frame's free callback was still parked: \
+         the filtergraph worker released its thread slot before tearing down its \
+         captured frames (counter==0 must imply teardown complete)"
+    );
+
+    // Once released, stop() finishes promptly.
+    wait_until(15, "stop() to return after the callbacks release", || {
+        stop_returned.load(Ordering::SeqCst)
+    });
+}
+
+/// A FrameFilter whose `init()` parks until the test releases it, then FAILS —
+/// modeling an initialization that errors only after upstream frames have already
+/// accumulated in this pipeline's receiver.
+struct FailInitOnCue {
+    proceed: Arc<AtomicBool>,
+}
+
+impl FrameFilter for FailInitOnCue {
+    fn media_type(&self) -> AVMediaType {
+        AVMediaType::AVMEDIA_TYPE_VIDEO
+    }
+
+    fn init(&mut self, _ctx: &FrameFilterContext) -> Result<(), FrameFilterError> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !self.proceed.load(Ordering::SeqCst) {
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Err("test-injected init failure".into())
+    }
+
+    fn filter_frame(
+        &mut self,
+        frame: Frame,
+        _ctx: &FrameFilterContext,
+    ) -> Result<Option<Frame>, FrameFilterError> {
+        // Never reached: init() fails, so the pipeline never enters run_pipeline.
+        Ok(Some(frame))
+    }
+
+    fn request_frame_mode(&self) -> RequestFrameMode {
+        RequestFrameMode::Never
+    }
+}
+
+/// Upstream stage for the init-error test: tags the first real frame with a blocking
+/// free callback and forwards EVERY frame. Its `Drop` fires `dropped` — and because a
+/// pipeline worker drops its output senders (inside `run_pipeline`) BEFORE it drops the
+/// filter, receiving that signal proves this pipeline's sender endpoint is already gone,
+/// so the tagged frame downstream is owned SOLELY by the downstream receiver.
+struct AttachFirstDropSignal {
+    state: Arc<BlockingFreeState>,
+    attached: bool,
+    dropped: Option<std::sync::mpsc::Sender<()>>,
+}
+
+impl FrameFilter for AttachFirstDropSignal {
+    fn media_type(&self) -> AVMediaType {
+        AVMediaType::AVMEDIA_TYPE_VIDEO
+    }
+
+    fn filter_frame(
+        &mut self,
+        frame: Frame,
+        _ctx: &FrameFilterContext,
+    ) -> Result<Option<Frame>, FrameFilterError> {
+        let props_only = unsafe { frame.as_ptr().is_null() || (*frame.as_ptr()).buf[0].is_null() };
+        if !props_only && !self.attached {
+            self.attached = true;
+            unsafe { attach_blocking_side_data(&frame, &self.state) };
+        }
+        Ok(Some(frame))
+    }
+
+    fn request_frame_mode(&self) -> RequestFrameMode {
+        RequestFrameMode::Never
+    }
+}
+
+impl Drop for AttachFirstDropSignal {
+    fn drop(&mut self) {
+        if let Some(tx) = self.dropped.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+/// the FramePipeline worker's `frame_receiver`/`frame_senders`/`frame_pool` are
+/// only MOVED into `run_pipeline` on the SUCCESS path. If `frame_filter_init` returns
+/// Err (or panics), the early return dropped them AFTER the ThreadDoneGuard (they are
+/// closure captures), so a frame already buffered in `frame_receiver` carrying a
+/// blocking `AVBufferRef` free callback ran its teardown after the caller observed
+/// completion — the same teardown-drop-order class, on the init-error path.
+///
+/// Construction: two chained pipelines on one input (`decoder -> upstream -> downstream`,
+/// since a later `add_frame_pipeline` splices in closer to the decoder). The upstream
+/// pipeline tags the first frame with a blocking free callback and forwards it. The input
+/// is a BOUNDED fixture, so the upstream reaches EOF, ends, and DROPS its output sender
+/// (inside `run_pipeline`) then its filter — whose `Drop` fires a signal. Receiving that
+/// signal proves the upstream sender endpoint is already gone, so the tagged
+/// frame sitting in the downstream pipeline's receiver is owned SOLELY by that receiver
+/// (a `crossbeam` bounded channel frees a queued item only when its LAST endpoint drops —
+/// otherwise the frame could be torn down under the UPSTREAM's guard, masking the bug).
+/// The downstream pipeline's `init()` is parked, so it never drains its receiver — the
+/// tagged frame is pinned there. Releasing `init()` makes it FAIL, taking the init-error
+/// path. With the captures rebound (the fix) the receiver drops (running the blocking
+/// callback) before the guard, so `wait()` stays blocked until we release; before the fix
+/// the guard released first and `wait()` could return while the callback was still parked.
+#[test]
+fn pipeline_init_error_drops_receiver_frames_before_releasing_its_slot() {
+    let fixture = mpegts_fixture("init_err_src.ts", 3);
+    let blocking = Arc::new(BlockingFreeState {
+        entered: AtomicBool::new(false),
+        release: AtomicBool::new(false),
+    });
+    let proceed = Arc::new(AtomicBool::new(false));
+    let (drop_tx, drop_rx) = std::sync::mpsc::channel();
+
+    // Added FIRST -> spliced downstream (closer to the filtergraph): the failing init.
+    let downstream = FramePipelineBuilder::new(AVMediaType::AVMEDIA_TYPE_VIDEO).filter(
+        "fail-init-on-cue",
+        Box::new(FailInitOnCue {
+            proceed: proceed.clone(),
+        }),
+    );
+    // Added SECOND -> spliced upstream (closer to the decoder): tags + forwards, and
+    // signals on Drop once its sender endpoint is gone.
+    let upstream = FramePipelineBuilder::new(AVMediaType::AVMEDIA_TYPE_VIDEO).filter(
+        "attach-first-drop-signal",
+        Box::new(AttachFirstDropSignal {
+            state: blocking.clone(),
+            attached: false,
+            dropped: Some(drop_tx),
+        }),
+    );
+
+    let out = tmp_path("pipeline_init_error_out.mp4");
+    let scheduler = FfmpegContext::builder()
+        .input(
+            Input::from(fixture.as_str())
+                .add_frame_pipeline(downstream)
+                .add_frame_pipeline(upstream),
+        )
+        .output(Output::from(out.as_str()).set_video_codec("mpeg4"))
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let wait_returned = Arc::new(AtomicBool::new(false));
+    let wr = wait_returned.clone();
+    std::thread::spawn(move || {
+        // Liveness test: the job ends in the injected init error; only the RETURN
+        // timing matters here.
+        let _ = scheduler.wait();
+        wr.store(true, Ordering::SeqCst);
+    });
+
+    // The upstream pipeline has finished and DROPPED its sender: the tagged frame in the
+    // downstream receiver is now solely owned by that (parked) receiver.
+    drop_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("upstream pipeline never finished / dropped its sender");
+
+    // Release init() -> it FAILS -> the downstream worker takes the init-error path.
+    proceed.store(true, Ordering::SeqCst);
+
+    // Teardown must reach (and park in) the receiver frame's blocking free callback.
+    wait_until(
+        15,
+        "the init-error teardown to drop the receiver frame",
+        || blocking.entered.load(Ordering::SeqCst),
+    );
+
+    // While the callback is parked, the worker's slot must NOT be released, so wait()
+    // must not have returned. Give it ample time to return IF it is going to.
+    std::thread::sleep(Duration::from_secs(2));
+    let returned_while_blocked = wait_returned.load(Ordering::SeqCst);
+    blocking.release.store(true, Ordering::SeqCst);
+    assert!(
+        !returned_while_blocked,
+        "wait() returned while a frame buffered in a pipeline's receiver was still \
+         being torn down (its blocking free callback parked): the pipeline worker \
+         released its thread slot before draining its receiver on the init-error path"
+    );
+
+    // Once released, wait() finishes promptly.
+    wait_until(15, "wait() to return after the callback releases", || {
+        wait_returned.load(Ordering::SeqCst)
+    });
 }

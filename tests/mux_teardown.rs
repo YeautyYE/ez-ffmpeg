@@ -71,8 +71,11 @@ fn start_dual_encoded_job(out: &str, paced: bool) -> FfmpegScheduler<Running> {
 /// a join ordering bug), turned into a panic naming `scenario`.
 fn stop_with_watchdog(scheduler: FfmpegScheduler<Running>, secs: u64, scenario: &str) {
     let (tx, rx) = std::sync::mpsc::channel();
+    let scenario_owned = scenario.to_string();
     std::thread::spawn(move || {
-        scheduler.stop();
+        scheduler.stop().unwrap_or_else(|e| {
+            panic!("stop() failed during mux teardown ({scenario_owned}): {e}")
+        });
         let _ = tx.send(());
     });
     assert!(
