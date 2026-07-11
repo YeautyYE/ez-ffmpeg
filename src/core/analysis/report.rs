@@ -1,10 +1,10 @@
-//! Folded analysis report and the pure event-folding function.
+//! Folded analysis report and the streaming event folder.
 //!
-//! [`fold`] collapses the flat [`MetadataEvent`] stream produced by a run into
-//! ranges and summaries. It is an online folder that also holds the detector's
-//! `min_duration` config (via [`FoldConfig`]) so it can close regions left open
-//! at end-of-stream and drop truncated tails shorter than the configured
-//! minimum.
+//! [`fold_event`] folds each [`MetadataEvent`] into a running [`FoldState`] as it
+//! arrives — collapsing the stream into ranges and summaries without buffering the
+//! per-frame events. [`finalize`] then closes regions left open at end-of-stream,
+//! using the detector's `min_duration` config (via [`FoldConfig`]) to drop
+//! truncated tails shorter than the configured minimum.
 
 use crate::core::analysis::event::MetadataEvent;
 
@@ -68,94 +68,102 @@ pub(crate) struct FoldConfig {
     pub silence_min_duration_us: Option<i64>,
 }
 
-/// Folds a flat event stream into an [`AnalysisReport`].
-///
-/// Start/End events are paired into ranges; a start with no matching end is
-/// closed at the last-seen stream timestamp ([`MetadataEvent::StreamEnd`]) and
-/// kept only if the resulting duration meets the configured minimum.
-pub(crate) fn fold(events: Vec<MetadataEvent>, cfg: &FoldConfig) -> AnalysisReport {
-    let mut report = AnalysisReport::default();
-    let mut pending_black: Option<i64> = None;
-    let mut pending_silence: Vec<(Option<usize>, i64)> = Vec::new();
-    let mut video_end_us: Option<i64> = None;
-    let mut audio_end_us: Option<i64> = None;
+/// Running state of a streaming fold: the report accumulated so far plus the
+/// cross-event bookkeeping needed to close ranges. Folding each event AS it
+/// arrives (rather than buffering every per-frame `MetadataEvent` and folding at
+/// the end) keeps analysis memory bounded by the number of DETECTED features, not
+/// the media duration — a long live input used to grow the event buffer without
+/// bound, since per-frame events the report discards were still retained.
+#[derive(Default)]
+pub(crate) struct FoldState {
+    report: AnalysisReport,
+    pending_black: Option<i64>,
+    pending_silence: Vec<(Option<usize>, i64)>,
+    video_end_us: Option<i64>,
+    audio_end_us: Option<i64>,
+}
 
-    for ev in events {
-        match ev {
-            MetadataEvent::BlackStart { at } => pending_black = Some(at.time_us),
-            MetadataEvent::BlackEnd { at, .. } => {
-                if let Some(start) = pending_black.take() {
-                    report.black.push(BlackRange {
-                        start_us: start,
-                        end_us: at.time_us,
-                    });
-                }
+/// Folds a single event into the running state. Per-frame events the report does
+/// not retain (`R128Frame`) are dropped here instead of being buffered.
+pub(crate) fn fold_event(state: &mut FoldState, ev: MetadataEvent) {
+    match ev {
+        MetadataEvent::BlackStart { at } => state.pending_black = Some(at.time_us),
+        MetadataEvent::BlackEnd { at, .. } => {
+            if let Some(start) = state.pending_black.take() {
+                state.report.black.push(BlackRange {
+                    start_us: start,
+                    end_us: at.time_us,
+                });
             }
-            MetadataEvent::SilenceStart { at, channel_number } => {
-                pending_silence.push((channel_number, at.time_us));
+        }
+        MetadataEvent::SilenceStart { at, channel_number } => {
+            state.pending_silence.push((channel_number, at.time_us));
+        }
+        MetadataEvent::SilenceEnd {
+            at, channel_number, ..
+        } => {
+            if let Some(pos) = state
+                .pending_silence
+                .iter()
+                .position(|(c, _)| *c == channel_number)
+            {
+                let (_, start) = state.pending_silence.remove(pos);
+                state.report.silence.push(SilenceRange {
+                    start_us: start,
+                    end_us: at.time_us,
+                    channel: channel_number,
+                });
             }
-            MetadataEvent::SilenceEnd {
-                at, channel_number, ..
-            } => {
-                if let Some(pos) = pending_silence
-                    .iter()
-                    .position(|(c, _)| *c == channel_number)
-                {
-                    let (_, start) = pending_silence.remove(pos);
-                    report.silence.push(SilenceRange {
-                        start_us: start,
-                        end_us: at.time_us,
-                        channel: channel_number,
-                    });
-                }
-            }
-            MetadataEvent::SceneChange { at, score } => report.scenes.push(SceneChange {
-                at_us: at.time_us,
-                score,
-            }),
-            MetadataEvent::CropDetect { x, y, w, h, .. } => {
-                report.crop = Some(CropSuggestion { x, y, w, h });
-            }
-            MetadataEvent::R128Summary {
+        }
+        MetadataEvent::SceneChange { at, score } => state.report.scenes.push(SceneChange {
+            at_us: at.time_us,
+            score,
+        }),
+        MetadataEvent::CropDetect { x, y, w, h, .. } => {
+            state.report.crop = Some(CropSuggestion { x, y, w, h });
+        }
+        MetadataEvent::R128Summary {
+            integrated,
+            lra,
+            true_peak,
+        } => {
+            state.report.loudness = Some(LoudnessReport {
                 integrated,
                 lra,
                 true_peak,
-            } => {
-                report.loudness = Some(LoudnessReport {
-                    integrated,
-                    lra,
-                    true_peak,
-                });
-            }
-            MetadataEvent::StreamEnd { at, media } => {
-                // Close black regions with the video stream's end and silence
-                // regions with the audio stream's end, so mismatched stream
-                // durations don't skew the trailing region.
-                let slot = if media == ffmpeg_sys_next::AVMediaType::AVMEDIA_TYPE_AUDIO {
-                    &mut audio_end_us
-                } else {
-                    &mut video_end_us
-                };
-                *slot = Some(slot.map_or(at.time_us, |e| e.max(at.time_us)));
-            }
-            MetadataEvent::R128Frame { .. } => {}
+            });
         }
+        MetadataEvent::StreamEnd { at, media } => {
+            // Close black regions with the video stream's end and silence
+            // regions with the audio stream's end, so mismatched stream
+            // durations don't skew the trailing region.
+            let slot = if media == ffmpeg_sys_next::AVMediaType::AVMEDIA_TYPE_AUDIO {
+                &mut state.audio_end_us
+            } else {
+                &mut state.video_end_us
+            };
+            *slot = Some(slot.map_or(at.time_us, |e| e.max(at.time_us)));
+        }
+        MetadataEvent::R128Frame { .. } => {}
     }
+}
 
+/// Closes any still-open ranges at the stream ends and returns the report.
+pub(crate) fn finalize(mut state: FoldState, cfg: &FoldConfig) -> AnalysisReport {
     // Close a still-open black region at the video stream's end-of-stream.
-    if let (Some(start), Some(end)) = (pending_black, video_end_us) {
+    if let (Some(start), Some(end)) = (state.pending_black, state.video_end_us) {
         if keep_tail(start, end, cfg.black_min_duration_us) {
-            report.black.push(BlackRange {
+            state.report.black.push(BlackRange {
                 start_us: start,
                 end_us: end,
             });
         }
     }
     // Close still-open silence regions at the audio stream's end-of-stream.
-    if let Some(end) = audio_end_us {
-        for (channel, start) in pending_silence {
+    if let Some(end) = state.audio_end_us {
+        for (channel, start) in state.pending_silence {
             if keep_tail(start, end, cfg.silence_min_duration_us) {
-                report.silence.push(SilenceRange {
+                state.report.silence.push(SilenceRange {
                     start_us: start,
                     end_us: end,
                     channel,
@@ -164,7 +172,19 @@ pub(crate) fn fold(events: Vec<MetadataEvent>, cfg: &FoldConfig) -> AnalysisRepo
         }
     }
 
-    report
+    state.report
+}
+
+/// Folds a whole event vector into a report (the streaming `fold_event` +
+/// `finalize` applied in sequence). Test-only: the live run folds incrementally to
+/// bound memory, so this batch form exists only for the event-list tests below.
+#[cfg(test)]
+pub(crate) fn fold(events: Vec<MetadataEvent>, cfg: &FoldConfig) -> AnalysisReport {
+    let mut state = FoldState::default();
+    for ev in events {
+        fold_event(&mut state, ev);
+    }
+    finalize(state, cfg)
 }
 
 fn keep_tail(start_us: i64, end_us: i64, min_duration_us: Option<i64>) -> bool {
@@ -202,6 +222,53 @@ mod tests {
                 start_us: 1_000_000,
                 end_us: 3_000_000
             }]
+        );
+    }
+
+    // The streaming fold drops per-frame R128Frame events instead of buffering
+    // them (the point of the change: analysis memory is bounded by detected
+    // features, not frame count). A flood of R128Frame must not affect the report,
+    // and folding incrementally via fold_event/finalize must produce the right one.
+    #[test]
+    fn streaming_fold_drops_per_frame_r128_events() {
+        let mut state = FoldState::default();
+        for i in 0..10_000 {
+            fold_event(
+                &mut state,
+                MetadataEvent::R128Frame {
+                    at: ts(i),
+                    momentary: Some(-20.0),
+                    short_term: Some(-20.0),
+                    integrated: Some(-23.0),
+                    lra: Some(1.0),
+                    true_peak: Some(-1.0),
+                },
+            );
+        }
+        // Real events still fold normally after the flood.
+        fold_event(&mut state, MetadataEvent::BlackStart { at: ts(1_000_000) });
+        fold_event(
+            &mut state,
+            MetadataEvent::BlackEnd {
+                at: ts(2_000_000),
+                duration_us: 1_000_000,
+            },
+        );
+        fold_event(
+            &mut state,
+            MetadataEvent::R128Summary {
+                integrated: Some(-23.0),
+                lra: Some(1.0),
+                true_peak: Some(-1.0),
+            },
+        );
+        let report = finalize(state, &FoldConfig::default());
+
+        assert!(report.loudness.is_some(), "the summary must be retained");
+        assert_eq!(report.black.len(), 1, "the black range must be retained");
+        assert!(
+            report.scenes.is_empty() && report.silence.is_empty(),
+            "per-frame R128 events must not leak into the report"
         );
     }
 

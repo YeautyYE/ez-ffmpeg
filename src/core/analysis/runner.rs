@@ -3,14 +3,15 @@
 //!
 //! `run()` builds an isolation topology (§C2): every detector branch is mapped
 //! to its own stream on a single `null` output, each carrying a
-//! [`MetadataEventFilter`] that collects events into a shared buffer. Audio
+//! [`MetadataEventFilter`] that folds events into a shared fold state as they
+//! arrive (so per-frame events are never buffered). Audio
 //! detectors are split into separate `asplit` branches so `ebur128`'s 100 ms
 //! re-chunking never perturbs `silencedetect`.
 
 use crate::core::analysis::detector::{AudioDetector, VideoDetector};
 use crate::core::analysis::event::{secs_to_us, MetadataEvent};
 use crate::core::analysis::filter::{EventSink, MetadataEventFilter, SinkError};
-use crate::core::analysis::report::{fold, AnalysisReport, FoldConfig};
+use crate::core::analysis::report::{finalize, fold_event, AnalysisReport, FoldConfig, FoldState};
 use crate::core::filter::frame_pipeline::FramePipeline;
 use crate::core::filter::frame_pipeline_builder::FramePipelineBuilder;
 use crate::error::Error;
@@ -70,7 +71,7 @@ impl Analysis {
         let (filter_desc, branches) = self.plan();
         let cfg = self.fold_config();
 
-        let collector: Arc<Mutex<Vec<MetadataEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let collector: Arc<Mutex<FoldState>> = Arc::new(Mutex::new(FoldState::default()));
         let pipelines: Vec<FramePipeline> = branches
             .iter()
             .enumerate()
@@ -91,7 +92,7 @@ impl Analysis {
             .build()?;
         FfmpegScheduler::new(context).start()?.wait()?;
 
-        let events = collector
+        let state = collector
             .lock()
             .map(|mut guard| std::mem::take(&mut *guard))
             .map_err(|_| {
@@ -100,7 +101,7 @@ impl Analysis {
                         .to_string(),
                 )
             })?;
-        Ok(fold(events, &cfg))
+        Ok(finalize(state, &cfg))
     }
 
     /// Rejects empty and duplicated detector sets (duplicate detectors of the
@@ -228,17 +229,18 @@ impl Analysis {
     }
 }
 
-/// A `Send`-able sink that appends events into the run's shared buffer.
+/// A `Send`-able sink that folds events into the run's shared fold state.
 #[derive(Clone)]
-struct VecSink {
-    collector: Arc<Mutex<Vec<MetadataEvent>>>,
+struct FoldSink {
+    collector: Arc<Mutex<FoldState>>,
 }
 
-impl EventSink for VecSink {
+impl EventSink for FoldSink {
     fn try_emit(&mut self, ev: MetadataEvent) -> Result<(), SinkError> {
         match self.collector.lock() {
             Ok(mut guard) => {
-                guard.push(ev);
+                // Fold on arrival so per-frame events are never buffered.
+                fold_event(&mut guard, ev);
                 Ok(())
             }
             // A poisoned mutex means a pipeline thread panicked; surface it as a
@@ -251,9 +253,9 @@ impl EventSink for VecSink {
 fn make_pipeline(
     media: AVMediaType,
     stream_index: usize,
-    collector: Arc<Mutex<Vec<MetadataEvent>>>,
+    collector: Arc<Mutex<FoldState>>,
 ) -> FramePipeline {
-    let filter = MetadataEventFilter::new(media, VecSink { collector });
+    let filter = MetadataEventFilter::new(media, FoldSink { collector });
     FramePipelineBuilder::new(media)
         .filter("analysis", Box::new(filter))
         .set_stream_index(stream_index)
