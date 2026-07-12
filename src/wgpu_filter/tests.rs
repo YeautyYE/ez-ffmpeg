@@ -2,6 +2,7 @@ use crate::core::filter::frame_filter_context::FrameFilterContext;
 use crate::filter::frame_filter::{FrameFilter, FrameFilterError};
 use crate::wgpu_filter::shaders;
 use crate::wgpu_filter::wgpu_frame_filter::WgpuFrameFilter;
+use crate::wgpu_filter::WgpuFilterError;
 use ffmpeg_next::Frame;
 use ffmpeg_sys_next::{
     av_frame_get_buffer, av_frame_is_writable, av_frame_make_writable, av_frame_ref, AVPixelFormat,
@@ -76,7 +77,7 @@ fn make_marker_frame(pts: i64) -> Frame {
     }
 }
 
-fn init_filter(filter: &mut WgpuFrameFilter) -> bool {
+pub(super) fn init_filter(filter: &mut WgpuFrameFilter) -> bool {
     let mut map = HashMap::new();
     let mut ctx = make_ctx(&mut map);
     match filter.init(&mut ctx) {
@@ -91,7 +92,7 @@ fn init_filter(filter: &mut WgpuFrameFilter) -> bool {
 
 /// Emulates the pipeline driver: `filter_frame` per input, `request_frame`
 /// polling after each input and until all expected outputs have drained.
-fn drive(
+pub(super) fn drive(
     filter: &mut WgpuFrameFilter,
     inputs: Vec<Frame>,
     expected: usize,
@@ -929,7 +930,7 @@ fn test_output_frame_pool_frame_writability() {
 
 /// Builds a YUV frame with per-pixel luma and per-sample chroma closures.
 /// Supports the planar formats plus NV12 (interleaved UV plane).
-fn make_yuv_frame_with(
+pub(super) fn make_yuv_frame_with(
     w: i32,
     h: i32,
     fmt: AVPixelFormat,
@@ -988,7 +989,7 @@ fn make_yuv_frame_with(
 }
 
 /// Copies one plane of a frame into a tight `Vec` (stride removed).
-fn plane_to_vec(frame: &Frame, index: usize, w: usize, h: usize) -> Vec<u8> {
+pub(super) fn plane_to_vec(frame: &Frame, index: usize, w: usize, h: usize) -> Vec<u8> {
     unsafe {
         let p = frame.as_ptr();
         let ls = (*p).linesize[index] as usize;
@@ -1328,7 +1329,10 @@ fn yuv_builder_requires_an_ez_effect_body() {
         Ok(_) => panic!("a body without ez_effect must fail build()"),
         Err(e) => e,
     };
-    assert!(err.contains("ez_effect"), "unexpected error: {err}");
+    assert!(
+        matches!(&err, WgpuFilterError::InvalidOption(msg) if msg.contains("ez_effect")),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
@@ -1384,7 +1388,10 @@ fn yuv_builder_rejects_group0_bindings_in_the_body() {
             Ok(_) => panic!("a body declaring a reserved group must fail build()"),
             Err(e) => e,
         };
-        assert!(err.contains("group(0)"), "unexpected error: {err}");
+        assert!(
+            matches!(&err, WgpuFilterError::InvalidOption(msg) if msg.contains("group(0)")),
+            "unexpected error: {err}"
+        );
     }
 
     // The params group stays allowed when spelled literally.

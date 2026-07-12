@@ -55,6 +55,25 @@ impl<P: bytemuck::Pod> WgpuParamsHandle<P> {
         bytes.extend_from_slice(bytemuck::bytes_of(&value));
         self.dirty.store(true, Ordering::Release);
     }
+
+    /// Reads, modifies and writes back the parameter value as one atomic
+    /// step — the lock is held across the closure, so concurrent `set` /
+    /// `update` calls from other threads serialize instead of losing
+    /// writes (`update(|p| p.gain += 0.1)` never overwrites a value it
+    /// did not see). Because the lock is held, calling `set`/`update` on
+    /// any handle to the same filter from inside the closure deadlocks.
+    pub fn update(&self, f: impl FnOnce(&mut P)) {
+        let mut bytes = self
+            .bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Unaligned read: `Vec<u8>` does not guarantee alignment for `P`.
+        let mut value: P = bytemuck::pod_read_unaligned(&bytes);
+        f(&mut value);
+        bytes.clear();
+        bytes.extend_from_slice(bytemuck::bytes_of(&value));
+        self.dirty.store(true, Ordering::Release);
+    }
 }
 
 /// Parameter state shared between the filter, its params handles, and the
@@ -72,5 +91,36 @@ impl SharedParams {
             bytes: Arc::new(Mutex::new(initial)),
             dirty: Arc::new(AtomicBool::new(true)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, PartialEq, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+    struct Pair {
+        a: f32,
+        b: f32,
+    }
+
+    #[test]
+    fn update_reads_modifies_and_marks_dirty() {
+        let shared = SharedParams::new(bytemuck::bytes_of(&Pair { a: 1.0, b: 2.0 }).to_vec());
+        let handle = WgpuParamsHandle::<Pair> {
+            bytes: Arc::clone(&shared.bytes),
+            dirty: Arc::clone(&shared.dirty),
+            _marker: PhantomData,
+        };
+        shared.dirty.store(false, Ordering::Release);
+        handle.update(|p| p.b += 40.0);
+        assert!(shared.dirty.load(Ordering::Acquire));
+        let bytes = shared
+            .bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let read: Pair = bytemuck::pod_read_unaligned(&bytes);
+        assert_eq!(read, Pair { a: 1.0, b: 42.0 });
     }
 }

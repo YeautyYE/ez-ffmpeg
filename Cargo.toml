@@ -34,7 +34,10 @@ libc = "0.2.159"
 #opengl
 surfman = { version = "0.9", features = ["chains"], optional = true }
 glow = { version = "0.16", optional = true }
-bytemuck = { version = "1.8", optional = true }
+# `derive` lets the built-in effects declare their params structs as
+# `#[derive(Pod, Zeroable)]`, which proves at compile time they carry no
+# padding bytes (a hand-written `unsafe impl Pod` would not).
+bytemuck = { version = "1.8", features = ["derive"], optional = true }
 
 #wgpu
 wgpu = { version = "26", optional = true }
