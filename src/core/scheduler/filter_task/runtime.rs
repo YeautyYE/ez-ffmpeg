@@ -700,10 +700,15 @@ pub(super) unsafe fn fg_output_frame(
 
             ofp.next_pts = (*frame.as_ptr()).pts + (*frame.as_ptr()).duration;
 
-            let ret = av_frame_ref(out.as_mut_ptr(), frame.as_ptr());
-            if ret < 0 {
-                return ret;
-            }
+            // Move the buffers into the pooled shell instead of av_frame_ref:
+            // audio produces exactly one output frame and `frame` is not
+            // retained afterwards (unlike the video fpsconv last_frame), so a
+            // ref (per-plane refcount atomics + av_frame_copy_props deep-clone
+            // of side data / metadata) is pure overhead. move_ref transfers
+            // ownership with no atomics and leaves `frame` an empty shell that
+            // the post-loop release returns to the pool. Matches fftools
+            // fg_output_frame (`frame_out = frame`).
+            av_frame_move_ref(out.as_mut_ptr(), frame.as_mut_ptr());
             out
         };
 
@@ -755,18 +760,19 @@ pub(super) unsafe fn fg_output_frame(
         ofp.got_frame = true;
     }
 
+    // `frame_is_null` tests the AVFrame *pointer*, which av_frame_move_ref
+    // leaves non-null (it only resets the frame's contents), so this still
+    // correctly distinguishes a real input frame from a null EOF marker.
     let frame_is_null = frame_is_null(&frame);
     if !frame_is_null {
         if ofp.media_type == AVMEDIA_TYPE_VIDEO {
             let frame_prev = std::mem::replace(&mut ofp.fpsconv_context.last_frame, frame);
             frame_pool.release(frame_prev);
         } else {
-            // Audio (and any non-video) sink frame: fg_output_frame already
-            // copied the buffers into a separate pooled shell via av_frame_ref
-            // and sent that downstream, so this original sink shell can return
-            // to the pool instead of Drop-freeing it every output frame
-            // (alloc-05). release() only unrefs this shell; the refcounted
-            // buffers now held by the sent frame are untouched.
+            // Audio (and any non-video) sink frame: the buffers were moved into
+            // the sent shell via av_frame_move_ref, leaving `frame` an empty
+            // (unref'd) shell — return it to the pool instead of Drop-freeing it
+            // every output frame (alloc-05).
             frame_pool.release(frame);
         }
     }

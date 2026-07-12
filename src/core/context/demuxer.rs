@@ -554,19 +554,18 @@ fn find_hwaccel(
             if out_hwaccel_id == HWAccelID::HwaccelNone {
                 error!("Unrecognized hwaccel: {hwaccel}.");
 
-                let mut hwaccels = Vec::new();
-                loop {
-                    let device_type =
-                        unsafe { av_hwdevice_find_type_by_name(hwaccel_cstr.as_ptr()) };
-                    if device_type == AV_HWDEVICE_TYPE_NONE {
-                        break;
-                    }
-                    hwaccels.push(device_type);
-                }
-                if !hwaccels.is_empty() {
-                    error!("Supported hwaccels: {:?}.", hwaccels);
-                } else {
+                // Enumerate the actually-available device types. The previous
+                // loop re-queried the same failed name via
+                // av_hwdevice_find_type_by_name, so it always broke on the first
+                // iteration and could never list anything (always "No hardware
+                // acceleration."). av_hwdevice_iterate_types is the correct
+                // enumerator (same as get_hwaccels / fftools).
+                let hwaccels = crate::core::hwaccel::get_hwaccels();
+                if hwaccels.is_empty() {
                     error!("No hardware acceleration.");
+                } else {
+                    let names: Vec<&str> = hwaccels.iter().map(|h| h.name.as_str()).collect();
+                    error!("Supported hwaccels: {names:?}.");
                 }
                 return Err(OpenInputError::from(AVERROR(EINVAL)).into());
             }
