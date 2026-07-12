@@ -5,7 +5,9 @@ use crate::core::filter::frame_filter_context::FrameFilterContext;
 use crate::filter::frame_filter::{FrameFilter, FrameFilterError};
 use crate::util::frame_utils::{ensure_software_format, is_hw_format};
 use crate::wgpu_filter::frame_io::{self, HwMappedFrame, PlaneLayout};
-use crate::wgpu_filter::gpu_state::{create_staging, GpuState, OutputGeometry, StagingSlot};
+use crate::wgpu_filter::gpu_state::{
+    create_staging, EffectSource, GpuState, OutputGeometry, StagingSlot,
+};
 use crate::wgpu_filter::params::SharedParams;
 use crate::wgpu_filter::shaders;
 use ffmpeg_next::Frame;
@@ -55,9 +57,20 @@ impl Drop for HwFramesCtxPin {
     }
 }
 
+/// Which domain the user effect shader runs in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EffectDomain {
+    /// Convert to RGBA first; the shader is a complete fragment module.
+    Rgba,
+    /// Run directly on raw YUV code values; the shader is an `ez_effect`
+    /// body wrapped by a library prelude.
+    Yuv,
+}
+
 /// Builder for [`WgpuFrameFilter`].
 pub struct WgpuFrameFilterBuilder {
     fragment_shader: String,
+    effect_domain: EffectDomain,
     output_size: Option<(u32, u32)>,
     params_bytes: Vec<u8>,
     frames_in_flight: usize,
@@ -74,6 +87,60 @@ impl WgpuFrameFilterBuilder {
     /// Optional user parameters: `@group(1) @binding(0) var<uniform> ...`.
     pub fn shader_wgsl(mut self, source: impl Into<String>) -> Self {
         self.fragment_shader = source.into();
+        self.effect_domain = EffectDomain::Rgba;
+        self
+    }
+
+    /// YUV passthrough mode: the effect runs directly on **raw YUV code
+    /// values**, skipping the YUV->RGBA convert pass, the RGBA intermediate
+    /// texture and the RGB->YUV math in the pack pass. For color effects
+    /// that are natural in YUV (tone curves, LUTs, luma sharpening) this
+    /// removes one input-sized render pass per frame. No matrix or range
+    /// math is applied anywhere: at unchanged output size an untouched luma
+    /// plane is reproduced bit-for-bit (super-black/super-white included),
+    /// while subsampled chroma is still resampled — see the caveats below.
+    ///
+    /// `body` is not a complete module: it defines
+    ///
+    /// ```wgsl
+    /// fn ez_effect(coord: vec2<f32>) -> vec3<f32> {
+    ///     return ez_sample_yuv(coord); // identity
+    /// }
+    /// ```
+    ///
+    /// and may call the library prelude (bindings themselves are private —
+    /// the same body compiles against planar and NV12 inputs):
+    /// - `ez_sample_yuv(coord) -> vec3<f32>` — (Y, U, V) code values in
+    ///   0..1, sampled at a normalized coordinate,
+    /// - `ez_luma(coord) -> f32`, `ez_chroma(coord) -> vec2<f32>`,
+    /// - `ez_input_size() -> vec2<f32>`, `ez_chroma_size() -> vec2<f32>`,
+    ///   `ez_output_size() -> vec2<f32>`,
+    /// - `ez_play_time() -> f32`,
+    /// - `ez_full_range() -> bool` — whether the code values are full range
+    ///   (JPEG / J-format input) rather than limited (16..235 luma). The
+    ///   library never range-converts in this mode; effects that assume
+    ///   headroom must branch on this themselves.
+    ///
+    /// User parameters keep working: declare
+    /// `@group(1) @binding(0) var<uniform> ...` in the body, with the group
+    /// index spelled as the literal `1`. `@group(0)` is reserved for the
+    /// prelude, and group indices are const-expressions (`0u`, `1-1` and
+    /// named consts all name group 0) that a lexical check cannot evaluate —
+    /// so `build()` rejects any `@group(...)` whose argument is not the
+    /// literal `1` (comments stripped; an unused duplicate binding would
+    /// otherwise silently alias the prelude's resources).
+    ///
+    /// Caveats:
+    /// - This is *raw code-value* processing, not lossless chroma: with
+    ///   subsampled input (4:2:0/4:2:2/NV12) chroma is still bilinearly
+    ///   upsampled for sampling and box-downsampled by the 4:2:0 pack, so a
+    ///   pure identity effect reproduces luma exactly but resamples chroma.
+    /// - The body must not define `fs_main` (the library appends the entry
+    ///   point) and gets no RGBA texture: `textureSample(texture1, ...)`
+    ///   style shaders belong to [`Self::shader_wgsl`].
+    pub fn shader_yuv_wgsl(mut self, body: impl Into<String>) -> Self {
+        self.fragment_shader = body.into();
+        self.effect_domain = EffectDomain::Yuv;
         self
     }
 
@@ -149,7 +216,28 @@ impl WgpuFrameFilterBuilder {
 
     pub fn build(self) -> Result<WgpuFrameFilter, String> {
         if self.fragment_shader.is_empty() {
-            return Err("WgpuFrameFilter requires a fragment shader (shader_wgsl)".to_string());
+            return Err(
+                "WgpuFrameFilter requires a fragment shader (shader_wgsl or shader_yuv_wgsl)"
+                    .to_string(),
+            );
+        }
+        if self.effect_domain == EffectDomain::Yuv {
+            if !shaders::body_defines_ez_effect(&self.fragment_shader) {
+                return Err("shader_yuv_wgsl takes a shader body defining \
+                     `fn ez_effect(coord: vec2<f32>) -> vec3<f32>`, not a complete fragment \
+                     module; see the shader_yuv_wgsl documentation"
+                    .to_string());
+            }
+            if shaders::body_declares_reserved_group(&self.fragment_shader) {
+                return Err(
+                    "shader_yuv_wgsl bodies may only declare the params group, spelled \
+                     literally `@group(1)` — @group(0) is reserved for the library prelude \
+                     (an unused duplicate would silently alias its resources), and group \
+                     indices are const-expressions (`0u`, `1-1`, a named const all name \
+                     group 0), so any spelling other than the literal `1` is rejected"
+                        .to_string(),
+                );
+            }
         }
         if let Some((w, h)) = self.output_size {
             if w == 0 || h == 0 {
@@ -173,6 +261,7 @@ impl WgpuFrameFilterBuilder {
         }
         Ok(WgpuFrameFilter {
             fragment_shader: self.fragment_shader,
+            effect_domain: self.effect_domain,
             output_size: self.output_size,
             frames_in_flight: self.frames_in_flight,
             zero_copy_readback: self.zero_copy_readback,
@@ -214,6 +303,7 @@ impl WgpuFrameFilterBuilder {
 /// can additionally skip the readback copy into system RAM.
 pub struct WgpuFrameFilter {
     fragment_shader: String,
+    effect_domain: EffectDomain,
     output_size: Option<(u32, u32)>,
     frames_in_flight: usize,
     zero_copy_readback: bool,
@@ -263,6 +353,10 @@ struct InFlightFrame {
     /// Geometry snapshot so the readback stays valid even if the shared
     /// resources are rebuilt for a new input size in the meantime.
     geo: OutputGeometry,
+    /// Effective color range the passes ran with, stamped onto the output
+    /// frame. `copy_props` alone would lose it for J-format input: the
+    /// output is plain YUV420P, which no longer implies full range.
+    full_range: bool,
 }
 
 /// Output queue entry. Frames leave from the front strictly in arrival
@@ -284,6 +378,7 @@ impl WgpuFrameFilter {
     pub fn builder() -> WgpuFrameFilterBuilder {
         WgpuFrameFilterBuilder {
             fragment_shader: String::new(),
+            effect_domain: EffectDomain::Rgba,
             output_size: None,
             params_bytes: Vec::new(),
             frames_in_flight: 2,
@@ -408,7 +503,7 @@ impl WgpuFrameFilter {
             unreachable!("pos still points at the Gpu entry checked above");
         };
         let t_download = Instant::now();
-        let frame = if self.zero_copy_readback {
+        let mut frame = if self.zero_copy_readback {
             // Drop the cached direct-pack bind group only when the
             // resources were rebuilt under it: a stale bind lent out
             // inside the frame would pin the old `out_view` downstream,
@@ -451,6 +546,18 @@ impl WgpuFrameFilter {
             }
             frame
         };
+        // Stamp the effective range explicitly: the RGBA pack ran its range
+        // math with this flag, and the YUV identity pack applied no matrix
+        // or range conversion — either way the output is plain YUV420P, so
+        // a J-format input's implicit full range would otherwise be lost.
+        // SAFETY: `frame` was just built and is exclusively owned here.
+        unsafe {
+            (*frame.as_mut_ptr()).color_range = if slot.full_range {
+                ffmpeg_sys_next::AVColorRange::AVCOL_RANGE_JPEG
+            } else {
+                ffmpeg_sys_next::AVColorRange::AVCOL_RANGE_MPEG
+            };
+        }
         let download_secs = t_download.elapsed().as_secs_f64();
 
         if let Ok(mut stats) = self.stats.lock() {
@@ -557,11 +664,11 @@ impl FrameFilter for WgpuFrameFilter {
     }
 
     fn init(&mut self, _ctx: &mut FrameFilterContext) -> Result<(), FrameFilterError> {
-        let gpu = GpuState::new(
-            &self.fragment_shader,
-            self.params.len,
-            self.hw_zero_copy_input,
-        )?;
+        let source = match self.effect_domain {
+            EffectDomain::Rgba => EffectSource::Rgba(&self.fragment_shader),
+            EffectDomain::Yuv => EffectSource::Yuv(&self.fragment_shader),
+        };
+        let gpu = GpuState::new(source, self.params.len, self.hw_zero_copy_input)?;
         self.gpu = Some(gpu);
         Ok(())
     }
@@ -794,13 +901,14 @@ impl FrameFilter for WgpuFrameFilter {
         let gpu = self.gpu.as_ref().expect("initialized above");
         let submitted = match &hw_mapped {
             Some(mapped) => {
-                // Imported planes bind straight into the NV12 convert pass;
-                // no CPU-side upload happens on this path.
-                let bind = gpu.hw_convert_bind(&mapped.imported.tex_y, &mapped.imported.tex_uv);
+                // Imported planes bind straight into the NV12 input slot of
+                // whichever pass consumes them (convert in RGBA mode, the
+                // effect itself in YUV mode); no CPU-side upload happens.
+                let bind = gpu.hw_nv12_bind(&mapped.imported.tex_y, &mapped.imported.tex_uv);
                 frame_io::encode_and_submit(
                     gpu,
-                    gpu.convert_pipeline(PlaneLayout::Nv12),
-                    &bind,
+                    PlaneLayout::Nv12,
+                    Some(&bind),
                     &frame,
                     matrix_id,
                     full_range,
@@ -839,6 +947,7 @@ impl FrameFilter for WgpuFrameFilter {
             src_props: frame,
             _hw: hw_mapped,
             geo,
+            full_range,
         }));
 
         // Synchronous mode returns its own frame; async mode returns whatever

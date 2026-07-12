@@ -91,7 +91,11 @@ fn init_filter(filter: &mut WgpuFrameFilter) -> bool {
 
 /// Emulates the pipeline driver: `filter_frame` per input, `request_frame`
 /// polling after each input and until all expected outputs have drained.
-fn drive(filter: &mut WgpuFrameFilter, inputs: Vec<Frame>, expected: usize) -> Vec<Frame> {
+fn drive(
+    filter: &mut WgpuFrameFilter,
+    inputs: Vec<Frame>,
+    expected: usize,
+) -> Vec<Frame> {
     let mut map = HashMap::new();
     let mut ctx = make_ctx(&mut map);
     let mut out = Vec::new();
@@ -919,4 +923,479 @@ fn test_output_frame_pool_frame_writability() {
         let after = (*frame.as_ptr()).data[0];
         assert_ne!(before, after, "make_writable must copy to a fresh buffer");
     }
+}
+
+// --- YUV passthrough mode (shader_yuv_wgsl) ---
+
+/// Builds a YUV frame with per-pixel luma and per-sample chroma closures.
+/// Supports the planar formats plus NV12 (interleaved UV plane).
+fn make_yuv_frame_with(
+    w: i32,
+    h: i32,
+    fmt: AVPixelFormat,
+    luma: impl Fn(usize, usize) -> u8,
+    chroma: impl Fn(usize, usize) -> (u8, u8),
+) -> Frame {
+    let (sub_x, sub_y, nv12) = match fmt {
+        AVPixelFormat::AV_PIX_FMT_YUV420P | AVPixelFormat::AV_PIX_FMT_YUVJ420P => (2, 2, false),
+        AVPixelFormat::AV_PIX_FMT_YUV444P => (1, 1, false),
+        AVPixelFormat::AV_PIX_FMT_NV12 => (2, 2, true),
+        other => panic!("unsupported test format {other:?}"),
+    };
+    unsafe {
+        let mut frame = Frame::empty();
+        let p = frame.as_mut_ptr();
+        (*p).width = w;
+        (*p).height = h;
+        (*p).format = fmt as i32;
+        assert!(av_frame_get_buffer(p, 1) >= 0);
+        (*p).pts = 0;
+        (*p).time_base = ffmpeg_sys_next::AVRational { num: 1, den: 30 };
+
+        let ls_y = (*p).linesize[0] as usize;
+        let y = std::slice::from_raw_parts_mut((*p).data[0], ls_y * h as usize);
+        for row in 0..h as usize {
+            for col in 0..w as usize {
+                y[row * ls_y + col] = luma(col, row);
+            }
+        }
+        let cw = (w as usize).div_ceil(sub_x);
+        let ch = (h as usize).div_ceil(sub_y);
+        if nv12 {
+            let ls = (*p).linesize[1] as usize;
+            let uv = std::slice::from_raw_parts_mut((*p).data[1], ls * ch);
+            for row in 0..ch {
+                for col in 0..cw {
+                    let (u, v) = chroma(col, row);
+                    uv[row * ls + col * 2] = u;
+                    uv[row * ls + col * 2 + 1] = v;
+                }
+            }
+        } else {
+            for plane in 1..=2 {
+                let ls = (*p).linesize[plane] as usize;
+                let data = std::slice::from_raw_parts_mut((*p).data[plane], ls * ch);
+                for row in 0..ch {
+                    for col in 0..cw {
+                        let (u, v) = chroma(col, row);
+                        data[row * ls + col] = if plane == 1 { u } else { v };
+                    }
+                }
+            }
+        }
+        frame
+    }
+}
+
+/// Copies one plane of a frame into a tight `Vec` (stride removed).
+fn plane_to_vec(frame: &Frame, index: usize, w: usize, h: usize) -> Vec<u8> {
+    unsafe {
+        let p = frame.as_ptr();
+        let ls = (*p).linesize[index] as usize;
+        let data = std::slice::from_raw_parts((*p).data[index], ls * h);
+        let mut out = Vec::with_capacity(w * h);
+        for row in 0..h {
+            out.extend_from_slice(&data[row * ls..row * ls + w]);
+        }
+        out
+    }
+}
+
+fn yuv_identity_filter() -> WgpuFrameFilter {
+    WgpuFrameFilter::builder()
+        .shader_yuv_wgsl(shaders::YUV_IDENTITY_BODY)
+        .build()
+        .unwrap()
+}
+
+/// A luma pattern that includes super-black (8) and super-white (250) code
+/// values, which the RGBA roundtrip would clip/stretch but the passthrough
+/// must preserve untouched.
+fn wide_luma(col: usize, row: usize) -> u8 {
+    match (col + row) % 5 {
+        0 => 8,
+        1 => 250,
+        _ => ((col * 7 + row * 13) % 256) as u8,
+    }
+}
+
+fn output_color_range(frame: &Frame) -> ffmpeg_sys_next::AVColorRange {
+    unsafe { (*frame.as_ptr()).color_range }
+}
+
+/// The pack shader's quantizer: `u32(clamp(v, 0, 1) * 255 + 0.5)`.
+fn quantize(v: f32) -> u8 {
+    (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
+}
+
+#[test]
+fn yuv_identity_444_luma_exact_chroma_is_quad_average() {
+    let mut filter = yuv_identity_filter();
+    if !init_filter(&mut filter) {
+        return;
+    }
+    let (w, h) = (321usize, 181usize);
+    let luma = wide_luma;
+    let chroma = |c: usize, r: usize| (((c * 3 + r) % 256) as u8, ((c + r * 5) % 256) as u8);
+    let input = make_yuv_frame_with(
+        w as i32,
+        h as i32,
+        AVPixelFormat::AV_PIX_FMT_YUV444P,
+        luma,
+        chroma,
+    );
+    let out = drive(&mut filter, vec![input], 1).pop().unwrap();
+
+    // 4:4:4 chroma texels sit exactly at pixel centers, so the effect pass
+    // reproduces every plane bit-for-bit; the only transform left is the
+    // pack's fixed 2x2 box average down to 4:2:0, reproduced here in the
+    // same f32 arithmetic (exact: sums of k/255 fit the f32 mantissa).
+    let out_y = plane_to_vec(&out, 0, w, h);
+    for row in 0..h {
+        for col in 0..w {
+            assert_eq!(out_y[row * w + col], luma(col, row), "Y at ({col},{row})");
+        }
+    }
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let out_u = plane_to_vec(&out, 1, cw, ch);
+    let out_v = plane_to_vec(&out, 2, cw, ch);
+    for by in 0..ch {
+        for bx in 0..cw {
+            let mut sum_u = 0.0f32;
+            let mut sum_v = 0.0f32;
+            for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                // load_px clamps the out-of-range column/row at odd edges.
+                let sx = (bx * 2 + dx).min(w - 1);
+                let sy = (by * 2 + dy).min(h - 1);
+                let (u, v) = chroma(sx, sy);
+                sum_u += u as f32 / 255.0;
+                sum_v += v as f32 / 255.0;
+            }
+            assert_eq!(
+                out_u[by * cw + bx],
+                quantize(sum_u * 0.25),
+                "U at ({bx},{by})"
+            );
+            assert_eq!(
+                out_v[by * cw + bx],
+                quantize(sum_v * 0.25),
+                "V at ({bx},{by})"
+            );
+        }
+    }
+}
+
+#[test]
+fn yuv_identity_420_is_bit_exact_with_constant_chroma() {
+    for (w, h) in [(1usize, 1usize), (3, 3), (322, 182)] {
+        let mut filter = yuv_identity_filter();
+        if !init_filter(&mut filter) {
+            return;
+        }
+        let input = make_yuv_frame_with(
+            w as i32,
+            h as i32,
+            AVPixelFormat::AV_PIX_FMT_YUV420P,
+            wide_luma,
+            |_, _| (77, 200),
+        );
+        let out = drive(&mut filter, vec![input], 1).pop().unwrap();
+        assert_eq!(
+            output_color_range(&out),
+            ffmpeg_sys_next::AVColorRange::AVCOL_RANGE_MPEG,
+            "{w}x{h}: limited input must tag the output limited"
+        );
+        let out_y = plane_to_vec(&out, 0, w, h);
+        for row in 0..h {
+            for col in 0..w {
+                assert_eq!(
+                    out_y[row * w + col],
+                    wide_luma(col, row),
+                    "{w}x{h}: Y at ({col},{row})"
+                );
+            }
+        }
+        // Bilinear upsampling and box downsampling of a constant plane are
+        // both the identity, so constant chroma must survive bit-for-bit.
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        assert!(plane_to_vec(&out, 1, cw, ch).iter().all(|&u| u == 77));
+        assert!(plane_to_vec(&out, 2, cw, ch).iter().all(|&v| v == 200));
+    }
+}
+
+#[test]
+fn yuv_identity_nv12_is_bit_exact_with_constant_chroma() {
+    let mut filter = yuv_identity_filter();
+    if !init_filter(&mut filter) {
+        return;
+    }
+    let (w, h) = (322usize, 182usize);
+    let input = make_yuv_frame_with(
+        w as i32,
+        h as i32,
+        AVPixelFormat::AV_PIX_FMT_NV12,
+        wide_luma,
+        |_, _| (33, 240),
+    );
+    let out = drive(&mut filter, vec![input], 1).pop().unwrap();
+    unsafe {
+        assert_eq!(
+            (*out.as_ptr()).format,
+            AVPixelFormat::AV_PIX_FMT_YUV420P as i32,
+            "output stays planar YUV420P"
+        );
+    }
+    let out_y = plane_to_vec(&out, 0, w, h);
+    for row in 0..h {
+        for col in 0..w {
+            assert_eq!(out_y[row * w + col], wide_luma(col, row));
+        }
+    }
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    assert!(plane_to_vec(&out, 1, cw, ch).iter().all(|&u| u == 33));
+    assert!(plane_to_vec(&out, 2, cw, ch).iter().all(|&v| v == 240));
+}
+
+#[test]
+fn yuvj420p_identity_preserves_code_values_and_tags_full_range() {
+    let mut filter = yuv_identity_filter();
+    if !init_filter(&mut filter) {
+        return;
+    }
+    let (w, h) = (64usize, 48usize);
+    let input = make_yuv_frame_with(
+        w as i32,
+        h as i32,
+        AVPixelFormat::AV_PIX_FMT_YUVJ420P,
+        wide_luma,
+        |_, _| (128, 128),
+    );
+    let out = drive(&mut filter, vec![input], 1).pop().unwrap();
+    // The output is plain YUV420P, which does not imply full range the way
+    // the J pixel format does — the explicit tag must carry it.
+    assert_eq!(
+        output_color_range(&out),
+        ffmpeg_sys_next::AVColorRange::AVCOL_RANGE_JPEG
+    );
+    let out_y = plane_to_vec(&out, 0, w, h);
+    for row in 0..h {
+        for col in 0..w {
+            assert_eq!(out_y[row * w + col], wide_luma(col, row));
+        }
+    }
+}
+
+#[test]
+fn yuv_full_range_flag_reaches_the_shader() {
+    // The body paints Y from ez_full_range(): full-range input turns the
+    // luma plane 255, limited input turns it 0.
+    let body = r#"
+        fn ez_effect(coord: vec2<f32>) -> vec3<f32> {
+            if (ez_full_range()) {
+                return vec3<f32>(1.0, 0.5, 0.5);
+            }
+            return vec3<f32>(0.0, 0.5, 0.5);
+        }
+    "#;
+    for (fmt, expected_y) in [
+        (AVPixelFormat::AV_PIX_FMT_YUVJ420P, 255u8),
+        (AVPixelFormat::AV_PIX_FMT_YUV420P, 0u8),
+    ] {
+        let mut filter = WgpuFrameFilter::builder()
+            .shader_yuv_wgsl(body)
+            .build()
+            .unwrap();
+        if !init_filter(&mut filter) {
+            return;
+        }
+        let input = make_yuv_frame_with(32, 32, fmt, |_, _| 128, |_, _| (128, 128));
+        let out = drive(&mut filter, vec![input], 1).pop().unwrap();
+        let out_y = plane_to_vec(&out, 0, 32, 32);
+        assert!(
+            out_y.iter().all(|&y| y == expected_y),
+            "{fmt:?}: expected uniform Y={expected_y}"
+        );
+    }
+}
+
+#[test]
+fn yuv_resize_keeps_constant_planes_exact() {
+    let mut filter = WgpuFrameFilter::builder()
+        .shader_yuv_wgsl(shaders::YUV_IDENTITY_BODY)
+        .output_size(32, 24)
+        .build()
+        .unwrap();
+    if !init_filter(&mut filter) {
+        return;
+    }
+    let input = make_yuv_frame_with(
+        64,
+        48,
+        AVPixelFormat::AV_PIX_FMT_YUV420P,
+        |_, _| 99,
+        |_, _| (44, 211),
+    );
+    let out = drive(&mut filter, vec![input], 1).pop().unwrap();
+    unsafe {
+        assert_eq!((*out.as_ptr()).width, 32);
+        assert_eq!((*out.as_ptr()).height, 24);
+    }
+    assert!(plane_to_vec(&out, 0, 32, 24).iter().all(|&y| y == 99));
+    assert!(plane_to_vec(&out, 1, 16, 12).iter().all(|&u| u == 44));
+    assert!(plane_to_vec(&out, 2, 16, 12).iter().all(|&v| v == 211));
+}
+
+#[test]
+fn yuv_420_gradient_chroma_matches_bilinear_box_reference() {
+    for (w, h) in [(64usize, 64usize), (63, 49)] {
+        yuv_gradient_chroma_case(w, h);
+    }
+}
+
+fn yuv_gradient_chroma_case(w: usize, h: usize) {
+    let mut filter = yuv_identity_filter();
+    if !init_filter(&mut filter) {
+        return;
+    }
+    let chroma = |c: usize, r: usize| ((c * 8 % 256) as u8, ((c * 3 + r * 5) % 256) as u8);
+    let input = make_yuv_frame_with(
+        w as i32,
+        h as i32,
+        AVPixelFormat::AV_PIX_FMT_YUV420P,
+        |_, _| 128,
+        chroma,
+    );
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let mut in_u = vec![0u8; cw * ch];
+    let mut in_v = vec![0u8; cw * ch];
+    for r in 0..ch {
+        for c in 0..cw {
+            let (u, v) = chroma(c, r);
+            in_u[r * cw + c] = u;
+            in_v[r * cw + c] = v;
+        }
+    }
+    let out = drive(&mut filter, vec![input], 1).pop().unwrap();
+
+    // CPU reference for the documented resample: the effect pass bilinearly
+    // samples the half-size chroma plane at every full-res pixel center
+    // (ClampToEdge), and the pack averages each 2x2 block. GPU bilinear
+    // weights may be fixed-point, hence the small tolerance.
+    let bilinear = |plane: &[u8], px: usize, py: usize| -> f32 {
+        let u = (px as f32 + 0.5) / w as f32 * cw as f32 - 0.5;
+        let v = (py as f32 + 0.5) / h as f32 * ch as f32 - 0.5;
+        let (x0, y0) = (u.floor(), v.floor());
+        let (fx, fy) = (u - x0, v - y0);
+        let sample = |xi: i64, yi: i64| -> f32 {
+            let x = xi.clamp(0, cw as i64 - 1) as usize;
+            let y = yi.clamp(0, ch as i64 - 1) as usize;
+            plane[y * cw + x] as f32 / 255.0
+        };
+        let (x0, y0) = (x0 as i64, y0 as i64);
+        let top = sample(x0, y0) * (1.0 - fx) + sample(x0 + 1, y0) * fx;
+        let bot = sample(x0, y0 + 1) * (1.0 - fx) + sample(x0 + 1, y0 + 1) * fx;
+        top * (1.0 - fy) + bot * fy
+    };
+    let out_u = plane_to_vec(&out, 1, cw, ch);
+    let out_v = plane_to_vec(&out, 2, cw, ch);
+    for by in 0..ch {
+        for bx in 0..cw {
+            for (plane_in, plane_out, name) in [(&in_u, &out_u, "U"), (&in_v, &out_v, "V")] {
+                let mut sum = 0.0f32;
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    // load_px clamps the out-of-range column/row at odd edges.
+                    let px = (bx * 2 + dx).min(w - 1);
+                    let py = (by * 2 + dy).min(h - 1);
+                    sum += bilinear(plane_in, px, py);
+                }
+                let expected = quantize(sum * 0.25) as i32;
+                let got = plane_out[by * cw + bx] as i32;
+                assert!(
+                    (got - expected).abs() <= 2,
+                    "{w}x{h} {name} at ({bx},{by}): got {got}, reference {expected}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn yuv_builder_requires_an_ez_effect_body() {
+    let err = match WgpuFrameFilter::builder()
+        .shader_yuv_wgsl(shaders::IDENTITY_FS)
+        .build()
+    {
+        Ok(_) => panic!("a body without ez_effect must fail build()"),
+        Err(e) => e,
+    };
+    assert!(err.contains("ez_effect"), "unexpected error: {err}");
+}
+
+#[test]
+fn yuv_resize_to_odd_size_keeps_constant_planes_exact() {
+    let mut filter = WgpuFrameFilter::builder()
+        .shader_yuv_wgsl(shaders::YUV_IDENTITY_BODY)
+        .output_size(33, 25)
+        .build()
+        .unwrap();
+    if !init_filter(&mut filter) {
+        return;
+    }
+    let input = make_yuv_frame_with(
+        65,
+        49,
+        AVPixelFormat::AV_PIX_FMT_YUV420P,
+        |_, _| 61,
+        |_, _| (90, 170),
+    );
+    let out = drive(&mut filter, vec![input], 1).pop().unwrap();
+    unsafe {
+        assert_eq!((*out.as_ptr()).width, 33);
+        assert_eq!((*out.as_ptr()).height, 25);
+    }
+    // Odd input, odd output: resampling a constant is still the constant,
+    // and the pack's clamped edge quads replicate that constant, so every
+    // plane (including the ceil-sized 17x13 chroma) must be uniform.
+    assert!(plane_to_vec(&out, 0, 33, 25).iter().all(|&y| y == 61));
+    assert!(plane_to_vec(&out, 1, 17, 13).iter().all(|&u| u == 90));
+    assert!(plane_to_vec(&out, 2, 17, 13).iter().all(|&v| v == 170));
+}
+
+#[test]
+fn yuv_builder_rejects_group0_bindings_in_the_body() {
+    // Group indices are const-expressions — `0u` names group 0 just as `0`
+    // does, and a type-compatible alias (a sampler at binding 3) would
+    // silently shadow the prelude's sampler if it slipped through.
+    for body in [
+        r#"
+        @group(0) @binding(9) var<uniform> hijack: f32;
+        fn ez_effect(coord: vec2<f32>) -> vec3<f32> {
+            return vec3<f32>(hijack, 0.5, 0.5);
+        }
+        "#,
+        r#"
+        @group(0u) @binding(3) var my_samp: sampler;
+        fn ez_effect(coord: vec2<f32>) -> vec3<f32> {
+            return vec3<f32>(ez_luma(coord), 0.5, 0.5);
+        }
+        "#,
+    ] {
+        let err = match WgpuFrameFilter::builder().shader_yuv_wgsl(body).build() {
+            Ok(_) => panic!("a body declaring a reserved group must fail build()"),
+            Err(e) => e,
+        };
+        assert!(err.contains("group(0)"), "unexpected error: {err}");
+    }
+
+    // The params group stays allowed when spelled literally.
+    let params_body = r#"
+        @group(1) @binding(0) var<uniform> gain: vec4<f32>;
+        fn ez_effect(coord: vec2<f32>) -> vec3<f32> {
+            return ez_sample_yuv(coord) * gain.x;
+        }
+    "#;
+    assert!(WgpuFrameFilter::builder()
+        .shader_yuv_wgsl(params_body)
+        .build()
+        .is_ok());
 }

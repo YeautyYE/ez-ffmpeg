@@ -23,12 +23,35 @@ pub(crate) struct OutputGeometry {
     pub(crate) buf_size: u64,
 }
 
+/// The user effect shader source, tagged with the domain it runs in.
+pub(crate) enum EffectSource<'a> {
+    /// Complete fragment module sampling the RGBA intermediate (the default
+    /// three-pass pipeline: convert -> effect -> pack).
+    Rgba(&'a str),
+    /// Body defining `ez_effect(coord) -> vec3<f32>` over raw YUV code
+    /// values; the library wraps it with a layout-specific prelude and the
+    /// fragment entry point (two-pass pipeline: effect -> identity pack).
+    Yuv(&'a str),
+}
+
+/// Mode-tagged effect pipelines. The YUV passthrough mode carries one
+/// pipeline per input plane layout (the prelude bindings differ), both
+/// prebuilt at init so a mid-stream layout change never compiles shaders
+/// on the frame path.
+pub(crate) enum EffectPipeline {
+    Rgba(wgpu::RenderPipeline),
+    Yuv {
+        planar: wgpu::RenderPipeline,
+        nv12: wgpu::RenderPipeline,
+    },
+}
+
 /// Device-level state created once in `init`.
 pub(crate) struct GpuState {
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
     sampler: wgpu::Sampler,
-    pub(crate) effect_pipeline: wgpu::RenderPipeline,
+    pub(crate) effect_pipeline: EffectPipeline,
     effect_bgl0: wgpu::BindGroupLayout,
     effect_bgl1: wgpu::BindGroupLayout,
     pub(crate) pack_pipeline: wgpu::ComputePipeline,
@@ -49,7 +72,7 @@ pub(crate) struct GpuState {
     /// contents even with frames in flight; `Cell` suffices because all
     /// encoding happens on the one pipeline thread.
     pub(crate) convert_uniforms_cache: std::cell::Cell<Option<[u32; 4]>>,
-    pub(crate) pack_uniforms_cache: std::cell::Cell<Option<[u32; 8]>>,
+    pub(crate) pack_uniforms_cache: std::cell::Cell<Option<[u32; 12]>>,
     pub(crate) resources: Option<FrameResources>,
     /// Raw Vulkan handles for dmabuf import; present only when the device
     /// was opened with the external-memory extensions (hw zero-copy input).
@@ -64,6 +87,22 @@ pub(crate) struct GpuState {
     resource_generation: u64,
 }
 
+/// Mode-specific pass inputs held by [`FrameResources`]. RGBA mode renders
+/// convert into an input-sized intermediate texture the effect then samples;
+/// YUV mode has no intermediate — the effect pass samples the uploaded
+/// planes directly (its bind group reuses the convert bind group layout,
+/// with the ez uniforms in the slot the convert uniforms occupy there).
+pub(crate) enum PassBinds {
+    Rgba {
+        intermediate_view: wgpu::TextureView,
+        convert_bind: wgpu::BindGroup,
+        effect_bind: wgpu::BindGroup,
+    },
+    Yuv {
+        effect_bind: wgpu::BindGroup,
+    },
+}
+
 /// Size/format-dependent resources, recreated when the input geometry changes.
 pub(crate) struct FrameResources {
     pub(crate) in_w: u32,
@@ -74,10 +113,8 @@ pub(crate) struct FrameResources {
     pub(crate) tex_y: wgpu::Texture,
     pub(crate) tex_u: wgpu::Texture,
     pub(crate) tex_v: Option<wgpu::Texture>,
-    pub(crate) intermediate_view: wgpu::TextureView,
     pub(crate) out_view: wgpu::TextureView,
-    pub(crate) convert_bind: wgpu::BindGroup,
-    pub(crate) effect_bind0: wgpu::BindGroup,
+    pub(crate) pass_binds: PassBinds,
     pub(crate) effect_bind1: wgpu::BindGroup,
     /// Cached pack bind group targeting `storage`; `None` in direct-pack
     /// mode, where a transient bind group targets the frame's staging buffer.
@@ -322,7 +359,7 @@ fn uniform_bgl_entry(
 
 impl GpuState {
     pub(crate) fn new(
-        user_fragment_shader: &str,
+        source: EffectSource<'_>,
         params_len: usize,
         hw_input: bool,
     ) -> Result<Self, String> {
@@ -398,17 +435,6 @@ impl GpuState {
             label: Some("ez_fullscreen_vs"),
             source: wgpu::ShaderSource::Wgsl(shaders::FULLSCREEN_VS.into()),
         });
-
-        // Shader compilation errors surface through the device error scope so
-        // users get the WGSL diagnostics instead of a later opaque failure.
-        device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let user_fs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("ez_user_effect_fs"),
-            source: wgpu::ShaderSource::Wgsl(user_fragment_shader.into()),
-        });
-        if let Some(err) = pollster::block_on(device.pop_error_scope()) {
-            return Err(format!("Effect shader compilation failed: {err}"));
-        }
 
         let convert_fs_planar = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("ez_convert_planar_fs"),
@@ -497,7 +523,7 @@ impl GpuState {
                     },
                     count: None,
                 },
-                uniform_bgl_entry(1, wgpu::ShaderStages::COMPUTE, 32),
+                uniform_bgl_entry(1, wgpu::ShaderStages::COMPUTE, 48),
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -548,14 +574,74 @@ impl GpuState {
             &convert_fs_nv12,
         );
 
-        device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let effect_pipeline = render_pipeline(&device, "ez_effect", &effect_layout, &vs, &user_fs);
-        if let Some(err) = pollster::block_on(device.pop_error_scope()) {
-            return Err(format!(
-                "Effect pipeline creation failed (does the shader match the \
-                 documented binding contract?): {err}"
-            ));
-        }
+        // User shader compilation and pipeline creation run inside device
+        // error scopes so users get WGSL diagnostics at init instead of a
+        // later opaque failure. The YUV mode prebuilds BOTH layout variants
+        // here, each under its own scope: a mid-stream planar<->NV12 switch
+        // must never compile shaders on the frame path, and a body that only
+        // breaks under one layout should fail init naming that layout.
+        let effect_pipeline = match source {
+            EffectSource::Rgba(shader) => {
+                device.push_error_scope(wgpu::ErrorFilter::Validation);
+                let user_fs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("ez_user_effect_fs"),
+                    source: wgpu::ShaderSource::Wgsl(shader.into()),
+                });
+                if let Some(err) = pollster::block_on(device.pop_error_scope()) {
+                    return Err(format!("Effect shader compilation failed: {err}"));
+                }
+                device.push_error_scope(wgpu::ErrorFilter::Validation);
+                let pipeline = render_pipeline(&device, "ez_effect", &effect_layout, &vs, &user_fs);
+                if let Some(err) = pollster::block_on(device.pop_error_scope()) {
+                    return Err(format!(
+                        "Effect pipeline creation failed (does the shader match the \
+                         documented binding contract?): {err}"
+                    ));
+                }
+                EffectPipeline::Rgba(pipeline)
+            }
+            EffectSource::Yuv(body) => {
+                let yuv_layout_planar =
+                    device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("ez_yuv_effect_planar_layout"),
+                        bind_group_layouts: &[&convert_bgl_planar, &effect_bgl1],
+                        push_constant_ranges: &[],
+                    });
+                let yuv_layout_nv12 =
+                    device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("ez_yuv_effect_nv12_layout"),
+                        bind_group_layouts: &[&convert_bgl_nv12, &effect_bgl1],
+                        push_constant_ranges: &[],
+                    });
+                let build = |variant: &str,
+                             module_src: String,
+                             layout: &wgpu::PipelineLayout|
+                 -> Result<wgpu::RenderPipeline, String> {
+                    device.push_error_scope(wgpu::ErrorFilter::Validation);
+                    let fs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some("ez_user_yuv_effect_fs"),
+                        source: wgpu::ShaderSource::Wgsl(module_src.into()),
+                    });
+                    let pipeline = render_pipeline(&device, "ez_yuv_effect", layout, &vs, &fs);
+                    if let Some(err) = pollster::block_on(device.pop_error_scope()) {
+                        return Err(format!(
+                            "YUV effect shader failed for the {variant} input layout (the \
+                             body must define `fn ez_effect(coord: vec2<f32>) -> vec3<f32>` \
+                             and may only declare `@group(1)` bindings): {err}"
+                        ));
+                    }
+                    Ok(pipeline)
+                };
+                EffectPipeline::Yuv {
+                    planar: build(
+                        "planar",
+                        shaders::yuv_effect_fs_planar(body),
+                        &yuv_layout_planar,
+                    )?,
+                    nv12: build("NV12", shaders::yuv_effect_fs_nv12(body), &yuv_layout_nv12)?,
+                }
+            }
+        };
 
         let pack_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("ez_pack"),
@@ -577,7 +663,7 @@ impl GpuState {
         let ez_uniforms = uniform_buf("ez_uniforms", 16);
         let params_buf = uniform_buf("ez_user_params", params_size);
         let convert_uniforms = uniform_buf("ez_convert_uniforms", 16);
-        let pack_uniforms = uniform_buf("ez_pack_uniforms", 32);
+        let pack_uniforms = uniform_buf("ez_pack_uniforms", 48);
 
         Ok(GpuState {
             device,
@@ -639,17 +725,24 @@ impl GpuState {
         })
     }
 
-    /// Builds an NV12 convert bind group for a pair of imported hardware
+    /// Builds an NV12 input bind group for a pair of imported hardware
     /// plane textures (per-frame: each hw frame is a distinct VkImage).
-    pub(crate) fn hw_convert_bind(
+    /// In RGBA mode this feeds the convert pass (convert uniforms at
+    /// binding 4); in YUV mode it feeds the effect pass directly (the
+    /// prelude's ez uniforms live in that slot instead).
+    pub(crate) fn hw_nv12_bind(
         &self,
         tex_y: &wgpu::Texture,
         tex_uv: &wgpu::Texture,
     ) -> wgpu::BindGroup {
+        let uniforms = match &self.effect_pipeline {
+            EffectPipeline::Rgba(_) => &self.convert_uniforms,
+            EffectPipeline::Yuv { .. } => &self.ez_uniforms,
+        };
         let y_view = tex_y.create_view(&wgpu::TextureViewDescriptor::default());
         let uv_view = tex_uv.create_view(&wgpu::TextureViewDescriptor::default());
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("ez_hw_convert_bind"),
+            label: Some("ez_hw_input_bind"),
             layout: &self.convert_bgl_nv12,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -666,7 +759,7 @@ impl GpuState {
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
-                    resource: self.convert_uniforms.as_entire_binding(),
+                    resource: uniforms.as_entire_binding(),
                 },
             ],
         })
@@ -736,13 +829,6 @@ impl GpuState {
             ),
         };
 
-        let intermediate = create_tex(
-            "ez_intermediate",
-            in_w,
-            in_h,
-            wgpu::TextureFormat::Rgba8Unorm,
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-        );
         let out_tex = create_tex(
             "ez_out",
             out_w,
@@ -774,14 +860,17 @@ impl GpuState {
         let view = |t: &wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor::default());
         let y_view = view(&tex_y);
         let u_view = view(&tex_u);
-        let intermediate_view = view(&intermediate);
         let out_view = view(&out_tex);
 
-        let convert_bind = match layout {
+        // Bind group over the uploaded input planes. The uniform at binding 4
+        // is whatever the consuming pass expects there: the convert uniforms
+        // for the RGBA convert pass, the ez uniforms for the YUV effect
+        // prelude (both are 16 bytes, sharing the convert bind group layout).
+        let input_bind = |label: &'static str, uniforms: &wgpu::Buffer| match layout {
             PlaneLayout::Planar { .. } => {
                 let v_view = view(tex_v.as_ref().expect("planar layout has a V texture"));
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("ez_convert_bind"),
+                    label: Some(label),
                     layout: &self.convert_bgl_planar,
                     entries: &[
                         wgpu::BindGroupEntry {
@@ -802,13 +891,13 @@ impl GpuState {
                         },
                         wgpu::BindGroupEntry {
                             binding: 4,
-                            resource: self.convert_uniforms.as_entire_binding(),
+                            resource: uniforms.as_entire_binding(),
                         },
                     ],
                 })
             }
             PlaneLayout::Nv12 => device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("ez_convert_bind"),
+                label: Some(label),
                 layout: &self.convert_bgl_nv12,
                 entries: &[
                     wgpu::BindGroupEntry {
@@ -825,30 +914,54 @@ impl GpuState {
                     },
                     wgpu::BindGroupEntry {
                         binding: 4,
-                        resource: self.convert_uniforms.as_entire_binding(),
+                        resource: uniforms.as_entire_binding(),
                     },
                 ],
             }),
         };
 
-        let effect_bind0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("ez_effect_bind0"),
-            layout: &self.effect_bgl0,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&intermediate_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: self.ez_uniforms.as_entire_binding(),
-                },
-            ],
-        });
+        let pass_binds = match &self.effect_pipeline {
+            EffectPipeline::Rgba(_) => {
+                let intermediate = create_tex(
+                    "ez_intermediate",
+                    in_w,
+                    in_h,
+                    wgpu::TextureFormat::Rgba8Unorm,
+                    wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                );
+                let intermediate_view = view(&intermediate);
+                let convert_bind = input_bind("ez_convert_bind", &self.convert_uniforms);
+                let effect_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("ez_effect_bind0"),
+                    layout: &self.effect_bgl0,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&intermediate_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&self.sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: self.ez_uniforms.as_entire_binding(),
+                        },
+                    ],
+                });
+                PassBinds::Rgba {
+                    intermediate_view,
+                    convert_bind,
+                    effect_bind,
+                }
+            }
+            // YUV mode has no convert pass and no intermediate texture: the
+            // effect pass samples the uploaded planes directly.
+            EffectPipeline::Yuv { .. } => PassBinds::Yuv {
+                effect_bind: input_bind("ez_yuv_effect_bind", &self.ez_uniforms),
+            },
+        };
+
         let effect_bind1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("ez_effect_bind1"),
             layout: &self.effect_bgl1,
@@ -870,10 +983,8 @@ impl GpuState {
             tex_y,
             tex_u,
             tex_v,
-            intermediate_view,
             out_view,
-            convert_bind,
-            effect_bind0,
+            pass_binds,
             effect_bind1,
             pack_bind,
             storage,

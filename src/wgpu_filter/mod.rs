@@ -39,6 +39,38 @@
 //! // output.add_frame_pipeline(pipeline);
 //! ```
 //!
+//! # YUV passthrough mode
+//!
+//! By default the effect shader sees RGBA: the pipeline converts YUV to
+//! RGBA on the GPU, runs the effect, and packs back to YUV420P. For color
+//! effects that are natural in YUV (tone curves, LUTs, luma sharpening),
+//! [`WgpuFrameFilterBuilder::shader_yuv_wgsl`] runs the effect directly on
+//! **raw YUV code values** instead — no convert pass, no RGBA intermediate,
+//! no matrix/range math. The shader is a body defining
+//! `fn ez_effect(coord: vec2<f32>) -> vec3<f32>` over a small prelude
+//! (`ez_sample_yuv`, `ez_luma`, `ez_chroma`, `ez_full_range`, ...):
+//!
+//! ```rust,ignore
+//! let filter = WgpuFrameFilter::builder()
+//!     .shader_yuv_wgsl(
+//!         r#"
+//!         fn ez_effect(coord: vec2<f32>) -> vec3<f32> {
+//!             var yuv = ez_sample_yuv(coord);
+//!             yuv.x = clamp(yuv.x * 1.1, 0.0, 1.0); // brighten luma only
+//!             return yuv;
+//!         }
+//!         "#,
+//!     )
+//!     .build()?;
+//! ```
+//!
+//! This is raw *code-value* processing, not lossless chroma: with
+//! subsampled input the 4:2:0 output still resamples chroma (bilinear up,
+//! box down), and resizing resamples every plane. What the mode guarantees
+//! is that no matrix or range math is applied anywhere — at unchanged
+//! output size an untouched luma plane survives bit-for-bit, super-black/
+//! super-white included.
+//!
 //! **Feature flag**: only available with the `wgpu` feature.
 //!
 //! **Input formats**: YUV420P, YUV422P, YUV444P (plus their full-range J
@@ -48,7 +80,8 @@
 //! `WgpuFrameFilterBuilder::hw_zero_copy_input` is enabled (Linux/Vulkan,
 //! experimental). Other formats need a `format=yuv420p` conversion in
 //! `filter_desc` first. Output is always YUV420P (4:2:2/4:4:4 inputs are
-//! chroma-downsampled on the GPU).
+//! chroma-downsampled on the GPU), tagged with the effective input color
+//! range (J-format input yields a full-range-tagged output).
 
 pub mod wgpu_frame_filter;
 
