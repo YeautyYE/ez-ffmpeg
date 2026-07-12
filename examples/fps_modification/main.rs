@@ -1,13 +1,12 @@
 use ez_ffmpeg::{FfmpegContext, Output};
-use ffmpeg_sys_next::AVRational;
 
 fn main() {
     // Method 1: Set framerate using Output's `set_framerate` method
     // This method directly sets the framerate on the output.
     FfmpegContext::builder()
         .input("test.mp4") // Input file: test.mp4
-        // Set framerate to 30 FPS using AVRational for the output
-        .output(Output::from("output.mp4").set_framerate(AVRational { num: 30, den: 1 }))
+        // Set framerate to 30 FPS for the output
+        .output(Output::from("output.mp4").set_framerate(30, 1))
         .build()
         .unwrap() // Build the context
         .start()

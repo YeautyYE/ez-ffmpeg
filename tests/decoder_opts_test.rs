@@ -102,9 +102,9 @@ fn rawvideo_fixture(name: &str) -> String {
 fn rawvideo_known_input(src: &str) -> Input {
     Input::from(src)
         .set_format("rawvideo")
-        .set_input_opt("video_size", "320x240")
-        .set_input_opt("pixel_format", "yuv420p")
-        .set_input_opt("framerate", "30")
+        .set_format_opt("video_size", "320x240")
+        .set_format_opt("pixel_format", "yuv420p")
+        .set_format_opt("framerate", "30")
 }
 
 fn assert_output_has_video(path: &str, scenario: &str) {

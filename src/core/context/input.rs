@@ -393,14 +393,13 @@ impl Input {
     /// applies when the input is a callback (no URL); ignored otherwise. The
     /// default is 64 KiB, which keeps first-packet latency low for live use.
     ///
-    /// # Panics
-    /// Panics if `size` is 0 or exceeds `i32::MAX` (FFmpeg's `avio_alloc_context`
+    /// # Errors
+    /// The value is validated when the context is built:
+    /// `FfmpegContext::builder().build()` fails with
+    /// [`OpenInputError::InvalidOption`](crate::error::OpenInputError::InvalidOption)
+    /// if `size` is 0 or exceeds `i32::MAX` (FFmpeg's `avio_alloc_context`
     /// takes an `int` buffer size).
     pub fn set_io_buffer_size(mut self, size: usize) -> Self {
-        assert!(
-            size > 0 && size <= i32::MAX as usize,
-            "io_buffer_size must be in 1..=i32::MAX, got {size}"
-        );
         self.io_buffer_size = size;
         self
     }
@@ -1085,7 +1084,8 @@ impl Input {
         self
     }
 
-    /// Sets a single input option for avformat_open_input.
+    /// Sets a single format option for avformat_open_input — the input-side
+    /// mirror of [`Output::set_format_opt`](crate::core::context::output::Output::set_format_opt).
     ///
     /// This method configures options that will be passed to FFmpeg's `avformat_open_input()`
     /// function. The options can control behavior at different levels including format detection,
@@ -1094,8 +1094,8 @@ impl Input {
     /// **Example Usage:**
     /// ```rust,ignore
     /// let input = Input::new("avfoundation:0")
-    ///     .set_input_opt("framerate", "30")
-    ///     .set_input_opt("probesize", "5000000");
+    ///     .set_format_opt("framerate", "30")
+    ///     .set_format_opt("probesize", "5000000");
     /// ```
     ///
     /// ### Parameters:
@@ -1104,7 +1104,7 @@ impl Input {
     ///
     /// ### Return Value:
     /// - Returns the modified `Input` instance for method chaining.
-    pub fn set_input_opt(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+    pub fn set_format_opt(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         if let Some(ref mut opts) = self.input_opts {
             opts.insert(key.into(), value.into());
         } else {
@@ -1115,7 +1115,17 @@ impl Input {
         self
     }
 
-    /// Sets multiple input options at once for avformat_open_input.
+    /// Deprecated spelling of [`set_format_opt`](Self::set_format_opt): the
+    /// input and output sides used different names for the same
+    /// AVFormatContext option map.
+    #[deprecated(since = "0.13.0", note = "renamed to `set_format_opt`")]
+    pub fn set_input_opt(self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.set_format_opt(key, value)
+    }
+
+    /// Sets multiple format options at once for avformat_open_input — the
+    /// input-side mirror of
+    /// [`Output::set_format_opts`](crate::core::context::output::Output::set_format_opts).
     ///
     /// This method allows setting multiple options in a single call, which will all be
     /// passed to FFmpeg's `avformat_open_input()` function. Each key-value pair will be
@@ -1124,7 +1134,7 @@ impl Input {
     /// **Example Usage:**
     /// ```rust,ignore
     /// let input = Input::new("http://example.com/stream.m3u8")
-    ///     .set_input_opts(vec![
+    ///     .set_format_opts(vec![
     ///         ("user_agent", "MyApp/1.0"),
     ///         ("timeout", "10000000"),
     ///         ("probesize", "5000000"),
@@ -1136,7 +1146,7 @@ impl Input {
     ///
     /// ### Return Value:
     /// - Returns the modified `Input` instance for method chaining.
-    pub fn set_input_opts(mut self, opts: Vec<(impl Into<String>, impl Into<String>)>) -> Self {
+    pub fn set_format_opts(mut self, opts: Vec<(impl Into<String>, impl Into<String>)>) -> Self {
         if let Some(ref mut input_opts) = self.input_opts {
             for (key, value) in opts {
                 input_opts.insert(key.into(), value.into());
@@ -1149,6 +1159,12 @@ impl Input {
             self.input_opts = Some(input_opts);
         }
         self
+    }
+
+    /// Deprecated spelling of [`set_format_opts`](Self::set_format_opts).
+    #[deprecated(since = "0.13.0", note = "renamed to `set_format_opts`")]
+    pub fn set_input_opts(self, opts: Vec<(impl Into<String>, impl Into<String>)>) -> Self {
+        self.set_format_opts(opts)
     }
 
     /// Enables or disables stream-information probing (`avformat_find_stream_info`)
@@ -1168,7 +1184,7 @@ impl Input {
     /// `FindStreamError::NoStreamFound`.
     ///
     /// To shrink probing instead of skipping it, prefer
-    /// `set_input_opt("probesize", ...)` / `set_input_opt("analyzeduration", ...)`.
+    /// `set_format_opt("probesize", ...)` / `set_format_opt("analyzeduration", ...)`.
     ///
     /// # Parameters
     /// - `enabled`: `true` to probe (default), `false` to trust the container header.
@@ -1308,11 +1324,12 @@ impl Input {
     ///     .set_ts_scale(2.0);
     /// ```
     ///
-    /// # Panics
-    /// Panics if `scale` is not a positive finite number.
+    /// # Errors
+    /// The value is stored as given and validated when the context is built:
+    /// `FfmpegContext::builder().build()` fails with
+    /// [`OpenInputError::InvalidOption`](crate::error::OpenInputError::InvalidOption)
+    /// if `scale` is not a positive finite number.
     pub fn set_ts_scale(mut self, scale: f64) -> Self {
-        assert!(scale.is_finite(), "ts_scale must be finite, got {scale}");
-        assert!(scale > 0.0, "ts_scale must be positive, got {scale}");
         self.ts_scale = Some(scale);
         self
     }
@@ -1348,11 +1365,12 @@ impl Input {
     ///     .set_framerate(24000, 1001);
     /// ```
     ///
-    /// # Panics
-    /// Panics if `num` or `den` is not positive.
+    /// # Errors
+    /// The value is stored as given and validated when the context is built
+    /// (like every other deferred option): `FfmpegContext::builder().build()`
+    /// fails with [`OpenInputError::InvalidOption`](crate::error::OpenInputError::InvalidOption)
+    /// if `num` or `den` is not positive.
     pub fn set_framerate(mut self, num: i32, den: i32) -> Self {
-        assert!(num > 0, "framerate numerator must be positive, got {num}");
-        assert!(den > 0, "framerate denominator must be positive, got {den}");
         self.framerate = Some((num, den));
         self
     }
@@ -1450,28 +1468,15 @@ mod tests {
         assert_eq!(input.framerate, Some((30, 1)));
     }
 
+    // Setters are infallible and store values as given; validation is
+    // deferred to open time (OpenInputError::InvalidOption), where the
+    // whole option set is checked uniformly.
     #[test]
-    #[should_panic(expected = "framerate numerator must be positive")]
-    fn set_framerate_zero_num() {
-        Input::from("test.mp4").set_framerate(0, 1);
-    }
-
-    #[test]
-    #[should_panic(expected = "framerate denominator must be positive")]
-    fn set_framerate_zero_den() {
-        Input::from("test.mp4").set_framerate(24, 0);
-    }
-
-    #[test]
-    #[should_panic(expected = "framerate numerator must be positive")]
-    fn set_framerate_negative_num() {
-        Input::from("test.mp4").set_framerate(-1, 1);
-    }
-
-    #[test]
-    #[should_panic(expected = "framerate denominator must be positive")]
-    fn set_framerate_negative_den() {
-        Input::from("test.mp4").set_framerate(24, -1);
+    fn set_framerate_stores_invalid_values_for_deferred_validation() {
+        for (num, den) in [(0, 1), (24, 0), (-1, 1), (24, -1)] {
+            let input = Input::from("test.mp4").set_framerate(num, den);
+            assert_eq!(input.framerate, Some((num, den)));
+        }
     }
 
     #[test]
@@ -1487,33 +1492,11 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "ts_scale must be finite")]
-    fn set_ts_scale_nan() {
-        Input::from("test.mp4").set_ts_scale(f64::NAN);
-    }
-
-    #[test]
-    #[should_panic(expected = "ts_scale must be finite")]
-    fn set_ts_scale_infinity() {
-        Input::from("test.mp4").set_ts_scale(f64::INFINITY);
-    }
-
-    #[test]
-    #[should_panic(expected = "ts_scale must be finite")]
-    fn set_ts_scale_neg_infinity() {
-        Input::from("test.mp4").set_ts_scale(f64::NEG_INFINITY);
-    }
-
-    #[test]
-    #[should_panic(expected = "ts_scale must be positive")]
-    fn set_ts_scale_zero() {
-        Input::from("test.mp4").set_ts_scale(0.0);
-    }
-
-    #[test]
-    #[should_panic(expected = "ts_scale must be positive")]
-    fn set_ts_scale_negative() {
-        Input::from("test.mp4").set_ts_scale(-1.0);
+    fn set_ts_scale_stores_invalid_values_for_deferred_validation() {
+        for scale in [f64::INFINITY, f64::NEG_INFINITY, 0.0, -1.0] {
+            let input = Input::from("test.mp4").set_ts_scale(scale);
+            assert_eq!(input.ts_scale, Some(scale));
+        }
     }
 
     #[test]
@@ -1621,14 +1604,8 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "io_buffer_size must be in 1..=i32::MAX")]
-    fn set_io_buffer_size_zero_panics() {
-        Input::from("test.mp4").set_io_buffer_size(0);
-    }
-
-    #[test]
-    #[should_panic(expected = "io_buffer_size must be in 1..=i32::MAX")]
-    fn set_io_buffer_size_too_large_panics() {
-        Input::from("test.mp4").set_io_buffer_size(i32::MAX as usize + 1);
+    fn set_io_buffer_size_stores_invalid_values_for_deferred_validation() {
+        let input = Input::new_by_read_callback(|_| 0).set_io_buffer_size(0);
+        assert_eq!(input.io_buffer_size, 0);
     }
 }

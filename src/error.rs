@@ -498,6 +498,14 @@ pub enum OpenInputError {
     #[error("The connection timed out while trying to open the stream")]
     Timeout,
 
+    /// A builder option carried an invalid value (e.g. a non-positive
+    /// `set_framerate`, a non-finite `set_ts_scale`, an out-of-range
+    /// `set_io_buffer_size`). Setters store values as given and defer
+    /// validation to open time, so a bad value surfaces here instead of
+    /// panicking in the setter.
+    #[error("Invalid input option: {0}")]
+    InvalidOption(String),
+
     #[error("{}. ret:{0}", crate::util::ffmpeg_utils::av_err2str(*.0))]
     UnknownError(i32),
 
@@ -778,6 +786,17 @@ pub enum OpenOutputError {
 
     #[error("Unknown pixel format: '{0}'")]
     UnknownPixelFormat(String),
+
+    #[error("Unknown sample format: '{0}'")]
+    UnknownSampleFormat(String),
+
+    /// A builder option carried an invalid value (e.g. a malformed
+    /// `set_force_key_frames` spec, an out-of-range `set_io_buffer_size`).
+    /// Setters store values as given and defer validation to open time, so
+    /// a bad value surfaces here instead of panicking in the setter or
+    /// forcing a `Result` into the middle of a builder chain.
+    #[error("Invalid output option: {0}")]
+    InvalidOption(String),
 
     #[error("Failed to read attachment file '{0}'")]
     AttachmentRead(String, #[source] io::Error),

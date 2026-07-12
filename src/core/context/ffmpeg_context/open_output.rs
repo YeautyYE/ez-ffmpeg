@@ -38,6 +38,40 @@ unsafe fn open_output_file(
     copy_ts: bool,
     interrupt_state: &Arc<crate::core::context::InterruptState>,
 ) -> Result<Muxer> {
+    // Deferred validation of stored builder options (the setters are
+    // infallible and store values as given, like every other option).
+    for (name, rate) in [
+        ("set_framerate", output.framerate),
+        ("set_framerate_max", output.framerate_max),
+    ] {
+        if let Some(AVRational { num, den }) = rate {
+            if num <= 0 || den <= 0 {
+                return Err(OpenOutputError::InvalidOption(format!(
+                    "{name} requires positive numerator and denominator, got {num}/{den}"
+                ))
+                .into());
+            }
+        }
+    }
+    if output.io_buffer_size == 0 || output.io_buffer_size > i32::MAX as usize {
+        return Err(OpenOutputError::InvalidOption(format!(
+            "set_io_buffer_size must be in 1..=i32::MAX, got {}",
+            output.io_buffer_size
+        ))
+        .into());
+    }
+    if output.max_muxing_queue_size == 0 {
+        return Err(
+            OpenOutputError::InvalidOption("set_max_muxing_queue_size must be > 0".into()).into(),
+        );
+    }
+    if output.muxing_queue_data_threshold == 0 {
+        return Err(OpenOutputError::InvalidOption(
+            "set_muxing_queue_data_threshold must be > 0".into(),
+        )
+        .into());
+    }
+
     let mut out_fmt_ctx = null_mut();
     // Frees out_fmt_ctx (and, for custom IO, its AVIO + callback box) on any
     // early return until the Muxer takes ownership below.
@@ -186,6 +220,33 @@ unsafe fn open_output_file(
         None => None,
     };
 
+    // Parse the deferred forced-keyframe spec; the setter stores it raw so
+    // a typo fails the build here, not mid-chain in user code.
+    let forced_kf_pts = match &output.forced_kf_spec {
+        Some(spec) => Some(
+            crate::core::context::output::parse_forced_key_frames(spec)
+                .map_err(OpenOutputError::InvalidOption)?,
+        ),
+        None => None,
+    };
+
+    // Resolve the sample-format name like pix_fmt above: same failure mode
+    // as FFmpeg CLI's `-sample_fmt foobar`. A name with an interior NUL is
+    // just as unknown as a misspelled one — map it to the same typed error
+    // instead of letting the CString conversion pick a generic one.
+    let audio_sample_fmt = match &output.audio_sample_fmt {
+        Some(name) => {
+            let cstr = CString::new(name.as_str())
+                .map_err(|_| OpenOutputError::UnknownSampleFormat(name.clone()))?;
+            let sf = ffmpeg_sys_next::av_get_sample_fmt(cstr.as_ptr());
+            if sf == ffmpeg_sys_next::AVSampleFormat::AV_SAMPLE_FMT_NONE {
+                return Err(OpenOutputError::UnknownSampleFormat(name.clone()).into());
+            }
+            Some(sf)
+        }
+        None => None,
+    };
+
     // Ownership of out_fmt_ctx transfers to the Muxer. `release()` disarms the
     // guard and hands back the pointer; wrap it in a `FormatContext` (custom-IO
     // variant for the write_callback path — the same discriminant the old
@@ -235,10 +296,10 @@ unsafe fn open_output_file(
         output.bits_per_raw_sample,
         output.audio_sample_rate,
         output.audio_channels,
-        output.audio_sample_fmt,
+        audio_sample_fmt,
         output.video_qscale,
         output.audio_qscale,
-        output.forced_kf_pts.clone(),
+        forced_kf_pts,
         output.max_video_frames,
         output.max_audio_frames,
         output.max_subtitle_frames,
