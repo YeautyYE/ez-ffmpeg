@@ -1,5 +1,5 @@
 use crate::filter::frame_pipeline::FramePipeline;
-use ffmpeg_sys_next::{AVRational, AVSampleFormat};
+use ffmpeg_sys_next::AVRational;
 use std::collections::HashMap;
 
 mod attachment;
@@ -247,7 +247,9 @@ pub struct Output {
     pub(crate) bits_per_raw_sample: Option<i32>,
     pub(crate) audio_sample_rate: Option<i32>,
     pub(crate) audio_channels: Option<i32>,
-    pub(crate) audio_sample_fmt: Option<AVSampleFormat>,
+    /// FFmpeg sample format name (e.g. `"s16"`), resolved to an
+    /// `AVSampleFormat` at open time like `pix_fmt`.
+    pub(crate) audio_sample_fmt: Option<String>,
 
     // -q:v
     // use fixed quality scale (VBR)
@@ -257,10 +259,11 @@ pub struct Output {
     // set audio quality (codec-specific)
     pub(crate) audio_qscale: Option<i32>,
 
-    /// Parsed, sorted forced-keyframe times in microseconds (`AV_TIME_BASE_Q`).
-    /// FFmpeg `-force_key_frames` list form. `None` = feature off; set via
-    /// [`Output::set_force_key_frames`]. Applies to re-encoded video only.
-    pub(crate) forced_kf_pts: Option<Vec<i64>>,
+    /// Raw forced-keyframe spec (FFmpeg `-force_key_frames` list form), as
+    /// given to [`Output::set_force_key_frames`]. `None` = feature off.
+    /// Parsed and validated at open time (`parse_forced_key_frames`), like
+    /// every other deferred option; applies to re-encoded video only.
+    pub(crate) forced_kf_spec: Option<String>,
 
     /// Maximum number of **video** frames to encode (equivalent to `-frames:v` in FFmpeg).
     ///
@@ -482,14 +485,13 @@ impl Output {
     /// when the output is a callback (no URL); ignored otherwise. The default is
     /// 64 KiB, which keeps first-packet latency low for live use.
     ///
-    /// # Panics
-    /// Panics if `size` is 0 or exceeds `i32::MAX` (FFmpeg's `avio_alloc_context`
+    /// # Errors
+    /// The value is validated when the context is built:
+    /// `FfmpegContext::builder().build()` fails with
+    /// [`OpenOutputError::InvalidOption`](crate::error::OpenOutputError::InvalidOption)
+    /// if `size` is 0 or exceeds `i32::MAX` (FFmpeg's `avio_alloc_context`
     /// takes an `int` buffer size).
     pub fn set_io_buffer_size(mut self, size: usize) -> Self {
-        assert!(
-            size > 0 && size <= i32::MAX as usize,
-            "io_buffer_size must be in 1..=i32::MAX, got {size}"
-        );
         self.io_buffer_size = size;
         self
     }
@@ -506,10 +508,10 @@ impl Output {
     /// a sparse subtitle stream whose first packet lands deep into a
     /// high-bitrate file.
     ///
-    /// # Panics
-    /// Panics if `size` is 0.
+    /// # Errors
+    /// Validated when the context is built: `0` fails with
+    /// [`OpenOutputError::InvalidOption`](crate::error::OpenOutputError::InvalidOption).
     pub fn set_max_muxing_queue_size(mut self, size: usize) -> Self {
-        assert!(size > 0, "max_muxing_queue_size must be > 0");
         self.max_muxing_queue_size = size;
         self
     }
@@ -526,10 +528,10 @@ impl Output {
     /// ahead (late first packet on one mapped stream) need a larger threshold
     /// (and/or packet cap).
     ///
-    /// # Panics
-    /// Panics if `bytes` is 0.
+    /// # Errors
+    /// Validated when the context is built: `0` fails with
+    /// [`OpenOutputError::InvalidOption`](crate::error::OpenOutputError::InvalidOption).
     pub fn set_muxing_queue_data_threshold(mut self, bytes: usize) -> Self {
-        assert!(bytes > 0, "muxing_queue_data_threshold must be > 0");
         self.muxing_queue_data_threshold = bytes;
         self
     }
@@ -959,20 +961,25 @@ impl Output {
     /// based on the selected codec/container.
     ///
     /// # Parameters
-    /// * `framerate` - An `AVRational` representing the desired frame rate
-    ///   numerator/denominator (e.g., `AVRational { num: 30, den: 1 }` for 30fps).
+    /// * `num`: Frame rate numerator (e.g., 30 for 30fps, 24000 for 23.976fps)
+    /// * `den`: Frame rate denominator (e.g., 1 for 30fps, 1001 for 23.976fps)
     ///
     /// # Returns
     /// * `Self` - The modified `Output`, allowing method chaining.
     ///
+    /// # Errors
+    /// The value is validated when the context is built:
+    /// `FfmpegContext::builder().build()` fails with
+    /// [`OpenOutputError::InvalidOption`](crate::error::OpenOutputError::InvalidOption)
+    /// if `num` or `den` is not positive.
+    ///
     /// # Example
     /// ```rust,ignore
-    /// use ffmpeg_sys_next::AVRational;
     /// let output = Output::from("output.mp4")
-    ///     .set_framerate(AVRational { num: 30, den: 1 });
+    ///     .set_framerate(30, 1);
     /// ```
-    pub fn set_framerate(mut self, framerate: AVRational) -> Self {
-        self.framerate = Some(framerate);
+    pub fn set_framerate(mut self, num: i32, den: i32) -> Self {
+        self.framerate = Some(AVRational { num, den });
         self
     }
 
@@ -984,20 +991,24 @@ impl Output {
     /// (ffmpeg_filter.c choose_out_timebase).
     ///
     /// # Parameters
-    /// * `framerate_max` - An `AVRational` upper bound (e.g.,
-    ///   `AVRational { num: 30, den: 1 }` for 30fps).
+    /// * `num`: Upper-bound numerator (e.g., 30 for a 30fps cap)
+    /// * `den`: Upper-bound denominator
     ///
     /// # Returns
     /// * `Self` - The modified `Output`, allowing method chaining.
     ///
+    /// # Errors
+    /// Validated when the context is built, like
+    /// [`set_framerate`](Self::set_framerate): non-positive values fail with
+    /// [`OpenOutputError::InvalidOption`](crate::error::OpenOutputError::InvalidOption).
+    ///
     /// # Example
     /// ```rust,ignore
-    /// use ffmpeg_sys_next::AVRational;
     /// let output = Output::from("output.mp4")
-    ///     .set_framerate_max(AVRational { num: 30, den: 1 });
+    ///     .set_framerate_max(30, 1);
     /// ```
-    pub fn set_framerate_max(mut self, framerate_max: AVRational) -> Self {
-        self.framerate_max = Some(framerate_max);
+    pub fn set_framerate_max(mut self, num: i32, den: i32) -> Self {
+        self.framerate_max = Some(AVRational { num, den });
         self
     }
 
@@ -1089,32 +1100,33 @@ impl Output {
         self
     }
 
-    /// Sets the **audio sample format** for output encoding.
+    /// Sets the **audio sample format** for output encoding, by FFmpeg
+    /// format name — the same currency as [`set_pix_fmt`](Self::set_pix_fmt).
     ///
-    /// This method allows you to specify the audio sample format, which affects
-    /// how audio samples are represented. Common formats include:
-    /// - `AV_SAMPLE_FMT_S16` (signed 16-bit)
-    /// - `AV_SAMPLE_FMT_S32` (signed 32-bit)
-    /// - `AV_SAMPLE_FMT_FLT` (32-bit float)
-    /// - `AV_SAMPLE_FMT_FLTP` (32-bit float, planar)
-    ///
-    /// The format choice can impact quality, processing requirements, and compatibility.
+    /// Common names (see `ffmpeg -sample_fmts`):
+    /// - `"s16"` (signed 16-bit)
+    /// - `"s32"` (signed 32-bit)
+    /// - `"flt"` (32-bit float)
+    /// - `"fltp"` (32-bit float, planar)
     ///
     /// # Parameters
-    /// * `sample_fmt` - An `AVSampleFormat` enum value specifying the desired sample format.
+    /// * `sample_fmt` - The FFmpeg sample format name (e.g., `"s16"`).
     ///
     /// # Returns
     /// * `Self` - The modified `Output`, allowing method chaining.
     ///
+    /// # Errors
+    /// The name is resolved when the context is built (like
+    /// [`set_pix_fmt`](Self::set_pix_fmt)): an unknown name fails with
+    /// [`OpenOutputError::UnknownSampleFormat`](crate::error::OpenOutputError::UnknownSampleFormat).
+    ///
     /// # Example
     /// ```rust,ignore
-    /// use ffmpeg_sys_next::AVSampleFormat::AV_SAMPLE_FMT_S16;
-    ///
     /// let output = Output::from("output.mp4")
-    ///     .set_audio_sample_fmt(AV_SAMPLE_FMT_S16); // Set to signed 16-bit
+    ///     .set_audio_sample_fmt("s16"); // signed 16-bit
     /// ```
-    pub fn set_audio_sample_fmt(mut self, sample_fmt: AVSampleFormat) -> Self {
-        self.audio_sample_fmt = Some(sample_fmt);
+    pub fn set_audio_sample_fmt(mut self, sample_fmt: impl Into<String>) -> Self {
+        self.audio_sample_fmt = Some(sample_fmt.into());
         self
     }
 
@@ -1187,19 +1199,22 @@ impl Output {
     ///   time is meaningless.
     ///
     /// # Errors
-    /// Returns `Err(String)` if `spec` is empty, contains an empty token, or contains a
-    /// token that is not a finite, non-negative decimal number (this rejects `NaN`,
+    /// The spec is stored as given and validated when the context is built
+    /// (like every other deferred option): `FfmpegContext::builder().build()`
+    /// fails with [`OpenOutputError::InvalidOption`](crate::error::OpenOutputError::InvalidOption)
+    /// if it is empty, contains an empty token, or contains a token that is
+    /// not a finite, non-negative decimal number (this rejects `NaN`,
     /// infinities, and values that would overflow `i64` microseconds).
     ///
     /// # Example
     /// ```rust,ignore
     /// let output = Output::from("output.mp4")
     ///     .set_video_codec("libx264")
-    ///     .set_force_key_frames("0,5,10.5")?;
+    ///     .set_force_key_frames("0,5,10.5");
     /// ```
-    pub fn set_force_key_frames(mut self, spec: impl AsRef<str>) -> Result<Self, String> {
-        self.forced_kf_pts = Some(parse_forced_key_frames(spec.as_ref())?);
-        Ok(self)
+    pub fn set_force_key_frames(mut self, spec: impl Into<String>) -> Self {
+        self.forced_kf_spec = Some(spec.into());
+        self
     }
 
     /// Sets the **audio quality scale** for encoding.
@@ -1554,7 +1569,7 @@ impl From<Box<dyn FnMut(&[u8]) -> i32 + Send>> for Output {
             audio_sample_fmt: None,
             video_qscale: None,
             audio_qscale: None,
-            forced_kf_pts: None,
+            forced_kf_spec: None,
             max_video_frames: None,
             max_audio_frames: None,
             max_subtitle_frames: None,
@@ -1616,7 +1631,7 @@ impl From<String> for Output {
             audio_sample_fmt: None,
             video_qscale: None,
             audio_qscale: None,
-            forced_kf_pts: None,
+            forced_kf_spec: None,
             max_video_frames: None,
             max_audio_frames: None,
             max_subtitle_frames: None,
@@ -1753,9 +1768,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "io_buffer_size must be in 1..=i32::MAX")]
-    fn set_io_buffer_size_zero_panics() {
-        Output::from("out.mp4").set_io_buffer_size(0);
+    fn set_io_buffer_size_stores_invalid_values_for_deferred_validation() {
+        let output = Output::new_by_write_callback(|_| 0).set_io_buffer_size(0);
+        assert_eq!(output.io_buffer_size, 0);
     }
 
     #[test]
@@ -1781,15 +1796,12 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "max_muxing_queue_size must be > 0")]
-    fn set_max_muxing_queue_size_zero_panics() {
-        Output::from("out.mp4").set_max_muxing_queue_size(0);
-    }
-
-    #[test]
-    #[should_panic(expected = "muxing_queue_data_threshold must be > 0")]
-    fn set_muxing_queue_data_threshold_zero_panics() {
-        Output::from("out.mp4").set_muxing_queue_data_threshold(0);
+    fn muxing_queue_setters_store_invalid_values_for_deferred_validation() {
+        let output = Output::from("out.mp4")
+            .set_max_muxing_queue_size(0)
+            .set_muxing_queue_data_threshold(0);
+        assert_eq!(output.max_muxing_queue_size, 0);
+        assert_eq!(output.muxing_queue_data_threshold, 0);
     }
 
     #[test]

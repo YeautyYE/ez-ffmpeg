@@ -9,7 +9,7 @@
 
 use ez_ffmpeg::core::context::output::VSyncMethod;
 use ez_ffmpeg::stream_info::{find_video_stream_info, StreamInfo};
-use ez_ffmpeg::{AVRational, FfmpegContext, FfmpegScheduler, Input, Output};
+use ez_ffmpeg::{FfmpegContext, FfmpegScheduler, Input, Output};
 use std::time::Duration;
 
 fn tmp_path(name: &str) -> String {
@@ -70,7 +70,7 @@ fn fpsmax_caps_only_framerates_above_the_cap() {
             .output(
                 Output::from(out.as_str())
                     .set_video_codec("mpeg4")
-                    .set_framerate_max(AVRational { num: 30, den: 1 }),
+                    .set_framerate_max(30, 1),
             )
             .build()
             .unwrap()
@@ -121,7 +121,7 @@ fn fpsmax_caps_only_framerates_above_the_cap() {
             .output(
                 Output::from(out.as_str())
                     .set_video_codec("mpeg4")
-                    .set_framerate_max(AVRational { num: 30, den: 1 }),
+                    .set_framerate_max(30, 1),
             )
             .build()
             .unwrap()
@@ -180,7 +180,7 @@ fn vscfr_fills_gaps_but_keeps_initial_offset() {
             .output(
                 Output::from(out.as_str())
                     .set_video_codec("mpeg4")
-                    .set_framerate(AVRational { num: 30, den: 1 })
+                    .set_framerate(30, 1)
                     .set_vsync_method(VSyncMethod::VsyncVscfr),
             )
             .build()
@@ -229,7 +229,7 @@ fn fpsmax_with_an_explicit_non_cfr_vsync_is_rejected() {
         .output(
             Output::from(out.as_str())
                 .set_video_codec("mpeg4")
-                .set_framerate_max(AVRational { num: 30, den: 1 })
+                .set_framerate_max(30, 1)
                 .set_vsync_method(VSyncMethod::VsyncVfr),
         )
         .build();

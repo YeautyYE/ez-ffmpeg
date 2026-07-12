@@ -173,12 +173,13 @@ pub use self::core::{set_ffmpeg_log_level, FfmpegLogLevel, FFMPEG_LOG_TARGET};
 
 // ez-ffmpeg is a thin FFmpeg wrapper, so FFmpeg's core types appear in the public
 // API by design (e.g. `StreamInfo` carries an `AVCodecID`, an audio stream an
-// `AVChannelOrder`, `Output::set_audio_sample_fmt` takes an `AVSampleFormat`, and a
-// filter's info carries `filter::Flags`). They are re-exported here so downstream
-// code can name them via `ez_ffmpeg::` without a direct `ffmpeg-next` /
-// `ffmpeg-sys-next` dependency. Feature-specific ecosystem types (`bytes` for `flv`,
-// `bytemuck`/`glow` for the GPU features) are intentionally left exposed to callers
-// already working in those ecosystems.
+// `AVChannelOrder`, and a filter's info carries `filter::Flags`). They are
+// re-exported here so downstream code can name them via `ez_ffmpeg::` without a
+// direct `ffmpeg-next` / `ffmpeg-sys-next` dependency (`AVSampleFormat` no longer
+// appears in builder signatures but custom FrameFilters still probe frame formats
+// with it). Feature-specific ecosystem types (`bytes` for `flv`, `bytemuck`/`glow`
+// for the GPU features) are intentionally left exposed to callers already working
+// in those ecosystems.
 pub use ffmpeg_next::filter::Flags as FilterFlags;
 pub use ffmpeg_next::Frame;
 pub use ffmpeg_sys_next::AVChannelOrder;

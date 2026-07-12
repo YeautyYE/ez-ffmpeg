@@ -53,9 +53,7 @@ fn encode_video(force: Option<&str>, name: &str) -> String {
         .set_video_codec_opt("g", "600")
         .set_max_video_frames(90);
     if let Some(spec) = force {
-        output = output
-            .set_force_key_frames(spec)
-            .expect("force_key_frames spec should parse");
+        output = output.set_force_key_frames(spec);
     }
     let result = wait_with_watchdog(
         FfmpegContext::builder()
@@ -144,9 +142,7 @@ fn encode_audio(force: Option<&str>, name: &str) -> String {
     // so this genuinely exercises "the forced list must not reach an audio encoder".
     let mut output = Output::from(out.as_str()).set_audio_codec("pcm_s16le");
     if let Some(spec) = force {
-        output = output
-            .set_force_key_frames(spec)
-            .expect("force_key_frames spec should parse");
+        output = output.set_force_key_frames(spec);
     }
     let result = wait_with_watchdog(
         FfmpegContext::builder()

@@ -115,6 +115,32 @@ unsafe fn open_input_file(
     copy_ts: bool,
     interrupt_state: &Arc<crate::core::context::InterruptState>,
 ) -> Result<Demuxer> {
+    // Deferred validation of stored builder options (the setters are
+    // infallible and store values as given, like every other option).
+    if let Some((num, den)) = input.framerate {
+        if num <= 0 || den <= 0 {
+            return Err(OpenInputError::InvalidOption(format!(
+                "set_framerate requires positive numerator and denominator, got {num}/{den}"
+            ))
+            .into());
+        }
+    }
+    if let Some(scale) = input.ts_scale {
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(OpenInputError::InvalidOption(format!(
+                "set_ts_scale requires a positive finite value, got {scale}"
+            ))
+            .into());
+        }
+    }
+    if input.io_buffer_size == 0 || input.io_buffer_size > i32::MAX as usize {
+        return Err(OpenInputError::InvalidOption(format!(
+            "set_io_buffer_size must be in 1..=i32::MAX, got {}",
+            input.io_buffer_size
+        ))
+        .into());
+    }
+
     let mut in_fmt_ctx = avformat_alloc_context();
     if in_fmt_ctx.is_null() {
         return Err(OpenInputError::OutOfMemory.into());
