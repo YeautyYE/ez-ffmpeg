@@ -6,12 +6,12 @@ use crate::filter::frame_filter::{FrameFilter, FrameFilterError};
 use crate::util::frame_utils::{ensure_software_format, is_hw_format};
 use crate::wgpu_filter::frame_io::{self, HwMappedFrame, PlaneLayout};
 use crate::wgpu_filter::gpu_state::{create_staging, GpuState, OutputGeometry, StagingSlot};
-use crate::wgpu_filter::hw_interop;
 use crate::wgpu_filter::params::SharedParams;
 use crate::wgpu_filter::shaders;
 use ffmpeg_next::Frame;
 use ffmpeg_sys_next::AVMediaType;
-use std::collections::VecDeque;
+use log::warn;
+use std::collections::{HashSet, VecDeque};
 use std::marker::PhantomData;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -21,6 +21,39 @@ pub use crate::wgpu_filter::params::{WgpuFilterStats, WgpuParamsHandle};
 
 /// Upper bound for [`WgpuFrameFilterBuilder::frames_in_flight`].
 const MAX_FRAMES_IN_FLIGHT: usize = 4;
+
+/// Consecutive dmabuf import failures after which the per-frame import
+/// attempt is skipped for the current decoder hwframes context. A failed
+/// import is expensive (an export ioctl, a descriptor parse and a driver
+/// query, all torn down again) while the download fallback produces
+/// identical output, so after three consecutive failures — deterministic
+/// or transient alike — the filter stops paying that cost for this
+/// context: a streak of transient failures means sustained resource
+/// distress, where per-frame doomed import attempts only add churn.
+/// One- or two-frame blips self-heal (any success resets the count); a
+/// new hwframes context (seek, resolution change) or a successful re-pin
+/// after an unpinned stretch re-arms the attempt.
+const HW_IMPORT_FAILURE_LATCH: u32 = 3;
+
+/// Owned reference to the decoder hwframes context whose identity backs
+/// [`WgpuFrameFilter::hw_frames_ctx_key`]. Holding the reference keeps the
+/// allocation alive, so the allocator cannot hand the same address to a
+/// different context while the key still points at it — without the pin,
+/// a freed-and-reallocated context could silently inherit the previous
+/// context's latched failure count.
+struct HwFramesCtxPin(*mut ffmpeg_sys_next::AVBufferRef);
+
+// SAFETY: `AVBufferRef` reference counts are atomic and `av_buffer_unref`
+// is callable from any thread; the pin never dereferences the payload.
+unsafe impl Send for HwFramesCtxPin {}
+
+impl Drop for HwFramesCtxPin {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is null or a reference owned by this pin;
+        // av_buffer_unref handles both and nulls the pointer.
+        unsafe { ffmpeg_sys_next::av_buffer_unref(&mut self.0) };
+    }
+}
 
 /// Builder for [`WgpuFrameFilter`].
 pub struct WgpuFrameFilterBuilder {
@@ -144,6 +177,10 @@ impl WgpuFrameFilterBuilder {
             frames_in_flight: self.frames_in_flight,
             zero_copy_readback: self.zero_copy_readback,
             hw_zero_copy_input: self.hw_zero_copy_input,
+            hw_import_failures: 0,
+            hw_frames_ctx_key: 0,
+            hw_frames_ctx_pin: None,
+            warned_import_reasons: HashSet::new(),
             params: SharedParams::new(self.params_bytes),
             stats: Arc::new(Mutex::new(WgpuFilterStats::default())),
             gpu: None,
@@ -181,6 +218,22 @@ pub struct WgpuFrameFilter {
     frames_in_flight: usize,
     zero_copy_readback: bool,
     hw_zero_copy_input: bool,
+    /// Consecutive dmabuf import failures for the current decoder hwframes
+    /// context. At [`HW_IMPORT_FAILURE_LATCH`] the per-frame import attempt
+    /// (an av_hwframe_map export + parse + driver query, all torn down
+    /// again on failure) is skipped and frames go straight to the download
+    /// fallback; a new hwframes context re-arms the attempt.
+    hw_import_failures: u32,
+    /// Identity of the decoder hwframes context the failure count belongs
+    /// to (the AVHWFramesContext data pointer; 0 = none seen yet).
+    hw_frames_ctx_key: usize,
+    /// Keeps the context behind `hw_frames_ctx_key` alive so its address
+    /// cannot be recycled for a different context (see [`HwFramesCtxPin`]).
+    hw_frames_ctx_pin: Option<HwFramesCtxPin>,
+    /// Import-failure reasons already warned about: each distinct reason
+    /// logs once per filter instance (a process-wide latch would silence a
+    /// second instance or a mid-stream reason change entirely).
+    warned_import_reasons: HashSet<String>,
     params: SharedParams,
     stats: Arc<Mutex<WgpuFilterStats>>,
     gpu: Option<GpuState>,
@@ -291,8 +344,13 @@ impl WgpuFrameFilter {
         let res = self.gpu.as_mut().and_then(|g| g.resources.as_mut());
         match res {
             Some(res) => {
-                while let Ok(slot) = self.recycle.1.try_recv() {
+                while let Ok(mut slot) = self.recycle.1.try_recv() {
                     if slot.buf_size == res.buf_size && res.staging_pool.len() < cap {
+                        // A slot lent out across a resource rebuild can come
+                        // back with a bind group targeting the previous
+                        // generation's out_view; drop it here so an idle pool
+                        // slot cannot pin dead textures.
+                        slot.clear_direct_pack_bind_if_stale(res.resource_generation);
                         res.staging_pool.push(slot);
                     }
                 }
@@ -346,11 +404,22 @@ impl WgpuFrameFilter {
             }
         }
 
-        let Some(PendingOutput::Gpu(slot)) = self.pending.remove(pos) else {
+        let Some(PendingOutput::Gpu(mut slot)) = self.pending.remove(pos) else {
             unreachable!("pos still points at the Gpu entry checked above");
         };
         let t_download = Instant::now();
         let frame = if self.zero_copy_readback {
+            // Drop the cached direct-pack bind group only when the
+            // resources were rebuilt under it: a stale bind lent out
+            // inside the frame would pin the old `out_view` downstream,
+            // while a current-generation one is reused on the slot's next
+            // submission (no per-frame create_bind_group).
+            match self.gpu.as_ref().and_then(|g| g.resources.as_ref()) {
+                Some(res) => slot
+                    .staging
+                    .clear_direct_pack_bind_if_stale(res.resource_generation),
+                None => slot.staging.clear_direct_pack_bind(),
+            }
             // Lend the mapped staging buffer out inside the frame; it comes
             // back through `recycle` when the last reference drops.
             frame_io::build_output_frame_zero_copy(
@@ -539,24 +608,103 @@ impl FrameFilter for WgpuFrameFilter {
         let mut hw_mapped: Option<HwMappedFrame> = None;
         let frame = if is_hw_format(unsafe { (*raw).format }) {
             if self.hw_zero_copy_input {
-                let gpu = self.gpu.as_ref().ok_or("WgpuFrameFilter not initialized")?;
-                match frame_io::import_hw_frame(gpu, &frame) {
-                    Ok(mapped) => hw_mapped = Some(mapped),
-                    Err(reason) => hw_interop::warn_import_failed_once(&reason),
+                // A failed import is not free: an av_hwframe_map export
+                // (driver ioctls + dmabuf fds), a descriptor parse and a
+                // possible driver query, all torn down again — on top of
+                // the download the frame needs anyway. Latch the attempt
+                // off after consecutive failures; a new decoder hwframes
+                // context (seek, resolution change) re-arms it.
+                // SAFETY: `frame` is a live frame; pointer field read only.
+                let ctx = unsafe { (*raw).hw_frames_ctx };
+                let ctx_key = if ctx.is_null() {
+                    0
+                } else {
+                    // SAFETY: non-null `hw_frames_ctx` is a valid AVBufferRef.
+                    unsafe { (*ctx).data as usize }
+                };
+                if ctx_key != self.hw_frames_ctx_key {
+                    self.hw_frames_ctx_key = ctx_key;
+                    self.hw_import_failures = 0;
+                    self.hw_frames_ctx_pin = None;
+                }
+                if !ctx.is_null()
+                    && self
+                        .hw_frames_ctx_pin
+                        .as_ref()
+                        .is_none_or(|pin| pin.0.is_null())
+                {
+                    // SAFETY: `ctx` is the frame's live hwframes context;
+                    // av_buffer_ref only bumps its refcount. A null return
+                    // (OOM) leaves the pin inert, and this branch retries on
+                    // the next frame, so the guard heals once memory does.
+                    let pin = HwFramesCtxPin(unsafe { ffmpeg_sys_next::av_buffer_ref(ctx) });
+                    if !pin.0.is_null() {
+                        // Identity continuity is unprovable across an
+                        // unpinned stretch (the address may have been
+                        // recycled for a different context), so a successful
+                        // (re-)pin conservatively re-arms the failure latch.
+                        // Steady state hits this once per context, right
+                        // after the key-change reset above (a no-op there).
+                        self.hw_import_failures = 0;
+                    }
+                    self.hw_frames_ctx_pin = Some(pin);
+                }
+                if self.hw_import_failures < HW_IMPORT_FAILURE_LATCH {
+                    let gpu = self.gpu.as_ref().ok_or("WgpuFrameFilter not initialized")?;
+                    match frame_io::import_hw_frame(gpu, &frame) {
+                        Ok(mapped) => {
+                            self.hw_import_failures = 0;
+                            hw_mapped = Some(mapped);
+                        }
+                        Err(reason) => {
+                            self.hw_import_failures += 1;
+                            // Each distinct reason logs once per instance.
+                            if !self.warned_import_reasons.contains(&reason) {
+                                warn!(
+                                    "hw zero-copy input failed ({reason}); falling back to \
+                                     downloading hardware frames to system memory"
+                                );
+                                self.warned_import_reasons.insert(reason);
+                            }
+                            if self.hw_import_failures == HW_IMPORT_FAILURE_LATCH {
+                                warn!(
+                                    "hw zero-copy input: {HW_IMPORT_FAILURE_LATCH} consecutive \
+                                     import failures; skipping further attempts for this decoder \
+                                     context (frames use the download fallback)"
+                                );
+                            }
+                        }
+                    }
                 }
             }
             if hw_mapped.is_some() {
+                if let Ok(mut stats) = self.stats.lock() {
+                    stats.hw_import_frames += 1;
+                }
                 frame
             } else {
                 let t_download = Instant::now();
                 let sw = frame_io::download_hw_frame(&frame)
                     .map_err(|e| format!("WgpuFrameFilter: {e}"))?;
+                // Capture before taking the stats lock, so reader contention
+                // is not billed as download time.
+                let download_secs = t_download.elapsed().as_secs_f64();
                 if let Ok(mut stats) = self.stats.lock() {
-                    stats.upload_secs += t_download.elapsed().as_secs_f64();
+                    stats.hw_download_frames += 1;
+                    stats.hw_download_secs += download_secs;
                 }
                 sw
             }
         } else {
+            // A software frame ends any hardware sequence: release the
+            // context pin so a permanent HW->SW switch cannot retain the
+            // decoder's surface pool until uninit, and re-arm the import
+            // gate for a future hardware sequence.
+            if self.hw_frames_ctx_key != 0 {
+                self.hw_frames_ctx_key = 0;
+                self.hw_import_failures = 0;
+                self.hw_frames_ctx_pin = None;
+            }
             frame
         };
 
@@ -715,5 +863,6 @@ impl FrameFilter for WgpuFrameFilter {
         self.pending.clear();
         self.drain_recycled();
         self.gpu = None;
+        self.hw_frames_ctx_pin = None;
     }
 }

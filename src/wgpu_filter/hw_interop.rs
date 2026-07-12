@@ -19,12 +19,11 @@
 //! that transition preserves texels in practice. Pixel correctness is
 //! verified by an end-to-end test before trusting a new driver.
 
-use ash::{khr, vk};
 #[cfg(target_os = "linux")]
 use ash::ext;
+use ash::{khr, vk};
 #[cfg(target_os = "linux")]
 use log::info;
-use log::warn;
 
 /// DRM fourccs accepted for NV12-shaped exports (drm_fourcc.h values).
 const DRM_FORMAT_R8: u32 = 0x2020_3852; // 'R8  '
@@ -41,10 +40,15 @@ pub(crate) struct HwVulkanInterop {
     ash_device: ash::Device,
     physical_device: vk::PhysicalDevice,
     memfd: khr::external_memory_fd::Device,
-    /// (format, modifier) pairs already proven importable, so steady-state
-    /// frames skip the two per-plane driver queries. Never invalidated:
-    /// physical-device format support cannot change at runtime.
-    supported_modifiers: std::sync::Mutex<std::collections::HashSet<(i32, u64)>>,
+    /// (format, modifier) pairs mapped to their queried importability
+    /// (`None` = importable, `Some(reason)` = the original rejection), so
+    /// steady-state frames skip the per-plane driver queries — rejections
+    /// included: a rejecting driver would otherwise be re-queried on every
+    /// frame of the (already failing) import attempt. Storing the original
+    /// reason keeps cached rejections byte-identical for the caller's
+    /// warn-once-per-reason dedup. Never invalidated: physical-device
+    /// format support cannot change at runtime.
+    supported_modifiers: std::sync::Mutex<std::collections::HashMap<(i32, u64), Option<String>>>,
 }
 
 /// One plane of a DRM PRIME NV12 frame.
@@ -198,7 +202,7 @@ pub(crate) fn try_open_dmabuf_device(
                 ash_device,
                 physical_device,
                 memfd,
-                supported_modifiers: std::sync::Mutex::new(std::collections::HashSet::new()),
+                supported_modifiers: std::sync::Mutex::new(std::collections::HashMap::new()),
             },
         ))
     }
@@ -291,8 +295,12 @@ impl HwVulkanInterop {
                 .supported_modifiers
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if cache.contains(&cache_key) {
-                return Ok(());
+            match cache.get(&cache_key) {
+                Some(None) => return Ok(()),
+                // Replay the original reason verbatim so the caller's
+                // warn-once dedup sees cached and fresh rejections as one.
+                Some(Some(reason)) => return Err(reason.clone()),
+                None => {}
             }
         }
 
@@ -313,31 +321,58 @@ impl HwVulkanInterop {
         let mut props = vk::ImageFormatProperties2::default().push_next(&mut external_props);
 
         // SAFETY: valid instance/physical device; plain capability query.
-        unsafe {
+        let query = unsafe {
             self.ash_instance
                 .get_physical_device_image_format_properties2(
                     self.physical_device,
                     &format_info,
                     &mut props,
                 )
-                .map_err(|e| {
-                    format!("driver rejects {format:?} with modifier 0x{modifier:016x}: {e}")
-                })?;
+        };
+        let (support, deterministic) = match query {
+            Ok(()) => {
+                if external_props
+                    .external_memory_properties
+                    .external_memory_features
+                    .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
+                {
+                    (Ok(()), true)
+                } else {
+                    (
+                        Err(format!(
+                            "{format:?} with modifier 0x{modifier:016x} is not importable"
+                        )),
+                        true,
+                    )
+                }
+            }
+            Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED) => (
+                Err(format!(
+                    "driver rejects {format:?} with modifier 0x{modifier:016x}: \
+                     ERROR_FORMAT_NOT_SUPPORTED"
+                )),
+                true,
+            ),
+            // Out-of-memory (or any other unexpected) results describe this
+            // call, not the format; a later frame may succeed.
+            Err(e) => (
+                Err(format!(
+                    "querying {format:?} with modifier 0x{modifier:016x} failed: {e}"
+                )),
+                false,
+            ),
+        };
+        // Cache deterministic rejections too: format support cannot change
+        // at runtime, and a rejecting driver would otherwise pay this query
+        // on every frame of an import attempt that is going to fail anyway.
+        // Transient failures stay uncached so the next frame retries.
+        if deterministic {
+            self.supported_modifiers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(cache_key, support.as_ref().err().cloned());
         }
-        if !external_props
-            .external_memory_properties
-            .external_memory_features
-            .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
-        {
-            return Err(format!(
-                "{format:?} with modifier 0x{modifier:016x} is not importable"
-            ));
-        }
-        self.supported_modifiers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(cache_key);
-        Ok(())
+        support
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -501,18 +536,4 @@ impl HwVulkanInterop {
         };
         Ok(texture)
     }
-}
-
-/// Warns once per process about a hw import failure; later failures fall
-/// back silently (the download path takes over, and per-frame logging would
-/// only repeat the same reason).
-pub(crate) fn warn_import_failed_once(reason: &str) {
-    use std::sync::Once;
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        warn!(
-            "hw zero-copy input failed ({reason}); falling back to downloading \
-             hardware frames to system memory"
-        );
-    });
 }

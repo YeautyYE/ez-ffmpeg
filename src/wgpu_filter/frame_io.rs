@@ -200,12 +200,12 @@ fn plane_slice(
 /// plus the copy into `staging`, submits, and registers the readback map.
 /// Returns the submission index and the map-completion receiver.
 ///
-/// Uploads use `queue.write_texture`: wgpu's internal staging belt is already
-/// a persistently mapped ring with one CPU copy + one GPU copy per plane. A
-/// hand-rolled MAP_WRITE ring buffer was measured slower on this path
-/// (COPY_BYTES_PER_ROW_ALIGNMENT padding inflates the CPU copy for widths
-/// that are not multiples of 256, plus an extra map_async round trip per
-/// frame; 1080p upload 0.77 -> 0.95 ms/frame on RADV RENOIR).
+/// Uploads use `queue.write_texture`, although wgpu-core 26 allocates a
+/// transient staging buffer per call: a hand-rolled reusable MAP_WRITE ring
+/// was measured SLOWER on this path (COPY_BYTES_PER_ROW_ALIGNMENT pads every
+/// row to 256 B, inflating the CPU copy for widths that are not multiples of
+/// 256, plus an extra map_async round trip per frame; 1080p upload
+/// 0.77 -> 0.95 ms/frame on RADV RENOIR).
 pub(crate) fn upload_and_encode(
     gpu: &GpuState,
     frame: &Frame,
@@ -286,13 +286,18 @@ pub(crate) fn encode_and_submit(
 
     // Per-frame uniforms. Queue writes are ordered on the queue timeline, so
     // sharing one uniform buffer across in-flight frames is race-free: the
-    // write for frame N+1 executes after frame N's submission.
+    // write for frame N+1 executes after frame N's submission. The convert
+    // and pack payloads only change with geometry/colorspace, so an
+    // equal-value write is skipped (the buffer already holds these bytes).
     let convert_data: [u32; 4] = [matrix_id, full_range as u32, 0, 0];
-    gpu.queue.write_buffer(
-        &gpu.convert_uniforms,
-        0,
-        bytemuck::cast_slice(&convert_data),
-    );
+    if gpu.convert_uniforms_cache.get() != Some(convert_data) {
+        gpu.queue.write_buffer(
+            &gpu.convert_uniforms,
+            0,
+            bytemuck::cast_slice(&convert_data),
+        );
+        gpu.convert_uniforms_cache.set(Some(convert_data));
+    }
 
     // SAFETY: reading scalar fields from a live, validated frame.
     let play_time = unsafe {
@@ -328,8 +333,11 @@ pub(crate) fn encode_and_submit(
         matrix_id,
         full_range as u32,
     ];
-    gpu.queue
-        .write_buffer(&gpu.pack_uniforms, 0, bytemuck::cast_slice(&pack_data));
+    if gpu.pack_uniforms_cache.get() != Some(pack_data) {
+        gpu.queue
+            .write_buffer(&gpu.pack_uniforms, 0, bytemuck::cast_slice(&pack_data));
+        gpu.pack_uniforms_cache.set(Some(pack_data));
+    }
 
     // Encode the three passes.
     let mut encoder = gpu
@@ -688,16 +696,16 @@ unsafe extern "C" fn zero_copy_free(opaque: *mut libc::c_void, _data: *mut u8) {
 /// read their input, and any FFmpeg code that needs to write goes through
 /// `av_frame_make_writable`, which copies first.
 pub(crate) fn build_output_frame_zero_copy(
-    mut staging: StagingSlot,
+    staging: StagingSlot,
     geo: &OutputGeometry,
     src: &Frame,
     recycle_tx: &mpsc::Sender<StagingSlot>,
 ) -> Result<Frame, String> {
-    // A zero-copy frame can outlive the current resources (it stays alive
-    // downstream until the encoder releases it), so drop the cached direct-pack
-    // bind group before lending the slot out: otherwise a long-lived frame
-    // would pin a since-rebuilt `out_view` through it.
-    staging.clear_direct_pack_bind();
+    // The caller (complete_oldest_gpu) has already dropped a STALE cached
+    // direct-pack bind group — a zero-copy frame can outlive the current
+    // resources, and a stale bind would pin a since-rebuilt `out_view`
+    // through it. A current-generation bind stays cached so the next use
+    // of this slot skips the create_bind_group.
 
     let out_h = geo.out_h as usize;
     let out_ch = geo.out_h.div_ceil(2) as usize;

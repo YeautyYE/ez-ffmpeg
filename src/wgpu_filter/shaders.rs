@@ -155,73 +155,75 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    // Load the 8x2 block once (edge-clamped, exactly load_px semantics);
-    // both the luma words and the chroma averages read these registers, so
-    // no texel is fetched twice.
-    var rgb: array<array<vec3<f32>, 8>, 2>;
-    for (var row = 0u; row < 2u; row = row + 1u) {
-        for (var col = 0u; col < 8u; col = col + 1u) {
-            rgb[row][col] = load_px(x0 + col, y0 + row);
-        }
-    }
-
-    // Luma: two rows, two u32 words (4 pixels each) per row.
-    for (var row = 0u; row < 2u; row = row + 1u) {
-        let yy = y0 + row;
-        if (yy >= pu.height) {
-            break;
-        }
-        for (var w = 0u; w < 2u; w = w + 1u) {
-            let word_x0 = x0 + w * 4u;
-            // A fully out-of-range word must not be written at all: in the flat
-            // buffer, index yy*stride + stride aliases row yy+1 word 0.
-            if (word_x0 >= pu.width) {
-                break;
-            }
-            var word = 0u;
-            for (var b = 0u; b < 4u; b = b + 1u) {
-                let xx = word_x0 + b;
-                var val = 0u;
-                if (xx < pu.width) {
-                    val = quantize(rgb_to_yuv(rgb[row][w * 4u + b]).x);
-                }
-                word = word | (val << (b * 8u));
-            }
-            out_buf[yy * pu.y_stride_words + bx * 2u + w] = word;
-        }
-    }
-
-    // Chroma: one row per block, one u32 word of 4 subsampled samples. The
-    // 2x2 sources are the same block pixels loaded above (edge clamping
-    // included, since load_px clamped them at load time).
+    // Process the block as four 2x2 quads, one at a time: each quad
+    // contributes two adjacent luma bytes per row and one chroma sample,
+    // so only four RGB values are ever live (a whole-8x2 preload keeps a
+    // 48-float working set that spills on register-limited GPUs). Every
+    // texel is still fetched exactly once, edge-clamped by load_px, and
+    // the per-sample arithmetic (operand order included) is unchanged.
     let cw = (pu.width + 1u) / 2u;
     let ch = (pu.height + 1u) / 2u;
-    let cy = by;
-    if (cy >= ch) {
-        return;
-    }
-    // Same aliasing hazard as the luma tail: never write a fully OOB word.
-    if (bx * 4u >= cw) {
-        return;
-    }
+    let write_row1 = (y0 + 1u) < pu.height;
+    let write_chroma = (by < ch) && (bx * 4u < cw);
+    // Zero-initialized accumulators: [row][word].
+    var words: array<array<u32, 2>, 2>;
     var uw = 0u;
     var vw = 0u;
-    for (var b = 0u; b < 4u; b = b + 1u) {
-        let cx = bx * 4u + b;
-        var uval = 0u;
-        var vval = 0u;
-        if (cx < cw) {
-            let avg = (rgb[0][b * 2u] + rgb[0][b * 2u + 1u]
-                + rgb[1][b * 2u] + rgb[1][b * 2u + 1u]) * 0.25;
-            let yuv = rgb_to_yuv(avg);
-            uval = quantize(yuv.y);
-            vval = quantize(yuv.z);
+    for (var q = 0u; q < 4u; q = q + 1u) {
+        let px = x0 + q * 2u;
+        // Quads only move right: the first fully out-of-range quad ends
+        // the block (its luma bytes and chroma sample would all be OOB).
+        if (px >= pu.width) {
+            break;
         }
-        uw = uw | (uval << (b * 8u));
-        vw = vw | (vval << (b * 8u));
+        let p00 = load_px(px, y0);
+        let p10 = load_px(px + 1u, y0);
+        let p01 = load_px(px, y0 + 1u);
+        let p11 = load_px(px + 1u, y0 + 1u);
+
+        // Luma: two bytes per row into word q/2 at byte offset (q%2)*2.
+        let w = q / 2u;
+        let shift = (q % 2u) * 16u;
+        var row0 = quantize(rgb_to_yuv(p00).x);
+        if (px + 1u < pu.width) {
+            row0 = row0 | (quantize(rgb_to_yuv(p10).x) << 8u);
+        }
+        words[0][w] = words[0][w] | (row0 << shift);
+        if (write_row1) {
+            var row1 = quantize(rgb_to_yuv(p01).x);
+            if (px + 1u < pu.width) {
+                row1 = row1 | (quantize(rgb_to_yuv(p11).x) << 8u);
+            }
+            words[1][w] = words[1][w] | (row1 << shift);
+        }
+
+        // Chroma sample q: the quad average. Edge quads average clamped
+        // (replicated) loads, exactly like the block form did.
+        if (write_chroma && (bx * 4u + q) < cw) {
+            let avg = (p00 + p10 + p01 + p11) * 0.25;
+            let yuv = rgb_to_yuv(avg);
+            uw = uw | (quantize(yuv.y) << (q * 8u));
+            vw = vw | (quantize(yuv.z) << (q * 8u));
+        }
     }
-    out_buf[pu.u_offset_words + cy * pu.c_stride_words + bx] = uw;
-    out_buf[pu.v_offset_words + cy * pu.c_stride_words + bx] = vw;
+
+    // Luma words: a fully out-of-range word must not be written at all —
+    // in the flat buffer, index yy*stride + stride aliases row yy+1 word 0.
+    for (var w = 0u; w < 2u; w = w + 1u) {
+        if (x0 + w * 4u >= pu.width) {
+            break;
+        }
+        out_buf[y0 * pu.y_stride_words + bx * 2u + w] = words[0][w];
+        if (write_row1) {
+            out_buf[(y0 + 1u) * pu.y_stride_words + bx * 2u + w] = words[1][w];
+        }
+    }
+    // Chroma: one u32 word of 4 subsampled samples per block; same
+    // no-fully-OOB-word rule.
+    if (write_chroma) {
+        out_buf[pu.u_offset_words + by * pu.c_stride_words + bx] = uw;
+        out_buf[pu.v_offset_words + by * pu.c_stride_words + bx] = vw;
+    }
 }
 "#;
 
@@ -243,3 +245,35 @@ fn fs_main(@location(0) tex_coord: vec2<f32>) -> @location(0) vec4<f32> {
     return textureSample(texture1, sampler1, tex_coord);
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every built-in WGSL module must parse and validate offline: a shader
+    /// error would otherwise surface only at pipeline creation on a live
+    /// GPU device, which no CI lane has. The validator is the same naga
+    /// wgpu compiles these strings with at runtime.
+    #[test]
+    fn builtin_shaders_parse_and_validate() {
+        let planar = convert_fs_planar();
+        let nv12 = convert_fs_nv12();
+        let modules: [(&str, &str); 5] = [
+            ("fullscreen_vs", FULLSCREEN_VS),
+            ("convert_fs_planar", planar.as_str()),
+            ("convert_fs_nv12", nv12.as_str()),
+            ("pack_cs", PACK_CS),
+            ("identity_fs", IDENTITY_FS),
+        ];
+        for (name, source) in modules {
+            let module = naga::front::wgsl::parse_str(source)
+                .unwrap_or_else(|e| panic!("{name}: WGSL parse failed:\n{e}"));
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::all(),
+            )
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("{name}: WGSL validation failed: {e:?}"));
+        }
+    }
+}
