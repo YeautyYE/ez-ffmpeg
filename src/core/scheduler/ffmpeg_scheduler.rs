@@ -703,15 +703,16 @@ impl FfmpegScheduler<Running> {
 
     /// Blocks the current thread until the FFmpeg job finishes (success, error, or abort).
     ///
-    /// This method is only available in **non-async** builds.
+    /// Always available, with or without the `async` feature: the feature is
+    /// additive (as Cargo feature unification requires) and only ADDS a
+    /// `Future` implementation on `FfmpegScheduler<Running>`, so async code
+    /// can `scheduler.await` as a non-blocking alternative to calling this
+    /// method. Enabling `async` anywhere in a dependency graph never removes
+    /// or changes `wait()` for sync callers.
     ///
     /// # Returns
     /// - `Ok(())` if the job completed successfully.
     /// - `Err(...)` if an error was encountered (also logs the error).
-    ///
-    /// # Notes
-    /// - If you enable the `async` feature, this method is replaced by an async `.await`.
-    ///   See the `Future` implementation below.
     ///
     /// # Example
     /// ```rust,ignore
@@ -905,7 +906,9 @@ impl std::future::Future for FfmpegScheduler<Running> {
     /// #[tokio::main]
     /// async fn main() {
     ///     let scheduler = FfmpegScheduler::new(ffmpeg_context).start().unwrap();
-    ///     let result = scheduler.await;  // same as scheduler.wait().await
+    ///     // Resolves when the job finishes — the non-blocking counterpart
+    ///     // of the always-available synchronous `wait()`.
+    ///     let result = scheduler.await;
     ///     assert!(result.is_ok());
     /// }
     /// ```
