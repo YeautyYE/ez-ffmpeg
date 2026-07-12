@@ -83,8 +83,10 @@
 //! chroma-downsampled on the GPU), tagged with the effective input color
 //! range (J-format input yields a full-range-tagged output).
 
+pub mod effects;
 pub mod wgpu_frame_filter;
 
+mod error;
 mod frame_io;
 mod gpu_state;
 mod hw_interop;
@@ -93,5 +95,6 @@ pub(crate) mod shaders;
 #[cfg(test)]
 mod tests;
 
+pub use error::WgpuFilterError;
 pub use params::{WgpuFilterStats, WgpuParamsHandle};
 pub use wgpu_frame_filter::{WgpuFrameFilter, WgpuFrameFilterBuilder};

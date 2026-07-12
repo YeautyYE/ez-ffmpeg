@@ -4,6 +4,7 @@
 use crate::core::filter::frame_filter_context::FrameFilterContext;
 use crate::filter::frame_filter::{FrameFilter, FrameFilterError};
 use crate::util::frame_utils::{ensure_software_format, is_hw_format};
+use crate::wgpu_filter::error::WgpuFilterError;
 use crate::wgpu_filter::frame_io::{self, HwMappedFrame, PlaneLayout};
 use crate::wgpu_filter::gpu_state::{
     create_staging, EffectSource, GpuState, OutputGeometry, StagingSlot,
@@ -214,22 +215,25 @@ impl WgpuFrameFilterBuilder {
         self
     }
 
-    pub fn build(self) -> Result<WgpuFrameFilter, String> {
+    pub fn build(self) -> Result<WgpuFrameFilter, WgpuFilterError> {
+        let invalid = |msg: String| Err(WgpuFilterError::InvalidOption(msg));
         if self.fragment_shader.is_empty() {
-            return Err(
+            return invalid(
                 "WgpuFrameFilter requires a fragment shader (shader_wgsl or shader_yuv_wgsl)"
                     .to_string(),
             );
         }
         if self.effect_domain == EffectDomain::Yuv {
             if !shaders::body_defines_ez_effect(&self.fragment_shader) {
-                return Err("shader_yuv_wgsl takes a shader body defining \
+                return invalid(
+                    "shader_yuv_wgsl takes a shader body defining \
                      `fn ez_effect(coord: vec2<f32>) -> vec3<f32>`, not a complete fragment \
                      module; see the shader_yuv_wgsl documentation"
-                    .to_string());
+                        .to_string(),
+                );
             }
             if shaders::body_declares_reserved_group(&self.fragment_shader) {
-                return Err(
+                return invalid(
                     "shader_yuv_wgsl bodies may only declare the params group, spelled \
                      literally `@group(1)` — @group(0) is reserved for the library prelude \
                      (an unused duplicate would silently alias its resources), and group \
@@ -241,20 +245,20 @@ impl WgpuFrameFilterBuilder {
         }
         if let Some((w, h)) = self.output_size {
             if w == 0 || h == 0 {
-                return Err(format!("Invalid output size {w}x{h}"));
+                return invalid(format!("Invalid output size {w}x{h}"));
             }
         }
         // `is_multiple_of` would need Rust 1.87; keep `%` for the older MSRV.
         #[allow(clippy::manual_is_multiple_of)]
         if self.params_bytes.len() % 4 != 0 {
-            return Err(format!(
+            return invalid(format!(
                 "Params type size must be a multiple of 4 bytes (got {}); \
                  add explicit padding fields to the struct",
                 self.params_bytes.len()
             ));
         }
         if !(1..=MAX_FRAMES_IN_FLIGHT).contains(&self.frames_in_flight) {
-            return Err(format!(
+            return invalid(format!(
                 "frames_in_flight must be within 1..={MAX_FRAMES_IN_FLIGHT} (got {})",
                 self.frames_in_flight
             ));
@@ -389,25 +393,25 @@ impl WgpuFrameFilter {
 
     /// Creates a filter from a WGSL fragment shader with default settings,
     /// mirroring `OpenGLFrameFilter::new_simple`.
-    pub fn new_simple(fragment_shader_wgsl: impl Into<String>) -> Result<Self, String> {
+    pub fn new_simple(fragment_shader_wgsl: impl Into<String>) -> Result<Self, WgpuFilterError> {
         Self::builder().shader_wgsl(fragment_shader_wgsl).build()
     }
 
     /// Identity filter (pass-through through the full GPU pipeline); useful
     /// for measuring the pipeline's fixed cost.
-    pub fn new_identity() -> Result<Self, String> {
+    pub fn new_identity() -> Result<Self, WgpuFilterError> {
         Self::new_simple(shaders::IDENTITY_FS)
     }
 
     /// Typed handle for live parameter updates. `P` must match the type given
     /// to [`WgpuFrameFilterBuilder::params`].
-    pub fn params_handle<P: bytemuck::Pod>(&self) -> Result<WgpuParamsHandle<P>, String> {
+    pub fn params_handle<P: bytemuck::Pod>(&self) -> Result<WgpuParamsHandle<P>, WgpuFilterError> {
         if std::mem::size_of::<P>() != self.params.len {
-            return Err(format!(
-                "Params type size mismatch: builder was given {} bytes, handle type has {} bytes",
+            return Err(WgpuFilterError::ParamsTypeMismatch(format!(
+                "builder was given {} bytes, handle type has {} bytes",
                 self.params.len,
                 std::mem::size_of::<P>()
-            ));
+            )));
         }
         Ok(WgpuParamsHandle {
             bytes: Arc::clone(&self.params.bytes),

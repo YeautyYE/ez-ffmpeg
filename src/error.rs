@@ -140,6 +140,10 @@ pub enum Error {
     #[error("Subtitle error: {0}")]
     Subtitle(#[from] crate::subtitle::SubtitleError),
 
+    #[cfg(feature = "wgpu")]
+    #[error("Wgpu filter error: {0}")]
+    WgpuFilter(#[from] crate::wgpu_filter::WgpuFilterError),
+
     #[error("IO error:{0}")]
     IO(#[from] io::Error),
 
