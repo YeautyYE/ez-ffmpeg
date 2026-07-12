@@ -678,6 +678,14 @@ pub struct Reactor {
     max_connections: usize,
     /// Connections with pending writes that need flushing (dirty tracking for O(m) instead of O(n))
     pending_flush: HashSet<usize>,
+    /// Connections that stopped at MAX_READ_PER_POLL and must be re-drained
+    /// next loop iteration. An edge-triggered poller (EPOLLET/EV_CLEAR) fires no
+    /// new readable event for bytes already in the kernel buffer, so we resume
+    /// the drain ourselves rather than wait for the peer. Unlike `pending_flush`
+    /// (drained within the same iteration) this set crosses iterations, so ids
+    /// must be scrubbed on connection removal: the slab reuses ids and a stale
+    /// entry would read a brand-new connection out of turn.
+    read_pending: HashSet<usize>,
     /// Connections whose poller interest may need updating (dirty tracking for O(m) instead of O(n))
     interest_dirty: HashSet<usize>,
     /// Reusable buffer for connection IDs (to avoid Vec allocation in hot path)
@@ -730,6 +738,7 @@ impl Reactor {
             status,
             max_connections: effective_max,
             pending_flush: HashSet::with_capacity(256),
+            read_pending: HashSet::new(),
             interest_dirty: HashSet::with_capacity(256),
             conn_ids_buffer: Vec::with_capacity(1024),
             packets_buffer: Vec::with_capacity(64),
@@ -832,6 +841,10 @@ impl Reactor {
 
     /// Remove connection
     pub fn remove_connection(&mut self, id: usize) {
+        // A pending re-drain must not outlive the connection: `read_pending`
+        // stores raw ids (no generation), and the slab may hand this id to a
+        // new connection next iteration.
+        self.read_pending.remove(&id);
         if let Some(conn) = self.connections.try_remove(id) {
             // Deregister from poller
             if let Err(e) = self.poller.deregister(conn.raw_handle()) {
@@ -938,7 +951,47 @@ impl Reactor {
             self.results_buffer.push(HandleResult::Disconnect(id));
         }
 
+        // try_read caps each pass at MAX_READ_PER_POLL to bound memory, so
+        // `data.len() >= MAX_READ_PER_POLL` means it stopped at the cap (not at
+        // WouldBlock) and the kernel buffer may still hold a tail. Under an
+        // edge-triggered poller no further readable event fires for those bytes,
+        // so mark the connection to be re-drained next iteration. `should_close`
+        // is always false at the cap (try_read returns EOF only via a 0-read),
+        // but processing may have condemned this connection (handshake error,
+        // scheduler-driven disconnect) — a doomed connection must not be
+        // re-read after the decision to close it.
+        let self_disconnect = self.results_buffer.iter().any(|r| {
+            let HandleResult::Disconnect(close_id) = r;
+            *close_id == id
+        });
+        if !should_close && !self_disconnect && data.len() >= MAX_READ_PER_POLL {
+            self.read_pending.insert(id);
+        }
+
         std::mem::take(&mut self.results_buffer)
+    }
+
+    /// Re-drain connections whose read stopped at MAX_READ_PER_POLL in a
+    /// previous iteration (loop step 5b). Skips ids the event pass already
+    /// read this iteration (their read either drained to WouldBlock or
+    /// re-inserted itself into `read_pending`) and ids already slated for
+    /// close (error/hangup or a disconnect decision this pass) — both would
+    /// otherwise read a second time between two flush points.
+    fn resume_capped_reads(
+        &mut self,
+        resume_ids: Vec<usize>,
+        read_this_pass: &[usize],
+        ids_to_close: &mut Vec<usize>,
+    ) {
+        for id in resume_ids {
+            if read_this_pass.contains(&id) || ids_to_close.contains(&id) {
+                continue;
+            }
+            for result in self.handle_readable(id) {
+                let HandleResult::Disconnect(close_id) = result;
+                ids_to_close.push(close_id);
+            }
+        }
     }
 
     /// Read data from connection
@@ -1600,11 +1653,12 @@ impl Reactor {
             // of latency per excess batch. Poll non-blocking and let steps
             // 5-10 run in between, which is exactly what the budget exists
             // to guarantee.
-            let poll_wait = if new_publisher_added || publishers_pending {
-                Duration::ZERO
-            } else {
-                poll_timeout
-            };
+            let poll_wait =
+                if new_publisher_added || publishers_pending || !self.read_pending.is_empty() {
+                    Duration::ZERO
+                } else {
+                    poll_timeout
+                };
             let events = match self.poller.poll(Some(poll_wait)) {
                 Ok(events) => events,
                 Err(e) => {
@@ -1613,8 +1667,21 @@ impl Reactor {
                 }
             };
 
+            // 5-pre. Snapshot the cap-hit re-drain set BEFORE processing this
+            // round's events: ids inserted during step 5 below belong to the
+            // NEXT iteration. Each connection is thus read at most once per
+            // flush cycle (step 7) — resuming a same-pass cap-hit immediately
+            // would let a single connection push ~2x MAX_READ_PER_POLL into
+            // subscriber queues before any flush ran.
+            let resume_ids: Vec<usize> = if self.read_pending.is_empty() {
+                Vec::new()
+            } else {
+                self.read_pending.drain().collect()
+            };
+
             // 5. Process IO events
             let mut ids_to_close = Vec::new();
+            let mut read_ids: Vec<usize> = Vec::new();
 
             for event in events {
                 let poller_token = event.token;
@@ -1641,6 +1708,12 @@ impl Reactor {
 
                 // Handle readable (drain until WouldBlock)
                 if event.is_readable() {
+                    // Track for the step-5b skip only while a resume is
+                    // actually pending: the common no-cap-hit pass must not
+                    // pay a per-batch Vec allocation for a list nobody reads.
+                    if !resume_ids.is_empty() {
+                        read_ids.push(id);
+                    }
                     let results = self.handle_readable(id);
                     for result in results {
                         let HandleResult::Disconnect(close_id) = result;
@@ -1655,6 +1728,14 @@ impl Reactor {
                     }
                 }
             }
+
+            // 5b. Resume connections that stopped at the MAX_READ_PER_POLL cap
+            // last iteration. Each resume reads another <=512KB; a still-
+            // saturated connection re-inserts itself (picked up next iteration),
+            // so progress is bounded per loop and no new edge event is needed
+            // to keep draining. `poll_wait` is ZERO while `read_pending` is
+            // non-empty so the tail is not stalled.
+            self.resume_capped_reads(resume_ids, &read_ids, &mut ids_to_close);
 
             // 6. Handle publishers data
             let (publisher_ids_to_remove, budget_exhausted) = self.process_publishers();
@@ -3090,6 +3171,121 @@ mod tests {
                 .as_deref(),
             Some(video_seq),
             "the next round must deliver the remaining item"
+        );
+    }
+
+    /// Fixture for the cap-resume (step 5b) tests: a reactor plus one
+    /// handshaking connection whose peer has already sent C0+C1. A resumed
+    /// read that actually happens processes the handshake and enqueues the
+    /// S0+S1+S2 response (observable via `is_pending_flush`); a skipped read
+    /// leaves nothing queued.
+    fn reactor_with_handshake_bytes_pending() -> (Reactor, ConnectionToken, TcpStream) {
+        use std::io::Write;
+
+        let stream_keys = Arc::new(dashmap::DashSet::new());
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let mut reactor =
+            Reactor::new(3, None, stream_keys, status).expect("Failed to create reactor");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to get address");
+        let mut client = TcpStream::connect(addr).expect("Failed to connect");
+        let (server, _) = listener.accept().expect("Failed to accept");
+
+        let token = reactor
+            .add_connection(server)
+            .expect("Failed to add connection");
+        // add_connection leaves the state at Handshaking.
+
+        // C0 (version 3) + C1 (1536 bytes: time, zeros, filler).
+        let mut c0c1 = vec![0u8; 1537];
+        c0c1[0] = 3;
+        for (i, b) in c0c1[9..].iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        client.write_all(&c0c1).expect("write C0+C1");
+        client.flush().ok();
+        // Loopback delivery is fast but not instant; without this the skip
+        // assertions could pass vacuously against a not-yet-readable socket.
+        std::thread::sleep(Duration::from_millis(100));
+
+        (reactor, token, client)
+    }
+
+    /// A connection already slated for close this pass (error/hangup event or
+    /// a disconnect decision) must not be read again by the step-5b resume:
+    /// the close decision precedes the resume, and reading a doomed
+    /// connection would push more data at its subscribers after that point.
+    #[test]
+    fn resume_capped_reads_skips_ids_slated_for_close() {
+        let (mut reactor, token, _client) = reactor_with_handshake_bytes_pending();
+
+        let mut ids_to_close = vec![token.id];
+        reactor.resume_capped_reads(vec![token.id], &[], &mut ids_to_close);
+        assert!(
+            !reactor.is_pending_flush(token.id),
+            "a close-slated id must not be re-read by the resume pass"
+        );
+
+        // Control: the same resume with nothing slated reads the handshake
+        // and enqueues the S0+S1+S2 response — proving the data was sitting
+        // there while the first call skipped it.
+        reactor.resume_capped_reads(vec![token.id], &[], &mut Vec::new());
+        assert!(
+            reactor.is_pending_flush(token.id),
+            "an unblocked resume must read the pending handshake bytes"
+        );
+
+        reactor.remove_connection(token.id);
+    }
+
+    /// An id the event pass already read this iteration must not be read a
+    /// second time by the resume: one read per connection per flush cycle,
+    /// or a single connection could pile ~2x MAX_READ_PER_POLL into
+    /// subscriber queues before any flush runs.
+    #[test]
+    fn resume_capped_reads_skips_ids_already_read_this_pass() {
+        let (mut reactor, token, _client) = reactor_with_handshake_bytes_pending();
+
+        reactor.resume_capped_reads(vec![token.id], &[token.id], &mut Vec::new());
+        assert!(
+            !reactor.is_pending_flush(token.id),
+            "an id already read by the event pass must not be read again"
+        );
+
+        reactor.resume_capped_reads(vec![token.id], &[], &mut Vec::new());
+        assert!(
+            reactor.is_pending_flush(token.id),
+            "an unblocked resume must read the pending handshake bytes"
+        );
+
+        reactor.remove_connection(token.id);
+    }
+
+    /// `read_pending` stores raw slab ids with no generation: an entry left
+    /// behind by a removed connection would make the resume pass read a new
+    /// connection that reused the id. Removal must scrub the set.
+    #[test]
+    fn remove_connection_scrubs_read_pending() {
+        let stream_keys = Arc::new(dashmap::DashSet::new());
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let mut reactor =
+            Reactor::new(3, None, stream_keys, status).expect("Failed to create reactor");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to get address");
+        let _client = TcpStream::connect(addr).expect("Failed to connect");
+        let (server, _) = listener.accept().expect("Failed to accept");
+
+        let token = reactor
+            .add_connection(server)
+            .expect("Failed to add connection");
+        reactor.read_pending.insert(token.id);
+
+        reactor.remove_connection(token.id);
+        assert!(
+            !reactor.read_pending.contains(&token.id),
+            "removal must scrub the id or a slab-reusing new connection would be read out of turn"
         );
     }
 }
