@@ -19,6 +19,16 @@ pub struct WgpuFilterStats {
     pub gpu_secs: f64,
     /// CPU time spent copying mapped readback bytes into output frames.
     pub download_secs: f64,
+    /// Hardware input frames imported zero-copy (dmabuf).
+    pub hw_import_frames: u64,
+    /// Hardware input frames downloaded to system memory instead — with
+    /// `hw_zero_copy_input` enabled, a nonzero count reveals the import
+    /// fallback engaging (a large per-frame perf cliff that a log line
+    /// alone cannot make visible mid-stream).
+    pub hw_download_frames: u64,
+    /// Wall time spent in `av_hwframe_transfer_data` downloads (previously
+    /// folded into `upload_secs`, which hid the fallback's cost).
+    pub hw_download_secs: f64,
 }
 
 /// Live handle for updating shader parameters from any thread while the

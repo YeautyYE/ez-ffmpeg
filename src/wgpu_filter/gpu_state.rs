@@ -41,6 +41,15 @@ pub(crate) struct GpuState {
     pub(crate) params_buf: wgpu::Buffer,
     pub(crate) convert_uniforms: wgpu::Buffer,
     pub(crate) pack_uniforms: wgpu::Buffer,
+    /// Last-written convert/pack uniform payloads. Geometry- and
+    /// colorspace-stable streams (the common case) skip the redundant
+    /// per-frame `queue.write_buffer` — each costs a staging-belt
+    /// allocation plus a recorded GPU-side copy. Queue writes are
+    /// queue-ordered, so a skipped write leaves bit-identical buffer
+    /// contents even with frames in flight; `Cell` suffices because all
+    /// encoding happens on the one pipeline thread.
+    pub(crate) convert_uniforms_cache: std::cell::Cell<Option<[u32; 4]>>,
+    pub(crate) pack_uniforms_cache: std::cell::Cell<Option<[u32; 8]>>,
     pub(crate) resources: Option<FrameResources>,
     /// Raw Vulkan handles for dmabuf import; present only when the device
     /// was opened with the external-memory extensions (hw zero-copy input).
@@ -79,11 +88,13 @@ pub(crate) struct FrameResources {
     /// Idle MAP_READ staging slots; one is taken per in-flight frame and
     /// returned (or dropped, after a geometry change) on completion.
     ///
-    /// Uploads deliberately stay on `queue.write_texture`: wgpu's internal
-    /// staging belt is already a persistently mapped ring with the same
-    /// one-CPU-copy + one-GPU-copy cost. A hand-rolled MAP_WRITE ring was
-    /// measured slower here (256-aligned row padding plus an extra map_async
-    /// per frame; 1080p upload 0.77 -> 0.95 ms/frame on RADV RENOIR).
+    /// Uploads deliberately stay on `queue.write_texture`, although
+    /// wgpu-core 26 allocates a transient staging buffer per call: a
+    /// hand-rolled reusable MAP_WRITE ring was measured SLOWER on this
+    /// path (COPY_BYTES_PER_ROW_ALIGNMENT pads every row to 256 B, which
+    /// inflates the CPU copy for non-multiple-of-256 widths, plus an extra
+    /// map_async round trip per frame; 1080p upload 0.77 -> 0.95 ms/frame
+    /// on RADV RENOIR).
     pub(crate) staging_pool: Vec<StagingSlot>,
     pub(crate) y_stride: usize,
     pub(crate) c_stride: usize,
@@ -192,6 +203,25 @@ impl StagingSlot {
     /// a stale `out_view` through the cached bind group.
     pub(crate) fn clear_direct_pack_bind(&mut self) {
         self.direct_pack_bind = None;
+    }
+
+    /// Drops the cached direct-pack bind group only when it was built for a
+    /// previous resource generation. A STALE bind lent out inside a
+    /// zero-copy frame would pin the rebuilt-away `out_view` for the
+    /// frame's whole downstream lifetime; a CURRENT-generation bind pins
+    /// objects that are alive anyway, so keeping it lets geometry-stable
+    /// streams reuse the bind group instead of paying `create_bind_group`
+    /// every frame. Accepted trade-off: a slot lent out just before a
+    /// mid-stream rebuild keeps the old view alive for that one frame's
+    /// bounded lifetime.
+    pub(crate) fn clear_direct_pack_bind_if_stale(&mut self, generation: u64) {
+        if self
+            .direct_pack_bind
+            .as_ref()
+            .is_some_and(|cached| cached.resource_generation != generation)
+        {
+            self.direct_pack_bind = None;
+        }
     }
 }
 
@@ -566,6 +596,8 @@ impl GpuState {
             params_buf,
             convert_uniforms,
             pack_uniforms,
+            convert_uniforms_cache: std::cell::Cell::new(None),
+            pack_uniforms_cache: std::cell::Cell::new(None),
             resources: None,
             hw_interop,
             direct_pack,

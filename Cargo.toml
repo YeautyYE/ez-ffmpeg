@@ -97,3 +97,7 @@ libc = "0.2.159"
 # Integration tests re-open output files and inspect raw AVStream fields
 # (extradata / codec_type) that the public StreamInfo API does not expose.
 ffmpeg-sys-next = "8.1.0"
+# Offline WGSL parse/validation of the built-in wgpu shaders: errors would
+# otherwise surface only at pipeline creation on a live GPU device. Same
+# major as wgpu, which compiles these shaders with this naga at runtime.
+naga = { version = "26", features = ["wgsl-in"] }
