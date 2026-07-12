@@ -410,6 +410,76 @@ fn blend_direct<S: Sample>(
     }
 }
 
+/// Fused packed-RGB fast path: the three interleaved U8 components of one
+/// packed plane blend in a single mask traversal. The per-component path
+/// walks the same destination rows and re-scans the same coverage mask
+/// three times (once per component task); dense packed-RGB burn-in pays
+/// ~3x the mask and row traffic for identical output. One pass per overlay
+/// writes all three samples of each covered pixel instead. Zero-mask skip
+/// blocks match [`blend_direct`]; a zero mask byte inside a live block is
+/// skipped rather than identity-blended (`S::blend(dst, src, 0) == dst`
+/// bit-exactly, so the output is unchanged — the strided three-sample
+/// writes cannot autovectorize, which makes the branch the cheaper choice
+/// here).
+///
+/// `plane` must span all three components from the lowest component
+/// offset; `offsets` are byte offsets within one pixel group (< step) and
+/// `srcs` the matching converted colors.
+pub(crate) fn blend_packed_rgb_u8(
+    plane: &mut PlaneView<'_>,
+    grid_w: usize,
+    grid_h: usize,
+    image: &OverlayImage<'_>,
+    srcs: [u32; 3],
+    offsets: [usize; 3],
+    alpha: u32,
+) {
+    if alpha == 0 || image.w == 0 || image.h == 0 {
+        return;
+    }
+    let Some((x0, xm0, w)) = clip_interval(grid_w, image.dst_x, image.w) else {
+        return;
+    };
+    let Some((y0, ym0, h)) = clip_interval(grid_h, image.dst_y, image.h) else {
+        return;
+    };
+    let step = plane.pixel_step;
+    let max_off = offsets[0].max(offsets[1]).max(offsets[2]);
+    for row in 0..h {
+        let mask_start = (ym0 + row) * image.stride + xm0;
+        let mask_row = &image.bitmap[mask_start..mask_start + w];
+        let dst_start = (y0 + row) * plane.linesize + x0 * step;
+        // The row ends at the last pixel's farthest component sample; the
+        // trailing interleave bytes may not exist on tight buffers,
+        // exactly like `row_len`.
+        let dst_row = &mut plane.data[dst_start..dst_start + (w - 1) * step + max_off + 1];
+        let block = SampleU8::SKIP_CHUNK;
+        let mut px = 0;
+        while px < w {
+            let end = (px + block).min(w);
+            if end - px == block && mask_is_zero(&mask_row[px..end]) {
+                px = end;
+                continue;
+            }
+            for (offset, &mask) in mask_row[px..end].iter().enumerate() {
+                let coverage = u32::from(mask) * alpha;
+                if coverage == 0 {
+                    continue;
+                }
+                let pixel = (px + offset) * step;
+                for component in 0..3 {
+                    let at = pixel + offsets[component];
+                    let sample = &mut dst_row[at..at + 1];
+                    let blended =
+                        SampleU8::blend(SampleU8::load(sample), srcs[component], coverage);
+                    SampleU8::store(sample, blended);
+                }
+            }
+            px = end;
+        }
+    }
+}
+
 /// Byte length of a destination row of `pixels` interleaved samples: it
 /// ends at the LAST sample's end, not at `pixels * step`. On offset
 /// interleaved components (NV12/NV21 chroma, P010, packed RGB) the plane

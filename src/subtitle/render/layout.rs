@@ -75,13 +75,40 @@ pub(crate) struct FrameContext<'a> {
     pub opts: &'a RenderOptions,
 }
 
+/// Output scale from script (PlayRes) space. Shared by [`FrameContext`]
+/// and the renderer's anchor quantization so both derive the identical
+/// factors — a drift would make sampled keys disagree with rendered nodes.
+pub(crate) fn play_res_scale(frame_w: i32, frame_h: i32, script: &Script) -> (f64, f64) {
+    (
+        f64::from(frame_w) / f64::from(script.play_res_x.max(1)),
+        f64::from(frame_h) / f64::from(script.play_res_y.max(1)),
+    )
+}
+
+/// A scaled anchor coordinate quantized to 1/8 output pixel (the libass
+/// bitmap-cache convention). Layout rasterizes a `\move` event at `q / 8`
+/// px and the sample key stores `q`, so two frames whose anchors share the
+/// subpixel phase (`q` differing by a multiple of 8) rasterize
+/// byte-identical masks at an integer-pixel offset — the renderer then
+/// translates the cached template instead of re-rendering.
+///
+/// `None` for a non-finite result (hostile endpoints can produce NaN even
+/// from finite inputs, e.g. `0 * -inf` mid-interpolation): a NaN would
+/// otherwise cast to `0`, a perfectly VALID origin anchor, and render
+/// garbage at the top-left instead of being dropped by the non-finite
+/// path guards.
+pub(crate) fn quantize_anchor_q8(coord: f64, scale: f64) -> Option<i64> {
+    let scaled = coord * scale * 8.0;
+    scaled.is_finite().then(|| scaled.round() as i64)
+}
+
 impl FrameContext<'_> {
     fn scale_x(&self) -> f64 {
-        f64::from(self.frame_w) / f64::from(self.script.play_res_x.max(1))
+        play_res_scale(self.frame_w, self.frame_h, self.script).0
     }
 
     fn scale_y(&self) -> f64 {
-        f64::from(self.frame_h) / f64::from(self.script.play_res_y.max(1))
+        play_res_scale(self.frame_w, self.frame_h, self.script).1
     }
 
     /// libass `blur_scale_*`: frame over layout resolution (the storage
@@ -297,9 +324,12 @@ pub(crate) struct EventDynamics {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EventSamples {
     fade: Option<i32>,
-    /// `to_bits` of the interpolated anchor — exact-phase comparison, no
-    /// quantization (NaN/negative zero can only cause a conservative miss).
-    anchor_bits: Option<(u64, u64)>,
+    /// The interpolated `\move` anchor, scaled to output pixels and
+    /// quantized to 1/8 px ([`quantize_anchor_q8`]) — layout rasterizes at
+    /// exactly `q / 8`, so equal values imply byte-identical masks and
+    /// values differing by a multiple of 8 imply the same masks at an
+    /// integer-pixel offset.
+    anchor_q8: Option<(i64, i64)>,
     karaoke: Vec<(bool, bool)>,
 }
 
@@ -312,8 +342,55 @@ pub(crate) struct EventSamples {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MaskSamples {
     fade: Option<(bool, bool)>,
-    anchor_bits: Option<(u64, u64)>,
+    anchor_q8: Option<(i64, i64)>,
     karaoke: Vec<(bool, bool)>,
+}
+
+impl MaskSamples {
+    /// Reduces the anchor to its subpixel phase (`q mod 8` per axis): the
+    /// key form for canonical (anchor-relative) templates, whose nodes are
+    /// rasterized at exactly this phase next to the origin.
+    pub(crate) fn canonicalize_anchor(&mut self) {
+        if let Some((x, y)) = &mut self.anchor_q8 {
+            *x = x.rem_euclid(8);
+            *y = y.rem_euclid(8);
+        }
+    }
+
+    /// Integer-pixel translation from `template` (the samples a cached
+    /// template was rendered with) to `self`: `Some((0, 0))` on exact
+    /// equality, `Some((dx, dy))` when every non-anchor input matches and
+    /// the anchors share the 1/8-px subpixel phase, `None` otherwise
+    /// (forces a re-render).
+    pub(crate) fn translation_from(&self, template: &MaskSamples) -> Option<(i32, i32)> {
+        if self.fade != template.fade || self.karaoke != template.karaoke {
+            return None;
+        }
+        match (template.anchor_q8, self.anchor_q8) {
+            (None, None) => Some((0, 0)),
+            (Some((tx, ty)), Some((nx, ny))) => {
+                let dx = nx.checked_sub(tx)?;
+                let dy = ny.checked_sub(ty)?;
+                if dx % 8 != 0 || dy % 8 != 0 {
+                    return None;
+                }
+                Some((i32::try_from(dx / 8).ok()?, i32::try_from(dy / 8).ok()?))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// A `\clip`/`\iclip` rectangle in output pixels. Frame-absolute: a moving
+/// event's clip window stays put while its content translates, so it is
+/// applied at template instantiation, never baked into translatable nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ClipRect {
+    pub x0: i32,
+    pub y0: i32,
+    pub x1: i32,
+    pub y1: i32,
+    pub inverse: bool,
 }
 
 impl EventSamples {
@@ -333,7 +410,7 @@ impl EventSamples {
             // fill; <= 0 is a no-op). Saturation means the post-clamp
             // multiplier is 255 (every node fully transparent), so >=.
             fade: self.fade.map(|f| (f > 0, f >= 255)),
-            anchor_bits: self.anchor_bits,
+            anchor_q8: self.anchor_q8,
             karaoke: self.karaoke.clone(),
         }
     }
@@ -345,15 +422,23 @@ impl EventSamples {
 }
 
 impl EventDynamics {
-    /// Resolves the dynamic inputs at `now_rel` ms since event start. Uses
-    /// the same evaluators as the render path, so equal samples guarantee
-    /// an equal render.
-    pub(crate) fn sample(&self, now_rel: i64, duration_ms: i64) -> EventSamples {
+    /// Resolves the dynamic inputs at `now_rel` ms since event start.
+    /// `scale` must be [`play_res_scale`] for the current geometry: the
+    /// anchor is quantized with the same evaluator and factors as the
+    /// render path, so equal samples guarantee an equal render.
+    pub(crate) fn sample(&self, now_rel: i64, duration_ms: i64, scale: (f64, f64)) -> EventSamples {
         EventSamples {
             fade: self.fade.map(|f| fade_alpha(f, now_rel, duration_ms)),
-            anchor_bits: self.movement.map(|m| {
+            anchor_q8: self.movement.map(|m| {
                 let (x, y) = eval_move_anchor(m, now_rel, duration_ms);
-                (x.to_bits(), y.to_bits())
+                // A poisoned (non-finite) axis collapses to one impossible
+                // key: the matching render is empty (layout's non-finite
+                // guards drop every node), so poisoned frames cache that
+                // empty render instead of aliasing a real anchor.
+                (
+                    quantize_anchor_q8(x, scale.0).unwrap_or(i64::MAX),
+                    quantize_anchor_q8(y, scale.1).unwrap_or(i64::MAX),
+                )
             }),
             karaoke: if self.karaoke.is_empty() {
                 Vec::new()
@@ -432,6 +517,23 @@ pub(crate) struct EventRender {
     pub detect_collisions: bool,
     /// `unsupported::*` features this event asked for.
     pub unsupported: u32,
+    /// A canonical `\move` event's frame-absolute clip, NOT baked into
+    /// `nodes`: the renderer applies it after translating each
+    /// instantiation into place. `None` for everything else (their clip
+    /// is baked as before).
+    pub clip: Option<ClipRect>,
+    /// False when the nodes bake frame-absolute geometry beyond the clip
+    /// (the BorderStyle-4 background box is clamped to the frame), in
+    /// which case a translated reuse would be wrong and the template only
+    /// hits on exact anchor equality.
+    pub translatable: bool,
+    /// True when `nodes` were rasterized at the anchor's subpixel PHASE
+    /// (next to the origin) rather than the absolute anchor: floating-
+    /// point rasterization is not exactly translation-invariant, so a
+    /// moving event renders once in canonical position and EVERY frame —
+    /// the defining one included — translates that same template into
+    /// place, making warm and cold frames bit-identical by construction.
+    pub canonical_anchor: bool,
 }
 
 /// Renders one event at `now_ms` into positioned nodes.
@@ -586,6 +688,9 @@ pub(crate) fn render_event(
             dynamics: EventDynamics::default(),
             detect_collisions,
             unsupported: overrides.unsupported,
+            clip: None,
+            translatable: true,
+            canonical_anchor: false,
         };
     }
 
@@ -652,16 +757,49 @@ pub(crate) fn render_event(
     let valign = alignment & 12;
 
     let now_rel = now_ms - event.start_ms;
+    // The BorderStyle-4 background box (rendered below) is clamped to the
+    // frame — frame-absolute geometry that must not be reused translated,
+    // so such events opt out of the canonical-anchor scheme.
+    let border_style_4 = segments
+        .iter()
+        .any(|segment| segment.state.border_style == 4);
+    let mut canonical_anchor =
+        overrides.pos.is_none() && overrides.movement.is_some() && !border_style_4;
+    // The anchor, already scaled to output pixels. A moving anchor is
+    // snapped to 1/8 px (libass bitmap-cache convention, a shift of at
+    // most 1/16 px) and then reduced to its subpixel PHASE next to the
+    // origin: floating-point rasterization is not exactly translation-
+    // invariant, so the canonical template is rendered once and every
+    // frame of the move — this defining one included — translates the
+    // same masks into place (renderer instantiation). `\pos` stays exact:
+    // it is constant per event, so neither snap nor canonicalization
+    // would buy anything.
     let anchor = match (overrides.pos, overrides.movement) {
-        (Some((x, y)), _) => Some((x, y)),
-        (None, Some(spec)) => Some(eval_move_anchor(spec, now_rel, event.duration_ms)),
+        (Some((x, y)), _) => Some((x * ctx.scale_x(), y * ctx.scale_y())),
+        (None, Some(spec)) => {
+            let (x, y) = eval_move_anchor(spec, now_rel, event.duration_ms);
+            match (
+                quantize_anchor_q8(x, ctx.scale_x()),
+                quantize_anchor_q8(y, ctx.scale_y()),
+            ) {
+                (Some(qx), Some(qy)) if canonical_anchor => {
+                    Some((qx.rem_euclid(8) as f64 / 8.0, qy.rem_euclid(8) as f64 / 8.0))
+                }
+                (Some(qx), Some(qy)) => Some((qx as f64 / 8.0, qy as f64 / 8.0)),
+                // Poisoned (non-finite) anchor: keep the raw value so the
+                // existing non-finite path guards drop every node — a
+                // canonical template would instead render at the origin.
+                _ => {
+                    canonical_anchor = false;
+                    Some((x * ctx.scale_x(), y * ctx.scale_y()))
+                }
+            }
+        }
         _ => None,
     };
 
     let (block_x, block_y) = match anchor {
         Some((ax, ay)) => {
-            let ax = ax * ctx.scale_x();
-            let ay = ay * ctx.scale_y();
             let x = match halign {
                 1 => ax,
                 3 => ax - block_w,
@@ -744,9 +882,6 @@ pub(crate) fn render_event(
     // BorderStyle 4 (libass add_background): one BackColour rectangle
     // behind the whole event, expanded by positive scaled \shad values and
     // clamped to the frame; per-glyph shadows were suppressed above.
-    let border_style_4 = segments
-        .iter()
-        .any(|segment| segment.state.border_style == 4);
     if border_style_4 {
         let boxes: Vec<(i32, i32, i32, i32)> = shadows
             .iter()
@@ -808,13 +943,29 @@ pub(crate) fn render_event(
     nodes.append(&mut fills);
 
     // ---- pass 5: clip ----
+    // The clip window is frame-absolute. A canonical (moving) event's
+    // content translates while the window stays put, so the clip cannot
+    // be baked into its template nodes — it is returned for the renderer
+    // to apply at every instantiation instead. Everything else (static,
+    // \pos, BorderStyle-4 movers) bakes it here exactly as before.
+    let mut deferred_clip = None;
     if let Some((x0, y0, x1, y1, inverse)) = overrides.clip {
         let sx = ctx.scale_x();
         let sy = ctx.scale_y();
-        let (cx0, cy0) = ((f64::from(x0) * sx) as i32, (f64::from(y0) * sy) as i32);
-        let (cx1, cy1) = ((f64::from(x1) * sx) as i32, (f64::from(y1) * sy) as i32);
-        for node in &mut nodes {
-            node.bitmap.clip_rect(cx0, cy0, cx1, cy1, inverse);
+        let rect = ClipRect {
+            x0: (f64::from(x0) * sx) as i32,
+            y0: (f64::from(y0) * sy) as i32,
+            x1: (f64::from(x1) * sx) as i32,
+            y1: (f64::from(y1) * sy) as i32,
+            inverse,
+        };
+        if canonical_anchor {
+            deferred_clip = Some(rect);
+        } else {
+            for node in &mut nodes {
+                node.bitmap
+                    .clip_rect(rect.x0, rect.y0, rect.x1, rect.y1, rect.inverse);
+            }
         }
     }
 
@@ -839,6 +990,9 @@ pub(crate) fn render_event(
         dynamics,
         detect_collisions,
         unsupported: overrides.unsupported,
+        clip: deferred_clip,
+        translatable: !border_style_4,
+        canonical_anchor,
     }
 }
 
@@ -1752,25 +1906,27 @@ fn rasterize_segment(
         let blur_sigma_factor = 2.0 / (256.0f64.ln()).sqrt();
         let sigma_x = state.blur * ctx.blur_scale_x() * blur_sigma_factor;
         let sigma_y = state.blur * ctx.blur_scale_y() * blur_sigma_factor;
-        let mut effect_target = if border_bitmap.is_empty() {
-            fill.clone()
-        } else {
-            border_bitmap.clone()
+        let apply_effects = |target: &mut CoverageBitmap| {
+            if state.blur > 0.0 {
+                gaussian_blur(target, sigma_x, sigma_y);
+            }
+            if state.be > 0 {
+                be_blur(target, state.be);
+            }
         };
-        if state.blur > 0.0 {
-            gaussian_blur(&mut effect_target, sigma_x, sigma_y);
-        }
-        if state.be > 0 {
-            be_blur(&mut effect_target, state.be);
-        }
         if border_bitmap.is_empty() {
-            // No border: the blurred fill replaces the fill.
+            // No border: the blurred fill becomes its own node; the sharp
+            // fill is still consumed below, so blur a copy.
+            let mut blurred = fill.clone();
+            apply_effects(&mut blurred);
             fills.push(RenderedNode {
-                bitmap: effect_target.into(),
+                bitmap: blurred.into(),
                 color: node_color(fill_color),
             });
         } else {
-            border_bitmap = effect_target;
+            // Border: nothing reads the sharp border mask after this point,
+            // so blur it in place instead of cloning the whole mask first.
+            apply_effects(&mut border_bitmap);
         }
     }
 
