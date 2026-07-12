@@ -254,3 +254,46 @@ fn zero_frame_sibling_does_not_hang_healthy_stream() {
     }
     assert_video_stream_empty_or_absent(&out, "zero-frame sibling");
 }
+
+/// Audio filtergraph frame accounting: every audio frame leaving a
+/// filtergraph must reach the output. The audio branch moves the sink
+/// frame's buffers into the pooled shell via av_frame_move_ref instead of
+/// av_frame_ref-copying them; a regression that lost or mis-accounted a frame
+/// here would truncate the track. A 44100 -> 48000 sample-rate change forces
+/// the auto-aresample filtergraph, so the whole 1s track flows through that
+/// audio branch.
+#[test]
+fn audio_filtergraph_output_is_not_truncated() {
+    let out = tmp_path("audio_fg_full.m4a");
+    let scheduler = FfmpegContext::builder()
+        .input(Input::from("sine=frequency=440:sample_rate=44100:duration=1").set_format("lavfi"))
+        .output(
+            Output::from(out.as_str())
+                .set_audio_codec("aac")
+                .set_audio_sample_rate(48000),
+        )
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let result = wait_with_watchdog(scheduler, 60, "audio filtergraph full");
+    assert!(
+        result.is_ok(),
+        "audio-through-filtergraph transcode must succeed, got {result:?}"
+    );
+    match find_audio_stream_info(&out)
+        .expect("failed to probe output")
+        .expect("audio stream missing from output")
+    {
+        StreamInfo::Audio { nb_frames, .. } => assert!(
+            // 1s @ 48000 through aac (frame_size 1024) is ~47 frames. The
+            // threshold sits well above 1 but below the true count to tolerate
+            // codec priming/padding while still catching a truncated track.
+            nb_frames >= 30,
+            "the full audio track must reach the output (a move_ref frame-loss \
+             regression would truncate it), got nb_frames={nb_frames}"
+        ),
+        other => panic!("expected audio stream info, got {other:?}"),
+    }
+}

@@ -9,7 +9,8 @@
 
 use ffmpeg_next::DictionaryRef;
 use ffmpeg_sys_next::AVMediaType::{self, AVMEDIA_TYPE_AUDIO, AVMEDIA_TYPE_VIDEO};
-use ffmpeg_sys_next::{av_rescale_q, AVRational};
+use ffmpeg_sys_next::{av_dict_get, av_rescale_q, AVRational};
+use std::ffi::CStr;
 
 // ---- lavfi metadata keys (verified against FFmpeg n7.1) --------------------
 
@@ -18,27 +19,49 @@ const BLACK_END: &str = "lavfi.black_end";
 const SILENCE_START: &str = "lavfi.silence_start";
 const SILENCE_END: &str = "lavfi.silence_end";
 const SILENCE_DURATION: &str = "lavfi.silence_duration";
-const SCD_SCORE: &str = "lavfi.scd.score";
-const SCD_TIME: &str = "lavfi.scd.time";
-const CROP_X: &str = "lavfi.cropdetect.x";
-const CROP_Y: &str = "lavfi.cropdetect.y";
-const CROP_W: &str = "lavfi.cropdetect.w";
-const CROP_H: &str = "lavfi.cropdetect.h";
-const R128_M: &str = "lavfi.r128.M";
-const R128_S: &str = "lavfi.r128.S";
-const R128_I: &str = "lavfi.r128.I";
-const R128_LRA: &str = "lavfi.r128.LRA";
+// Hot per-frame lavfi keys as `&CStr` literals so lookups can call
+// `av_dict_get` directly (see `dict_get`), avoiding the `CString::new` heap
+// allocation `DictionaryRef::get` performs on every call.
+const SCD_SCORE: &CStr = c"lavfi.scd.score";
+const SCD_TIME: &CStr = c"lavfi.scd.time";
+const CROP_X: &CStr = c"lavfi.cropdetect.x";
+const CROP_Y: &CStr = c"lavfi.cropdetect.y";
+const CROP_W: &CStr = c"lavfi.cropdetect.w";
+const CROP_H: &CStr = c"lavfi.cropdetect.h";
+const R128_M: &CStr = c"lavfi.r128.M";
+const R128_S: &CStr = c"lavfi.r128.S";
+const R128_I: &CStr = c"lavfi.r128.I";
+const R128_LRA: &CStr = c"lavfi.r128.LRA";
 /// Aggregate true-peak key emitted by `ebur128` when `peak=true` is set. Its
 /// `SET_META_PEAK` macro (verified against FFmpeg n7.1 `f_ebur128.c`) writes
 /// `lavfi.r128.true_peak` — the max across channels — alongside the per-channel
 /// `lavfi.r128.true_peaks_chN` keys, so we read the aggregate directly.
-const R128_TRUE_PEAK: &str = "lavfi.r128.true_peak";
+const R128_TRUE_PEAK: &CStr = c"lavfi.r128.true_peak";
 
 /// Microseconds per second, used as the rescale target for pts conversion.
 const US_PER_SEC: AVRational = AVRational {
     num: 1,
     den: 1_000_000,
 };
+
+/// Direct `av_dict_get` lookup for the hot `&CStr` lavfi keys, avoiding the
+/// per-call `CString::new` heap allocation `DictionaryRef::get` performs on
+/// every lookup (ffmpeg-next util/dictionary/immutable.rs).
+fn dict_get<'a>(md: &'a DictionaryRef<'_>, key: &CStr) -> Option<&'a str> {
+    // SAFETY: `as_ptr()` yields the live `AVDictionary` backing `md`. The
+    // returned `&str` is tied to the `&'a md` borrow (not the dict's own type
+    // lifetime), so it cannot outlive `md`. av_dict_get allocates nothing and
+    // the entry's NUL-terminated `value` is owned by the dict, valid while `md`
+    // is borrowed.
+    unsafe {
+        let entry = av_dict_get(md.as_ptr(), key.as_ptr(), std::ptr::null(), 0);
+        if entry.is_null() {
+            None
+        } else {
+            CStr::from_ptr((*entry).value).to_str().ok()
+        }
+    }
+}
 
 /// A detection event timestamp, normalised to microseconds.
 ///
@@ -278,8 +301,8 @@ fn parse_silence(md: &DictionaryRef<'_>, out: &mut Vec<MetadataEvent>, state: &m
 fn parse_scene(md: &DictionaryRef<'_>, out: &mut Vec<MetadataEvent>) {
     // `scdet` writes `lavfi.scd.score` on every frame but only writes
     // `lavfi.scd.time` on an actual scene change — key on the latter.
-    if let Some(at) = md.get(SCD_TIME).and_then(parse_secs) {
-        let score = md.get(SCD_SCORE).and_then(parse_f64).unwrap_or(0.0);
+    if let Some(at) = dict_get(md, SCD_TIME).and_then(parse_secs) {
+        let score = dict_get(md, SCD_SCORE).and_then(parse_f64).unwrap_or(0.0);
         out.push(MetadataEvent::SceneChange { at, score });
     }
 }
@@ -287,10 +310,10 @@ fn parse_scene(md: &DictionaryRef<'_>, out: &mut Vec<MetadataEvent>) {
 fn parse_crop(md: &DictionaryRef<'_>, frame_ts: Option<Timestamp>, out: &mut Vec<MetadataEvent>) {
     let Some(at) = frame_ts else { return };
     if let (Some(x), Some(y), Some(w), Some(h)) = (
-        md.get(CROP_X).and_then(parse_i32),
-        md.get(CROP_Y).and_then(parse_i32),
-        md.get(CROP_W).and_then(parse_i32),
-        md.get(CROP_H).and_then(parse_i32),
+        dict_get(md, CROP_X).and_then(parse_i32),
+        dict_get(md, CROP_Y).and_then(parse_i32),
+        dict_get(md, CROP_W).and_then(parse_i32),
+        dict_get(md, CROP_H).and_then(parse_i32),
     ) {
         out.push(MetadataEvent::CropDetect { at, x, y, w, h });
     }
@@ -303,10 +326,10 @@ fn parse_r128(
     state: &mut ParseState,
 ) {
     let Some(at) = frame_ts else { return };
-    let momentary = md.get(R128_M).and_then(parse_f64);
-    let short_term = md.get(R128_S).and_then(parse_f64);
-    let integrated = md.get(R128_I).and_then(parse_f64);
-    let lra = md.get(R128_LRA).and_then(parse_f64);
+    let momentary = dict_get(md, R128_M).and_then(parse_f64);
+    let short_term = dict_get(md, R128_S).and_then(parse_f64);
+    let integrated = dict_get(md, R128_I).and_then(parse_f64);
+    let lra = dict_get(md, R128_LRA).and_then(parse_f64);
     let true_peak = max_true_peak(md);
 
     if momentary.is_none()
@@ -339,7 +362,7 @@ fn parse_r128(
 /// The frame's aggregate true peak, or `None` if `ebur128` did not emit
 /// true-peak keys (i.e. `peak=true` was not requested).
 fn max_true_peak(md: &DictionaryRef<'_>) -> Option<f64> {
-    md.get(R128_TRUE_PEAK).and_then(parse_f64)
+    dict_get(md, R128_TRUE_PEAK).and_then(parse_f64)
 }
 
 /// Parses a `.N` channel suffix (1-based) into `Some(N)`; `""` yields `None`.

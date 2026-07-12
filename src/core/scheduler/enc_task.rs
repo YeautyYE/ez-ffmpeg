@@ -239,6 +239,11 @@ pub(crate) fn enc_init(
             // hard error or shutdown -> skip the queue EOF and the drain
             // wait entirely, proceed straight to the shared flush.
             let mut stop = false;
+            // Hoisted scratch reused across the producer loop and both drain
+            // loops below. Every use `drain(..)`s it, so it re-enters empty
+            // (capacity retained); avoids the per-frame Vec alloc/free that
+            // mux_task.rs already hoists as `released`/`nf`.
+            let mut local: Vec<FrameBox> = Vec::new();
 
             // ---- producer + live drain ----
             while !stop {
@@ -278,7 +283,6 @@ pub(crate) fn enc_init(
                     SyncFrame::Break => { producer_eof = true; break; }
                 };
 
-                let mut local: Vec<FrameBox> = Vec::new();
                 {
                     let mut q = sq_lock.lock().unwrap();
                     if let Some(fb) = frame_box_opt {
@@ -295,7 +299,7 @@ pub(crate) fn enc_init(
                     }
                     sq_propagate_and_notify(&mut q, sq_finished, sq_cv);
                 }
-                for fb in local {
+                for fb in local.drain(..) {
                     if enc_done || stop {
                         // Terminal already hit mid-batch: a flushed encoder
                         // must not be fed again (send_frame -> AVERROR_EOF ->
@@ -358,7 +362,6 @@ pub(crate) fn enc_init(
                 // the heartbeat cannot rescue a stuck window smaller than
                 // buf_size_us (or a tail==head single-frame FIFO).
                 if (producer_eof || enc_done) && !sq_finished[sq_idx].load(Ordering::Acquire) {
-                    let mut local: Vec<FrameBox> = Vec::new();
                     {
                         let mut q = sq_lock.lock().unwrap();
                         q.send(sq_idx, None, None, last_tb, 0); // finish + cascade
@@ -369,7 +372,7 @@ pub(crate) fn enc_init(
                         }
                         sq_propagate_and_notify(&mut q, sq_finished, sq_cv);
                     }
-                    for fb in local {
+                    for fb in local.drain(..) {
                         if stop {
                             frame_pool.release(fb.frame);
                             continue;
@@ -391,7 +394,6 @@ pub(crate) fn enc_init(
                 // doctrine. Peers only need the queue STATE (finished flag +
                 // heads), never this thread — each runs its own heartbeat.
                 while !stop && !enc_done {
-                    let mut local: Vec<FrameBox> = Vec::new();
                     let done;
                     {
                         let mut q = sq_lock.lock().unwrap();
@@ -407,7 +409,7 @@ pub(crate) fn enc_init(
                             continue;
                         }
                     }
-                    for fb in local {
+                    for fb in local.drain(..) {
                         if enc_done || stop {
                             frame_pool.release(fb.frame);
                             continue;
@@ -1275,8 +1277,13 @@ unsafe fn receive_samples(
 
         if to_copy < (*src.as_ptr()).nb_samples {
             offset_audio(src.as_mut_ptr(), to_copy);
-        } else {
-            audio_frame_queue.pop_front();
+        } else if let Some(fb) = audio_frame_queue.pop_front() {
+            // Recycle the fully-consumed source shell instead of dropping it
+            // (Frame::drop -> av_frame_free); the next frame_pool.get() would
+            // otherwise av_frame_alloc a fresh one, defeating the pool. Matches
+            // fftools sync_queue.c receive_samples and the release discipline at
+            // the other pool sites in this file.
+            frame_pool.release(fb.frame);
         }
 
         *samples_queued -= to_copy;

@@ -525,11 +525,18 @@ unsafe fn ts_fixup(
         }
     }
 
-    if (*pkt).dts != AV_NOPTS_VALUE {
-        (*pkt).dts += av_rescale_q(demux_parameter.ts_offset, AV_TIME_BASE_Q, (*pkt).time_base);
-    }
-    if (*pkt).pts != AV_NOPTS_VALUE {
-        (*pkt).pts += av_rescale_q(demux_parameter.ts_offset, AV_TIME_BASE_Q, (*pkt).time_base);
+    // ts_offset is 0 in the common single-input, no-seek, no-start-offset case,
+    // and av_rescale_q(0, ..) is always 0. Skip the rescale entirely then;
+    // otherwise compute it once (dts and pts share pkt.time_base) instead of the
+    // two identical per-packet rescales this used to do.
+    if demux_parameter.ts_offset != 0 {
+        let offset = av_rescale_q(demux_parameter.ts_offset, AV_TIME_BASE_Q, (*pkt).time_base);
+        if (*pkt).dts != AV_NOPTS_VALUE {
+            (*pkt).dts += offset;
+        }
+        if (*pkt).pts != AV_NOPTS_VALUE {
+            (*pkt).pts += offset;
+        }
     }
 
     // Apply timestamp scaling (after ts_offset, before duration)
@@ -545,11 +552,17 @@ unsafe fn ts_fixup(
         }
     }
 
-    let duration = av_rescale_q(
-        demux_parameter.duration.ts,
-        demux_parameter.duration.tb,
-        (*pkt).time_base,
-    );
+    // duration.ts is 0 unless -stream_loop has accumulated a loop offset, and
+    // av_rescale_q(0, ..) is 0, so skip the rescale in the common no-loop case.
+    let duration = if demux_parameter.duration.ts != 0 {
+        av_rescale_q(
+            demux_parameter.duration.ts,
+            demux_parameter.duration.tb,
+            (*pkt).time_base,
+        )
+    } else {
+        0
+    };
 
     if (*pkt).pts != AV_NOPTS_VALUE {
         // audio decoders take precedence for estimating total file duration
