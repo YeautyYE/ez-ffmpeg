@@ -12,7 +12,8 @@ use crate::util::ffmpeg_utils::av_err2str;
 use crate::util::frame_utils::ensure_software_format;
 use ffmpeg_next::Frame;
 use ffmpeg_sys_next::{
-    av_frame_get_buffer, av_frame_make_writable, av_q2d, sws_scale, AVFrame, AVMediaType,
+    av_frame_alloc, av_frame_copy_props, av_frame_free, av_frame_get_buffer, av_frame_is_writable,
+    av_frame_make_writable, av_frame_unref, av_q2d, sws_scale, AVFrame, AVMediaType,
 };
 use glow::{HasContext, NativeProgram, PixelPackData, PixelUnpackData};
 use log::{info, warn};
@@ -26,6 +27,13 @@ use surfman::{Connection, ContextAttributeFlags, ContextAttributes};
 /// which runs headless, converts colors on the GPU with the correct matrix,
 /// and overlaps GPU work with CPU work. This type remains functional but
 /// will be removed in a future major release.
+///
+/// Context sharing: each instance owns its own GL context and re-binds it
+/// (`make_context_current`) on every `filter_frame`/`uninit` entry, so
+/// several instances — or another filter that switches the thread's GL
+/// context — can coexist on one pipeline thread. GL object names are
+/// per-context; without the re-bind a sibling's context would silently
+/// resolve this filter's ids to its own objects.
 #[deprecated(
     since = "0.11.0",
     note = "use `wgpu_filter::WgpuFrameFilter` (feature \"wgpu\") for custom GPU shaders, or \
@@ -342,16 +350,21 @@ impl OpenGLFrameFilter {
         Ok(())
     }
 
-    fn init_opengl(&mut self) -> Result<(), String> {
-        if let Err(e) = self
-            .surfman_device
+    /// Makes this filter's GL context current on the calling thread. A
+    /// sibling filter on the same pipeline thread (a second
+    /// `OpenGLFrameFilter`, or a wgpu filter that fell back to wgpu's GL
+    /// backend) may have switched contexts since our last call — GL names
+    /// are per-context, so issuing calls against a sibling's context would
+    /// silently resolve to its objects. Re-binding when already current is
+    /// a cheap driver no-op.
+    fn rebind_context(&self) -> Result<(), String> {
+        self.surfman_device
             .make_context_current(&self.surfman_context)
-        {
-            return Err(format!(
-                "Failed to make OpenGL context for this thread: {:?}",
-                e
-            ));
-        }
+            .map_err(|e| format!("Failed to make OpenGL context current: {:?}", e))
+    }
+
+    fn init_opengl(&mut self) -> Result<(), String> {
+        self.rebind_context()?;
 
         let gl = unsafe {
             glow::Context::from_loader_function(|s| {
@@ -1042,6 +1055,10 @@ impl FrameFilter for OpenGLFrameFilter {
             return Ok(Some(frame));
         }
 
+        // A sibling filter on this pipeline thread may own a different GL
+        // context and have left it current; re-bind ours before any GL work.
+        self.rebind_context()?;
+
         // Buffers, viewport and both sws contexts are sized for exactly one
         // (width, height, format). A mid-stream change (h264 resolution
         // switch, filter reconfiguration) must rebuild them: scaling into
@@ -1055,16 +1072,19 @@ impl FrameFilter for OpenGLFrameFilter {
             self.init_buffer(width, height, original_format)?;
         }
 
-        // The GL result is written back into this frame's buffers, which may
-        // still be shared with the decoder's frame pool (refcount > 1).
-        unsafe {
-            let ret = av_frame_make_writable(frame.as_mut_ptr());
-            if ret < 0 {
-                return Err(format!("Failed to make frame writable: {}", av_err2str(ret)).into());
-            }
-        }
-
         if original_format == ffmpeg_sys_next::AVPixelFormat::AV_PIX_FMT_RGB24 {
+            // The GL result is written back into this frame's own buffers,
+            // which may still be shared with the decoder's frame pool
+            // (refcount > 1) — here the pre-copy is real work, since only
+            // the drawn region changes.
+            unsafe {
+                let ret = av_frame_make_writable(frame.as_mut_ptr());
+                if ret < 0 {
+                    return Err(
+                        format!("Failed to make frame writable: {}", av_err2str(ret)).into(),
+                    );
+                }
+            }
             self.process_frame_through_texture(&mut frame)?;
         } else {
             self.convert_to_rgb(&frame)?;
@@ -1076,6 +1096,12 @@ impl FrameFilter for OpenGLFrameFilter {
             self.rgb_frame = Some(rgb_frame);
             result?;
 
+            // convert_from_rgb overwrites every byte of the frame's planes,
+            // so a shared frame needs fresh buffers, NOT make_writable's
+            // full-plane deep copy of bytes that are then 100% overwritten
+            // (~3 MB of dead memcpy per 1080p yuv420p frame).
+            unsafe { ensure_overwritable(&mut frame)? };
+
             self.convert_from_rgb(&mut frame)?;
         }
 
@@ -1083,6 +1109,13 @@ impl FrameFilter for OpenGLFrameFilter {
     }
 
     fn uninit(&mut self, _ctx: &mut FrameFilterContext) {
+        // Deleting against a sibling's context would free ITS objects (GL
+        // names are per-context). If ours cannot be made current the
+        // context is dead and Drop's destroy_context reclaims everything.
+        if let Err(e) = self.rebind_context() {
+            warn!("OpenGL uninit skipped GL deletes (context not current): {e}");
+            return;
+        }
         // init may have failed halfway and uninit may run twice: take() each
         // resource so missing ones are skipped and none is deleted twice.
         self.release_frame_resources();
@@ -1103,6 +1136,57 @@ impl FrameFilter for OpenGLFrameFilter {
             }
         }
     }
+}
+
+/// Gives `frame` exclusively-owned planes WITHOUT copying pixel data, for
+/// callers about to overwrite every byte: `av_frame_make_writable` on a
+/// shared frame allocates AND deep-copies the planes, and that copy is pure
+/// waste when the very next operation overwrites them all. A frame that is
+/// already writable is returned untouched (its planes are reused in place).
+///
+/// # Safety
+/// `frame` must wrap a valid, non-null `AVFrame` describing video pixel
+/// data (width/height/format set).
+unsafe fn ensure_overwritable(frame: &mut Frame) -> Result<(), String> {
+    if av_frame_is_writable(frame.as_mut_ptr()) != 0 {
+        return Ok(());
+    }
+    let mut props = av_frame_alloc();
+    if props.is_null() {
+        return Err("Failed to allocate a frame props holder".to_string());
+    }
+    let result = (|| {
+        let ret = av_frame_copy_props(props, frame.as_ptr());
+        if ret < 0 {
+            return Err(format!(
+                "Failed to snapshot frame props: {}",
+                av_err2str(ret)
+            ));
+        }
+        let raw = frame.as_mut_ptr();
+        let (width, height, format) = ((*raw).width, (*raw).height, (*raw).format);
+        av_frame_unref(raw);
+        (*raw).width = width;
+        (*raw).height = height;
+        (*raw).format = format;
+        let ret = av_frame_get_buffer(raw, 0);
+        if ret < 0 {
+            return Err(format!(
+                "Failed to allocate replacement planes: {}",
+                av_err2str(ret)
+            ));
+        }
+        let ret = av_frame_copy_props(raw, props);
+        if ret < 0 {
+            return Err(format!(
+                "Failed to restore frame props: {}",
+                av_err2str(ret)
+            ));
+        }
+        Ok(())
+    })();
+    av_frame_free(&mut props);
+    result
 }
 
 impl Drop for OpenGLFrameFilter {
