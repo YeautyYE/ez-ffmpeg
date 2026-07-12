@@ -322,6 +322,10 @@ impl EmbedRtmpServer<Initialization> {
 #[derive(Clone)]
 pub struct RtmpStreamSender {
     inner: crossbeam_channel::Sender<Vec<u8>>,
+    /// Wakes the reactor after each send so a raw publisher's media is
+    /// drained on the next loop turn instead of waiting up to POLL_TIMEOUT_MS
+    /// (~100ms). `None` only for the unit-test constructor (no running reactor).
+    wake_handle: Option<WakeHandle>,
 }
 
 impl RtmpStreamSender {
@@ -336,7 +340,14 @@ impl RtmpStreamSender {
     pub fn send(&self, chunk: Vec<u8>) -> crate::error::Result<()> {
         self.inner
             .send(chunk)
-            .map_err(|_| crate::error::Error::RtmpStreamClosed)
+            .map_err(|_| crate::error::Error::RtmpStreamClosed)?;
+        // Nudge the reactor so process_publishers drains this Raw channel on the
+        // next loop turn rather than after the POLL_TIMEOUT_MS fallback. The
+        // internal Feed path (create_rtmp_input) wakes the same way per packet.
+        if let Some(wake) = &self.wake_handle {
+            wake.wake();
+        }
+        Ok(())
     }
 }
 
@@ -555,7 +566,10 @@ impl EmbedRtmpServer<Running> {
                 return Err(RtmpCreateStream.into());
             }
         }
-        Ok(RtmpStreamSender { inner: sender })
+        Ok(RtmpStreamSender {
+            inner: sender,
+            wake_handle: self.wake_handle.clone(),
+        })
     }
 
     /// Registers an in-process publisher whose steady-state audio/video is
@@ -1297,7 +1311,10 @@ mod tests {
     #[test]
     fn stream_sender_reports_stream_closed_and_clones_share_the_stream() {
         let (tx, rx) = crossbeam_channel::bounded::<Vec<u8>>(4);
-        let sender = RtmpStreamSender { inner: tx };
+        let sender = RtmpStreamSender {
+            inner: tx,
+            wake_handle: None,
+        };
 
         // A clone feeds the same stream: a chunk pushed through the clone is
         // observed on the single receiver (the old handle was `Clone`).

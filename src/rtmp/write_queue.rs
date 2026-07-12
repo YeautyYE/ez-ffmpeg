@@ -245,20 +245,26 @@ impl WriteQueue {
             // so the borrow is scoped and the queue is only mutated afterwards.
             let mut gathered = 0usize;
             let write_result = {
-                let mut iov: Vec<IoSlice> = Vec::with_capacity(MAX_IOV);
+                // Fixed stack array instead of a per-batch Vec::with_capacity:
+                // try_flush runs once per writable event per subscriber, so the
+                // heap alloc/free was pure hot-loop overhead. IoSlice is Copy and
+                // the empty-slice fill is overwritten by the gather below.
+                let mut iov = [IoSlice::new(&[]); MAX_IOV];
+                let mut n_iov = 0;
                 for entry in self.queue.iter() {
-                    if iov.len() == MAX_IOV {
+                    if n_iov == MAX_IOV {
                         break;
                     }
                     let rem = entry.remaining();
                     if !rem.is_empty() {
                         gathered += rem.len();
-                        iov.push(IoSlice::new(rem));
+                        iov[n_iov] = IoSlice::new(rem);
+                        n_iov += 1;
                     }
                 }
                 // pop_completed_front ran and the queue is non-empty, so the
-                // front entry has unsent bytes and iov is non-empty here.
-                writer.write_vectored(&iov)
+                // front entry has unsent bytes and iov[..n_iov] is non-empty.
+                writer.write_vectored(&iov[..n_iov])
             };
 
             match write_result {

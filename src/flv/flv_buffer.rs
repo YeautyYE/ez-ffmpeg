@@ -180,7 +180,10 @@ impl FlvBuffer {
 
         // Copy existing data directly to new buffer
         if self.tail > self.head {
-            new_buffer[..current_len].copy_from_slice(&self.buffer[self.head..self.tail]);
+            // Single contiguous span. A stray safe copy_from_slice used to run
+            // here in addition to the unsafe copy below, memcpy'ing the same
+            // region twice per resize; only the unsafe copy (matching the
+            // wrap-around branches) remains.
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     self.buffer.as_ptr().add(self.head),
@@ -338,10 +341,13 @@ impl FlvBuffer {
             return None; // Not enough data to read the tag data and PreviousTagSize
         }
 
-        // Read the tag data into a temporary buffer
-        let mut data = vec![0u8; data_size as usize];
+        // Read the tag data into a fresh buffer. Append the ring segment(s)
+        // instead of `vec![0u8; data_size]` + overwrite, which zero-filled the
+        // whole payload (a full-payload memset per FLV tag on the ingest path)
+        // just to immediately overwrite it.
+        let mut data = Vec::with_capacity(data_size as usize);
         let data_start = self.head + FLV_TAG_HEADER_LENGTH;
-        self.read_data(data_start, &mut data);
+        self.read_data_append(data_start, data_size as usize, &mut data);
 
         // Create the FLV Tag
         let flv_tag = FlvTag {
@@ -412,6 +418,30 @@ impl FlvBuffer {
                     second_len,
                 );
             }
+        }
+    }
+
+    /// Appends `len` bytes starting at `start` (ring-wrapped) onto `out`,
+    /// splitting across the wrap point like [`read_data`] but without a
+    /// pre-zeroed destination — the caller passes a `Vec::with_capacity(len)`,
+    /// so no calloc/memset is paid before the copy. Safe `extend_from_slice`
+    /// (a memcpy) replaces the unsafe pointer copies since the source is a plain
+    /// slice of `self.buffer`.
+    fn read_data_append(&self, start: usize, len: usize, out: &mut Vec<u8>) {
+        let buffer_size = self.buffer.len();
+        if buffer_size == 0 || len == 0 {
+            return;
+        }
+
+        let normalized_start = start % buffer_size;
+        let safe_len = len.min(buffer_size);
+        let virtual_end = normalized_start + safe_len;
+        if virtual_end <= buffer_size {
+            out.extend_from_slice(&self.buffer[normalized_start..normalized_start + safe_len]);
+        } else {
+            let first_len = buffer_size - normalized_start;
+            out.extend_from_slice(&self.buffer[normalized_start..]);
+            out.extend_from_slice(&self.buffer[..safe_len - first_len]);
         }
     }
 }
@@ -522,5 +552,39 @@ mod tests {
 
     fn available_space(head: usize, tail: usize, buffer_len: usize) -> usize {
         (head.wrapping_sub(tail).wrapping_sub(1)) & (buffer_len - 1)
+    }
+
+    /// `read_data_append` (the zero-fill-free tag reader) must produce the
+    /// same bytes as `read_data`, including across the ring wrap point.
+    #[test]
+    fn read_data_append_matches_read_data_across_wrap() {
+        use super::FlvBuffer;
+        let mut b = FlvBuffer::new();
+        // 8-byte ring holding 0..8; head=6, tail=3 => len 5, so a 5-byte read
+        // wraps: segment [6,7] then [0,1,2].
+        b.buffer = (0u8..8).collect();
+        b.head = 6;
+        b.tail = 3;
+
+        let mut via_read_data = vec![0u8; 5];
+        b.read_data(6, &mut via_read_data);
+
+        let mut via_append = Vec::with_capacity(5);
+        b.read_data_append(6, 5, &mut via_append);
+
+        assert_eq!(
+            via_append,
+            vec![6u8, 7, 0, 1, 2],
+            "wrap-around segments must be [6,7] then [0,1,2]"
+        );
+        assert_eq!(
+            via_append, via_read_data,
+            "read_data_append must match read_data byte-for-byte"
+        );
+
+        // Non-wrapping read from the same buffer.
+        let mut contiguous = Vec::with_capacity(3);
+        b.read_data_append(1, 3, &mut contiguous);
+        assert_eq!(contiguous, vec![1u8, 2, 3]);
     }
 }
