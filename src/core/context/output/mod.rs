@@ -97,9 +97,12 @@ pub struct Output {
     ///   - `ffmpeg_sys_next::SEEK_SET` (0) - Seek to an absolute position.
     ///   - `ffmpeg_sys_next::SEEK_CUR` (1) - Seek relative to the current position.
     ///   - `ffmpeg_sys_next::SEEK_END` (2) - Seek relative to the end of the output.
-    ///   - `ffmpeg_sys_next::AVSEEK_FLAG_BYTE` (2) - Seek using **byte offset** instead of timestamps.
-    ///   - `ffmpeg_sys_next::AVSEEK_SIZE` (65536) - Query the **total size** of the stream.
-    ///   - `ffmpeg_sys_next::AVSEEK_FORCE` (131072) - **Force seeking, even if normally restricted.**
+    ///   - `ffmpeg_sys_next::AVSEEK_SIZE` (65536) - Query the **total size** of the stream
+    ///     instead of seeking.
+    ///
+    ///   `avio_seek` strips `ffmpeg_sys_next::AVSEEK_FORCE` (131072) from `whence` before
+    ///   invoking a custom callback; the example masks it anyway as cheap defense. No
+    ///   other `whence` values reach a custom seek callback.
     ///
     /// ### Return Value:
     /// - **Positive Value**: The new offset position after seeking.
@@ -123,29 +126,18 @@ pub struct Output {
     ///     Box::new(move |offset: i64, whence: i32| -> i64 {
     ///         let mut file = file.lock().unwrap();
     ///
-    ///         // ✅ Handle AVSEEK_SIZE: Return total file size
+    ///         // ✅ Handle AVSEEK_SIZE: FFmpeg asks for the total stream size instead of seeking
     ///         if whence == ffmpeg_sys_next::AVSEEK_SIZE {
     ///             if let Ok(size) = file.metadata().map(|m| m.len() as i64) {
-    ///                 println!("FFmpeg requested stream size: {}", size);
     ///                 return size;
     ///             }
     ///             return ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO) as i64;
     ///         }
     ///
-    ///         // ✅ Ignore AVSEEK_FORCE flag
-    ///         let actual_whence = whence & !ffmpeg_sys_next::AVSEEK_FORCE;
-    ///
-    ///         // ✅ Handle AVSEEK_FLAG_BYTE: Perform byte-based seek
-    ///         if actual_whence & ffmpeg_sys_next::AVSEEK_FLAG_BYTE != 0 {
-    ///             println!("FFmpeg requested byte-based seeking. Seeking to byte offset: {}", offset);
-    ///             if let Ok(new_pos) = file.seek(SeekFrom::Start(offset as u64)) {
-    ///                 return new_pos as i64;
-    ///             }
-    ///             return ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO) as i64;
-    ///         }
-    ///
-    ///         // ✅ Standard seek modes
-    ///         let seek_result = match actual_whence {
+    ///         // ✅ Defensive: mask AVSEEK_FORCE (avio_seek strips it before a custom
+    ///         // callback). The AVIO layer sends no other whence values (lseek extensions
+    ///         // like SEEK_HOLE/SEEK_DATA never reach a custom callback).
+    ///         let seek_result = match whence & !ffmpeg_sys_next::AVSEEK_FORCE {
     ///             ffmpeg_sys_next::SEEK_SET => file.seek(SeekFrom::Start(offset as u64)),
     ///             ffmpeg_sys_next::SEEK_CUR => file.seek(SeekFrom::Current(offset)),
     ///             ffmpeg_sys_next::SEEK_END => file.seek(SeekFrom::End(offset)),
@@ -566,9 +558,12 @@ impl Output {
     ///     - `ffmpeg_sys_next::SEEK_SET` (0): Seek to an absolute position.
     ///     - `ffmpeg_sys_next::SEEK_CUR` (1): Seek relative to the current position.
     ///     - `ffmpeg_sys_next::SEEK_END` (2): Seek relative to the end of the output.
-    ///     - `ffmpeg_sys_next::AVSEEK_FLAG_BYTE` (2): Seek using **byte offset** instead of timestamps.
-    ///     - `ffmpeg_sys_next::AVSEEK_SIZE` (65536): Query the **total size** of the stream.
-    ///     - `ffmpeg_sys_next::AVSEEK_FORCE` (131072): **Force seeking, even if normally restricted.**
+    ///     - `ffmpeg_sys_next::AVSEEK_SIZE` (65536): Query the **total size** of the stream
+    ///       instead of seeking.
+    ///
+    ///     `avio_seek` strips `ffmpeg_sys_next::AVSEEK_FORCE` (131072) from `whence` before
+    ///     invoking a custom callback; the example masks it anyway as cheap defense. No
+    ///     other `whence` values reach a custom seek callback.
     ///
     /// ### Return Value:
     /// - **Positive Value**: The new offset position after seeking.
@@ -580,7 +575,8 @@ impl Output {
     /// Since `FFmpeg` may call `write_callback` and `seek_callback` from different threads,
     /// **use `Arc<Mutex<File>>` to ensure safe concurrent access.**
     ///
-    /// ```rust,ignore
+    /// ```rust,no_run
+    /// use ez_ffmpeg::Output;
     /// use std::fs::File;
     /// use std::io::{Seek, SeekFrom, Write};
     /// use std::sync::{Arc, Mutex};
@@ -609,36 +605,29 @@ impl Output {
     ///     Box::new(move |offset: i64, whence: i32| -> i64 {
     ///         let mut file = file.lock().unwrap();
     ///
-    ///         match whence {
-    ///             // ✅ Handle AVSEEK_SIZE: Return total file size
-    ///             ffmpeg_sys_next::AVSEEK_SIZE => {
-    ///                 if let Ok(size) = file.metadata().map(|m| m.len() as i64) {
-    ///                     println!("FFmpeg requested stream size: {}", size);
-    ///                     return size;
-    ///                 }
-    ///                 return ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO) as i64;
+    ///         // ✅ Handle AVSEEK_SIZE: FFmpeg asks for the total stream size instead of seeking
+    ///         if whence == ffmpeg_sys_next::AVSEEK_SIZE {
+    ///             if let Ok(size) = file.metadata().map(|m| m.len() as i64) {
+    ///                 return size;
     ///             }
+    ///             return ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO) as i64;
+    ///         }
     ///
-    ///             // ✅ Handle AVSEEK_FLAG_BYTE: Seek using byte offset
-    ///             ffmpeg_sys_next::AVSEEK_FLAG_BYTE => {
-    ///                 println!("FFmpeg requested byte-based seeking. Seeking to byte offset: {}", offset);
-    ///                 if let Ok(new_pos) = file.seek(SeekFrom::Start(offset as u64)) {
-    ///                     return new_pos as i64;
-    ///                 }
-    ///                 return ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO) as i64;
-    ///             }
-    ///
-    ///             // ✅ Standard seek modes
+    ///         // ✅ Defensive: mask AVSEEK_FORCE (avio_seek strips it before a custom
+    ///         // callback). The AVIO layer sends no other whence values (lseek extensions
+    ///         // like SEEK_HOLE/SEEK_DATA never reach a custom callback).
+    ///         match whence & !ffmpeg_sys_next::AVSEEK_FORCE {
     ///             ffmpeg_sys_next::SEEK_SET => file.seek(SeekFrom::Start(offset as u64)),
     ///             ffmpeg_sys_next::SEEK_CUR => file.seek(SeekFrom::Current(offset)),
     ///             ffmpeg_sys_next::SEEK_END => file.seek(SeekFrom::End(offset)),
-    ///             _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Unsupported seek mode")),
+    ///             _ => return ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::ESPIPE) as i64,
     ///         }.map_or(ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO) as i64, |pos| pos as i64)
     ///     })
     /// };
     ///
     /// // ✅ Create an output with both callbacks
-    /// let output = Output::new_by_write_callback(write_callback, "mp4")
+    /// let output = Output::new_by_write_callback(write_callback)
+    ///     .set_format("mp4")
     ///     .set_seek_callback(seek_callback);
     /// ```
     pub fn set_seek_callback<F>(mut self, seek_callback: F) -> Self

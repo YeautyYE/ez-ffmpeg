@@ -107,7 +107,9 @@
 //! - **`flv`**: Adds FLV container parsing and handling.
 //! - **`subtitle`**: Native ASS/SRT subtitle burn-in rendered in pure Rust — no system
 //!   libraries beyond FFmpeg itself (see the `subtitle` module docs).
-//! - **`async`**: Makes the [`FfmpegScheduler`] wait method asynchronous (you can `.await` it).
+//! - **`async`**: Adds asynchronous functionality: [`FfmpegScheduler`] additionally implements
+//!   `Future`, so a running scheduler can be `.await`ed as a non-blocking alternative to the
+//!   always-available synchronous `wait()`.
 //! - **`static`**: Uses static linking for FFmpeg libraries (via `ffmpeg-next/static`).
 //!
 //! ## Relationship to the FFmpeg CLI
