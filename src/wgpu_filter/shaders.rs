@@ -99,9 +99,14 @@ fn fs_main(@location(0) tex_coord: vec2<f32>) -> @location(0) vec4<f32> {{
     )
 }
 
-/// Compute shader packing the RGBA output texture into tightly-strided
+/// Compute shader packing the effect output texture into tightly-strided
 /// YUV420P planes inside one storage buffer (u32 words, 4-byte row alignment).
 /// Each invocation packs an 8x2 luma block (4 Y words, 1 U word, 1 V word).
+///
+/// Two pack modes: RGB (matrix + range transform) for the RGBA effect
+/// pipeline, and identity for the YUV passthrough pipeline, where the
+/// texture already holds raw YUV code values and no matrix or range
+/// conversion is applied (the 4:2:0 pack still box-averages chroma).
 pub(crate) const PACK_CS: &str = r#"
 struct PackUniforms {
     width: u32,
@@ -110,15 +115,23 @@ struct PackUniforms {
     c_stride_words: u32,
     u_offset_words: u32,
     v_offset_words: u32,
-    matrix_id: u32,   // 0 = BT.601, 1 = BT.709
-    full_range: u32,  // 0 = limited, 1 = full
+    matrix_id: u32,   // 0 = BT.601, 1 = BT.709 (RGB mode only)
+    full_range: u32,  // 0 = limited, 1 = full (RGB mode only)
+    pack_mode: u32,   // 0 = RGB -> YUV, 1 = identity (raw YUV code values)
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 };
 
 @group(0) @binding(0) var src: texture_2d<f32>;
 @group(0) @binding(1) var<uniform> pu: PackUniforms;
 @group(0) @binding(2) var<storage, read_write> out_buf: array<u32>;
 
-fn rgb_to_yuv(c: vec3<f32>) -> vec3<f32> {
+fn texel_to_yuv(c: vec3<f32>) -> vec3<f32> {
+    if (pu.pack_mode == 1u) {
+        // Identity: the texel channels ARE (Y, U, V) code values.
+        return c;
+    }
     var yuv: vec3<f32>;
     if (pu.matrix_id == 1u) {
         let y = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
@@ -184,15 +197,15 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // Luma: two bytes per row into word q/2 at byte offset (q%2)*2.
         let w = q / 2u;
         let shift = (q % 2u) * 16u;
-        var row0 = quantize(rgb_to_yuv(p00).x);
+        var row0 = quantize(texel_to_yuv(p00).x);
         if (px + 1u < pu.width) {
-            row0 = row0 | (quantize(rgb_to_yuv(p10).x) << 8u);
+            row0 = row0 | (quantize(texel_to_yuv(p10).x) << 8u);
         }
         words[0][w] = words[0][w] | (row0 << shift);
         if (write_row1) {
-            var row1 = quantize(rgb_to_yuv(p01).x);
+            var row1 = quantize(texel_to_yuv(p01).x);
             if (px + 1u < pu.width) {
-                row1 = row1 | (quantize(rgb_to_yuv(p11).x) << 8u);
+                row1 = row1 | (quantize(texel_to_yuv(p11).x) << 8u);
             }
             words[1][w] = words[1][w] | (row1 << shift);
         }
@@ -201,7 +214,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // (replicated) loads, exactly like the block form did.
         if (write_chroma && (bx * 4u + q) < cw) {
             let avg = (p00 + p10 + p01 + p11) * 0.25;
-            let yuv = rgb_to_yuv(avg);
+            let yuv = texel_to_yuv(avg);
             uw = uw | (quantize(yuv.y) << (q * 8u));
             vw = vw | (quantize(yuv.z) << (q * 8u));
         }
@@ -246,6 +259,288 @@ fn fs_main(@location(0) tex_coord: vec2<f32>) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// Shared prelude functions of the YUV passthrough effect shader. The
+/// layout-specific piece (bindings + `ez_chroma` + `ez_chroma_size`) is
+/// prepended by [`yuv_effect_fs_planar`]/[`yuv_effect_fs_nv12`]; the user
+/// body only ever calls these functions, so one body compiles against both
+/// plane layouts.
+const YUV_PRELUDE_COMMON: &str = r#"
+fn ez_luma(coord: vec2<f32>) -> f32 {
+    return textureSample(ez_tex_y, ez_samp, coord).r;
+}
+fn ez_sample_yuv(coord: vec2<f32>) -> vec3<f32> {
+    return vec3<f32>(ez_luma(coord), ez_chroma(coord));
+}
+fn ez_input_size() -> vec2<f32> {
+    return vec2<f32>(textureDimensions(ez_tex_y));
+}
+fn ez_output_size() -> vec2<f32> {
+    return vec2<f32>(ez_yuv_uniforms.out_w, ez_yuv_uniforms.out_h);
+}
+fn ez_play_time() -> f32 {
+    return ez_yuv_uniforms.play_time;
+}
+fn ez_full_range() -> bool {
+    return ez_yuv_uniforms.range_flag > 0.5;
+}
+"#;
+
+/// Epilogue appended after the user body: the user defines `ez_effect`, the
+/// library owns the fragment entry point and pads the alpha channel.
+const YUV_EPILOGUE: &str = r#"
+@fragment
+fn fs_main(@location(0) tex_coord: vec2<f32>) -> @location(0) vec4<f32> {
+    return vec4<f32>(ez_effect(tex_coord), 1.0);
+}
+"#;
+
+/// Layout-specific prelude head for planar input (three R8 planes).
+const YUV_HEADER_PLANAR: &str = r#"struct EzYuvUniforms {
+    play_time: f32,
+    out_w: f32,
+    out_h: f32,
+    range_flag: f32,
+};
+@group(0) @binding(0) var ez_tex_y: texture_2d<f32>;
+@group(0) @binding(1) var ez_tex_u: texture_2d<f32>;
+@group(0) @binding(2) var ez_tex_v: texture_2d<f32>;
+@group(0) @binding(3) var ez_samp: sampler;
+@group(0) @binding(4) var<uniform> ez_yuv_uniforms: EzYuvUniforms;
+
+fn ez_chroma(coord: vec2<f32>) -> vec2<f32> {
+    return vec2<f32>(
+        textureSample(ez_tex_u, ez_samp, coord).r,
+        textureSample(ez_tex_v, ez_samp, coord).r,
+    );
+}
+fn ez_chroma_size() -> vec2<f32> {
+    return vec2<f32>(textureDimensions(ez_tex_u));
+}
+"#;
+
+/// Layout-specific prelude head for NV12 input (R8 luma + RG8 chroma).
+const YUV_HEADER_NV12: &str = r#"struct EzYuvUniforms {
+    play_time: f32,
+    out_w: f32,
+    out_h: f32,
+    range_flag: f32,
+};
+@group(0) @binding(0) var ez_tex_y: texture_2d<f32>;
+@group(0) @binding(1) var ez_tex_uv: texture_2d<f32>;
+@group(0) @binding(3) var ez_samp: sampler;
+@group(0) @binding(4) var<uniform> ez_yuv_uniforms: EzYuvUniforms;
+
+fn ez_chroma(coord: vec2<f32>) -> vec2<f32> {
+    return textureSample(ez_tex_uv, ez_samp, coord).rg;
+}
+fn ez_chroma_size() -> vec2<f32> {
+    return vec2<f32>(textureDimensions(ez_tex_uv));
+}
+"#;
+
+fn assemble_yuv_module(header: &str, body: &str) -> String {
+    let mut module = String::with_capacity(
+        header.len() + YUV_PRELUDE_COMMON.len() + body.len() + YUV_EPILOGUE.len(),
+    );
+    module.push_str(header);
+    module.push_str(YUV_PRELUDE_COMMON);
+    module.push_str(body);
+    module.push_str(YUV_EPILOGUE);
+    module
+}
+
+/// Full YUV passthrough effect module for planar input. `body` is the
+/// user-provided WGSL defining `fn ez_effect(coord: vec2<f32>) -> vec3<f32>`.
+pub(crate) fn yuv_effect_fs_planar(body: &str) -> String {
+    assemble_yuv_module(YUV_HEADER_PLANAR, body)
+}
+
+/// Full YUV passthrough effect module for NV12 input.
+pub(crate) fn yuv_effect_fs_nv12(body: &str) -> String {
+    assemble_yuv_module(YUV_HEADER_NV12, body)
+}
+
+/// Identity body for the YUV passthrough contract: samples the input at the
+/// same coordinate and returns its code values unchanged. Used by tests as
+/// the minimal conforming shader body.
+#[cfg(test)]
+pub(crate) const YUV_IDENTITY_BODY: &str = r#"
+fn ez_effect(coord: vec2<f32>) -> vec3<f32> {
+    return ez_sample_yuv(coord);
+}
+"#;
+
+/// Strips `//` line comments and nested `/* */` block comments so the
+/// lexical body checks below cannot be fooled by commented-out code. WGSL
+/// has no string literals, which keeps this a plain scanner; an unterminated
+/// block comment swallows the rest (naga rejects such a module anyway).
+///
+/// A `//` comment ends at any WGSL line break — LF, VT, FF, CR, NEL, LS or
+/// PS — not just LF, so `// hidden\r<code>` cannot smuggle `<code>` past
+/// the checks (naga starts a fresh line at each of these).
+fn strip_wgsl_comments(src: &str) -> String {
+    fn is_line_break(c: char) -> bool {
+        matches!(
+            c,
+            '\n' | '\x0B' | '\x0C' | '\r' | '\u{0085}' | '\u{2028}' | '\u{2029}'
+        )
+    }
+    let mut out = String::with_capacity(src.len());
+    let mut chars = src.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '/' {
+            match chars.peek() {
+                Some('/') => {
+                    for c2 in chars.by_ref() {
+                        if is_line_break(c2) {
+                            out.push(c2);
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                Some('*') => {
+                    chars.next();
+                    let mut depth = 1u32;
+                    let mut prev = ' ';
+                    while depth > 0 {
+                        let Some(c2) = chars.next() else { break };
+                        if prev == '/' && c2 == '*' {
+                            depth += 1;
+                            prev = ' ';
+                        } else if prev == '*' && c2 == '/' {
+                            depth -= 1;
+                            prev = ' ';
+                        } else {
+                            prev = c2;
+                        }
+                    }
+                    // Keep token separation where the comment sat.
+                    out.push(' ');
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn ident_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// WGSL blankspace (spec "blankspace" pattern): ASCII whitespace plus NEL,
+/// the LTR/RTL marks and the LS/PS separators. Rust's `str::trim_start`
+/// does NOT cover U+200E/U+200F (category Cf, not White_Space), yet naga
+/// separates tokens at them like at a space — so the scanners below must
+/// use this predicate or `@\u{200E}group(0)` slips through while a legal
+/// `fn\u{200E}ez_effect` is falsely rejected.
+fn wgsl_blank(c: char) -> bool {
+    matches!(
+        c,
+        ' ' | '\t'
+            | '\n'
+            | '\x0B'
+            | '\x0C'
+            | '\r'
+            | '\u{0085}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{2028}'
+            | '\u{2029}'
+    )
+}
+
+fn trim_wgsl_start(s: &str) -> &str {
+    s.trim_start_matches(wgsl_blank)
+}
+
+/// Whether a YUV effect body defines `fn ez_effect(...)` — the function the
+/// generated `fs_main` calls. A lexical check (comments stripped, `fn` and
+/// the name matched as whole words, `(` required), so `// fn ez_effect` or
+/// `fn ez_effect_helper` do not count; used by `build()` to fail early with
+/// a friendly message instead of a shader diagnostic at init.
+pub(crate) fn body_defines_ez_effect(body: &str) -> bool {
+    let stripped = strip_wgsl_comments(body);
+    let s = stripped.as_str();
+    let mut search = 0;
+    while let Some(rel) = s[search..].find("fn") {
+        let at = search + rel;
+        search = at + 2;
+        if s[..at].chars().next_back().is_some_and(ident_char) {
+            continue; // tail of a longer identifier
+        }
+        let rest = &s[at + 2..];
+        let trimmed = trim_wgsl_start(rest);
+        if trimmed.len() == rest.len() {
+            continue; // no separator after `fn` (e.g. `fnez_effect`)
+        }
+        if let Some(after_name) = trimmed.strip_prefix("ez_effect") {
+            if !after_name.starts_with(ident_char) && trim_wgsl_start(after_name).starts_with('(') {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether a YUV effect body declares a binding group other than the
+/// literal `@group(1)` params group. `@group(0)` is reserved for the
+/// library prelude, and naga only rejects a duplicate binding when BOTH
+/// declarations are statically used — an unused-looking alias could
+/// silently sample the prelude's resources. Group indices are
+/// const-expressions (`0u`, `0x0`, `1-1`, `u32(0)` and a named const all
+/// name group 0), which a lexical scan cannot evaluate, so the check is an
+/// allowlist instead: after comment stripping, every `@group(...)`
+/// argument must be the single token `1`; any other spelling is rejected
+/// at `build()`.
+pub(crate) fn body_declares_reserved_group(body: &str) -> bool {
+    let stripped = strip_wgsl_comments(body);
+    let s = stripped.as_str();
+    let mut search = 0;
+    while let Some(rel) = s[search..].find('@') {
+        let at = search + rel;
+        search = at + 1;
+        let rest = trim_wgsl_start(&s[at + 1..]);
+        let Some(args) = rest.strip_prefix("group") else {
+            continue;
+        };
+        // `group` must end there (`@groups` is some other attribute).
+        if args.starts_with(ident_char) {
+            continue;
+        }
+        let args = trim_wgsl_start(args);
+        let Some(inner) = args.strip_prefix('(') else {
+            continue;
+        };
+        // Take the argument up to the matching `)` — `u32(0)` nests.
+        let mut depth = 1u32;
+        let mut end = None;
+        for (i, c) in inner.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else {
+            return true; // unterminated argument — reject conservatively
+        };
+        if inner[..end].trim_matches(wgsl_blank) != "1" {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,12 +553,16 @@ mod tests {
     fn builtin_shaders_parse_and_validate() {
         let planar = convert_fs_planar();
         let nv12 = convert_fs_nv12();
-        let modules: [(&str, &str); 5] = [
+        let yuv_planar = yuv_effect_fs_planar(YUV_IDENTITY_BODY);
+        let yuv_nv12 = yuv_effect_fs_nv12(YUV_IDENTITY_BODY);
+        let modules: [(&str, &str); 7] = [
             ("fullscreen_vs", FULLSCREEN_VS),
             ("convert_fs_planar", planar.as_str()),
             ("convert_fs_nv12", nv12.as_str()),
             ("pack_cs", PACK_CS),
             ("identity_fs", IDENTITY_FS),
+            ("yuv_effect_fs_planar", yuv_planar.as_str()),
+            ("yuv_effect_fs_nv12", yuv_nv12.as_str()),
         ];
         for (name, source) in modules {
             let module = naga::front::wgsl::parse_str(source)
@@ -275,5 +574,88 @@ mod tests {
             .validate(&module)
             .unwrap_or_else(|e| panic!("{name}: WGSL validation failed: {e:?}"));
         }
+    }
+
+    #[test]
+    fn ez_effect_detection_matches_definitions_only() {
+        assert!(body_defines_ez_effect(YUV_IDENTITY_BODY));
+        assert!(body_defines_ez_effect(
+            "fn ez_effect (coord: vec2<f32>) -> vec3<f32> { return vec3<f32>(0.0); }"
+        ));
+        assert!(body_defines_ez_effect(
+            "fn\n  ez_effect\n  (c: vec2<f32>) -> vec3<f32> {}"
+        ));
+        // U+200E is WGSL blankspace: a legal separator after `fn`.
+        assert!(body_defines_ez_effect(
+            "fn\u{200E}ez_effect(c: vec2<f32>) -> vec3<f32> {}"
+        ));
+
+        // Comments, longer identifiers and call sites must not count.
+        assert!(!body_defines_ez_effect("// fn ez_effect(c: vec2<f32>)"));
+        assert!(!body_defines_ez_effect(
+            "/* fn ez_effect(c) */ fn other() {}"
+        ));
+        assert!(!body_defines_ez_effect(
+            "fn ez_effect_helper(c: vec2<f32>) -> vec3<f32> {}"
+        ));
+        assert!(!body_defines_ez_effect("fnez_effect(c)"));
+        assert!(!body_defines_ez_effect("let x = my_fn; ez_effect(x);"));
+    }
+
+    #[test]
+    fn group_detection_allows_only_the_literal_params_group() {
+        // Group indices are const-expressions: every spelling below names a
+        // reserved group (or is unreadable) and must be rejected.
+        for body in [
+            "@group(0) @binding(9) var<uniform> x: f32;",
+            "@ group ( 0 ) @binding(0) var t: f32;",
+            "@group(0u) @binding(3) var s: sampler;",
+            "@group(0x0) @binding(0) var t: texture_2d<f32>;",
+            "@group(1-1) @binding(0) var t: texture_2d<f32>;",
+            "@group(u32(0)) @binding(0) var t: texture_2d<f32>;",
+            "const ZERO = 0; @group(ZERO) @binding(0) var t: texture_2d<f32>;",
+            "@group(2) @binding(0) var<uniform> p: f32;",
+            "@group(1u) @binding(0) var<uniform> p: f32;", // literal `1` only
+            "@group(1 @binding(0) var<uniform> p: f32;",   // unterminated
+            // WGSL blankspace includes U+200E/U+200F, which Rust's
+            // trim_start does not — naga still tokenizes across them.
+            "@\u{200E}group(0u) @binding(3) var s: sampler;",
+            "@group\u{200F}(0) @binding(0) var t: texture_2d<f32>;",
+        ] {
+            assert!(body_declares_reserved_group(body), "not rejected: {body}");
+        }
+
+        for body in [
+            "@group(1) @binding(0) var<uniform> params: f32;",
+            "@group( 1 ) @binding(0) var<uniform> params: f32;",
+            "@group(/* params */ 1) @binding(0) var<uniform> params: f32;",
+            "@group\u{200E}(\u{200F}1\u{200E}) @binding(0) var<uniform> params: f32;",
+            "// @group(0) commented out",
+            "/* nested /* @group(0) */ still comment */ fn f() {}",
+        ] {
+            assert!(!body_declares_reserved_group(body), "rejected: {body}");
+        }
+    }
+
+    #[test]
+    fn comment_stripping_handles_line_block_and_nesting() {
+        assert_eq!(strip_wgsl_comments("a // b\nc"), "a \nc");
+        assert_eq!(strip_wgsl_comments("a /* b */ c"), "a   c");
+        assert_eq!(strip_wgsl_comments("a /* b /* c */ d */ e"), "a   e");
+        // Unterminated block comments swallow the tail.
+        assert_eq!(strip_wgsl_comments("a /* b"), "a  ");
+    }
+
+    #[test]
+    fn comment_stripping_ends_line_comments_at_every_wgsl_line_break() {
+        // WGSL also breaks lines at VT, FF, CR, NEL, LS and PS; a `//`
+        // comment must not swallow code that naga sees on the next line.
+        for br in ['\x0B', '\x0C', '\r', '\u{0085}', '\u{2028}', '\u{2029}'] {
+            let hidden = format!("// hide{br}@group(0) @binding(0) var s: sampler;");
+            assert!(body_declares_reserved_group(&hidden), "break {br:?}");
+            let def = format!("//x{br}fn ez_effect(c: vec2<f32>) -> vec3<f32> {{}}");
+            assert!(body_defines_ez_effect(&def), "break {br:?}");
+        }
+        assert_eq!(strip_wgsl_comments("a // b\rc"), "a \rc");
     }
 }

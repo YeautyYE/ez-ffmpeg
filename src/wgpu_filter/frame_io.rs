@@ -3,7 +3,9 @@
 
 use crate::util::ffmpeg_utils::av_err2str;
 use crate::util::frame_utils::copy_plane;
-use crate::wgpu_filter::gpu_state::{GpuState, OutputGeometry, StagingSlot};
+use crate::wgpu_filter::gpu_state::{
+    EffectPipeline, GpuState, OutputGeometry, PassBinds, StagingSlot,
+};
 use crate::wgpu_filter::hw_interop::{self, ImportedNv12};
 use crate::wgpu_filter::params::SharedParams;
 use ffmpeg_next::Frame;
@@ -257,25 +259,23 @@ pub(crate) fn upload_and_encode(
     }
 
     encode_and_submit(
-        gpu,
-        gpu.convert_pipeline(layout),
-        &res.convert_bind,
-        frame,
-        matrix_id,
-        full_range,
-        staging,
-        params,
+        gpu, layout, None, frame, matrix_id, full_range, staging, params,
     )
 }
 
-/// Encodes the convert/effect/pack passes against an already-uploaded (or
-/// imported) input bound by `convert_bind`, submits, and registers the
-/// readback map. Shared tail of the software and hardware input paths.
+/// Encodes the frame's passes against an already-uploaded (or imported)
+/// input, submits, and registers the readback map. Shared tail of the
+/// software and hardware input paths: `hw_input_bind` overrides the cached
+/// input bind group with a per-frame one built over imported hw textures.
+///
+/// RGBA mode encodes convert -> effect -> pack; YUV passthrough mode has no
+/// convert pass — the effect samples the input planes directly and the pack
+/// runs in identity mode.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_and_submit(
     gpu: &GpuState,
-    convert_pipeline: &wgpu::RenderPipeline,
-    convert_bind: &wgpu::BindGroup,
+    layout: PlaneLayout,
+    hw_input_bind: Option<&wgpu::BindGroup>,
     frame: &Frame,
     matrix_id: u32,
     full_range: bool,
@@ -283,20 +283,23 @@ pub(crate) fn encode_and_submit(
     params: &SharedParams,
 ) -> Result<wgpu::SubmissionIndex, String> {
     let res = gpu.resources.as_ref().expect("resources ensured");
+    let yuv_mode = matches!(gpu.effect_pipeline, EffectPipeline::Yuv { .. });
 
     // Per-frame uniforms. Queue writes are ordered on the queue timeline, so
     // sharing one uniform buffer across in-flight frames is race-free: the
     // write for frame N+1 executes after frame N's submission. The convert
     // and pack payloads only change with geometry/colorspace, so an
     // equal-value write is skipped (the buffer already holds these bytes).
-    let convert_data: [u32; 4] = [matrix_id, full_range as u32, 0, 0];
-    if gpu.convert_uniforms_cache.get() != Some(convert_data) {
-        gpu.queue.write_buffer(
-            &gpu.convert_uniforms,
-            0,
-            bytemuck::cast_slice(&convert_data),
-        );
-        gpu.convert_uniforms_cache.set(Some(convert_data));
+    if !yuv_mode {
+        let convert_data: [u32; 4] = [matrix_id, full_range as u32, 0, 0];
+        if gpu.convert_uniforms_cache.get() != Some(convert_data) {
+            gpu.queue.write_buffer(
+                &gpu.convert_uniforms,
+                0,
+                bytemuck::cast_slice(&convert_data),
+            );
+            gpu.convert_uniforms_cache.set(Some(convert_data));
+        }
     }
 
     // SAFETY: reading scalar fields from a live, validated frame.
@@ -308,7 +311,21 @@ pub(crate) fn encode_and_submit(
             pts as f64 * av_q2d((*frame.as_ptr()).time_base)
         }
     };
-    let ez_data: [f32; 4] = [play_time as f32, res.out_w as f32, res.out_h as f32, 0.0];
+    // The fourth slot is the documented `_pad` of the RGBA shader contract
+    // and must stay 0.0 there — an existing shader reading it would observe
+    // a value change otherwise. Only the YUV prelude interprets it, as the
+    // effective-range flag behind `ez_full_range()`.
+    let range_flag = if yuv_mode {
+        full_range as u32 as f32
+    } else {
+        0.0
+    };
+    let ez_data: [f32; 4] = [
+        play_time as f32,
+        res.out_w as f32,
+        res.out_h as f32,
+        range_flag,
+    ];
     gpu.queue
         .write_buffer(&gpu.ez_uniforms, 0, bytemuck::cast_slice(&ez_data));
 
@@ -322,7 +339,7 @@ pub(crate) fn encode_and_submit(
         gpu.queue.write_buffer(&gpu.params_buf, 0, &bytes);
     }
 
-    let pack_data: [u32; 8] = [
+    let pack_data: [u32; 12] = [
         res.out_w,
         res.out_h,
         (res.y_stride / 4) as u32,
@@ -332,6 +349,10 @@ pub(crate) fn encode_and_submit(
             as u32,
         matrix_id,
         full_range as u32,
+        yuv_mode as u32,
+        0,
+        0,
+        0,
     ];
     if gpu.pack_uniforms_cache.get() != Some(pack_data) {
         gpu.queue
@@ -358,30 +379,58 @@ pub(crate) fn encode_and_submit(
         })
     }
 
-    {
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("ez_convert_pass"),
-            color_attachments: &[color_attachment(&res.intermediate_view)],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-        pass.set_pipeline(convert_pipeline);
-        pass.set_bind_group(0, convert_bind, &[]);
-        pass.draw(0..3, 0..1);
-    }
-    {
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("ez_effect_pass"),
-            color_attachments: &[color_attachment(&res.out_view)],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-        pass.set_pipeline(&gpu.effect_pipeline);
-        pass.set_bind_group(0, &res.effect_bind0, &[]);
-        pass.set_bind_group(1, &res.effect_bind1, &[]);
-        pass.draw(0..3, 0..1);
+    match (&gpu.effect_pipeline, &res.pass_binds) {
+        (
+            EffectPipeline::Rgba(effect_pipeline),
+            PassBinds::Rgba {
+                intermediate_view,
+                convert_bind,
+                effect_bind,
+            },
+        ) => {
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("ez_convert_pass"),
+                    color_attachments: &[color_attachment(intermediate_view)],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_pipeline(gpu.convert_pipeline(layout));
+                pass.set_bind_group(0, hw_input_bind.unwrap_or(convert_bind), &[]);
+                pass.draw(0..3, 0..1);
+            }
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("ez_effect_pass"),
+                color_attachments: &[color_attachment(&res.out_view)],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(effect_pipeline);
+            pass.set_bind_group(0, effect_bind, &[]);
+            pass.set_bind_group(1, &res.effect_bind1, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        (EffectPipeline::Yuv { planar, nv12 }, PassBinds::Yuv { effect_bind }) => {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("ez_yuv_effect_pass"),
+                color_attachments: &[color_attachment(&res.out_view)],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(match layout {
+                PlaneLayout::Planar { .. } => planar,
+                PlaneLayout::Nv12 => nv12,
+            });
+            pass.set_bind_group(0, hw_input_bind.unwrap_or(effect_bind), &[]);
+            pass.set_bind_group(1, &res.effect_bind1, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        // The pipeline mode is fixed at init and the resources are built by
+        // the same GpuState, so the variants can never disagree.
+        _ => unreachable!("effect pipeline and pass binds share the mode"),
     }
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
