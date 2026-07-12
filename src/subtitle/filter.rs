@@ -198,82 +198,15 @@ impl SubtitleFilter {
         let width = (*frame).width as usize;
         let height = (*frame).height as usize;
 
-        // Per-overlay alpha + converted color, computed once and shared by
-        // both workers. A tiny linear-probe cache dedups the f64 color
-        // conversion: dense frames carry ~100 nodes reusing a handful of
-        // colors (fill, outline, shadow), and each conversion is ~15 f64
-        // ops plus three float->int rounds.
-        scratch.preps.clear();
-        scratch.preps.reserve(images.len());
-        let mut colors = [(u32::MAX, [0u32; 3]); 8]; // key is 24-bit RGB: MAX never collides
-        let mut color_count = 0usize;
-        for overlay in images {
-            let alpha = spec.sample.alpha_fixed(overlay.opacity());
-            if alpha == 0 {
-                scratch.preps.push(OverlayPrep { alpha, src: [0; 3] });
-                continue;
-            }
-            let key = overlay.color >> 8; // RGB part; the conversion ignores alpha
-            let src = match colors[..color_count].iter().find(|(k, _)| *k == key) {
-                Some(&(_, hit)) => hit,
-                None => {
-                    let converted = match spec.model {
-                        ColorModel::Yuv => {
-                            blend::yuv_components(overlay.rgb(), matrix, range, spec.scale_bits)
-                        }
-                        ColorModel::Rgb => {
-                            blend::rgb_components(overlay.rgb(), range, spec.scale_bits)
-                        }
-                    };
-                    if color_count < colors.len() {
-                        colors[color_count] = (key, converted);
-                        color_count += 1;
-                    }
-                    converted
-                }
-            };
-            scratch.preps.push(OverlayPrep { alpha, src });
-        }
-
-        // Raw component geometry, captured once on this thread. Unusable
-        // planes are skipped (defensive; the scheduler never feeds such
-        // frames) exactly like the old per-view checks.
-        let mut tasks: Vec<CompTask> = Vec::with_capacity(spec.comps.len());
-        for (source, placement) in spec.comps {
-            let plane_w = (width + (1usize << placement.hsub) - 1) >> placement.hsub;
-            let plane_h = (height + (1usize << placement.vsub) - 1) >> placement.vsub;
-            let linesize = (*frame).linesize[placement.plane];
-            let data = (*frame).data[placement.plane];
-            if linesize <= 0 || data.is_null() || plane_w == 0 || plane_h == 0 {
-                continue;
-            }
-            let linesize = linesize as usize;
-            tasks.push(CompTask {
-                plane: placement.plane,
-                data: data.add(placement.offset),
-                // View length relative to the offset-advanced pointer, ending
-                // at the component's LAST SAMPLE:
-                //   linesize*(plane_h-1) + (plane_w-1)*pixel_step + sample_bytes.
-                // The trailing interleave bytes after that sample belong to
-                // sibling components (or don't exist on tight buffers); the
-                // kernels never touch them (`row_len` ends at the last sample
-                // too). `plane_w`/`plane_h` are >= 1 past the guard above.
-                len: linesize * (plane_h - 1)
-                    + (plane_w - 1) * placement.pixel_step
-                    + spec.sample.bytes(),
-                linesize,
-                pixel_step: placement.pixel_step,
-                source: *source,
-                hsub: placement.hsub,
-                vsub: placement.vsub,
-            });
-        }
+        fill_overlay_preps(images, spec, matrix, range, &mut scratch.preps);
+        collect_comp_tasks(frame, spec, (width, height), &mut scratch.tasks);
 
         let dims = (width, height);
         let sample = spec.sample;
         let preps = &scratch.preps;
+        let tasks = &scratch.tasks;
         if parallel {
-            if let Some((group_a, group_b)) = split_tasks(&tasks) {
+            if let Some((group_a, group_b)) = split_tasks(tasks) {
                 let (pool_a, pool_b) = (&mut scratch.pool_a, &mut scratch.pool_b);
                 std::thread::scope(|s| {
                     // Group A (the first plane — luma) on the spawned
@@ -289,7 +222,94 @@ impl SubtitleFilter {
                 return;
             }
         }
-        blend_task_group(&tasks, images, preps, sample, dims, &mut scratch.pool_a);
+        blend_task_group(tasks, images, preps, sample, dims, &mut scratch.pool_a);
+    }
+}
+
+/// Per-overlay alpha + converted color, computed once and shared by both
+/// blend workers. A tiny linear-probe cache dedups the f64 color
+/// conversion: dense frames carry ~100 nodes reusing a handful of colors
+/// (fill, outline, shadow), and each conversion is ~15 f64 ops plus three
+/// float->int rounds.
+fn fill_overlay_preps(
+    images: &[OverlayImage<'_>],
+    spec: &FormatSpec,
+    matrix: ColorMatrix,
+    range: ColorRange,
+    preps: &mut Vec<OverlayPrep>,
+) {
+    preps.clear();
+    preps.reserve(images.len());
+    let mut colors = [(u32::MAX, [0u32; 3]); 8]; // key is 24-bit RGB: MAX never collides
+    let mut color_count = 0usize;
+    for overlay in images {
+        let alpha = spec.sample.alpha_fixed(overlay.opacity());
+        if alpha == 0 {
+            preps.push(OverlayPrep { alpha, src: [0; 3] });
+            continue;
+        }
+        let key = overlay.color >> 8; // RGB part; the conversion ignores alpha
+        let src = match colors[..color_count].iter().find(|(k, _)| *k == key) {
+            Some(&(_, hit)) => hit,
+            None => {
+                let converted = match spec.model {
+                    ColorModel::Yuv => {
+                        blend::yuv_components(overlay.rgb(), matrix, range, spec.scale_bits)
+                    }
+                    ColorModel::Rgb => blend::rgb_components(overlay.rgb(), range, spec.scale_bits),
+                };
+                if color_count < colors.len() {
+                    colors[color_count] = (key, converted);
+                    color_count += 1;
+                }
+                converted
+            }
+        };
+        preps.push(OverlayPrep { alpha, src });
+    }
+}
+
+/// Raw component geometry, captured once on the calling thread. Unusable
+/// planes are skipped (defensive; the scheduler never feeds such frames)
+/// exactly like the old per-view checks.
+///
+/// # Safety
+/// `frame` must satisfy [`SubtitleFilter::blend_images`]'s contract.
+unsafe fn collect_comp_tasks(
+    frame: *mut AVFrame,
+    spec: &FormatSpec,
+    (width, height): (usize, usize),
+    tasks: &mut Vec<CompTask>,
+) {
+    tasks.clear();
+    for (source, placement) in spec.comps {
+        let plane_w = (width + (1usize << placement.hsub) - 1) >> placement.hsub;
+        let plane_h = (height + (1usize << placement.vsub) - 1) >> placement.vsub;
+        let linesize = (*frame).linesize[placement.plane];
+        let data = (*frame).data[placement.plane];
+        if linesize <= 0 || data.is_null() || plane_w == 0 || plane_h == 0 {
+            continue;
+        }
+        let linesize = linesize as usize;
+        tasks.push(CompTask {
+            plane: placement.plane,
+            data: data.add(placement.offset),
+            // View length relative to the offset-advanced pointer, ending
+            // at the component's LAST SAMPLE:
+            //   linesize*(plane_h-1) + (plane_w-1)*pixel_step + sample_bytes.
+            // The trailing interleave bytes after that sample belong to
+            // sibling components (or don't exist on tight buffers); the
+            // kernels never touch them (`row_len` ends at the last sample
+            // too). `plane_w`/`plane_h` are >= 1 past the guard above.
+            len: linesize * (plane_h - 1)
+                + (plane_w - 1) * placement.pixel_step
+                + spec.sample.bytes(),
+            linesize,
+            pixel_step: placement.pixel_step,
+            source: *source,
+            hsub: placement.hsub,
+            vsub: placement.vsub,
+        });
     }
 }
 
@@ -299,6 +319,10 @@ impl SubtitleFilter {
 struct BlendScratch {
     /// Per-overlay alpha + converted color, shared by both blend workers.
     preps: Vec<OverlayPrep>,
+    /// Component-geometry tasks for the current frame. Cleared and refilled
+    /// on every call; entries hold frame-local pointers, so they are never
+    /// read across calls — only the capacity is reused.
+    tasks: Vec<CompTask>,
     /// Mask-sum buffer for the serial path / parallel group A.
     pool_a: Vec<u16>,
     /// Mask-sum buffer for parallel group B (each worker pools into its
@@ -362,6 +386,80 @@ impl CompTask {
     }
 }
 
+/// One view spanning the three interleaved components of a packed-RGB
+/// plane, with each component's byte offset inside a pixel group and its
+/// converted-color index.
+struct FusedRgb {
+    view_task: CompTask,
+    offsets: [usize; 3],
+    sources: [usize; 3],
+}
+
+impl FusedRgb {
+    /// # Safety
+    /// Same contract as [`CompTask::view`]; the fused range is the union
+    /// of the three component ranges inside one plane allocation.
+    unsafe fn view(&self) -> PlaneView<'_> {
+        self.view_task.view()
+    }
+}
+
+/// Detects the packed-RGB shape: exactly three unsubsampled U8 components
+/// on one plane sharing a linesize and a pixel step of 3 or 4, each offset
+/// inside one pixel group (rgb24/bgr24 and the rgba family in the layout
+/// table). Returns one task spanning all three so they blend in a single
+/// mask traversal.
+fn fused_packed_rgb(tasks: &[CompTask], sample: SampleFormat) -> Option<FusedRgb> {
+    if sample != SampleFormat::U8 {
+        return None;
+    }
+    let [a, b, c] = tasks else {
+        return None;
+    };
+    let step = a.pixel_step;
+    if step != 3 && step != 4 {
+        return None;
+    }
+    let same_shape = |t: &CompTask| {
+        t.plane == a.plane
+            && t.linesize == a.linesize
+            && t.pixel_step == step
+            && t.hsub == 0
+            && t.vsub == 0
+    };
+    if !(same_shape(a) && same_shape(b) && same_shape(c)) {
+        return None;
+    }
+    let base = [a, b, c]
+        .into_iter()
+        .min_by_key(|t| t.data as usize)
+        .expect("three tasks");
+    let mut offsets = [0usize; 3];
+    let mut sources = [0usize; 3];
+    let mut len = 0usize;
+    for (i, t) in [a, b, c].into_iter().enumerate() {
+        // SAFETY: all three pointers derive from the same plane base
+        // (`frame.data[plane].add(placement.offset)` in blend_images), so
+        // the offset stays inside one allocation.
+        let off = usize::try_from(unsafe { t.data.offset_from(base.data) }).ok()?;
+        if off >= step {
+            return None;
+        }
+        offsets[i] = off;
+        sources[i] = t.source;
+        len = len.max(off + t.len);
+    }
+    Some(FusedRgb {
+        view_task: CompTask {
+            data: base.data,
+            len,
+            ..*base
+        },
+        offsets,
+        sources,
+    })
+}
+
 /// Splits tasks into (components on the first plane, the rest) for the
 /// two-thread blend. `None` when the split is impossible: fewer than two
 /// planes touched (packed RGB, gray) or any byte overlap between the groups
@@ -397,6 +495,38 @@ fn blend_task_group(
     (width, height): (usize, usize),
     pool: &mut Vec<u16>,
 ) {
+    // Packed-RGB fusion: when this group is exactly the three interleaved
+    // U8 color components of one packed plane, each overlay's mask is
+    // traversed once and all three samples per covered pixel blend in that
+    // pass, instead of three independent strided passes over the same rows
+    // (same detect-once/apply-many idea as the chroma pooling below). A
+    // packed-RGB group is single-plane, so `split_tasks` never carries it
+    // into the parallel split — this only ever runs on the serial path.
+    if let Some(fused) = fused_packed_rgb(tasks, sample) {
+        for (overlay, prep) in images.iter().zip(preps) {
+            if prep.alpha == 0 {
+                continue;
+            }
+            // SAFETY: the fused view is the only live view — the
+            // per-component loop below never runs for a fused group.
+            let mut plane = unsafe { fused.view() };
+            blend::blend_packed_rgb_u8(
+                &mut plane,
+                width,
+                height,
+                overlay,
+                [
+                    prep.src[fused.sources[0]],
+                    prep.src[fused.sources[1]],
+                    prep.src[fused.sources[2]],
+                ],
+                fused.offsets,
+                prep.alpha,
+            );
+        }
+        return;
+    }
+
     // When this group carries exactly two h2-subsampled components
     // (4:2:0/4:2:2 planar, NV12/NV21, P010 chroma) and the two-phase route
     // is preferred for the sample width, each node's mask is pooled ONCE
@@ -1062,6 +1192,130 @@ mod tests {
                 let mut parallel = parallel;
                 av_frame_free(&mut serial);
                 av_frame_free(&mut parallel);
+            }
+        }
+    }
+
+    /// The fused packed-RGB path must be byte-identical to blending each
+    /// interleaved component independently (the general path it replaces).
+    /// A single-task group never matches the fused shape, so running each
+    /// component as its own group exercises the reference; component byte
+    /// ranges are disjoint, so the reference's per-component ordering is
+    /// equivalent to the fused per-overlay ordering.
+    #[test]
+    fn packed_rgb_fused_blend_matches_per_component_reference() {
+        use ffmpeg_sys_next::AVPixelFormat::*;
+        let (w, h) = (318i32, 178i32);
+        let mut seed = 0x0DDB_A11D_00C0_FFEEu64;
+
+        // Structured mask overhanging the top-left, a translucent interior
+        // red, and a solid block overhanging the bottom-right: clipping on
+        // all sides, zero-mask skip blocks, and compositing order all in
+        // play.
+        let mask_a = {
+            let mut mask = lcg_bytes(220 * 130, &mut seed);
+            for (i, byte) in mask.iter_mut().enumerate() {
+                if (i / 40) % 3 == 0 {
+                    *byte = 0;
+                }
+            }
+            mask
+        };
+        let mask_b = lcg_bytes(97 * 53, &mut seed);
+        let mask_c = vec![255u8; 90 * 60];
+        let images = [
+            OverlayImage {
+                w: 220,
+                h: 130,
+                stride: 220,
+                bitmap: &mask_a,
+                color: 0xFFFFFF00,
+                dst_x: -8,
+                dst_y: -6,
+            },
+            OverlayImage {
+                w: 97,
+                h: 53,
+                stride: 97,
+                bitmap: &mask_b,
+                color: 0xFF000040,
+                dst_x: 40,
+                dst_y: 30,
+            },
+            OverlayImage {
+                w: 90,
+                h: 60,
+                stride: 90,
+                bitmap: &mask_c,
+                color: 0x00FF0080,
+                dst_x: 260,
+                dst_y: 140,
+            },
+        ];
+
+        for format in [
+            AV_PIX_FMT_RGB24,
+            AV_PIX_FMT_BGR24,
+            AV_PIX_FMT_RGBA,
+            AV_PIX_FMT_BGRA,
+            AV_PIX_FMT_ARGB,
+            AV_PIX_FMT_ABGR,
+        ] {
+            let spec = layout::format_spec(format as i32).expect("supported format");
+            let fill_seed = 0xF05E_ED00 ^ format as u64;
+            let dims = (w as usize, h as usize);
+            // SAFETY: frames allocated and freed here; the task views obey
+            // the one-live-view-per-worker contract (everything is serial).
+            unsafe {
+                let fused_frame = filled_frame(w, h, format, spec, fill_seed);
+                let reference = filled_frame(w, h, format, spec, fill_seed);
+                let original = plane_bytes(fused_frame, spec, h as usize);
+
+                let mut preps = Vec::new();
+                fill_overlay_preps(
+                    &images,
+                    spec,
+                    ColorMatrix::Bt601,
+                    ColorRange::Full,
+                    &mut preps,
+                );
+                let mut tasks = Vec::new();
+                let mut pool = Vec::new();
+
+                collect_comp_tasks(fused_frame, spec, dims, &mut tasks);
+                assert!(
+                    fused_packed_rgb(&tasks, spec.sample).is_some(),
+                    "{format:?} must take the fused packed-RGB path"
+                );
+                blend_task_group(&tasks, &images, &preps, spec.sample, dims, &mut pool);
+
+                collect_comp_tasks(reference, spec, dims, &mut tasks);
+                for task in &tasks {
+                    blend_task_group(
+                        std::slice::from_ref(task),
+                        &images,
+                        &preps,
+                        spec.sample,
+                        dims,
+                        &mut pool,
+                    );
+                }
+
+                let fused_planes = plane_bytes(fused_frame, spec, h as usize);
+                let reference_planes = plane_bytes(reference, spec, h as usize);
+                assert_ne!(
+                    original, fused_planes,
+                    "{format:?}: blend must alter the frame"
+                );
+                assert_eq!(
+                    fused_planes, reference_planes,
+                    "{format:?}: fused packed-RGB blend diverged from the per-component reference"
+                );
+
+                let mut fused_frame = fused_frame;
+                let mut reference = reference;
+                av_frame_free(&mut fused_frame);
+                av_frame_free(&mut reference);
             }
         }
     }

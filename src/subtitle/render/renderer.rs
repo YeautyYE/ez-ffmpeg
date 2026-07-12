@@ -8,8 +8,8 @@
 
 use super::fonts::{FontStore, LoadedFace};
 use super::layout::{
-    apply_fade, render_event, unsupported, EventDynamics, EventRender, EventSamples, FrameContext,
-    MaskSamples, RenderOptions, RenderedNode,
+    apply_fade, play_res_scale, render_event, unsupported, ClipRect, EventDynamics, EventRender,
+    EventSamples, FrameContext, MaskSamples, RenderOptions, RenderedNode,
 };
 use crate::subtitle::ass::{Script, VALIGN_CENTER, VALIGN_TOP};
 use crate::subtitle::backend::SubtitleRenderer;
@@ -54,6 +54,12 @@ pub(crate) struct PureRenderer {
     /// geometry setters clear this map; eviction keeps only the visible
     /// set to bound memory.
     templates: HashMap<usize, EventTemplate>,
+    /// Per-frame work buffers reused across frames (grow once, then no
+    /// per-frame allocation on the cache-hit path). Contents are
+    /// meaningless between `render_frame` calls.
+    visible_scratch: Vec<usize>,
+    fades_scratch: Vec<Option<i32>>,
+    mask_scratch: Vec<Option<MaskSamples>>,
     lazy_inited: bool,
     /// `unsupported::*` features already warned about (once per feature).
     warned_unsupported: u32,
@@ -67,11 +73,71 @@ pub(crate) struct PureRenderer {
 
 /// One event's rendered output before collision stacking, reusable while
 /// its mask-affecting samples stay unchanged (colors are unfaded; the
-/// fade value is emission-only).
+/// fade value is emission-only) — or, for a `\move` event whose anchor
+/// keeps the same 1/8-px subpixel phase, reusable at an integer-pixel
+/// translation.
 struct EventTemplate {
     samples: MaskSamples,
+    /// Nodes as rendered; a moving event's clip is NOT baked in (see
+    /// `clip`), everything else is final.
     nodes: Vec<RenderedNode>,
     detect_collisions: bool,
+    /// Frame-absolute clip applied at every instantiation, after any
+    /// translation (`None` for non-moving events — theirs is baked).
+    clip: Option<ClipRect>,
+    /// False when the nodes bake frame-absolute geometry (BorderStyle-4
+    /// background): reuse then requires exact anchor equality.
+    translatable: bool,
+}
+
+impl EventTemplate {
+    /// Instantiates the template for `sample`: a cheap node clone (bitmap
+    /// payloads are shared), translated by the anchor delta when the
+    /// samples match at an integer-pixel offset, then clipped. `None`
+    /// forces a re-render.
+    fn instantiate(&self, sample: &MaskSamples) -> Option<Vec<RenderedNode>> {
+        let (dx, dy) = sample.translation_from(&self.samples)?;
+        if (dx, dy) != (0, 0) && !self.translatable {
+            return None;
+        }
+        let mut nodes = self.nodes.clone();
+        if (dx, dy) != (0, 0) {
+            // The translated bounds must stay representable end-to-end —
+            // block_bbox and the blend clip compute `x + w` in plain i32 —
+            // so a node the delta pushes past i32 is dropped instead:
+            // content that far off-frame is unrenderable anyway (the
+            // uncached path drops it through the extent guards).
+            nodes.retain_mut(|node| {
+                let bitmap = &mut node.bitmap;
+                let (Ok(w), Ok(h)) = (i32::try_from(bitmap.w), i32::try_from(bitmap.h)) else {
+                    return false;
+                };
+                let (Some(x), Some(y)) = (bitmap.x.checked_add(dx), bitmap.y.checked_add(dy))
+                else {
+                    return false;
+                };
+                if x.checked_add(w).is_none() || y.checked_add(h).is_none() {
+                    return false;
+                }
+                bitmap.x = x;
+                bitmap.y = y;
+                true
+            });
+        }
+        apply_deferred_clip(&mut nodes, self.clip);
+        Some(nodes)
+    }
+}
+
+/// Applies a moving event's frame-absolute clip to instantiated nodes and
+/// drops the ones it emptied (mirrors the bake-time retain in layout).
+fn apply_deferred_clip(nodes: &mut Vec<RenderedNode>, clip: Option<ClipRect>) {
+    let Some(clip) = clip else { return };
+    for node in nodes.iter_mut() {
+        node.bitmap
+            .clip_rect(clip.x0, clip.y0, clip.x1, clip.y1, clip.inverse);
+    }
+    nodes.retain(|node| !node.bitmap.is_empty());
 }
 
 /// Frame-cache identity: the visible event set, the output geometry, and
@@ -108,6 +174,9 @@ impl PureRenderer {
             cache: None,
             dynamics: HashMap::new(),
             templates: HashMap::new(),
+            visible_scratch: Vec::new(),
+            fades_scratch: Vec::new(),
+            mask_scratch: Vec::new(),
             lazy_inited: false,
             warned_unsupported: 0,
             #[cfg(test)]
@@ -161,22 +230,23 @@ impl PureRenderer {
 
     /// Indices of events visible at `now_ms`, in layer order (stable over
     /// ReadOrder within a layer, like libass's qsort by layer/ReadOrder).
-    fn visible_events(&self, now_ms: i64) -> Vec<usize> {
-        let mut visible: Vec<usize> = self
-            .script
-            .events
-            .iter()
-            .enumerate()
-            .filter(|(_, event)| {
-                now_ms >= event.start_ms && now_ms < event.start_ms + event.duration_ms
-            })
-            .map(|(index, _)| index)
-            .collect();
+    /// Fills the caller's buffer so the per-frame call can reuse capacity.
+    fn visible_events(&self, now_ms: i64, visible: &mut Vec<usize>) {
+        visible.clear();
+        visible.extend(
+            self.script
+                .events
+                .iter()
+                .enumerate()
+                .filter(|(_, event)| {
+                    now_ms >= event.start_ms && now_ms < event.start_ms + event.duration_ms
+                })
+                .map(|(index, _)| index),
+        );
         visible.sort_by_key(|&index| {
             let event = &self.script.events[index];
             (event.layer, event.read_order)
         });
-        visible
     }
 }
 
@@ -213,7 +283,8 @@ impl SubtitleRenderer for PureRenderer {
             return Vec::new();
         }
 
-        let visible = self.visible_events(now_ms);
+        let mut visible = std::mem::take(&mut self.visible_scratch);
+        self.visible_events(now_ms, &mut visible);
         let frame = (self.frame_w, self.frame_h);
         let storage = (
             if self.storage_w > 0 {
@@ -227,29 +298,27 @@ impl SubtitleRenderer for PureRenderer {
                 self.frame_h
             },
         );
-        // Resolve every visible event's dynamic samples. An event that was
-        // never rendered has no captured record yet (None) and forces a
-        // miss — a made-up "static" sample could wrongly hit for a dynamic
-        // event.
-        let samples: Vec<Option<EventSamples>> = visible
-            .iter()
-            .map(|&index| {
-                self.dynamics.get(&index).map(|dynamics| {
-                    let event = &self.script.events[index];
-                    dynamics.sample(now_ms - event.start_ms, event.duration_ms)
-                })
-            })
-            .collect();
-        // Per-frame emission fades (deliberately NOT part of any cache
-        // key: nodes are stored unfaded and faded at emission below).
-        let mut fades: Vec<Option<i32>> = samples
-            .iter()
-            .map(|sample| sample.as_ref().and_then(EventSamples::fade))
-            .collect();
-        let mask_samples: Vec<Option<MaskSamples>> = samples
-            .iter()
-            .map(|sample| sample.as_ref().map(EventSamples::mask_key))
-            .collect();
+        // Resolve every visible event's dynamic samples in one pass. An
+        // event that was never rendered has no captured record yet (None)
+        // and forces a miss — a made-up "static" sample could wrongly hit
+        // for a dynamic event. Fades are deliberately NOT part of any cache
+        // key: nodes are stored unfaded and faded at emission below.
+        // Anchor quantization scale — must match the FrameContext the
+        // render pass builds (same play_res_scale), or sampled keys would
+        // disagree with rendered nodes.
+        let scale = play_res_scale(self.frame_w, self.frame_h, &self.script);
+        let mut fades = std::mem::take(&mut self.fades_scratch);
+        fades.clear();
+        let mut mask_samples = std::mem::take(&mut self.mask_scratch);
+        mask_samples.clear();
+        for &index in &visible {
+            let sample = self.dynamics.get(&index).map(|dynamics| {
+                let event = &self.script.events[index];
+                dynamics.sample(now_ms - event.start_ms, event.duration_ms, scale)
+            });
+            fades.push(sample.as_ref().and_then(EventSamples::fade));
+            mask_samples.push(sample.as_ref().map(EventSamples::mask_key));
+        }
 
         let cache_valid = match &self.cache {
             Some(cache) => {
@@ -282,20 +351,19 @@ impl SubtitleRenderer for PureRenderer {
             };
 
             // Reuse each event's template when its mask samples are
-            // unchanged: layout, shaping and rasterization are then
-            // skipped and only the node copy + stacking replay run.
+            // unchanged — or, for a \move whose anchor keeps its 1/8-px
+            // subpixel phase, translated to the new anchor: layout,
+            // shaping and rasterization are then skipped and only the
+            // node copy + clip + stacking replay run.
             let mut prepared: Vec<Option<(Vec<RenderedNode>, bool)>> = visible
                 .iter()
                 .enumerate()
                 .map(|(order, &index)| {
-                    mask_samples[order]
-                        .as_ref()
-                        .and_then(|sample| {
-                            self.templates
-                                .get(&index)
-                                .filter(|template| &template.samples == sample)
-                        })
-                        .map(|template| (template.nodes.clone(), template.detect_collisions))
+                    mask_samples[order].as_ref().and_then(|sample| {
+                        let template = self.templates.get(&index)?;
+                        let nodes = template.instantiate(sample)?;
+                        Some((nodes, template.detect_collisions))
+                    })
                 })
                 .collect();
             let misses: Vec<usize> = (0..visible.len())
@@ -375,19 +443,33 @@ impl SubtitleRenderer for PureRenderer {
                             .dynamics
                             .get(&index)
                             .expect("dynamics recorded just above")
-                            .sample(now_ms - event.start_ms, event.duration_ms);
+                            .sample(now_ms - event.start_ms, event.duration_ms, scale);
                         // First render of this event: the pre-loop fade was
                         // None (no record yet); emission needs the real one.
                         fades[order] = full.fade();
-                        self.templates.insert(
-                            index,
-                            EventTemplate {
-                                samples: full.mask_key(),
-                                nodes: render.nodes.clone(),
-                                detect_collisions: render.detect_collisions,
-                            },
-                        );
-                        (render.nodes, render.detect_collisions)
+                        let sample = full.mask_key();
+                        let mut template_samples = sample.clone();
+                        if render.canonical_anchor {
+                            template_samples.canonicalize_anchor();
+                        }
+                        let detect_collisions = render.detect_collisions;
+                        let template = EventTemplate {
+                            samples: template_samples,
+                            nodes: render.nodes,
+                            detect_collisions,
+                            clip: render.clip,
+                            translatable: render.translatable,
+                        };
+                        // This frame's nodes come from the same
+                        // instantiation the hit path uses (translate the
+                        // canonical template into place, then clip), so
+                        // warm and cold frames are bit-identical by
+                        // construction. `None` only for anchors whose
+                        // pixel offset overflows i32 — content that far
+                        // off-frame contributes nothing, like before.
+                        let nodes = template.instantiate(&sample).unwrap_or_default();
+                        self.templates.insert(index, template);
+                        (nodes, detect_collisions)
                     }
                 };
                 // A saturated fade (>= 255 pre-clamp) turns every node
@@ -417,22 +499,23 @@ impl SubtitleRenderer for PureRenderer {
             self.templates.retain(|index, _| visible.contains(index));
             // Key the result by the mask samples the render actually used —
             // the records are complete now, so resolve any missing ones.
+            // (`drain` keeps the scratch buffer's capacity for reuse.)
             let samples = visible
                 .iter()
-                .zip(mask_samples)
+                .zip(mask_samples.drain(..))
                 .map(|(&index, mask)| {
                     mask.unwrap_or_else(|| {
                         let event = &self.script.events[index];
                         self.dynamics
                             .get(&index)
                             .expect("dynamics recorded during this render pass")
-                            .sample(now_ms - event.start_ms, event.duration_ms)
+                            .sample(now_ms - event.start_ms, event.duration_ms, scale)
                             .mask_key()
                     })
                 })
                 .collect();
             self.cache = Some(CacheKey {
-                events: visible,
+                events: visible.clone(),
                 frame,
                 storage,
                 samples,
@@ -440,7 +523,8 @@ impl SubtitleRenderer for PureRenderer {
             self.warn_unsupported(seen_unsupported);
         }
 
-        self.nodes
+        let overlays = self
+            .nodes
             .iter()
             .zip(&self.node_orders)
             .filter(|(node, _)| !node.bitmap.is_empty())
@@ -453,7 +537,12 @@ impl SubtitleRenderer for PureRenderer {
                 dst_x: node.bitmap.x,
                 dst_y: node.bitmap.y,
             })
-            .collect()
+            .collect();
+        // Park the per-frame work buffers for the next call (capacity kept).
+        self.visible_scratch = visible;
+        self.fades_scratch = fades;
+        self.mask_scratch = mask_samples;
+        overlays
     }
 
     fn teardown(&mut self) {
@@ -797,8 +886,9 @@ mod tests {
         let _ = renderer.render_frame(1_100); // anchor sample moved
         assert_eq!(renderer.cold_renders, 2, "moving anchor misses");
         assert_eq!(
-            renderer.event_renders, 3,
-            "only the moving event re-renders; the static line reuses its template"
+            renderer.event_renders, 2,
+            "nobody re-renders: the static line reuses its template and the \
+             mover (same 1/8-px phase, integer-pixel step) is translated"
         );
         // Template reuse must compose byte-identically to a cold render of
         // the same timestamp.
@@ -814,6 +904,180 @@ mod tests {
             .map(|o| (o.dst_x, o.dst_y, o.w, o.h, o.color, o.bitmap.to_vec()))
             .collect();
         assert_eq!(warmed, cold, "template compose must match a cold render");
+    }
+
+    /// A `\move` whose anchor advances by whole pixels (same 1/8-px
+    /// subpixel phase) must translate its cached template instead of
+    /// re-rendering: same masks, exactly shifted.
+    #[test]
+    fn move_translates_cached_template_between_frames() {
+        // PlayRes == frame size (scale 1): x(t) = 100 + t/10, so t=1000 ->
+        // x=200 and t=1100 -> x=210 — a 10-px step at identical phase.
+        let events =
+            "Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\move(100,100,600,100)}Slide\n";
+        let Some(mut renderer) = renderer_with(events) else {
+            eprintln!("skipping: no known test font present on this machine");
+            return;
+        };
+        let first: Vec<(i32, i32, usize, usize, Vec<u8>)> = renderer
+            .render_frame(1_000)
+            .into_iter()
+            .map(|o| (o.dst_x, o.dst_y, o.w, o.h, o.bitmap.to_vec()))
+            .collect();
+        assert!(!first.is_empty());
+        assert_eq!(renderer.event_renders, 1);
+        let second: Vec<(i32, i32, usize, usize, Vec<u8>)> = renderer
+            .render_frame(1_100)
+            .into_iter()
+            .map(|o| (o.dst_x, o.dst_y, o.w, o.h, o.bitmap.to_vec()))
+            .collect();
+        assert_eq!(
+            renderer.event_renders, 1,
+            "an integer-pixel move at the same phase must not re-render"
+        );
+        assert_eq!(renderer.cold_renders, 2, "the frame cache still misses");
+        let shifted: Vec<(i32, i32, usize, usize, Vec<u8>)> = first
+            .into_iter()
+            .map(|(x, y, w, h, bytes)| (x + 10, y, w, h, bytes))
+            .collect();
+        assert_eq!(
+            second, shifted,
+            "translated instantiation must be the first frame shifted by exactly +10 px"
+        );
+    }
+
+    /// A `\move` step that lands on a different 1/8-px phase must
+    /// re-render — serving the old masks at a fractional offset would
+    /// smear the motion to the nearest whole pixel.
+    #[test]
+    fn move_phase_mismatch_still_rerenders() {
+        let events =
+            "Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\move(100,100,600,100)}Slide\n";
+        let Some(mut renderer) = renderer_with(events) else {
+            eprintln!("skipping: no known test font present on this machine");
+            return;
+        };
+        let _ = renderer.render_frame(1_000); // x = 200.0 (q = 1600)
+        assert_eq!(renderer.event_renders, 1);
+        let _ = renderer.render_frame(1_005); // x = 200.5 (q = 1604): phase differs
+        assert_eq!(
+            renderer.event_renders, 2,
+            "a fractional-pixel anchor step must re-render, not translate"
+        );
+    }
+
+    /// A moving event's `\clip` window is frame-absolute: the content
+    /// slides, the window must not. The pixel assertion pins the window
+    /// (clip_rect zeroes coverage without shrinking the node box); the
+    /// cold comparison proves a warmed translated-and-clipped
+    /// instantiation is bit-identical to a first render of that frame.
+    #[test]
+    fn move_clip_window_stays_fixed_while_content_translates() {
+        // x(t) = 100 + 0.04 t: t=1000 -> 140, t=1100 -> 144 (integer px,
+        // same phase — the second frame is a translated instantiation).
+        let moving = "Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,\
+                      {\\move(100,100,300,100)\\clip(100,60,260,140)}Word\n";
+        let Some(mut renderer) = renderer_with(moving) else {
+            eprintln!("skipping: no known test font present on this machine");
+            return;
+        };
+        let _ = renderer.render_frame(1_000);
+        assert_eq!(renderer.event_renders, 1);
+        let warmed: Vec<(i32, i32, usize, usize, u32, Vec<u8>)> = renderer
+            .render_frame(1_100)
+            .into_iter()
+            .map(|o| (o.dst_x, o.dst_y, o.w, o.h, o.color, o.bitmap.to_vec()))
+            .collect();
+        assert_eq!(
+            renderer.event_renders, 1,
+            "the clipped mover must translate its template, not re-render"
+        );
+        let mut covered = 0usize;
+        for &(x, y, w, _, _, ref mask) in &warmed {
+            for (i, &byte) in mask.iter().enumerate() {
+                if byte == 0 {
+                    continue;
+                }
+                covered += 1;
+                let (px, py) = (x + (i % w) as i32, y + (i / w) as i32);
+                assert!(
+                    px >= 100 && px < 260 && py >= 60 && py < 140,
+                    "covered pixel ({px},{py}) escaped the \\clip window"
+                );
+            }
+        }
+        assert!(covered > 0, "the clip window must keep some content");
+
+        // A fresh renderer's first look at t=1100 builds the same
+        // canonical template and translates it the same way: warmed and
+        // cold frames must be bit-identical.
+        let mut fresh = renderer_with(moving).expect("font probed above");
+        let cold: Vec<(i32, i32, usize, usize, u32, Vec<u8>)> = fresh
+            .render_frame(1_100)
+            .into_iter()
+            .map(|o| (o.dst_x, o.dst_y, o.w, o.h, o.color, o.bitmap.to_vec()))
+            .collect();
+        assert_eq!(
+            warmed, cold,
+            "translated-and-clipped instantiation must match a cold render"
+        );
+    }
+
+    /// A translation delta that would push a node's `x + w` past i32 must
+    /// drop the node (it is unrenderably off-frame), not overflow:
+    /// block_bbox and the blend clip compute bounds in plain i32, so an
+    /// unchecked translation panics in debug builds and wraps in release.
+    #[test]
+    fn move_translation_overflow_drops_nodes_instead_of_overflowing() {
+        // scale 1: x(t) = 4294967000 * t / 5000. t=5 -> 4294967 (finite
+        // template); t=2500 -> 2147483500, same 1/8 phase (both multiples
+        // of 5 give integer anchors), so the template translates by
+        // dx = 2143188533 — in i32 range, but x + w overflows for any
+        // node wider than 147 px. The \p1 drawing keeps geometry
+        // font-independent.
+        let events = "Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,\
+                      {\\an7\\move(0,0,4294967000,0)\\p1}m 0 0 l 200 0 200 100 0 100{\\p0}\n";
+        let Some(mut renderer) = renderer_with(events) else {
+            eprintln!("skipping: no known test font present on this machine");
+            return;
+        };
+        assert!(
+            !renderer.render_frame(5).is_empty(),
+            "the near-origin frame must render the drawing"
+        );
+        assert!(
+            renderer.render_frame(2_500).is_empty(),
+            "a translation overflowing i32 bounds must drop the nodes"
+        );
+        assert_eq!(
+            renderer.event_renders, 1,
+            "the overflow must be hit on the TRANSLATION path (same 1/8 \
+             phase), not dodged by a re-render"
+        );
+    }
+
+    /// A `\move` whose interpolation poisons the anchor (NaN/inf — possible
+    /// even from finite endpoints via 0 * inf) must render NOTHING: the
+    /// naive `NaN as i64` quantization is 0, which would silently render
+    /// the event at the frame origin instead.
+    #[test]
+    fn non_finite_move_anchor_renders_nothing_not_at_origin() {
+        let events = "Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,\
+                      {\\move(1e308,100,-1e308,100)}Gone\n";
+        let Some(mut renderer) = renderer_with(events) else {
+            eprintln!("skipping: no known test font present on this machine");
+            return;
+        };
+        assert!(
+            renderer.render_frame(1_000).is_empty(),
+            "a poisoned \\move anchor must drop the event, not render it at the origin"
+        );
+        // The poisoned key is stable, so repeat frames reuse the empty render.
+        assert!(renderer.render_frame(1_100).is_empty());
+        assert_eq!(
+            renderer.cold_renders, 1,
+            "poisoned frames must cache their (empty) render"
+        );
     }
 
     /// Templates are evicted once their event leaves the visible set.
