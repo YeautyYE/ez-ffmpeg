@@ -17,7 +17,7 @@ use crate::hwaccel::{
 use crate::util::ffmpeg_utils::av_rescale_q_rnd;
 use crate::util::ffmpeg_utils::{av_err2str, hashmap_to_avdictionary, DictGuard};
 use crate::util::thread_synchronizer::{ThreadDoneGuard, ThreadSynchronizer};
-use crossbeam_channel::{RecvTimeoutError, Sender};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use ffmpeg_next::packet::{Mut, Ref};
 use ffmpeg_next::{Frame, Packet};
 use ffmpeg_sys_next::AVHWDeviceType::AV_HWDEVICE_TYPE_QSV;
@@ -29,11 +29,11 @@ use ffmpeg_sys_next::{
     av_frame_copy_props, av_frame_move_ref, av_frame_ref, av_frame_unref, av_free, av_freep,
     av_gcd, av_hwdevice_get_type_name, av_hwframe_transfer_data, av_inv_q, av_mallocz, av_memdup,
     av_mul_q, av_opt_set_dict2, av_pix_fmt_desc_get, av_rescale_delta, av_rescale_q, av_strdup,
-    avcodec_alloc_context3, avcodec_decode_subtitle2, avcodec_default_get_buffer2,
-    avcodec_flush_buffers, avcodec_get_hw_config, avcodec_open2, avcodec_parameters_to_context,
-    avcodec_receive_frame, avcodec_send_packet, avsubtitle_free, AVCodec, AVCodecContext, AVFrame,
-    AVHWDeviceType, AVMediaType, AVPixelFormat, AVRational, AVSubtitle, AVSubtitleRect, AVERROR,
-    AVERROR_EOF, AVPALETTE_SIZE, AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX, AV_FRAME_CROP_UNALIGNED,
+    avcodec_alloc_context3, avcodec_decode_subtitle2, avcodec_flush_buffers,
+    avcodec_get_hw_config, avcodec_open2, avcodec_parameters_to_context, avcodec_receive_frame,
+    avcodec_send_packet, avsubtitle_free, AVCodec, AVCodecContext, AVFrame, AVHWDeviceType,
+    AVMediaType, AVPixelFormat, AVRational, AVSubtitle, AVSubtitleRect, AVERROR, AVERROR_EOF,
+    AVPALETTE_SIZE, AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX, AV_FRAME_CROP_UNALIGNED,
     AV_FRAME_FLAG_CORRUPT, AV_NOPTS_VALUE, AV_PIX_FMT_FLAG_HWACCEL, AV_TIME_BASE_Q, EAGAIN, EINVAL,
     ENOMEM,
 };
@@ -115,48 +115,47 @@ pub(crate) fn dec_init(
 
     let dp = DecoderParameter::new(dec_stream);
     let dp_arc = Arc::new(Mutex::new(dp));
-    dec_open(dp_arc.clone(), dec_stream, null_mut())?;
+    let dec_ctx = dec_open(dp_arc.clone(), dec_stream, null_mut())?;
 
     let senders = dec_stream.take_dsts();
     let exit_on_error = exit_on_error.unwrap_or(false);
 
-    let dp_arc_worker = dp_arc.clone();
+    // Everything the worker owns is prepared BEFORE the slot is claimed, so
+    // nothing fallible runs between thread_start() and the guard adoption.
+    let thread_name = format!(
+        "decoder{}:{demux_idx}:{decoder_name}",
+        dec_stream.stream_index,
+    );
 
     // Slot claimed before spawn; the guard releases it on any exit path.
     thread_sync.thread_start();
-    let thread_done_guard = ThreadDoneGuard::adopt(
+    let thread_done = ThreadDoneGuard::adopt(
         thread_sync.clone(),
         scheduler_status.clone(),
         scheduler_result.clone(),
     );
-    // The AVCodecContext's opaque holds one raw Arc refcount (installed by
-    // dec_open for get_format). Constructed BEFORE the spawn and moved into
-    // the closure: a failed spawn drops the closure — and with it this guard
-    // — so the reclaim happens on spawn failure, worker unwind, and normal
-    // exit alike, with no reliance on any code (even a log call) running
-    // after the failure. drop_opaque_ptr is idempotent.
-    let opaque_reclaim = DecOpaqueReclaimGuard {
-        dp_arc: dp_arc.clone(),
+    // Pure moves from here to the spawn: a failed spawn drops the closure —
+    // and with it `resources` — running the exact same field-order teardown
+    // as a normal worker exit (context freed and FFmpeg workers joined, then
+    // the Arc, then the slot).
+    let resources = DecWorkerResources {
+        senders,
+        receiver,
+        frame_pool,
+        packet_pool,
+        dec_ctx,
+        dp_arc,
+        _thread_done: thread_done,
     };
 
     let result = std::thread::Builder::new()
-        .name(format!(
-            "decoder{}:{demux_idx}:{decoder_name}",
-            dec_stream.stream_index,
-        ))
+        .name(thread_name)
         .spawn(move || {
-            let _thread_done = thread_done_guard;
-            let dp_arc = dp_arc_worker;
-            let _opaque_reclaim = opaque_reclaim;
-            // `receiver`/`senders` are `move`-closure CAPTURES; rebind them as
-            // body locals declared AFTER the guard so they drop BEFORE it. For a
-            // `crossbeam_channel::bounded` channel the queued items are freed only when
-            // the LAST endpoint drops, so an undrained HW `FrameBox` in the
-            // decoder->filter channel (whose `AVBufferRef` release callback can block)
-            // would otherwise be torn down after this worker released its slot — i.e.
-            // after the sync counter that stop()/wait() gate on already hit zero.
-            let receiver = receiver;
-            let senders = senders;
+            // DROP ORDER IS LOAD-BEARING — see DecWorkerResources. Rebinding
+            // the capture as a body local ties the whole struct (and its
+            // field-order teardown) to body scope end, on return and unwind
+            // alike, with no reliance on closure-capture drop order.
+            let resources = resources;
             let input_status = false;
             let mut err_exit = false;
 
@@ -165,7 +164,7 @@ pub(crate) fn dec_init(
                     break;
                 }
 
-                let result = receiver.recv_timeout(Duration::from_millis(100));
+                let result = resources.receiver.recv_timeout(Duration::from_millis(100));
 
                 if is_stopping(wait_until_not_paused(&scheduler_status)) {
                     info!("Decoder receiver end command, finishing.");
@@ -202,12 +201,13 @@ pub(crate) fn dec_init(
                     }
 
                     if let Err(e) = packet_decode(
-                        &dp_arc,
+                        &resources.dp_arc,
+                        resources.dec_ctx.as_mut_ptr(),
                         exit_on_error,
                         packet_box,
-                        &packet_pool,
-                        &frame_pool,
-                        &senders,
+                        &resources.packet_pool,
+                        &resources.frame_pool,
+                        &resources.senders,
                         &scheduler_status,
                     ) {
                         if e == Error::Exit {
@@ -227,11 +227,13 @@ pub(crate) fn dec_init(
                                 break;
                             }
 
-                            /* report last frame duration to the scheduler */
-                            let dp = dp_arc.clone();
-                            let dp = dp.lock().unwrap();
-
-                            avcodec_flush_buffers(dp.dec_ctx.as_mut_ptr());
+                            // Reset the decoder for the next stream_loop pass.
+                            // Called WITHOUT the DecoderParameter mutex: under
+                            // frame threading the flush parks FFmpeg's workers,
+                            // and a worker blocked in get_format_callback's
+                            // lock() would deadlock the park (see the invariant
+                            // at DecWorkerResources).
+                            avcodec_flush_buffers(resources.dec_ctx.as_mut_ptr());
                         } else {
                             err_exit = true;
                             error!("Error processing packet in decoder: {e}");
@@ -248,11 +250,10 @@ pub(crate) fn dec_init(
                 // skipping it starves downstream of the finish signal.
                 // Losing the EOF marker itself only costs the last-frame
                 // duration hint.
-                if let Ok(mut frame) = frame_pool.get() {
+                if let Ok(mut frame) = resources.frame_pool.get() {
                     unsafe {
                         {
-                            let dp = dp_arc.clone();
-                            let dp = dp.lock().unwrap();
+                            let dp = resources.dp_arc.lock().unwrap();
                             (*frame.as_mut_ptr()).opaque =
                                 FrameOpaque::FrameOpaqueEof as i32 as *mut c_void;
                             (*frame.as_mut_ptr()).pts = if dp.last_frame_pts == AV_NOPTS_VALUE {
@@ -262,8 +263,10 @@ pub(crate) fn dec_init(
                             };
                             (*frame.as_mut_ptr()).time_base = dp.last_frame_tb;
                         }
-                        let frame_box = dec_frame_to_box(dp_arc.clone(), frame);
-                        if let Err(e) = dec_send(frame_box, &frame_pool, &senders) {
+                        let frame_box =
+                            dec_frame_to_box(&resources.dp_arc, resources.dec_ctx.as_ptr(), frame);
+                        if let Err(e) = dec_send(frame_box, &resources.frame_pool, &resources.senders)
+                        {
                             if e != Error::EOF {
                                 error!("Error signalling EOF: {e}");
                                 set_scheduler_error(&scheduler_status, &scheduler_result, e);
@@ -275,8 +278,7 @@ pub(crate) fn dec_init(
                 }
 
                 {
-                    let dp = dp_arc.clone();
-                    let dp = dp.lock().unwrap();
+                    let dp = resources.dp_arc.lock().unwrap();
                     let err_rate = if dp.dec.frames_decoded != 0 || dp.dec.decode_errors != 0 {
                         dp.dec.decode_errors as f64
                             / (dp.dec.frames_decoded + dp.dec.decode_errors) as f64
@@ -299,42 +301,76 @@ pub(crate) fn dec_init(
                 }
             }
 
-            dec_done(&dp_arc, &senders);
+            dec_done(&resources.dp_arc, resources.dec_ctx.as_ptr(), &resources.senders);
 
-            // The opaque refcount is reclaimed by _opaque_reclaim at scope end
-            // (normal and unwind alike).
+            // `resources` tears down at scope end (normal and unwind alike):
+            // channels, then the codec context (joining FFmpeg's workers and
+            // quiescing callbacks), then the DecoderParameter Arc, then the
+            // scheduler slot.
             debug!("Decoder finished.");
         });
     if let Err(e) = result {
         error!("Decoder thread exited with error: {e}");
-        // The closure (and the reclaim guard inside it) was already dropped
-        // by the failed spawn — the opaque refcount is reclaimed by then.
+        // The failed spawn already dropped the closure and its `resources`
+        // capture — the context was freed (before the Arc, before the slot
+        // release) on this thread, where no decode work was ever submitted.
         return Err(OpenDecoderOperationError::ThreadExited.into());
     }
 
     Ok(())
 }
 
-/// Reclaims the decoder context's `opaque` Arc refcount when the worker exits
-/// — by return or by unwind. Without the unwind half, a panicking decoder
-/// leaked its `DecoderParameter` (and the `AVCodecContext`, hardware frame
-/// contexts, and buffers it owns) forever.
-struct DecOpaqueReclaimGuard {
+/// Everything the decoder worker owns, in one struct so the teardown order is
+/// fixed by field declaration order instead of closure-capture order (which
+/// the language does not guarantee) — and so a failed `spawn` runs the exact
+/// same order when it drops the un-executed closure.
+///
+/// # Lifetime invariant (LOAD-BEARING — field order included; do not reorder)
+///
+/// `AVCodecContext.opaque` stores an immutable, non-owning pointer to the
+/// `Mutex<DecoderParameter>` inside `dp_arc`; it never owns or represents an
+/// `Arc` refcount. From its publication before `avcodec_open2` (including
+/// callbacks FFmpeg makes during open) until `avcodec_free_context` returns —
+/// which joins FFmpeg's internal decoder workers and thereby quiesces every
+/// callback — a strong `Arc` backing that pointer is held at every instant:
+/// by `dec_open`'s argument during open and failure cleanup (where the
+/// local `CodecContext` owner drops first), by `dec_init`'s local binding
+/// across a successful return and handoff, and by this struct for the
+/// worker's lifetime. On every path the `CodecContext` owner therefore
+/// drops before that `Arc` and before the `ThreadDoneGuard` releases the
+/// scheduler slot. Never hold the `DecoderParameter` mutex
+/// while calling libavcodec operations that may execute, wait for, or
+/// destroy decoder callbacks or workers (e.g. `avcodec_open2`,
+/// `avcodec_send_packet`, `avcodec_receive_frame`, `avcodec_flush_buffers`,
+/// `avcodec_free_context`): a frame-threading worker blocked on that mutex
+/// inside `get_format_callback` would deadlock the park/join — or the
+/// worker-progress wait in send/receive — those operations perform.
+///
+/// Field-order rationale:
+/// - `senders`/`receiver` first: for a `crossbeam_channel::bounded` channel
+///   the queued items are freed only when the LAST endpoint drops, so an
+///   undrained HW `FrameBox` (whose `AVBufferRef` release callback can block)
+///   must be torn down before the slot counter that stop()/wait() gate on
+///   hits zero (hardening invariant S1/S2).
+/// - the pools next, for the same reason: pooled frames/packets must not
+///   outlive the slot release.
+/// - `dec_ctx` before `dp_arc`: freeing the context joins FFmpeg's workers,
+///   so no callback can dereference `opaque` once the Arc becomes droppable.
+/// - `_thread_done` last: the slot is released only after the full teardown.
+struct DecWorkerResources {
+    senders: Vec<(Sender<FrameBox>, usize, Arc<[AtomicBool]>)>,
+    receiver: Receiver<PacketBox>,
+    frame_pool: ObjPool<Frame>,
+    packet_pool: ObjPool<Packet>,
+    dec_ctx: CodecContext,
     dp_arc: Arc<Mutex<DecoderParameter>>,
-}
-
-impl Drop for DecOpaqueReclaimGuard {
-    fn drop(&mut self) {
-        self.dp_arc
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .drop_opaque_ptr();
-    }
+    _thread_done: ThreadDoneGuard,
 }
 
 #[cfg(docsrs)]
 unsafe fn transcode_subtitles(
-    dp_arc: Arc<Mutex<DecoderParameter>>,
+    dp_arc: &Arc<Mutex<DecoderParameter>>,
+    dec_ctx: *mut AVCodecContext,
     exit_on_error: bool,
     packet_box: PacketBox,
     packet_pool: &ObjPool<Packet>,
@@ -346,7 +382,8 @@ unsafe fn transcode_subtitles(
 
 #[cfg(not(docsrs))]
 unsafe fn transcode_subtitles(
-    dp_arc: Arc<Mutex<DecoderParameter>>,
+    dp_arc: &Arc<Mutex<DecoderParameter>>,
+    dec_ctx: *mut AVCodecContext,
     exit_on_error: bool,
     mut packet_box: PacketBox,
     packet_pool: &ObjPool<Packet>,
@@ -367,7 +404,7 @@ unsafe fn transcode_subtitles(
         (*frame.as_mut_ptr()).time_base = (*packet_box.packet.as_ptr()).time_base;
         (*frame.as_mut_ptr()).opaque = PacketOpaque::PktOpaqueSubHeartbeat as i32 as *mut c_void;
 
-        let frame_box = dec_frame_to_box(dp_arc, frame);
+        let frame_box = dec_frame_to_box(dp_arc, dec_ctx, frame);
 
         let result = dec_send(frame_box, frame_pool, senders);
         packet_pool.release(packet_box.packet);
@@ -388,7 +425,7 @@ unsafe fn transcode_subtitles(
     {
         //TODO
         let _ret = fix_sub_duration_heartbeat(
-            dp_arc,
+            dp_arc.clone(),
             av_rescale_q(
                 (*packet_box.packet.as_ptr()).pts,
                 (*packet_box.packet.as_ptr()).time_base,
@@ -414,8 +451,7 @@ unsafe fn transcode_subtitles(
         packet_is_eof = true;
     };
 
-    let dp = dp_arc.clone();
-    let mut dp = dp.lock().unwrap();
+    let mut dp = dp_arc.lock().unwrap();
     // `raw::Subtitle` owns the decoded AVSubtitle: avcodec_decode_subtitle2 fills
     // its rects, and Drop frees them exactly once on every path below — the
     // frame-pool-exhaustion and wrap-failure early returns included — so there is
@@ -423,7 +459,7 @@ unsafe fn transcode_subtitles(
     let mut subtitle = crate::raw::Subtitle::zeroed();
     let mut got_output: libc::c_int = 0;
     let ret = avcodec_decode_subtitle2(
-        dp.dec_ctx.as_mut_ptr(),
+        dec_ctx,
         subtitle.as_mut_ptr(),
         &mut got_output,
         packet_box.packet.as_mut_ptr(),
@@ -463,15 +499,16 @@ unsafe fn transcode_subtitles(
     // on failure `?` returns and Drop frees the still-owned rects.
     subtitle_wrap_frame(frame.as_mut_ptr(), subtitle.as_mut_ptr(), false)?;
 
-    (*frame.as_mut_ptr()).width = (*dp.dec_ctx.as_ptr()).width;
-    (*frame.as_mut_ptr()).height = (*dp.dec_ctx.as_ptr()).height;
+    (*frame.as_mut_ptr()).width = (*dec_ctx).width;
+    (*frame.as_mut_ptr()).height = (*dec_ctx).height;
     std::mem::drop(dp);
 
-    process_subtitle(dp_arc, frame, frame_pool, senders)
+    process_subtitle(dp_arc, dec_ctx, frame, frame_pool, senders)
 }
 
 unsafe fn process_subtitle(
-    dp_arc: Arc<Mutex<DecoderParameter>>,
+    dp_arc: &Arc<Mutex<DecoderParameter>>,
+    dec_ctx: *const AVCodecContext,
     frame: Frame,
     frame_pool: &ObjPool<Frame>,
     senders: &Vec<(Sender<FrameBox>, usize, Arc<[AtomicBool]>)>,
@@ -490,7 +527,7 @@ unsafe fn process_subtitle(
         return Ok(());
     }
 
-    let frame_box = dec_frame_to_box(dp_arc, frame);
+    let frame_box = dec_frame_to_box(dp_arc, dec_ctx, frame);
 
     match dec_send(frame_box, frame_pool, senders) {
         Ok(_) => Ok(()),
@@ -727,9 +764,12 @@ unsafe fn dec_send(
     }
 }
 
-unsafe fn dec_frame_to_box(dp_arc: Arc<Mutex<DecoderParameter>>, frame: Frame) -> FrameBox {
+unsafe fn dec_frame_to_box(
+    dp_arc: &Arc<Mutex<DecoderParameter>>,
+    dec_ctx: *const AVCodecContext,
+    frame: Frame,
+) -> FrameBox {
     let dp = dp_arc.lock().unwrap();
-    let dec_ctx = dp.dec_ctx.as_ptr();
 
     FrameBox {
         frame,
@@ -756,8 +796,8 @@ fn dec_open(
     dp_arc: Arc<Mutex<DecoderParameter>>,
     dec_stream: &DecoderStream,
     param_out: *mut AVFrame,
-) -> crate::error::Result<()> {
-    Ok(())
+) -> crate::error::Result<CodecContext> {
+    Ok(CodecContext::new(null_mut()))
 }
 
 /// Builds the decoder options dict from the user's per-media opts
@@ -794,58 +834,12 @@ fn build_decoder_opts(codec_opts: &Option<HashMap<CString, CString>>) -> (DictGu
     (dec_opts, !user_set_threads)
 }
 
-/// Reclaims the `Arc<Mutex<DecoderParameter>>` refcount stashed in an
-/// `AVCodecContext.opaque` if `dec_open` fails after installing it.
-///
-/// The `opaque` back-reference (an `Arc::into_raw`) is installed **before**
-/// `avcodec_open2`, because some hardware decoders call `get_format` during
-/// open and that callback both needs a live `opaque` and records
-/// `hwaccel_pix_fmt` as a side effect. If any step after the install fails and
-/// returns early, that refcount would otherwise leak (the normal reclaim,
-/// `drop_opaque_ptr`, runs only once the context reaches its long-lived owner).
-/// This guard reclaims it via `Arc::from_raw` on drop; a successful handoff
-/// calls [`disarm`](Self::disarm) so the live decoder owns the reference and
-/// `drop_opaque_ptr` releases it at shutdown instead.
-#[cfg(not(docsrs))]
-struct OpaqueGuard {
-    dec_ctx: *mut AVCodecContext,
-}
-
-#[cfg(not(docsrs))]
-impl OpaqueGuard {
-    /// Give up responsibility for the `opaque` Arc: the context handed off
-    /// successfully and the live decoder now owns the refcount.
-    fn disarm(mut self) {
-        self.dec_ctx = null_mut();
-    }
-}
-
-#[cfg(not(docsrs))]
-impl Drop for OpaqueGuard {
-    fn drop(&mut self) {
-        if self.dec_ctx.is_null() {
-            return;
-        }
-        // SAFETY: armed only after `(*dec_ctx).opaque = Arc::into_raw(...)`, so
-        // `opaque` is a live `Arc<Mutex<DecoderParameter>>` pointer here. Reclaim
-        // that one refcount exactly once (mirrors `drop_opaque_ptr`), then null
-        // the field so nothing else treats it as live.
-        unsafe {
-            let dp_ptr = (*self.dec_ctx).opaque as *const Mutex<DecoderParameter>;
-            if !dp_ptr.is_null() {
-                let _ = Arc::from_raw(dp_ptr);
-                (*self.dec_ctx).opaque = null_mut();
-            }
-        }
-    }
-}
-
 #[cfg(not(docsrs))]
 fn dec_open(
     dp_arc: Arc<Mutex<DecoderParameter>>,
     dec_stream: &DecoderStream,
     param_out: *mut AVFrame,
-) -> crate::error::Result<()> {
+) -> crate::error::Result<CodecContext> {
     unsafe {
         let dec_ctx = avcodec_alloc_context3(dec_stream.codec.as_ptr());
         if dec_ctx.is_null() {
@@ -873,22 +867,22 @@ fn dec_open(
 
         (*dec_ctx).pkt_timebase = dec_stream.time_base;
 
-        // Install the decode-time callbacks and the decoder-parameter
+        // Install the decode-time callback and the decoder-parameter
         // back-reference BEFORE `avcodec_open2`: some hardware decoders invoke
         // `get_format` during open, and that callback needs a live `opaque` and
         // records `hwaccel_pix_fmt` as a side effect used later by the frame
         // path — deferring it past open would silently drop that side effect.
         //
-        // SAFETY: `Arc::into_raw` preserves the refcount; `opaque` stays a live
-        // pointer until reclaimed exactly once. On success that reclaim is
-        // `drop_opaque_ptr` at decoder shutdown; on any early return below it is
-        // `opaque_guard`'s Drop (armed on the next line). `get_format` clones and
-        // restores the Arc to keep the count balanced.
+        // SAFETY: `opaque` is a NON-OWNING borrow of the `Mutex` inside
+        // `dp_arc` — it never carries an Arc refcount (see the lifetime
+        // invariant at `DecWorkerResources`). It stays valid for as long as
+        // callbacks can run because a strong `dp_arc` is held across that
+        // whole window: by this function's argument on the open/failure
+        // paths (the returned owner's Drop frees the context — joining
+        // FFmpeg's workers — before the argument dies), and by the worker's
+        // `DecWorkerResources` afterwards.
         (*dec_ctx).get_format = Some(get_format_callback);
-        (*dec_ctx).get_buffer2 = Some(get_buffer_callback);
-        let dp_ptr = Arc::into_raw(dp_arc.clone());
-        (*dec_ctx).opaque = dp_ptr as *mut libc::c_void;
-        let opaque_guard = OpaqueGuard { dec_ctx };
+        (*dec_ctx).opaque = Arc::as_ptr(&dp_arc) as *mut libc::c_void;
 
         {
             let dp_arc_clone = dp_arc.clone();
@@ -1011,18 +1005,12 @@ fn dec_open(
             (*param_out).time_base = (*dec_ctx).pkt_timebase;
         }
 
-        // All fallible setup has succeeded. Hand the context to its long-lived
-        // owner first, then give up the guard: from here the live decoder owns
-        // the `opaque` Arc refcount, released exactly once by `drop_opaque_ptr()`
-        // at shutdown. `dec_ctx_owner` is MOVED into `dp.dec_ctx` (the prior null
-        // owner there drops as a no-op), so the context is freed exactly once.
-        // Parking the owner before `disarm` keeps a single custodian of the
-        // context across the hand-off even if a panic were to intervene.
-        dp_arc.lock().unwrap().dec_ctx = dec_ctx_owner;
-        opaque_guard.disarm();
+        // All fallible setup has succeeded. The caller (or its worker's
+        // `DecWorkerResources`) becomes the context's single owner; the
+        // borrow published in `opaque` stays backed by the caller's strong
+        // `dp_arc` for the whole callback window.
+        Ok(dec_ctx_owner)
     }
-
-    Ok(())
 }
 
 fn hw_device_setup_for_decode(
@@ -1204,35 +1192,26 @@ unsafe extern "C" fn get_format_callback(
     s: *mut AVCodecContext,
     pix_fmts: *const AVPixelFormat,
 ) -> AVPixelFormat {
-    // Everything — including the trace! for the null-argument case, which
-    // runs a user-installed log hook that can panic — must stay inside a
-    // catch_unwind: unwinding across this extern "C" boundary is undefined
-    // behavior.
-    if s.is_null() || pix_fmts.is_null() || (*s).opaque.is_null() {
-        let _ = std::panic::catch_unwind(|| trace!("get pixel format: none"));
-        return AVPixelFormat::AV_PIX_FMT_NONE;
-    }
-
-    // SAFETY: Retrieve Arc<Mutex<DecoderParameter>> from FFmpeg's opaque field.
-    // This callback is invoked synchronously by FFmpeg from the decoder thread.
-    // The Arc lifecycle is managed as follows:
-    // 1. Arc::from_raw reconstructs the Arc from the raw pointer (takes ownership)
-    // 2. Arc::clone increments the reference count
-    // 3. Arc::into_raw stores one reference back (does not decrement)
-    // 4. The cloned Arc (dp_arc) is used in this function and dropped at scope end
-    // Net effect: reference count unchanged, pointer remains valid for future callbacks
-    let dp_ptr = (*s).opaque as *const Mutex<DecoderParameter>;
-    let dp_arc = Arc::from_raw(dp_ptr);
-    let dp_ptr = Arc::into_raw(dp_arc.clone());
-    (*s).opaque = dp_ptr as *mut libc::c_void;
-
-    // This callback runs across the extern "C" boundary: a panic unwinding out
-    // of it is undefined behavior. The scan below can panic through the log
-    // hook (a user-installed logger backs trace!), so contain it and report
-    // "no usable format" instead. The mutex recovers from poisoning rather
-    // than panicking — a worker that died elsewhere must not cascade here.
+    // This callback runs across the extern "C" boundary — under FFmpeg frame
+    // threading on FFmpeg's OWN worker threads, asynchronously with the
+    // submitting thread — and a panic unwinding out of it is undefined
+    // behavior. EVERYTHING here, the null checks and the opaque borrow
+    // included, stays inside a catch_unwind (trace! runs a user-installed log
+    // hook that can panic). catch_unwind only contains panics: the borrow's
+    // validity is guaranteed by the lifetime invariant at
+    // `DecWorkerResources` (a strong Arc backs `opaque` until
+    // `avcodec_free_context` has quiesced all callbacks).
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut dp = dp_arc
+        if s.is_null() || pix_fmts.is_null() || (*s).opaque.is_null() {
+            trace!("get pixel format: none");
+            return AVPixelFormat::AV_PIX_FMT_NONE;
+        }
+
+        // A NON-OWNING borrow of the Mutex behind `opaque`: no Arc::from_raw,
+        // no clone, no write-back. The mutex recovers from poisoning rather
+        // than panicking — a worker that died elsewhere must not cascade here.
+        let dp_mutex = &*((*s).opaque as *const Mutex<DecoderParameter>);
+        let mut dp = dp_mutex
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
@@ -1284,45 +1263,8 @@ unsafe extern "C" fn get_format_callback(
     }
 }
 
-unsafe extern "C" fn get_buffer_callback(
-    dec_ctx: *mut AVCodecContext,
-    frame: *mut AVFrame,
-    flags: libc::c_int,
-) -> libc::c_int {
-    if dec_ctx.is_null() || frame.is_null() {
-        return AVERROR(EINVAL);
-    }
-
-    /*let dp_ptr = (*dec_ctx).opaque as *const Arc<Mutex<DecoderParameter>>;
-    let dp_arc = Arc::clone(&*dp_ptr);
-
-    let mut dp = dp_arc.lock().unwrap();*/
-
-    // for multiview video, store the output mask in frame opaque
-    /*if dp.view_map.len() > 0 {
-        let sd = av_frame_get_side_data(frame, AV_FRAME_DATA_VIEW_ID);
-        let view_id = if !sd.is_null() {
-            *(sd.as_ref().unwrap().data as *const i32)
-        } else {
-            0
-        };
-
-        for i in 0..dp.view_map.len() {
-            if dp.view_map[i].id == view_id {
-                (*frame).opaque = dp.view_map[i].out_mask as *mut c_void;
-                break;
-            }
-        }
-    }*/
-
-    avcodec_default_get_buffer2(dec_ctx, frame, flags)
-}
-
 struct DecoderParameter {
     dec: Decoder,
-
-    dec_ctx: CodecContext,
-    // dec_ctx: *mut AVCodecContext,
 
     // override output video sample aspect ratio with this value
     sar_override: AVRational,
@@ -1348,39 +1290,12 @@ struct DecoderParameter {
     // view_map: Vec<ViewMap>,
 }
 
-// SAFETY: DecoderParameter contains a raw pointer (dec_ctx) but is safe to
-// Send/Sync because:
-// 1. The decoder thread has exclusive ownership of the AVCodecContext during decoding
-// 2. DecoderParameter is wrapped in Arc<Mutex<>> ensuring synchronized access
-// 3. The scheduler architecture guarantees that FFmpeg contexts are only accessed from
-//    their owning thread, with data passed via crossbeam channels
-// 4. Raw pointers are only dereferenced within the decoder thread or FFmpeg callbacks
-//    which are invoked synchronously from the decoder thread
-unsafe impl Send for DecoderParameter {}
-
 /*struct ViewMap {
     id: i32,
     out_mask: i32,
 }*/
 
 impl DecoderParameter {
-    fn drop_opaque_ptr(&self) {
-        let dec_ctx = self.dec_ctx.as_ptr();
-        if !dec_ctx.is_null() {
-            unsafe {
-                let dec_ctx = dec_ctx as *mut ffmpeg_sys_next::AVCodecContext;
-                let dp_ptr = (*dec_ctx).opaque as *const Mutex<DecoderParameter>;
-                if !dp_ptr.is_null() {
-                    let _dp_arc = Arc::from_raw(dp_ptr);
-                    // Null it out so the reclaim is idempotent: the worker's
-                    // RAII guard and any failure-path caller must never turn
-                    // a second call into a refcount underflow.
-                    (*dec_ctx).opaque = null_mut();
-                }
-            }
-        }
-    }
-
     fn new(dec_stream: &mut DecoderStream) -> Self {
         Self {
             dec: Decoder {
@@ -1390,7 +1305,6 @@ impl DecoderParameter {
                 samples_decoded: 0,
                 decode_errors: 0,
             },
-            dec_ctx: CodecContext::null(),
 
             sar_override: unsafe { (*(*dec_stream.stream.inner).codecpar).sample_aspect_ratio },
             framerate_in: dec_stream.avg_framerate,
@@ -1427,6 +1341,7 @@ struct Decoder {
 
 fn dec_done(
     dp_arc: &Arc<Mutex<DecoderParameter>>,
+    dec_ctx: *const AVCodecContext,
     senders: &Vec<(Sender<FrameBox>, usize, Arc<[AtomicBool]>)>,
 ) {
     for (sender, fg_input_index, finished_flag_list) in senders {
@@ -1437,7 +1352,7 @@ fn dec_done(
             continue;
         }
 
-        let mut frame_box = unsafe { dec_frame_to_box(dp_arc.clone(), null_frame()) };
+        let mut frame_box = unsafe { dec_frame_to_box(dp_arc, dec_ctx, null_frame()) };
         frame_box.frame_data.fg_input_index = *fg_input_index;
         if let Err(_) = sender.send(frame_box) {
             debug!("Decoder send EOF failed, destination already finished");
@@ -1557,8 +1472,10 @@ impl DecodeErrorBudget {
 }
 
 #[cfg(not(docsrs))]
+#[allow(clippy::too_many_arguments)] // internal worker-loop call; a params struct only adds ceremony
 unsafe fn packet_decode(
     dp_arc: &Arc<Mutex<DecoderParameter>>,
+    dec_ctx: *mut AVCodecContext,
     exit_on_error: bool,
     packet_box: PacketBox,
     packet_pool: &ObjPool<Packet>,
@@ -1566,15 +1483,10 @@ unsafe fn packet_decode(
     senders: &Vec<(Sender<FrameBox>, usize, Arc<[AtomicBool]>)>,
     scheduler_status: &Arc<AtomicUsize>,
 ) -> crate::error::Result<()> {
-    let dec_ctx = {
-        let dp = dp_arc.clone();
-        let dp = dp.lock().unwrap();
-        dp.dec_ctx.as_mut_ptr()
-    };
-
     if !dec_ctx.is_null() && (*dec_ctx).codec_type == AVMEDIA_TYPE_SUBTITLE {
         return transcode_subtitles(
-            dp_arc.clone(),
+            dp_arc,
+            dec_ctx,
             exit_on_error,
             packet_box,
             packet_pool,
@@ -1711,7 +1623,7 @@ unsafe fn packet_decode(
             }
         }
 
-        let mut frame_box = dec_frame_to_box(dp_arc.clone(), frame);
+        let mut frame_box = dec_frame_to_box(dp_arc, dec_ctx, frame);
         // fdemux_parameter.dec.pts                 = (*frame).pts;
         // fdemux_parameter.dec.tb                  = dec->pkt_timebase;
         // fdemux_parameter.dec.frame_num           = dec->frame_num - 1;
@@ -1725,7 +1637,8 @@ unsafe fn packet_decode(
 
             audio_ts_process(dp, frame_box.frame.as_mut_ptr());
         } else if let Err(e) = video_frame_process(
-            dp_arc.clone(),
+            dp_arc,
+            dec_ctx,
             frame_box.frame.as_mut_ptr(),
             &mut outputs_mask,
             frame_pool,
@@ -1752,7 +1665,8 @@ unsafe fn packet_decode(
 
 #[cfg(not(docsrs))]
 unsafe fn video_frame_process(
-    dp_arc: Arc<Mutex<DecoderParameter>>,
+    dp_arc: &Arc<Mutex<DecoderParameter>>,
+    dec_ctx: *const AVCodecContext,
     frame: *mut AVFrame,
     outputs_mask: &mut usize,
     frame_pool: &ObjPool<Frame>,
@@ -1789,7 +1703,7 @@ unsafe fn video_frame_process(
     }
 
     // update timestamp history
-    dp.last_frame_duration_est = video_duration_estimate(&dp, frame);
+    dp.last_frame_duration_est = video_duration_estimate(&dp, dec_ctx, frame);
     dp.last_frame_pts = (*frame).pts;
     dp.last_frame_tb = (*frame).time_base;
 
@@ -1815,7 +1729,11 @@ unsafe fn video_frame_process(
 }
 
 #[cfg(not(docsrs))]
-unsafe fn video_duration_estimate(dp: &MutexGuard<DecoderParameter>, frame: *mut AVFrame) -> i64 {
+unsafe fn video_duration_estimate(
+    dp: &MutexGuard<DecoderParameter>,
+    dec_ctx: *const AVCodecContext,
+    frame: *mut AVFrame,
+) -> i64 {
     let mut codec_duration = 0;
     // difference between this and last frame's timestamps
     let ts_diff: i64 = if (*frame).pts != AV_NOPTS_VALUE && dp.last_frame_pts != AV_NOPTS_VALUE {
@@ -1840,12 +1758,9 @@ unsafe fn video_duration_estimate(dp: &MutexGuard<DecoderParameter>, frame: *mut
         return (*frame).duration;
     }
 
-    if (*dp.dec_ctx.as_ptr()).framerate.den != 0 && (*dp.dec_ctx.as_ptr()).framerate.num != 0 {
+    if (*dec_ctx).framerate.den != 0 && (*dec_ctx).framerate.num != 0 {
         let fields = (*frame).repeat_pict + 2;
-        let field_rate = av_mul_q(
-            (*dp.dec_ctx.as_ptr()).framerate,
-            AVRational { num: 2, den: 1 },
-        );
+        let field_rate = av_mul_q((*dec_ctx).framerate, AVRational { num: 2, den: 1 });
         codec_duration = av_rescale_q(fields as i64, av_inv_q(field_rate), (*frame).time_base);
     }
 
@@ -2010,12 +1925,109 @@ unsafe fn audio_samplerate_update(
 #[cfg(all(test, not(docsrs)))]
 mod tests {
     use super::build_decoder_opts;
+    use super::{dec_open, get_format_callback, DecoderParameter};
     use super::{decode_stall_limit, DecodeErrorBudget};
+    use crate::core::context::ffmpeg_context::FfmpegContext;
+    use crate::core::context::input::Input;
+    use ffmpeg_sys_next::AVMediaType::AVMEDIA_TYPE_VIDEO;
     use ffmpeg_sys_next::{
-        av_dict_count, av_dict_get, AV_DICT_MATCH_CASE, FF_THREAD_FRAME, FF_THREAD_SLICE,
+        av_dict_count, av_dict_get, AVCodecID, AVPixelFormat, AV_DICT_MATCH_CASE, FF_THREAD_FRAME,
+        FF_THREAD_SLICE,
     };
     use std::collections::HashMap;
     use std::ffi::{CStr, CString};
+    use std::sync::{Arc, Mutex};
+
+    // Ownership-invariant test (NOT a race repro): pins that `opaque` is a
+    // borrow, never a stashed Arc refcount. The counted-stash design this
+    // replaces double-claimed that refcount between a frame-threading
+    // get_format callback and the worker teardown (refcount underflow →
+    // concurrent double avcodec_free_context → SIGABRT in
+    // pthread_frame.c async_unlock). With a counted stash reverted,
+    // strong_count after dec_open is 2 and the first assertion fails.
+    //
+    // Known limitation: this counts the EXTERNAL refcount only. A revert
+    // that reintroduces the callback's own from_raw/clone/into_raw dance
+    // WITHOUT the stash is refcount-neutral and passes here; the lifecycle
+    // amplifier in tests/lifecycle.rs and review of the invariant at
+    // DecWorkerResources cover that variant.
+    #[test]
+    fn dec_open_publishes_a_borrow_only_opaque_with_no_refcount() {
+        // hw_device_setup_for_decode consults the process-global device
+        // registry even for HwaccelNone (hw_device_match_by_codec):
+        // serialize with the snapshot/sentinel registry tests.
+        let _registry = crate::hwaccel::HW_REGISTRY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Probes test.mp4 without starting a scheduler; `threads=1` keeps the
+        // decoder single-threaded (no FFmpeg worker pool in a unit test).
+        let mut ffctx = FfmpegContext::new(
+            vec![Input::from("test.mp4").set_video_codec_opt("threads", "1")],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+        let demuxer = &mut ffctx.demuxs[0];
+        let dec_stream = demuxer
+            .get_streams_mut()
+            .iter_mut()
+            .find(|s| s.codec_type == AVMEDIA_TYPE_VIDEO)
+            .expect("test.mp4 must contain a video stream");
+        // SAFETY: the stream and its codecpar stay owned by the open
+        // AVFormatContext inside ffctx for the whole test.
+        let codec_id = unsafe { (*(*dec_stream.stream.inner).codecpar).codec_id };
+        assert_eq!(
+            codec_id,
+            AVCodecID::AV_CODEC_ID_H264,
+            "the oracle is calibrated for the h264 decode path"
+        );
+
+        let dp = DecoderParameter::new(dec_stream);
+        let dp_arc = Arc::new(Mutex::new(dp));
+        assert_eq!(Arc::strong_count(&dp_arc), 1);
+
+        let dec_ctx = dec_open(Arc::clone(&dp_arc), dec_stream, std::ptr::null_mut())
+            .expect("opening the h264 decoder must succeed");
+
+        // The clone passed to dec_open died with its argument: the ONLY
+        // strong ref left is the test's. A counted opaque stash would make
+        // this 2 — the fail-on-revert edge.
+        assert_eq!(Arc::strong_count(&dp_arc), 1);
+        // SAFETY: dec_ctx is the open decoder context owned above.
+        let opaque = unsafe { (*dec_ctx.as_ptr()).opaque };
+        assert_eq!(
+            opaque,
+            Arc::as_ptr(&dp_arc) as *mut libc::c_void,
+            "opaque must be the borrow of the Mutex inside dp_arc"
+        );
+
+        // A real callback invocation (the sw path: first entry is not a
+        // hwaccel format, so the scan stops there) must not touch the
+        // refcount or rewrite opaque.
+        let pix_fmts = [
+            AVPixelFormat::AV_PIX_FMT_YUV444P,
+            AVPixelFormat::AV_PIX_FMT_NONE,
+        ];
+        // SAFETY: a valid open context and a NONE-terminated format list.
+        let chosen = unsafe { get_format_callback(dec_ctx.as_mut_ptr(), pix_fmts.as_ptr()) };
+        assert_eq!(chosen, AVPixelFormat::AV_PIX_FMT_YUV444P);
+        assert_eq!(Arc::strong_count(&dp_arc), 1);
+        // SAFETY: as above.
+        assert_eq!(unsafe { (*dec_ctx.as_ptr()).opaque }, opaque);
+
+        // Freeing the context must not free (or double-free) the parameter
+        // state behind the borrow.
+        drop(dec_ctx);
+        assert_eq!(Arc::strong_count(&dp_arc), 1);
+        let _guard = dp_arc
+            .lock()
+            .expect("DecoderParameter must still be alive and unpoisoned");
+        drop(_guard);
+
+        drop(ffctx);
+    }
 
     // The ceiling grows with thread_count ONLY under native frame threading;
     // everything else (external decoders, slice threading, none) pins to the flat

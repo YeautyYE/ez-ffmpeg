@@ -253,3 +253,48 @@ fn stop_interrupts_muxer_blocked_on_unread_network_output() {
 
     drop(accept_thread); // detach; the sleeping peer ends with the process
 }
+
+/// Probabilistic lifecycle amplifier, not a deterministic race oracle. Each
+/// iteration opens a fresh frame-threaded H.264 decoder and signals stop
+/// after one scheduler yield, landing the teardown inside the decoder's
+/// startup window (where a get_format callback on an FFmpeg frame-threading
+/// worker once raced the worker-thread teardown into a double
+/// avcodec_free_context — SIGABRT in pthread_frame.c async_unlock). Passing
+/// raises regression-detection probability but carries no statistical
+/// guarantee; the deterministic ownership invariant is pinned separately by
+/// the dec_task unit test.
+#[test]
+fn immediate_stop_of_frame_threaded_h264_decode_is_clean() {
+    let _lock = PROCESS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    // 512 iterations: measured ~0.2s for 32 under local ASAN, so this stays
+    // seconds-scale in the CI ASAN lane while giving a regression a few
+    // hundred independent shots at the startup window; the local acceptance
+    // bar is the larger stress loop, not this test.
+    for i in 0..512 {
+        let scheduler = FfmpegContext::builder()
+            .input(
+                Input::from("test.mp4")
+                    .set_video_codec_opt("threads", "4")
+                    .set_video_codec_opt("thread_type", "frame"),
+            )
+            .output(
+                Output::from("-")
+                    .set_format("null")
+                    .add_stream_map("0:v")
+                    .set_video_codec("mpeg4"),
+            )
+            .build()
+            .unwrap()
+            .start()
+            .unwrap();
+
+        std::thread::yield_now();
+
+        // stop() waits for every tracked worker; a teardown race aborts the
+        // whole process, so reaching the next iteration IS the assertion.
+        scheduler
+            .stop()
+            .unwrap_or_else(|e| panic!("iteration {i}: clean immediate stop failed: {e}"));
+    }
+}

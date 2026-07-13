@@ -372,9 +372,14 @@ pub(crate) struct CodecContext {
     inner: *mut AVCodecContext,
 }
 
-// SAFETY: CodecContext can be sent to another thread. The raw AVCodecContext pointer
-// is only accessed from the thread that owns the CodecContext, and the crate ensures
-// single-threaded access to codec operations.
+// SAFETY: CodecContext can be sent to another thread. It is a single-owner
+// handle: application-side lifecycle API calls (open/decode/flush/free) go
+// through its one owner (a worker's resource struct or an open-function
+// local on failure paths), never through aliases on other Rust threads.
+// Rust code DOES also run on FFmpeg-managed threads — decode callbacks like
+// `get_format` receive a context pointer (often a per-thread copy) there —
+// but libavcodec synchronizes those accesses, and `avcodec_free_context`
+// (Drop) quiesces all callbacks and joins FFmpeg's workers before returning.
 unsafe impl Send for CodecContext {}
 
 impl CodecContext {
@@ -382,10 +387,6 @@ impl CodecContext {
         Self {
             inner: avcodec_context,
         }
-    }
-
-    pub(crate) fn null() -> Self {
-        Self { inner: null_mut() }
     }
 
     pub(crate) fn as_mut_ptr(&self) -> *mut AVCodecContext {
