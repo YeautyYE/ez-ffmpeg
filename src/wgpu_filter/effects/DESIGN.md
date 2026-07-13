@@ -4,14 +4,14 @@ This module is an adapter layer over `WgpuFrameFilter`.
 
 ## Architecture
 
-`effects` adapts one fixed WGSL shader contract into six named effects: every
-effect shares the same `@group(0)` header (input texture / sampler / the `ez`
-uniforms — the standard `shader_wgsl` contract) and the same underlying
-pipeline (`WgpuFrameFilter`); they differ only in their `@group(1)` parameter
-struct and fragment body. Each effect exposes one constructor
-(`adjust(params)`, ...) returning a typed builder; the built `Effect<P>`
-implements `FrameFilter` by delegation and fixes the parameter type `P` into
-the handle-acquisition path.
+`effects` adapts one fixed WGSL shader contract into a catalog of named
+effects: every effect shares the same `@group(0)` header (input texture /
+sampler / the `ez` uniforms — the standard `shader_wgsl` contract) and the
+same underlying pipeline (`WgpuFrameFilter`); they differ only in their
+`@group(1)` parameter struct and fragment body. Each effect exposes one
+constructor (`adjust(params)`, ...) returning a typed builder; the built
+`Effect<P>` implements `FrameFilter` by delegation and fixes the parameter
+type `P` into the handle-acquisition path.
 
 ### Static layering
 
@@ -35,7 +35,7 @@ the handle-acquisition path.
 ### Entity relations
 
 ```text
-constructors (6) ──1:1──▶ parameter structs (#[repr(C)] Pod)
+constructors (13) ──1:1──▶ parameter structs (#[repr(C)] Pod)
       │                        │ positional mirror (field order = layout)
       ▼                        ▼
 EffectBuilder<P> ──build──▶ Effect<P> ──1:1──▶ WgpuFrameFilter (embedded)
@@ -65,6 +65,13 @@ check (byte-count comparison) to a compile-time one (type binding).
 | `transform` | TransformParams (32) | none (inverse mapping) | — | out-of-frame renders black; positive angle = counterclockwise for the viewer |
 | `pixelate` | PixelateParams (16) | none (block-center sample) | — | block clipped to the frame, then its center sampled; `block_size <= 1` degrades to passthrough |
 | `soft_blur` | SoftBlurParams (16) | yes | 13-tap two-ring disc | `privacy()` strong preset |
+| `soul` | SoulParams (16) | none (second sample point) | — | ghost blend; cycle start = identity; timestamp-driven |
+| `sway` | SwayParams (16) | none (inverse mapping) | — | derived overscan keeps sampling inside the frame at every phase; timestamp-driven |
+| `wave` | WaveParams (16) | none (inverse mapping) | — | out-of-frame clamps (edge-extends); timestamp-driven phase |
+| `swirl` | SwirlParams (32) | none (inverse mapping) | — | quadratic falloff to zero at the rim; `speed > 0` oscillates through identity at `t = 0`; same rotation convention as `transform` |
+| `magnifier` | MagnifierParams (16) | none (inverse mapping) | — | smoothstep-eased zoom, seamless rim; identity outside the radius |
+| `fisheye` | FisheyeParams (16) | none (inverse mapping) | — | corner-normalized barrel map (strength ≥ 0 only): corners pinned, factor ≤ 1 keeps every sample in frame |
+| `chroma_key` | ChromaKeyParams (48) | yes | 9-tap box on the chroma DISTANCE | FFmpeg `chromakey` ramp + `despill` clamp; composites over a solid background (alpha-less output) |
 
 Contracts shared across the matrix:
 
@@ -110,6 +117,34 @@ Contracts shared across the matrix:
    construction. The size-mismatch branch is unreachable, and infecting the
    caller's signature with an unreachable error is not worth it.
 
+6. **Animated effects read `ez.play_time`, not a frame counter.** The
+   pipeline derives `play_time` from `pts × time_base`, so animation speed
+   is stable across frame rates and seeks; a counter would tie the look to
+   the frame rate. Cost: frames without timestamps (`AV_NOPTS_VALUE` maps
+   to `play_time = 0`) render the `t = 0` phase — every animated effect is
+   designed so that phase is the identity or a mild pose, never a violent
+   one.
+
+7. **`chroma_key` follows FFmpeg/OBS reference math, not novelty.** The
+   pixel and the key color are both projected to CbCr with FFmpeg
+   `chromakey`'s own RGB→UV coefficients, so distances — and therefore
+   `similarity`/`blend` values — land on FFmpeg's scale; the distance, not
+   the color, is box-filtered over a 3×3 neighborhood (both references do
+   this against 4:2:0 chroma blocking); the matte is FFmpeg's linear
+   `(d - similarity)/blend` ramp; spill suppression is FFmpeg `despill`'s
+   self-gating clamp aimed at the key's dominant channel. One structural
+   difference: FFmpeg compares the source's RAW chroma plane codes against
+   a BT.601-converted key, while this shader decodes the pixel to RGB and
+   projects both sides through the one BT.601 conversion — the two agree
+   (within quantization) only on full-range BT.601 input, and every other
+   range/matrix combination carries a small bias on FFmpeg's side, so
+   ported values are a close starting point, not bit-identical. Keying on
+   chroma (not RGB distance) is what makes the
+   matte survive shadows and uneven lighting on a physical screen. Because
+   the pipeline's output is alpha-less YUV, the matte composites over a
+   solid `background` color here; a future alpha-carrying pipeline could
+   expose it directly.
+
 ## Failure contract
 
 - **`build()`** → `WgpuFilterError::InvalidOption`. Through this module's API
@@ -138,8 +173,8 @@ long-lived locks.
 ## Test strategy
 
 - **Offline shader validation**: naga (same major version as wgpu) parses and
-  validates all 7 assembled shaders (beauty_lite × 2 quality tiers + the
-  other 5), so shader-text errors explode in `cargo test` without a real GPU.
+  validates all 14 assembled shaders (beauty_lite × 2 quality tiers + the
+  other 12), so shader-text errors explode in `cargo test` without a real GPU.
 - **Layout sentinels**: each parameter struct's `size_of` is pinned to a
   multiple of 16 (WGSL rounds uniform struct sizes up to 16; the host must
   match).
@@ -150,3 +185,27 @@ long-lived locks.
   `block_size = 1` plus resize matches an identity resize; sharpen overshoots
   at edges; soft_blur shrinks edge contrast; beauty_lite keeps constant
   frames uniform and cuts skin-region luma noise; `update` desaturates live.
+- **Lens/motion/keying oracles** (same skip rule): every neutral phase is
+  pinned to the identity (soul at cycle start, sway with zero amplitudes,
+  wave at zero amplitude, animated swirl at `t = 0`, fisheye at zero
+  strength); soul's mid-cycle ghost band blends toward the enlarged copy;
+  sway's zoom peak moves the step edge outward, its trough passes the
+  frame through, and a max-amplitude translation lands the edge where
+  only overscan + translation together put it (dropping either term
+  fails); wave bends the edge in opposite directions on opposite-phase
+  rows, flips both directions half a period later (the travelling time
+  term), and displaces a horizontal edge vertically (the second axis);
+  swirl rotates inside its radius only, and an animated swirl at its
+  oscillation peak matches the static twist; the magnified square covers
+  ground outside its input footprint, the outside stays identity, and a
+  near-rim probe pins the smoothstep ease-off (constant zoom fails it);
+  fisheye pushes an off-center edge outward while both corners keep their
+  content (the corner-pinned mapping); chroma_key keys the pure-green
+  band to the background, keys a near-green band through the similarity
+  tolerance, keeps a skin band untouched, honors a non-black background
+  color, blends a mid-ramp teal partway (the linear ramp, not a hard
+  threshold), keys a boundary column only its 3×3 box-averaged distance
+  reaches (center-only sampling fails it), and its despill measurably
+  pulls a green-spilled foreground toward neutral vs `spill = 0`.
+- **Timestamp phases** are chosen on the harness's 1/30 time base so each
+  oracle drives a known `play_time` (e.g. pts 15 → 0.5 s).

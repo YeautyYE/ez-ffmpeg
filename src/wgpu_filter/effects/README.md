@@ -84,11 +84,39 @@ use ez_ffmpeg::wgpu_filter::effects::{transform, TransformParams};
 let effect = transform(TransformParams::mirrored()).build()?;
 ```
 
+**Green-screen extraction (chroma key)**:
+
+```rust,ignore
+use ez_ffmpeg::wgpu_filter::effects::{chroma_key, ChromaKeyParams};
+
+// FFmpeg `chromakey` semantics: similarity/blend on FFmpeg's chroma
+// distance scale; despill clamp on the surviving foreground. The
+// pipeline outputs alpha-less YUV, so the foreground composites over
+// a solid background color (default black).
+let effect = chroma_key(ChromaKeyParams::green_screen()).build()?;
+// or: ChromaKeyParams::blue_screen(), .with_background(r, g, b)
+```
+
+**Fun lens looks (soul / magnifier / fisheye)**:
+
+```rust,ignore
+use ez_ffmpeg::wgpu_filter::effects::{soul, SoulParams, magnifier, MagnifierParams};
+
+let ghost = soul(SoulParams::default()).build()?;        // astral projection
+let lens = magnifier(MagnifierParams::default()).build()?; // move it live via params_handle()
+```
+
 Catalog overview: `adjust` (brightness/contrast/saturation/exposure/gamma/
 vibrance/white-balance, 8 controls), `beauty_lite`/`portrait` (skin smoothing
 + whitening + brightening), `sharpen` (luma unsharp mask), `transform`
 (mirror/flip/rotate/scale/translate), `pixelate` (mosaic), `soft_blur`
-(soft-focus / privacy blur).
+(soft-focus / privacy blur), `chroma_key` (green/blue-screen extraction with
+despill), and the lens/motion family — `soul` (fading ghost copy), `sway`
+(handheld / breathing camera), `wave` (travelling sine ripple), `swirl`
+(vortex, optionally oscillating), `magnifier` (circular lens zoom), `fisheye`
+(barrel distortion). The animated ones (`soul`, `sway`, `wave`,
+animated `swirl`) run off frame timestamps (`pts` × `time_base`); frames
+without timestamps render their `t = 0` phase.
 
 ## Dependencies
 

@@ -11,14 +11,21 @@ use ffmpeg_sys_next::AVPixelFormat;
 fn effect_shaders_parse_and_validate() {
     let beauty_fast = beauty::beauty_shader(BeautyQuality::Fast);
     let beauty_balanced = beauty::beauty_shader(BeautyQuality::Balanced);
-    let modules: [(&str, String); 7] = [
+    let modules: [(&str, String); 14] = [
         ("adjust", effect_module(adjust::ADJUST_BODY)),
         ("beauty_fast", beauty_fast),
         ("beauty_balanced", beauty_balanced),
+        ("chroma_key", effect_module(chroma_key::CHROMA_KEY_BODY)),
+        ("fisheye", effect_module(fisheye::FISHEYE_BODY)),
+        ("magnifier", effect_module(magnifier::MAGNIFIER_BODY)),
         ("pixelate", effect_module(pixelate::PIXELATE_BODY)),
         ("sharpen", effect_module(sharpen::SHARPEN_BODY)),
         ("soft_blur", effect_module(soft_blur::SOFT_BLUR_BODY)),
+        ("soul", effect_module(soul::SOUL_BODY)),
+        ("sway", effect_module(sway::SWAY_BODY)),
+        ("swirl", effect_module(swirl::SWIRL_BODY)),
         ("transform", effect_module(transform::TRANSFORM_BODY)),
+        ("wave", effect_module(wave::WAVE_BODY)),
     ];
     for (name, source) in modules {
         let module = naga::front::wgsl::parse_str(&source)
@@ -40,10 +47,17 @@ fn effect_shaders_parse_and_validate() {
 fn params_structs_are_uniform_compatible() {
     assert_eq!(std::mem::size_of::<AdjustParams>(), 32);
     assert_eq!(std::mem::size_of::<BeautyParams>(), 16);
+    assert_eq!(std::mem::size_of::<ChromaKeyParams>(), 48);
+    assert_eq!(std::mem::size_of::<FisheyeParams>(), 16);
+    assert_eq!(std::mem::size_of::<MagnifierParams>(), 16);
     assert_eq!(std::mem::size_of::<PixelateParams>(), 16);
     assert_eq!(std::mem::size_of::<SharpenParams>(), 16);
     assert_eq!(std::mem::size_of::<SoftBlurParams>(), 16);
+    assert_eq!(std::mem::size_of::<SoulParams>(), 16);
+    assert_eq!(std::mem::size_of::<SwayParams>(), 16);
+    assert_eq!(std::mem::size_of::<SwirlParams>(), 32);
     assert_eq!(std::mem::size_of::<TransformParams>(), 32);
+    assert_eq!(std::mem::size_of::<WaveParams>(), 16);
 }
 
 /// `Default` must be a *neutral or mild* preset — a filter built with
@@ -71,6 +85,37 @@ fn default_params_are_neutral_or_mild() {
     assert!(SharpenParams::default().amount <= 1.0);
     assert_eq!(PixelateParams::default().block_size, 16.0);
     assert!(SoftBlurParams::default().strength <= 0.8);
+
+    // The lens/motion effects are inherently visible; their defaults must
+    // still be the documented moderate values, and the animated ones must
+    // start from a subtle motion, not a violent one.
+    let s = SoulParams::default();
+    assert!(s.period > 0.0 && s.max_alpha <= 0.5 && s.max_scale <= 1.5);
+
+    let w = SwayParams::default();
+    assert!(w.x_amplitude <= 0.01 && w.y_amplitude <= 0.01);
+    assert!(w.zoom_amplitude <= 0.05);
+
+    let v = WaveParams::default();
+    assert!(v.amplitude <= 0.01 && v.frequency <= 4.0);
+
+    let sw = SwirlParams::default();
+    assert_eq!((sw.center_x, sw.center_y, sw.speed), (0.5, 0.5, 0.0));
+    assert!(sw.twist.abs() <= 4.0);
+
+    let m = MagnifierParams::default();
+    assert_eq!((m.center_x, m.center_y), (0.5, 0.5));
+    assert!(m.magnification <= 2.0 && m.radius <= 0.3);
+
+    assert!(FisheyeParams::default().strength <= 1.0);
+
+    // Chroma key defaults must match the documented FFmpeg-scale values
+    // and key pure green over black.
+    let ck = ChromaKeyParams::default();
+    assert_eq!((ck.key_r, ck.key_g, ck.key_b), (0.0, 1.0, 0.0));
+    assert_eq!((ck.bg_r, ck.bg_g, ck.bg_b), (0.0, 0.0, 0.0));
+    assert!(ck.similarity > 0.0 && ck.similarity <= 0.4);
+    assert!(ck.blend <= 0.1);
 }
 
 /// Builders must produce filters without touching a GPU (validation and
@@ -93,6 +138,19 @@ fn builders_build_without_a_gpu() {
         .frames_in_flight(1)
         .build()
         .is_ok());
+    assert!(soul(SoulParams::default()).build().is_ok());
+    assert!(sway(SwayParams::breathe()).build().is_ok());
+    assert!(sway(SwayParams::handheld()).build().is_ok());
+    assert!(wave(WaveParams::default()).build().is_ok());
+    assert!(swirl(SwirlParams::tornado()).build().is_ok());
+    assert!(magnifier(MagnifierParams::default()).build().is_ok());
+    assert!(fisheye(FisheyeParams::with_strength(0.8)).build().is_ok());
+    assert!(chroma_key(ChromaKeyParams::blue_screen()).build().is_ok());
+    assert!(
+        chroma_key(ChromaKeyParams::green_screen().with_background(0.0, 0.0, 1.0))
+            .build()
+            .is_ok()
+    );
 }
 
 // --- GPU runtime tests (skipped when no adapter is present) ---
@@ -561,7 +619,9 @@ fn beauty_lite_smooths_skin_noise() {
     if !init_filter(&mut filter) {
         return;
     }
-    let out = drive(&mut filter, vec![noisy_skin_frame()], 1).pop().unwrap();
+    let out = drive(&mut filter, vec![noisy_skin_frame()], 1)
+        .pop()
+        .unwrap();
     let y = plane_to_vec(&out, 0, 64, 48);
 
     let in_mad = mean_abs_dev(&interior_vals(|c, r| noisy_skin_luma(c, r) as i32));
@@ -644,5 +704,791 @@ fn portrait_smooths_and_brightens_more_than_default_beauty() {
         p_mean > d_mean + 2.0,
         "portrait must whiten/brighten strictly above default params \
          (default mean {d_mean:.2}, portrait mean {p_mean:.2})"
+    );
+}
+
+// --- Lens / motion / keying effect oracles ---
+
+/// Sets the frame's pts (the harness frames carry `time_base` 1/30, so
+/// `play_time = pts / 30` seconds drives the animated effects).
+fn with_pts(mut frame: ffmpeg_next::Frame, pts: i64) -> ffmpeg_next::Frame {
+    unsafe { (*frame.as_mut_ptr()).pts = pts };
+    frame
+}
+
+/// Vertical luma step edge at `edge_x` (fraction of the width): dark 60
+/// left of it, bright 200 right of it, neutral chroma.
+fn step_edge_frame(w: i32, h: i32, edge_x: f32) -> ffmpeg_next::Frame {
+    let edge_col = (edge_x * w as f32) as usize;
+    make_yuv_frame_with(
+        w,
+        h,
+        AVPixelFormat::AV_PIX_FMT_YUV420P,
+        move |c, _| if c < edge_col { 60 } else { 200 },
+        |_, _| (128, 128),
+    )
+}
+
+#[test]
+fn soul_cycle_start_matches_identity() {
+    // At the cycle start (pts=0 => progress 0) the ghost has scale 1 and
+    // coincides with the image: mixing a pixel with itself is the identity
+    // regardless of max_alpha.
+    let filter = soul(SoulParams {
+        max_alpha: 1.0,
+        ..SoulParams::default()
+    })
+    .build()
+    .unwrap()
+    .into_inner();
+    assert_matches_identity(filter, 1, "soul cycle start");
+}
+
+#[test]
+fn soul_mid_cycle_blends_an_enlarged_ghost() {
+    let mut filter = soul(SoulParams {
+        period: 1.0,
+        max_alpha: 0.4,
+        max_scale: 1.25,
+        _pad: 0.0,
+    })
+    .build()
+    .unwrap()
+    .into_inner();
+    if !init_filter(&mut filter) {
+        return;
+    }
+    // Mid-cycle (pts 15 of 30/s => t=0.5s => progress 0.5): alpha 0.2,
+    // ghost scale 1.125. The input edge sits at x=0.25 (col 16 of 64);
+    // the enlarged ghost's edge lands at 0.5 - 0.28125 = 0.219 (col 14).
+    // Between the two edges the dark base blends with the bright ghost:
+    // 60 + 0.2*(200-60) = 88.
+    let input = with_pts(step_edge_frame(64, 48, 0.25), 15);
+    let out = drive(&mut filter, vec![input], 1).pop().unwrap();
+    let y = plane_to_vec(&out, 0, 64, 48);
+    let row = 24usize;
+    for col in [14usize, 15] {
+        let v = y[row * 64 + col] as i32;
+        assert!(
+            (75..=105).contains(&v),
+            "ghost band col {col} must blend toward the bright ghost, got {v}"
+        );
+    }
+    // Outside the band both layers agree, so the image is unchanged.
+    assert!((y[row * 64 + 8] as i32 - 60).abs() <= 3, "far dark side");
+    assert!(
+        (y[row * 64 + 56] as i32 - 200).abs() <= 3,
+        "far bright side"
+    );
+}
+
+#[test]
+fn sway_zero_amplitudes_match_identity() {
+    // All amplitudes zero: the overscan formula must degenerate to exactly
+    // 1 and the oscillation must vanish — bit-stable pass-through.
+    let filter = sway(SwayParams {
+        x_amplitude: 0.0,
+        y_amplitude: 0.0,
+        zoom_amplitude: 0.0,
+        speed: 5.0,
+    })
+    .build()
+    .unwrap()
+    .into_inner();
+    assert_matches_identity(filter, 1, "sway zero amplitudes");
+}
+
+#[test]
+fn sway_translation_shifts_the_edge_through_the_overscan() {
+    // Pure horizontal travel at the range maximum (xa = 0.05): overscan
+    // is 1/0.9, so sampling is c = 0.9·x + 0.1 at the sin = 1 peak
+    // (pts 15, speed pi => t·speed = pi/2). The edge at x = 0.25 lands at
+    // output x = 1/6 (col ~10.7). Col 12 samples c = 0.276 — bright.
+    // This pins BOTH terms: dropping the translation samples c = 0.226
+    // and dropping the overscan samples c = 0.245 — dark either way.
+    let params = SwayParams {
+        x_amplitude: 0.05,
+        y_amplitude: 0.0,
+        zoom_amplitude: 0.0,
+        speed: std::f32::consts::PI,
+    };
+    let mut filter = sway(params).build().unwrap().into_inner();
+    if !init_filter(&mut filter) {
+        return;
+    }
+    let out = drive(
+        &mut filter,
+        vec![with_pts(step_edge_frame(64, 48, 0.25), 15)],
+        1,
+    )
+    .pop()
+    .unwrap();
+    let y = plane_to_vec(&out, 0, 64, 48);
+    let row = 24usize;
+    assert!(
+        y[row * 64 + 12] as i32 >= 170,
+        "col 12 must go bright once the edge translated to col ~11, got {}",
+        y[row * 64 + 12]
+    );
+    assert!(
+        (y[row * 64 + 9] as i32 - 60).abs() <= 3,
+        "col 9 stays left of the translated edge, got {}",
+        y[row * 64 + 9]
+    );
+    // The right border must show genuine in-frame content: with the
+    // overscan the sampling window peaks at exactly c = 1.0.
+    assert!(
+        (y[row * 64 + 62] as i32 - 200).abs() <= 3,
+        "right border keeps in-frame bright content, got {}",
+        y[row * 64 + 62]
+    );
+}
+
+#[test]
+fn sway_zoom_pulses_and_never_leaves_the_frame() {
+    // Pure zoom pulse (breathe), amplitude 0.2, speed pi rad/s: overscan
+    // is 1/0.8 = 1.25, so the scale swings between 1.0 and 1.5.
+    let params = SwayParams {
+        x_amplitude: 0.0,
+        y_amplitude: 0.0,
+        zoom_amplitude: 0.2,
+        speed: std::f32::consts::PI,
+    };
+    let mut filter = sway(params).build().unwrap().into_inner();
+    if !init_filter(&mut filter) {
+        return;
+    }
+    // Peak zoom at t=0.5s (sin = 1, scale 1.5): the edge at x=0.25
+    // (col 16) moves out to 0.5 - 0.25*1.5 = 0.125 (col 8).
+    let out = drive(
+        &mut filter,
+        vec![with_pts(step_edge_frame(64, 48, 0.25), 15)],
+        1,
+    )
+    .pop()
+    .unwrap();
+    let y = plane_to_vec(&out, 0, 64, 48);
+    let row = 24usize;
+    assert!(
+        (y[row * 64 + 6] as i32 - 60).abs() <= 3,
+        "left of the zoomed edge stays dark"
+    );
+    assert!(
+        y[row * 64 + 10] as i32 >= 170,
+        "col 10 must be bright once the edge zoomed out to col 8, got {}",
+        y[row * 64 + 10]
+    );
+
+    // Trough at t=1.5s (sin = -1): the overscan and the pulse cancel to
+    // scale exactly 1 — the frame passes through unchanged. This pins the
+    // sampling window never exceeding the frame (scale >= 1 at all phases).
+    let out = drive(
+        &mut filter,
+        vec![with_pts(step_edge_frame(64, 48, 0.25), 45)],
+        1,
+    )
+    .pop()
+    .unwrap();
+    let y = plane_to_vec(&out, 0, 64, 48);
+    assert!(
+        (y[row * 64 + 14] as i32 - 60).abs() <= 3,
+        "trough phase: col 14 keeps the input's dark value"
+    );
+    assert!(
+        (y[row * 64 + 17] as i32 - 200).abs() <= 3,
+        "trough phase: col 17 keeps the input's bright value"
+    );
+}
+
+#[test]
+fn wave_zero_amplitude_matches_identity() {
+    let filter = wave(WaveParams {
+        amplitude: 0.0,
+        ..WaveParams::default()
+    })
+    .build()
+    .unwrap()
+    .into_inner();
+    assert_matches_identity(filter, 1, "wave amplitude=0");
+}
+
+#[test]
+fn wave_bends_the_edge_by_the_sine_of_the_row() {
+    // Static phase (pts=0), amplitude 0.03, frequency 2: the x displacement
+    // is cos(y*4pi)*0.03, so the vertical edge bends LEFT (~2 px) on rows
+    // where the cosine is +1 and RIGHT on rows where it is -1. Luma varies
+    // only with x, so the y displacement is a no-op and the sine SHAPE is
+    // pinned by the two opposite rows.
+    let mut filter = wave(WaveParams {
+        amplitude: 0.03,
+        frequency: 2.0,
+        speed: 1.5,
+        _pad: 0.0,
+    })
+    .build()
+    .unwrap()
+    .into_inner();
+    if !init_filter(&mut filter) {
+        return;
+    }
+    let out = drive(&mut filter, vec![step_edge_frame(64, 48, 0.5)], 1)
+        .pop()
+        .unwrap();
+    let y = plane_to_vec(&out, 0, 64, 48);
+    // Row 24 (y=0.51, cos=+0.99): sampling shifts +0.03, the edge appears
+    // at x=0.47, so col 31 (input: dark) flips bright.
+    assert!(
+        y[24 * 64 + 31] as i32 >= 170,
+        "row 24 col 31 must flip bright (edge bent left), got {}",
+        y[24 * 64 + 31]
+    );
+    // Row 12 (y=0.26, cos=-0.99): the edge appears at x=0.53, so col 32
+    // (input: bright) flips dark.
+    assert!(
+        y[12 * 64 + 32] as i32 <= 90,
+        "row 12 col 32 must flip dark (edge bent right), got {}",
+        y[12 * 64 + 32]
+    );
+    // Far columns are flat on both sides of every bent edge position.
+    assert!((y[24 * 64 + 8] as i32 - 60).abs() <= 3);
+    assert!((y[12 * 64 + 56] as i32 - 200).abs() <= 3);
+}
+
+#[test]
+fn wave_time_phase_travels_the_ripple() {
+    // Same geometry as the static test but half a period later: speed 2π
+    // at t = 0.5 s (pts 15) adds a π phase, flipping the displacement
+    // sign on every row. Row 24 bent LEFT at t = 0 — now it bends RIGHT
+    // (sampling shifts −0.03, the edge appears at x ≈ 0.53): col 32
+    // (input: bright) flips dark. Row 12 flips the other way: col 31
+    // (input: dark) goes bright. Freezing the time term re-renders the
+    // static phase and fails both.
+    let mut filter = wave(WaveParams {
+        amplitude: 0.03,
+        frequency: 2.0,
+        speed: std::f32::consts::TAU,
+        _pad: 0.0,
+    })
+    .build()
+    .unwrap()
+    .into_inner();
+    if !init_filter(&mut filter) {
+        return;
+    }
+    let out = drive(
+        &mut filter,
+        vec![with_pts(step_edge_frame(64, 48, 0.5), 15)],
+        1,
+    )
+    .pop()
+    .unwrap();
+    let y = plane_to_vec(&out, 0, 64, 48);
+    assert!(
+        y[24 * 64 + 32] as i32 <= 90,
+        "row 24 col 32 must flip dark half a period later, got {}",
+        y[24 * 64 + 32]
+    );
+    assert!(
+        y[12 * 64 + 31] as i32 >= 170,
+        "row 12 col 31 must flip bright half a period later, got {}",
+        y[12 * 64 + 31]
+    );
+}
+
+#[test]
+fn wave_displaces_vertically_by_the_sine_of_the_column() {
+    // Horizontal edge (dark above y = 0.5, bright below) pins the SECOND
+    // displacement line: luma varies only with y here, so the x term
+    // alone moves nothing. At col 38 the sine of the (already
+    // x-displaced) column sits near +1: sampling shifts +0.03 in y, the
+    // edge appears at y ≈ 0.47, and row 23 (input: dark) flips bright.
+    // At col 22 the sine is near −1 and row 24 (input: bright) flips
+    // dark. Deleting the y line leaves both rows at their input values.
+    let mut filter = wave(WaveParams {
+        amplitude: 0.03,
+        frequency: 2.0,
+        speed: 1.5,
+        _pad: 0.0,
+    })
+    .build()
+    .unwrap()
+    .into_inner();
+    if !init_filter(&mut filter) {
+        return;
+    }
+    let input = make_yuv_frame_with(
+        64,
+        48,
+        AVPixelFormat::AV_PIX_FMT_YUV420P,
+        |_, r| if r < 24 { 60 } else { 200 },
+        |_, _| (128, 128),
+    );
+    let out = drive(&mut filter, vec![input], 1).pop().unwrap();
+    let y = plane_to_vec(&out, 0, 64, 48);
+    assert!(
+        y[23 * 64 + 38] as i32 >= 170,
+        "col 38 row 23 must flip bright (edge lifted), got {}",
+        y[23 * 64 + 38]
+    );
+    assert!(
+        y[24 * 64 + 22] as i32 <= 90,
+        "col 22 row 24 must flip dark (edge pushed down), got {}",
+        y[24 * 64 + 22]
+    );
+}
+
+#[test]
+fn swirl_animated_starts_untwisted() {
+    // tornado() oscillates as twist*sin(speed*t); at t=0 that is zero
+    // twist, so the first frame passes through unchanged.
+    let filter = swirl(SwirlParams::tornado()).build().unwrap().into_inner();
+    assert_matches_identity(filter, 1, "tornado at t=0");
+}
+
+#[test]
+fn swirl_oscillation_peaks_at_the_static_twist() {
+    // Animated swirl a quarter period in (speed pi, pts 15 => t=0.5s,
+    // sin = 1): the effective twist equals the static default, so the
+    // static test's oracle point must rotate identically. An
+    // implementation whose animated path never twists (or ignores the
+    // time term) leaves this point at its dark input value.
+    let mut filter = swirl(SwirlParams {
+        speed: std::f32::consts::PI,
+        ..SwirlParams::default()
+    })
+    .build()
+    .unwrap()
+    .into_inner();
+    if !init_filter(&mut filter) {
+        return;
+    }
+    let out = drive(
+        &mut filter,
+        vec![with_pts(step_edge_frame(64, 64, 0.5), 15)],
+        1,
+    )
+    .pop()
+    .unwrap();
+    let y = plane_to_vec(&out, 0, 64, 64);
+    assert!(
+        y[22 * 64 + 30] as i32 >= 170,
+        "at sin=1 the animated vortex must rotate like the static one, got {}",
+        y[22 * 64 + 30]
+    );
+    assert!(
+        (y[32 * 64 + 2] as i32 - 60).abs() <= 3,
+        "outside the radius stays untouched, got {}",
+        y[32 * 64 + 2]
+    );
+}
+
+#[test]
+fn swirl_rotates_inside_the_radius_only() {
+    // Static swirl (speed 0), default center/radius 0.4/twist 2.5 on a
+    // square frame with the step edge through the center. A point above
+    // and left of the center (r=0.15, theta ~ 0.97 rad CCW) samples from
+    // the bright right half; a point outside the radius is untouched.
+    let mut filter = swirl(SwirlParams::default()).build().unwrap().into_inner();
+    if !init_filter(&mut filter) {
+        return;
+    }
+    let out = drive(&mut filter, vec![step_edge_frame(64, 64, 0.5)], 1)
+        .pop()
+        .unwrap();
+    let y = plane_to_vec(&out, 0, 64, 64);
+    // (col 30, row 22): inside the vortex, input dark (x<0.5); the CCW
+    // rotation brings the right half's bright content here.
+    assert!(
+        y[22 * 64 + 30] as i32 >= 170,
+        "inside the vortex the dark left half must rotate bright, got {}",
+        y[22 * 64 + 30]
+    );
+    // (col 2, row 32): r=0.46 > radius 0.4 — identity, stays dark.
+    assert!(
+        (y[32 * 64 + 2] as i32 - 60).abs() <= 3,
+        "outside the radius the frame must be untouched, got {}",
+        y[32 * 64 + 2]
+    );
+}
+
+#[test]
+fn magnifier_enlarges_under_the_lens_only() {
+    // Bright 13x13 square (|x-0.5|<=0.1) on dark ground, default lens
+    // (radius 0.25, magnification 1.8). Under the lens the square grows
+    // past its input footprint; outside the lens radius nothing changes.
+    let mut filter = magnifier(MagnifierParams::default())
+        .build()
+        .unwrap()
+        .into_inner();
+    if !init_filter(&mut filter) {
+        return;
+    }
+    let input = make_yuv_frame_with(
+        64,
+        64,
+        AVPixelFormat::AV_PIX_FMT_YUV420P,
+        |c, r| {
+            let inside = |v: usize| (26..=37).contains(&v);
+            if inside(c) && inside(r) {
+                200
+            } else {
+                60
+            }
+        },
+        |_, _| (128, 128),
+    );
+    let out = drive(&mut filter, vec![input], 1).pop().unwrap();
+    let y = plane_to_vec(&out, 0, 64, 64);
+    // (col 39, row 32): input dark (outside the square), r=0.117 inside
+    // the lens; the eased zoom (~1.44 here) contracts sampling to
+    // x=0.58 < 0.6 — inside the square, so the magnified square covers it.
+    assert!(
+        y[32 * 64 + 39] as i32 >= 170,
+        "the magnified square must cover col 39, got {}",
+        y[32 * 64 + 39]
+    );
+    // (col 55, row 32): r=0.36 > radius — identity, stays dark.
+    assert!(
+        (y[32 * 64 + 55] as i32 - 60).abs() <= 3,
+        "outside the lens the frame must be untouched, got {}",
+        y[32 * 64 + 55]
+    );
+}
+
+#[test]
+fn magnifier_zoom_eases_off_toward_the_rim() {
+    // Pins the smoothstep gradient, not just "inside is magnified".
+    // Step edge at x = 0.65; probe (col 46, row 32): r = 0.227, near the
+    // default rim (radius 0.25). Eased zoom there is only ~1.02, so
+    // sampling lands at x ~ 0.722 — bright. A constant full-strength
+    // zoom (1.8 across the lens) would sample x ~ 0.626 — dark.
+    let mut filter = magnifier(MagnifierParams::default())
+        .build()
+        .unwrap()
+        .into_inner();
+    if !init_filter(&mut filter) {
+        return;
+    }
+    let out = drive(&mut filter, vec![step_edge_frame(64, 64, 0.65)], 1)
+        .pop()
+        .unwrap();
+    let y = plane_to_vec(&out, 0, 64, 64);
+    assert!(
+        y[32 * 64 + 46] as i32 >= 170,
+        "near the rim the zoom must have eased off (~1.02, sampling stays \
+         right of the edge), got {}",
+        y[32 * 64 + 46]
+    );
+}
+
+#[test]
+fn fisheye_zero_strength_matches_identity() {
+    let filter = fisheye(FisheyeParams::with_strength(0.0))
+        .build()
+        .unwrap()
+        .into_inner();
+    assert_matches_identity(filter, 1, "fisheye strength=0");
+}
+
+#[test]
+fn fisheye_bulges_the_center_and_pins_the_corners() {
+    let mut filter = fisheye(FisheyeParams::with_strength(1.0))
+        .build()
+        .unwrap()
+        .into_inner();
+    if !init_filter(&mut filter) {
+        return;
+    }
+    // Square frame, edge at x=0.75. Center magnification pushes off-center
+    // content outward: col 52 (input bright, x=0.82) now samples x=0.69 —
+    // dark. The corner-normalized mapping keeps r=1 fixed, so both corners
+    // keep their input's content.
+    let out = drive(&mut filter, vec![step_edge_frame(64, 64, 0.75)], 1)
+        .pop()
+        .unwrap();
+    let y = plane_to_vec(&out, 0, 64, 64);
+    assert!(
+        y[32 * 64 + 52] as i32 <= 90,
+        "center bulge must push the edge outward past col 52, got {}",
+        y[32 * 64 + 52]
+    );
+    assert!(
+        y[0 * 64 + 63] as i32 >= 170,
+        "top-right corner must keep its bright content, got {}",
+        y[0 * 64 + 63]
+    );
+    assert!(
+        y[63 * 64 + 0] as i32 <= 90,
+        "bottom-left corner must keep its dark content, got {}",
+        y[63 * 64 + 0]
+    );
+}
+
+/// Three-band chroma key input frame (YUV420P, limited-range BT.601
+/// codes): pure green screen | near-green teal | skin tone.
+///
+///   green #00FF00     -> (145,  54,  34)
+///   teal  (.1,.9,.2)  -> (143,  80,  51)   chroma distance ~0.10 from key
+///   skin  (.8,.6,.5)  -> (158, 109, 152)   chroma distance ~0.40 from key
+fn chroma_key_bands_frame() -> ffmpeg_next::Frame {
+    make_yuv_frame_with(
+        64,
+        48,
+        AVPixelFormat::AV_PIX_FMT_YUV420P,
+        |c, _| {
+            if c < 24 {
+                145
+            } else if c < 40 {
+                143
+            } else {
+                158
+            }
+        },
+        |c, _| {
+            // Chroma plane is half width: bands at cols 12 and 20.
+            if c < 12 {
+                (54, 34)
+            } else if c < 20 {
+                (80, 51)
+            } else {
+                (109, 152)
+            }
+        },
+    )
+}
+
+#[test]
+fn chroma_key_removes_green_tolerates_shade_keeps_foreground() {
+    let mut filter = chroma_key(ChromaKeyParams::green_screen())
+        .build()
+        .unwrap()
+        .into_inner();
+    if !init_filter(&mut filter) {
+        return;
+    }
+    let out = drive(&mut filter, vec![chroma_key_bands_frame()], 1)
+        .pop()
+        .unwrap();
+    let y = plane_to_vec(&out, 0, 64, 48);
+    let u = plane_to_vec(&out, 1, 32, 24);
+    let v = plane_to_vec(&out, 2, 32, 24);
+    let row = 24usize;
+    let crow = 12usize;
+
+    // Pure green band -> the black background (Y 16, neutral chroma).
+    assert!(
+        y[row * 64 + 8] as i32 <= 22,
+        "green screen must key to black, got Y {}",
+        y[row * 64 + 8]
+    );
+    assert!((u[crow * 32 + 4] as i32 - 128).abs() <= 4);
+    assert!((v[crow * 32 + 4] as i32 - 128).abs() <= 4);
+
+    // Near-green teal (distance ~0.10 < similarity 0.3): ALSO keyed —
+    // the tolerance keys shaded/uneven screen areas, not just the exact
+    // key color. This is the point of chroma keying over exact matching.
+    assert!(
+        y[row * 64 + 32] as i32 <= 22,
+        "near-green must fall inside the similarity tolerance, got Y {}",
+        y[row * 64 + 32]
+    );
+
+    // Skin band (distance ~0.40 > similarity+blend): fully kept, and the
+    // despill clamp must NOT touch it (its green is below the mean of
+    // red+blue, so the suppression self-gates off).
+    assert!(
+        (y[row * 64 + 54] as i32 - 158).abs() <= 5,
+        "skin luma must survive, got {}",
+        y[row * 64 + 54]
+    );
+    assert!(
+        (u[crow * 32 + 27] as i32 - 109).abs() <= 5,
+        "skin U must survive untouched, got {}",
+        u[crow * 32 + 27]
+    );
+    assert!(
+        (v[crow * 32 + 27] as i32 - 152).abs() <= 5,
+        "skin V must survive untouched, got {}",
+        v[crow * 32 + 27]
+    );
+}
+
+#[test]
+fn chroma_key_background_color_is_honored() {
+    // Same bands, blue background: the keyed area must show blue
+    // (limited-range BT.601 pure blue ~= (41, 240, 110)), not black.
+    let mut filter = chroma_key(ChromaKeyParams::green_screen().with_background(0.0, 0.0, 1.0))
+        .build()
+        .unwrap()
+        .into_inner();
+    if !init_filter(&mut filter) {
+        return;
+    }
+    let out = drive(&mut filter, vec![chroma_key_bands_frame()], 1)
+        .pop()
+        .unwrap();
+    let y = plane_to_vec(&out, 0, 64, 48);
+    let u = plane_to_vec(&out, 1, 32, 24);
+    assert!(
+        (y[24 * 64 + 8] as i32 - 41).abs() <= 5,
+        "keyed area must show the blue background's luma, got {}",
+        y[24 * 64 + 8]
+    );
+    assert!(
+        u[12 * 32 + 4] as i32 >= 220,
+        "keyed area must show the blue background's chroma, got U {}",
+        u[12 * 32 + 4]
+    );
+}
+
+#[test]
+fn chroma_key_despill_clamps_green_spill() {
+    // A green-spilled foreground: RGB(0.6, 0.75, 0.5) = YUV(164, 106, 116).
+    // Its chroma distance from the key is ~0.30, so key it as foreground
+    // with a tighter similarity, and compare spill 1.0 against spill 0.0:
+    // the clamp g' = g - max(g - (r+b)/2, 0) rewrites it to
+    // RGB(0.6, 0.55, 0.5) = YUV(~139, ~121, ~135) — both chroma channels
+    // move toward neutral and luma drops as the green energy is removed.
+    let keyed = |spill: f32| ChromaKeyParams {
+        similarity: 0.15,
+        blend: 0.02,
+        spill,
+        ..ChromaKeyParams::green_screen()
+    };
+    let spilled_frame = || {
+        make_yuv_frame_with(
+            64,
+            48,
+            AVPixelFormat::AV_PIX_FMT_YUV420P,
+            |_, _| 164,
+            |_, _| (106, 116),
+        )
+    };
+
+    let mut with_spill = chroma_key(keyed(1.0)).build().unwrap().into_inner();
+    if !init_filter(&mut with_spill) {
+        return;
+    }
+    let out = drive(&mut with_spill, vec![spilled_frame()], 1)
+        .pop()
+        .unwrap();
+    let (y, u, v) = (
+        plane_to_vec(&out, 0, 64, 48),
+        plane_to_vec(&out, 1, 32, 24),
+        plane_to_vec(&out, 2, 32, 24),
+    );
+    assert!(
+        y[24 * 64 + 32] as i32 <= 150,
+        "despill must remove green luma energy, got {}",
+        y[24 * 64 + 32]
+    );
+    assert!(
+        u[12 * 32 + 16] as i32 >= 115,
+        "despill must lift U toward neutral, got {}",
+        u[12 * 32 + 16]
+    );
+    assert!(
+        v[12 * 32 + 16] as i32 >= 128,
+        "despill must lift V past neutral, got {}",
+        v[12 * 32 + 16]
+    );
+
+    let mut no_spill = chroma_key(keyed(0.0)).build().unwrap().into_inner();
+    assert!(init_filter(&mut no_spill));
+    let out = drive(&mut no_spill, vec![spilled_frame()], 1)
+        .pop()
+        .unwrap();
+    let (y, u, v) = (
+        plane_to_vec(&out, 0, 64, 48),
+        plane_to_vec(&out, 1, 32, 24),
+        plane_to_vec(&out, 2, 32, 24),
+    );
+    assert!(
+        (y[24 * 64 + 32] as i32 - 164).abs() <= 4,
+        "spill=0 must keep the foreground untouched, got Y {}",
+        y[24 * 64 + 32]
+    );
+    assert!((u[12 * 32 + 16] as i32 - 106).abs() <= 4);
+    assert!((v[12 * 32 + 16] as i32 - 116).abs() <= 4);
+}
+
+#[test]
+fn chroma_key_blend_ramps_linearly() {
+    // Pins the linear (d - similarity)/blend ramp against a hard
+    // threshold. Uniform teal frame: d ~= 0.098 from the green key, so
+    // similarity 0.05 / blend 0.1 puts it mid-ramp — alpha ~= 0.48 and
+    // the output luma lands near 77, between the black background (16)
+    // and the kept foreground (143). A hard threshold collapses to one
+    // of the extremes.
+    let mut filter = chroma_key(ChromaKeyParams {
+        similarity: 0.05,
+        blend: 0.1,
+        spill: 0.0,
+        ..ChromaKeyParams::green_screen()
+    })
+    .build()
+    .unwrap()
+    .into_inner();
+    if !init_filter(&mut filter) {
+        return;
+    }
+    let teal = make_yuv_frame_with(
+        64,
+        48,
+        AVPixelFormat::AV_PIX_FMT_YUV420P,
+        |_, _| 143,
+        |_, _| (80, 51),
+    );
+    let out = drive(&mut filter, vec![teal], 1).pop().unwrap();
+    let y = plane_to_vec(&out, 0, 64, 48);
+    assert!(
+        (60..=95).contains(&(y[24 * 64 + 32] as i32)),
+        "mid-ramp teal must blend partway to the background (~77), got {}",
+        y[24 * 64 + 32]
+    );
+}
+
+#[test]
+fn chroma_key_box_filter_softens_the_matte_boundary() {
+    // Pins the 3x3 distance box filter against center-only sampling.
+    // YUV444P (full-res chroma) with a hard green|skin boundary at
+    // col 32. The first skin column's taps reach one texel into the
+    // green field, dragging its averaged distance down to ~0.27, while
+    // its center-only distance is ~0.41. With similarity 0.34 (near-hard
+    // blend) the box filter keys that column to the background; sampling
+    // only the center would keep it at skin luma 158. The next column's
+    // taps see no green — it must survive.
+    let mut filter = chroma_key(ChromaKeyParams {
+        similarity: 0.34,
+        blend: 0.001,
+        spill: 0.0,
+        ..ChromaKeyParams::green_screen()
+    })
+    .build()
+    .unwrap()
+    .into_inner();
+    if !init_filter(&mut filter) {
+        return;
+    }
+    let input = make_yuv_frame_with(
+        64,
+        48,
+        AVPixelFormat::AV_PIX_FMT_YUV444P,
+        |c, _| if c < 32 { 145 } else { 158 },
+        |c, _| if c < 32 { (54, 34) } else { (109, 152) },
+    );
+    let out = drive(&mut filter, vec![input], 1).pop().unwrap();
+    let y = plane_to_vec(&out, 0, 64, 48);
+    assert!(
+        y[24 * 64 + 32] as i32 <= 22,
+        "the boundary column's box-averaged distance (~0.27) must key it \
+         to the background, got Y {}",
+        y[24 * 64 + 32]
+    );
+    assert!(
+        (y[24 * 64 + 34] as i32 - 158).abs() <= 5,
+        "two columns in, no tap reaches the green field — skin must \
+         survive, got Y {}",
+        y[24 * 64 + 34]
     );
 }

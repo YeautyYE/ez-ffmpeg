@@ -1,0 +1,10 @@
+[package]
+name = "builtin_effects"
+version = "0.1.0"
+edition = "2021"
+authors = ["Yeauty <YeautyYE@gmail.com>"]
+publish = false
+
+[dependencies]
+ez-ffmpeg = { path = "../..", features = ["wgpu"] }
+env_logger = "0.10"
