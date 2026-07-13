@@ -40,12 +40,8 @@ const FONT_MIMETYPES: [&str; 10] = [
     "application/x-font-ttf",
 ];
 
-// c"..." literals need Rust 1.77; the crate supports older toolchains.
-// SAFETY (both): the literals contain exactly one NUL, at the end.
-#[allow(clippy::manual_c_str_literals)]
-const MIMETYPE_KEY: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"mimetype\0") };
-#[allow(clippy::manual_c_str_literals)]
-const FILENAME_KEY: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"filename\0") };
+const MIMETYPE_KEY: &CStr = c"mimetype";
+const FILENAME_KEY: &CStr = c"filename";
 
 pub(crate) enum LoaderInput<'a> {
     Path(&'a Path),
