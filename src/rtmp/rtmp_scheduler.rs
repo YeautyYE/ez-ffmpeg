@@ -445,6 +445,9 @@ impl RtmpScheduler {
         server_results
     }
 
+    // The production reactor always supplies a real write-queue backlog via
+    // bytes_received_with_backlog; only unit tests drive the scheduler bare.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn bytes_received(
         &mut self,
         connection_id: usize,
