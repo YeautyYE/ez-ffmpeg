@@ -432,12 +432,12 @@ impl EmbedRtmpServer<Running> {
         // in-order sequence to the pure-serialize path. External TCP clients
         // are unaffected — they never touch this feed.
         let feed_sender = self.create_bypass_feed_sender(app_name, stream_key)?;
-        // PERF-3: only this internal path holds a WakeHandle (raw
-        // create_stream_sender users fall back to the poll timeout). Wake once
-        // now so the reactor flushes the queued connect/createStream/publish
-        // handshake immediately instead of waiting for the first media frame or
-        // the 100ms poll fallback — otherwise stream setup carries avoidable
-        // startup latency.
+        // PERF-3: both feed paths hold a WakeHandle — this internal Feed path
+        // and raw `create_stream_sender` users (RtmpStreamSender::send wakes
+        // per chunk). Wake once now so the reactor flushes the queued
+        // connect/createStream/publish handshake immediately instead of
+        // waiting for the first media frame or the 100ms poll fallback —
+        // otherwise stream setup carries avoidable startup latency.
         let wake_handle = self.wake_handle.clone();
         if let Some(waker) = &wake_handle {
             waker.wake();
@@ -1110,12 +1110,15 @@ impl Drop for StreamHandle {
     fn drop(&mut self) {
         // Wait-then-signal. Waiting first preserves the drain semantics: a
         // handle dropped mid-stream still delivers the remaining frames to
-        // connected watchers before the server goes away (cancelling the
-        // FFmpeg job instead is a separate concern, out of scope here). The
-        // explicit stop after it is what actually releases the listener port
-        // and the worker threads — dropping the Arc alone never did: the
-        // threads own clones of the status flag and keep running (and keep
-        // the port bound) until the flag flips.
+        // connected watchers before the server goes away — best-effort, not
+        // absolute: a watcher whose join-replay budget was exhausted keeps
+        // only its bounded backlog, and stop-time teardown does not re-run
+        // finished-status delivery for it (cancelling the FFmpeg job instead
+        // is a separate concern, out of scope here). The explicit stop after
+        // it is what actually releases the listener port and the worker
+        // threads — dropping the Arc alone never did: the threads own clones
+        // of the status flag and keep running (and keep the port bound)
+        // until the flag flips.
         if let Some(scheduler) = self.scheduler.take() {
             let _ = scheduler.wait();
         }
