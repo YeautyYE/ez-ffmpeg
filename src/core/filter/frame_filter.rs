@@ -115,7 +115,9 @@ pub trait FrameFilter: Send {
     /// drained chain after the flush. Treat every marker as a flush point,
     /// never as a terminal signal or an error. As a safety net against
     /// runaway generators, the end-of-stream drain forwards at most 1024
-    /// frames per filter; a backlog beyond that is discarded.
+    /// frames per filter; a filter that hits that cap has the rest of its
+    /// backlog discarded and stops being polled (and sees no further
+    /// markers) until the next real input frame arrives.
     ///
     /// [`request_frame`]: FrameFilter::request_frame
     fn filter_frame(
