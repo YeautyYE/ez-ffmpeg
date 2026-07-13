@@ -20,6 +20,7 @@ use ffmpeg_sys_next::{avformat_alloc_context, avformat_close_input, avformat_ope
 #[non_exhaustive]
 pub enum StreamInfo {
     /// Video stream information
+    #[non_exhaustive]
     Video {
         // from AVStream
         /// The index of the stream within the media file.
@@ -80,6 +81,7 @@ pub enum StreamInfo {
         rotate: i32,
     },
     /// Audio stream information
+    #[non_exhaustive]
     Audio {
         // from AVStream
         /// The index of the audio stream within the media file.
@@ -130,6 +132,7 @@ pub enum StreamInfo {
         frame_size: i32,
     },
     /// Subtitle stream information
+    #[non_exhaustive]
     Subtitle {
         // from AVStream
         /// The index of the subtitle stream within the media file.
@@ -158,6 +161,7 @@ pub enum StreamInfo {
         codec_name: String,
     },
     /// Data stream information
+    #[non_exhaustive]
     Data {
         // From AVStream
         /// The index of the data stream within the media file.
@@ -176,6 +180,7 @@ pub enum StreamInfo {
         metadata: HashMap<String, String>,
     },
     /// Attachment stream information
+    #[non_exhaustive]
     Attachment {
         // From AVStream
         /// The index of the attachment stream within the media file.
@@ -195,6 +200,7 @@ pub enum StreamInfo {
     ///
     /// Returned when the codec type does not match any known media type
     /// (video, audio, subtitle, data, attachment) or when `codecpar` is null.
+    #[non_exhaustive]
     Unknown {
         /// The index of the unknown stream within the media file.
         index: i32,

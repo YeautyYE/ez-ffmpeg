@@ -15,6 +15,8 @@
 //!   see the identity template in the `wgpu_filter` module docs);
 //! - `new_with_custom_shaders(...)` callbacks -> builder options
 //!   (`output_size`, `params` + `params_handle` for live updates);
+//! - constructor errors: `OpenGLFilterError` (`Error::OpenGLFilter`) ->
+//!   `WgpuFilterError` (`Error::WgpuFilter`);
 //! - full-GPU pipelines (hardware decode/encode) -> FFmpeg native filters
 //!   (`scale_vaapi`/`scale_cuda`/...) via `filter_desc`.
 //!
@@ -50,3 +52,7 @@
 //! **Feature Flag**: Only available when the `opengl` feature is enabled.
 
 pub mod opengl_frame_filter;
+
+mod error;
+
+pub use error::OpenGLFilterError;
