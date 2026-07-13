@@ -21,11 +21,13 @@
 # (nasm/yasm/clang/pkg-config/zlib). First build per lane compiles FFmpeg
 # (~10-20 min); caches make subsequent runs fast.
 #
-# GPU-dependent code: the `opengl`/`wgpu` frame filters need a real GPU/display
-# and their tests fail headless ("Failed to create Surfman connection"). The
-# `build` job still compiles them (via `--all-features`) so they stay
-# type-checked; the `test` job omits those two features so the suite runs green
-# on a GPU-less runner. The macOS-only `videotoolbox` scheduler tests are
+# GPU-dependent code: the `opengl` frame filter needs a real GPU/display and
+# its tests fail headless ("Failed to create Surfman connection"), so the
+# `test` job omits that feature; the `build` job still compiles it (via
+# `--all-features`) so it stays type-checked. The `wgpu` feature runs in the
+# test job: its GPU oracles self-skip without an adapter while its CPU-only
+# gates (offline naga shader validation, layout pins, builders) run for real.
+# The macOS-only `videotoolbox` scheduler tests are
 # `#[cfg(target_os = "macos")]`, so they do not run on Linux.
 #
 # The `build` job (all-features build + a default-features build + clippy) and
@@ -121,6 +123,13 @@ jobs:
       - name: Build
         run: cargo build --all-features ${{ matrix.ffmpeg-features }} --verbose
 
+      # Compiles every #[cfg(test)] tree under --all-features WITHOUT running:
+      # the opengl/wgpu suites need a GPU/display to RUN, but their tests carry
+      # compile-time signature pins (e.g. the opengl typed-error fn-pointer
+      # bindings) that only a test build type-checks. `--no-run` is headless-safe.
+      - name: Build tests (all features, no run)
+        run: cargo test --lib --all-features ${{ matrix.ffmpeg-features }} --no-run
+
       # The crate's default feature set is empty (`default = []`), yet every job
       # here builds `--all-features`; this proves the no-feature build and its cfg
       # gates still compile. The ffmpeg-features flag only controls how FFmpeg is
@@ -144,9 +153,12 @@ jobs:
             ffmpeg-features: "--features ffmpeg-sys-next/build"
           - ffmpeg: "7.1"
             ffmpeg-features: ""
-    # Runs the full library suite MINUS the opengl/wgpu features, whose tests
-    # need a GPU/display. Everything else passes headless. Media assets are
-    # committed as test.mp4.
+    # Runs the full library suite MINUS the opengl feature, whose tests need a
+    # GPU/display (surfman connection creation fails headless). The wgpu
+    # feature IS included: its GPU oracles self-skip when no adapter exists,
+    # while its CPU-only gates — offline naga shader validation, uniform
+    # layout pins, builder checks — run for real. Media assets are committed
+    # as test.mp4.
     steps:
       - uses: actions/checkout@v4
 
@@ -194,7 +206,7 @@ jobs:
           key: ${{ runner.os }}-cargo-ffmpeg${{ matrix.ffmpeg }}-${{ hashFiles('**/Cargo.toml') }}
 
       - name: Test
-        run: cargo test --lib --features async,rtmp,flv,subtitle ${{ matrix.ffmpeg-features }}
+        run: cargo test --lib --features async,rtmp,flv,subtitle,wgpu ${{ matrix.ffmpeg-features }}
 
   docs:
     name: Docs (docsrs cfg compile)
@@ -261,8 +273,9 @@ jobs:
       # scripts / proc-macros; std is reused un-instrumented from the sysroot (so no
       # `-Zbuild-std`), which suffices because the UAF regressions here are detected
       # on the Rust side. `detect_leaks=0` because FFmpeg's one-time global
-      # allocations are not leaks. GPU features (opengl/wgpu) are omitted like the
-      # test job; the lifecycle/teardown suites do not need them.
+      # allocations are not leaks. GPU features are omitted here (the test job
+      # runs wgpu's self-skipping suite; opengl needs a display either way) —
+      # the lifecycle/teardown suites under ASAN do not need them.
       - name: ASAN UAF tests
         env:
           RUSTFLAGS: "-Zsanitizer=address"
@@ -272,4 +285,5 @@ jobs:
           cargo +nightly test --target x86_64-unknown-linux-gnu \
             --features ffmpeg-sys-next/build,async,rtmp,flv,subtitle \
             --test bsf --test mux_teardown --test lifecycle \
-            --test start_failure_join --test shortest --test frame_pipeline_hardening
+            --test start_failure_join --test start_panic_unwind \
+            --test shortest --test frame_pipeline_hardening
