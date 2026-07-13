@@ -14,6 +14,7 @@ use crate::error::{Error, FilterGraphError, FilterGraphOperationError, FilterGra
 use crate::hwaccel::{hw_device_for_filter, HWDevice};
 use crate::util::ffmpeg_utils::av_err2str;
 use crate::util::ffmpeg_utils::av_rescale_q_rnd;
+use crate::util::ffmpeg_utils::frame_is_eof_marker;
 use crate::util::thread_synchronizer::{ThreadDoneGuard, ThreadSynchronizer};
 use crossbeam_channel::{RecvTimeoutError, Sender};
 use ffmpeg_next::Frame;
@@ -227,9 +228,21 @@ pub(crate) fn filter_graph_init(
                              sub2video is not supported"
                         );
                         frame_pool.release(frame_box.frame);
-                    } else if !frame_is_null(&frame_box.frame)
-                        && !(*frame_box.frame.as_ptr()).buf[0].is_null()
-                    {
+                    } else if !frame_is_eof_marker(&frame_box.frame) {
+                        // Real frame: anything that is neither the null EOF
+                        // shell nor a props-only cue (buf[0] null AND every
+                        // data[] null). The previous buf[0]-only probe
+                        // misrouted a NON-refcounted real frame (buf[0] null
+                        // but data[] set — a user FrameFilter may legally
+                        // emit one) into fg_send_eof: its pixels were lost
+                        // and ifp.eof latched, silently truncating the
+                        // stream. No normalization is needed before
+                        // fg_send_frame: av_buffersrc_add_frame_flags without
+                        // KEEP_REF clones a non-refcounted frame
+                        // (av_frame_clone -> av_frame_ref allocates owned
+                        // buffers and copies the data; buffersrc.c), and the
+                        // pre-config queue replay av_frame_refs it the same
+                        // way (config.rs).
                         if let Err(e) = fg_send_frame(
                             fg_index,
                             &mut graph,

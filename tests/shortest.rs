@@ -427,3 +427,52 @@ fn shortest_recording_time_with_shared_graph_composes() {
         "30 fps video cut at ~2s should hold 40..=75 frames, got {frames}"
     );
 }
+
+/// A cascade-finish must not end an encoder BEFORE it has opened: opening
+/// publishes the ready signal the muxer's init waits on. Deterministic
+/// pre-open cascade: `set_max_video_frames(0)` finishes the video stream at
+/// sync-queue SETUP, the fast 1s audio's first frames propagate that finish
+/// into the encoder-visible flag within milliseconds — while the video leg
+/// routes through `realtime,select='gte(n,60)'`, so its first frame cannot
+/// reach its encoder before ~2s. Every video-encoder loop iteration in
+/// between sees the cascade-finish while still unopened. Honoring it there
+/// (the step-0 break without the `opened` gate) kills the encoder before it
+/// ever publishes ready and the muxer never initializes; the watchdog (or
+/// the resulting error) turns that into a failure.
+#[test]
+fn zero_frame_cap_cascade_before_open_still_opens_the_encoder() {
+    let out = tmp_path("zero_cap_pre_open.mp4");
+    let scheduler = FfmpegContext::builder()
+        .input(lavfi_video_infinite())
+        .input(lavfi_audio_secs(1))
+        .filter_desc("[0:v]realtime,select='gte(n,60)'[slow]")
+        .output(
+            Output::from(out.as_str())
+                .add_stream_map("[slow]")
+                .add_stream_map("1:a")
+                .set_video_codec("mpeg4")
+                .set_audio_codec("aac")
+                .set_shortest(true)
+                .set_max_video_frames(0),
+        )
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let result = wait_with_watchdog(
+        scheduler,
+        60,
+        "zero-frame cap + delayed first frame still opens the encoder",
+    );
+    assert!(result.is_ok(), "pre-open cascade job failed: {result:?}");
+
+    // The muxer finalized with the audio intact: the video encoder opened
+    // (publishing ready) despite its stream being finished before its first
+    // frame ever arrived.
+    let audio_secs = audio_duration_secs(&out);
+    assert!(
+        audio_secs > 0.5,
+        "audio should survive the pre-open video cascade, got {audio_secs}s"
+    );
+}
