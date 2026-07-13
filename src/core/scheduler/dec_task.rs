@@ -1191,7 +1191,7 @@ fn hw_device_setup_for_decode(
             err
         }
         Some(dev) => unsafe {
-            (*dec_ctx).hw_device_ctx = av_buffer_ref(dev.device_ref);
+            (*dec_ctx).hw_device_ctx = av_buffer_ref(dev.device_ref());
             if (*dec_ctx).hw_device_ctx.is_null() {
                 return AVERROR(ENOMEM);
             }

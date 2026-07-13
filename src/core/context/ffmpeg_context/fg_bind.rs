@@ -505,7 +505,7 @@ pub(super) fn init_filter_graph(
                 if (*(*f).filter).flags & AVFILTER_FLAG_HWDEVICE == 0 {
                     continue;
                 }
-                (*f).hw_device_ctx = av_buffer_ref(dev.device_ref);
+                (*f).hw_device_ctx = av_buffer_ref(dev.device_ref());
                 if (*f).hw_device_ctx.is_null() {
                     avfilter_graph_segment_free(&mut seg);
                     return Err(FilterGraphParseError::OutOfMemory.into());
