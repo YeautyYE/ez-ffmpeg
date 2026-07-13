@@ -36,11 +36,9 @@ use std::path::Path;
 pub(crate) const MAX_ATTACHMENT_SIZE: u64 = 100 * 1024 * 1024;
 
 // The metadata keys FFmpeg (and this crate's subtitle loader) use for
-// attachments. SAFETY: each literal holds exactly one NUL, at the end.
-#[allow(clippy::manual_c_str_literals)]
-const FILENAME_KEY: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"filename\0") };
-#[allow(clippy::manual_c_str_literals)]
-const MIMETYPE_KEY: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"mimetype\0") };
+// attachments.
+const FILENAME_KEY: &CStr = c"filename";
+const MIMETYPE_KEY: &CStr = c"mimetype";
 
 /// Create one `AVMEDIA_TYPE_ATTACHMENT` output stream per `-attach` request on
 /// `mux`.
