@@ -1361,6 +1361,12 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn test_to_stdout() {
+        // Registers/resolves REAL hw devices in the process-global registry:
+        // serialize with the hwaccel snapshot tests, which replace that
+        // table with sentinel entries for their whole body.
+        let _registry = crate::hwaccel::HW_REGISTRY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _ = env_logger::builder()
             .filter_level(log::LevelFilter::Trace)
             .is_test(true)
@@ -1385,6 +1391,12 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn test_thumbnail() {
+        // Registers/resolves REAL hw devices in the process-global registry:
+        // serialize with the hwaccel snapshot tests, which replace that
+        // table with sentinel entries for their whole body.
+        let _registry = crate::hwaccel::HW_REGISTRY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _ = env_logger::builder()
             .filter_level(log::LevelFilter::Trace)
             .is_test(true)
@@ -1616,6 +1628,12 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn test_hwaccel() {
+        // Registers/resolves REAL hw devices in the process-global registry:
+        // serialize with the hwaccel snapshot tests, which replace that
+        // table with sentinel entries for their whole body.
+        let _registry = crate::hwaccel::HW_REGISTRY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _ = env_logger::builder()
             .filter_level(log::LevelFilter::Trace)
             .is_test(true)
