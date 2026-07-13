@@ -1892,6 +1892,200 @@ fn capped_eof_flush_keeps_real_frames_away_from_cued_filters() {
     );
 }
 
+/// Rewrites every real video frame into a NON-refcounted equivalent: a fresh
+/// AVFrame whose yuv420p planes are carved out of one `av_malloc`'d slab
+/// referenced through `data[]` only (`buf[0]` stays null), pixel bytes copied
+/// verbatim and props (pts/time_base/duration/...) cloned. This is the frame
+/// shape a user `FrameFilter` may legally emit. Props-only cues and the null
+/// EOF shell pass through untouched.
+///
+/// The slab is deliberately leaked: the scheduler only ever unrefs the shell
+/// (`av_frame_unref` never frees bare `data[]` pointers), nothing downstream
+/// takes ownership of the slab, and freeing it from the filter would race the
+/// in-flight frame. Bounded by the fixture length (30 frames of 320x240
+/// yuv420p, ~3.5 MiB per test), reclaimed at process exit.
+struct NonRefcountedRewriter {
+    rewritten: Arc<AtomicUsize>,
+}
+
+impl FrameFilter for NonRefcountedRewriter {
+    fn media_type(&self) -> AVMediaType {
+        AVMediaType::AVMEDIA_TYPE_VIDEO
+    }
+
+    fn filter_frame(
+        &mut self,
+        frame: Frame,
+        _ctx: &mut FrameFilterContext,
+    ) -> Result<Option<Frame>, FrameFilterError> {
+        unsafe {
+            let src = frame.as_ptr();
+            let props_only = src.is_null()
+                || ((*src).buf[0].is_null() && (*src).data.iter().all(|d| d.is_null()));
+            if props_only {
+                return Ok(Some(frame));
+            }
+            // The plane carving below is yuv420p-specific; both pipelines in
+            // these tests carry yuv420p (mpeg2video decode, mpeg4 encode), so
+            // anything else is a broken test setup, not a skippable frame.
+            if (*src).format != AVPixelFormat::AV_PIX_FMT_YUV420P as i32 {
+                return Err(
+                    format!("test expects yuv420p frames, got format {}", (*src).format).into(),
+                );
+            }
+            let h = (*src).height as usize;
+            // Full-res luma plane + two half-res chroma planes, kept at the
+            // source's own (possibly padded) linesizes so each plane is one copy.
+            let ls = [
+                (*src).linesize[0] as usize,
+                (*src).linesize[1] as usize,
+                (*src).linesize[2] as usize,
+            ];
+            let ph = [h, h.div_ceil(2), h.div_ceil(2)];
+            let total = ls[0] * ph[0] + ls[1] * ph[1] + ls[2] * ph[2];
+            let slab = av_malloc(total) as *mut u8;
+            if slab.is_null() {
+                return Err("av_malloc failed".into());
+            }
+
+            let mut out = Frame::empty();
+            if out.as_ptr().is_null() {
+                av_free(slab as *mut std::ffi::c_void);
+                return Err("av_frame_alloc failed".into());
+            }
+            let dst = out.as_mut_ptr();
+            let ret = av_frame_copy_props(dst, src);
+            if ret < 0 {
+                av_free(slab as *mut std::ffi::c_void);
+                return Err(format!("av_frame_copy_props failed: {ret}").into());
+            }
+            (*dst).format = (*src).format;
+            (*dst).width = (*src).width;
+            (*dst).height = (*src).height;
+            let mut offset = 0usize;
+            for p in 0..3 {
+                (*dst).data[p] = slab.add(offset);
+                (*dst).linesize[p] = ls[p] as i32;
+                std::ptr::copy_nonoverlapping((*src).data[p], slab.add(offset), ls[p] * ph[p]);
+                offset += ls[p] * ph[p];
+            }
+            assert!(
+                (*dst).buf[0].is_null(),
+                "the rewritten frame must stay non-refcounted"
+            );
+            self.rewritten.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(out))
+        }
+    }
+
+    fn request_frame_mode(&self) -> RequestFrameMode {
+        RequestFrameMode::Never
+    }
+}
+
+/// Runs the baseline (no pipeline) and the rewriter transcode for one of the
+/// two placements and returns `(baseline_frames, filtered_frames, rewritten)`.
+fn transcode_with_rewriter(tag: &str, on_output: bool) -> (i64, i64, usize) {
+    let fixture = mpegts_fixture(&format!("nonref_{tag}_in.ts"), 30);
+
+    let baseline_out = tmp_path(&format!("nonref_{tag}_baseline.mp4"));
+    let result = wait_with_watchdog(
+        FfmpegContext::builder()
+            .input(Input::from(fixture.as_str()))
+            .output(Output::from(baseline_out.as_str()).set_video_codec("mpeg4"))
+            .build()
+            .unwrap()
+            .start()
+            .unwrap(),
+        60,
+        "non-refcounted baseline transcode",
+    );
+    assert!(result.is_ok(), "baseline transcode failed: {result:?}");
+    let baseline_frames = probe_video_frames(&baseline_out);
+    assert!(baseline_frames > 0, "baseline produced no frames");
+
+    let rewritten = Arc::new(AtomicUsize::new(0));
+    let pipeline = FramePipelineBuilder::new(AVMediaType::AVMEDIA_TYPE_VIDEO).filter(
+        "non-refcounted-rewriter",
+        Box::new(NonRefcountedRewriter {
+            rewritten: rewritten.clone(),
+        }),
+    );
+
+    let filtered_out = tmp_path(&format!("nonref_{tag}_filtered.mp4"));
+    let mut input = Input::from(fixture.as_str());
+    let mut output = Output::from(filtered_out.as_str()).set_video_codec("mpeg4");
+    if on_output {
+        output = output.add_frame_pipeline(pipeline);
+    } else {
+        input = input.add_frame_pipeline(pipeline);
+    }
+    let result = wait_with_watchdog(
+        FfmpegContext::builder()
+            .input(input)
+            .output(output)
+            .build()
+            .unwrap()
+            .start()
+            .unwrap(),
+        60,
+        "non-refcounted rewriter transcode",
+    );
+    assert!(result.is_ok(), "rewriter transcode failed: {result:?}");
+
+    (
+        baseline_frames,
+        probe_video_frames(&filtered_out),
+        rewritten.load(Ordering::SeqCst),
+    )
+}
+
+/// An OUTPUT pipeline always has exactly one sender (the encoder), so
+/// `send_frame`'s last-sender branch forwards the filter's ORIGINAL frame —
+/// non-refcounted and unnormalized — straight to the encoder task. The
+/// encoder's post-open dummy probe used to test `buf[0]` alone, misreading
+/// the first such frame as the parameters-only init dummy from close_output
+/// and silently dropping it (output short by one frame). The probe must
+/// treat only a props-only frame (no buffers AND no data planes) as the
+/// dummy; avcodec_send_frame itself is safe with non-refcounted input (it
+/// refs internally, copying when the source is not refcounted).
+#[test]
+fn non_refcounted_filter_frame_is_not_dropped_as_the_encoder_init_dummy() {
+    let (baseline_frames, filtered_frames, rewritten) = transcode_with_rewriter("enc", true);
+    assert!(
+        rewritten > 0,
+        "the rewriter never produced a non-refcounted frame; the scenario \
+         no longer exercises the encoder-side probe"
+    );
+    assert_eq!(
+        filtered_frames, baseline_frames,
+        "a non-refcounted frame from an output-pipeline filter was dropped \
+         as the encoder init dummy (expected {baseline_frames}, got \
+         {filtered_frames})"
+    );
+}
+
+/// The same frame shape on an INPUT pipeline feeds the filtergraph gate,
+/// which used to test `buf[0]` alone: the first non-refcounted real frame
+/// was routed into fg_send_eof — its pixels lost AND `ifp.eof` latched,
+/// permanently closing that filtergraph input (silent stream truncation).
+/// The gate must classify props-only frames as EOF cues and everything else
+/// as real; av_buffersrc_add_frame_flags is safe with non-refcounted input
+/// (without KEEP_REF it clones, allocating owned buffers and copying).
+#[test]
+fn non_refcounted_filter_frame_does_not_truncate_the_filtergraph_input() {
+    let (baseline_frames, filtered_frames, rewritten) = transcode_with_rewriter("fg", false);
+    assert!(
+        rewritten > 0,
+        "the rewriter never produced a non-refcounted frame; the scenario \
+         no longer exercises the filtergraph-side gate"
+    );
+    assert_eq!(
+        filtered_frames, baseline_frames,
+        "a non-refcounted frame from an input-pipeline filter truncated the \
+         filtergraph input (expected {baseline_frames}, got {filtered_frames})"
+    );
+}
 
 /// The source EOF-timestamp marker (input-side pipelines: the decoder sends
 /// it right before the null sentinel) traverses the chain AFTER the ordered

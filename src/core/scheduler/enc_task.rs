@@ -877,14 +877,23 @@ fn receive_frame(
             }
         }
 
-        // A data-less frame is a dummy carrying only encoder init parameters:
-        // the filtergraph sends one when a stream produced no frames at all
-        // (close_output), so the encoder can open and the muxer become ready.
-        // Mirror fftools ffmpeg_sched.c send_to_enc(): open with it, then
-        // discard it — there is nothing to encode.
-        // SAFETY: the frame pointer is non-null — the frame_is_null early
-        // return above already handled the null (EOF marker) case.
-        if unsafe { (*frame_box.frame.as_ptr()).buf[0].is_null() } {
+        // A props-only frame (no buffers AND no data planes) is a dummy
+        // carrying only encoder init parameters: the filtergraph sends one
+        // when a stream produced no frames at all (close_output), so the
+        // encoder can open and the muxer become ready. Mirror fftools
+        // ffmpeg_sched.c send_to_enc(): open with it, then discard it — there
+        // is nothing to encode. A NON-refcounted real frame (buf[0] null but
+        // data[] set — a user FrameFilter on an output pipeline may legally
+        // emit one) is NOT a dummy: it falls through and is encoded like any
+        // other frame. That is safe without normalization: avcodec_send_frame
+        // never assumes buf[0] — it av_frame_refs the input into its own
+        // buffer_frame, and av_frame_ref allocates owned buffers and copies
+        // when the source is not refcounted (libavcodec/encode.c
+        // encode_send_frame_internal; libavutil/frame.c av_frame_ref). The
+        // audio queue's receive_samples clones the same way. The frame pointer
+        // itself is non-null here — the frame_is_null early return above
+        // already handled the null (EOF marker) case.
+        if crate::util::ffmpeg_utils::frame_is_eof_marker(&frame_box.frame) {
             frame_pool.release(frame_box.frame);
             return SyncFrame::Continue;
         }
@@ -1622,7 +1631,7 @@ unsafe fn hw_device_setup_for_encode(
                 .to_str()
                 .unwrap_or("[unknow codec / Invalid UTF-8]")
         );
-        (*enc_ctx).hw_device_ctx = av_buffer_ref(dev.device_ref);
+        (*enc_ctx).hw_device_ctx = av_buffer_ref(dev.device_ref());
         if (*enc_ctx).hw_device_ctx.is_null() {
             return AVERROR(ffmpeg_sys_next::ENOMEM);
         }
