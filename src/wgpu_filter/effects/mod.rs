@@ -26,6 +26,20 @@
 //! - [`pixelate`] — mosaic blocks,
 //! - [`soft_blur`] — soft focus / privacy blur.
 //!
+//! Lens and motion effects (geometric warps; the animated ones run off
+//! frame timestamps):
+//! - [`soul`] — ghost copy drifting outward while fading (astral
+//!   projection),
+//! - [`sway`] — handheld / breathing camera motion,
+//! - [`wave`] — travelling sine ripple,
+//! - [`swirl`] — vortex around a center, optionally oscillating,
+//! - [`magnifier`] — circular lens zoom over an untouched frame,
+//! - [`fisheye`] — whole-frame barrel distortion.
+//!
+//! Keying:
+//! - [`chroma_key`] — green/blue-screen extraction with spill
+//!   suppression, composited over a solid background color.
+//!
 //! Every params struct is `#[repr(C)]` + [`bytemuck::Pod`] with a mild
 //! product preset as `Default`; out-of-range values are clamped in the
 //! shader, never rejected. Live updates go through the handle returned by
@@ -42,20 +56,34 @@
 
 mod adjust;
 mod beauty;
+mod chroma_key;
+mod fisheye;
+mod magnifier;
 mod pixelate;
 mod sharpen;
 mod soft_blur;
+mod soul;
+mod sway;
+mod swirl;
 mod transform;
+mod wave;
 
 #[cfg(test)]
 mod tests;
 
 pub use adjust::{adjust, AdjustParams};
 pub use beauty::{beauty_lite, portrait, BeautyBuilder, BeautyParams, BeautyQuality};
+pub use chroma_key::{chroma_key, ChromaKeyParams};
+pub use fisheye::{fisheye, FisheyeParams};
+pub use magnifier::{magnifier, MagnifierParams};
 pub use pixelate::{pixelate, PixelateParams};
 pub use sharpen::{sharpen, SharpenParams};
 pub use soft_blur::{soft_blur, SoftBlurParams};
+pub use soul::{soul, SoulParams};
+pub use sway::{sway, SwayParams};
+pub use swirl::{swirl, SwirlParams};
 pub use transform::{transform, TransformParams};
+pub use wave::{wave, WaveParams};
 
 use crate::core::filter::frame_filter_context::FrameFilterContext;
 use crate::filter::frame_filter::{FrameFilter, FrameFilterError, RequestFrameMode};
