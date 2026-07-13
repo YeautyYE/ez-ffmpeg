@@ -288,6 +288,7 @@ fn require_null_muxer() -> crate::error::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::analysis::event::Timestamp;
 
     fn sample() -> Analysis {
         Analysis::new("input.mp4")
@@ -349,5 +350,102 @@ mod tests {
         let cfg = sample().fold_config();
         assert_eq!(cfg.black_min_duration_us, Some(100_000));
         assert_eq!(cfg.silence_min_duration_us, Some(500_000));
+    }
+
+    // Pins the fold-on-arrival contract: FoldSink must fold each event into
+    // the shared FoldState the moment try_emit is called. That is what keeps
+    // analysis memory bounded by DETECTED features rather than media duration;
+    // a buffer-then-fold sink (accumulate Vec<MetadataEvent>, fold at end)
+    // would leave the shared state untouched until finalize and fail the
+    // after-every-emit assertions below.
+    #[test]
+    fn fold_sink_folds_each_event_on_arrival() {
+        fn ts(us: i64) -> Timestamp {
+            Timestamp {
+                time_us: us,
+                pts: None,
+                time_base: None,
+            }
+        }
+
+        let collector: Arc<Mutex<FoldState>> = Arc::new(Mutex::new(FoldState::default()));
+        let mut sink = FoldSink {
+            collector: collector.clone(),
+        };
+
+        // Scene changes append a report entry per event: after the k-th emit
+        // the folded report must already hold exactly k scenes — no waiting
+        // for a finalize step.
+        for k in 1..=4i64 {
+            sink.try_emit(MetadataEvent::SceneChange {
+                at: ts(k * 1_000_000),
+                score: k as f64,
+            })
+            .unwrap();
+            let state = collector.lock().unwrap();
+            let scenes = &state.report_so_far().scenes;
+            assert_eq!(
+                scenes.len(),
+                k as usize,
+                "scene event {k} must be folded on arrival, not buffered"
+            );
+            assert_eq!(scenes[k as usize - 1].at_us, k * 1_000_000);
+        }
+
+        // A paired region: the range must appear the moment its END event
+        // arrives (the fold closes it immediately), not at finalize.
+        sink.try_emit(MetadataEvent::BlackStart { at: ts(5_000_000) })
+            .unwrap();
+        assert!(
+            collector.lock().unwrap().report_so_far().black.is_empty(),
+            "an open region has nothing to report yet"
+        );
+        sink.try_emit(MetadataEvent::BlackEnd {
+            at: ts(6_000_000),
+            duration_us: 1_000_000,
+        })
+        .unwrap();
+        {
+            let state = collector.lock().unwrap();
+            assert_eq!(
+                state.report_so_far().black,
+                vec![crate::analysis::BlackRange {
+                    start_us: 5_000_000,
+                    end_us: 6_000_000
+                }],
+                "the range must be visible right after its end event"
+            );
+        }
+
+        // Last-value events: folded state reflects each one immediately.
+        sink.try_emit(MetadataEvent::CropDetect {
+            at: ts(7_000_000),
+            x: 2,
+            y: 4,
+            w: 100,
+            h: 90,
+        })
+        .unwrap();
+        assert!(
+            collector.lock().unwrap().report_so_far().crop.is_some(),
+            "crop must be folded on arrival"
+        );
+        sink.try_emit(MetadataEvent::R128Summary {
+            integrated: Some(-23.0),
+            lra: Some(4.0),
+            true_peak: None,
+        })
+        .unwrap();
+        assert!(
+            collector.lock().unwrap().report_so_far().loudness.is_some(),
+            "loudness must be folded on arrival"
+        );
+
+        // The end-to-end shape run() relies on: taking the state and
+        // finalizing yields the already-folded report.
+        let state = std::mem::take(&mut *collector.lock().unwrap());
+        let report = finalize(state, &FoldConfig::default());
+        assert_eq!(report.scenes.len(), 4);
+        assert_eq!(report.black.len(), 1);
     }
 }

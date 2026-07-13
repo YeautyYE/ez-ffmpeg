@@ -19,8 +19,8 @@
 //! The catalog (all operate on gamma-encoded RGB, like FFmpeg's `eq`):
 //! - [`adjust`] — brightness/contrast/saturation, exposure, gamma,
 //!   vibrance, white balance,
-//! - [`beauty`] / [`portrait`] — heuristic skin smoothing + whitening
-//!   (`beauty_lite` grade, see the module docs there),
+//! - [`beauty_lite`] / [`portrait`] — heuristic skin smoothing + whitening
+//!   (the `_lite` suffix is deliberate, see the module docs there),
 //! - [`sharpen`] — luma unsharp mask,
 //! - [`transform`] — mirror/flip/rotate/scale/translate,
 //! - [`pixelate`] — mosaic blocks,
@@ -51,7 +51,7 @@ mod transform;
 mod tests;
 
 pub use adjust::{adjust, AdjustParams};
-pub use beauty::{beauty, portrait, BeautyBuilder, BeautyParams, BeautyQuality};
+pub use beauty::{beauty_lite, portrait, BeautyBuilder, BeautyParams, BeautyQuality};
 pub use pixelate::{pixelate, PixelateParams};
 pub use sharpen::{sharpen, SharpenParams};
 pub use soft_blur::{soft_blur, SoftBlurParams};

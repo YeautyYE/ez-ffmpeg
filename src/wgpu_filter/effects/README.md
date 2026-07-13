@@ -1,20 +1,25 @@
 # wgpu_filter::effects
 
-内置命名 GPU 特效目录:每个特效是一个类型化构造器,返回绑定了参数类型的
-[`Effect<P>`](mod.rs),可直接装进 frame pipeline,运行中通过 typed handle 实时调参。
+A catalog of named, built-in GPU effects: each effect is a typed constructor
+returning an [`Effect<P>`](mod.rs) bound to its parameter type, ready to drop
+into a frame pipeline, with live parameter updates through a typed handle.
 
-## 用途
+## Purpose
 
-把「常用直播/短视频特效」沉淀为库 API:调用方不写 WGSL、不关心 uniform 布局,
-用 Rust 结构体表达参数,一行构造出可入管线的 `FrameFilter`。
+Turn the common live-streaming / short-video effects into library API: callers
+write no WGSL, never touch uniform layouts, express parameters as plain Rust
+structs, and get a pipeline-ready `FrameFilter` from a one-line constructor.
 
-### 非目标
+### Non-goals
 
-- 不做多特效单实例融合链(每个 `Effect` 独占一条完整 GPU 管线;见「注意事项」)
-- 不做人脸检测/分割级美颜(`beauty` 是启发式肤色 mask 的 lite 档,命名即声明)
-- 不接受运行期改采样核大小(`BeautyQuality` 在 build 时烤进 shader)
+- No multi-effect fusion into a single instance (each `Effect` owns a full GPU
+  pipeline; see "Caveats")
+- No face-detection / segmentation-grade beautification (`beauty_lite` is the
+  heuristic-skin-mask tier — the name states the limit)
+- No runtime kernel-size changes (`BeautyQuality` is baked into the shader at
+  build time)
 
-## 快速开始
+## Quick start
 
 ```rust,ignore
 use ez_ffmpeg::wgpu_filter::effects::{adjust, AdjustParams};
@@ -33,33 +38,35 @@ let pipeline = pipeline.filter("adjust", Box::new(effect));
 // output.add_frame_pipeline(pipeline);
 ```
 
-所有参数结构的 `Default` 都是中性或温和预设:默认构造的特效不会明显改变画面。
+Every parameter struct's `Default` is a neutral or gentle preset: a
+default-constructed effect does not visibly change the image.
 
-## 使用示例
+## Examples
 
-**直播美颜(集显上用 Fast 档)**:
+**Live-stream beautification (Fast tier for integrated GPUs)**:
 
 ```rust,ignore
-use ez_ffmpeg::wgpu_filter::effects::{beauty, BeautyParams, BeautyQuality};
+use ez_ffmpeg::wgpu_filter::effects::{beauty_lite, BeautyParams, BeautyQuality};
 
-let effect = beauty(BeautyParams::default())
-    .quality(BeautyQuality::Fast)   // 9 taps;集显 1080p60
-    .frames_in_flight(1)            // 直播低延迟
+let effect = beauty_lite(BeautyParams::default())
+    .quality(BeautyQuality::Fast)   // 9 taps; integrated-GPU 1080p60
+    .frames_in_flight(1)            // low latency for live streaming
     .build()?;
 ```
 
-或直接用融合预设 `portrait()`(磨皮+美白+提亮一档到位)。
+Or use the fused preset `portrait()` (smoothing + whitening + brightening in
+one step).
 
-**运行中实时调参**(任意线程):
+**Live parameter updates** (from any thread):
 
 ```rust,ignore
 let effect = adjust(AdjustParams::default()).build()?;
-let params = effect.params_handle(); // 类型已绑定,无需 turbofish
-// ...特效已装入管线并运行...
-params.update(|p| p.saturation = 0.0); // 原子读改写,下一帧生效
+let params = effect.params_handle(); // type already bound, no turbofish
+// ...effect installed in a pipeline and running...
+params.update(|p| p.saturation = 0.0); // atomic read-modify-write, next frame
 ```
 
-**隐私模糊 + 缩小输出**:
+**Privacy blur + downscaled output**:
 
 ```rust,ignore
 use ez_ffmpeg::wgpu_filter::effects::{soft_blur, SoftBlurParams};
@@ -69,7 +76,7 @@ let effect = soft_blur(SoftBlurParams::privacy())
     .build()?;
 ```
 
-**镜像(自拍翻转)**:
+**Mirror (selfie flip)**:
 
 ```rust,ignore
 use ez_ffmpeg::wgpu_filter::effects::{transform, TransformParams};
@@ -77,32 +84,42 @@ use ez_ffmpeg::wgpu_filter::effects::{transform, TransformParams};
 let effect = transform(TransformParams::mirrored()).build()?;
 ```
 
-目录一览:`adjust`(亮度/对比度/饱和度/曝光/gamma/自然饱和/白平衡 8 控制项)、
-`beauty`/`portrait`(磨皮+美白+提亮)、`sharpen`(luma 锐化)、`transform`
-(镜像/翻转/旋转/缩放/平移)、`pixelate`(马赛克)、`soft_blur`(柔焦/隐私模糊)。
+Catalog overview: `adjust` (brightness/contrast/saturation/exposure/gamma/
+vibrance/white-balance, 8 controls), `beauty_lite`/`portrait` (skin smoothing
++ whitening + brightening), `sharpen` (luma unsharp mask), `transform`
+(mirror/flip/rotate/scale/translate), `pixelate` (mosaic), `soft_blur`
+(soft-focus / privacy blur).
 
-## 依赖
+## Dependencies
 
-- **上游**:`wgpu_filter::wgpu_frame_filter`(底层 GPU 管线与 builder)、
-  `wgpu_filter::params`(`WgpuParamsHandle` 实时参数)、
-  `wgpu_filter::error`(`WgpuFilterError`)、`core::filter::frame_filter`
-  (`FrameFilter` trait,委托实现)、`bytemuck`(参数结构 Pod 派生)
-- **下游**:无仓内调用方(公开 API,面向 crate 使用者)
-- **外部**:随 `wgpu` feature 启用;运行期需要一个 wgpu 可用的 GPU adapter
+- **Upstream**: `wgpu_filter::wgpu_frame_filter` (the underlying GPU pipeline
+  and builder), `wgpu_filter::params` (`WgpuParamsHandle` live parameters),
+  `wgpu_filter::error` (`WgpuFilterError`), `core::filter::frame_filter`
+  (the `FrameFilter` trait, implemented by delegation), `bytemuck` (Pod
+  derives for the parameter structs)
+- **Downstream**: no in-crate callers (public API for crate users)
+- **External**: enabled by the `wgpu` feature; needs a wgpu-capable GPU
+  adapter at runtime
 
-## 注意事项
+## Caveats
 
-- **一个特效 = 一条完整 GPU 管线**(上传/转换/特效/打包/回读)。串联两个
-  `Effect` 意味着这套开销 ×2。优先选参数覆盖面广的单特效(`adjust` 八项、
-  `portrait` 融合),不要叠实例。
-- **参数越界不报错**:所有参数在 shader 内 clamp 到文档区间,`build()` 不校验
-  数值——传 `saturation: 99.0` 得到的是 clamp 后的 3.0 效果。
-- **`_pad` 字段必须保持 0**:参数结构的 padding 字段是 `#[doc(hidden)] pub`
-  (为了 `..Default::default()` 语法),不要写入。
-- **`params_handle().update(|p| ...)` 闭包内不要再调同一特效的 handle 方法**
-  ——锁跨闭包持有,重入会死锁。
-- **`BeautyQuality` 只能 build 时选**:Fast=9 taps(集显 1080p60),
-  Balanced=13 taps(独显或 720p)。运行期 tap 数会让 GPU wavefront 仍跑满
-  整个循环,故不提供。
-- **无 GPU 环境**:`build()` 纯 CPU 侧(shader 组装+校验),不触 GPU;
-  设备创建发生在管线 `init`,无 adapter 时在那里报错。
+- **One effect = one full GPU pipeline** (upload/convert/effect/pack/readback).
+  Chaining two `Effect`s doubles that cost. Prefer a single effect with wide
+  parameter coverage (`adjust` has eight controls, `portrait` is fused) over
+  stacking instances.
+- **Out-of-range parameters do not error**: every parameter is clamped inside
+  the shader to its documented range; `build()` does no value validation —
+  passing `saturation: 99.0` behaves as the clamped 3.0.
+- **`_pad` fields must stay 0**: the parameter structs' padding fields are
+  `#[doc(hidden)] pub` (to keep `..Default::default()` working); do not write
+  to them.
+- **Never call the same effect's handle methods inside
+  `params_handle().update(|p| ...)`** — the lock is held across the closure;
+  re-entry deadlocks.
+- **`BeautyQuality` is build-time only**: Fast = 9 taps (integrated-GPU
+  1080p60), Balanced = 13 taps (discrete GPU or 720p). A runtime tap count
+  would still schedule the GPU wavefront for the full loop, so it is not
+  offered.
+- **No GPU present**: `build()` is pure CPU work (shader assembly +
+  validation) and never touches the GPU; device creation happens at pipeline
+  `init`, which is where a missing adapter surfaces.
