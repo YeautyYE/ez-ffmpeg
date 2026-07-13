@@ -954,7 +954,8 @@ impl Output {
         self
     }
 
-    /// Sets a **target frame rate** (`AVRational`) for output encoding.
+    /// Sets a **target frame rate** for output encoding, as a `num/den`
+    /// rational (e.g. `30, 1` for 30 FPS).
     ///
     /// This can force the output to use a specific frame rate (e.g., 30/1 for 30 FPS).
     /// If unset, FFmpeg typically preserves the source frame rate or uses defaults

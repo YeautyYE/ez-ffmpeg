@@ -202,7 +202,11 @@ impl WgpuFrameFilterBuilder {
     /// RADV/ANV). When unavailable — or when a particular frame cannot be
     /// imported — hardware frames transparently fall back to
     /// `av_hwframe_transfer_data` download, so enabling this is always safe.
-    /// Software input frames are unaffected.
+    /// After three consecutive import failures the filter stops attempting
+    /// imports for the current decoder hwframes context (deterministic
+    /// failures would otherwise burn a fallback round-trip on every frame);
+    /// a new hwframes context re-arms the attempt. Software input frames are
+    /// unaffected.
     ///
     /// Marked experimental because wgpu tracks imported textures as
     /// uninitialized and its first layout transition is from `UNDEFINED`,

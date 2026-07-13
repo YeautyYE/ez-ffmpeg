@@ -657,9 +657,12 @@ impl OutputFramePool {
                 return Err(format!("Failed to copy frame props: {}", av_err2str(ret)));
             }
             (*p).time_base = (*src.as_ptr()).time_base;
-            // The packed output is always 4:2:0 planar; color matrix/range
-            // tags carried over by copy_props stay correct by construction of
-            // the convert/pack passes.
+            // copy_props carries the SOURCE frame's tags, which is not enough:
+            // the passes may have run with a different effective range than
+            // the source advertises (J-format inputs normalize the pix_fmt).
+            // The caller re-stamps `color_range` from the slot's effective
+            // flag right after this frame is handed back — keep that stamp in
+            // sync with any tag logic added here.
 
             let dst_y_stride = self.layout.linesize[0] as usize;
             let dst_u_stride = self.layout.linesize[1] as usize;
