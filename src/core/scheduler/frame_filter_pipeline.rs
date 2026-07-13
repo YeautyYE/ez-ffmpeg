@@ -314,6 +314,14 @@ fn run_pipeline(
     // delayed output) keep the 1ms poll cadence.
     let poll_indices = pipeline.request_frame_indices();
     let needs_polling = !poll_indices.is_empty();
+    // Filters whose EOF flush drain hit `EOF_FLUSH_FRAME_CAP`. The regular
+    // poll sweep must stop pulling from a capped filter: its next output
+    // would reach filters that already consumed their flush cue (and, on the
+    // null-sentinel path, trail the EOF marker downstream), breaking the
+    // ordered-flush "no real frame after your cue" contract. A new real
+    // source frame re-arms the chain (stream_loop: the next segment's frames
+    // flow and its end-of-stream cues the chain again).
+    let mut eof_capped = vec![false; pipeline.filters.len()];
     let recv_interval = if needs_polling {
         Duration::from_millis(1)
     } else {
@@ -371,6 +379,7 @@ fn run_pipeline(
                                 &mut frame_senders,
                                 frame_pool,
                                 &poll_indices,
+                                &mut eof_capped,
                                 scheduler_status,
                             )?;
                         }
@@ -405,6 +414,7 @@ fn run_pipeline(
                                 &mut frame_senders,
                                 frame_pool,
                                 &poll_indices,
+                                &mut eof_capped,
                                 scheduler_status,
                             )?
                                 && !crate::core::scheduler::ffmpeg_scheduler::is_stopping(
@@ -423,9 +433,22 @@ fn run_pipeline(
                             cue_since_last_real = true;
                         } else {
                             cue_since_last_real = false;
+                            // A real frame means the stream is live again
+                            // (stream_loop segment, late source): a filter
+                            // capped during an earlier EOF flush may produce
+                            // for the new segment, and its next flush will
+                            // cue it again.
+                            eof_capped.fill(false);
                         }
-                        // filter frame
-                        match pipeline.run_filters(frame_box.frame) {
+                        // filter frame. Skipping is live only on the marker
+                        // path: a real frame just cleared `eof_capped`, so
+                        // this degenerates to the plain chain traversal. A
+                        // capped filter must not see the source marker — it
+                        // already consumed its cue during the flush, and a
+                        // saturating generator would answer the marker with
+                        // one more real frame for the already-cued filters
+                        // behind it.
+                        match pipeline.run_filters_skipping(&eof_capped, frame_box.frame) {
                             Ok(tmp_frame) => {
                                 send_frame(pipeline, &mut frame_senders, frame_pool, tmp_frame)?
                             }
@@ -457,6 +480,13 @@ fn run_pipeline(
         // request frame — only from filters that can produce (PERF-8).
         let mut produced_frame = false;
         for &i in &poll_indices {
+            // Capped during an EOF flush: everything it produces now would
+            // land after the downstream filters' flush cue (they are already
+            // cued and drained), violating the ordered-flush contract. Skip
+            // until a real source frame clears the mark.
+            if eof_capped[i] {
+                continue;
+            }
             loop {
                 // A saturating MayProduce generator (request_frame always
                 // returns Some) would otherwise spin here forever: is_stopping
@@ -529,10 +559,13 @@ fn run_pipeline(
 /// flush exists to release the FINITE backlog a filter holds at end of stream
 /// (a handful of in-flight GPU readbacks). A filter whose `request_frame`
 /// never returns `None` (a saturating generator) must not hold the EOF
-/// sentinel hostage; past the cap its output reverts to the previous
-/// end-of-stream behavior — produced after EOF and dropped once the
-/// downstream consumer leaves. Documented in [`FrameFilter::filter_frame`]'s
-/// "End of stream" section; keep the two in sync.
+/// sentinel hostage: past the cap the filter is marked capped and the poll
+/// sweep stops pulling from it, so its remaining backlog is discarded — it
+/// can never leak a real frame to filters that already consumed their flush
+/// cue, or trail the EOF sentinel downstream. A capped filter is polled
+/// again only after a new real source frame re-arms the chain. Documented in
+/// [`FrameFilter::filter_frame`]'s "End of stream" section; keep the two in
+/// sync.
 ///
 /// [`FrameFilter::filter_frame`]: crate::filter::frame_filter::FrameFilter::filter_frame
 const EOF_FLUSH_FRAME_CAP: usize = 1024;
@@ -557,9 +590,12 @@ fn flush_pipeline_for_eof(
     frame_senders: &mut FrameSenders,
     frame_pool: &ObjPool<Frame>,
     poll_indices: &[usize],
+    eof_capped: &mut [bool],
     scheduler_status: &Arc<AtomicUsize>,
 ) -> crate::error::Result<bool> {
-    for k in 0..pipeline.filters.len() {
+    // `eof_capped` is sized to the filter count, so this pairs each stage
+    // index with its cap mark.
+    for (k, capped) in eof_capped.iter_mut().enumerate() {
         // Per-stage gate, BEFORE the cue enters user code: a stage can run
         // arbitrarily expensive filter work (the GPU filter blocks until
         // every in-flight frame completes), which a stopping scheduler must
@@ -615,9 +651,15 @@ fn flush_pipeline_for_eof(
             if flushed >= EOF_FLUSH_FRAME_CAP {
                 warn!(
                     "Pipeline [index:{}] EOF flush hit the {EOF_FLUSH_FRAME_CAP}-frame cap \
-                     on filter {k}; its remaining output stays unflushed",
+                     on filter {k}; its remaining output is discarded",
                     pipeline.stream_index.unwrap_or(usize::MAX),
                 );
+                // Take the filter out of the regular poll sweep too: the
+                // filters after it have consumed their cue by the time this
+                // flush returns, so anything more it produces would arrive
+                // after their cue (or trail the EOF sentinel downstream).
+                // A new real source frame clears the mark.
+                *capped = true;
                 break;
             }
             let result = pipeline.request_frame(k);

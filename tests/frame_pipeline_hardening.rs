@@ -24,8 +24,8 @@ use ez_ffmpeg::filter::frame_pipeline_builder::FramePipelineBuilder;
 use ez_ffmpeg::stream_info::{find_video_stream_info, StreamInfo};
 use ez_ffmpeg::{AVMediaType, FfmpegContext, Frame, Input, Output};
 use ffmpeg_sys_next::{
-    av_buffer_create, av_frame_new_side_data_from_buf, av_frame_ref, av_free, av_malloc,
-    AVFrameSideDataType, AVRational,
+    av_buffer_create, av_frame_copy_props, av_frame_new_side_data_from_buf, av_frame_ref, av_free,
+    av_malloc, AVFrameSideDataType, AVPixelFormat, AVRational,
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -1707,4 +1707,261 @@ fn pipeline_init_error_drops_receiver_frames_before_releasing_its_slot() {
     wait_until(15, "wait() to return after the callback releases", || {
         wait_returned.load(Ordering::SeqCst)
     });
+}
+
+/// Saturates only from its own flush cue onward: `request_frame` yields
+/// nothing until `filter_frame` sees a props-only marker, then clones its
+/// stashed template forever. This confines the saturation to the ordered
+/// EOF flush drain (the regular poll sweep sees `None` all stream long), so
+/// the per-filter flush cap is guaranteed to trip at natural end of stream.
+struct CueArmedSaturatingGenerator {
+    generated: Arc<AtomicUsize>,
+    armed: bool,
+    /// When armed, answer a LATER props-only marker (the decoder's source
+    /// EOF-timestamp marker traversing the chain after the flush) with a
+    /// stashed real frame instead of passing it through — the documented
+    /// holder behavior of consuming a marker to release held output. A
+    /// flush-capped filter doing this must NOT be able to leak that frame
+    /// to already-cued downstream filters.
+    convert_markers: bool,
+    stash: Option<Frame>,
+    next_pts: i64,
+    time_base: AVRational,
+    duration: i64,
+}
+
+impl FrameFilter for CueArmedSaturatingGenerator {
+    fn media_type(&self) -> AVMediaType {
+        AVMediaType::AVMEDIA_TYPE_VIDEO
+    }
+
+    fn filter_frame(
+        &mut self,
+        frame: Frame,
+        _ctx: &mut FrameFilterContext,
+    ) -> Result<Option<Frame>, FrameFilterError> {
+        unsafe {
+            if frame.as_ptr().is_null() || (*frame.as_ptr()).buf[0].is_null() {
+                if self.armed && self.convert_markers {
+                    if let Some(stash) = self.stash.as_ref() {
+                        // Consume the marker, release a held real frame
+                        // (legitimate holder behavior per the trait docs).
+                        let mut clone = Frame::empty();
+                        if !clone.as_ptr().is_null()
+                            && av_frame_ref(clone.as_mut_ptr(), stash.as_ptr()) >= 0
+                        {
+                            (*clone.as_mut_ptr()).pts = self.next_pts;
+                            (*clone.as_mut_ptr()).time_base = self.time_base;
+                            (*clone.as_mut_ptr()).duration = self.duration;
+                            self.next_pts += 1;
+                            self.generated.fetch_add(1, Ordering::SeqCst);
+                            return Ok(Some(clone));
+                        }
+                    }
+                }
+                // Own flush cue (or EOF sentinel): saturate from here on.
+                self.armed = true;
+                return Ok(Some(frame));
+            }
+        }
+        let mut copy = unsafe { Frame::empty() };
+        if unsafe { copy.as_ptr().is_null() } {
+            return Err("av_frame_alloc failed".into());
+        }
+        let ret = unsafe { av_frame_ref(copy.as_mut_ptr(), frame.as_ptr()) };
+        if ret < 0 {
+            return Err(format!("av_frame_ref failed: {ret}").into());
+        }
+        unsafe {
+            self.next_pts = (*frame.as_ptr()).pts + 1;
+            self.time_base = (*frame.as_ptr()).time_base;
+            self.duration = (*frame.as_ptr()).duration;
+        }
+        self.stash = Some(copy);
+        Ok(Some(frame))
+    }
+
+    fn request_frame(
+        &mut self,
+        _ctx: &mut FrameFilterContext,
+    ) -> Result<Option<Frame>, FrameFilterError> {
+        if !self.armed {
+            return Ok(None);
+        }
+        let Some(stash) = self.stash.as_ref() else {
+            return Ok(None);
+        };
+        let mut clone = unsafe { Frame::empty() };
+        if unsafe { clone.as_ptr().is_null() } {
+            return Err("av_frame_alloc failed".into());
+        }
+        let ret = unsafe { av_frame_ref(clone.as_mut_ptr(), stash.as_ptr()) };
+        if ret < 0 {
+            return Err(format!("av_frame_ref failed: {ret}").into());
+        }
+        unsafe {
+            (*clone.as_mut_ptr()).pts = self.next_pts;
+            (*clone.as_mut_ptr()).time_base = self.time_base;
+            (*clone.as_mut_ptr()).duration = self.duration;
+        }
+        self.next_pts += 1;
+        self.generated.fetch_add(1, Ordering::SeqCst);
+        Ok(Some(clone))
+    }
+
+    fn request_frame_mode(&self) -> RequestFrameMode {
+        RequestFrameMode::MayProduce
+    }
+}
+
+/// A saturating generator must not leak frames past the ordered EOF flush:
+/// once the flush drain hits the per-filter cap, the regular poll sweep has
+/// to stop pulling from that filter — its next output would reach a
+/// downstream filter that already consumed its flush cue, violating the
+/// "no real frame after your cue" contract (and, on the null-sentinel path,
+/// trail EOF downstream). The generator here saturates from its own flush
+/// cue, so the cap trips at natural end of stream while the downstream
+/// sentinel records ordering.
+#[test]
+fn capped_eof_flush_keeps_real_frames_away_from_cued_filters() {
+    let fixture = mpegts_fixture("cap_order_in.ts", 5);
+    let out = tmp_path("cap_order_out.mp4");
+
+    let generated = Arc::new(AtomicUsize::new(0));
+    let cue_seen = Arc::new(AtomicBool::new(false));
+    let real_after_cue = Arc::new(AtomicBool::new(false));
+    let sentinel_frames = Arc::new(AtomicUsize::new(0));
+
+    // Generator FIRST, ordering sentinel SECOND: the flush cues the
+    // generator, drains it into the cap, then cues the sentinel — any
+    // generator frame reaching the sentinel afterwards is the violation.
+    let pipeline = FramePipelineBuilder::new(AVMediaType::AVMEDIA_TYPE_VIDEO)
+        .filter(
+            "cue-armed-generator",
+            Box::new(CueArmedSaturatingGenerator {
+                generated: generated.clone(),
+                armed: false,
+                convert_markers: false,
+                stash: None,
+                next_pts: 0,
+                time_base: AVRational { num: 0, den: 1 },
+                duration: 0,
+            }),
+        )
+        .filter(
+            "cue-order-sentinel",
+            Box::new(CueOrderSentinel {
+                cue_seen: cue_seen.clone(),
+                real_after_cue: real_after_cue.clone(),
+                frames_seen: sentinel_frames.clone(),
+            }),
+        );
+
+    let result = wait_with_watchdog(
+        FfmpegContext::builder()
+            .input(Input::from(fixture.as_str()))
+            .output(
+                Output::from(out.as_str())
+                    .set_video_codec("mpeg4")
+                    .add_frame_pipeline(pipeline),
+            )
+            .build()
+            .unwrap()
+            .start()
+            .unwrap(),
+        120,
+        "saturated EOF flush transcode",
+    );
+    assert!(result.is_ok(), "transcode failed: {result:?}");
+
+    assert!(
+        cue_seen.load(Ordering::SeqCst),
+        "the downstream sentinel never received its flush cue"
+    );
+    assert!(
+        generated.load(Ordering::SeqCst) >= 1024,
+        "the generator never saturated the EOF flush cap (generated {}), \
+         the scenario no longer exercises the capped path",
+        generated.load(Ordering::SeqCst)
+    );
+    assert!(
+        !real_after_cue.load(Ordering::SeqCst),
+        "a capped generator's frame reached a filter AFTER its end-of-stream \
+         cue: the poll sweep kept pulling from a filter whose EOF flush hit \
+         the cap"
+    );
+}
+
+
+/// The source EOF-timestamp marker (input-side pipelines: the decoder sends
+/// it right before the null sentinel) traverses the chain AFTER the ordered
+/// flush. A filter whose flush drain hit the per-filter cap already consumed
+/// its cue and had its backlog discarded — the marker traversal must skip
+/// it: by the documented holder semantics a filter may answer a marker with
+/// a held REAL frame, which would otherwise land on downstream filters that
+/// already consumed their own cue.
+#[test]
+fn capped_filter_cannot_convert_the_source_marker_into_a_late_real_frame() {
+    let fixture = mpegts_fixture("cap_marker_in.ts", 5);
+    let out = tmp_path("cap_marker_out.mp4");
+
+    let generated = Arc::new(AtomicUsize::new(0));
+    let cue_seen = Arc::new(AtomicBool::new(false));
+    let real_after_cue = Arc::new(AtomicBool::new(false));
+    let sentinel_frames = Arc::new(AtomicUsize::new(0));
+
+    // INPUT-side pipeline: only input pipelines receive the decoder's
+    // EOF-timestamp marker when frames flowed. Converter FIRST (saturates
+    // from its cue, then answers the source marker with a real frame),
+    // ordering sentinel SECOND.
+    let pipeline = FramePipelineBuilder::new(AVMediaType::AVMEDIA_TYPE_VIDEO)
+        .filter(
+            "marker-converting-generator",
+            Box::new(CueArmedSaturatingGenerator {
+                generated: generated.clone(),
+                armed: false,
+                convert_markers: true,
+                stash: None,
+                next_pts: 0,
+                time_base: AVRational { num: 0, den: 1 },
+                duration: 0,
+            }),
+        )
+        .filter(
+            "cue-order-sentinel",
+            Box::new(CueOrderSentinel {
+                cue_seen: cue_seen.clone(),
+                real_after_cue: real_after_cue.clone(),
+                frames_seen: sentinel_frames.clone(),
+            }),
+        );
+
+    let result = wait_with_watchdog(
+        FfmpegContext::builder()
+            .input(Input::from(fixture.as_str()).add_frame_pipeline(pipeline))
+            .output(Output::from(out.as_str()).set_video_codec("mpeg4"))
+            .build()
+            .unwrap()
+            .start()
+            .unwrap(),
+        120,
+        "capped filter vs source marker traversal",
+    );
+    assert!(result.is_ok(), "transcode failed: {result:?}");
+
+    assert!(
+        cue_seen.load(Ordering::SeqCst),
+        "the downstream sentinel never received its flush cue"
+    );
+    assert!(
+        generated.load(Ordering::SeqCst) >= 1024,
+        "the generator never saturated the EOF flush cap (generated {})",
+        generated.load(Ordering::SeqCst)
+    );
+    assert!(
+        !real_after_cue.load(Ordering::SeqCst),
+        "a flush-capped filter converted the source EOF marker into a real \
+         frame for a filter that already consumed its cue: the marker \
+         traversal must skip capped filters"
+    );
 }

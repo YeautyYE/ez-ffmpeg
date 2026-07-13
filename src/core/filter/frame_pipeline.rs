@@ -83,11 +83,34 @@ impl FramePipeline {
 
     /// Pushes a frame through each filter in order. If any filter returns `None`,
     /// the frame is dropped. Otherwise, the final `Some(frame)` is returned.
+    // The scheduler loop now routes through `run_filters_skipping` (the EOF
+    // marker traversal must bypass flush-capped filters); this plain form
+    // remains for the wgpu feature's tests and the attribute-map unit test —
+    // all `#[cfg(test)]` code, so every non-test build allows the dead code.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn run_filters(
         &mut self,
+        frame: ffmpeg_next::Frame,
+    ) -> Result<Option<ffmpeg_next::Frame>, FrameFilterError> {
+        self.run_filters_skipping(&[], frame)
+    }
+
+    /// `run_filters`, minus the filters whose index is marked in `skip`
+    /// (indices past `skip`'s length are not skipped). The end-of-stream
+    /// marker traversal uses this for filters whose flush drain hit the
+    /// per-filter cap: such a filter already consumed its cue and its
+    /// remaining backlog is discarded by contract — handing it the source
+    /// marker would let it convert the marker into yet another real frame
+    /// for filters that already consumed their own cue.
+    pub(crate) fn run_filters_skipping(
+        &mut self,
+        skip: &[bool],
         mut frame: ffmpeg_next::Frame,
     ) -> Result<Option<ffmpeg_next::Frame>, FrameFilterError> {
-        for holder in &mut self.filters {
+        for (i, holder) in self.filters.iter_mut().enumerate() {
+            if skip.get(i).copied().unwrap_or(false) {
+                continue;
+            }
             let mut ctx = FrameFilterContext::new(&holder.name, &mut self.attribute_map);
             match holder.filter.filter_frame(frame, &mut ctx)? {
                 Some(f) => {
