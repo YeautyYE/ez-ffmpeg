@@ -2,6 +2,7 @@
 //! thin veneers in one place makes it easy to compare our Rust code with the original C
 //! implementations from libavutil/libavformat when debugging.
 
+use crate::error::{FrameWritableError, Result};
 use ffmpeg_sys_next::{
     av_dict_free, av_dict_get, av_dict_iterate, av_dict_set, av_strerror, AVDictionary, AVRational,
     AV_DICT_MATCH_CASE, AV_ERROR_MAX_STRING_SIZE,
@@ -213,7 +214,12 @@ pub fn frame_is_writable(frame: &ffmpeg_next::Frame) -> bool {
 /// copy. A non-refcounted software frame (`buf[0] == null` but real data in
 /// `data[0]`) is NOT skipped: `av_frame_make_writable` allocates owned buffers
 /// and copies its data, so an in-place edit cannot corrupt the caller's memory.
-pub fn make_frame_writable(frame: &mut ffmpeg_next::Frame) -> Result<(), String> {
+///
+/// A failed `av_frame_make_writable` (most commonly an allocation failure
+/// while copying) surfaces as
+/// [`Error::FrameWritable`](crate::error::Error::FrameWritable) wrapping a
+/// [`FrameWritableError`].
+pub fn make_frame_writable(frame: &mut ffmpeg_next::Frame) -> Result<()> {
     // A null shell or props-only frame has nothing to copy; everything else,
     // non-refcounted frames included, is handed to av_frame_make_writable.
     if frame_is_eof_marker(frame) {
@@ -223,10 +229,7 @@ pub fn make_frame_writable(frame: &mut ffmpeg_next::Frame) -> Result<(), String>
     unsafe {
         let ret = ffmpeg_sys_next::av_frame_make_writable(frame.as_mut_ptr());
         if ret < 0 {
-            return Err(format!(
-                "av_frame_make_writable failed: {}",
-                av_err2str(ret)
-            ));
+            return Err(FrameWritableError::from(ret).into());
         }
     }
     Ok(())

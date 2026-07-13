@@ -3,6 +3,14 @@ use ffmpeg_sys_next::*;
 use std::ffi::NulError;
 use std::{io, result};
 
+// The `opengl` module path is deprecated as a whole (superseded by
+// `wgpu_filter`), but the crate error enum must still name its typed error;
+// importing it here, with the module-path deprecation silenced, keeps the
+// variant and thiserror's generated `From` impl warning-free.
+#[cfg(feature = "opengl")]
+#[allow(deprecated)]
+use crate::opengl::OpenGLFilterError;
+
 /// Result type of all ez-ffmpeg library calls.
 pub type Result<T, E = Error> = result::Result<T, E>;
 
@@ -59,6 +67,9 @@ pub enum Error {
 
     #[error("Alloc packet error: {0}")]
     AllocPacket(#[from] AllocPacketError),
+
+    #[error("Frame writable error: {0}")]
+    FrameWritable(#[from] FrameWritableError),
 
     // ---- Muxing ----
     #[error("Muxing operation failed {0}")]
@@ -144,6 +155,15 @@ pub enum Error {
     #[error("Wgpu filter error: {0}")]
     WgpuFilter(#[from] crate::wgpu_filter::WgpuFilterError),
 
+    // The allow covers the deprecation that OpenGLFilterError inherits from
+    // the deprecated `opengl` module; the variant must still carry the type.
+    // From is hand-written below the enum (a derived #[from] would re-name
+    // the type in generated code that no #[allow] on the variant reaches).
+    #[cfg(feature = "opengl")]
+    #[allow(deprecated)]
+    #[error("OpenGL filter error: {0}")]
+    OpenGLFilter(#[source] OpenGLFilterError),
+
     #[error("IO error:{0}")]
     IO(#[from] io::Error),
 
@@ -159,6 +179,17 @@ pub enum Error {
 
     #[error("Container info error: {0}")]
     ContainerInfo(#[from] ContainerInfoError),
+}
+
+// Hand-written counterpart of the #[from] the sibling variants derive: the
+// error type inherits deprecation from the deprecated `opengl` module, so
+// the conversion is spelled out where the lint can be silenced.
+#[cfg(feature = "opengl")]
+#[allow(deprecated)]
+impl From<OpenGLFilterError> for Error {
+    fn from(err: OpenGLFilterError) -> Self {
+        Error::OpenGLFilter(err)
+    }
 }
 
 /// Errors from the `container_info` queries where the caller asked for an index
@@ -987,6 +1018,36 @@ pub enum AllocFrameError {
     OutOfMemory,
 }
 
+/// Errors from [`make_frame_writable`], the safe wrapper over FFmpeg's
+/// `av_frame_make_writable`: ensuring exclusive ownership of a frame's data
+/// buffers may allocate new buffers and copy into them, and that underlying
+/// call can fail. Common AVERROR codes map to named variants; anything else
+/// carries the raw code.
+///
+/// [`make_frame_writable`]: crate::util::ffmpeg_utils::make_frame_writable
+#[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
+pub enum FrameWritableError {
+    #[error("Memory allocation error while copying frame data")]
+    OutOfMemory,
+
+    #[error("Invalid argument provided")]
+    InvalidArgument,
+
+    #[error("{}. ret:{0}", crate::util::ffmpeg_utils::av_err2str(*.0))]
+    UnknownError(i32),
+}
+
+impl From<i32> for FrameWritableError {
+    fn from(err_code: i32) -> Self {
+        match err_code {
+            AVERROR_OUT_OF_MEMORY => FrameWritableError::OutOfMemory,
+            AVERROR_INVALID_ARGUMENT => FrameWritableError::InvalidArgument,
+            _ => FrameWritableError::UnknownError(err_code),
+        }
+    }
+}
+
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]
 pub enum MuxingError {
@@ -1357,5 +1418,55 @@ mod tests {
             FilterGraphParseError::from(AVERROR_NOT_SOCKET),
             FilterGraphParseError::NotSocket
         ));
+    }
+
+    // make_frame_writable's failure is typed like every other AVERROR-coded
+    // failure in this file: common codes map to named variants, the rest keep
+    // the raw code. Pin the mapping and the user-facing Display string.
+    #[test]
+    fn frame_writable_error_maps_codes_and_pins_display() {
+        use super::{Error, FrameWritableError, AVERROR_INVALID_ARGUMENT, AVERROR_OUT_OF_MEMORY};
+        assert!(matches!(
+            FrameWritableError::from(AVERROR_OUT_OF_MEMORY),
+            FrameWritableError::OutOfMemory
+        ));
+        assert!(matches!(
+            FrameWritableError::from(AVERROR_INVALID_ARGUMENT),
+            FrameWritableError::InvalidArgument
+        ));
+        assert!(matches!(
+            FrameWritableError::from(-99),
+            FrameWritableError::UnknownError(-99)
+        ));
+        let err = Error::from(FrameWritableError::from(AVERROR_OUT_OF_MEMORY));
+        assert_eq!(
+            err.to_string(),
+            "Frame writable error: Memory allocation error while copying frame data"
+        );
+    }
+
+    // The deprecated OpenGL filter's constructor failures are typed like the
+    // wgpu successor's: they carry OpenGLFilterError and convert into
+    // Error::OpenGLFilter. Pin the user-facing Display strings.
+    #[cfg(feature = "opengl")]
+    #[test]
+    fn opengl_filter_error_pins_display() {
+        use super::{Error, OpenGLFilterError};
+        let err = Error::from(OpenGLFilterError::InvalidOption(
+            "fragment shader must declare 'in vec2 TexCoord;'".to_string(),
+        ));
+        assert_eq!(
+            err.to_string(),
+            "OpenGL filter error: invalid OpenGL filter option: \
+             fragment shader must declare 'in vec2 TexCoord;'"
+        );
+        let err = Error::from(OpenGLFilterError::ContextCreation(
+            "Failed to create Surfman connection".to_string(),
+        ));
+        assert_eq!(
+            err.to_string(),
+            "OpenGL filter error: OpenGL context creation failed: \
+             Failed to create Surfman connection"
+        );
     }
 }

@@ -8,6 +8,7 @@
 
 use crate::core::filter::frame_filter_context::FrameFilterContext;
 use crate::filter::frame_filter::{FrameFilter, FrameFilterError, RequestFrameMode};
+use crate::opengl::error::OpenGLFilterError;
 use crate::util::ffmpeg_utils::av_err2str;
 use crate::util::frame_utils::ensure_software_format;
 use ffmpeg_next::Frame;
@@ -59,14 +60,15 @@ pub struct OpenGLFrameFilter {
                 glow::NativeBuffer,
                 glow::NativeBuffer,
             ),
-            String,
+            FrameFilterError,
         >,
     >,
 
     /// Optional function for setting uniforms (playTime, width, height).
     /// If None, a default implementation is used.
     /// Default: Uses `glUniform*` calls to set `playTime`, `width`, and `height` in the shader.
-    set_uniforms_fn: Option<fn(&glow::Context, NativeProgram, &Frame) -> Result<(), String>>,
+    set_uniforms_fn:
+        Option<fn(&glow::Context, NativeProgram, &Frame) -> Result<(), FrameFilterError>>,
 
     /// Optional function for rendering the frame.
     /// If None, a default `glDrawElements`-based implementation is used.
@@ -122,8 +124,8 @@ impl OpenGLFrameFilter {
     ///
     /// Returns:
     /// - `Ok(OpenGLFrameFilter)`: On successful initialization.
-    /// - `Err(String)`: If the fragment shader does not contain the required texture coordinate variable.
-    pub fn new_simple(fragment_shader_code: impl Into<String>) -> Result<Self, String> {
+    /// - `Err(OpenGLFilterError::InvalidOption)`: If the fragment shader does not contain the required texture coordinate variable.
+    pub fn new_simple(fragment_shader_code: impl Into<String>) -> Result<Self, OpenGLFilterError> {
         // Default vertex shader code, assumes texture coordinates as input.
         let vertex_shader = r##"
             #version 330 core
@@ -142,9 +144,9 @@ impl OpenGLFrameFilter {
         // Ensure the fragment shader contains the required texture coordinate variable.
         let fragment_shader_code = fragment_shader_code.into();
         if !fragment_shader_code.contains("in vec2 TexCoord;") {
-            return Err(String::from(
+            return Err(OpenGLFilterError::InvalidOption(String::from(
                 "Fragment shader code must contain a variable with 'in vec2 TexCoord;' for texture coordinates.",
-            ));
+            )));
         }
 
         // Delegate to `new_with_custom_shaders` with default vertex shader and no custom callbacks.
@@ -165,9 +167,12 @@ impl OpenGLFrameFilter {
     /// - `render_frame_fn`: Optional function to render the frame. Uses a default implementation if None.
     ///   Default: Renders the quad using `glDrawElements` with `GL_TRIANGLES` mode.
     ///
+    /// Custom callbacks report failures as [`FrameFilterError`], which the
+    /// pipeline surfaces from `init`/`filter_frame`.
+    ///
     /// Returns:
     /// - `Ok(OpenGLFrameFilter)`: On successful initialization.
-    /// - `Err(String)`: On failure (e.g., OpenGL context creation failure).
+    /// - `Err(OpenGLFilterError::ContextCreation)`: On failure (e.g., OpenGL context creation failure).
     pub fn new_with_custom_shaders(
         opengl_version_major: u8,
         opengl_version_minor: u8,
@@ -182,14 +187,17 @@ impl OpenGLFrameFilter {
                     glow::NativeBuffer,
                     glow::NativeBuffer,
                 ),
-                String,
+                FrameFilterError,
             >,
         >,
-        set_uniforms_fn: Option<fn(&glow::Context, NativeProgram, &Frame) -> Result<(), String>>,
+        set_uniforms_fn: Option<
+            fn(&glow::Context, NativeProgram, &Frame) -> Result<(), FrameFilterError>,
+        >,
         render_frame_fn: Option<fn(&glow::Context)>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, OpenGLFilterError> {
         // Initialize Surfman device and context.
-        let (device, context) = Self::init_surfman(opengl_version_major, opengl_version_minor)?;
+        let (device, context) = Self::init_surfman(opengl_version_major, opengl_version_minor)
+            .map_err(OpenGLFilterError::ContextCreation)?;
 
         // Return a new OpenGLFrameFilter instance with the specified parameters.
         Ok(OpenGLFrameFilter {
@@ -568,7 +576,7 @@ impl OpenGLFrameFilter {
         self.to_original_scaler = None;
     }
 
-    fn process_frame_through_texture(&self, frame: &mut Frame) -> Result<(), String> {
+    fn process_frame_through_texture(&self, frame: &mut Frame) -> Result<(), FrameFilterError> {
         self.upload_frame_to_texture(frame)?;
 
         let gl = self.gl.as_ref().unwrap();
@@ -774,7 +782,11 @@ impl OpenGLFrameFilter {
 }
 
 /// Sets the `playTime`, `width`, and `height` uniform variables in the shader.
-fn set_uniforms(gl: &glow::Context, program: NativeProgram, frame: &Frame) -> Result<(), String> {
+fn set_uniforms(
+    gl: &glow::Context,
+    program: NativeProgram,
+    frame: &Frame,
+) -> Result<(), FrameFilterError> {
     unsafe {
         // Get uniform locations
         let play_time_location = gl.get_uniform_location(program, "playTime");
@@ -816,7 +828,7 @@ fn setup_vertex_data(
         glow::NativeBuffer,
         glow::NativeBuffer,
     ),
-    String,
+    FrameFilterError,
 > {
     // Vertex data and texture coordinates (quad)
     let vertices: [f32; 20] = [
@@ -837,7 +849,7 @@ fn setup_vertex_data(
         // Create and bind the VAO
         let result = gl.create_vertex_array();
         if let Err(e) = result {
-            return Err(format!("Failed to create VAO: {e}"));
+            return Err(format!("Failed to create VAO: {e}").into());
         }
         let vao = result.unwrap();
         gl.bind_vertex_array(Some(vao));
@@ -845,7 +857,7 @@ fn setup_vertex_data(
         // Create and bind the VBO
         let result = gl.create_buffer();
         if let Err(e) = result {
-            return Err(format!("Failed to create VBO: {e}"));
+            return Err(format!("Failed to create VBO: {e}").into());
         }
         let vbo = result.unwrap();
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
@@ -860,7 +872,7 @@ fn setup_vertex_data(
         // Create and bind the EBO (Element Buffer Object for indexed drawing)
         let result = gl.create_buffer();
         if let Err(e) = result {
-            return Err(format!("Failed to create EBO: {e}"));
+            return Err(format!("Failed to create EBO: {e}").into());
         }
         let ebo = result.unwrap();
         gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(ebo));
@@ -1208,6 +1220,58 @@ mod tests {
     use crate::core::scheduler::ffmpeg_scheduler::{FfmpegScheduler, Initialization};
     use crate::filter::frame_pipeline_builder::FramePipelineBuilder;
     use ffmpeg_sys_next::AVPixelFormat;
+
+    // Compile-time pin for the 0.13 typed-error surface (R3/R4): binding
+    // the constructors AND the callback fn-pointer parameters to these exact
+    // signatures makes any revert to the old `Result<_, String>` forms a
+    // compile error in `cargo test --features opengl`, GPU or not.
+    #[test]
+    fn constructor_signatures_are_pinned_to_typed_errors() {
+        // Dummy callbacks with the exact public types: reverting either
+        // fn-pointer parameter to a String error breaks these `Some(...)`
+        // arguments at compile time.
+        fn dummy_setup(
+            _gl: &glow::Context,
+        ) -> Result<
+            (
+                glow::NativeVertexArray,
+                glow::NativeBuffer,
+                glow::NativeBuffer,
+            ),
+            crate::filter::frame_filter::FrameFilterError,
+        > {
+            Err("dummy setup callback: never runs".into())
+        }
+        fn dummy_uniforms(
+            _gl: &glow::Context,
+            _program: glow::NativeProgram,
+            _frame: &ffmpeg_next::Frame,
+        ) -> Result<(), crate::filter::frame_filter::FrameFilterError> {
+            Err("dummy uniforms callback: never runs".into())
+        }
+
+        let simple: fn(&str) -> Result<OpenGLFrameFilter, OpenGLFilterError> =
+            |src| OpenGLFrameFilter::new_simple(src.to_string());
+        let custom: fn() -> Result<OpenGLFrameFilter, OpenGLFilterError> = || {
+            OpenGLFrameFilter::new_with_custom_shaders(
+                3,
+                3,
+                "",
+                "in vec2 TexCoord;",
+                Some(dummy_setup),
+                Some(dummy_uniforms),
+                None,
+            )
+        };
+        // The rejected-input path runs without a GPU: missing TexCoord is
+        // the InvalidOption arm, proving the typed error flows end-to-end.
+        let err = match simple("void main() {}") {
+            Err(e) => e,
+            Ok(_) => panic!("must reject a shader without TexCoord"),
+        };
+        assert!(matches!(err, OpenGLFilterError::InvalidOption(_)));
+        let _ = custom; // context creation needs a display; signature pin only
+    }
 
     #[test]
     fn test_ensure_software_format_accepts_cpu_formats() {
