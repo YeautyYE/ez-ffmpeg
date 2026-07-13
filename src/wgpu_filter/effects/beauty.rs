@@ -26,8 +26,8 @@ pub enum BeautyQuality {
     Balanced,
 }
 
-/// Parameters for [`beauty`]. `Default` is a mild, streaming-safe preset;
-/// [`portrait`] starts from a stronger one.
+/// Parameters for [`beauty_lite`]. `Default` is a mild, streaming-safe
+/// preset; [`portrait`] starts from a stronger one.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct BeautyParams {
@@ -175,7 +175,7 @@ pub(super) fn beauty_shader(quality: BeautyQuality) -> String {
     effect_module(&body)
 }
 
-/// Builder for [`beauty`]: [`EffectBuilder`] plus the build-time
+/// Builder for [`beauty_lite`]: [`EffectBuilder`] plus the build-time
 /// [`BeautyQuality`] choice.
 pub struct BeautyBuilder {
     eb: EffectBuilder<BeautyParams>,
@@ -227,20 +227,21 @@ impl BeautyBuilder {
     }
 }
 
-/// Heuristic skin smoothing + whitening (`beauty_lite` grade — see the
-/// module docs for what that implies). See [`BeautyParams`] and
-/// [`BeautyQuality`].
-pub fn beauty(params: BeautyParams) -> BeautyBuilder {
+/// Heuristic skin smoothing + whitening. The `_lite` suffix is the
+/// quality contract: the heuristic skin mask can misjudge skin-toned wood
+/// or sand, and production-grade beautification needs face segmentation
+/// (see the module docs). See [`BeautyParams`] and [`BeautyQuality`].
+pub fn beauty_lite(params: BeautyParams) -> BeautyBuilder {
     BeautyBuilder {
         eb: EffectBuilder::new(beauty_shader(BeautyQuality::default()), params),
         quality: BeautyQuality::default(),
     }
 }
 
-/// [`beauty`] with a stronger preset: the fused portrait look (smoothing
-/// + whitening + brightening) for talking-head streams.
+/// [`beauty_lite`] with a stronger preset: the fused portrait look
+/// (smoothing + whitening + brightening) for talking-head streams.
 pub fn portrait() -> BeautyBuilder {
-    beauty(BeautyParams {
+    beauty_lite(BeautyParams {
         smooth: 0.65,
         whiten: 0.35,
         brighten: 0.2,

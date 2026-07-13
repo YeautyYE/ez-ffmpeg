@@ -83,6 +83,16 @@ pub(crate) struct FoldState {
     audio_end_us: Option<i64>,
 }
 
+#[cfg(test)]
+impl FoldState {
+    /// Test-only window into the incrementally folded report: lets sink
+    /// tests assert an event is folded the moment it arrives (rather than
+    /// buffered until finalize) without consuming the state.
+    pub(crate) fn report_so_far(&self) -> &AnalysisReport {
+        &self.report
+    }
+}
+
 /// Folds a single event into the running state. Per-frame events the report does
 /// not retain (`R128Frame`) are dropped here instead of being buffered.
 pub(crate) fn fold_event(state: &mut FoldState, ev: MetadataEvent) {

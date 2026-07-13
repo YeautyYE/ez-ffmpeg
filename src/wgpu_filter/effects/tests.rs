@@ -78,7 +78,7 @@ fn default_params_are_neutral_or_mild() {
 #[test]
 fn builders_build_without_a_gpu() {
     assert!(adjust(AdjustParams::default()).build().is_ok());
-    assert!(beauty(BeautyParams::default())
+    assert!(beauty_lite(BeautyParams::default())
         .quality(BeautyQuality::Fast)
         .build()
         .is_ok());
@@ -204,6 +204,48 @@ fn soft_blur_zero_strength_matches_identity() {
     };
     let filter = soft_blur(params).build().unwrap().into_inner();
     assert_matches_identity(filter, 1, "soft_blur strength=0");
+}
+
+#[test]
+fn soft_blur_softens_edge_contrast() {
+    // The strong named preset: radius 12, strength 1.0 (full blur mix).
+    let mut filter = soft_blur(SoftBlurParams::privacy())
+        .build()
+        .unwrap()
+        .into_inner();
+    if !init_filter(&mut filter) {
+        return;
+    }
+    // The same vertical luma step edge the sharpen oracle uses. A disc
+    // blur must pull both sides toward the mean, SHRINKING the step across
+    // the edge — the opposite direction of unsharp masking's overshoot.
+    let step_frame = || {
+        make_yuv_frame_with(
+            64,
+            48,
+            AVPixelFormat::AV_PIX_FMT_YUV420P,
+            |c, _| if c < 32 { 80 } else { 170 },
+            |_, _| (128, 128),
+        )
+    };
+    let out = drive(&mut filter, vec![step_frame()], 1).pop().unwrap();
+    let y = plane_to_vec(&out, 0, 64, 48);
+    let row = 24usize;
+    // For an edge-adjacent pixel, 5 of the 12 ring taps (weight 5.25 of
+    // wsum 14) land across the edge regardless of radius, moving each side
+    // 3/8 of the step toward the other: the 90-step collapses to ~22.
+    let dark_side = y[row * 64 + 31] as i32; // last dark column
+    let bright_side = y[row * 64 + 32] as i32; // first bright column
+    let blurred_contrast = bright_side - dark_side;
+    assert!(
+        blurred_contrast <= (170 - 80) / 2,
+        "edge contrast must shrink well below the input step (got {blurred_contrast})"
+    );
+    // The blur redistributes, it must not shift levels: columns further
+    // from the edge than the outer tap ring (10.4 px) average a flat
+    // neighborhood and keep their value.
+    assert!((y[row * 64 + 8] as i32 - 80).abs() <= 3);
+    assert!((y[row * 64 + 56] as i32 - 170).abs() <= 3);
 }
 
 #[test]
@@ -429,7 +471,7 @@ fn pixelate_block_size_one_resizes_smoothly() {
 fn beauty_keeps_constant_frames_uniform() {
     // Constant skin-toned input: smoothing must not invent gradients, and
     // whiten/brighten shift every pixel by the same amount.
-    let mut filter = beauty(BeautyParams::default())
+    let mut filter = beauty_lite(BeautyParams::default())
         .quality(BeautyQuality::Fast)
         .build()
         .unwrap()
@@ -451,4 +493,156 @@ fn beauty_keeps_constant_frames_uniform() {
         let mx = *pv.iter().max().unwrap() as i32;
         assert!(mx - mn <= 1, "plane {plane} not uniform: {mn}..{mx}");
     }
+}
+
+/// Luma of the noisy-skin oracle frame: a 150-code base tone plus
+/// deterministic integer-hash noise in -6..=6 (no rand dependency). The
+/// +/-6 range keeps |luma_c - luma_s| under the shader's 0.05 edge_keep
+/// knee, so smoothing stays fully active.
+fn noisy_skin_luma(c: usize, r: usize) -> u8 {
+    let mut x = (c as u32)
+        .wrapping_mul(1_664_525)
+        .wrapping_add((r as u32).wrapping_mul(1_013_904_223))
+        .wrapping_add(0x9E37_79B9);
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x045D_9F3B);
+    x ^= x >> 16;
+    (150 + (x % 13) as i32 - 6) as u8
+}
+
+/// A 64x48 skin-cluster base tone with per-pixel luma noise. U=117/V=153
+/// sit at the shader's skin-mask cluster center: with the limited-range
+/// BT.601 convert this frame gets, skin_confidence recovers
+/// cb=(U-128)/224=-0.049 and cr=(V-128)/224=0.112, i.e. the mask's
+/// (-0.05, 0.11) target, and the tone's saturation (~0.24) is inside the
+/// 0.08..0.5 band — so the mask is ~1 and smoothing is fully active.
+fn noisy_skin_frame() -> ffmpeg_next::Frame {
+    make_yuv_frame_with(
+        64,
+        48,
+        AVPixelFormat::AV_PIX_FMT_YUV420P,
+        noisy_skin_luma,
+        |_, _| (117, 153),
+    )
+}
+
+/// Materializes `f(col, row)` over the noisy-skin frame's interior (8 px
+/// in from every edge, away from the sampler's edge clamp).
+fn interior_vals(f: impl Fn(usize, usize) -> i32) -> Vec<i32> {
+    let mut vals = Vec::with_capacity(32 * 48);
+    for r in 8..40 {
+        for c in 8..56 {
+            vals.push(f(c, r));
+        }
+    }
+    vals
+}
+
+fn mean(vals: &[i32]) -> f64 {
+    vals.iter().map(|&v| v as f64).sum::<f64>() / vals.len() as f64
+}
+
+fn mean_abs_dev(vals: &[i32]) -> f64 {
+    let m = mean(vals);
+    vals.iter().map(|&v| (v as f64 - m).abs()).sum::<f64>() / vals.len() as f64
+}
+
+#[test]
+fn beauty_lite_smooths_skin_noise() {
+    let mut filter = beauty_lite(BeautyParams {
+        smooth: 1.0,
+        whiten: 0.0,
+        brighten: 0.0,
+        detail_preserve: 0.3,
+    })
+    .build()
+    .unwrap()
+    .into_inner();
+    if !init_filter(&mut filter) {
+        return;
+    }
+    let out = drive(&mut filter, vec![noisy_skin_frame()], 1).pop().unwrap();
+    let y = plane_to_vec(&out, 0, 64, 48);
+
+    let in_mad = mean_abs_dev(&interior_vals(|c, r| noisy_skin_luma(c, r) as i32));
+    let out_mad = mean_abs_dev(&interior_vals(|c, r| y[r * 64 + c] as i32));
+    assert!(
+        in_mad > 2.5,
+        "test bug: the noise pattern must actually be noisy (in {in_mad:.2})"
+    );
+    assert!(
+        out_mad < in_mad * 0.6,
+        "smoothing must cut skin luma noise substantially \
+         (in {in_mad:.2}, out {out_mad:.2})"
+    );
+    // detail_preserve hands back part of the removed high frequency and
+    // the 13-tap kernel keeps a noise residual: the region must retain
+    // texture, not flatten to a plateau (which would read ~0 here).
+    assert!(
+        out_mad > 0.3,
+        "output must not collapse to a constant region (out {out_mad:.2})"
+    );
+}
+
+#[test]
+fn portrait_smooths_and_brightens_more_than_default_beauty() {
+    // `portrait()` is documented as a *stronger* fused preset than the
+    // mild `BeautyParams::default()`; this pins that ordering. Degrading
+    // `portrait()` to `beauty_lite(BeautyParams::default())` keeps every
+    // other test green — this one must fail.
+    let mut default_beauty = beauty_lite(BeautyParams::default())
+        .build()
+        .unwrap()
+        .into_inner();
+    let mut portrait_beauty = portrait().build().unwrap().into_inner();
+    if !init_filter(&mut default_beauty) {
+        return;
+    }
+    assert!(init_filter(&mut portrait_beauty));
+
+    let out_d = drive(&mut default_beauty, vec![noisy_skin_frame()], 1)
+        .pop()
+        .unwrap();
+    let out_p = drive(&mut portrait_beauty, vec![noisy_skin_frame()], 1)
+        .pop()
+        .unwrap();
+    let yd = plane_to_vec(&out_d, 0, 64, 48);
+    let yp = plane_to_vec(&out_p, 0, 64, 48);
+    let d_vals = interior_vals(|c, r| yd[r * 64 + c] as i32);
+    let p_vals = interior_vals(|c, r| yp[r * 64 + c] as i32);
+
+    let in_mad = mean_abs_dev(&interior_vals(|c, r| noisy_skin_luma(c, r) as i32));
+    let d_mad = mean_abs_dev(&d_vals);
+    let p_mad = mean_abs_dev(&p_vals);
+    let d_mean = mean(&d_vals);
+    let p_mean = mean(&p_vals);
+    assert!(
+        in_mad > 2.5,
+        "test bug: the noise pattern must actually be noisy (in {in_mad:.2})"
+    );
+    // The comparison is meaningless if the mild preset didn't smooth.
+    assert!(
+        d_mad < in_mad * 0.9,
+        "default preset must smooth at all (in {in_mad:.2}, default {d_mad:.2})"
+    );
+    // Net high-frequency attenuation is smooth*(1-detail_preserve) at
+    // mask~1: default 0.5*0.7 = 0.35, portrait 0.65*0.65 = 0.4225, so
+    // portrait keeps ~0.58 of the noise vs ~0.65 — about 0.9x the default
+    // output's MAD. 0.97 splits that from the 1.0 a degraded (identical)
+    // preset would measure.
+    assert!(
+        p_mad < d_mad * 0.97,
+        "portrait must smooth strictly harder than default params \
+         (default {d_mad:.2}, portrait {p_mad:.2})"
+    );
+    // Whiten/brighten lift every channel by k*c*(1-c), k >= 0, monotone
+    // in k for c in (0,1) — no highlight-compression non-monotonicity on
+    // this frame's mid-tones (~0.53..0.77). At mask~1 the fused lift is
+    // whiten*0.35 + brighten*0.25: default 0.095, portrait 0.1725, about
+    // +4 luma codes of separation; require half of it.
+    assert!(
+        p_mean > d_mean + 2.0,
+        "portrait must whiten/brighten strictly above default params \
+         (default mean {d_mean:.2}, portrait mean {p_mean:.2})"
+    );
 }
