@@ -9,7 +9,10 @@
 
 use ez_ffmpeg::{FfmpegContext, Input, Output};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+// Only the Linux-gated thread-count test polls against a deadline.
+#[cfg(target_os = "linux")]
+use std::time::Instant;
 
 /// Both tests observe process-global state (thread counts, socket buffers):
 /// they must not run concurrently inside the shared test binary.

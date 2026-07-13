@@ -1370,7 +1370,7 @@ mod tests {
             }
         "##;
 
-        let mut output: Output = "output.mp4".into();
+        let output: Output = "output.mp4".into();
         let frame_pipeline_builder: FramePipelineBuilder = AVMediaType::AVMEDIA_TYPE_VIDEO.into();
         let filter = OpenGLFrameFilter::new_simple(fragment_shader.to_string()).unwrap();
         let frame_pipeline_builder = frame_pipeline_builder.filter("test", Box::new(filter));
@@ -1429,7 +1429,7 @@ mod tests {
             }
         "##;
 
-        let mut output: Output = "output.mp4".into();
+        let output: Output = "output.mp4".into();
         let frame_pipeline_builder: FramePipelineBuilder = AVMediaType::AVMEDIA_TYPE_VIDEO.into();
         let filter = OpenGLFrameFilter::new_simple(fragment_shader.to_string()).unwrap();
         let frame_pipeline_builder = frame_pipeline_builder.filter("opengl", Box::new(filter));
