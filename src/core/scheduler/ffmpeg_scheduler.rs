@@ -26,17 +26,67 @@ pub struct Paused;
 pub struct Ended;
 
 // publishes a muxer's `enc_registered` flag on Drop — including on UNWIND.
-// start() sets the flag explicitly on the normal and enc_init-error paths (before
-// fail_start joins the waiter), but a PANIC inside an enc_init (e.g. a panicking log
-// hook) mid-registration would skip both, leaving the delayed-start mux waiter's
-// registration barrier (MuxRegistrationBarrier) blocked forever. This RAII, held
-// across a muxer's enc_init loop, republishes the flag as the stack unwinds so that
-// barrier can never hang.
+// start() sets the flag explicitly on the normal and enc_init-error paths, but a
+// PANIC inside an enc_init (e.g. a panicking log hook) mid-registration would skip
+// both, leaving the delayed-start mux waiter's registration barrier
+// (MuxRegistrationBarrier) blocked forever. This RAII, held across a muxer's
+// enc_init loop, republishes the flag as the stack unwinds so that barrier can
+// never hang. It drops BEFORE the StartFailGuard (declared earlier in start()),
+// so the waiter the guard joins can always pass its barrier.
 struct SetEncRegisteredOnDrop(Arc<AtomicBool>);
 
 impl Drop for SetEncRegisteredOnDrop {
     fn drop(&mut self) {
         self.0.store(true, Ordering::Release);
+    }
+}
+
+/// Failure cleanup for `start()` once one or more worker threads may already be
+/// running, as a guard so it covers BOTH the explicit `Err` returns and a panic
+/// unwinding out of any init call (e.g. a user log hook panicking on the
+/// "input does not need to be sent" warning after earlier workers spawned).
+/// Drop publishes the terminal state, wakes every blocking wait, releases any
+/// pre-counted muxer thread slot no worker will free, and JOINS all workers.
+///
+/// Joining before `start()` drops `self.ffmpeg_context` is what prevents a
+/// use-after-free: that context is the sole owner of the `InterruptState` the
+/// workers' AVIO interrupt callbacks dereference (via a refcount-free raw
+/// pointer). A worker finishing its trailer I/O after the context was freed
+/// would otherwise read and write freed memory. The guard is a body local of
+/// `start()`, so on unwind it drops before the `self` parameter (locals drop
+/// first) — the join always precedes the context teardown. `mux_handed[i]` is
+/// true once muxer `i`'s pre-counted slot has been handed to a worker or waiter
+/// (which will release it on STATUS_END); the rest are released here so
+/// `wait_for_all_threads` cannot block forever on a slot no thread owns.
+/// The success path disarms the guard after the RunningGuard takes over.
+struct StartFailGuard {
+    armed: bool,
+    status: Arc<AtomicUsize>,
+    thread_sync: ThreadSynchronizer,
+    // Cloned upfront: Drop cannot borrow ffmpeg_context (start() holds it
+    // mutably), and the demuxer set is fixed before any worker spawns.
+    demux_waiters: Vec<Arc<crate::util::sch_waiter::SchWaiter>>,
+    mux_handed: Vec<bool>,
+}
+
+impl Drop for StartFailGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.status.store(STATUS_END, Ordering::Release);
+        notify_pause_waiters();
+        // Wake choked demuxers so they observe the terminal state and exit
+        // (mirrors RunningGuard::drop).
+        for waiter in &self.demux_waiters {
+            waiter.set(false);
+        }
+        for &handed in &self.mux_handed {
+            if !handed {
+                crate::core::scheduler::mux_task::release_mux_slot(&self.status, &self.thread_sync);
+            }
+        }
+        self.thread_sync.wait_for_all_threads();
     }
 }
 
@@ -306,20 +356,39 @@ impl FfmpegScheduler<Initialization> {
         for _ in 0..self.ffmpeg_context.muxs.len() {
             thread_sync.thread_start();
         }
-        // Tracks which muxer's pre-counted thread slot has been handed to a
-        // worker/waiter (so it will be released on STATUS_END). On a failure
-        // path, fail_start() releases the slots still marked false and joins
-        // every spawned worker before self.ffmpeg_context (and the
-        // InterruptState it owns) drops.
-        let mut mux_handed = vec![false; self.ffmpeg_context.muxs.len()];
+        // From here on worker threads may be running: any exit from start()
+        // other than the disarm at the very end — an explicit `return Err` OR
+        // a panic unwinding out of an init call — must publish the terminal
+        // state, release the pre-counted slots no worker owns
+        // (`mux_handed[i] == false`), and join every spawned worker BEFORE
+        // `self.ffmpeg_context` drops. The guard's Drop does exactly that.
+        let mut start_fail_guard = StartFailGuard {
+            armed: true,
+            status: scheduler_status.clone(),
+            thread_sync: thread_sync.clone(),
+            demux_waiters: self
+                .ffmpeg_context
+                .demuxs
+                .iter()
+                .filter_map(|demux| {
+                    let crate::core::scheduler::input_controller::SchNode::Demux { waiter, .. } =
+                        demux.node.as_ref()
+                    else {
+                        return None;
+                    };
+                    Some(waiter.clone())
+                })
+                .collect(),
+            mux_handed: vec![false; self.ffmpeg_context.muxs.len()],
+        };
 
         // Muxer
         for (mux_idx, mux) in self.ffmpeg_context.muxs.iter_mut().enumerate() {
             if mux.is_ready() {
                 // Calling mux_init hands this slot off: on success a worker
                 // releases it, on failure fail_mux_init releases it internally.
-                mux_handed[mux_idx] = true;
-                if let Err(e) = mux_init(
+                start_fail_guard.mux_handed[mux_idx] = true;
+                mux_init(
                     mux_idx,
                     mux,
                     packet_pool.clone(),
@@ -329,15 +398,7 @@ impl FfmpegScheduler<Initialization> {
                     thread_sync.clone(),
                     scheduler_result.clone(),
                     mux_done_remaining.clone(),
-                ) {
-                    Self::fail_start(
-                        &scheduler_status,
-                        &thread_sync,
-                        &self.ffmpeg_context,
-                        &mux_handed,
-                    );
-                    return Err(e);
-                }
+                )?;
             }
         }
 
@@ -346,7 +407,7 @@ impl FfmpegScheduler<Initialization> {
         for (mux_idx, mux) in ffmpeg_context.muxs.iter_mut().enumerate() {
             if let Some(frame_pipelines) = mux.frame_pipelines.take() {
                 for frame_pipeline in frame_pipelines {
-                    if let Err(e) = output_pipeline_init(
+                    output_pipeline_init(
                         mux_idx,
                         frame_pipeline,
                         mux.get_streams_mut(),
@@ -354,15 +415,7 @@ impl FfmpegScheduler<Initialization> {
                         scheduler_status.clone(),
                         thread_sync.clone(),
                         scheduler_result.clone(),
-                    ) {
-                        Self::fail_start(
-                            &scheduler_status,
-                            &thread_sync,
-                            ffmpeg_context,
-                            &mux_handed,
-                        );
-                        return Err(e);
-                    }
+                    )?;
                 }
             }
         }
@@ -393,11 +446,10 @@ impl FfmpegScheduler<Initialization> {
                     // A not-ready muxer's slot is now owned by the spawned
                     // waiter thread; a ready muxer was already marked handed in
                     // the loop above (setting it again is idempotent).
-                    mux_handed[mux_idx] = true;
+                    start_fail_guard.mux_handed[mux_idx] = true;
                     sender
                 }
                 Err(e) => {
-                    Self::fail_start(&scheduler_status, &thread_sync, ffmpeg_context, &mux_handed);
                     return Err(e);
                 }
             };
@@ -493,11 +545,10 @@ impl FfmpegScheduler<Initialization> {
                     input_controller.clone(),
                 ) {
                     // Registration is over for this muxer (nothing more will
-                    // be spawned) — signal it BEFORE fail_start joins the
+                    // be spawned) — signal it BEFORE the guard joins the
                     // delayed-start waiter, whose teardown waits for the flag
                     // so its encoder join cannot miss an in-flight handle.
                     mux.enc_registered.store(true, Ordering::Release);
-                    Self::fail_start(&scheduler_status, &thread_sync, ffmpeg_context, &mux_handed);
                     return Err(e);
                 }
             }
@@ -510,7 +561,7 @@ impl FfmpegScheduler<Initialization> {
         // Filter graph
         let ffmpeg_context = &mut self.ffmpeg_context;
         for (i, filter_graph) in ffmpeg_context.filter_graphs.iter_mut().enumerate() {
-            if let Err(e) = filter_graph_init(
+            filter_graph_init(
                 i,
                 filter_graph,
                 frame_pool.clone(),
@@ -519,18 +570,14 @@ impl FfmpegScheduler<Initialization> {
                 scheduler_status.clone(),
                 thread_sync.clone(),
                 scheduler_result.clone(),
-            ) {
-                Self::fail_start(&scheduler_status, &thread_sync, ffmpeg_context, &mux_handed);
-                return Err(e);
-            }
+            )?;
         }
 
         // Input frame filter pipeline
-        let ffmpeg_context = &mut self.ffmpeg_context;
         for (demux_idx, demux) in ffmpeg_context.demuxs.iter_mut().enumerate() {
             if let Some(frame_pipelines) = demux.frame_pipelines.take() {
                 for frame_pipeline in frame_pipelines {
-                    if let Err(e) = input_pipeline_init(
+                    input_pipeline_init(
                         demux_idx,
                         frame_pipeline,
                         demux.get_streams_mut(),
@@ -538,15 +585,7 @@ impl FfmpegScheduler<Initialization> {
                         scheduler_status.clone(),
                         thread_sync.clone(),
                         scheduler_result.clone(),
-                    ) {
-                        Self::fail_start(
-                            &scheduler_status,
-                            &thread_sync,
-                            ffmpeg_context,
-                            &mux_handed,
-                        );
-                        return Err(e);
-                    }
+                    )?;
                 }
             }
         }
@@ -556,7 +595,7 @@ impl FfmpegScheduler<Initialization> {
             let exit_on_error = demux.exit_on_error;
 
             for dec_stream in demux.get_streams_mut() {
-                if let Err(e) = dec_init(
+                dec_init(
                     demux_idx,
                     dec_stream,
                     exit_on_error,
@@ -565,16 +604,13 @@ impl FfmpegScheduler<Initialization> {
                     scheduler_status.clone(),
                     thread_sync.clone(),
                     scheduler_result.clone(),
-                ) {
-                    Self::fail_start(&scheduler_status, &thread_sync, ffmpeg_context, &mux_handed);
-                    return Err(e);
-                }
+                )?;
             }
         }
 
         // Demuxer
         for (demux_idx, demux) in ffmpeg_context.demuxs.iter_mut().enumerate() {
-            if let Err(e) = demux_init(
+            demux_init(
                 demux_idx,
                 demux,
                 ffmpeg_context.independent_readrate,
@@ -584,10 +620,7 @@ impl FfmpegScheduler<Initialization> {
                 pause_epoch.clone(),
                 thread_sync.clone(),
                 scheduler_result.clone(),
-            ) {
-                Self::fail_start(&scheduler_status, &thread_sync, ffmpeg_context, &mux_handed);
-                return Err(e);
-            }
+            )?;
         }
 
         input_controller.as_ref().update_locked(&scheduler_status);
@@ -614,6 +647,10 @@ impl FfmpegScheduler<Initialization> {
             _interrupt_state: running_scheduler.ffmpeg_context.interrupt_state.clone(),
         });
 
+        // Failure duty is now the RunningGuard's: it performs the same
+        // terminal-state + join protocol for the scheduler's whole lifetime.
+        start_fail_guard.armed = false;
+
         Ok(running_scheduler)
     }
 
@@ -626,44 +663,6 @@ impl FfmpegScheduler<Initialization> {
         // with the failed scheduler.
         scheduler_status.store(STATUS_END, Ordering::Release);
         notify_pause_waiters();
-    }
-
-    /// Failure path once one or more worker threads may already be running:
-    /// publish the terminal state, wake every blocking wait, release any
-    /// pre-counted muxer thread slot no worker will free, and JOIN all workers
-    /// before returning.
-    ///
-    /// Joining before `start()` drops `self.ffmpeg_context` is what prevents a
-    /// use-after-free: that context is the sole owner of the `InterruptState`
-    /// the workers' AVIO interrupt callbacks dereference (via a refcount-free
-    /// raw pointer). A worker finishing its trailer I/O after the context was
-    /// freed would otherwise read and write freed memory. `mux_handed[i]` is
-    /// true once muxer `i`'s pre-counted slot has been handed to a worker or
-    /// waiter (which will release it on STATUS_END); the rest are released here
-    /// so `wait_for_all_threads` cannot block forever on a slot no thread owns.
-    fn fail_start(
-        scheduler_status: &Arc<AtomicUsize>,
-        thread_sync: &ThreadSynchronizer,
-        ffmpeg_context: &FfmpegContext,
-        mux_handed: &[bool],
-    ) {
-        scheduler_status.store(STATUS_END, Ordering::Release);
-        notify_pause_waiters();
-        // Wake choked demuxers so they observe the terminal state and exit
-        // (mirrors RunningGuard::drop).
-        for demux in &ffmpeg_context.demuxs {
-            if let crate::core::scheduler::input_controller::SchNode::Demux { waiter, .. } =
-                demux.node.as_ref()
-            {
-                waiter.set(false);
-            }
-        }
-        for &handed in mux_handed {
-            if !handed {
-                crate::core::scheduler::mux_task::release_mux_slot(scheduler_status, thread_sync);
-            }
-        }
-        thread_sync.wait_for_all_threads();
     }
 }
 
