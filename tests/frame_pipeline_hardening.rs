@@ -1399,8 +1399,15 @@ impl FrameFilter for SwallowAllFrames {
 /// Construction: a two-input overlay graph whose second input delivers NOTHING (its
 /// pipeline swallows every frame), so the graph never configures and input 0's tagged
 /// frames — each carrying a side-data buffer whose free callback blocks — accumulate in
-/// the worker's pre-config path. The injector FORWARDS 10 frames (tagging the first two)
-/// and fires its barrier on FRAME 11. Because the input->filtergraph channel is
+/// the worker's pre-config path. Both graph inputs come from ONE lavfi demuxer exposing
+/// two streams: with two demuxers, the input-balancing pass chokes stream 0's demuxer
+/// the moment the unconfigured graph requests input 1 (`fg_read_frames`' pre-config
+/// branch), and whether the injector has seen its 11 frames by then is an interleaving
+/// race — lost reliably under ASAN's allocator serialization. A single demuxer has
+/// nothing to balance against (`balancing_possible = false`), so stream 0 flows
+/// deterministically while stream 1 starves the graph pre-config. The injector FORWARDS
+/// 10 frames (tagging the first two) and fires its barrier on FRAME 11. Because the
+/// input->filtergraph channel is
 /// `bounded(8)`, 10 accepted sends prove the filtergraph DEQUEUED at least two
 /// frames, and since the worker pushes each frame into `ifps` before recv'ing the next,
 /// frame 1 (the first dequeued) is PROVABLY in the worker's OWN `ifps` queue (a rebound
@@ -1438,31 +1445,31 @@ fn filtergraph_worker_drops_captured_frames_before_releasing_its_slot() {
     let s2 = make_state();
     let (barrier_tx, barrier_rx) = std::sync::mpsc::channel();
 
-    let input0 = Input::from("color=c=red:s=320x240:r=30")
-        .set_format("lavfi")
-        .add_frame_pipeline(
-            FramePipelineBuilder::new(AVMediaType::AVMEDIA_TYPE_VIDEO).filter(
-                "blocking-injector",
-                Box::new(BlockingBufferInjector {
-                    states: vec![s1.clone(), s2.clone()],
-                    real_seen: 0,
-                    forward_until: 10,
-                    barrier: Some(barrier_tx),
-                }),
-            ),
-        );
-    let input1 = Input::from("color=c=blue:s=320x240:r=30")
+    let input = Input::from("color=c=red:s=320x240:r=30[out0];color=c=blue:s=320x240:r=30[out1]")
         .set_format("lavfi")
         .add_frame_pipeline(
             FramePipelineBuilder::new(AVMediaType::AVMEDIA_TYPE_VIDEO)
+                .set_stream_index(0)
+                .filter(
+                    "blocking-injector",
+                    Box::new(BlockingBufferInjector {
+                        states: vec![s1.clone(), s2.clone()],
+                        real_seen: 0,
+                        forward_until: 10,
+                        barrier: Some(barrier_tx),
+                    }),
+                ),
+        )
+        .add_frame_pipeline(
+            FramePipelineBuilder::new(AVMediaType::AVMEDIA_TYPE_VIDEO)
+                .set_stream_index(1)
                 .filter("swallow-all", Box::new(SwallowAllFrames)),
         );
 
     let out = tmp_path("fg_worker_teardown_out.mp4");
     let scheduler = FfmpegContext::builder()
-        .input(input0)
-        .input(input1)
-        .filter_desc("[0:v][1:v]overlay")
+        .input(input)
+        .filter_desc("[0:v:0][0:v:1]overlay")
         .output(Output::from(out.as_str()).set_video_codec("mpeg4"))
         .build()
         .unwrap()
