@@ -62,6 +62,46 @@ vcpkg install ffmpeg:x64-windows-static-md
 # Set VCPKG_ROOT environment variable
 ```
 
+<details>
+<summary>Static linking fails with <code>unresolved external symbol</code> errors? (click to expand)</summary>
+
+`ffmpeg-sys-next`'s vcpkg path emits only a handful of Windows system
+libraries (see
+[rust-ffmpeg-sys#28](https://github.com/zmwangx/rust-ffmpeg-sys/issues/28)),
+so the final link of your application can fail with many
+`unresolved external symbol` errors (`BCrypt*`, `MF*`, DirectShow, ...).
+If it does, declare the missing libraries in **your own project's**
+`build.rs`:
+
+```rust
+// build.rs of your application
+fn main() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        for lib in [
+            "user32", "kernel32", "gdi32", "shell32", "ole32", "oleaut32",
+            "uuid", "advapi32", "bcrypt", "ws2_32", "winmm", "crypt32",
+            "secur32", "strmiids", "mfplat", "mfuuid", "mf", "mfreadwrite",
+            "dxgi", "d3d11", "quartz", "comdlg32", "winspool", "version",
+            "setupapi", "shlwapi", "ncrypt", "vfw32",
+        ] {
+            println!("cargo:rustc-link-lib={}", lib);
+        }
+    }
+}
+```
+
+Notes:
+- Set `VCPKG_ROOT` in your shell before building. Calling `std::env::set_var`
+  inside `build.rs` does not work: `ffmpeg-sys-next`'s build script runs as a
+  separate process and never sees those variables.
+- The exact list depends on the vcpkg FFmpeg port version and its enabled
+  features; the list above is the union of libraries users reported in
+  [#16](https://github.com/YeautyYE/ez-ffmpeg/issues/16) in June 2025 and
+  July 2026 — your exact set may differ.
+- Dynamic linking (`vcpkg install ffmpeg`) is not affected.
+
+</details>
+
 ### Adding the Dependency
 
 Add **ez-ffmpeg** to your project by including it in your `Cargo.toml`:
