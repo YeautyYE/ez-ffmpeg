@@ -19,8 +19,14 @@
 #
 # Ubuntu's apt FFmpeg (6.1 on 24.04) matches neither lane, so it is never
 # installed; the apt packages below are just the FFmpeg build toolchain
-# (nasm/yasm/clang/pkg-config/zlib). First build per lane compiles FFmpeg
-# (~10-20 min); caches make subsequent runs fast.
+# (nasm/yasm/clang/pkg-config/zlib). The 7.1 install is cached; the 8.1 lane
+# rebuilds FFmpeg per job because its source-build helper tunes for the current
+# runner CPU.
+#
+# Cargo caches deliberately keep only registry and git sources, never `target`.
+# ffmpeg-sys-next's native source build adds `-march=native -mtune=native`, and
+# GitHub can schedule the same runner architecture on different CPU generations;
+# restoring those compiled artifacts can otherwise terminate tests with SIGILL.
 #
 # Native platform coverage outside Linux runs once per GitHub-hosted
 # architecture: Apple Silicon macOS, Windows x64, and Windows ARM64. macOS
@@ -131,14 +137,13 @@ jobs:
           echo "PKG_CONFIG_PATH=$HOME/ffmpeg71/lib/pkgconfig" >> "$GITHUB_ENV"
           echo "LD_LIBRARY_PATH=$HOME/ffmpeg71/lib" >> "$GITHUB_ENV"
 
-      - name: Cache cargo registry and target
+      - name: Cache cargo sources
         uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-build-ffmpeg${{ matrix.ffmpeg }}-${{ hashFiles('**/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-sources-v1-${{ hashFiles('**/Cargo.toml') }}
 
       - name: Build
         run: cargo build --all-features ${{ matrix.ffmpeg-features }} --verbose
@@ -228,14 +233,13 @@ jobs:
           echo "PKG_CONFIG_PATH=$HOME/ffmpeg71/lib/pkgconfig" >> "$GITHUB_ENV"
           echo "LD_LIBRARY_PATH=$HOME/ffmpeg71/lib" >> "$GITHUB_ENV"
 
-      - name: Cache cargo registry and target
+      - name: Cache cargo sources
         uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-test-ffmpeg${{ matrix.ffmpeg }}-${{ hashFiles('**/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-sources-v1-${{ hashFiles('**/Cargo.toml') }}
 
       - name: Test
         run: cargo test --lib --features async,rtmp,flv,subtitle,wgpu ${{ matrix.ffmpeg-features }}
@@ -288,14 +292,13 @@ jobs:
           rustc -vV
           test "$(rustc -vV | sed -n 's/^host: //p')" = "${{ matrix.target }}"
 
-      - name: Cache cargo registry and target
+      - name: Cache cargo sources
         uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-platform-${{ hashFiles('**/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-sources-v1-${{ hashFiles('**/Cargo.toml') }}
 
       - name: Configure vcpkg
         if: matrix.os == 'windows'
@@ -376,14 +379,13 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo registry and target
+      - name: Cache cargo sources
         uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-docs-${{ hashFiles('**/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-sources-v1-${{ hashFiles('**/Cargo.toml') }}
 
       # `DOCS_RS=1` makes ez-ffmpeg's build.rs pass `--cfg docsrs`, compiling its FFI
       # call sites as stubs; this gate catches a docsrs-stub compile gap (a fn that
@@ -414,14 +416,13 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@nightly
 
-      - name: Cache cargo registry and target
+      - name: Cache cargo sources
         uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-asan-${{ hashFiles('**/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-sources-v1-${{ hashFiles('**/Cargo.toml') }}
 
       # `-Zsanitizer=address` instruments the target crates' Rust code. The explicit
       # `--target` scopes the sanitizer to those crates and off the host build
