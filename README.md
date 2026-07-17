@@ -102,6 +102,146 @@ Notes:
 
 </details>
 
+#### Linux
+
+ez-ffmpeg links FFmpeg **7.0–8.x**, which is newer than what many
+distributions package (Ubuntu 24.04 ships FFmpeg 6.x, for example). Install
+the development libraries from a source that provides FFmpeg 7 or 8 — or build
+FFmpeg through Cargo (see [below](#no-system-ffmpeg-build-it-from-source-linuxmacos)):
+
+```bash
+# Debian/Ubuntu (needs an apt source that provides FFmpeg 7+):
+sudo apt install pkg-config clang \
+    libavcodec-dev libavformat-dev libavfilter-dev libavdevice-dev \
+    libavutil-dev libswscale-dev libswresample-dev
+pkg-config --modversion libavcodec   # 61.x => FFmpeg 7.x, 62.x => FFmpeg 8.x
+```
+
+`pkg-config` and `clang` (for bindgen) are required regardless of how FFmpeg
+is provided.
+
+### No system FFmpeg? Build it from source (Linux/macOS)
+
+`ffmpeg-next` — a dependency of ez-ffmpeg — can compile a minimal FFmpeg from
+source during `cargo build`. Add it as a direct dependency with its `build`
+feature; Cargo feature unification applies it to the copy ez-ffmpeg uses:
+
+```toml
+[dependencies]
+ez-ffmpeg = "*"
+# Keep the FFmpeg major in sync with the one ez-ffmpeg depends on:
+ffmpeg-next = { version = "8.1", features = ["build"] }
+```
+
+What to expect:
+
+- **Platforms:** Linux and macOS. **Not** supported on Windows — vcpkg (above)
+  remains the Windows path.
+- **Build prerequisites:** `git`, network access, a C toolchain, `make`,
+  `nasm`/`yasm`, `clang`, and `pkg-config`. The first build compiles FFmpeg
+  (typically 10–20 minutes) and adds roughly 1 GB to `target/` (the artifacts
+  keep debug symbols).
+- **Reproducibility:** the build clones FFmpeg's `release/8.1` **moving
+  branch** at build time, so two clean builds of the same `Cargo.lock` can
+  compile different FFmpeg commits. `--locked` and `cargo vendor` do not cover
+  the nested clone, and offline builds are not supported. This is fine for
+  local decode/analysis and CI; for production, prefer a system FFmpeg you
+  provision and pin yourself.
+- **Portability:** the upstream build compiles with `-march=native`, so the
+  resulting binaries are tied to the building machine's CPU — do not
+  redistribute them.
+- **Capabilities:** the result is a *minimal* FFmpeg (`--disable-autodetect`,
+  no external libraries): all native decoders (H.264, HEVC, AV1, VP9, AAC,
+  MP3, …), native encoders such as AAC/MJPEG/GIF, every muxer/demuxer, the
+  detection filters behind the analysis API (black/silence/scene/loudness),
+  and file/pipe I/O — but **no libx264** (HLS ladders must select another
+  encoder via `.video_codec(...)`), **no PNG/WebP encoders** (write thumbnails
+  as `.jpg`), and **no https/TLS**. See the capability matrix below.
+
+To add GPL components, combine the documented `build-*` features — for example
+H.264 encoding via a **system-installed** libx264 (the feature links it, it
+does not compile it):
+
+```toml
+ffmpeg-next = { version = "8.1", features = ["build", "build-license-gpl", "build-lib-x264"] }
+```
+
+Binaries produced this way are subject to the GPL.
+
+### FFmpeg capability matrix
+
+What common ez-ffmpeg tasks require from the linked FFmpeg build:
+
+| Task | Requirement in the linked FFmpeg |
+|---|---|
+| Decode H.264 / HEVC / AV1 / VP9 / AAC / MP3 | Native decoders — any standard build |
+| Encode AAC audio | Native encoder — any standard build |
+| JPEG thumbnails, GIF export | Native encoders — any standard build |
+| Black / silence / scene / loudness detection | Built-in filters — any standard build |
+| Subtitle burn-in (`subtitle` feature) | Nothing extra — rendered by a pure-Rust engine, no `--enable-libass` |
+| RTMP server (`rtmp` feature) | Nothing extra — in-process server |
+| H.264 encode (`HlsLadder` default `libx264`) | `--enable-gpl --enable-libx264` (vcpkg: the `x264` feature); otherwise pick another encoder via `.video_codec(...)` / `Output::set_video_codec` |
+| PNG thumbnails | A PNG encoder (zlib; present in full builds, absent from the minimal source build) |
+| WebP thumbnails | `--enable-libwebp` |
+| `https://` inputs | A TLS backend (`--enable-openssl` / `--enable-gnutls`; present in full builds, absent from the minimal source build) |
+| Crop detection | The `cropdetect` filter — a GPL build (`--enable-gpl`) |
+| Hardware acceleration (NVENC / QSV / AMF / VideoToolbox / VAAPI) | The matching build flags **and** the runtime drivers/SDK |
+
+When a required encoder is missing, ez-ffmpeg fails with an error naming it
+(for example `encoder 'libx264' is not available in the linked FFmpeg build`).
+`ez_ffmpeg::codec::get_encoders()` / `get_decoders()` list what your linked
+build actually provides.
+
+### Troubleshooting installation
+
+<details>
+<summary><code>encoder '…' is not available in the linked FFmpeg build</code></summary>
+
+The FFmpeg your binary linked against does not include that encoder. List what
+is actually available with `ez_ffmpeg::codec::get_encoders()`, then either
+link an FFmpeg build that enables the encoder (see the capability matrix) or
+select an available one (`Output::set_video_codec` / `set_audio_codec`, or
+`.video_codec(...)` on recipes). On Windows, a vcpkg *feature list* is not
+proof the DLLs you link at runtime provide it — inspect with
+`get_encoders()`, and note that hardware encoders (`h264_nvenc`, `qsv`,
+`amf`) additionally require the vendor runtime/driver.
+(Reported in [#35](https://github.com/YeautyYE/ez-ffmpeg/issues/35).)
+
+</details>
+
+<details>
+<summary><code>unresolved import ffmpeg_sys_next::AVCodecConfig</code> and similar missing-type build errors</summary>
+
+The FFmpeg headers found at build time are older than 7.0 (`AVCodecConfig`
+arrived in FFmpeg 7.1). Distribution and vcpkg ports can lag — check with
+`pkg-config --modversion libavcodec` (61.x = FFmpeg 7.x, 62.x = 8.x) or your
+vcpkg port version, and upgrade to FFmpeg 7.0–8.x.
+(Reported in [#18](https://github.com/YeautyYE/ez-ffmpeg/issues/18).)
+
+</details>
+
+<details>
+<summary>ARM/aarch64: <code>cannot find type __va_list_tag_aarch64</code></summary>
+
+A `va_list` portability bug in older ez-ffmpeg releases, fixed in current
+versions. Update the `ez-ffmpeg` dependency; if a current release still fails
+on your target triple, open an issue including the triple and FFmpeg version.
+(Reported in [#33](https://github.com/YeautyYE/ez-ffmpeg/issues/33).)
+
+</details>
+
+<details>
+<summary>Windows static linking fails only when the project has both <code>main.rs</code> and <code>lib.rs</code></summary>
+
+Cargo builds both a binary and a library target, and the duplicated
+static-link arguments can conflict. Either remove `lib.rs`, disable the
+library target in `Cargo.toml` (`[lib]` with `crate-type = []`), or move the
+code into `main.rs`. See the `unresolved external symbol` section above for
+the accompanying system-library list.
+(Reported in [#20](https://github.com/YeautyYE/ez-ffmpeg/issues/20).)
+
+</details>
+
 ### Adding the Dependency
 
 Add **ez-ffmpeg** to your project by including it in your `Cargo.toml`:
