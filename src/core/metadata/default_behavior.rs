@@ -74,25 +74,25 @@ pub unsafe fn copy_metadata_default(
         // These keys are typically encoder/software specific and shouldn't be copied
         av_dict_set(
             &mut output_ref.metadata,
-            b"creation_time\0".as_ptr() as *const i8,
+            b"creation_time\0".as_ptr() as *const std::os::raw::c_char,
             std::ptr::null(),
             0,
         );
         av_dict_set(
             &mut output_ref.metadata,
-            b"company_name\0".as_ptr() as *const i8,
+            b"company_name\0".as_ptr() as *const std::os::raw::c_char,
             std::ptr::null(),
             0,
         );
         av_dict_set(
             &mut output_ref.metadata,
-            b"product_name\0".as_ptr() as *const i8,
+            b"product_name\0".as_ptr() as *const std::os::raw::c_char,
             std::ptr::null(),
             0,
         );
         av_dict_set(
             &mut output_ref.metadata,
-            b"product_version\0".as_ptr() as *const i8,
+            b"product_version\0".as_ptr() as *const std::os::raw::c_char,
             std::ptr::null(),
             0,
         );
@@ -101,7 +101,7 @@ pub unsafe fn copy_metadata_default(
         if recording_time_set {
             av_dict_set(
                 &mut output_ref.metadata,
-                b"duration\0".as_ptr() as *const i8,
+                b"duration\0".as_ptr() as *const std::os::raw::c_char,
                 std::ptr::null(),
                 0,
             );
@@ -166,7 +166,7 @@ pub unsafe fn copy_metadata_default(
             if encoding_streams.contains(&output_idx) {
                 av_dict_set(
                     &mut output_stream.metadata,
-                    b"encoder\0".as_ptr() as *const i8,
+                    b"encoder\0".as_ptr() as *const std::os::raw::c_char,
                     std::ptr::null(),
                     0,
                 );
