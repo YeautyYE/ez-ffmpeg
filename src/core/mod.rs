@@ -487,40 +487,41 @@ extern "C" fn cleanup() {
     });
 }
 
-// The following type definitions for `VaListType` are inspired by the Rust standard library's
-// implementation of `va_list` (see std::ffi::va_list::VaListImpl). These definitions ensure compatibility
-// with platform-specific ABI requirements when interfacing with C variadic functions.
+// C adjusts an array-typed `va_list` parameter to a pointer. Bindgen preserves
+// that adjustment in FFmpeg's function signatures, while its public `va_list`
+// alias remains the original one-element array. Extract the generated element
+// type so the callback follows the same ABI without naming bindgen internals.
+#[cfg(any(
+    all(target_arch = "powerpc", not(target_os = "uefi"), not(windows)),
+    target_arch = "s390x",
+    all(target_arch = "x86_64", not(target_os = "uefi"), not(windows)),
+))]
+trait VaListArray {
+    type Element;
+}
 
 #[cfg(any(
-    all(
-        not(target_arch = "aarch64"),
-        not(target_arch = "powerpc"),
-        not(target_arch = "s390x"),
-        not(target_arch = "x86_64")
-    ),
-    all(target_arch = "aarch64", target_vendor = "apple"),
-    target_family = "wasm",
-    target_os = "uefi",
-    windows,
+    all(target_arch = "powerpc", not(target_os = "uefi"), not(windows)),
+    target_arch = "s390x",
+    all(target_arch = "x86_64", not(target_os = "uefi"), not(windows)),
 ))]
-type VaListType = *mut libc::c_char;
+impl<T, const N: usize> VaListArray for [T; N] {
+    type Element = T;
+}
 
-#[cfg(all(target_arch = "x86_64", not(target_os = "uefi"), not(windows)))]
-type VaListType = *mut ffmpeg_sys_next::__va_list_tag;
-
-#[cfg(all(
-    target_arch = "aarch64",
-    not(target_vendor = "apple"),
-    not(target_os = "uefi"),
-    not(windows),
+#[cfg(any(
+    all(target_arch = "powerpc", not(target_os = "uefi"), not(windows)),
+    target_arch = "s390x",
+    all(target_arch = "x86_64", not(target_os = "uefi"), not(windows)),
 ))]
-type VaListType = *mut libc::c_void;
+type VaListType = *mut <ffmpeg_sys_next::va_list as VaListArray>::Element;
 
-#[cfg(all(target_arch = "powerpc", not(target_os = "uefi"), not(windows)))]
-type VaListType = *mut ffmpeg_sys_next::__va_list_tag_powerpc;
-
-#[cfg(target_arch = "s390x")]
-type VaListType = *mut ffmpeg_sys_next::__va_list_tag_s390x;
+#[cfg(not(any(
+    all(target_arch = "powerpc", not(target_os = "uefi"), not(windows)),
+    target_arch = "s390x",
+    all(target_arch = "x86_64", not(target_os = "uefi"), not(windows)),
+)))]
+type VaListType = ffmpeg_sys_next::va_list;
 
 /// Log target used for every message forwarded from FFmpeg, so applications
 /// can tune FFmpeg's verbosity independently of ez-ffmpeg's own logs,
