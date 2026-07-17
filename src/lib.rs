@@ -164,6 +164,7 @@ pub use self::core::context::input::Input;
 pub use self::core::context::output::Output;
 pub use self::core::device;
 pub use self::core::filter;
+pub use self::core::frame_export;
 pub use self::core::hwaccel;
 pub use self::core::packet_scanner;
 pub use self::core::recipes;
