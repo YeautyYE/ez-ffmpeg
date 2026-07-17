@@ -1,7 +1,15 @@
+use crate::core::context::demuxer::Demuxer;
 use crate::core::context::ffmpeg_context::FfmpegContext;
 use crate::core::context::filter_complex::FilterComplex;
 use crate::core::context::input::Input;
 use crate::core::context::output::Output;
+
+/// A filter-graph description resolved *after* inputs are opened, so it can read
+/// the real (opened) stream layout and durations. Crate-internal seam used by
+/// `frame_export` to select the video stream and assemble its graph against the
+/// demuxer the run will actually use — avoiding a second probe open.
+pub(crate) type DeferredFilterDesc =
+    Box<dyn FnOnce(&[Demuxer]) -> crate::error::Result<FilterComplex> + Send>;
 
 /// A builder for constructing [`FfmpegContext`] objects with customized inputs,
 /// outputs, and filter configurations. Typically, you will start by calling
@@ -32,6 +40,7 @@ pub struct FfmpegContextBuilder {
     filter_descs: Vec<FilterComplex>,
     outputs: Vec<Output>,
     copy_ts: bool,
+    deferred_filter_descs: Vec<DeferredFilterDesc>,
 }
 
 impl Default for FfmpegContextBuilder {
@@ -56,6 +65,7 @@ impl FfmpegContextBuilder {
             filter_descs: vec![],
             outputs: vec![],
             copy_ts: false,
+            deferred_filter_descs: vec![],
         }
     }
 
@@ -295,6 +305,14 @@ impl FfmpegContextBuilder {
         self
     }
 
+    /// Registers a filter-graph description resolved after the inputs are opened,
+    /// receiving the opened demuxers. Crate-internal (used by `frame_export` for
+    /// post-open stream selection and graph assembly).
+    pub(crate) fn add_deferred_filter_desc(mut self, f: DeferredFilterDesc) -> Self {
+        self.deferred_filter_descs.push(f);
+        self
+    }
+
     /// Finalizes this builder, creating an [`FfmpegContext`] which can then be used
     /// to run FFmpeg jobs via [`FfmpegContext::start()`](FfmpegContext::start) or by constructing an
     /// [`FfmpegScheduler`](crate::FfmpegScheduler) yourself.
@@ -334,6 +352,7 @@ impl FfmpegContextBuilder {
             self.filter_descs,
             self.outputs,
             self.copy_ts,
+            self.deferred_filter_descs,
         )
     }
 }
