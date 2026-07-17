@@ -487,9 +487,40 @@ extern "C" fn cleanup() {
     });
 }
 
-// Use the exact target ABI emitted by ffmpeg-sys-next for the same bindings as
-// av_log_set_callback and av_log_format_line. Keeping a second architecture
-// table here would drift whenever bindgen changes a platform's va_list layout.
+// C adjusts an array-typed `va_list` parameter to a pointer. Bindgen preserves
+// that adjustment in FFmpeg's function signatures, while its public `va_list`
+// alias remains the original one-element array. Extract the generated element
+// type so the callback follows the same ABI without naming bindgen internals.
+#[cfg(any(
+    all(target_arch = "powerpc", not(target_os = "uefi"), not(windows)),
+    target_arch = "s390x",
+    all(target_arch = "x86_64", not(target_os = "uefi"), not(windows)),
+))]
+trait VaListArray {
+    type Element;
+}
+
+#[cfg(any(
+    all(target_arch = "powerpc", not(target_os = "uefi"), not(windows)),
+    target_arch = "s390x",
+    all(target_arch = "x86_64", not(target_os = "uefi"), not(windows)),
+))]
+impl<T, const N: usize> VaListArray for [T; N] {
+    type Element = T;
+}
+
+#[cfg(any(
+    all(target_arch = "powerpc", not(target_os = "uefi"), not(windows)),
+    target_arch = "s390x",
+    all(target_arch = "x86_64", not(target_os = "uefi"), not(windows)),
+))]
+type VaListType = *mut <ffmpeg_sys_next::va_list as VaListArray>::Element;
+
+#[cfg(not(any(
+    all(target_arch = "powerpc", not(target_os = "uefi"), not(windows)),
+    target_arch = "s390x",
+    all(target_arch = "x86_64", not(target_os = "uefi"), not(windows)),
+)))]
 type VaListType = ffmpeg_sys_next::va_list;
 
 /// Log target used for every message forwarded from FFmpeg, so applications
