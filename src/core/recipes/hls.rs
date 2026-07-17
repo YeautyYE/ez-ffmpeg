@@ -16,10 +16,12 @@
 //!   (`0:a:0?`). No audio groups, no per-rendition audio.
 //! - Keyframe alignment across renditions is achieved with **fixed-GOP codec
 //!   AVOptions** (`g` / `keyint_min` / `sc_threshold`, plus closed-GOP
-//!   `x264-params` for libx264), not `force_key_frames` (which is not reachable
-//!   through this crate). Because every rendition shares the same CFR input and
-//!   the same GOP length, their keyframe PTS sequences coincide, so segments
-//!   split at the same PTS and are cross-switchable.
+//!   `x264-params` for libx264) rather than a spec-driven
+//!   [`Output::set_force_key_frames`](crate::Output::set_force_key_frames),
+//!   which remains available for hand-built pipelines. Because every rendition
+//!   shares the same CFR input and the same GOP length, their keyframe PTS
+//!   sequences coincide, so segments split at the same PTS and are
+//!   cross-switchable.
 //!
 //! Out of scope for the MVP (future work): VFR input, exact cross-rendition
 //! alignment guarantees, subtitles, audio groups (`EXT-X-MEDIA`), encryption
