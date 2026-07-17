@@ -258,11 +258,30 @@ unsafe fn open_input_file(
                 return Err(e);
             }
 
-            if !have_seek_callback && input_requires_seek(in_fmt_ctx) {
-                avformat_close_input(&mut in_fmt_ctx);
-                crate::core::context::free_input_opaque(avio_ctx);
-                warn!(target: LOG_TARGET, "The input format supports seeking, but no seek callback is provided. This may cause issues.");
-                return Err(OpenInputError::SeekFunctionMissing.into());
+            // The rawvideo demuxer over a read callback is purely sequential and
+            // never seeks on its own. For such an input the generic probe in
+            // `input_requires_seek` would run a destructive seek test that reads
+            // and discards frames through the callback — blocking a live push
+            // source at open, or mis-reporting a finite one depending on
+            // buffer/frame sizes. Skip the probe for rawvideo and reject it only
+            // when the caller asked for a reposition (`start_time_us` /
+            // `stream_loop`) that cannot be honored without a seek callback.
+            if !have_seek_callback {
+                if format_is_rawvideo(in_fmt_ctx) {
+                    let wants_reposition =
+                        input.start_time_us.is_some() || input.stream_loop.unwrap_or(0) != 0;
+                    if wants_reposition {
+                        avformat_close_input(&mut in_fmt_ctx);
+                        crate::core::context::free_input_opaque(avio_ctx);
+                        warn!(target: LOG_TARGET, "A rawvideo callback input requested repositioning (start_time_us/stream_loop), which requires a seek callback that was not provided.");
+                        return Err(OpenInputError::SeekFunctionMissing.into());
+                    }
+                } else if input_requires_seek(in_fmt_ctx) {
+                    avformat_close_input(&mut in_fmt_ctx);
+                    crate::core::context::free_input_opaque(avio_ctx);
+                    warn!(target: LOG_TARGET, "The input format supports seeking, but no seek callback is provided. This may cause issues.");
+                    return Err(OpenInputError::SeekFunctionMissing.into());
+                }
             }
         }
         Some(url) => {
@@ -710,6 +729,17 @@ mod find_stream_info_tests {
         assert!(!opts.dicts[0].is_null());
         drop(opts);
     }
+}
+
+/// True when the opened input is the rawvideo demuxer — a purely sequential
+/// elementary-stream format that never seeks on its own. Used to skip the
+/// destructive generic seek probe for callback-backed rawvideo inputs.
+unsafe fn format_is_rawvideo(fmt_ctx: *mut AVFormatContext) -> bool {
+    if fmt_ctx.is_null() || (*fmt_ctx).iformat.is_null() {
+        return false;
+    }
+    let name = CStr::from_ptr((*(*fmt_ctx).iformat).name).to_string_lossy();
+    name.split(',').any(|f| f == "rawvideo")
 }
 
 unsafe fn input_requires_seek(fmt_ctx: *mut AVFormatContext) -> bool {
