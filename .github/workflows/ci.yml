@@ -347,7 +347,7 @@ jobs:
 
       - name: Build default crate features with source FFmpeg on macOS
         if: matrix.os == 'macos'
-        run: cargo build --features ffmpeg-sys-next/build --verbose
+        run: cargo build --features ffmpeg-sys-next/build-videotoolbox --verbose
 
       # GPU-dependent features are compile-only above. This run exercises the
       # platform scheduler, device, socket, RTMP, subtitle, and async paths.
