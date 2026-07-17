@@ -132,6 +132,8 @@
 //! video), `-fix_sub_duration`, and two-pass encoding. Unsupported paths
 //! fail with explicit errors rather than approximations.
 //!
+#![doc = include_str!("../docs/cli_mapping.md")]
+//!
 //! ## Logging
 //!
 //! FFmpeg's own diagnostics (av_log) are redirected into the Rust `log`
