@@ -254,6 +254,10 @@ jobs:
             target: aarch64-apple-darwin
             build_features: ffmpeg-sys-next/build-videotoolbox,async,opengl,wgpu,rtmp,flv,subtitle
             test_features: ffmpeg-sys-next/build-videotoolbox,async,rtmp,flv,subtitle,wgpu
+            test_args: >-
+              --
+              --skip core::scheduler::ffmpeg_scheduler::tests::test_hwaccel
+              --skip core::scheduler::ffmpeg_scheduler::tests::test_to_stdout
           - runner: windows-2025
             platform: windows-2025-x64
             os: windows
@@ -261,6 +265,7 @@ jobs:
             vcpkg_triplet: x64-windows
             build_features: async,opengl,wgpu,rtmp,flv,subtitle
             test_features: async,rtmp,flv,subtitle,wgpu
+            test_args: ""
           - runner: windows-11-arm
             platform: windows-11-arm64
             os: windows
@@ -268,6 +273,7 @@ jobs:
             vcpkg_triplet: arm64-windows
             build_features: async,opengl,wgpu,rtmp,flv,subtitle
             test_features: async,rtmp,flv,subtitle,wgpu
+            test_args: ""
     env:
       CARGO_BUILD_JOBS: 2
       CARGO_INCREMENTAL: 0
@@ -349,10 +355,12 @@ jobs:
         if: matrix.os == 'macos'
         run: cargo build --features ffmpeg-sys-next/build-videotoolbox --verbose
 
-      # GPU-dependent features are compile-only above. This run exercises the
-      # platform scheduler, device, socket, RTMP, subtitle, and async paths.
+      # GPU-dependent features are compile-only above. GitHub's macOS runner
+      # also cannot create a VideoToolbox compression session, so its two
+      # hardware-encoder tests stay compile-only. The remaining suite exercises
+      # the platform scheduler, device, socket, RTMP, subtitle, and async paths.
       - name: Run CPU-only library tests
-        run: cargo test --lib --features "${{ matrix.test_features }}"
+        run: cargo test --lib --features "${{ matrix.test_features }}" ${{ matrix.test_args }}
 
   docs:
     name: Docs (docsrs cfg compile)
