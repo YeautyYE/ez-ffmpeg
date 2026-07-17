@@ -1,6 +1,7 @@
 # CI for ez-ffmpeg.
 #
-# Every job runs in a two-lane FFmpeg matrix, because the crate supports
+# Linux build and test jobs run on both native GitHub-hosted architectures
+# (x64 and ARM64) in a two-lane FFmpeg matrix, because the crate supports
 # linking either major and the two lanes are provisioned differently:
 #
 #   * ffmpeg 8.1 lane — `--features ffmpeg-sys-next/build`: the sys crate's
@@ -21,6 +22,12 @@
 # (nasm/yasm/clang/pkg-config/zlib). First build per lane compiles FFmpeg
 # (~10-20 min); caches make subsequent runs fast.
 #
+# Native platform coverage outside Linux runs once per GitHub-hosted
+# architecture: Apple Silicon macOS, Windows x64, and Windows ARM64. macOS
+# builds FFmpeg 8.1 from source, while Windows installs FFmpeg 8.1 through the
+# runner's vcpkg checkout. These jobs build every functional non-static feature,
+# compile the corresponding test trees, and run the CPU-only library suite.
+#
 # GPU-dependent code: the `opengl` frame filter needs a real GPU/display and
 # its tests fail headless ("Failed to create Surfman connection"), so the
 # `test` job omits that feature; the `build` job still compiles it (via
@@ -31,7 +38,8 @@
 # `#[cfg(target_os = "macos")]`, so they do not run on Linux.
 #
 # The `build` job (all-features build + a default-features build + clippy) and
-# the `test` job run per FFmpeg lane. Two lanes run once, not per FFmpeg:
+# the `test` job run per Linux architecture and FFmpeg lane. Two specialized
+# jobs run once on Linux x64:
 #
 #   * `docs` — compiles the crate under `--cfg docsrs` (`DOCS_RS=1`), which stubs
 #     ez-ffmpeg's own FFI call sites; the gate catches docsrs-stub compile gaps.
@@ -61,15 +69,27 @@ env:
 
 jobs:
   build:
-    name: Build & Clippy (FFmpeg ${{ matrix.ffmpeg }})
-    runs-on: ubuntu-latest
+    name: Build & Clippy (${{ matrix.arch }}, FFmpeg ${{ matrix.ffmpeg }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - ffmpeg: "8.1"
+          - runner: ubuntu-24.04
+            arch: x64
+            ffmpeg: "8.1"
             ffmpeg-features: "--features ffmpeg-sys-next/build"
-          - ffmpeg: "7.1"
+          - runner: ubuntu-24.04
+            arch: x64
+            ffmpeg: "7.1"
+            ffmpeg-features: ""
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            ffmpeg: "8.1"
+            ffmpeg-features: "--features ffmpeg-sys-next/build"
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            ffmpeg: "7.1"
             ffmpeg-features: ""
     steps:
       - uses: actions/checkout@v4
@@ -90,7 +110,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/ffmpeg71
-          key: ${{ runner.os }}-ffmpeg71-shared-v1
+          key: ${{ runner.os }}-${{ runner.arch }}-ffmpeg71-shared-v1
 
       - name: Build FFmpeg 7.1 from source (if not cached)
         if: matrix.ffmpeg == '7.1'
@@ -118,7 +138,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-ffmpeg${{ matrix.ffmpeg }}-${{ hashFiles('**/Cargo.toml') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-build-ffmpeg${{ matrix.ffmpeg }}-${{ hashFiles('**/Cargo.toml') }}
 
       - name: Build
         run: cargo build --all-features ${{ matrix.ffmpeg-features }} --verbose
@@ -143,15 +163,27 @@ jobs:
         run: cargo clippy --all-features ${{ matrix.ffmpeg-features }} --lib
 
   test:
-    name: Test (FFmpeg ${{ matrix.ffmpeg }})
-    runs-on: ubuntu-latest
+    name: Test (${{ matrix.arch }}, FFmpeg ${{ matrix.ffmpeg }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - ffmpeg: "8.1"
+          - runner: ubuntu-24.04
+            arch: x64
+            ffmpeg: "8.1"
             ffmpeg-features: "--features ffmpeg-sys-next/build"
-          - ffmpeg: "7.1"
+          - runner: ubuntu-24.04
+            arch: x64
+            ffmpeg: "7.1"
+            ffmpeg-features: ""
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            ffmpeg: "8.1"
+            ffmpeg-features: "--features ffmpeg-sys-next/build"
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            ffmpeg: "7.1"
             ffmpeg-features: ""
     # Runs the full library suite MINUS the opengl feature, whose tests need a
     # GPU/display (surfman connection creation fails headless). The wgpu
@@ -175,7 +207,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/ffmpeg71
-          key: ${{ runner.os }}-ffmpeg71-shared-v1
+          key: ${{ runner.os }}-${{ runner.arch }}-ffmpeg71-shared-v1
 
       - name: Build FFmpeg 7.1 from source (if not cached)
         if: matrix.ffmpeg == '7.1'
@@ -203,14 +235,128 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-ffmpeg${{ matrix.ffmpeg }}-${{ hashFiles('**/Cargo.toml') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-test-ffmpeg${{ matrix.ffmpeg }}-${{ hashFiles('**/Cargo.toml') }}
 
       - name: Test
         run: cargo test --lib --features async,rtmp,flv,subtitle,wgpu ${{ matrix.ffmpeg-features }}
 
+  platform:
+    name: Platform (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            platform: macos-15-arm64
+            os: macos
+            target: aarch64-apple-darwin
+            build_features: ffmpeg-sys-next/build-videotoolbox,async,opengl,wgpu,rtmp,flv,subtitle
+            test_features: ffmpeg-sys-next/build-videotoolbox,async,rtmp,flv,subtitle,wgpu
+          - runner: windows-2025
+            platform: windows-2025-x64
+            os: windows
+            target: x86_64-pc-windows-msvc
+            vcpkg_triplet: x64-windows
+            build_features: async,opengl,wgpu,rtmp,flv,subtitle
+            test_features: async,rtmp,flv,subtitle,wgpu
+          - runner: windows-11-arm
+            platform: windows-11-arm64
+            os: windows
+            target: aarch64-pc-windows-msvc
+            vcpkg_triplet: arm64-windows
+            build_features: async,opengl,wgpu,rtmp,flv,subtitle
+            test_features: async,rtmp,flv,subtitle,wgpu
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify native Rust target
+        shell: bash
+        run: |
+          rustc -vV
+          test "$(rustc -vV | sed -n 's/^host: //p')" = "${{ matrix.target }}"
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-platform-${{ hashFiles('**/Cargo.toml') }}
+
+      - name: Configure vcpkg
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $root = $env:VCPKG_INSTALLATION_ROOT
+          $cache = Join-Path $env:GITHUB_WORKSPACE "vcpkg-bincache"
+          New-Item -ItemType Directory -Force -Path $cache | Out-Null
+          "VCPKG_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "VCPKG_DEFAULT_TRIPLET=${{ matrix.vcpkg_triplet }}" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "VCPKGRS_TRIPLET=${{ matrix.vcpkg_triplet }}" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "VCPKGRS_DYNAMIC=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "VCPKG_DEFAULT_BINARY_CACHE=$cache" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "$root\installed\${{ matrix.vcpkg_triplet }}\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Cache vcpkg binary packages
+        if: matrix.os == 'windows'
+        uses: actions/cache@v4
+        with:
+          path: vcpkg-bincache
+          key: ${{ runner.os }}-${{ runner.arch }}-vcpkg-b5229343-ffmpeg-8.1.2-v1
+
+      - name: Install FFmpeg 8.1 with vcpkg
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          git config --global --add safe.directory $env:VCPKG_ROOT
+          if ($LASTEXITCODE -ne 0) { throw "git config exited with code $LASTEXITCODE" }
+          git -C $env:VCPKG_ROOT fetch --depth=1 origin b5229343b4b80264ed51e89c6a7dcd0cbe85e9cc
+          if ($LASTEXITCODE -ne 0) { throw "git fetch exited with code $LASTEXITCODE" }
+          git -C $env:VCPKG_ROOT checkout --force FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw "git checkout exited with code $LASTEXITCODE" }
+          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw "bootstrap-vcpkg exited with code $LASTEXITCODE" }
+          & "$env:VCPKG_ROOT\vcpkg.exe" install "ffmpeg:${{ matrix.vcpkg_triplet }}" --clean-after-build
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg install exited with code $LASTEXITCODE" }
+          $ffmpeg = & "$env:VCPKG_ROOT\vcpkg.exe" list | Select-String "^ffmpeg:"
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg list exited with code $LASTEXITCODE" }
+          if (-not $ffmpeg) { throw "The FFmpeg vcpkg package was not installed" }
+          $ffmpeg
+
+      # The crate-level `static` feature is intentionally omitted on Windows:
+      # these vcpkg triplets provide shared FFmpeg libraries. macOS uses the
+      # dependency's source-build feature directly. Every functional optional
+      # feature is type-checked on each native platform.
+      - name: Build all non-static features
+        run: cargo build --features "${{ matrix.build_features }}" --verbose
+
+      - name: Build all non-static feature tests
+        run: cargo test --lib --features "${{ matrix.build_features }}" --no-run
+
+      - name: Build default features on Windows
+        if: matrix.os == 'windows'
+        run: cargo build --verbose
+
+      - name: Build default crate features with source FFmpeg on macOS
+        if: matrix.os == 'macos'
+        run: cargo build --features ffmpeg-sys-next/build --verbose
+
+      # GPU-dependent features are compile-only above. This run exercises the
+      # platform scheduler, device, socket, RTMP, subtitle, and async paths.
+      - name: Run CPU-only library tests
+        run: cargo test --lib --features "${{ matrix.test_features }}"
+
   docs:
     name: Docs (docsrs cfg compile)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -229,7 +375,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-docs-${{ hashFiles('**/Cargo.toml') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-docs-${{ hashFiles('**/Cargo.toml') }}
 
       # `DOCS_RS=1` makes ez-ffmpeg's build.rs pass `--cfg docsrs`, compiling its FFI
       # call sites as stubs; this gate catches a docsrs-stub compile gap (a fn that
@@ -247,7 +393,8 @@ jobs:
 
   asan:
     name: ASAN (UAF, FFmpeg 8.1)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -266,7 +413,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-asan-${{ hashFiles('**/Cargo.toml') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-asan-${{ hashFiles('**/Cargo.toml') }}
 
       # `-Zsanitizer=address` instruments the target crates' Rust code. The explicit
       # `--target` scopes the sanitizer to those crates and off the host build
