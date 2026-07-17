@@ -314,6 +314,17 @@ impl FfmpegContextBuilder {
     /// muxer, otherwise from [`wait`](crate::FfmpegScheduler::wait) — not from
     /// `build()`.
     ///
+    /// The same applies to the filters of a
+    /// [`filter_desc`](FfmpegContextBuilder::filter_desc): `build()` validates the
+    /// description (syntax, filter and option names, link labels and pad counts) but
+    /// does **not** initialize the filters, so filter side effects — `movie=` opening
+    /// its file, model- or font-loading filters reading their resources,
+    /// destination-writing filters (e.g. `metadata=file=...`) creating or truncating
+    /// their target — only happen once the job runs. Consequently an init-time filter
+    /// error (a missing `movie=` source or model file, a bad font path, ...) also
+    /// surfaces at run time, from [`wait`](crate::FfmpegScheduler::wait), not from
+    /// `build()`.
+    ///
     /// # Example
     /// ```rust,ignore
     /// let context = FfmpegContextBuilder::new()
