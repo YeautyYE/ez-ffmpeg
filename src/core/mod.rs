@@ -336,6 +336,36 @@ pub mod hwaccel;
 ///   and any external libraries installed on the system.
 pub mod codec;
 
+/// The **capabilities** module provides lightweight probes for what the
+/// linked FFmpeg build contains — whether a muxer (output format) or an
+/// output-capable I/O protocol was compiled in. Use these before configuring
+/// outputs that depend on optional components (e.g. `whip`, `srt`) to fail
+/// fast with an actionable error instead of a mid-pipeline failure.
+///
+/// # Public API
+///
+/// - [`is_muxer_available()`](capabilities::is_muxer_available): Checks for a
+///   muxer by short name (e.g. `"matroska"`, `"mpegts"`, `"whip"`).
+/// - [`is_output_protocol_available()`](capabilities::is_output_protocol_available):
+///   Checks for an I/O protocol that supports writing (e.g. `"file"`, `"srt"`).
+///
+/// # Example
+///
+/// ```rust,ignore
+/// if !ez_ffmpeg::capabilities::is_muxer_available("whip") {
+///     eprintln!("this FFmpeg build lacks the whip muxer");
+/// }
+/// ```
+///
+/// # Notes
+///
+/// - A `true` result only means the component is registered in the linked
+///   FFmpeg build; encoders, TLS backends, endpoint compatibility, and
+///   network reachability are separate concerns.
+/// - Muxer names and protocol names are separate namespaces (the `srt`
+///   muxer is the SubRip subtitle format, not the SRT streaming protocol).
+pub mod capabilities;
+
 /// The **filter** module provides a flexible framework for custom frame processing
 /// within the FFmpeg pipeline, along with the ability to query FFmpeg's built-in filters.
 /// It introduces the [`FrameFilter`](filter::frame_filter::FrameFilter) trait, which defines how to apply transformations
