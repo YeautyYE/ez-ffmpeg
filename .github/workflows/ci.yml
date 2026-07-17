@@ -92,7 +92,7 @@ jobs:
             ffmpeg: "7.1"
             ffmpeg-features: ""
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install FFmpeg build toolchain
         run: |
@@ -107,7 +107,7 @@ jobs:
 
       - name: Cache FFmpeg 7.1 install
         if: matrix.ffmpeg == '7.1'
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/ffmpeg71
           key: ${{ runner.os }}-${{ runner.arch }}-ffmpeg71-shared-v1
@@ -132,7 +132,7 @@ jobs:
           echo "LD_LIBRARY_PATH=$HOME/ffmpeg71/lib" >> "$GITHUB_ENV"
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -192,7 +192,7 @@ jobs:
     # layout pins, builder checks — run for real. Media assets are committed
     # as test.mp4.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install FFmpeg build toolchain
         run: |
@@ -204,7 +204,7 @@ jobs:
 
       - name: Cache FFmpeg 7.1 install
         if: matrix.ffmpeg == '7.1'
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/ffmpeg71
           key: ${{ runner.os }}-${{ runner.arch }}-ffmpeg71-shared-v1
@@ -229,7 +229,7 @@ jobs:
           echo "LD_LIBRARY_PATH=$HOME/ffmpeg71/lib" >> "$GITHUB_ENV"
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -278,7 +278,7 @@ jobs:
       CARGO_BUILD_JOBS: 2
       CARGO_INCREMENTAL: 0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -289,7 +289,7 @@ jobs:
           test "$(rustc -vV | sed -n 's/^host: //p')" = "${{ matrix.target }}"
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -313,7 +313,7 @@ jobs:
 
       - name: Cache vcpkg binary packages
         if: matrix.os == 'windows'
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: vcpkg-bincache
           key: ${{ runner.os }}-${{ runner.arch }}-vcpkg-b5229343-ffmpeg-8.1.2-v1
@@ -366,7 +366,7 @@ jobs:
     name: Docs (docsrs cfg compile)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install FFmpeg build toolchain
         run: |
@@ -377,7 +377,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -404,7 +404,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install FFmpeg build toolchain
         run: |
@@ -415,7 +415,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
