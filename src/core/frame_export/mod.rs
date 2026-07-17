@@ -62,6 +62,9 @@ mod resolve;
 mod sink;
 mod video;
 
+#[cfg(test)]
+mod color_goldens;
+
 pub use error::FrameExportError;
 pub use frame::VideoFrame;
 pub use iter::FrameIter;
