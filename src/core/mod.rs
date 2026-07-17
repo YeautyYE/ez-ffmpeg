@@ -514,7 +514,7 @@ type VaListType = *mut ffmpeg_sys_next::__va_list_tag;
     not(target_os = "uefi"),
     not(windows),
 ))]
-type VaListType = *mut libc::c_void;
+type VaListType = ffmpeg_sys_next::__BindgenOpaqueArray<u64, 4>;
 
 #[cfg(all(target_arch = "powerpc", not(target_os = "uefi"), not(windows)))]
 type VaListType = *mut ffmpeg_sys_next::__va_list_tag_powerpc;
