@@ -321,10 +321,13 @@ impl HlsLadder {
     /// Builds the underlying [`FfmpegContext`] (consuming `self`, since [`Input`]
     /// is not `Clone`).
     ///
-    /// This creates the output directory tree and wires one HLS [`Output`] per
-    /// rendition, but does **not** run the job or write the master playlist —
-    /// that is [`run`](Self::run)'s job. Use this when you want to drive the
-    /// [`crate::FfmpegScheduler`] yourself.
+    /// This wires one HLS [`Output`] per rendition and creates the output
+    /// directory tree — but the directories are created only **after** the
+    /// context has been built, so a configuration rejected at build time (for
+    /// example a video encoder the linked FFmpeg build lacks) leaves no empty
+    /// rendition directories behind. It does **not** run the job or write the
+    /// master playlist — that is [`run`](Self::run)'s job. Use this when you
+    /// want to drive the [`crate::FfmpegScheduler`] yourself.
     pub fn build_context(self) -> Result<FfmpegContext> {
         self.validate()?;
 
@@ -350,18 +353,25 @@ impl HlsLadder {
         // builder does not conflict with the later use of `out_dir`.
         let HlsLadder { input, out_dir, .. } = self;
 
-        create_dir(&out_dir)?;
-        for rendition_dir in &rendition_dirs {
-            create_dir(rendition_dir)?;
-        }
-
         let mut builder = FfmpegContext::builder()
             .input(input)
             .filter_desc(filter_desc);
         for output in outputs {
             builder = builder.output(output);
         }
-        builder.build()
+        // Build first: encoder resolution happens inside build(), while
+        // output-file I/O is deferred to start(), so the directories are only
+        // needed before start(). Creating them after build() succeeds means a
+        // rejected configuration (e.g. an unavailable encoder) leaves no empty
+        // directory tree behind.
+        let context = builder.build()?;
+
+        create_dir(&out_dir)?;
+        for rendition_dir in &rendition_dirs {
+            create_dir(rendition_dir)?;
+        }
+
+        Ok(context)
     }
 
     /// Wires one rendition's HLS [`Output`]: playlist path, segment template,

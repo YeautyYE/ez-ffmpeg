@@ -14,6 +14,7 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use common::tmp_path_in;
+use ez_ffmpeg::error::{Error, OpenOutputError};
 use ez_ffmpeg::recipes::{HlsLadder, HlsSegmentType};
 use ez_ffmpeg::stream_info::{find_video_stream_info, StreamInfo};
 use ez_ffmpeg::{FfmpegContext, Output};
@@ -236,4 +237,33 @@ fn mpegts_default_ladder_layout_is_unchanged() {
         assert!(playlist.contains("#EXT-X-ENDLIST"));
         assert!(media_uris(&playlist).iter().all(|uri| uri.ends_with(".ts")));
     }
+}
+
+/// Fail-on-revert lock for the create-directories-after-build ordering: a
+/// ladder whose video encoder is unavailable must fail `build_context()`
+/// (with a `NAME`d error, exercising the diagnostics change too) and must not
+/// leave a half-created output directory tree behind.
+#[test]
+fn failed_build_leaves_no_directory_debris() {
+    let out_dir = tmp_path_in(SUBDIR, "no_debris_out");
+    let _ = std::fs::remove_dir_all(&out_dir);
+
+    let result = HlsLadder::new(fixture(), &out_dir)
+        .rendition(320, 240, "300k")
+        .segment_duration(1.0)
+        .fps(10, 1)
+        .video_codec("definitely_not_a_real_encoder")
+        .build_context();
+
+    match result {
+        Err(Error::OpenOutput(OpenOutputError::EncoderUnavailable { name })) => {
+            assert_eq!(name, "definitely_not_a_real_encoder");
+        }
+        Err(other) => panic!("expected EncoderUnavailable naming the codec, got {other:?}"),
+        Ok(_) => panic!("build_context must fail for an unavailable encoder"),
+    }
+    assert!(
+        !Path::new(&out_dir).exists(),
+        "a failed build_context() must not create the output directory tree"
+    );
 }
