@@ -17,8 +17,8 @@ use crate::core::scheduler::ffmpeg_scheduler::{FfmpegScheduler, Initialization};
 use crate::core::scheduler::filter_task::graph_opts_apply;
 use crate::core::scheduler::input_controller::SchNode;
 use crate::error::Error::{
-    FileSameAsInput, FilterDescUtf8, FilterNameUtf8, FilterZeroInputs, FilterZeroOutputs,
-    FrameFilterStreamTypeNoMatched, FrameFilterTypeNoMatched, ParseInteger,
+    FileSameAsInput, FilterZeroInputs, FilterZeroOutputs, FrameFilterStreamTypeNoMatched,
+    FrameFilterTypeNoMatched, ParseInteger,
 };
 use crate::error::FilterGraphParseError::{
     InvalidFileIndexInFg, InvalidFilterSpecifier, OutputUnconnected,
@@ -50,21 +50,19 @@ use ffmpeg_sys_next::{
     av_guess_frame_rate, av_inv_q, av_malloc, av_rescale_q, av_seek_frame, avcodec_alloc_context3,
     avcodec_descriptor_get, avcodec_descriptor_get_by_name, avcodec_find_encoder,
     avcodec_find_encoder_by_name, avcodec_get_name, avcodec_parameters_from_context,
-    avcodec_parameters_to_context, avfilter_pad_get_name, avfilter_pad_get_type,
-    avformat_alloc_context, avformat_alloc_output_context2, avformat_close_input,
-    avformat_find_stream_info, avformat_flush, avformat_free_context, avformat_open_input,
-    avio_alloc_context, AVCodec, AVCodecID, AVColorRange, AVColorSpace, AVFilterContext,
-    AVFilterInOut, AVFilterPad, AVFormatContext, AVMediaType, AVOutputFormat, AVPixelFormat,
-    AVRational, AVSampleFormat, AVStream, AVERROR_ENCODER_NOT_FOUND, AVFMT_FLAG_CUSTOM_IO,
-    AVFMT_GLOBALHEADER, AVFMT_NOBINSEARCH, AVFMT_NOFILE, AVFMT_NOGENSEARCH, AVFMT_NOSTREAMS,
-    AVSEEK_FLAG_BACKWARD, AV_CODEC_PROP_BITMAP_SUB, AV_CODEC_PROP_TEXT_SUB, AV_TIME_BASE,
+    avcodec_parameters_to_context, avformat_alloc_context, avformat_alloc_output_context2,
+    avformat_close_input, avformat_find_stream_info, avformat_flush, avformat_free_context,
+    avformat_open_input, avio_alloc_context, AVCodec, AVCodecID, AVColorRange, AVColorSpace,
+    AVFormatContext, AVMediaType, AVOutputFormat, AVPixelFormat, AVRational, AVSampleFormat,
+    AVStream, AVERROR_ENCODER_NOT_FOUND, AVFMT_FLAG_CUSTOM_IO, AVFMT_GLOBALHEADER,
+    AVFMT_NOBINSEARCH, AVFMT_NOFILE, AVFMT_NOGENSEARCH, AVFMT_NOSTREAMS, AVSEEK_FLAG_BACKWARD,
+    AV_CODEC_PROP_BITMAP_SUB, AV_CODEC_PROP_TEXT_SUB, AV_TIME_BASE,
 };
 #[cfg(not(docsrs))]
 use ffmpeg_sys_next::{
     av_buffer_ref, av_channel_layout_copy, av_packet_side_data_new, avcodec_get_supported_config,
-    avfilter_graph_segment_apply, avfilter_graph_segment_create_filters,
-    avfilter_graph_segment_free, avfilter_graph_segment_parse, AVChannelLayout,
-    AVFILTER_FLAG_HWDEVICE,
+    avfilter_graph_segment_create_filters, avfilter_graph_segment_free,
+    avfilter_graph_segment_parse, AVChannelLayout, AVFILTER_FLAG_HWDEVICE,
 };
 #[cfg(not(docsrs))]
 use ffmpeg_sys_next::{
@@ -73,11 +71,13 @@ use ffmpeg_sys_next::{
 };
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
-use std::ffi::{c_uint, c_void, CStr, CString};
+use std::ffi::{c_void, CStr, CString};
 use std::ptr::{null, null_mut};
 use std::sync::Arc;
 
 mod fg_bind;
+#[cfg(not(docsrs))]
+mod fg_probe;
 mod open_input;
 mod open_output;
 mod opt_util;
