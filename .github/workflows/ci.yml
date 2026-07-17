@@ -273,7 +273,7 @@ jobs:
             vcpkg_triplet: arm64-windows
             build_features: async,opengl,wgpu,rtmp,flv,subtitle
             test_features: async,rtmp,flv,subtitle,wgpu
-            test_args: ""
+            test_args: -- --test-threads=1
     env:
       CARGO_BUILD_JOBS: 2
       CARGO_INCREMENTAL: 0
