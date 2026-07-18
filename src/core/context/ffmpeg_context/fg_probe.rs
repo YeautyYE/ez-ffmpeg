@@ -57,6 +57,14 @@ pub(super) struct ProbedPad {
 pub(super) struct ProbedTopology {
     pub(super) inputs: Vec<ProbedPad>,
     pub(super) outputs: Vec<ProbedPad>,
+    /// Number of weakly-connected components over the created filters, where
+    /// the edges are the links the mirror pass established (labeled and
+    /// implicit alike). `1` for every ordinary chain; a `;`-separated
+    /// description whose parts share no link label yields one component per
+    /// part. Consumers that require a single coherent graph (the writer's
+    /// build path) reject anything else; the regular demuxer-driven path
+    /// ignores this field, preserving its historical acceptance.
+    pub(super) filter_components: usize,
 }
 
 /// Dynamic-pad filters whose `init` performs I/O or loads external resources
@@ -162,6 +170,10 @@ pub(super) unsafe fn init_topology_filters(seg: *mut AVFilterGraphSegment) -> i3
     }
     0
 }
+
+/// A would-be link between two created filters, in (chain, filter) node
+/// coordinates: (producer, consumer).
+type NodeEdge = ((usize, usize), (usize, usize));
 
 /// Link-table mirror of one created filter.
 struct NodeState {
@@ -392,6 +404,7 @@ fn link_inputs_mirror(
     ci: usize,
     fi: usize,
     open: &mut Vec<ProbedPad>,
+    edges: &mut Vec<NodeEdge>,
 ) -> Result<()> {
     let (eff, exact, nb_labels) = {
         let n = &nodes[ci][fi];
@@ -415,6 +428,7 @@ fn link_inputs_mirror(
                 unsafe { check_link_media_types(nodes, (cj, fj, pj), (ci, fi, pi)) }?;
                 nodes[cj][fj].out_linked[pj] = true;
                 nodes[ci][fi].in_linked[pi] = true;
+                edges.push(((cj, fj), (ci, fi)));
                 continue;
             }
         }
@@ -428,6 +442,7 @@ fn link_outputs_mirror(
     ci: usize,
     fi: usize,
     open: &mut Vec<ProbedPad>,
+    edges: &mut Vec<NodeEdge>,
 ) -> Result<()> {
     let (eff, exact, nb_labels) = {
         let n = &nodes[ci][fi];
@@ -451,6 +466,7 @@ fn link_outputs_mirror(
                 unsafe { check_link_media_types(nodes, (ci, fi, pi), (cj, fj, pj)) }?;
                 nodes[cj][fj].in_linked[pj] = true;
                 nodes[ci][fi].out_linked[pi] = true;
+                edges.push(((ci, fi), (cj, fj)));
                 continue 'pads;
             }
         } else {
@@ -474,6 +490,7 @@ fn link_outputs_mirror(
                     unsafe { check_link_media_types(nodes, (ci, fi, pi), (ci, nfi, pj)) }?;
                     nodes[ci][nfi].in_linked[pj] = true;
                     nodes[ci][fi].out_linked[pi] = true;
+                    edges.push(((ci, fi), (ci, nfi)));
                     continue 'pads;
                 }
                 break;
@@ -496,16 +513,58 @@ pub(super) unsafe fn probe_open_pads(seg: *mut AVFilterGraphSegment) -> Result<P
     let mut nodes = build_nodes(seg)?;
     let mut inputs = Vec::new();
     let mut outputs = Vec::new();
+    let mut edges = Vec::new();
     for ci in 0..nodes.len() {
         for fi in 0..nodes[ci].len() {
             if nodes[ci][fi].ctx.is_null() {
                 continue;
             }
-            link_inputs_mirror(&mut nodes, ci, fi, &mut inputs)?;
-            link_outputs_mirror(&mut nodes, ci, fi, &mut outputs)?;
+            link_inputs_mirror(&mut nodes, ci, fi, &mut inputs, &mut edges)?;
+            link_outputs_mirror(&mut nodes, ci, fi, &mut outputs, &mut edges)?;
         }
     }
-    Ok(ProbedTopology { inputs, outputs })
+    let filter_components = count_components(&nodes, &edges);
+    Ok(ProbedTopology {
+        inputs,
+        outputs,
+        filter_components,
+    })
+}
+
+/// Weakly-connected components of the created filters under the mirrored
+/// links, via a plain union-find over dense node ids. Skipped (null-ctx)
+/// entries are not nodes.
+fn count_components(nodes: &[Vec<NodeState>], edges: &[NodeEdge]) -> usize {
+    // Dense id per created filter.
+    let mut id = std::collections::HashMap::new();
+    for (ci, chain) in nodes.iter().enumerate() {
+        for (fi, n) in chain.iter().enumerate() {
+            if !n.ctx.is_null() {
+                let next = id.len();
+                id.insert((ci, fi), next);
+            }
+        }
+    }
+    let mut parent: Vec<usize> = (0..id.len()).collect();
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    for (a, b) in edges {
+        let (Some(&ia), Some(&ib)) = (id.get(a), id.get(b)) else {
+            continue;
+        };
+        let (ra, rb) = (find(&mut parent, ia), find(&mut parent, ib));
+        if ra != rb {
+            parent[ra] = rb;
+        }
+    }
+    (0..parent.len())
+        .filter(|&i| find(&mut parent, i) == i)
+        .count()
 }
 
 #[cfg(test)]

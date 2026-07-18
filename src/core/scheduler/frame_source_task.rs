@@ -353,6 +353,59 @@ mod tests {
         }
     }
 
+    /// The time-boxed send is the worker's liveness mechanism toward a
+    /// stalled filter channel: with the channel full and a terminal status
+    /// published, it must give up within one poll interval instead of
+    /// blocking, releasing the undelivered frame.
+    #[test]
+    fn blocked_send_observes_terminal_status() {
+        use crate::core::scheduler::ffmpeg_scheduler::STATUS_END;
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Instant;
+
+        let pool = test_pool();
+        let p = params(AV_PIX_FMT_GRAY8, 8, 2);
+        let boxed = |pool: &ObjPool<Frame>| FrameBox {
+            frame: pool.get().unwrap(),
+            frame_data: frame_data_for(&p),
+        };
+
+        let (tx, rx) = crossbeam_channel::bounded::<FrameBox>(1);
+        tx.send(boxed(&pool)).unwrap(); // channel now full; receiver held, never read
+        let status = Arc::new(AtomicUsize::new(STATUS_END));
+
+        let start = Instant::now();
+        let delivered = send_with_status_poll(&tx, boxed(&pool), &status, &pool);
+        assert!(!delivered, "terminal status must abort a blocked send");
+        // Generous hang-detection bound (one poll interval is 100 ms): this
+        // pins liveness, not latency, and must not flake under machine load.
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the abort must land within a few poll intervals, took {:?}",
+            start.elapsed()
+        );
+        drop(rx);
+    }
+
+    /// A vanished filter worker (receiver dropped) must fail the send
+    /// immediately, not hang.
+    #[test]
+    fn disconnected_filter_channel_fails_send() {
+        use crate::core::scheduler::ffmpeg_scheduler::STATUS_RUN;
+        use std::sync::atomic::AtomicUsize;
+
+        let pool = test_pool();
+        let p = params(AV_PIX_FMT_GRAY8, 8, 2);
+        let (tx, rx) = crossbeam_channel::bounded::<FrameBox>(1);
+        drop(rx);
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let frame_box = FrameBox {
+            frame: pool.get().unwrap(),
+            frame_data: frame_data_for(&p),
+        };
+        assert!(!send_with_status_poll(&tx, frame_box, &status, &pool));
+    }
+
     /// A recycled shell (released with buffers attached) must come back clean
     /// and refill correctly — the pool's unref_fn is what discharges the old
     /// buffers.

@@ -23,7 +23,7 @@ use crate::core::context::frame_source::{FrameSource, FrameSourceParams};
 use crate::core::writer::WriterError;
 use crossbeam_channel::Sender;
 
-use super::fg_bind::init_filter_graph;
+use super::fg_bind::{init_filter_graph, probe_writer_filter_shape};
 use super::opt_util::{choose_encoder, ofilter_bind_ost, process_metadata};
 
 /// Builds a frame-push context: one frame source, one filtergraph, one output.
@@ -51,38 +51,56 @@ pub(crate) fn build_writer_context(
     let mut outputs = vec![output];
     let mut muxs = open_output_files(&mut outputs, false, &interrupt_state)?;
 
+    // Stream maps address multi-stream mapping problems the writer does not
+    // have: its single video stream IS the mapping. Accepting maps here would
+    // either silently ignore them (this path binds pad 0 unconditionally) or
+    // demand the full map_manual machinery for one stream; reject instead.
+    if !muxs[0].stream_map_specs.is_empty() || !muxs[0].stream_maps.is_empty() {
+        return Err(WriterError::StreamMapsUnsupported.into());
+    }
+
     // The graph between the pushed frames and the encoder. "null" mirrors
     // init_simple_filtergraph's implicit per-output video graph.
     let desc = filter_desc.unwrap_or("null");
-    let mut filter_graph = init_filter_graph(0, desc, None, None, None)?;
 
-    // Exactly one video input pad and one video output pad. init_filter_graph
-    // rejects only zero-pad graphs; a multi-input filter_desc would strand pad
-    // 1 with no producer — its pre-config buffering would wait forever — and a
-    // multi-output graph would leave pad 1 unbound. Audio pads have no source
-    // or destination in a video-only writer, so they count as invalid too.
-    let input_pads = filter_graph.inputs.len();
-    let output_pads = filter_graph.outputs.len();
-    let video_input_pads = filter_graph
-        .inputs
-        .iter()
-        .filter(|i| i.media_type == AVMEDIA_TYPE_VIDEO)
-        .count();
-    let video_output_pads = filter_graph
-        .outputs
-        .iter()
-        .filter(|o| o.media_type == AVMEDIA_TYPE_VIDEO)
-        .count();
-    if input_pads != 1 || video_input_pads != 1 || output_pads != 1 || video_output_pads != 1 {
+    // Validate the description's shape BEFORE building: exactly one video
+    // input pad, one video output pad, and one connected component.
+    // - Pad counts alone are not enough: "nullsink;color=..." probes as one
+    //   open input + one open output, but the pushed frames would feed the
+    //   sink while the unrelated source feeds the encoder — with no duration
+    //   it never reaches EOF and finish() would hang. Any disconnected part
+    //   (even a fully closed "color,nullsink" side component) keeps the
+    //   configured graph producing or consuming on its own, so require a
+    //   single component outright.
+    // - A multi-input desc would strand pad 1 with no producer (its
+    //   pre-config buffering would wait forever); a multi-output desc would
+    //   leave pad 1 unbound; audio pads have no source or destination in a
+    //   video-only writer.
+    // Probing first also means zero-pad descriptions ("color", "nullsink")
+    // report the writer-typed FilterShape instead of init_filter_graph's
+    // generic zero-pad errors.
+    let shape = probe_writer_filter_shape(desc)?;
+    if shape.components > 1 {
+        return Err(WriterError::DisconnectedFilterGraph {
+            components: shape.components,
+        }
+        .into());
+    }
+    if shape.input_pads != 1
+        || shape.video_input_pads != 1
+        || shape.output_pads != 1
+        || shape.video_output_pads != 1
+    {
         return Err(WriterError::FilterShape {
-            input_pads,
-            video_input_pads,
-            output_pads,
-            video_output_pads,
+            input_pads: shape.input_pads,
+            video_input_pads: shape.video_input_pads,
+            output_pads: shape.output_pads,
+            video_output_pads: shape.video_output_pads,
         }
         .into());
     }
 
+    let mut filter_graph = init_filter_graph(0, desc, None, None, None)?;
     let fg_sender = ifilter_bind_frame_source(&mut filter_graph, &params);
 
     {
@@ -119,13 +137,15 @@ pub(crate) fn build_writer_context(
         }
     }
 
-    // NoVideoDestination without a demuxer: a disable_video()/streamless
-    // output never bound the graph output, so the mux got no source
-    // (check_output_streams' NotContainStream case) — and an AVFMT_NOSTREAMS/
-    // attachment-only output can pass that flag check while the graph output
-    // still has no destination (the case A caught with destination_is_empty).
-    // Either way the pushed frames have nowhere to go; without this check
-    // write() would block forever against a live-but-unconsumed channel.
+    // NoVideoDestination without a demuxer: when disable_video() skipped the
+    // bind above, the mux got no packet source and the graph output has no
+    // destination — the pushed frames would have nowhere to go and write()
+    // would block forever against a live-but-unconsumed channel. On the bind
+    // path both predicates are true by construction (ofilter_bind_ost created
+    // the stream and set the destination), so this is the disable_video gate
+    // plus a defensive invariant, not a runtime-muxer capability check: an
+    // exotic output format that accepts the stream at build time but rejects
+    // its packets surfaces from the mux worker as a normal pipeline error.
     if !muxs[0].has_src() || !filter_graph.outputs[0].has_dst() {
         warn!(target: LOG_TARGET, "Writer output consumes no video stream");
         return Err(OpenOutputError::NotContainStream.into());

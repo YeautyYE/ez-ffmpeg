@@ -14,9 +14,8 @@ ffmpeg -f rawvideo -pix_fmt rgba -s 640x360 -r 30 -i - -c:v mpeg4 -q:v 5 plasma.
 
 ## How to Run
 
-1. Navigate to the `examples/frames_to_video` directory.
-2. Run `cargo run` to execute the code.
-3. `plasma.mp4` is written to the current directory.
+1. From the repository root, run `cargo run --example frames_to_video`.
+2. `plasma.mp4` is written to the current directory.
 
 ## Code Explanation
 

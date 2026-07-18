@@ -429,13 +429,17 @@ fn filter_desc_transforms_frames() {
 
 /// A filter_desc that does not consume exactly one video input and produce
 /// exactly one video output is rejected at open() with a typed error — a
-/// stranded second input pad would otherwise buffer forever.
+/// stranded second input pad would otherwise buffer forever. Source-only and
+/// sink-only descriptions (zero open pads on one side) take the same typed
+/// error rather than the generic zero-pad parse errors.
 #[test]
 fn invalid_filter_shapes_are_rejected() {
     let shapes = [
         ("[a][b]overlay", "two inputs"),
         ("split", "two outputs"),
         ("anull", "audio pads"),
+        ("color=c=red:s=64x48", "source only"),
+        ("nullsink", "sink only"),
     ];
     for (desc, label) in shapes {
         let out = tmp_path(&format!("shape_{}.mp4", label.replace(' ', "_")));
@@ -448,6 +452,111 @@ fn invalid_filter_shapes_are_rejected() {
             "{label} ({desc}) must be FilterShape, got {result:?}"
         );
     }
+}
+
+/// A disconnected filter_desc whose parts happen to leave one open input and
+/// one open output must be rejected: the pushed frames would feed a sink
+/// while an unrelated source feeds the encoder — with no duration, forever.
+#[test]
+fn disconnected_filter_graph_is_rejected() {
+    let out = tmp_path("shape_disconnected.mp4");
+    let result = VideoWriter::builder(64, 48)
+        .filter_desc("nullsink;color=c=red:s=64x48")
+        .open(mp4_output(&out))
+        .map(|_| ());
+    assert!(
+        matches!(
+            result,
+            Err(Error::Writer(WriterError::DisconnectedFilterGraph {
+                components: 2
+            }))
+        ),
+        "expected DisconnectedFilterGraph, got {result:?}"
+    );
+}
+
+/// Stream maps have nothing to select on a writer output (the pushed frames
+/// are the only stream) and are rejected rather than silently ignored.
+#[test]
+fn stream_maps_are_rejected() {
+    let out = tmp_path("stream_map.mp4");
+    let result = VideoWriter::builder(64, 48)
+        .open(mp4_output(&out).add_stream_map("0:v"))
+        .map(|_| ());
+    assert!(
+        matches!(
+            result,
+            Err(Error::Writer(WriterError::StreamMapsUnsupported))
+        ),
+        "expected StreamMapsUnsupported, got {result:?}"
+    );
+}
+
+/// EOF tail timing: the explicit EOF marker closes the buffersrc at the
+/// accumulated frame-end time, so N frames at fps num/den yield a stream
+/// duration of exactly N*den/num seconds — the final frame keeps its full
+/// duration instead of being clipped at its start timestamp.
+#[test]
+fn eof_preserves_final_frame_duration() {
+    let out = tmp_path("tail_duration.mp4");
+    let out2 = out.clone();
+    within(30, "tail_duration", move || {
+        let mut w = VideoWriter::builder(64, 48)
+            .fps(5, 1)
+            .open(mp4_output(&out2))
+            .unwrap();
+        for i in 0..10 {
+            w.write_owned(frame(&w, i * 25)).unwrap();
+        }
+        w.finish().unwrap();
+    });
+    let (duration, time_base) = match find_video_stream_info(&out)
+        .expect("probe")
+        .expect("video stream")
+    {
+        StreamInfo::Video {
+            duration,
+            time_base,
+            nb_frames,
+            ..
+        } => {
+            assert_eq!(nb_frames, 10);
+            (duration, time_base)
+        }
+        other => panic!("expected video stream info, got {other:?}"),
+    };
+    let seconds = duration as f64 * time_base.num as f64 / time_base.den as f64;
+    assert!(
+        (seconds - 2.0).abs() < 0.05,
+        "10 frames at 5 fps must last 2.0s (full last-frame duration), got {seconds}"
+    );
+}
+
+/// An Output frame limit completes the job early and successfully: write()
+/// eventually reports PipelineClosed, finish() returns Ok, and the file holds
+/// exactly the limit.
+#[test]
+fn output_frame_limit_closes_pipeline_cleanly() {
+    let out = tmp_path("frame_limit.mp4");
+    let out2 = out.clone();
+    within(30, "frame_limit", move || {
+        let mut w = VideoWriter::builder(64, 48)
+            .fps(30, 1)
+            .queue_capacity(1)
+            .open(mp4_output(&out2).set_max_video_frames(3))
+            .unwrap();
+        let mut closed = false;
+        for i in 0..600 {
+            if w.write_owned(frame(&w, i as u8)).is_err() {
+                closed = true;
+                break;
+            }
+        }
+        assert!(closed, "the frame limit must eventually close ingress");
+        w.finish()
+            .expect("an early frame-limit completion is a success, not an error");
+    });
+    assert_eq!(video_nb_frames(&out), 3);
 }
 
 /// A pipeline that dies mid-stream must unblock write() with PipelineClosed
