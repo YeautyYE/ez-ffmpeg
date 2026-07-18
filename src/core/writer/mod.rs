@@ -153,6 +153,18 @@ pub enum WriterError {
     #[error("filter_desc must be a single connected graph; found {components} disconnected parts")]
     DisconnectedFilterGraph { components: usize },
 
+    /// The `filter_desc` is connected, but no directed path leads from its
+    /// input pad to its output pad (e.g.
+    /// `"color,split[out][aux];[aux][in]overlay,nullsink"`): the pushed
+    /// frames drain into a sink while an unrelated branch feeds the encoder,
+    /// so they could never influence the encoded output — and an unbounded
+    /// side source would keep the job from ever finishing.
+    #[error(
+        "filter_desc has no directed path from its input pad to its output \
+         pad; the pushed frames could not influence the encoded output"
+    )]
+    UnreachableFilterOutput,
+
     /// The [`Output`] carries stream maps (`add_stream_map` /
     /// `add_stream_map_with_copy`). The writer's single video stream is the
     /// only stream there is, so maps have nothing to select; rejecting them
@@ -364,16 +376,33 @@ impl VideoWriterBuilder {
     /// remedy). Must be a single connected graph
     /// ([`WriterError::DisconnectedFilterGraph`] otherwise) consuming exactly
     /// one video input and producing exactly one video output
-    /// ([`WriterError::FilterShape`] otherwise).
+    /// ([`WriterError::FilterShape`] otherwise), with the output downstream
+    /// of the input ([`WriterError::UnreachableFilterOutput`] otherwise).
+    ///
+    /// Generator filters embedded in the graph (`color`, `testsrc`, …) are
+    /// allowed as long as the pushed frames still reach the output — e.g.
+    /// compositing over a generated background with
+    /// `"color=...[bg];[in][bg]overlay=shortest=1"`. The same rules as the
+    /// FFmpeg CLI apply: a graph built to outlive the pushed stream (an
+    /// `overlay` without `shortest=1`, a `concat` onto an unbounded
+    /// generator) keeps running after [`finish`](VideoWriter::finish) closes
+    /// the input, until the generator ends or the job is aborted — that is
+    /// the semantics asked for, not a writer malfunction.
     pub fn filter_desc(mut self, desc: impl Into<String>) -> Self {
         self.filter_desc = Some(desc.into());
         self
     }
 
     /// Builds the pipeline and starts it, returning without waiting for the
-    /// first frame. `output` carries every existing [`Output`] capability:
-    /// codec, codec options, format, format options (`movflags`…),
-    /// write/seek callbacks, frame pipelines (wgpu…), bitrate, qscale.
+    /// first frame. `output` carries the [`Output`] capabilities that make
+    /// sense for a single pushed video stream: codec, codec options, format,
+    /// format options (`movflags`…), write/seek callbacks, frame pipelines
+    /// (wgpu…), bitrate, qscale, frame limits. Stream maps are the exception
+    /// and are rejected ([`WriterError::StreamMapsUnsupported`]) — there is
+    /// only one stream to map. A format that cannot actually carry the video
+    /// stream is not second-guessed at build time: it surfaces as a pipeline
+    /// error from [`finish`](VideoWriter::finish), like any other muxer
+    /// failure.
     pub fn open(self, output: impl Into<Output>) -> crate::error::Result<VideoWriter> {
         if self.width == 0
             || self.height == 0

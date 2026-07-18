@@ -475,6 +475,58 @@ fn disconnected_filter_graph_is_rejected() {
     );
 }
 
+/// A weakly connected graph whose output is NOT downstream of its input must
+/// be rejected: here the pushed frames drain into a sink while an unbounded
+/// generator feeds the encoder — the output would never contain a pushed
+/// frame and a healthy finish() could hang forever waiting for the generator.
+#[test]
+fn unreachable_filter_output_is_rejected() {
+    let out = tmp_path("shape_unreachable.mp4");
+    // Under a watchdog: if the gate ever regressed, open() would succeed and
+    // the drop would hang on the never-ending generator — fail loudly instead.
+    let result = within(15, "shape_unreachable", move || {
+        VideoWriter::builder(64, 48)
+            .filter_desc("color=c=red:s=64x48,split[out][aux];[aux][in]overlay,nullsink")
+            .open(mp4_output(&out))
+            .map(|_| ())
+    });
+    assert!(
+        matches!(
+            result,
+            Err(Error::Writer(WriterError::UnreachableFilterOutput))
+        ),
+        "expected UnreachableFilterOutput, got {result:?}"
+    );
+}
+
+/// The reachability gate must NOT over-reject legitimate generator graphs:
+/// compositing the pushed frames over an embedded generator has a directed
+/// input-to-output path (the pushed frames are the main overlay input) and
+/// must run and finish normally. `shortest=1` is FFmpeg's own requirement for
+/// ending a composite over an unbounded generator — identical to the CLI.
+#[test]
+fn generator_composite_graph_is_accepted() {
+    let out = tmp_path("generator_overlay.mp4");
+    let out2 = out.clone();
+    within(30, "generator_overlay", move || {
+        let mut w = VideoWriter::builder(64, 48)
+            .fps(30, 1)
+            .filter_desc("color=c=red:s=64x48[bg];[in][bg]overlay=shortest=1")
+            .open(mp4_output(&out2))
+            .unwrap();
+        for i in 0..8 {
+            w.write_owned(frame(&w, i * 30)).unwrap();
+        }
+        w.finish()
+            .expect("a generator-composite graph must finish on input EOF");
+    });
+    assert!(
+        video_nb_frames(&out) >= 8,
+        "all pushed frames must be composited (shortest=1 may emit a frame or \
+         two past the main EOF depending on generator pacing)"
+    );
+}
+
 /// Stream maps have nothing to select on a writer output (the pushed frames
 /// are the only stream) and are rejected rather than silently ignored.
 #[test]
@@ -495,41 +547,50 @@ fn stream_maps_are_rejected() {
 /// EOF tail timing: the explicit EOF marker closes the buffersrc at the
 /// accumulated frame-end time, so N frames at fps num/den yield a stream
 /// duration of exactly N*den/num seconds — the final frame keeps its full
-/// duration instead of being clipped at its start timestamp.
+/// duration instead of being clipped at its start timestamp. Covered for an
+/// integral rate and a fractional (NTSC) rate, whose per-frame duration is
+/// not representable in a decimal timebase; the tolerance is under half a
+/// frame so a clipped tail cannot pass.
 #[test]
 fn eof_preserves_final_frame_duration() {
-    let out = tmp_path("tail_duration.mp4");
-    let out2 = out.clone();
-    within(30, "tail_duration", move || {
-        let mut w = VideoWriter::builder(64, 48)
-            .fps(5, 1)
-            .open(mp4_output(&out2))
-            .unwrap();
-        for i in 0..10 {
-            w.write_owned(frame(&w, i * 25)).unwrap();
-        }
-        w.finish().unwrap();
-    });
-    let (duration, time_base) = match find_video_stream_info(&out)
-        .expect("probe")
-        .expect("video stream")
-    {
-        StreamInfo::Video {
-            duration,
-            time_base,
-            nb_frames,
-            ..
-        } => {
-            assert_eq!(nb_frames, 10);
-            (duration, time_base)
-        }
-        other => panic!("expected video stream info, got {other:?}"),
-    };
-    let seconds = duration as f64 * time_base.num as f64 / time_base.den as f64;
-    assert!(
-        (seconds - 2.0).abs() < 0.05,
-        "10 frames at 5 fps must last 2.0s (full last-frame duration), got {seconds}"
-    );
+    let cases: [(i32, i32, usize, &str); 2] = [(5, 1, 10, "integral"), (30000, 1001, 30, "ntsc")];
+    for (num, den, frames, label) in cases {
+        let out = tmp_path(&format!("tail_duration_{label}.mp4"));
+        let out2 = out.clone();
+        within(30, "tail_duration", move || {
+            let mut w = VideoWriter::builder(64, 48)
+                .fps(num, den)
+                .open(mp4_output(&out2))
+                .unwrap();
+            for i in 0..frames {
+                w.write_owned(frame(&w, (i * 7) as u8)).unwrap();
+            }
+            w.finish().unwrap();
+        });
+        let (duration, time_base) = match find_video_stream_info(&out)
+            .expect("probe")
+            .expect("video stream")
+        {
+            StreamInfo::Video {
+                duration,
+                time_base,
+                nb_frames,
+                ..
+            } => {
+                assert_eq!(nb_frames, frames as i64, "{label}: frame count");
+                (duration, time_base)
+            }
+            other => panic!("expected video stream info, got {other:?}"),
+        };
+        let seconds = duration as f64 * time_base.num as f64 / time_base.den as f64;
+        let expected = frames as f64 * den as f64 / num as f64;
+        let tolerance = 0.45 * den as f64 / num as f64; // under half a frame
+        assert!(
+            (seconds - expected).abs() < tolerance,
+            "{label}: {frames} frames at {num}/{den} fps must last {expected}s \
+             (full last-frame duration), got {seconds}"
+        );
+    }
 }
 
 /// An Output frame limit completes the job early and successfully: write()

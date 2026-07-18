@@ -99,6 +99,17 @@ pub(crate) fn build_writer_context(
         }
         .into());
     }
+    // One weak component is still not enough: the output pad must be
+    // DOWNSTREAM of the input pad. In
+    // "color,split[out][aux];[aux][in]overlay,nullsink" everything is weakly
+    // connected with exactly one open input and one open output, yet frames
+    // pushed into [in] flow only into the sink while the independent color
+    // source feeds [out]: the encoded output would not contain the pushed
+    // frames, and with no source duration the graph never reaches EOF — a
+    // healthy finish() would hang unboundedly.
+    if !shape.output_reachable {
+        return Err(WriterError::UnreachableFilterOutput.into());
+    }
 
     let mut filter_graph = init_filter_graph(0, desc, None, None, None)?;
     let fg_sender = ifilter_bind_frame_source(&mut filter_graph, &params);

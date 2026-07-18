@@ -52,11 +52,21 @@ pub(super) struct ProbedPad {
     /// Display name (`filter` or `filter:pad`), mirroring the naming the
     /// AVFilterInOut-based probe produced.
     pub(super) name: String,
+    /// (chain, filter) coordinates of the filter owning this pad, keyed like
+    /// [`ProbedTopology::edges`] endpoints — lets consumers run reachability
+    /// over the mirrored links.
+    pub(super) node: (usize, usize),
 }
 
 pub(super) struct ProbedTopology {
     pub(super) inputs: Vec<ProbedPad>,
     pub(super) outputs: Vec<ProbedPad>,
+    /// The mirrored links, directed producer -> consumer, over the same
+    /// (chain, filter) coordinates as [`ProbedPad::node`]. Lets consumers
+    /// check directed reachability (can frames entering an open input pad
+    /// influence an open output pad?), which weak component counting cannot
+    /// answer.
+    pub(super) edges: Vec<NodeEdge>,
     /// Number of weakly-connected components over the created filters, where
     /// the edges are the links the mirror pass established (labeled and
     /// implicit alike). `1` for every ordinary chain; a `;`-separated
@@ -172,8 +182,9 @@ pub(super) unsafe fn init_topology_filters(seg: *mut AVFilterGraphSegment) -> i3
 }
 
 /// A would-be link between two created filters, in (chain, filter) node
-/// coordinates: (producer, consumer).
-type NodeEdge = ((usize, usize), (usize, usize));
+/// coordinates, DIRECTED as (producer, consumer): frames flow from the first
+/// node into the second.
+pub(super) type NodeEdge = ((usize, usize), (usize, usize));
 
 /// Link-table mirror of one created filter.
 struct NodeState {
@@ -363,6 +374,7 @@ unsafe fn check_link_media_types(
 
 unsafe fn describe_pad(
     n: &NodeState,
+    node: (usize, usize),
     is_output: bool,
     pad_idx: usize,
     label: Option<String>,
@@ -396,6 +408,7 @@ unsafe fn describe_pad(
         linklabel: label.unwrap_or_default(),
         media_type,
         name,
+        node,
     })
 }
 
@@ -432,7 +445,7 @@ fn link_inputs_mirror(
                 continue;
             }
         }
-        open.push(unsafe { describe_pad(&nodes[ci][fi], false, pi, label) }?);
+        open.push(unsafe { describe_pad(&nodes[ci][fi], (ci, fi), false, pi, label) }?);
     }
     Ok(())
 }
@@ -496,7 +509,7 @@ fn link_outputs_mirror(
                 break;
             }
         }
-        open.push(unsafe { describe_pad(&nodes[ci][fi], true, pi, label) }?);
+        open.push(unsafe { describe_pad(&nodes[ci][fi], (ci, fi), true, pi, label) }?);
     }
     Ok(())
 }
@@ -527,6 +540,7 @@ pub(super) unsafe fn probe_open_pads(seg: *mut AVFilterGraphSegment) -> Result<P
     Ok(ProbedTopology {
         inputs,
         outputs,
+        edges,
         filter_components,
     })
 }
