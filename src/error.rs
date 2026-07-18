@@ -179,6 +179,9 @@ pub enum Error {
 
     #[error("Container info error: {0}")]
     ContainerInfo(#[from] ContainerInfoError),
+
+    #[error("Frame export error: {0}")]
+    FrameExport(#[from] crate::core::frame_export::FrameExportError),
 }
 
 // Hand-written counterpart of the #[from] the sibling variants derive: the
