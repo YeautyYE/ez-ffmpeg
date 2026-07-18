@@ -79,6 +79,10 @@
 /// ```
 pub mod context;
 
+/// Push raw video frames from Rust code into a full FFmpeg pipeline
+/// ([`VideoWriter`](writer::VideoWriter)).
+pub mod writer;
+
 /// Display matrix helpers shared by stream probing and filter graph setup.
 pub(crate) mod display;
 

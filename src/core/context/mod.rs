@@ -332,6 +332,7 @@ pub(super) mod decoder_stream;
 pub(super) mod demuxer;
 pub(super) mod encoder_stream;
 pub(super) mod filter_graph;
+pub(super) mod frame_source;
 pub(super) mod input_filter;
 pub(super) mod muxer;
 pub(super) mod obj_pool;
