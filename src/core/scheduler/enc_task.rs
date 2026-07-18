@@ -2080,13 +2080,28 @@ pub(crate) enum SendToMuxError {
 /// `demux_task`, streamcopy destinations — fftools sends both through the same
 /// `sch_send` path (ffmpeg_sched.c:2038-2077).
 pub(crate) fn send_to_mux(
-    packet_box: PacketBox,
+    mut packet_box: PacketBox,
     pkt_sender: &Sender<PacketBox>,
     pre_pkt_sender: &PreMuxQueueSender,
     mux_start_gate: &Arc<crate::core::context::MuxStartGate>,
     scheduler_status: &Arc<AtomicUsize>,
     pause_epoch: &Arc<AtomicUsize>,
 ) -> Result<(), SendToMuxError> {
+    // avcodec_receive_packet leaves stream_index at the packet shell's default
+    // (normally 0). The mux worker uses that field for per-stream scheduling
+    // before write_packet later stamps it, so packets from encoded stream 1+
+    // would otherwise advance stream 0's DTS and could starve a finite input in
+    // the balancing pass. PacketData is the canonical destination carried by
+    // every encoder/copy path. Preserve a negative stream_index because it is
+    // the demux-side per-stream EOF sentinel.
+    // SAFETY: Packet owns a live AVPacket for the duration of this mutation.
+    unsafe {
+        let pkt = packet_box.packet.as_mut_ptr();
+        if (*pkt).stream_index >= 0 {
+            (*pkt).stream_index = packet_box.packet_data.output_stream_index;
+        }
+    }
+
     if mux_start_gate.is_started() {
         return pkt_sender
             .send(packet_box)
@@ -2241,12 +2256,15 @@ const PRE_MUX_FULL_WAIT_SLICE: Duration = Duration::from_millis(200);
 #[cfg(all(test, not(docsrs)))]
 mod tests {
     use super::should_cascade_break;
-    use super::{account_slice, park_pre_mux, SendToMuxError, PRE_MUX_FULL_WAIT_SLICE};
+    use super::{
+        account_slice, park_pre_mux, send_to_mux, SendToMuxError, PRE_MUX_FULL_WAIT_SLICE,
+    };
     use crate::core::context::pre_mux_queue::{channel, PreMuxQueueConfig, PreQueueTryPush};
     use crate::core::context::{MuxStartGate, PacketBox, PacketData};
     use crate::core::scheduler::ffmpeg_scheduler::{
         notify_pause_waiters, STATUS_END, STATUS_PAUSE, STATUS_RUN,
     };
+    use ffmpeg_next::packet::{Mut, Ref};
     use ffmpeg_sys_next::AVMediaType::AVMEDIA_TYPE_VIDEO;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -2293,6 +2311,41 @@ mod tests {
         // Not finished: never break for a cascade, regardless of opened.
         assert!(!should_cascade_break(false, false));
         assert!(!should_cascade_break(true, false));
+    }
+
+    // Real packets returned by avcodec_receive_packet keep the AVPacket shell's
+    // default stream_index (0). The mux worker reads stream_index before its
+    // write-time fixup, so the shared send boundary must stamp the canonical
+    // PacketData destination. A negative value is the demux EOF sentinel and
+    // must survive unchanged.
+    #[test]
+    fn send_to_mux_stamps_data_stream_index_and_preserves_eof() {
+        let (pre_tx, _pre_rx) = channel(park_test_cfg());
+        let gate = Arc::new(MuxStartGate::new());
+        gate.start_with(|| {});
+        let (pkt_tx, pkt_rx) = crossbeam_channel::bounded(2);
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let pause_epoch = Arc::new(AtomicUsize::new(0));
+
+        let mut data = park_test_packet(8);
+        data.packet_data.output_stream_index = 2;
+        // SAFETY: `data` owns this live packet shell exclusively.
+        unsafe {
+            (*data.packet.as_mut_ptr()).stream_index = 0;
+        }
+        assert!(send_to_mux(data, &pkt_tx, &pre_tx, &gate, &status, &pause_epoch).is_ok());
+        let data = pkt_rx.recv().unwrap();
+        assert_eq!(unsafe { (*data.packet.as_ptr()).stream_index }, 2);
+
+        let mut eof = park_test_packet(0);
+        eof.packet_data.output_stream_index = 2;
+        // SAFETY: `eof` owns this live packet shell exclusively.
+        unsafe {
+            (*eof.packet.as_mut_ptr()).stream_index = -1;
+        }
+        assert!(send_to_mux(eof, &pkt_tx, &pre_tx, &gate, &status, &pause_epoch).is_ok());
+        let eof = pkt_rx.recv().unwrap();
+        assert_eq!(unsafe { (*eof.packet.as_ptr()).stream_index }, -1);
     }
 
     // A full pre-mux queue whose deferred-start gate never opens and whose
