@@ -37,26 +37,37 @@
 //!
 //! [`ColorPolicy::Tagged`] (the default) honors the frame's own colorspace tags
 //! when converting YUV → RGB, so BT.709 (HD) content is not silently decoded as
-//! BT.601. [`ColorPolicy::Force`] pins a specific matrix/range for all frames.
+//! BT.601. [`ColorPolicy::TaggedOrResolutionGuess`] additionally fills in
+//! UNTAGGED frames with a per-frame resolution guess (height ≥ 720 → BT.709,
+//! else BT.601) without ever overriding real tags. [`ColorPolicy::Force`] pins
+//! a specific matrix/range for all frames.
 //!
 //! # Threading & teardown
 //!
-//! A run drives the normal scheduler (demux → decode → filtergraph → null
-//! output) with the export sink mounted on the output frame pipeline. The
-//! returned [`FrameIter`] is `Send` (consume it on a worker thread) and fused
-//! (exactly one terminal error, then `None` forever). Dropping it early aborts
-//! the run cleanly — teardown drops the receiver before aborting the scheduler,
-//! which may block until in-flight FFmpeg calls return.
+//! A run drives the normal scheduler (demux → decode → input frame pipeline →
+//! filtergraph → null output) with the export sink mounted on the output frame
+//! pipeline. Every run carries a dedicated input-pipeline thread (the
+//! per-frame HDR guard / color stamp, plus the `UniformN` sampler when used)
+//! between the decoder and the filtergraph, connected by a small bounded
+//! channel hop. The returned [`FrameIter`] is `Send` (consume it on a worker
+//! thread) and fused (exactly one terminal error, then `None` forever).
+//! Dropping it early aborts the run cleanly — teardown drops the receiver
+//! before aborting the scheduler, which may block until in-flight FFmpeg calls
+//! return.
 //!
 //! # Non-goals (v1)
 //!
 //! Random access by index/timestamp, planar / >8-bit output, HDR tone mapping
-//! (HDR input is a typed error, detected at open time from stream parameters —
-//! a mid-stream splice to HDR is not yet detected), GPU-frame export without
-//! download, and Python bindings are out of scope.
+//! (HDR input is a typed error — declared HDR fails at open time from stream
+//! parameters, and decoded frames are re-checked at runtime, so a mid-stream
+//! splice to HDR surfaces the same typed error instead of wrong colors; on
+//! inputs with multiple video streams, set `video_stream_index` to keep that
+//! runtime guard on the exported stream), GPU-frame export without download,
+//! and Python bindings are out of scope.
 
 mod error;
 mod frame;
+mod guard;
 mod iter;
 mod options;
 mod resolve;

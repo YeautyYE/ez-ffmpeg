@@ -125,6 +125,19 @@ pub enum ColorPolicy {
     /// documented default (BT.601 / limited). This is the default.
     #[default]
     Tagged,
+    /// Like [`Tagged`](ColorPolicy::Tagged), but frames with an UNSPECIFIED
+    /// colorspace get a per-frame resolution guess: BT.709 when the frame
+    /// height is at least 720, BT.601 otherwise (an UNSPECIFIED range is
+    /// pinned to limited). Tagged frames are never overridden, and the guess
+    /// never freezes — a mid-stream change from untagged to tagged (or a
+    /// resolution change) takes effect on that very frame.
+    ///
+    /// On inputs with multiple video streams, set
+    /// [`video_stream_index`](super::FrameExtractor::video_stream_index) if the
+    /// exported stream is not the first video stream; the run is otherwise
+    /// rejected with a typed error rather than silently leaving the exported
+    /// stream unstamped.
+    TaggedOrResolutionGuess,
     /// Force a specific interpretation for ALL frames, overriding any tags.
     Force {
         /// The YUV matrix to assume.
