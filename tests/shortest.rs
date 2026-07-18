@@ -117,18 +117,21 @@ fn shortest_stops_infinite_video_at_short_audio() {
     );
 }
 
-/// Three encoded streams exercise the `sq_enc` cascade-cut path. Audio (2 s) is
+/// Three encoded streams exercise the `sq_enc` cascade-cut path. Audio (10 s) is
 /// the shortest; two INFINITE videos are both cascade-cut when it ends. With 3+
 /// streams, a cascade-cut stream that keeps its now-stale timestamp in the input
 /// balancer can choke a peer that another cascade-cut stream's drain is waiting
 /// on — a deadlock that a 2-stream job never hits (the sole other stream is
-/// always the trailing one). Both videos must be cut at ~2 s and the job must
+/// always the trailing one). Both videos must be cut at ~10 s and the job must
 /// terminate; a hang here means a cascade-cut stream never left the balancer.
 #[test]
 fn shortest_stops_three_streams_with_two_infinite_videos() {
     let out = tmp_path("shortest_three_streams.mp4");
     let scheduler = FfmpegContext::builder()
-        .input(lavfi_audio_secs(2))
+        // Long enough that input balancing starts before this synthetic source
+        // reaches EOF. With 2 s the demuxer can win the startup race and hide a
+        // bug that chokes the finite source mid-stream.
+        .input(lavfi_audio_secs(10))
         .input(lavfi_video_infinite())
         .input(lavfi_video_infinite())
         .output(
@@ -148,7 +151,7 @@ fn shortest_stops_three_streams_with_two_infinite_videos() {
     let result = wait_with_watchdog(scheduler, 60, "shortest stops three streams");
     assert!(result.is_ok(), "-shortest 3-stream job failed: {result:?}");
 
-    // Both infinite videos are cut at the 2 s audio bound. `find_video_stream_info`
+    // Both infinite videos are cut at the 10 s audio bound. `find_video_stream_info`
     // reports the first video; a bounded count (not thousands) proves the cut —
     // and termination at all proves BOTH infinite videos were stopped. The upper
     // bound is looser than the two-stream test: with three encoders competing for
@@ -157,8 +160,8 @@ fn shortest_stops_three_streams_with_two_infinite_videos() {
     // fails loudly on a real regression.
     let frames = video_nb_frames(&out);
     assert!(
-        (45..=120).contains(&frames),
-        "video should be truncated near the 2s audio bound, got {frames}"
+        (240..=390).contains(&frames),
+        "video should be truncated near the 10s audio bound, got {frames}"
     );
 }
 
