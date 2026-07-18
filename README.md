@@ -4,10 +4,12 @@
 
 <div align="center">
 
-[![CI](https://github.com/YeautyYE/ez-ffmpeg/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/YeautyYE/ez-ffmpeg/actions/workflows/ci.yml?query=branch%3Amain+event%3Apush)
 [![Crates.io](https://img.shields.io/crates/v/ez-ffmpeg.svg)](https://crates.io/crates/ez-ffmpeg)
 [![Documentation](https://img.shields.io/badge/docs.rs-ez--ffmpeg-blue)](https://docs.rs/ez-ffmpeg)
 [![License: MIT/Apache-2.0/MPL-2.0](https://img.shields.io/badge/License-MIT%2FApache--2.0%2FMPL--2.0-brightgreen.svg)](https://github.com/YeautyYE/ez-ffmpeg/blob/main/LICENSE-APACHE)
+[![Rust](https://img.shields.io/badge/Rust-%3E=1.80.0-orange)](https://www.rust-lang.org/)
+[![FFmpeg](https://img.shields.io/badge/FFmpeg-7.0--8.x-blue)](https://ffmpeg.org)
+[![CI](https://github.com/YeautyYE/ez-ffmpeg/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/YeautyYE/ez-ffmpeg/actions/workflows/ci.yml?query=branch%3Amain+event%3Apush)
 
 </div>
 
@@ -36,16 +38,6 @@ Not every CLI feature is implemented. Notable gaps (unsupported paths fail with 
 
 - **Rust:** Version 1.80.0 or higher.
 - **FFmpeg:** Version 7.0 through 8.x (one build links either major; the bindings gate on the installed version).
-
-### Continuously Tested Platforms
-
-The following native targets and FFmpeg versions are continuously tested by GitHub Actions. This matrix is not an exhaustive list of targets on which `ez-ffmpeg` may work.
-
-| Operating system | Rust targets tested in CI | FFmpeg versions |
-| --- | --- | --- |
-| Linux | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` | 7.1, 8.1 |
-| macOS | `aarch64-apple-darwin` | 7.1, 8.1 |
-| Windows | `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc` | 7.1, 8.1 |
 
 ## Documentation
 
@@ -185,6 +177,16 @@ adopting one globally.
 - **flv:** Provides support for FLV container parsing and handling.
 - **async:** Adds asynchronous functionality (allowing you to `.await` operations).
 - **static:** Enables static linking for FFmpeg libraries (via `ffmpeg-next/static`).
+
+## Continuously Tested Platforms
+
+The following native targets and FFmpeg versions are continuously tested by GitHub Actions. This matrix is not an exhaustive list of targets on which `ez-ffmpeg` may work.
+
+| Operating system | Rust targets tested in CI | FFmpeg versions |
+| --- | --- | --- |
+| Linux | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` | 7.1, 8.1 |
+| macOS | `aarch64-apple-darwin` | 7.1, 8.1 |
+| Windows | `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc` | 7.1, 8.1 |
 
 ## License
 
