@@ -7,9 +7,10 @@
 //! makes it trivially unit-testable and keeps [`crate::core::recipes::hls`]
 //! focused on wiring FFmpeg outputs.
 //!
-//! The generator is intentionally conservative (see the R4 MVP notes in
-//! `HlsLadder`): it emits `#EXT-X-VERSION:3`, one `#EXT-X-STREAM-INF` per
-//! variant with `BANDWIDTH` and `RESOLUTION`, and an optional `CODECS`
+//! The generator is intentionally conservative (see the MVP boundary notes on
+//! `HlsLadder`): it emits `#EXT-X-VERSION:<version>` (the hls recipe passes
+//! `3` for MPEG-TS ladders and `7` for fMP4 ones), one `#EXT-X-STREAM-INF`
+//! per variant with `BANDWIDTH` and `RESOLUTION`, and an optional `CODECS`
 //! attribute. Variants are sorted ascending by `BANDWIDTH` so the first entry
 //! is the lowest-bitrate fallback, matching HLS client expectations.
 
@@ -45,7 +46,9 @@ pub(crate) struct MasterVariant {
     pub(crate) codecs: Option<String>,
 }
 
-/// Renders the master playlist text for `variants`.
+/// Renders the master playlist text for `variants`, declaring `version` as
+/// the `EXT-X-VERSION` (the hls recipe passes `3` for MPEG-TS segments and
+/// `7` for fMP4 segments).
 ///
 /// The variants are sorted ascending by [`MasterVariant::bandwidth`] (the input
 /// slice is not mutated). Each variant produces a two-line block:
@@ -57,12 +60,12 @@ pub(crate) struct MasterVariant {
 ///
 /// An empty `variants` slice still yields a valid (header-only) playlist; the
 /// caller is expected to reject empty ladders before reaching this point.
-pub(crate) fn generate_master_playlist(variants: &[MasterVariant]) -> String {
+pub(crate) fn generate_master_playlist(variants: &[MasterVariant], version: u32) -> String {
     // Sort references so we never disturb the caller's ordering.
     let mut ordered: Vec<&MasterVariant> = variants.iter().collect();
     ordered.sort_by_key(|v| v.bandwidth);
 
-    let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:3\n");
+    let mut out = format!("#EXTM3U\n#EXT-X-VERSION:{version}\n");
     for v in ordered {
         // `write!` into a String is infallible, but honour the Result to keep
         // clippy happy without unwrapping.
@@ -96,14 +99,18 @@ mod tests {
     }
 
     #[test]
-    fn header_is_version_3() {
-        let text = generate_master_playlist(&[variant(800_000, 640, 360, "360p/index.m3u8")]);
+    fn header_carries_the_requested_version() {
+        let text = generate_master_playlist(&[variant(800_000, 640, 360, "360p/index.m3u8")], 3);
         assert!(text.starts_with("#EXTM3U\n#EXT-X-VERSION:3\n"));
+
+        // fMP4 ladders pass 7; the version is written verbatim.
+        let text = generate_master_playlist(&[variant(800_000, 640, 360, "360p/index.m3u8")], 7);
+        assert!(text.starts_with("#EXTM3U\n#EXT-X-VERSION:7\n"));
     }
 
     #[test]
     fn stream_inf_has_bandwidth_and_resolution_then_uri() {
-        let text = generate_master_playlist(&[variant(1_500_000, 1280, 720, "720p/index.m3u8")]);
+        let text = generate_master_playlist(&[variant(1_500_000, 1280, 720, "720p/index.m3u8")], 3);
         assert!(text.contains("#EXT-X-STREAM-INF:BANDWIDTH=1500000,RESOLUTION=1280x720\n"));
         // The child URI is on its own line directly after the STREAM-INF tag.
         assert!(text.contains("RESOLUTION=1280x720\n720p/index.m3u8\n"));
@@ -119,7 +126,7 @@ mod tests {
             variant(800_000, 640, 360, "360p/index.m3u8"),
             variant(1_500_000, 1280, 720, "720p/index.m3u8"),
         ];
-        let text = generate_master_playlist(&variants);
+        let text = generate_master_playlist(&variants, 3);
 
         let pos_360 = text.find("360p/index.m3u8").unwrap();
         let pos_720 = text.find("720p/index.m3u8").unwrap();
@@ -136,13 +143,13 @@ mod tests {
     fn codecs_attribute_is_quoted_when_present() {
         let mut v = variant(1_500_000, 1280, 720, "720p/index.m3u8");
         v.codecs = Some("avc1.640028,mp4a.40.2".to_string());
-        let text = generate_master_playlist(&[v]);
+        let text = generate_master_playlist(&[v], 3);
         assert!(text.contains(",CODECS=\"avc1.640028,mp4a.40.2\"\n"));
     }
 
     #[test]
     fn empty_ladder_yields_header_only() {
-        let text = generate_master_playlist(&[]);
+        let text = generate_master_playlist(&[], 3);
         assert_eq!(text, "#EXTM3U\n#EXT-X-VERSION:3\n");
     }
 }
