@@ -28,10 +28,11 @@
 # GitHub can schedule the same runner architecture on different CPU generations;
 # restoring those compiled artifacts can otherwise terminate tests with SIGILL.
 #
-# Native platform coverage outside Linux runs once per GitHub-hosted
-# architecture: Apple Silicon macOS, Windows x64, and Windows ARM64. macOS
-# builds FFmpeg 8.1 from source, while Windows installs FFmpeg 8.1 through the
-# runner's vcpkg checkout. These jobs build every functional non-static feature,
+# Native platform coverage outside Linux runs both FFmpeg lanes on every
+# GitHub-hosted architecture: Apple Silicon macOS, Windows x64, and Windows
+# ARM64. macOS builds FFmpeg 8.1 from source and uses Homebrew's versioned
+# FFmpeg 7 formula; Windows checks out pinned vcpkg revisions whose ports carry
+# FFmpeg 8.1.2 and 7.1.2. These jobs build every functional non-static feature,
 # compile the corresponding test trees, and run the CPU-only library suite.
 #
 # GPU-dependent code: the `opengl` frame filter needs a real GPU/display and
@@ -245,7 +246,7 @@ jobs:
         run: cargo test --lib --features async,rtmp,flv,subtitle,wgpu ${{ matrix.ffmpeg-features }}
 
   platform:
-    name: Platform (${{ matrix.platform }})
+    name: Platform (${{ matrix.platform }}, FFmpeg ${{ matrix.ffmpeg }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     strategy:
@@ -256,8 +257,22 @@ jobs:
             platform: macos-15-arm64
             os: macos
             target: aarch64-apple-darwin
+            ffmpeg: "8.1"
             build_features: ffmpeg-sys-next/build-videotoolbox,async,opengl,wgpu,rtmp,flv,subtitle
             test_features: ffmpeg-sys-next/build-videotoolbox,async,rtmp,flv,subtitle,wgpu
+            default_ffmpeg_features: --features ffmpeg-sys-next/build-videotoolbox
+            test_args: >-
+              --
+              --skip core::scheduler::ffmpeg_scheduler::tests::test_hwaccel
+              --skip core::scheduler::ffmpeg_scheduler::tests::test_to_stdout
+          - runner: macos-15
+            platform: macos-15-arm64
+            os: macos
+            target: aarch64-apple-darwin
+            ffmpeg: "7.1"
+            build_features: async,opengl,wgpu,rtmp,flv,subtitle
+            test_features: async,rtmp,flv,subtitle,wgpu
+            default_ffmpeg_features: ""
             test_args: >-
               --
               --skip core::scheduler::ffmpeg_scheduler::tests::test_hwaccel
@@ -266,17 +281,49 @@ jobs:
             platform: windows-2025-x64
             os: windows
             target: x86_64-pc-windows-msvc
+            ffmpeg: "8.1"
             vcpkg_triplet: x64-windows
+            vcpkg_ref: b5229343b4b80264ed51e89c6a7dcd0cbe85e9cc
+            vcpkg_cache: b5229343-ffmpeg-8.1.2-v1
             build_features: async,opengl,wgpu,rtmp,flv,subtitle
             test_features: async,rtmp,flv,subtitle,wgpu
+            default_ffmpeg_features: ""
+            test_args: ""
+          - runner: windows-2025
+            platform: windows-2025-x64
+            os: windows
+            target: x86_64-pc-windows-msvc
+            ffmpeg: "7.1"
+            vcpkg_triplet: x64-windows
+            vcpkg_ref: 6070d5cb2f818921c10ccdf6f35f3415a2503369
+            vcpkg_cache: 6070d5cb-ffmpeg-7.1.2-p5-v1
+            build_features: async,opengl,wgpu,rtmp,flv,subtitle
+            test_features: async,rtmp,flv,subtitle,wgpu
+            default_ffmpeg_features: ""
             test_args: ""
           - runner: windows-11-arm
             platform: windows-11-arm64
             os: windows
             target: aarch64-pc-windows-msvc
+            ffmpeg: "8.1"
             vcpkg_triplet: arm64-windows
+            vcpkg_ref: b5229343b4b80264ed51e89c6a7dcd0cbe85e9cc
+            vcpkg_cache: b5229343-ffmpeg-8.1.2-v1
             build_features: async,opengl,wgpu,rtmp,flv,subtitle
             test_features: async,rtmp,flv,subtitle,wgpu
+            default_ffmpeg_features: ""
+            test_args: -- --test-threads=1
+          - runner: windows-11-arm
+            platform: windows-11-arm64
+            os: windows
+            target: aarch64-pc-windows-msvc
+            ffmpeg: "7.1"
+            vcpkg_triplet: arm64-windows
+            vcpkg_ref: 6070d5cb2f818921c10ccdf6f35f3415a2503369
+            vcpkg_cache: 6070d5cb-ffmpeg-7.1.2-p5-v1
+            build_features: async,opengl,wgpu,rtmp,flv,subtitle
+            test_features: async,rtmp,flv,subtitle,wgpu
+            default_ffmpeg_features: ""
             test_args: -- --test-threads=1
     env:
       CARGO_BUILD_JOBS: 2
@@ -300,6 +347,27 @@ jobs:
             ~/.cargo/git
           key: ${{ runner.os }}-cargo-sources-v1-${{ hashFiles('**/Cargo.toml') }}
 
+      # ffmpeg@7 is keg-only and uses absolute Homebrew install names, so its
+      # shared libraries remain discoverable without DYLD_LIBRARY_PATH. The
+      # versioned formula tracks the latest 7.1 patch release.
+      - name: Install FFmpeg 7.1 with Homebrew
+        if: matrix.os == 'macos' && matrix.ffmpeg == '7.1'
+        shell: bash
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: |
+          brew install ffmpeg@7
+          prefix="$(brew --prefix ffmpeg@7)"
+          version="$("$prefix/bin/ffmpeg" -version | sed -n 's/^ffmpeg version \([^ ]*\).*/\1/p')"
+          case "$version" in
+            7.1*) ;;
+            *) echo "Expected FFmpeg 7.1.x, found $version" >&2; exit 1 ;;
+          esac
+          echo "PKG_CONFIG_PATH=$prefix/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "$prefix/bin" >> "$GITHUB_PATH"
+          PKG_CONFIG_PATH="$prefix/lib/pkgconfig" pkg-config --modversion libavcodec
+
       - name: Configure vcpkg
         if: matrix.os == 'windows'
         shell: pwsh
@@ -319,15 +387,15 @@ jobs:
         uses: actions/cache@v6
         with:
           path: vcpkg-bincache
-          key: ${{ runner.os }}-${{ runner.arch }}-vcpkg-b5229343-ffmpeg-8.1.2-v1
+          key: ${{ runner.os }}-${{ runner.arch }}-vcpkg-${{ matrix.vcpkg_cache }}
 
-      - name: Install FFmpeg 8.1 with vcpkg
+      - name: Install FFmpeg ${{ matrix.ffmpeg }} with vcpkg
         if: matrix.os == 'windows'
         shell: pwsh
         run: |
           git config --global --add safe.directory $env:VCPKG_ROOT
           if ($LASTEXITCODE -ne 0) { throw "git config exited with code $LASTEXITCODE" }
-          git -C $env:VCPKG_ROOT fetch --depth=1 origin b5229343b4b80264ed51e89c6a7dcd0cbe85e9cc
+          git -C $env:VCPKG_ROOT fetch --depth=1 origin ${{ matrix.vcpkg_ref }}
           if ($LASTEXITCODE -ne 0) { throw "git fetch exited with code $LASTEXITCODE" }
           git -C $env:VCPKG_ROOT checkout --force FETCH_HEAD
           if ($LASTEXITCODE -ne 0) { throw "git checkout exited with code $LASTEXITCODE" }
@@ -338,25 +406,28 @@ jobs:
           $ffmpeg = & "$env:VCPKG_ROOT\vcpkg.exe" list | Select-String "^ffmpeg:"
           if ($LASTEXITCODE -ne 0) { throw "vcpkg list exited with code $LASTEXITCODE" }
           if (-not $ffmpeg) { throw "The FFmpeg vcpkg package was not installed" }
+          $expectedVersion = [regex]::Escape("${{ matrix.ffmpeg }}")
+          if ("$ffmpeg" -notmatch "\s$expectedVersion\.") {
+            throw "Expected FFmpeg ${{ matrix.ffmpeg }}.x, found: $ffmpeg"
+          }
           $ffmpeg
 
       # The crate-level `static` feature is intentionally omitted on Windows:
       # these vcpkg triplets provide shared FFmpeg libraries. macOS uses the
-      # dependency's source-build feature directly. Every functional optional
-      # feature is type-checked on each native platform.
+      # dependency's source-build feature for 8.1 and Homebrew's shared 7.1
+      # libraries for the compatibility lane. Every functional optional feature
+      # is type-checked on each native platform.
       - name: Build all non-static features
         run: cargo build --features "${{ matrix.build_features }}" --verbose
 
       - name: Build all non-static feature tests
         run: cargo test --lib --features "${{ matrix.build_features }}" --no-run
 
-      - name: Build default features on Windows
-        if: matrix.os == 'windows'
-        run: cargo build --verbose
-
-      - name: Build default crate features with source FFmpeg on macOS
-        if: matrix.os == 'macos'
-        run: cargo build --features ffmpeg-sys-next/build-videotoolbox --verbose
+      # This keeps the crate's own default feature set empty while carrying only
+      # the dependency feature needed to provision source-built FFmpeg 8.1 on
+      # macOS. The system/vcpkg lanes pass an empty string here.
+      - name: Build default crate features
+        run: cargo build ${{ matrix.default_ffmpeg_features }} --verbose
 
       # GPU-dependent features are compile-only above. GitHub's macOS runner
       # also cannot create a VideoToolbox compression session, so its two
