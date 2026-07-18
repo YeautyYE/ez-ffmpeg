@@ -8,6 +8,5 @@ render loop with mutable per-frame state driving the encoder.
 
 ## How to Run
 
-1. Navigate to the `examples/bouncing_balls` directory.
-2. Run `cargo run`.
-3. `bouncing_balls.mp4` is written to the current directory.
+1. From the repository root, run `cargo run --example bouncing_balls`.
+2. `bouncing_balls.mp4` is written to the current directory.

@@ -57,11 +57,13 @@
 //!
 //! # Memory
 //!
-//! Only the **ingress** queue is bounded (`queue_capacity × frame_size`
-//! bytes, plus a bounded handful of in-flight frames in the internal
-//! channels). Filters that buffer (`reverse`, `tpad`, …), the codec's
-//! lookahead, and output I/O can each hold further data with no global
-//! limit — exactly as they do in any other job of this crate.
+//! Only the **ingress** queue is bounded, by frame count: `queue_capacity`
+//! frames (an exact `frame_size` copy per slot with [`write`](VideoWriter::write);
+//! the caller's `Vec` as provided with [`write_owned`](VideoWriter::write_owned)),
+//! plus a bounded handful of in-flight frames in the internal channels.
+//! Filters that buffer (`reverse`, `tpad`, …), the codec's lookahead, and
+//! output I/O can each hold further data with no global limit — exactly as
+//! they do in any other job of this crate.
 //!
 //! # FFmpeg versions
 //!
@@ -123,8 +125,7 @@ pub enum WriterError {
     ZeroQueueCapacity,
 
     /// The built pipeline consumes no video from the pushed frames (a
-    /// `disable_video()` output, a streamless/attachment-only format, or a
-    /// mapping that dropped the stream). Without this check `write` would block
+    /// `disable_video()` output). Without this check `write` would block
     /// forever against a live-but-unconsumed receiver.
     #[error("output consumes no video stream from the pushed frames")]
     NoVideoDestination,
@@ -144,6 +145,20 @@ pub enum WriterError {
         output_pads: usize,
         video_output_pads: usize,
     },
+
+    /// The `filter_desc` parses into more than one disconnected filter
+    /// component (e.g. `"nullsink;color=..."`). The pushed frames would feed
+    /// one part while an unrelated part feeds (or starves) the encoder — an
+    /// unbounded side source could even keep the job from ever finishing.
+    #[error("filter_desc must be a single connected graph; found {components} disconnected parts")]
+    DisconnectedFilterGraph { components: usize },
+
+    /// The [`Output`] carries stream maps (`add_stream_map` /
+    /// `add_stream_map_with_copy`). The writer's single video stream is the
+    /// only stream there is, so maps have nothing to select; rejecting them
+    /// beats silently ignoring them.
+    #[error("stream maps are not supported by VideoWriter; the pushed frames are the only stream")]
+    StreamMapsUnsupported,
 }
 
 /// Errors returned by [`VideoWriter::write`] / [`VideoWriter::write_owned`].
@@ -154,9 +169,12 @@ pub enum PushError {
     #[error("frame has {got} bytes, expected exactly {expected} (tightly packed)")]
     InvalidSize { expected: usize, got: usize },
 
-    /// The pipeline is gone (a worker failed, or teardown began). Call
-    /// [`VideoWriter::finish`] to retrieve the underlying error.
-    #[error("pipeline closed; call finish() to retrieve the underlying error")]
+    /// The pipeline stopped accepting frames (a worker failed, an [`Output`]
+    /// limit such as `set_max_video_frames` completed the job early, or
+    /// teardown began). Call [`VideoWriter::finish`] for the authoritative
+    /// result: the underlying error if one occurred, or `Ok` when the
+    /// pipeline closed after completing normally.
+    #[error("pipeline closed; call finish() to retrieve the pipeline result")]
     PipelineClosed,
 }
 
@@ -206,7 +224,8 @@ impl VideoWriter {
     /// the borrow-copy that [`write`](Self::write) performs. The pipeline
     /// still copies the bytes once, plane-by-plane, into an aligned `AVFrame`
     /// on the worker thread. `frame.len()` must equal
-    /// [`frame_size`](Self::frame_size).
+    /// [`frame_size`](Self::frame_size); the `Vec` is queued as-is, so any
+    /// spare `capacity` beyond its length stays allocated while it waits.
     pub fn write_owned(&mut self, frame: Vec<u8>) -> Result<(), PushError> {
         if frame.len() != self.frame_size {
             return Err(PushError::InvalidSize {
@@ -247,8 +266,10 @@ impl VideoWriter {
 
     /// Closes ingress (the frame source emits its end-of-stream marker),
     /// drains the encoder, finalizes the container, and returns the first
-    /// authoritative pipeline error. This is the error path — a `write` that
-    /// returned [`PushError::PipelineClosed`] leaves the real cause here.
+    /// authoritative pipeline error. This is the result path — a `write` that
+    /// returned [`PushError::PipelineClosed`] resolves here, either to the
+    /// real cause or to `Ok` when the pipeline closed after completing
+    /// normally (e.g. an [`Output`] frame limit was reached).
     pub fn finish(mut self) -> crate::error::Result<()> {
         self.sender = None; // drop the sender → the frame source observes EOF
         match self.scheduler.take() {
@@ -328,8 +349,11 @@ impl VideoWriterBuilder {
     }
 
     /// Queue depth in frames. Default: `max(1, min(4, 64 MiB / frame_size))`, so
-    /// large frames do not silently reserve a lot of memory. Ingress memory is
-    /// `capacity × frame_size`.
+    /// large frames do not silently reserve a lot of memory. The queue is
+    /// count-bounded: with [`write`](VideoWriter::write) each slot holds an
+    /// exact `frame_size` copy (`capacity × frame_size` bytes total); with
+    /// [`write_owned`](VideoWriter::write_owned) each slot holds the caller's
+    /// `Vec` as provided, including any spare capacity it carries.
     pub fn queue_capacity(mut self, frames: usize) -> Self {
         self.queue_capacity = Some(frames);
         self
@@ -337,8 +361,10 @@ impl VideoWriterBuilder {
 
     /// Optional FFmpeg filter chain between the pushed frames and the encoder,
     /// e.g. `"hue=s=0"` or `"pad=ceil(iw/2)*2:ceil(ih/2)*2"` (an odd-size
-    /// remedy). Must consume exactly one video input and produce exactly one
-    /// video output ([`WriterError::FilterShape`] otherwise).
+    /// remedy). Must be a single connected graph
+    /// ([`WriterError::DisconnectedFilterGraph`] otherwise) consuming exactly
+    /// one video input and producing exactly one video output
+    /// ([`WriterError::FilterShape`] otherwise).
     pub fn filter_desc(mut self, desc: impl Into<String>) -> Self {
         self.filter_desc = Some(desc.into());
         self
@@ -604,7 +630,9 @@ mod tests {
                 }
                 let _ = tx.send(());
             });
-            rx.recv_timeout(Duration::from_secs(10))
+            // Hang-detection watchdog, generous for loaded machines: the
+            // property is that teardown completes at all, not how fast.
+            rx.recv_timeout(Duration::from_secs(30))
                 .unwrap_or_else(|_| panic!("{label}: teardown hung with a live ingress sender"));
             drop(sender);
         }

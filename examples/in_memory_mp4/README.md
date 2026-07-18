@@ -12,6 +12,5 @@ straight through — see the note at the end of `main.rs`.
 
 ## How to Run
 
-1. Navigate to the `examples/in_memory_mp4` directory.
-2. Run `cargo run`.
-3. The program prints the size of the encoded in-memory MP4.
+1. From the repository root, run `cargo run --example in_memory_mp4`.
+2. The program prints the size of the encoded in-memory MP4.
