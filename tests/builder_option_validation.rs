@@ -149,3 +149,59 @@ fn zero_muxing_queue_caps_fail_build() {
         "unexpected error: {err}"
     );
 }
+
+/// An explicitly-requested encoder that the linked FFmpeg build does not
+/// provide must fail `build()` with `EncoderUnavailable` naming that exact
+/// encoder (not the generic `EncoderNotFound`). This runs on any build: the
+/// name is guaranteed absent.
+#[test]
+fn unknown_explicit_encoder_is_named() {
+    let output =
+        Output::from("/tmp/ez_opt_never_written.mp4").set_video_codec("nonexistent_codec_zz");
+    let err = build_with(Input::from(fixture()), output)
+        .err()
+        .expect("an unknown explicit encoder must fail build");
+    match &err {
+        Error::OpenOutput(OpenOutputError::EncoderUnavailable { name }) => {
+            assert_eq!(name, "nonexistent_codec_zz");
+        }
+        other => panic!("expected EncoderUnavailable, got {other}"),
+    }
+    // The rendered message must name the encoder and point at the linked build.
+    let msg = err.to_string();
+    assert!(
+        msg.contains("nonexistent_codec_zz") && msg.contains("linked FFmpeg build"),
+        "error message is not actionable: {msg}"
+    );
+}
+
+/// When no encoder is set and the output format's guessed default codec has no
+/// encoder in the linked build, `build()` must fail naming that guessed codec.
+/// The `webp` muxer defaults to the `webp` codec, for which FFmpeg has no
+/// native encoder (only the external `libwebp` wrapper) — so on an
+/// external-lib-free build this exercises the auto-selection branch. Builds
+/// that ship a `webp` encoder skip the assertion.
+#[test]
+fn auto_selected_missing_encoder_is_named() {
+    let has_webp_encoder = ez_ffmpeg::codec::get_encoders()
+        .iter()
+        .any(|c| c.desc_name == "webp" || c.codec_name.contains("webp"));
+    if has_webp_encoder {
+        eprintln!("skipping: linked FFmpeg provides a webp encoder");
+        return;
+    }
+
+    let output = Output::from("/tmp/ez_opt_never_written.webp");
+    let err = build_with(Input::from(fixture()), output)
+        .err()
+        .expect("a format whose default codec has no encoder must fail build");
+    match &err {
+        Error::OpenOutput(OpenOutputError::EncoderUnavailable { name }) => {
+            assert!(
+                name.contains("webp"),
+                "expected the guessed codec name to mention webp, got '{name}'"
+            );
+        }
+        other => panic!("expected EncoderUnavailable naming the guessed codec, got {other}"),
+    }
+}

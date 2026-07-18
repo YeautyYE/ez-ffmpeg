@@ -792,6 +792,22 @@ pub enum OpenOutputError {
     #[error("encoder not found")]
     EncoderNotFound,
 
+    /// A named encoder could not be opened because the linked FFmpeg build
+    /// does not provide it — either it was compiled without that encoder
+    /// (e.g. no `--enable-libx264`) or the name is not a known encoder at all.
+    /// Unlike the bare [`EncoderNotFound`](Self::EncoderNotFound) errno
+    /// mapping, this names the encoder so the fix is actionable. `name` is the
+    /// encoder the caller requested, or the codec the output format guessed
+    /// when none was set explicitly.
+    #[error(
+        "encoder '{name}' is not available in the linked FFmpeg build — link \
+         an FFmpeg build that provides it (for example one configured with \
+         --enable-libx264 for libx264), or select a different encoder via \
+         Output::set_video_codec / set_audio_codec / set_subtitle_codec \
+         (list what the build provides with codec::get_encoders)"
+    )]
+    EncoderUnavailable { name: String },
+
     #[error("Stream map '{0}' matches no streams;")]
     MatchesNoStreams(String),
 

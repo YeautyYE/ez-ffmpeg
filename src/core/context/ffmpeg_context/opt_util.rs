@@ -1699,7 +1699,19 @@ fn choose_encoder(
                     if let (Ok(format_name), Ok(codec_name)) = (format_name, codec_name) {
                         error!(target: LOG_TARGET, "Automatic encoder selection failed Default encoder for format {format_name} (codec {codec_name}) is probably disabled. Please choose an encoder manually.");
                     }
-                    return Err(OpenOutputError::from(AVERROR_ENCODER_NOT_FOUND).into());
+                    // Name the format-guessed codec so the caller knows what to
+                    // provision. AV_CODEC_ID_NONE (the format declares no default
+                    // codec for this media type) and non-UTF-8 names carry no
+                    // actionable name, so they keep the generic errno mapping.
+                    return match codec_name {
+                        Ok(codec_name) if codec_id != AV_CODEC_ID_NONE => {
+                            Err(OpenOutputError::EncoderUnavailable {
+                                name: codec_name.to_string(),
+                            }
+                            .into())
+                        }
+                        _ => Err(OpenOutputError::from(AVERROR_ENCODER_NOT_FOUND).into()),
+                    };
                 }
 
                 return Ok(Some((codec_id, enc)));
@@ -1726,7 +1738,9 @@ fn choose_encoder(
 
             if enc.is_null() {
                 error!(target: LOG_TARGET, "Unknown encoder '{media_codec}'");
-                return Err(OpenOutputError::from(AVERROR_ENCODER_NOT_FOUND).into());
+                // The caller asked for this encoder by name and the linked
+                // FFmpeg build does not provide it; report it by name.
+                return Err(OpenOutputError::EncoderUnavailable { name: media_codec }.into());
             }
 
             if (*enc).type_ != media_type {
