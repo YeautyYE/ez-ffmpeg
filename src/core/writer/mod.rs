@@ -159,6 +159,15 @@ pub enum WriterError {
     /// frames drain into a sink while an unrelated branch feeds the encoder,
     /// so they could never influence the encoded output — and an unbounded
     /// side source would keep the job from ever finishing.
+    ///
+    /// This check works at FILTER granularity: it follows links between
+    /// filters, not streams within a filter. A filter that internally routes
+    /// distinct streams between pad pairs (multi-stream `concat` is the
+    /// notable case) can therefore pass it while still steering the pushed
+    /// frames into a sink leg — libavfilter exposes no static per-pad
+    /// dataflow to validate against. Such a graph has to be constructed
+    /// deliberately and stands on the same footing as any other
+    /// `filter_desc` whose declared routing is what runs.
     #[error(
         "filter_desc has no directed path from its input pad to its output \
          pad; the pushed frames could not influence the encoded output"
@@ -388,6 +397,12 @@ impl VideoWriterBuilder {
     /// generator) keeps running after [`finish`](VideoWriter::finish) closes
     /// the input, until the generator ends or the job is aborted — that is
     /// the semantics asked for, not a writer malfunction.
+    ///
+    /// The validation is best-effort at filter granularity (see
+    /// [`WriterError::UnreachableFilterOutput`]): a description that
+    /// deliberately routes the pushed stream into a sink through a
+    /// stream-routing filter (multi-stream `concat`, …) runs exactly as
+    /// declared, like it would in the CLI.
     pub fn filter_desc(mut self, desc: impl Into<String>) -> Self {
         self.filter_desc = Some(desc.into());
         self
