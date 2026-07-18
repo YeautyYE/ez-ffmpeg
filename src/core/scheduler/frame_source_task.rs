@@ -406,6 +406,81 @@ mod tests {
         assert!(!send_with_status_poll(&tx, frame_box, &status, &pool));
     }
 
+    /// Full teardown liveness of a REAL spawned worker parked in a healthy
+    /// full-channel send: the filter channel (capacity 1, receiver held but
+    /// never read) fills, the worker parks in `send_timeout` under
+    /// STATUS_RUN, then a terminal status is published — exactly what
+    /// RunningGuard/StartFailGuard/abort do — and the guard-side
+    /// `wait_for_all_threads` join must complete. This pins the wake-set-free
+    /// teardown design at the thread level, not just the helper level.
+    #[test]
+    fn worker_parked_in_full_send_exits_on_terminal_status() {
+        use crate::core::scheduler::ffmpeg_scheduler::{STATUS_END, STATUS_RUN};
+        use crate::util::thread_synchronizer::ThreadSynchronizer;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+        use std::time::Instant;
+
+        let pool = ObjPool::new(4, test_new_frame, unref_frame, frame_is_null).expect("pool");
+        let p = params(AV_PIX_FMT_GRAY8, 8, 2);
+        let size = tight_size(p.pix_fmt, 8, 2);
+
+        let (ingress_tx, ingress_rx) = crossbeam_channel::bounded::<Vec<u8>>(4);
+        let (fg_tx, fg_rx) = crossbeam_channel::bounded::<FrameBox>(1);
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let thread_sync = ThreadSynchronizer::new();
+        let result = Arc::new(Mutex::new(None));
+
+        frame_source_init(
+            0,
+            FrameSource {
+                ingress: ingress_rx,
+                fg_sender: fg_tx,
+                params: p,
+            },
+            pool,
+            status.clone(),
+            thread_sync.clone(),
+            result.clone(),
+        )
+        .expect("spawn");
+
+        // Frame 1 fills the 1-slot filter channel; frame 2 parks the worker
+        // inside send_timeout (the receiver is deliberately never read).
+        ingress_tx.send(vec![1u8; size]).unwrap();
+        ingress_tx.send(vec![2u8; size]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !(fg_rx.is_full() && ingress_tx.is_empty()) {
+            assert!(
+                Instant::now() < deadline,
+                "worker never reached the parked send"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Give the worker time to actually enter the send park (it has frame
+        // 2 in hand and nowhere else to go).
+        std::thread::sleep(Duration::from_millis(300));
+
+        // Publish the terminal status (what every guard/abort path does) and
+        // require the join to complete while the channel stays full and the
+        // ingress sender stays alive.
+        status.store(STATUS_END, Ordering::Release);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sync2 = thread_sync.clone();
+        std::thread::spawn(move || {
+            sync2.wait_for_all_threads();
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(30))
+            .expect("worker parked in a full-channel send must exit on terminal status");
+        assert!(
+            result.lock().unwrap().is_none(),
+            "a status-driven exit is not an error"
+        );
+        drop(fg_rx);
+        drop(ingress_tx);
+    }
+
     /// A recycled shell (released with buffers attached) must come back clean
     /// and refill correctly — the pool's unref_fn is what discharges the old
     /// buffers.
