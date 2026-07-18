@@ -110,15 +110,15 @@ Notes:
 
 ez-ffmpeg links FFmpeg **7.1–8.x**, which is newer than what many
 distributions package (Ubuntu 24.04 ships FFmpeg 6.x, for example). Install
-the development libraries from a source that provides FFmpeg 7 or 8 — or build
+the development libraries from a source that provides FFmpeg 7.1+ or 8 — or build
 FFmpeg through Cargo (see [below](#no-system-ffmpeg-build-it-from-source-linuxmacos)):
 
 ```bash
-# Debian/Ubuntu (needs an apt source that provides FFmpeg 7+):
+# Debian/Ubuntu (needs an apt source that provides FFmpeg 7.1+):
 sudo apt install pkg-config clang \
     libavcodec-dev libavformat-dev libavfilter-dev libavdevice-dev \
     libavutil-dev libswscale-dev libswresample-dev
-pkg-config --modversion libavcodec   # 61.x => FFmpeg 7.x, 62.x => FFmpeg 8.x
+pkg-config --modversion libavcodec   # needs >= 61.13 (FFmpeg 7.1); 62.x => FFmpeg 8.x
 ```
 
 `pkg-config` and `clang` (for bindgen) are required regardless of how FFmpeg
@@ -218,8 +218,8 @@ proof the DLLs you link at runtime provide it — inspect with
 
 The FFmpeg headers found at build time are older than 7.1 (`AVCodecConfig`
 arrived in FFmpeg 7.1). Distribution and vcpkg ports can lag — check with
-`pkg-config --modversion libavcodec` (7.1 ships libavcodec 61.13; anything
-below that is too old, and 62.x = 8.x) or your
+`pkg-config --modversion libavcodec` (the API needs libavcodec >= 61.13;
+released FFmpeg 7.1 reports 61.19.x, and 62.x = 8.x) or your
 vcpkg port version, and upgrade to FFmpeg 7.1–8.x.
 (Reported in [#18](https://github.com/YeautyYE/ez-ffmpeg/issues/18).)
 
