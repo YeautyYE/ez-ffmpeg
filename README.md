@@ -34,6 +34,8 @@ Bitstream filters (`-bsf:v/-bsf:a/-bsf:s`) are supported via `Output::set_video_
 
 Not every CLI feature is implemented. Notable gaps (unsupported paths fail with explicit errors): progress/stats reporting (`-progress`), sub2video, `-fix_sub_duration`, and two-pass encoding.
 
+Migrating a specific `ffmpeg` command? The crate docs include a [CLI-to-API mapping table](https://docs.rs/ez-ffmpeg/latest/ez_ffmpeg/#cli-to-api-mapping) covering ~50 common flags and patterns, with compile-checked equivalents for the most-asked commands.
+
 ## Version Requirements
 
 - **Rust:** Version 1.80.0 or higher.
