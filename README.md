@@ -291,10 +291,15 @@ experimental and may be reshaped in a future minor release.
 
 - **`FrameExtractor`** turns a video into owned, tightly packed 8-bit pixel
   buffers (`Rgb24`/`Rgba32`/`Gray8`) with frame sampling (`All`, `EveryNth`,
-  `EverySec`, `KeyframesOnly`), optional aspect-preserving resize, and time
-  windows.
+  `EverySec`, `KeyframesOnly`, `UniformN`), optional aspect-preserving resize,
+  and time windows.
 - **`SampleExtractor`** turns audio into owned, interleaved `f32` PCM;
   `for_whisper()` presets the 16 kHz mono shape ASR models consume.
+
+`Sampling::UniformN(n)` yields exactly `n` frames evenly spread over the
+duration — the fixed frame budget VLM/CLIP-style pipelines expect, padding
+short inputs by repeating nearby frames; supply `duration_hint_us()` when the
+duration cannot be probed (live/piped inputs).
 
 ```rust
 use ez_ffmpeg::frame_export::{FrameExtractor, SampleExtractor, Sampling};
@@ -328,8 +333,8 @@ fails fast with a typed error rather than being silently mis-converted.
 
 See `examples/color_policy_comparison` for a measured BT.601-vs-BT.709
 side-by-side, and the other `frame_export` examples (`extract_rgb_frames`,
-`frame_sampling`, `keyframe_thumbnails`, `extract_whisper_pcm`,
-`ai_media_ingest`) for the full tour.
+`frame_sampling`, `uniform_thumbnails`, `keyframe_thumbnails`,
+`extract_whisper_pcm`, `ai_media_ingest`) for the full tour.
 
 ## Streaming protocol outputs (WHIP / SRT)
 
