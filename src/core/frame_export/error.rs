@@ -1,10 +1,10 @@
 //! Typed errors for frame export.
 //!
-//! These surface either from `FrameExtractor::frames()` (option validation and
-//! stream/duration/HDR resolution, before any worker thread starts) or as the
-//! iterator's single terminal error (runtime failures). They reach the public
-//! [`crate::error::Error`] through the [`crate::error::Error::FrameExport`]
-//! variant.
+//! These surface either from `FrameExtractor::frames()` / `SampleExtractor::samples()`
+//! (option validation and stream/duration/HDR resolution, before any worker
+//! thread starts) or as the iterator's single terminal error (runtime failures).
+//! They reach the public [`crate::error::Error`] through the
+//! [`crate::error::Error::FrameExport`] variant.
 
 use thiserror::Error;
 
@@ -53,4 +53,24 @@ pub enum FrameExportError {
     /// An option value was invalid (zero count, zero size, non-finite seconds, …).
     #[error("invalid frame-export option: {0}")]
     InvalidOption(String),
+
+    /// The input has no audio stream to export from.
+    #[error("input has no audio stream")]
+    NoAudioStream,
+
+    /// An explicit `audio_stream_index` was out of range.
+    #[error("audio stream index {index} out of bounds: input has {count} stream(s)")]
+    AudioStreamIndexOutOfBounds {
+        /// The requested (out-of-range) index.
+        index: usize,
+        /// The number of streams the input actually has.
+        count: usize,
+    },
+
+    /// An explicit `audio_stream_index` referred to a non-audio stream.
+    #[error("stream {index} is not an audio stream")]
+    NotAnAudioStream {
+        /// The requested index.
+        index: usize,
+    },
 }

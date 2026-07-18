@@ -1,5 +1,5 @@
 //! Frame & sample export for AI/CV — decode a video into packed RGB frames
-//! (and, later, audio into f32 PCM) in one pass, correctly.
+//! (and audio into f32 PCM) in one pass, correctly.
 //!
 //! # Experimental (0.14)
 //!
@@ -42,6 +42,25 @@
 //! else BT.601) without ever overriding real tags. [`ColorPolicy::Force`] pins
 //! a specific matrix/range for all frames.
 //!
+//! # Audio (PCM) export
+//!
+//! [`SampleExtractor`] is the audio sibling: it decodes one input's audio into
+//! owned, interleaved `f32` PCM — the shape whisper-rs / candle / ort consume.
+//! Defaults preserve the source rate and layout; [`SampleExtractor::sample_rate`]
+//! and [`SampleExtractor::channels`] opt into resample / downmix, and
+//! [`SampleExtractor::for_whisper`] presets 16 kHz mono.
+//!
+//! ```no_run
+//! use ez_ffmpeg::frame_export::SampleExtractor;
+//!
+//! # fn main() -> Result<(), ez_ffmpeg::error::Error> {
+//! // 16 kHz mono f32, ready to hand to an ASR model.
+//! let pcm: Vec<f32> = SampleExtractor::for_whisper("input.mp4").collect_samples()?;
+//! # let _ = pcm;
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! # Threading & teardown
 //!
 //! A run drives the normal scheduler (demux → decode → input frame pipeline →
@@ -83,3 +102,16 @@ pub use frame::VideoFrame;
 pub use iter::FrameIter;
 pub use options::{ColorPolicy, PixelLayout, Sampling, YuvMatrix, YuvRange};
 pub use video::FrameExtractor;
+
+// --- Audio (PCM) sample export ---
+mod audio;
+mod audio_iter;
+mod audio_options;
+mod audio_resolve;
+mod audio_sink;
+mod chunk;
+
+pub use audio::SampleExtractor;
+pub use audio_iter::SampleIter;
+pub use audio_options::Channels;
+pub use chunk::AudioChunk;
