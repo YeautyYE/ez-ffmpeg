@@ -115,18 +115,67 @@ fn no_video_stream_is_typed_error() {
     }
 }
 
+/// Waits up to `secs` for the scenario thread's next signal, surfacing a
+/// scenario panic as this test's own failure and a missing signal as the
+/// named `hang_msg` panic. Returns the handle so later stages can keep it.
+fn expect_signal(
+    rx: &std::sync::mpsc::Receiver<()>,
+    scenario: std::thread::JoinHandle<()>,
+    secs: u64,
+    hang_msg: &str,
+) -> std::thread::JoinHandle<()> {
+    use std::sync::mpsc::RecvTimeoutError;
+    match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
+        Ok(()) => scenario,
+        Err(RecvTimeoutError::Timeout) => panic!("{hang_msg}"),
+        Err(RecvTimeoutError::Disconnected) => match scenario.join() {
+            Err(panic) => std::panic::resume_unwind(panic),
+            Ok(()) => unreachable!("thread cannot exit cleanly without signalling"),
+        },
+    }
+}
+
 #[test]
 fn drop_mid_stream_does_not_deadlock() {
-    // 300 frames, default channel capacity 1: after one frame the sink is
-    // almost certainly parked in a blocking send(). Dropping must release it
-    // (S6: receiver first, then abort) rather than hang. Reaching the end of
-    // this test IS the assertion (a wrong teardown order would deadlock).
-    let mut it = FrameExtractor::new(lavfi("testsrc2=s=320x240:r=30:d=10"))
-        .frames()
-        .expect("start failed");
-    let first = it.next().expect("at least one frame").expect("frame ok");
-    assert_eq!(first.index(), 0);
-    drop(it);
+    // 300 frames, channel capacity 1 (pinned explicitly — the scenario depends
+    // on it): after one frame the sink parks in a blocking send(). Dropping
+    // must release it (S6: receiver first, then abort) rather than hang. The
+    // scenario runs on its own thread and signals right before dropping, so
+    // the 30s deadline measures the TEARDOWN alone (startup and the first
+    // decode sit under their own generous deadline) — a teardown regression
+    // fails a named assertion instead of hanging the whole test binary until
+    // CI kills it.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let scenario = std::thread::spawn(move || {
+        let mut it = FrameExtractor::new(lavfi("testsrc2=s=320x240:r=30:d=10"))
+            .channel_capacity(1)
+            .frames()
+            .expect("start failed");
+        let first = it.next().expect("at least one frame").expect("frame ok");
+        assert_eq!(first.index(), 0);
+        // Consuming one frame freed the only channel slot. Give the producer
+        // time to refill it and park in the next blocking send, biasing the
+        // drop below into the release-while-parked case (the regression this
+        // test exists for) instead of racing a producer that has not blocked
+        // yet. Teardown must succeed either way, so this cannot flake.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let _ = tx.send(());
+        drop(it);
+        let _ = tx.send(());
+    });
+    let scenario = expect_signal(
+        &rx,
+        scenario,
+        60,
+        "frame scenario did not reach its drop point within 60s",
+    );
+    let scenario = expect_signal(
+        &rx,
+        scenario,
+        30,
+        "dropping FrameIter mid-stream did not tear down within 30s (deadlock)",
+    );
+    scenario.join().expect("scenario thread must exit cleanly");
 }
 
 #[test]
@@ -262,5 +311,222 @@ fn resolution_guess_multi_video_best_not_first_requires_index() {
         .collect_frames()
         .expect("default Tagged policy must still work on this layout");
     assert!(!frames.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Encodes `desc` into `path` with the given video codec (plus per-codec
+/// options), so tests can build small real-container fixtures.
+fn encode_fixture(desc: &str, path: &str, codec: &str, codec_opts: &[(&str, &str)]) {
+    use ez_ffmpeg::{FfmpegContext, FfmpegScheduler, Output};
+    let mut output = Output::from(path).set_video_codec(codec);
+    for (k, v) in codec_opts {
+        output = output.set_video_codec_opt(*k, *v);
+    }
+    FfmpegScheduler::new(
+        FfmpegContext::builder()
+            .input(lavfi(desc))
+            .output(output)
+            .build()
+            .expect("build fixture"),
+    )
+    .start()
+    .and_then(|s| s.wait())
+    .expect("encode fixture");
+}
+
+#[test]
+fn keyframes_only_selects_exactly_the_keyframes() {
+    use ez_ffmpeg::packet_scanner::PacketScanner;
+    use ez_ffmpeg::stream_info::StreamInfo;
+
+    // 3 s @ 10 fps with GOP 10 => 30 frames whose only keyframes are frames
+    // 0/10/20 (0 s, 1 s, 2 s). Scene-change insertion is disabled and B-frames
+    // pinned off so the cadence is the GOP grid alone on every encoder build.
+    // A real container (mkv, tb 1/1000) keeps the pts path honest.
+    let dir = std::env::temp_dir().join(format!("ez_fe_kf_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("gop10.mkv");
+    let path = path.to_str().unwrap();
+    encode_fixture(
+        "testsrc2=s=64x48:r=10:d=3",
+        path,
+        "mpeg4",
+        &[("g", "10"), ("sc_threshold", "1000000000"), ("bf", "0")],
+    );
+
+    // Ground truth from the container itself: where the keyframe packets sit.
+    let mut scanner = PacketScanner::open(path).expect("open fixture");
+    let time_base = match scanner.video_stream().expect("fixture has video") {
+        StreamInfo::Video { time_base, .. } => *time_base,
+        other => panic!("expected a video stream, got {other:?}"),
+    };
+    let mut key_pts_us = Vec::new();
+    let mut total_packets = 0usize;
+    for packet in scanner.packets() {
+        let info = packet.expect("read packet");
+        if !info.is_video() {
+            continue;
+        }
+        total_packets += 1;
+        if info.is_keyframe() {
+            let pts = info.pts().expect("video packet pts");
+            key_pts_us.push(pts * 1_000_000 * time_base.num as i64 / time_base.den as i64);
+        }
+    }
+    // The fixture must be meaningfully sparse: 3 keyframes out of 30 frames,
+    // sitting on the GOP grid. If this ever fails, the ENCODER changed, not
+    // the extractor.
+    assert_eq!(total_packets, 30, "3s @ 10fps fixture must hold 30 frames");
+    assert_eq!(key_pts_us.len(), 3, "GOP 10 => keyframes at frames 0/10/20");
+    for (got, want) in key_pts_us.iter().zip([0i64, 1_000_000, 2_000_000]) {
+        assert!(
+            (got - want).abs() <= 20_000,
+            "fixture keyframe at {got}us, expected ~{want}us"
+        );
+    }
+
+    // KeyframesOnly must yield exactly those frames: same count, same
+    // positions — nothing from inside the GOPs.
+    let frames = FrameExtractor::new(path)
+        .sampling(Sampling::KeyframesOnly)
+        .collect_frames()
+        .expect("extraction failed");
+    assert_eq!(
+        frames.len(),
+        key_pts_us.len(),
+        "exactly one exported frame per container keyframe"
+    );
+    for (i, (f, want)) in frames.iter().zip(&key_pts_us).enumerate() {
+        assert_eq!(f.index() as usize, i, "indices are dense and 0-based");
+        let got = f.pts_us().expect("exported frame pts");
+        assert!(
+            (got - want).abs() <= 20_000,
+            "exported keyframe {i} at {got}us must match container keyframe at {want}us"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn keyframes_only_intra_only_source_keeps_every_frame() {
+    // mjpeg is intra-only: every frame is a keyframe. KeyframesOnly must keep
+    // all of them — the decoder-level nokey skip must not discard intra frames
+    // and the KEY-flag selection must not over-filter.
+    let dir = std::env::temp_dir().join(format!("ez_fe_kf_intra_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("intra.mkv");
+    let path = path.to_str().unwrap();
+    encode_fixture("testsrc2=s=32x32:r=10:d=1", path, "mjpeg", &[]);
+
+    let frames = FrameExtractor::new(path)
+        .sampling(Sampling::KeyframesOnly)
+        .collect_frames()
+        .expect("extraction failed");
+    assert_eq!(
+        frames.len(),
+        10,
+        "every frame of an intra-only 1s @ 10fps stream is a keyframe"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn out_of_bounds_video_stream_index_is_typed_error() {
+    let err = FrameExtractor::new(lavfi("testsrc2=s=16x16:r=10:d=1"))
+        .video_stream_index(99)
+        .frames()
+        .err()
+        .expect("index 99 on a single-stream input must fail");
+    match err {
+        ez_ffmpeg::error::Error::FrameExport(
+            ez_ffmpeg::frame_export::FrameExportError::StreamIndexOutOfBounds { index, count },
+        ) => {
+            assert_eq!(index, 99);
+            assert_eq!(count, 1, "the lavfi source exposes exactly one stream");
+        }
+        other => panic!("expected StreamIndexOutOfBounds, got {other:?}"),
+    }
+}
+
+#[test]
+fn video_index_pointing_at_audio_stream_is_typed_error() {
+    // Audio-only input: stream 0 exists but is not a video stream.
+    let err = FrameExtractor::new(lavfi("sine=frequency=440:duration=1"))
+        .video_stream_index(0)
+        .frames()
+        .err()
+        .expect("video extraction from an audio stream must fail");
+    match err {
+        ez_ffmpeg::error::Error::FrameExport(
+            ez_ffmpeg::frame_export::FrameExportError::NotAVideoStream { index },
+        ) => assert_eq!(index, 0),
+        other => panic!("expected NotAVideoStream, got {other:?}"),
+    }
+}
+
+#[test]
+fn start_and_duration_window_bounds_output() {
+    // Intra-only mjpeg so the seek lands on the requested time rather than a
+    // distant earlier keyframe: 2 s @ 10 fps = 20 frames on a real container.
+    let dir = std::env::temp_dir().join(format!("ez_fe_window_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("window.mkv");
+    let path = path.to_str().unwrap();
+    encode_fixture("testsrc2=s=64x48:r=10:d=2", path, "mjpeg", &[]);
+
+    // Whole file first: the windowed run below is checked against these
+    // frames for count AND content.
+    let all = FrameExtractor::new(path)
+        .collect_frames()
+        .expect("full extraction");
+    assert_eq!(all.len(), 20, "2s @ 10fps must yield 20 frames unwindowed");
+    assert_ne!(
+        all[0].as_bytes(),
+        all[5].as_bytes(),
+        "fixture frames at 0s and 0.5s must differ for the seek check below"
+    );
+
+    // [0.5 s, 1.5 s) of a 10 fps stream is exactly frames 5..15. Input-side
+    // seeking shifts timestamps so the exported clock restarts at ~0 (FFmpeg
+    // `-ss` semantics): the window must bound the count and the whole pts
+    // span. Decoding the same coded frame twice is byte-deterministic, so the
+    // first windowed frame must equal frame 5 of the full run — proving the
+    // seek actually moved the start (a run that ignored start_time_us would
+    // also yield 10 frames with pts 0..900ms, but starting at frame 0).
+    let frames = FrameExtractor::new(path)
+        .start_time_us(500_000)
+        .duration_us(1_000_000)
+        .collect_frames()
+        .expect("windowed extraction");
+    assert_eq!(
+        frames.len(),
+        10,
+        "0.5s..1.5s of a 10fps intra-only stream is exactly 10 frames"
+    );
+    assert_eq!(
+        frames[0].as_bytes(),
+        all[5].as_bytes(),
+        "first windowed frame must be the source frame at 0.5s"
+    );
+    let pts: Vec<i64> = frames.iter().filter_map(|f| f.pts_us()).collect();
+    assert_eq!(pts.len(), frames.len(), "every windowed frame has a pts");
+    assert!(
+        pts.windows(2).all(|w| w[0] < w[1]),
+        "windowed pts strictly increasing: {pts:?}"
+    );
+    assert!(
+        pts.iter().all(|&p| (0..1_000_000).contains(&p)),
+        "every windowed pts must fall inside the 1s duration window: {pts:?}"
+    );
+    let first = *pts.first().unwrap();
+    let last = *pts.last().unwrap();
+    assert!(
+        (0..=20_000).contains(&first),
+        "first frame must sit at the window start, got {first}us"
+    );
+    assert!(
+        (880_000..=920_000).contains(&last),
+        "last frame must sit at ~0.9s, got {last}us"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
