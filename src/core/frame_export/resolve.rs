@@ -8,9 +8,11 @@
 
 use super::error::FrameExportError;
 use super::options::{ColorPolicy, PixelLayout};
+use super::sampler::UniformSpan;
 use ffmpeg_sys_next::{
-    av_find_best_stream, AVColorPrimaries, AVColorSpace, AVColorTransferCharacteristic,
-    AVFormatContext, AVMediaType::AVMEDIA_TYPE_VIDEO,
+    av_find_best_stream, av_rescale_q, AVColorPrimaries, AVColorSpace,
+    AVColorTransferCharacteristic, AVFormatContext, AVMediaType::AVMEDIA_TYPE_VIDEO,
+    AV_NOPTS_VALUE, AV_TIME_BASE_Q,
 };
 use std::ptr::null_mut;
 
@@ -21,6 +23,16 @@ pub(crate) struct ResolvePlan {
     pub(crate) height: Option<u32>,
     pub(crate) pixel: PixelLayout,
     pub(crate) color: ColorPolicy,
+    /// Present for `UniformN`: resolve the grid span and publish it.
+    pub(crate) uniform: Option<UniformResolve>,
+}
+
+/// What the resolver needs to compute and publish the UniformN grid span.
+pub(crate) struct UniformResolve {
+    pub(crate) span_cell: UniformSpan,
+    pub(crate) duration_hint_us: Option<i64>,
+    pub(crate) duration_us: Option<i64>,
+    pub(crate) start_time_us: Option<i64>,
 }
 
 /// Resolves the stream against `fmt_ctx`, fast-fails HDR, and returns the
@@ -34,8 +46,104 @@ pub(crate) unsafe fn resolve_and_build_desc(
     plan: &ResolvePlan,
 ) -> crate::error::Result<String> {
     let stream_index = resolve_stream_index(fmt_ctx, plan.stream_index)?;
+    if plan.uniform.is_some() {
+        // The input-side sampler binds by MEDIA TYPE when no explicit index is
+        // given, while this graph uses the best stream. With more than one video
+        // stream the two can disagree — the sampler would sample one stream while
+        // the graph exports another, breaking the exact-N contract. Reject the
+        // ambiguity instead of silently mis-sampling (checked before the HDR
+        // fast-fail so the actionable error wins on ambiguous HDR inputs).
+        if plan.stream_index.is_none() && count_video_streams(fmt_ctx) > 1 {
+            return Err(FrameExportError::InvalidOption(
+                "UniformN on an input with multiple video streams requires video_stream_index()"
+                    .to_string(),
+            )
+            .into());
+        }
+    }
+    // Unconditional for every sampling mode (the ambiguity check above only
+    // runs first so its actionable error wins on ambiguous HDR inputs).
     hdr_fast_fail(fmt_ctx, stream_index)?;
+    if let Some(u) = &plan.uniform {
+        let span = resolve_span(fmt_ctx, stream_index, u)?;
+        // Filled before start(); the input-side sampler reads it at frame 0.
+        let _ = u.span_cell.set(span);
+    }
     Ok(build_filter_desc(stream_index, plan))
+}
+
+/// Number of video streams (any disposition, including attached pictures — the
+/// input-side pipeline's media-type binding does not distinguish them either).
+///
+/// # Safety
+/// `fmt_ctx` must be a valid, opened `AVFormatContext` pointer.
+unsafe fn count_video_streams(fmt_ctx: *mut AVFormatContext) -> usize {
+    let nb = (*fmt_ctx).nb_streams as usize;
+    (0..nb)
+        .filter(|&i| {
+            let stream = *(*fmt_ctx).streams.add(i);
+            let par = (*stream).codecpar;
+            !par.is_null() && (*par).codec_type == AVMEDIA_TYPE_VIDEO
+        })
+        .count()
+}
+
+/// Resolves the UniformN grid span in microseconds:
+/// `duration_us` (trim window) > `duration_hint_us` > selected-stream duration
+/// > container duration, else [`FrameExportError::UnknownDuration`].
+///
+/// # Safety
+/// `fmt_ctx` must be valid and `stream_index` in range.
+unsafe fn resolve_span(
+    fmt_ctx: *mut AVFormatContext,
+    stream_index: usize,
+    u: &UniformResolve,
+) -> crate::error::Result<i64> {
+    if let Some(d) = u.duration_us {
+        if d > 0 {
+            return Ok(d);
+        }
+    }
+    if let Some(h) = u.duration_hint_us {
+        if h > 0 {
+            return Ok(h);
+        }
+    }
+    // Probed fallbacks describe the WHOLE input, but the grid anchors at the
+    // seek point — subtract the requested start so a start-only UniformN covers
+    // the remaining content instead of aiming targets beyond EOF (which would
+    // over-pad the tail with duplicates of the last frame).
+    let start = u.start_time_us.unwrap_or(0).max(0);
+    let mut probed: Option<i64> = None;
+    let stream = *(*fmt_ctx).streams.add(stream_index);
+    let sdur = (*stream).duration;
+    if sdur != AV_NOPTS_VALUE && sdur > 0 {
+        let us = av_rescale_q(sdur, (*stream).time_base, AV_TIME_BASE_Q);
+        if us > 0 {
+            probed = Some(us);
+        }
+    }
+    if probed.is_none() {
+        let cdur = (*fmt_ctx).duration;
+        if cdur != AV_NOPTS_VALUE && cdur > 0 {
+            // AVFormatContext.duration is already in AV_TIME_BASE (µs) units.
+            probed = Some(cdur);
+        }
+    }
+    match probed {
+        Some(dur) => {
+            let span = dur.saturating_sub(start);
+            if span > 0 {
+                Ok(span)
+            } else {
+                Err(FrameExportError::InvalidOption(format!(
+                    "start_time_us ({start}) is at or beyond the input duration ({dur})"
+                ))
+                .into())
+            }
+        }
+        None => Err(FrameExportError::UnknownDuration.into()),
+    }
 }
 
 /// Selects the video stream: an explicit index is range/type-validated; the
@@ -72,8 +180,10 @@ unsafe fn resolve_stream_index(
     }
 }
 
-/// Rejects HDR inputs (BT.2020 / PQ / HLG) at build time. The per-frame runtime
-/// check remains authoritative for mid-stream splices.
+/// Rejects HDR inputs (BT.2020 / PQ / HLG) from the OPEN-TIME stream parameters
+/// only. There is no per-frame runtime check yet, so a mid-stream splice to HDR
+/// (e.g. MPEG-TS ad insertion) is not detected — that guard lands with the
+/// per-frame color-stamp work.
 ///
 /// # Safety
 /// `fmt_ctx` must be valid and `stream_index` in range.
@@ -142,6 +252,7 @@ mod tests {
             height,
             pixel,
             color,
+            uniform: None,
         }
     }
 

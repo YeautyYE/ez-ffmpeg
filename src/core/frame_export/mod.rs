@@ -51,14 +51,16 @@
 //! # Non-goals (v1)
 //!
 //! Random access by index/timestamp, planar / >8-bit output, HDR tone mapping
-//! (HDR input is a typed error), GPU-frame export without download, and Python
-//! bindings are out of scope.
+//! (HDR input is a typed error, detected at open time from stream parameters —
+//! a mid-stream splice to HDR is not yet detected), GPU-frame export without
+//! download, and Python bindings are out of scope.
 
 mod error;
 mod frame;
 mod iter;
 mod options;
 mod resolve;
+mod sampler;
 mod sink;
 mod video;
 
