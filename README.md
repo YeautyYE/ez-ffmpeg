@@ -282,6 +282,147 @@ More examples can be found [here][examples].
 
 [examples]: https://github.com/YeautyYE/ez-ffmpeg/tree/master/examples
 
+## Streaming protocol outputs (WHIP / SRT)
+
+Whether a streaming output works depends on the FFmpeg build your process
+links against, not on ez-ffmpeg itself. The `capabilities` module probes the
+linked build up front, so unsupported setups can fail with a clear error
+instead of a mid-pipeline failure:
+
+```rust
+use ez_ffmpeg::capabilities;
+
+// Muxers (output formats) and I/O protocols are separate namespaces.
+let has_whip_muxer = capabilities::is_muxer_available("whip");
+let has_srt_protocol = capabilities::is_output_protocol_available("srt");
+```
+
+A `true` result only means the component is compiled into the linked FFmpeg;
+encoders, TLS backends, endpoint compatibility, and network reachability are
+separate concerns.
+
+### WHIP output (experimental, FFmpeg 8+)
+
+**Status:** FFmpeg 8 ships an upstream `whip` muxer that publishes WebRTC
+streams to WHIP endpoints (Twitch/IVS, Cloudflare Stream, LiveKit, MediaMTX,
+...). The muxer is marked **experimental** upstream and has a known upstream
+FIXME on Opus timestamp handling, and ez-ffmpeg's own CI cannot exercise it
+(its FFmpeg builds carry no DTLS backend) — treat this section as status and
+instructions, not as a verified recipe.
+
+Requirements, all imposed by the upstream muxer:
+
+- **FFmpeg 8.0 or newer, built with a DTLS-capable TLS backend.** FFmpeg 8.0
+  supports OpenSSL or Schannel for DTLS; FFmpeg 8.1 accepts any of OpenSSL,
+  GnuTLS, Schannel, or mbedTLS. Without one of these, the `whip` muxer is not
+  compiled in — `capabilities::is_muxer_available("whip")` returns `false`.
+- **Video: H.264, Baseline or Constrained Baseline profile only, with
+  B-frames disabled.** The muxer supports only those H.264 profiles, and
+  real-time WebRTC playout does not reorder frames. `libx264` defaults to the
+  High profile, so you must set the profile explicitly (see the example). The
+  muxer reads the H.264 profile/level from global headers; ez-ffmpeg raises
+  the encoder's global-header flag automatically whenever a muxer requires
+  it, so that part needs no configuration.
+- **Audio: Opus at 48 kHz stereo** — the muxer enforces this combination.
+
+Discover the encoders your build offers with `ez_ffmpeg::codec::get_encoders()`.
+H.264 encoders are commonly `libx264` (GPL — mind your licensing),
+`libopenh264`, or hardware encoders such as `h264_nvenc` /
+`h264_videotoolbox`; Opus is commonly `libopus`.
+
+```rust
+use ez_ffmpeg::{capabilities, FfmpegContext, FfmpegScheduler, Input, Output};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if !capabilities::is_muxer_available("whip") {
+        return Err("this FFmpeg build has no 'whip' muxer \
+                    (WHIP needs FFmpeg >= 8.0 with a DTLS backend)"
+            .into());
+    }
+
+    // File inputs must be paced to real time for live publishing.
+    let input = Input::from("input.mp4").set_readrate(1.0);
+
+    let output = Output::from("https://example.com/whip/endpoint")
+        .set_format("whip") // required: never auto-guessed from the URL
+        .set_format_opt("authorization", "<token>") // raw token; FFmpeg itself adds "Bearer "
+        .set_video_codec("libx264") // pick from codec::get_encoders()
+        .set_video_codec_opt("profile", "baseline") // WHIP: Baseline profile only
+        .set_video_codec_opt("bf", "0") // WHIP: no B-frames
+        .set_audio_codec("libopus")
+        .set_audio_sample_rate(48000) // the muxer requires 48 kHz stereo Opus
+        .set_audio_channels(2);
+
+    FfmpegScheduler::new(FfmpegContext::builder().input(input).output(output).build()?)
+        .start()?
+        .wait()?;
+    Ok(())
+}
+```
+
+### SRT output
+
+SRT output needs two independent components in the linked FFmpeg build: the
+`srt` **protocol** (built with `--enable-libsrt`) for transport, and a
+container muxer for the payload — MPEG-TS below. Probe both:
+
+```rust
+use ez_ffmpeg::capabilities;
+
+let srt_ready = capabilities::is_output_protocol_available("srt")
+    && capabilities::is_muxer_available("mpegts");
+```
+
+> **Never test SRT streaming support with `is_muxer_available("srt")`.** That
+> name matches the SubRip **subtitle** muxer, which exists in practically
+> every FFmpeg build, so the probe returns `true` whether or not the SRT
+> transport is present — it tells you nothing about SRT streaming support.
+
+```rust
+use ez_ffmpeg::{capabilities, FfmpegContext, FfmpegScheduler, Output};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if !(capabilities::is_output_protocol_available("srt")
+        && capabilities::is_muxer_available("mpegts"))
+    {
+        return Err("this FFmpeg build lacks the srt protocol \
+                    (--enable-libsrt) or the mpegts muxer"
+            .into());
+    }
+
+    let output = Output::from(
+        // ALL protocol options live in the URL query; latency is in MICROSECONDS.
+        "srt://127.0.0.1:9000?mode=caller&transtype=live&latency=120000&payload_size=1316",
+    )
+    .set_format("mpegts");
+
+    FfmpegScheduler::new(FfmpegContext::builder().input("input.mp4").output(output).build()?)
+        .start()?
+        .wait()?;
+    Ok(())
+}
+```
+
+Three warnings worth reading twice:
+
+- **Protocol options go in the URL query — only.** On the output side,
+  ez-ffmpeg opens the network connection without an options dictionary, so
+  `Output::set_format_opt` feeds the MPEG-TS **muxer**, never the SRT
+  protocol. A `passphrase` set that way only draws an "option not recognized"
+  warning from the muxer and never reaches the transport, so the stream goes
+  out **unencrypted** with no hard error. Encryption parameters (`passphrase`,
+  `pbkeylen`) must go in the URL query; percent-encode the passphrase if it
+  contains characters reserved in URLs.
+- **`latency` is in microseconds, not milliseconds.** `latency=120000` means
+  120 ms. libsrt truncates the value to whole milliseconds by integer
+  division, so a value of `120` collapses to 0 ms — an unusable budget.
+- **Redact stream URLs in logs.** With SRT, credentials (`passphrase`) are
+  part of the URL itself, so any log line printing the URL leaks them.
+
+On the **input** side, `srt://` is a live network protocol with no seek
+support, and — unlike the output side — `Input::set_format_opt` options do
+reach the `avformat_open_input` call.
+
 ## Performance build
 
 ez-ffmpeg is a library; release-profile choices are controlled by the final
