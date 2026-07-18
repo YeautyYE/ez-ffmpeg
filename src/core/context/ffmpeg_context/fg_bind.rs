@@ -575,3 +575,116 @@ pub(super) fn init_filter_graph(
         Ok(filter_graph)
     }
 }
+
+/// Shape summary of a writer filtergraph description, computed by the same
+/// probe `init_filter_graph` runs but reported BEFORE any zero-pad rejection,
+/// so the writer build path can validate the full 1-video-in/1-video-out/
+/// single-component contract with its own typed errors.
+pub(super) struct WriterFilterShape {
+    pub(super) input_pads: usize,
+    pub(super) video_input_pads: usize,
+    pub(super) output_pads: usize,
+    pub(super) video_output_pads: usize,
+    /// Weakly-connected filter components (see `ProbedTopology`). A
+    /// description like `"nullsink;color"` parses to 1 open input + 1 open
+    /// output but 2 components: the pushed frames would feed a sink while an
+    /// unrelated source feeds the encoder — possibly forever.
+    pub(super) components: usize,
+    /// Whether the open OUTPUT pad's filter is reachable from the open INPUT
+    /// pad's filter following the DIRECTED (producer -> consumer) links.
+    /// Weak connectivity is not enough: in
+    /// `"color,split[out][aux];[aux][in]overlay,nullsink"` everything is one
+    /// weak component with one open input and one open output, yet frames
+    /// entering `[in]` flow only into the sink while an independent source
+    /// feeds `[out]` — the pushed frames cannot influence the encoded output
+    /// and an unbounded side source keeps the job from finishing. Meaningful
+    /// only when there is exactly one input pad and one output pad; `false`
+    /// otherwise.
+    pub(super) output_reachable: bool,
+}
+
+#[cfg(docsrs)]
+pub(super) fn probe_writer_filter_shape(filter_desc: &str) -> Result<WriterFilterShape> {
+    let _ = filter_desc;
+    Err(Error::Bug)
+}
+
+#[cfg(not(docsrs))]
+pub(super) fn probe_writer_filter_shape(filter_desc: &str) -> Result<WriterFilterShape> {
+    let desc_cstr = CString::new(filter_desc)?;
+    unsafe {
+        // Same probe preamble as init_filter_graph: parse, create (but never
+        // fully init) the filters, apply options, init only topology-shaping
+        // filters, then mirror the link pass.
+        let graph = crate::raw::FilterGraph::alloc().ok_or(FilterGraphParseError::OutOfMemory)?;
+        (*graph.as_ptr()).nb_threads = 1;
+
+        let mut seg = null_mut();
+        let mut ret = avfilter_graph_segment_parse(graph.as_ptr(), desc_cstr.as_ptr(), 0, &mut seg);
+        if ret < 0 {
+            return Err(FilterGraphParseError::from(ret).into());
+        }
+        ret = avfilter_graph_segment_create_filters(seg, 0);
+        if ret < 0 {
+            avfilter_graph_segment_free(&mut seg);
+            return Err(FilterGraphParseError::from(ret).into());
+        }
+        ret = graph_opts_apply(seg);
+        if ret < 0 {
+            avfilter_graph_segment_free(&mut seg);
+            return Err(FilterGraphParseError::from(ret).into());
+        }
+        ret = fg_probe::init_topology_filters(seg);
+        if ret < 0 {
+            avfilter_graph_segment_free(&mut seg);
+            return Err(FilterGraphParseError::from(ret).into());
+        }
+
+        let topology = fg_probe::probe_open_pads(seg);
+        avfilter_graph_segment_free(&mut seg);
+        let topology = topology?;
+
+        let video = |pads: &[fg_probe::ProbedPad]| {
+            pads.iter()
+                .filter(|p| p.media_type == AVMEDIA_TYPE_VIDEO)
+                .count()
+        };
+        let output_reachable = match (&topology.inputs[..], &topology.outputs[..]) {
+            ([input], [output]) => node_reaches(input.node, output.node, &topology.edges),
+            _ => false,
+        };
+        Ok(WriterFilterShape {
+            input_pads: topology.inputs.len(),
+            video_input_pads: video(&topology.inputs),
+            output_pads: topology.outputs.len(),
+            video_output_pads: video(&topology.outputs),
+            components: topology.filter_components,
+            output_reachable,
+        })
+    }
+}
+
+/// Directed reachability over the probe's (producer -> consumer) link edges:
+/// can frames entering `from`'s filter flow into `to`'s filter? `from == to`
+/// is trivially reachable (a single-filter graph like `"null"` carries both
+/// open pads).
+#[cfg(not(docsrs))]
+fn node_reaches(from: (usize, usize), to: (usize, usize), edges: &[fg_probe::NodeEdge]) -> bool {
+    if from == to {
+        return true;
+    }
+    let mut visited = std::collections::HashSet::new();
+    let mut stack = vec![from];
+    visited.insert(from);
+    while let Some(node) = stack.pop() {
+        for &(producer, consumer) in edges {
+            if producer == node && visited.insert(consumer) {
+                if consumer == to {
+                    return true;
+                }
+                stack.push(consumer);
+            }
+        }
+    }
+    false
+}

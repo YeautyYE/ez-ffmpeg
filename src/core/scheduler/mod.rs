@@ -60,6 +60,7 @@ mod enc_task;
 pub mod ffmpeg_scheduler;
 pub(crate) mod filter_task;
 mod frame_filter_pipeline;
+mod frame_source_task;
 pub(crate) mod input_controller;
 mod mux_task;
 pub(crate) mod sync_queue;

@@ -81,6 +81,9 @@ mod fg_probe;
 mod open_input;
 mod open_output;
 mod opt_util;
+mod writer_build;
+
+pub(crate) use writer_build::build_writer_context;
 
 /// Log target held stable across the module split so target-based log
 /// filtering and routing keep observing `ez_ffmpeg::core::context::ffmpeg_context`.
@@ -108,6 +111,10 @@ pub struct FfmpegContext {
     pub(crate) demuxs: Vec<Demuxer>,
     pub(crate) filter_graphs: Vec<FilterGraph>,
     pub(crate) muxs: Vec<Muxer>,
+    /// Headless frame-push inputs ([`VideoWriter`](crate::VideoWriter)):
+    /// empty for every demuxer-driven job. `start()` drains this and spawns
+    /// one counted frame-source worker per entry, after every consumer.
+    pub(crate) frame_sources: Vec<crate::core::context::frame_source::FrameSource>,
     // Created at build time so the AVIO interrupt callbacks installed on the
     // input/output contexts observe the same atomic the scheduler drives.
     pub(crate) scheduler_status: Arc<std::sync::atomic::AtomicUsize>,
@@ -265,6 +272,7 @@ impl FfmpegContext {
             demuxs,
             filter_graphs,
             muxs,
+            frame_sources: Vec::new(),
             scheduler_status,
             interrupt_state,
         })
