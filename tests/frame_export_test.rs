@@ -143,3 +143,56 @@ fn iterator_is_fused_after_completion() {
     assert!(it.next().is_none());
     assert!(it.next().is_none());
 }
+
+/// Encodes a small real container so the stream time base differs from 1/fps
+/// (mkv uses 1/1000). Lavfi-direct sources have stream tb == 1/fps exactly,
+/// which cannot distinguish a pts scaled with the wrong time base.
+fn encode_mkv_fixture(path: &str) {
+    use ez_ffmpeg::{FfmpegContext, FfmpegScheduler, Output};
+    FfmpegScheduler::new(
+        FfmpegContext::builder()
+            .input(lavfi("testsrc2=s=64x48:r=25:d=2"))
+            .output(Output::from(path).set_video_codec("mpeg2video"))
+            .build()
+            .expect("build fixture"),
+    )
+    .start()
+    .and_then(|s| s.wait())
+    .expect("encode fixture");
+}
+
+#[test]
+fn pts_us_is_exact_on_real_container_time_base() {
+    let dir = std::env::temp_dir().join(format!("ez_fe_pts_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mkv = dir.join("t.mkv");
+    let mkv = mkv.to_str().unwrap();
+    encode_mkv_fixture(mkv);
+
+    // 25 fps: frame 25 sits at exactly 1 s. A pts read against the wrong time
+    // base (decoder-era best_effort_timestamp vs the post-filter 1/framerate
+    // time base) is off by tb_out/stream_tb — 40x for mkv's 1/1000.
+    let frames = FrameExtractor::new(mkv)
+        .max_frames(30)
+        .collect_frames()
+        .expect("extract");
+    let p25 = frames.get(25).and_then(|f| f.pts_us());
+    assert!(
+        p25.map(|v| (v - 1_000_000).abs() < 100_000)
+            .unwrap_or(false),
+        "frame 25 of a 25 fps stream must sit near 1s, got {p25:?}"
+    );
+
+    // The same pts path drives EverySec: 2 s at one-per-second must select ~2
+    // frames, not every frame (which the 40x scale error would cause).
+    let sec = FrameExtractor::new(mkv)
+        .sampling(Sampling::EverySec(1.0))
+        .collect_frames()
+        .expect("everysec");
+    assert!(
+        (1..=3).contains(&sec.len()),
+        "EverySec(1.0) over 2s must select ~2 frames, got {}",
+        sec.len()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

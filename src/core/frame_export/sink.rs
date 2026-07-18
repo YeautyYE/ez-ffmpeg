@@ -3,12 +3,14 @@
 //! [`ExportSink`] is a `Never`-mode [`FrameFilter`] mounted on the null output's
 //! frame pipeline, downstream of `scale`/`format` and the vsync passthrough
 //! (S4). Per frame it: forwards end-of-stream markers untouched, applies the
-//! sampling decision, packs the selected frame into an owned tight buffer, and
-//! delivers it over a bounded channel. It owns the exact `max_frames` cap (S5);
-//! the encoder-side `set_max_video_frames` is only an upstream terminator.
+//! sampling decision (or, for `UniformN`, reads the input-side sampler's
+//! dup-count), packs the selected frame into an owned tight buffer, and delivers
+//! it over a bounded channel. It owns the exact `max_frames` cap (S5); the
+//! encoder-side `set_max_video_frames` is only an upstream terminator.
 
 use super::frame::VideoFrame;
 use super::options::{PixelLayout, Sampling};
+use super::sampler::EMIT_COUNT_KEY;
 use crate::core::filter::frame_filter::{FrameFilter, FrameFilterError, RequestFrameMode};
 use crate::core::filter::frame_filter_context::FrameFilterContext;
 use crate::util::ffmpeg_utils::frame_is_eof_marker;
@@ -16,9 +18,10 @@ use crate::util::frame_utils::ensure_software_format;
 use crossbeam_channel::Sender;
 use ffmpeg_next::Frame;
 use ffmpeg_sys_next::{
-    av_rescale_q, AVFrame, AVMediaType, AVMediaType::AVMEDIA_TYPE_VIDEO, AVRational,
-    AV_FRAME_FLAG_KEY, AV_NOPTS_VALUE,
+    av_dict_get, av_dict_set, av_rescale_q, AVFrame, AVMediaType, AVMediaType::AVMEDIA_TYPE_VIDEO,
+    AVRational, AV_FRAME_FLAG_KEY, AV_NOPTS_VALUE,
 };
+use std::ffi::{CStr, CString};
 
 const US_PER_SEC: AVRational = AVRational {
     num: 1,
@@ -31,6 +34,9 @@ pub(crate) struct ExportSink {
     sampling: Sampling,
     layout: PixelLayout,
     max_frames: Option<u64>,
+    /// True for `UniformN`: selection happened on the input side, so this sink
+    /// reads the `EMIT_COUNT` dup-count and expands rather than selecting.
+    uniform: bool,
     /// Countdown to the next `EveryNth` selection (0 means take this frame).
     countdown: u64,
     /// Frames emitted so far (becomes each frame's `index`, enforces the cap).
@@ -56,11 +62,13 @@ impl ExportSink {
             Sampling::EverySec(s) => (s * 1_000_000.0) as i64,
             _ => 0,
         };
+        let uniform = matches!(sampling, Sampling::UniformN(_));
         Self {
             tx,
             sampling,
             layout,
             max_frames,
+            uniform,
             countdown: 0,
             emitted: 0,
             next_target_us: None,
@@ -69,8 +77,16 @@ impl ExportSink {
         }
     }
 
-    /// Reads a frame's presentation time in microseconds, or `None` when it has
-    /// no usable timestamp.
+    /// Reads a POST-FILTER frame's presentation time in microseconds, or `None`
+    /// when it has no usable timestamp.
+    ///
+    /// Deliberately reads `pts` only: the filtergraph output stage rewrites
+    /// `pts` into its own output time base (1/framerate for video), while
+    /// `best_effort_timestamp` still carries the decoder-era number in the
+    /// ORIGINAL stream time base. Pairing that stale value with the rewritten
+    /// `time_base` mis-scales by tb_out/stream_tb on any real container whose
+    /// stream tb differs from 1/fps (mkv 1/1000, mp4 1/12800, ...) — lavfi
+    /// sources mask it because their stream tb equals 1/fps exactly.
     ///
     /// # Safety
     /// `p` must be a valid, non-null `AVFrame` pointer.
@@ -79,15 +95,15 @@ impl ExportSink {
         if tb.den == 0 {
             return None;
         }
-        let raw = (*p).best_effort_timestamp;
-        let raw = if raw == AV_NOPTS_VALUE { (*p).pts } else { raw };
-        if raw == AV_NOPTS_VALUE {
+        let pts = (*p).pts;
+        if pts == AV_NOPTS_VALUE {
             return None;
         }
-        Some(av_rescale_q(raw, tb, US_PER_SEC))
+        Some(av_rescale_q(pts, tb, US_PER_SEC))
     }
 
     /// Decides whether to select this frame, advancing the sampling state.
+    /// (Not used for `UniformN`, whose selection happens on the input side.)
     ///
     /// # Safety
     /// `p` must be a valid, non-null `AVFrame` pointer.
@@ -136,6 +152,30 @@ impl ExportSink {
                     }
                 }
             }
+            // Input-side selection; the sink expands the dup-count instead.
+            Sampling::UniformN(_) => true,
+        }
+    }
+
+    /// Sends one `VideoFrame`, updating the emit count / done flag. Returns
+    /// `false` when the sink should stop emitting (cap hit or receiver gone).
+    fn deliver(&mut self, w: u32, h: u32, pts_us: Option<i64>, data: Vec<u8>) -> bool {
+        if let Some(max) = self.max_frames {
+            if self.emitted >= max {
+                self.done = true;
+                return false;
+            }
+        }
+        let vf = VideoFrame::new(w, h, self.layout, pts_us, self.emitted, data);
+        match self.tx.send(vf) {
+            Ok(()) => {
+                self.emitted += 1;
+                true
+            }
+            Err(_) => {
+                self.done = true;
+                false
+            }
         }
     }
 }
@@ -151,7 +191,7 @@ impl FrameFilter for ExportSink {
 
     fn filter_frame(
         &mut self,
-        frame: Frame,
+        mut frame: Frame,
         _ctx: &mut FrameFilterContext,
     ) -> Result<Option<Frame>, FrameFilterError> {
         // End-of-stream flush markers pass through untouched; never exported.
@@ -163,65 +203,113 @@ impl FrameFilter for ExportSink {
         if p.is_null() {
             return Ok(Some(frame));
         }
-        // After the cap is hit or the receiver disconnects, drop the rest so the
-        // encoder cap / Drop-abort ends the run without further work.
+        // After the cap is hit or the receiver disconnects, keep FORWARDING
+        // (without packing/delivery): encoder-side enforcement (frame cap,
+        // recording time) must keep seeing frames, or an unbounded UniformN run
+        // whose sink finished early would starve it and never terminate. In
+        // uniform mode strip the stale count so nothing re-interprets it.
         if self.done {
-            return Ok(None);
+            if self.uniform {
+                let _ = unsafe { read_and_strip_emit_count(&mut frame) };
+            }
+            return Ok(Some(frame));
         }
 
         let pts_us = unsafe { Self::frame_pts_us(p) };
+
+        if self.uniform {
+            // The input-side sampler already selected this frame and stamped the
+            // number of copies to emit (1 when absent). Pack once, clone the rest.
+            let count = unsafe { read_and_strip_emit_count(&mut frame) };
+            // Defense in depth: even a corrupted or injected count can never
+            // deliver more than the UniformN contract's n frames in total.
+            let count = match self.sampling {
+                Sampling::UniformN(n) => count.min((n as u64).saturating_sub(self.emitted)),
+                _ => count,
+            };
+            if count == 0 {
+                return Ok(Some(frame));
+            }
+            let (w, h, mut bytes) = unsafe { pack_bytes(p, self.layout)? };
+            let mut remaining = count;
+            while remaining > 0 {
+                remaining -= 1;
+                let data = if remaining == 0 {
+                    std::mem::take(&mut bytes)
+                } else {
+                    bytes.clone()
+                };
+                if !self.deliver(w, h, pts_us, data) {
+                    break;
+                }
+            }
+            // Forward so the run drains to EOF (no encoder cap for UniformN).
+            return Ok(Some(frame));
+        }
+
         if !unsafe { self.select(p, pts_us) } {
-            // Dropped pre-graph would be ideal; here it simply does not reach the
-            // encoder, so `set_max_video_frames` counts selected frames 1:1.
+            // Non-uniform modes only: a dropped frame does not reach the
+            // encoder, so `set_max_video_frames` counts SELECTED frames 1:1.
+            // (UniformN never takes this path; there the encoder sees unique
+            // frames while delivery counts duplicate expansions.)
             return Ok(None);
         }
-
-        // The sink owns the exact public cap (S5).
-        if let Some(max) = self.max_frames {
-            if self.emitted >= max {
-                self.done = true;
-                return Ok(None);
-            }
-        }
-
-        let vf = unsafe { pack_frame(p, self.layout, pts_us, self.emitted)? };
-        match self.tx.send(vf) {
-            Ok(()) => {
-                self.emitted += 1;
-                // Forward the (unpacked) frame so the upstream terminator counts it.
-                Ok(Some(frame))
-            }
-            Err(_) => {
-                // Receiver gone: stop emitting, let the run wind down.
-                self.done = true;
-                Ok(Some(frame))
-            }
+        let (w, h, bytes) = unsafe { pack_bytes(p, self.layout)? };
+        if self.deliver(w, h, pts_us, bytes) {
+            // Forward the (unpacked) frame so the upstream terminator counts it.
+            Ok(Some(frame))
+        } else {
+            // Cap reached or receiver gone. Forward for a clean wind-down.
+            Ok(Some(frame))
         }
     }
 }
 
-/// Packs a single packed-format plane into an owned, tight `VideoFrame`.
+/// Reads (and strips) the `EMIT_COUNT` dup-count from a frame's metadata,
+/// defaulting to 1 when absent or malformed.
 ///
-/// Handles negative `linesize` (bottom-up frames) and rejects sizes that would
-/// overflow `usize`. The graph pins `format=<pix>`, so a non-software or
-/// mismatched format here is an internal invariant violation, surfaced as an
-/// error rather than undefined behavior.
+/// # Safety
+/// `frame` must be a valid owned frame whose metadata dict we may modify.
+unsafe fn read_and_strip_emit_count(frame: &mut Frame) -> u64 {
+    let key = CString::new(EMIT_COUNT_KEY).expect("literal has no NUL");
+    let p = frame.as_mut_ptr();
+    let entry = av_dict_get((*p).metadata, key.as_ptr(), std::ptr::null(), 0);
+    let count = if entry.is_null() {
+        1
+    } else {
+        CStr::from_ptr((*entry).value)
+            .to_str()
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(1)
+            .max(1)
+    };
+    // Strip ALL matches (a MULTIKEY-built dict may hold several) so nothing
+    // downstream re-interprets the key. Each av_dict_set(NULL) removes one
+    // entry, so the loop strictly shrinks the dict.
+    while !av_dict_get((*p).metadata, key.as_ptr(), std::ptr::null(), 0).is_null() {
+        if av_dict_set(&mut (*p).metadata, key.as_ptr(), std::ptr::null(), 0) < 0 {
+            break;
+        }
+    }
+    count
+}
+
+/// Packs a single packed-format plane into an owned, tight `(width, height,
+/// bytes)` buffer. Handles negative `linesize` (bottom-up frames) and rejects
+/// sizes that would overflow `usize`/`isize`. The graph pins `format=<pix>`, so
+/// a non-software or mismatched format here is an internal invariant violation,
+/// surfaced as an error rather than undefined behavior.
 ///
 /// # Safety
 /// `p` must be a valid, non-null `AVFrame` whose `data[0]`/`linesize[0]` describe
 /// a single packed plane of `format` pixels.
-unsafe fn pack_frame(
+unsafe fn pack_bytes(
     p: *const AVFrame,
     layout: PixelLayout,
-    pts_us: Option<i64>,
-    index: u64,
-) -> Result<VideoFrame, FrameFilterError> {
+) -> Result<(u32, u32, Vec<u8>), FrameFilterError> {
     ensure_software_format((*p).format)
         .map_err(|e| -> FrameFilterError { format!("frame export: {e}").into() })?;
-    // The graph pins `format=<pix>`, so anything else is an internal invariant
-    // breach. Reject the EXACT format (not just "is software"): a leaked frame of
-    // a different packed layout would be packed with the wrong bytes-per-pixel and
-    // could overread a minimally-backed final row.
     let expected = layout.av_pixel_format() as i32;
     if (*p).format != expected {
         return Err(format!(
@@ -278,12 +366,5 @@ unsafe fn pack_frame(
         let dst = out.as_mut_ptr().add(row * row_bytes);
         std::ptr::copy_nonoverlapping(src_row, dst, row_bytes);
     }
-    Ok(VideoFrame::new(
-        width as u32,
-        height as u32,
-        layout,
-        pts_us,
-        index,
-        out,
-    ))
+    Ok((width as u32, height as u32, out))
 }
