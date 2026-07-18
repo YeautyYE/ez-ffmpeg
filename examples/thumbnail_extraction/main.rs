@@ -67,6 +67,9 @@ fn main() {
         .input(Input::from("testsrc2=duration=12:size=640x360:rate=10").set_format("lavfi"))
         .output(
             Output::from("output_keyframe_source.mp4")
+                // mpeg4 ships in every FFmpeg build (the default H.264 pick
+                // needs an external encoder such as libx264).
+                .set_video_codec("mpeg4")
                 // Force a keyframe every 10 frames (one per second at 10 fps)
                 .set_video_codec_opt("g", "10"),
         )
