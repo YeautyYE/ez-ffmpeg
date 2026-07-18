@@ -8,7 +8,7 @@
 [![Documentation](https://img.shields.io/badge/docs.rs-ez--ffmpeg-blue)](https://docs.rs/ez-ffmpeg)
 [![License: MIT/Apache-2.0/MPL-2.0](https://img.shields.io/badge/License-MIT%2FApache--2.0%2FMPL--2.0-brightgreen.svg)](https://github.com/YeautyYE/ez-ffmpeg/blob/main/LICENSE-APACHE)
 [![Rust](https://img.shields.io/badge/Rust-%3E=1.80.0-orange)](https://www.rust-lang.org/)
-[![FFmpeg](https://img.shields.io/badge/FFmpeg-7.0--8.x-blue)](https://ffmpeg.org)
+[![FFmpeg](https://img.shields.io/badge/FFmpeg-7.1--8.x-blue)](https://ffmpeg.org)
 [![CI](https://github.com/YeautyYE/ez-ffmpeg/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/YeautyYE/ez-ffmpeg/actions/workflows/ci.yml?query=branch%3Amain+event%3Apush)
 
 </div>
@@ -40,7 +40,7 @@ Migrating a specific `ffmpeg` command? The crate docs include a [CLI-to-API mapp
 ## Version Requirements
 
 - **Rust:** Version 1.80.0 or higher.
-- **FFmpeg:** Version 7.0 through 8.x (one build links either major; the bindings gate on the installed version).
+- **FFmpeg:** Version 7.1 through 8.x (one build links either major; the bindings gate on the installed version).
 
 ## Documentation
 
@@ -108,7 +108,7 @@ Notes:
 
 #### Linux
 
-ez-ffmpeg links FFmpeg **7.0–8.x**, which is newer than what many
+ez-ffmpeg links FFmpeg **7.1–8.x**, which is newer than what many
 distributions package (Ubuntu 24.04 ships FFmpeg 6.x, for example). Install
 the development libraries from a source that provides FFmpeg 7 or 8 — or build
 FFmpeg through Cargo (see [below](#no-system-ffmpeg-build-it-from-source-linuxmacos)):
@@ -216,10 +216,11 @@ proof the DLLs you link at runtime provide it — inspect with
 <details>
 <summary><code>unresolved import ffmpeg_sys_next::AVCodecConfig</code> and similar missing-type build errors</summary>
 
-The FFmpeg headers found at build time are older than 7.0 (`AVCodecConfig`
+The FFmpeg headers found at build time are older than 7.1 (`AVCodecConfig`
 arrived in FFmpeg 7.1). Distribution and vcpkg ports can lag — check with
-`pkg-config --modversion libavcodec` (61.x = FFmpeg 7.x, 62.x = 8.x) or your
-vcpkg port version, and upgrade to FFmpeg 7.0–8.x.
+`pkg-config --modversion libavcodec` (7.1 ships libavcodec 61.13; anything
+below that is too old, and 62.x = 8.x) or your
+vcpkg port version, and upgrade to FFmpeg 7.1–8.x.
 (Reported in [#18](https://github.com/YeautyYE/ez-ffmpeg/issues/18).)
 
 </details>
