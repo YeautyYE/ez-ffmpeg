@@ -1,6 +1,8 @@
-//! End-to-end frame-export tests over synthetic lavfi sources (no fixtures).
+//! End-to-end frame-export tests over synthetic lavfi sources (plus small
+//! generated container fixtures where a real time base or stream layout is
+//! load-bearing).
 
-use ez_ffmpeg::frame_export::{FrameExtractor, PixelLayout, Sampling};
+use ez_ffmpeg::frame_export::{ColorPolicy, FrameExtractor, PixelLayout, Sampling};
 use ez_ffmpeg::Input;
 
 /// A finite synthetic video source. `testsrc2` is a real decode path, so these
@@ -194,5 +196,71 @@ fn pts_us_is_exact_on_real_container_time_base() {
         "EverySec(1.0) over 2s must select ~2 frames, got {}",
         sec.len()
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn resolution_guess_multi_video_best_not_first_requires_index() {
+    use ez_ffmpeg::{FfmpegContext, FfmpegScheduler, Output};
+    // A file whose FIRST video stream is NOT the exported (best) one: stream 0
+    // carries 2 probed frames (fps=2), stream 1 carries 10 — best-stream
+    // selection ranks by probed frame count, so it picks stream 1. The
+    // input-side stamp binds to the first video stream, so
+    // TaggedOrResolutionGuess without an explicit index must be REJECTED with
+    // the typed, actionable error (removing that rejection would silently
+    // leave the exported stream unstamped).
+    let dir = std::env::temp_dir().join(format!("ez_fe_guess_mv_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("two_video.mkv");
+    FfmpegScheduler::new(
+        FfmpegContext::builder()
+            .input(lavfi("testsrc2=s=64x48:r=10:d=1"))
+            .filter_desc("[0:v]split=2[t][a];[t]fps=2[b]")
+            .output(
+                Output::from(path.to_str().unwrap())
+                    .set_video_codec("mpeg2video")
+                    .add_stream_map("[b]")
+                    .add_stream_map("[a]"),
+            )
+            .build()
+            .expect("build sparse+dense two-video fixture"),
+    )
+    .start()
+    .and_then(|s| s.wait())
+    .expect("encode sparse+dense two-video fixture");
+    let path = path.to_str().unwrap();
+
+    let err = FrameExtractor::new(path)
+        .color(ColorPolicy::TaggedOrResolutionGuess)
+        .frames()
+        .err()
+        .expect("guess policy without an index must be rejected on this layout");
+    match err {
+        ez_ffmpeg::error::Error::FrameExport(
+            ez_ffmpeg::frame_export::FrameExportError::InvalidOption(msg),
+        ) => {
+            assert!(
+                msg.contains("video_stream_index"),
+                "error must name the fix: {msg}"
+            );
+        }
+        other => panic!("expected typed InvalidOption, got {other:?}"),
+    }
+
+    // An explicit index resolves it: the stamp pipeline binds to that stream.
+    let frames = FrameExtractor::new(path)
+        .color(ColorPolicy::TaggedOrResolutionGuess)
+        .video_stream_index(1)
+        .collect_frames()
+        .expect("explicit index works with the guess policy");
+    assert!(!frames.is_empty());
+
+    // Other policies keep working without an index on the same layout (the
+    // mismatch is warn-only there; the wrong-bound guard sits on a stream that
+    // is never decoded and must not stall or fail the run).
+    let frames = FrameExtractor::new(path)
+        .collect_frames()
+        .expect("default Tagged policy must still work on this layout");
+    assert!(!frames.is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }

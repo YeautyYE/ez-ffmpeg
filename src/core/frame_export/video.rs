@@ -2,6 +2,7 @@
 
 use super::error::FrameExportError;
 use super::frame::VideoFrame;
+use super::guard::ColorGuard;
 use super::iter::FrameIter;
 use super::options::{ColorPolicy, PixelLayout, Sampling};
 use super::resolve::{resolve_and_build_desc, ResolvePlan, UniformResolve};
@@ -64,7 +65,9 @@ impl FrameExtractor {
     }
 
     /// Selects an explicit video stream by absolute index (default: best video
-    /// stream).
+    /// stream). Also pins the input-side per-frame HDR guard / color stamp to
+    /// that stream — without it they bind to the first video stream, which
+    /// coincides with the exported one except on exotic multi-video layouts.
     pub fn video_stream_index(mut self, index: usize) -> Self {
         self.video_stream_index = Some(index);
         self
@@ -174,18 +177,26 @@ impl FrameExtractor {
                 input = input.set_recording_time_us(hint);
             }
         }
+        // Input-side pipeline, every run: the color guard re-checks each
+        // decoded (pre-conversion) frame for HDR and applies the
+        // TaggedOrResolutionGuess stamp; UniformN chains its sampler after the
+        // guard so selection only ever sees guarded, stamped frames.
+        let mut builder = FramePipelineBuilder::new(AVMEDIA_TYPE_VIDEO).filter(
+            "frame_export_color_guard",
+            Box::new(ColorGuard::new(self.color)),
+        );
         if let Some(n) = uniform_n {
             let sampler = ExportSampler::new(n, span_cell.clone());
-            let mut builder = FramePipelineBuilder::new(AVMEDIA_TYPE_VIDEO)
-                .filter("frame_export_sampler", Box::new(sampler));
-            // Bind to the explicit stream when given; otherwise the video stream
-            // by media type (the resolver's best-stream selection coincides for
-            // single-video-stream inputs, the common UniformN case).
-            if let Some(idx) = self.video_stream_index {
-                builder = builder.set_stream_index(idx);
-            }
-            input = input.add_frame_pipeline(builder.build());
+            builder = builder.filter("frame_export_sampler", Box::new(sampler));
         }
+        // Bind to the explicit stream when given; otherwise the video stream
+        // by media type (the resolver's best-stream selection coincides for
+        // single-video-stream inputs, the common case — the resolver rejects
+        // or warns on the mismatching layouts).
+        if let Some(idx) = self.video_stream_index {
+            builder = builder.set_stream_index(idx);
+        }
+        input = input.add_frame_pipeline(builder.build());
 
         // Null output: vsync passthrough (S4) preserves 1:1 frames and PTS.
         let mut output = Output::from("-")

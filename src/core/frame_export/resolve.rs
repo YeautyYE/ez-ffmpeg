@@ -7,13 +7,14 @@
 //! stream index — never the `[0:v]` first-match linklabel.
 
 use super::error::FrameExportError;
+use super::guard::is_hdr;
 use super::options::{ColorPolicy, PixelLayout};
 use super::sampler::UniformSpan;
 use ffmpeg_sys_next::{
-    av_find_best_stream, av_rescale_q, AVColorPrimaries, AVColorSpace,
-    AVColorTransferCharacteristic, AVFormatContext, AVMediaType::AVMEDIA_TYPE_VIDEO,
+    av_find_best_stream, av_rescale_q, AVFormatContext, AVMediaType::AVMEDIA_TYPE_VIDEO,
     AV_NOPTS_VALUE, AV_TIME_BASE_Q,
 };
+use log::warn;
 use std::ptr::null_mut;
 
 /// Configuration the resolver needs, captured from the builder.
@@ -61,8 +62,35 @@ pub(crate) unsafe fn resolve_and_build_desc(
             .into());
         }
     }
-    // Unconditional for every sampling mode (the ambiguity check above only
-    // runs first so its actionable error wins on ambiguous HDR inputs).
+    // The input-side color guard binds to the first video stream when no
+    // explicit index is given. If the exported (best) stream is a LATER video
+    // stream, the guard sits on a stream that is never decoded: harmless, but
+    // inert. For plain HDR guarding that only narrows mid-stream splice
+    // detection back to the open-time check (warned below); for
+    // `TaggedOrResolutionGuess` it would silently skip the stamp — the exact
+    // wrong-color failure this module exists to prevent — so that combination
+    // is rejected with an actionable error instead.
+    if plan.stream_index.is_none() {
+        let first_video = first_video_stream_index(fmt_ctx);
+        if first_video != Some(stream_index) {
+            if matches!(plan.color, ColorPolicy::TaggedOrResolutionGuess) {
+                return Err(FrameExportError::InvalidOption(format!(
+                    "TaggedOrResolutionGuess requires video_stream_index({stream_index}) on \
+                     this input: the exported stream is not the first video stream, so the \
+                     per-frame color stamp would not reach it"
+                ))
+                .into());
+            }
+            warn!(
+                "frame export: exported stream {stream_index} is not the first video stream; \
+                 mid-stream HDR splice detection binds to the first video stream and will not \
+                 cover it (the open-time HDR check still applies). Set \
+                 video_stream_index({stream_index}) to pin the runtime guard."
+            );
+        }
+    }
+    // Unconditional for every sampling mode (the ambiguity checks above only
+    // run first so their actionable errors win on ambiguous HDR inputs).
     hdr_fast_fail(fmt_ctx, stream_index)?;
     if let Some(u) = &plan.uniform {
         let span = resolve_span(fmt_ctx, stream_index, u)?;
@@ -86,6 +114,20 @@ unsafe fn count_video_streams(fmt_ctx: *mut AVFormatContext) -> usize {
             !par.is_null() && (*par).codec_type == AVMEDIA_TYPE_VIDEO
         })
         .count()
+}
+
+/// Index of the first video stream in file order — the stream an input-side
+/// frame pipeline binds to when built without an explicit index.
+///
+/// # Safety
+/// `fmt_ctx` must be a valid, opened `AVFormatContext` pointer.
+unsafe fn first_video_stream_index(fmt_ctx: *mut AVFormatContext) -> Option<usize> {
+    let nb = (*fmt_ctx).nb_streams as usize;
+    (0..nb).find(|&i| {
+        let stream = *(*fmt_ctx).streams.add(i);
+        let par = (*stream).codecpar;
+        !par.is_null() && (*par).codec_type == AVMEDIA_TYPE_VIDEO
+    })
 }
 
 /// Resolves the UniformN grid span in microseconds:
@@ -180,10 +222,11 @@ unsafe fn resolve_stream_index(
     }
 }
 
-/// Rejects HDR inputs (BT.2020 / PQ / HLG) from the OPEN-TIME stream parameters
-/// only. There is no per-frame runtime check yet, so a mid-stream splice to HDR
-/// (e.g. MPEG-TS ad insertion) is not detected — that guard lands with the
-/// per-frame color-stamp work.
+/// Rejects HDR inputs (BT.2020 / PQ / HLG) from the OPEN-TIME stream
+/// parameters, so a declared-HDR input fails before any worker thread starts.
+/// The per-frame check in the input-side color guard remains authoritative at
+/// runtime — it catches mid-stream splices to HDR (e.g. MPEG-TS ad insertion)
+/// that never show up in the declared parameters. Both share [`is_hdr`].
 ///
 /// # Safety
 /// `fmt_ctx` must be valid and `stream_index` in range.
@@ -196,15 +239,11 @@ unsafe fn hdr_fast_fail(
     if codecpar.is_null() {
         return Ok(());
     }
-    let cs = (*codecpar).color_space;
-    let trc = (*codecpar).color_trc;
-    let pri = (*codecpar).color_primaries;
-    let hdr = cs == AVColorSpace::AVCOL_SPC_BT2020_NCL
-        || cs == AVColorSpace::AVCOL_SPC_BT2020_CL
-        || trc == AVColorTransferCharacteristic::AVCOL_TRC_SMPTE2084
-        || trc == AVColorTransferCharacteristic::AVCOL_TRC_ARIB_STD_B67
-        || pri == AVColorPrimaries::AVCOL_PRI_BT2020;
-    if hdr {
+    if is_hdr(
+        (*codecpar).color_space,
+        (*codecpar).color_trc,
+        (*codecpar).color_primaries,
+    ) {
         return Err(FrameExportError::HdrRequiresToneMapping.into());
     }
     Ok(())
@@ -219,7 +258,12 @@ fn build_filter_desc(stream_index: usize, plan: &ResolvePlan) -> String {
         (None, None) => "iw:ih".to_string(),
     };
     let (matrix, range) = match plan.color {
-        ColorPolicy::Tagged => ("auto".to_string(), "auto".to_string()),
+        // The resolution guess is stamped onto the frames by the input-side
+        // guard, so the graph reads the (now filled-in) tags exactly like
+        // `Tagged` does.
+        ColorPolicy::Tagged | ColorPolicy::TaggedOrResolutionGuess => {
+            ("auto".to_string(), "auto".to_string())
+        }
         ColorPolicy::Force { matrix, range } => (
             matrix.in_color_matrix().to_string(),
             range.in_range().to_string(),
@@ -305,5 +349,29 @@ mod tests {
             &plan(None, Some(224), PixelLayout::Rgb24, ColorPolicy::Tagged),
         );
         assert!(d.starts_with("[0:1]scale=-2:224:"), "{d}");
+    }
+
+    #[test]
+    fn resolution_guess_uses_auto_graph_inputs() {
+        // The guess is stamped per frame on the input side; the graph must keep
+        // reading the (filled-in) tags via auto, exactly like Tagged.
+        let tagged = build_filter_desc(
+            0,
+            &plan(None, None, PixelLayout::Rgb24, ColorPolicy::Tagged),
+        );
+        let guessed = build_filter_desc(
+            0,
+            &plan(
+                None,
+                None,
+                PixelLayout::Rgb24,
+                ColorPolicy::TaggedOrResolutionGuess,
+            ),
+        );
+        assert_eq!(tagged, guessed);
+        assert!(
+            guessed.contains("in_color_matrix=auto:in_range=auto"),
+            "{guessed}"
+        );
     }
 }
