@@ -8,7 +8,7 @@ use super::*;
 /// 2. Chapter auto-copy (`copy_chapters`)
 /// 3. Default auto-copy (`copy_metadata_default`)
 /// 4. User-specified metadata (`of_add_metadata`)
-unsafe fn process_metadata(mux: &Muxer, demuxs: &Vec<Demuxer>) -> Result<()> {
+pub(super) unsafe fn process_metadata(mux: &Muxer, demuxs: &Vec<Demuxer>) -> Result<()> {
     use crate::core::metadata::MetadataType;
     use crate::core::metadata::{
         copy_chapters_from_input, copy_metadata, copy_metadata_default, of_add_metadata,
@@ -1634,7 +1634,7 @@ fn output_bind_by_unlabeled_filter(
     Ok(())
 }
 
-fn ofilter_bind_ost(
+pub(super) fn ofilter_bind_ost(
     index: usize,
     mux: &mut Muxer,
     filter_graph: &mut FilterGraph,
@@ -1668,7 +1668,7 @@ fn ofilter_bind_ost(
     Ok(output_stream_index)
 }
 
-fn choose_encoder(
+pub(super) fn choose_encoder(
     mux: &Muxer,
     media_type: AVMediaType,
 ) -> Result<Option<(AVCodecID, *const AVCodec)>> {

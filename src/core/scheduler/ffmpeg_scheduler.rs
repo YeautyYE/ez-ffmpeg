@@ -6,6 +6,7 @@ use crate::core::scheduler::demux_task::demux_init;
 use crate::core::scheduler::enc_task::enc_init;
 use crate::core::scheduler::filter_task::filter_graph_init;
 use crate::core::scheduler::frame_filter_pipeline::{input_pipeline_init, output_pipeline_init};
+use crate::core::scheduler::frame_source_task::frame_source_init;
 use crate::core::scheduler::input_controller::InputController;
 use crate::core::scheduler::mux_task::{mux_init, ready_to_init_mux};
 use crate::core::scheduler::sync_queue::SyncQueue;
@@ -618,6 +619,23 @@ impl FfmpegScheduler<Initialization> {
                 demux.node.clone(),
                 scheduler_status.clone(),
                 pause_epoch.clone(),
+                thread_sync.clone(),
+                scheduler_result.clone(),
+            )?;
+        }
+
+        // Frame sources (VideoWriter): spawned LAST, so the worker's entire
+        // consumer chain (filter -> encoder -> mux) already exists. Inside the
+        // StartFailGuard window: on any later failure (none exists today —
+        // this loop is the final init) the pre-claimed slot is joined, and the
+        // worker's 100 ms status polls make that join terminate. No
+        // demux-keyed wake entry is needed for the same reason.
+        for (i, frame_source) in ffmpeg_context.frame_sources.drain(..).enumerate() {
+            frame_source_init(
+                i,
+                frame_source,
+                frame_pool.clone(),
+                scheduler_status.clone(),
                 thread_sync.clone(),
                 scheduler_result.clone(),
             )?;
