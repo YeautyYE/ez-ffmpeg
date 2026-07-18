@@ -282,7 +282,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 More examples can be found [here][examples].
 
-[examples]: https://github.com/YeautyYE/ez-ffmpeg/tree/master/examples
+[examples]: https://github.com/YeautyYE/ez-ffmpeg/tree/main/examples
 
 ## Frame & Sample Export (Experimental)
 
