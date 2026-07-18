@@ -504,6 +504,8 @@ pub mod analysis;
 /// available for anything these do not cover.
 pub mod recipes;
 
+pub mod frame_export;
+
 static INIT_FFMPEG: std::sync::Once = std::sync::Once::new();
 
 extern "C" fn cleanup() {

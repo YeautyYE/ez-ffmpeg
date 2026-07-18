@@ -174,15 +174,18 @@ impl FfmpegContext {
         filter_complexs: Vec<FilterComplex>,
         outputs: Vec<Output>,
     ) -> Result<FfmpegContext> {
-        Self::new_with_options(false, inputs, filter_complexs, outputs, false)
+        Self::new_with_options(false, inputs, filter_complexs, outputs, false, Vec::new())
     }
 
     pub(crate) fn new_with_options(
         mut independent_readrate: bool,
         mut inputs: Vec<Input>,
-        filter_complexs: Vec<FilterComplex>,
+        mut filter_complexs: Vec<FilterComplex>,
         mut outputs: Vec<Output>,
         copy_ts: bool,
+        deferred_filter_descs: Vec<
+            crate::core::context::ffmpeg_context_builder::DeferredFilterDesc,
+        >,
     ) -> Result<FfmpegContext> {
         check_duplicate_inputs_outputs(&inputs, &outputs)?;
 
@@ -202,6 +205,16 @@ impl FfmpegContext {
 
         if demuxs.len() <= 1 {
             independent_readrate = false;
+        }
+
+        // Resolve deferred filter descriptions against the just-opened demuxers
+        // (stream selection, durations, codec parameters) and append them BEFORE
+        // the emptiness check below, so the resulting graph is initialized. These
+        // closures must not consume corrected timing state
+        // (start_time_effective / ts_offset) — that is populated later by
+        // correct_input_start_times.
+        for deferred in deferred_filter_descs {
+            filter_complexs.push(deferred(&demuxs)?);
         }
 
         let mut filter_graphs = if !filter_complexs.is_empty() {
