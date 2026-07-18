@@ -182,7 +182,22 @@ pub enum Error {
 
     #[error("Frame export error: {0}")]
     FrameExport(#[from] crate::core::frame_export::FrameExportError),
+
+    #[error("Video writer error: {0}")]
+    Writer(#[from] crate::core::writer::WriterError),
+
+    #[error("Video writer push error: {0}")]
+    Push(#[from] crate::core::writer::PushError),
+
+    #[error("Frame source thread failed to start")]
+    FrameSourceThreadExited,
 }
+
+/// Builder/open-time validation errors for [`crate::VideoWriter`]. Exported here
+/// (not from the crate root) to mirror the existing `OpenInputError` /
+/// `OpenOutputError` organization; the root surface stays the three settled
+/// writer types.
+pub use crate::core::writer::WriterError;
 
 // Hand-written counterpart of the #[from] the sibling variants derive: the
 // error type inherits deprecation from the deprecated `opengl` module, so
