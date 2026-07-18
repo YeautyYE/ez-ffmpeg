@@ -243,7 +243,7 @@ jobs:
           key: ${{ runner.os }}-cargo-sources-v1-${{ hashFiles('**/Cargo.toml') }}
 
       - name: Test
-        run: cargo test --lib --test build_probe --test builder_option_validation --test frame_export_test --test frame_export_uniform_test --test frame_export_audio_test --test hls_fmp4 --features async,rtmp,flv,subtitle,wgpu ${{ matrix.ffmpeg-features }}
+        run: cargo test --lib --test build_probe --test builder_option_validation --test frame_export_test --test frame_export_uniform_test --test frame_export_audio_test --test hls_fmp4 --test video_writer --test rawvideo_seek_gating --features async,rtmp,flv,subtitle,wgpu ${{ matrix.ffmpeg-features }}
 
       - name: Doctests
         run: cargo test --doc --features async,rtmp,flv,subtitle,wgpu ${{ matrix.ffmpeg-features }}
@@ -440,7 +440,7 @@ jobs:
       # hardware-encoder tests stay compile-only. The remaining suite exercises
       # the platform scheduler, device, socket, RTMP, subtitle, and async paths.
       - name: Run CPU-only library tests
-        run: cargo test --lib --test build_probe --test builder_option_validation --test frame_export_test --test frame_export_uniform_test --test frame_export_audio_test --test hls_fmp4 --features "${{ matrix.test_features }}" ${{ matrix.test_args }}
+        run: cargo test --lib --test build_probe --test builder_option_validation --test frame_export_test --test frame_export_uniform_test --test frame_export_audio_test --test hls_fmp4 --test video_writer --test rawvideo_seek_gating --features "${{ matrix.test_features }}" ${{ matrix.test_args }}
 
   docs:
     name: Docs (docsrs cfg compile)
@@ -521,4 +521,5 @@ jobs:
             --test start_failure_join --test start_panic_unwind \
             --test shortest --test frame_pipeline_hardening \
             --test build_probe --test frame_export_test \
-            --test frame_export_uniform_test --test frame_export_audio_test
+            --test frame_export_uniform_test --test frame_export_audio_test \
+            --test video_writer
