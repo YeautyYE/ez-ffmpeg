@@ -25,6 +25,7 @@ This library:
 - Supports custom Rust filters and flexible input/output handling
 - Offers optional GPU-accelerated custom filters (wgpu) and a high-performance embedded RTMP server
 - Ships one-shot recipes (thumbnails/sprite sheets, animated GIF, HLS ABR ladders) and a detection/measurement API (black/silence/scene/crop/EBU R128 loudness) that returns typed Rust results instead of only FFmpeg logs
+- Exports decoded video frames (packed RGB) and audio (interleaved `f32` PCM) straight into memory for AI/CV/ASR pipelines, honoring color tags by default (experimental)
 
 By abstracting the complexity of the raw C API, `ez-ffmpeg` simplifies configuring media pipelines, performing transcoding and filtering, and inspecting media streams.
 
@@ -281,6 +282,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 More examples can be found [here][examples].
 
 [examples]: https://github.com/YeautyYE/ez-ffmpeg/tree/master/examples
+
+## Frame & Sample Export (Experimental)
+
+Decode straight into memory for AI/CV/ASR pipelines — no intermediate files,
+no raw-byte plumbing. Available without any extra Cargo feature; the API is
+experimental and may be reshaped in a future minor release.
+
+- **`FrameExtractor`** turns a video into owned, tightly packed 8-bit pixel
+  buffers (`Rgb24`/`Rgba32`/`Gray8`) with frame sampling (`All`, `EveryNth`,
+  `EverySec`, `KeyframesOnly`), optional aspect-preserving resize, and time
+  windows.
+- **`SampleExtractor`** turns audio into owned, interleaved `f32` PCM;
+  `for_whisper()` presets the 16 kHz mono shape ASR models consume.
+
+```rust
+use ez_ffmpeg::frame_export::{FrameExtractor, SampleExtractor, Sampling};
+
+fn main() -> Result<(), ez_ffmpeg::error::Error> {
+    // One 224-wide RGB frame per second — ready for a tensor or an image encoder.
+    for frame in FrameExtractor::new("input.mp4")
+        .sampling(Sampling::EverySec(1.0))
+        .width(224)
+        .frames()?
+    {
+        let frame = frame?;
+        // frame.as_bytes(): tightly packed RGB24, no row padding, top-down.
+    }
+
+    // 16 kHz mono f32 — the whisper-rs / candle handoff shape.
+    let pcm: Vec<f32> = SampleExtractor::for_whisper("input.mp4").collect_samples()?;
+    Ok(())
+}
+```
+
+Color conversion is tag-aware by default: `ColorPolicy::Tagged` honors each
+frame's colorspace tags during YUV → RGB conversion, so BT.709 (HD) content is
+not converted with BT.601 coefficients. Pipelines built on swscale's bare
+defaults — hand-rolled `sws_scale` with no colorspace setup, or
+`frame.to_ndarray(format="rgb24")` in older PyAV releases — apply BT.601 to
+everything, which visibly shifts saturated colors on HD sources.
+`ColorPolicy::Force` pins a specific matrix/range when the tags are known to
+be wrong, and input flagged as HDR in its stream metadata (BT.2020/PQ/HLG)
+fails fast with a typed error rather than being silently mis-converted.
+
+See `examples/color_policy_comparison` for a measured BT.601-vs-BT.709
+side-by-side, and the other `frame_export` examples (`extract_rgb_frames`,
+`frame_sampling`, `keyframe_thumbnails`, `extract_whisper_pcm`,
+`ai_media_ingest`) for the full tour.
 
 ## Streaming protocol outputs (WHIP / SRT)
 
