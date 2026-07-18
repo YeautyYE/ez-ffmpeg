@@ -160,18 +160,67 @@ fn resampled_chunk_pts_track_output_samples() {
     assert!(checked >= 2, "expected timestamped chunks to verify");
 }
 
+/// Waits up to `secs` for the scenario thread's next signal, surfacing a
+/// scenario panic as this test's own failure and a missing signal as the
+/// named `hang_msg` panic. Returns the handle so later stages can keep it.
+fn expect_signal(
+    rx: &std::sync::mpsc::Receiver<()>,
+    scenario: std::thread::JoinHandle<()>,
+    secs: u64,
+    hang_msg: &str,
+) -> std::thread::JoinHandle<()> {
+    use std::sync::mpsc::RecvTimeoutError;
+    match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
+        Ok(()) => scenario,
+        Err(RecvTimeoutError::Timeout) => panic!("{hang_msg}"),
+        Err(RecvTimeoutError::Disconnected) => match scenario.join() {
+            Err(panic) => std::panic::resume_unwind(panic),
+            Ok(()) => unreachable!("thread cannot exit cleanly without signalling"),
+        },
+    }
+}
+
 #[test]
 fn drop_mid_stream_does_not_deadlock() {
-    // A long source with capacity 1: after one chunk the sink is almost certainly
-    // parked in a blocking send(). Dropping must release it (S6: receiver first,
-    // then abort) rather than hang. Reaching the end of this test IS the assertion.
-    let mut it = SampleExtractor::new(lavfi("sine=frequency=440:duration=30:sample_rate=44100"))
-        .channel_capacity(1)
-        .samples()
-        .expect("start failed");
-    let first = it.next().expect("at least one chunk").expect("chunk ok");
-    assert_eq!(first.index(), 0);
-    drop(it);
+    // A long source with channel capacity 1: after one chunk the sink parks in
+    // a blocking send(). Dropping must release it (S6: receiver first, then
+    // abort) rather than hang. The scenario runs on its own thread and signals
+    // right before dropping, so the 30s deadline measures the TEARDOWN alone
+    // (startup and the first decode sit under their own generous deadline) — a
+    // teardown regression fails a named assertion instead of hanging the whole
+    // test binary until CI kills it.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let scenario = std::thread::spawn(move || {
+        let mut it =
+            SampleExtractor::new(lavfi("sine=frequency=440:duration=30:sample_rate=44100"))
+                .channel_capacity(1)
+                .samples()
+                .expect("start failed");
+        let first = it.next().expect("at least one chunk").expect("chunk ok");
+        assert_eq!(first.index(), 0);
+        // Consuming one chunk freed the only channel slot. Give the producer
+        // time to refill it and park in the next blocking send, biasing the
+        // drop below into the release-while-parked case (the regression this
+        // test exists for) instead of racing a producer that has not blocked
+        // yet. Teardown must succeed either way, so this cannot flake.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let _ = tx.send(());
+        drop(it);
+        let _ = tx.send(());
+    });
+    let scenario = expect_signal(
+        &rx,
+        scenario,
+        60,
+        "sample scenario did not reach its drop point within 60s",
+    );
+    let scenario = expect_signal(
+        &rx,
+        scenario,
+        30,
+        "dropping SampleIter mid-stream did not tear down within 30s (deadlock)",
+    );
+    scenario.join().expect("scenario thread must exit cleanly");
 }
 
 #[test]
@@ -202,5 +251,39 @@ fn no_audio_stream_is_typed_error() {
             ez_ffmpeg::frame_export::FrameExportError::NoAudioStream,
         ) => {}
         other => panic!("expected NoAudioStream, got {other:?}"),
+    }
+}
+
+#[test]
+fn out_of_bounds_audio_stream_index_is_typed_error() {
+    let err = SampleExtractor::new(lavfi("sine=frequency=440:duration=1"))
+        .audio_stream_index(99)
+        .samples()
+        .err()
+        .expect("index 99 on a single-stream input must fail");
+    match err {
+        ez_ffmpeg::error::Error::FrameExport(
+            ez_ffmpeg::frame_export::FrameExportError::AudioStreamIndexOutOfBounds { index, count },
+        ) => {
+            assert_eq!(index, 99);
+            assert_eq!(count, 1, "the lavfi source exposes exactly one stream");
+        }
+        other => panic!("expected AudioStreamIndexOutOfBounds, got {other:?}"),
+    }
+}
+
+#[test]
+fn audio_index_pointing_at_video_stream_is_typed_error() {
+    // Video-only input: stream 0 exists but is not an audio stream.
+    let err = SampleExtractor::new(lavfi("testsrc2=s=32x32:r=10:d=1"))
+        .audio_stream_index(0)
+        .samples()
+        .err()
+        .expect("audio extraction from a video stream must fail");
+    match err {
+        ez_ffmpeg::error::Error::FrameExport(
+            ez_ffmpeg::frame_export::FrameExportError::NotAnAudioStream { index },
+        ) => assert_eq!(index, 0),
+        other => panic!("expected NotAnAudioStream, got {other:?}"),
     }
 }

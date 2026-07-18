@@ -368,3 +368,44 @@ unsafe fn pack_bytes(
     }
     Ok((width as u32, height as u32, out))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ffmpeg_sys_next::av_frame_alloc;
+
+    /// A minimal owned frame whose only meaningful field is `flags`.
+    fn flag_frame(key: bool) -> Frame {
+        // SAFETY: fresh alloc; wrapped so Drop frees it.
+        unsafe {
+            let p = av_frame_alloc();
+            assert!(!p.is_null());
+            if key {
+                (*p).flags |= AV_FRAME_FLAG_KEY;
+            }
+            Frame::wrap(p)
+        }
+    }
+
+    /// The KEY-flag check is what keeps `KeyframesOnly` correct even when a
+    /// decoder ignores `skip_frame=nokey` and delivers every frame: key frames
+    /// pass the selection, delta frames do not.
+    #[test]
+    fn keyframes_only_selects_by_key_flag() {
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let mut sink = ExportSink::new(tx, Sampling::KeyframesOnly, PixelLayout::Rgb24, None);
+        let key = flag_frame(true);
+        let delta = flag_frame(false);
+        // SAFETY: both frames are valid allocations owned by this test.
+        unsafe {
+            assert!(
+                sink.select(key.as_ptr(), Some(0)),
+                "a KEY-flagged frame must be selected"
+            );
+            assert!(
+                !sink.select(delta.as_ptr(), Some(100_000)),
+                "a delta frame must not be selected"
+            );
+        }
+    }
+}
