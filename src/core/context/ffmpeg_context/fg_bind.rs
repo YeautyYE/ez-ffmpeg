@@ -475,11 +475,11 @@ pub(super) fn init_filter_graph(
 
     unsafe {
         /* this graph is only used for determining the kinds of inputs
-        and outputs we have, and is discarded on exit from this function */
+        and outputs we have, and is discarded on exit from this function;
+        its filters are created but (except dynamic-pad ones) never
+        initialized, so no filter side effects run at build() time */
         // Owned handle: `raw::FilterGraph`'s Drop frees the graph (and every
-        // filter context it holds) on every return path below — including the
-        // two `inouts_to_*_filters(..)?` early returns, which the hand-balanced
-        // `avfilter_graph_free` calls used to miss, leaking the graph.
+        // filter context it holds) on every return path below.
         let graph = crate::raw::FilterGraph::alloc().ok_or(FilterGraphParseError::OutOfMemory)?;
         (*graph.as_ptr()).nb_threads = 1;
 
@@ -513,28 +513,42 @@ pub(super) fn init_filter_graph(
             }
         }
 
-        #[cfg(not(docsrs))]
-        {
-            ret = graph_opts_apply(seg);
-        }
+        ret = graph_opts_apply(seg);
         if ret < 0 {
             avfilter_graph_segment_free(&mut seg);
             return Err(FilterGraphParseError::from(ret).into());
         }
 
-        let mut inputs = crate::raw::FilterInOut::empty();
-        let mut outputs = crate::raw::FilterInOut::empty();
-        ret = avfilter_graph_segment_apply(seg, 0, inputs.as_out_ptr(), outputs.as_out_ptr());
-        avfilter_graph_segment_free(&mut seg);
-
+        // NOT avfilter_graph_segment_apply: its init stage would run every
+        // filter's side effects (file opens, model/font loads, destination
+        // truncation) at build() time, violating the documented build()
+        // contract. Only topology-shaping (dynamic-pad) filters are
+        // initialized; the open pads are then computed by mirroring the
+        // upstream link pass (see fg_probe). Init-time errors of the filters
+        // this skips surface from the runtime parse — at the job's first
+        // configuration — instead of from build().
+        ret = fg_probe::init_topology_filters(seg);
         if ret < 0 {
+            avfilter_graph_segment_free(&mut seg);
             return Err(FilterGraphParseError::from(ret).into());
         }
 
-        // `inputs`/`outputs` own the parsed AVFilterInOut lists; their Drop frees
-        // them on every path below — the two `?` early returns included.
-        let input_filters = inouts_to_input_filters(fg_index, inputs.as_ptr())?;
-        let output_filters = inouts_to_output_filters(outputs.as_ptr())?;
+        let topology = fg_probe::probe_open_pads(seg);
+        avfilter_graph_segment_free(&mut seg);
+        let topology = topology?;
+
+        let mut input_filters = Vec::with_capacity(topology.inputs.len());
+        for (filter_index, pad) in topology.inputs.into_iter().enumerate() {
+            let fallback = frame_alloc()?;
+            let mut filter = InputFilter::new(pad.linklabel, pad.media_type, pad.name, fallback);
+            filter.opts.name = format!("fg:{fg_index}:{filter_index}");
+            input_filters.push(filter);
+        }
+        let output_filters = topology
+            .outputs
+            .into_iter()
+            .map(|pad| OutputFilter::new(pad.linklabel, pad.media_type, pad.name))
+            .collect::<Vec<_>>();
 
         // Keep the zero-OUTPUTS check first so a closed zero-in/zero-out graph
         // (e.g. `color=...,nullsink`) keeps returning FilterZeroOutputs as before.
@@ -560,104 +574,4 @@ pub(super) fn init_filter_graph(
 
         Ok(filter_graph)
     }
-}
-
-unsafe fn inouts_to_input_filters(
-    fg_index: usize,
-    inouts: *mut AVFilterInOut,
-) -> Result<Vec<InputFilter>> {
-    let mut cur = inouts;
-    let mut filterinouts = Vec::new();
-    let mut filter_index = 0;
-    while !cur.is_null() {
-        let linklabel = if (*cur).name.is_null() {
-            ""
-        } else {
-            let linklabel = CStr::from_ptr((*cur).name);
-            let result = linklabel.to_str();
-            if result.is_err() {
-                return Err(FilterDescUtf8);
-            }
-            result.unwrap()
-        };
-
-        let filter_ctx = (*cur).filter_ctx;
-        let media_type = avfilter_pad_get_type((*filter_ctx).input_pads, (*cur).pad_idx);
-
-        let pads = (*filter_ctx).input_pads;
-        let nb_pads = (*filter_ctx).nb_inputs;
-
-        let name = describe_filter_link(cur, filter_ctx, pads, nb_pads)?;
-
-        let fallback = frame_alloc()?;
-
-        let mut filter = InputFilter::new(linklabel.to_string(), media_type, name, fallback);
-        filter.opts.name = format!("fg:{fg_index}:{filter_index}");
-        filterinouts.push(filter);
-
-        cur = (*cur).next;
-        filter_index += 1;
-    }
-    Ok(filterinouts)
-}
-
-unsafe fn inouts_to_output_filters(inouts: *mut AVFilterInOut) -> Result<Vec<OutputFilter>> {
-    let mut cur = inouts;
-    let mut output_filters = Vec::new();
-    while !cur.is_null() {
-        let linklabel = if (*cur).name.is_null() {
-            ""
-        } else {
-            let linklabel = CStr::from_ptr((*cur).name);
-            let result = linklabel.to_str();
-            if result.is_err() {
-                return Err(FilterDescUtf8);
-            }
-            result.unwrap()
-        };
-
-        let filter_ctx = (*cur).filter_ctx;
-        let media_type = avfilter_pad_get_type((*filter_ctx).output_pads, (*cur).pad_idx);
-
-        let pads = (*filter_ctx).output_pads;
-        let nb_pads = (*filter_ctx).nb_outputs;
-
-        let name = describe_filter_link(cur, filter_ctx, pads, nb_pads)?;
-
-        let filter = OutputFilter::new(linklabel.to_string(), media_type, name);
-        output_filters.push(filter);
-
-        cur = (*cur).next;
-    }
-    Ok(output_filters)
-}
-
-unsafe fn describe_filter_link(
-    cur: *mut AVFilterInOut,
-    filter_ctx: *mut AVFilterContext,
-    pads: *mut AVFilterPad,
-    nb_pads: c_uint,
-) -> Result<String> {
-    let filter = (*filter_ctx).filter;
-    let name = (*filter).name;
-    let name = CStr::from_ptr(name);
-    let result = name.to_str();
-    if result.is_err() {
-        return Err(FilterNameUtf8);
-    }
-    let name = result.unwrap();
-
-    let name = if nb_pads > 1 {
-        name.to_string()
-    } else {
-        let pad_name = avfilter_pad_get_name(pads, (*cur).pad_idx);
-        let pad_name = CStr::from_ptr(pad_name);
-        let result = pad_name.to_str();
-        if result.is_err() {
-            return Err(FilterNameUtf8);
-        }
-        let pad_name = result.unwrap();
-        format!("{name}:{pad_name}")
-    };
-    Ok(name)
 }
