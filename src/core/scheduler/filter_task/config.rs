@@ -214,6 +214,36 @@ pub(super) unsafe fn configure_filtergraph(
         i += 1;
     }
 
+    // A probe-fabricated pad (a deferred-init filter whose real parse
+    // produced fewer pads than the build-time probe assumed) leaves its
+    // parameter slot unconfigured: the walks above pair parsed pads with
+    // slots and simply run out of parsed pads. Everything downstream —
+    // queued-frame replay, EOF replay, buffersink reads — dereferences the
+    // filter context unconditionally, so reject the mismatch here, at the
+    // single choke point, instead of segfaulting later.
+    for idx in 0..ifps.len() {
+        if ifps[idx].filter.is_null() {
+            error!(target: LOG_TARGET,
+                "input[{idx}] of filter graph '{graph_desc}' was never configured: \
+                 the graph's real input pads differ from the build-time assumption");
+            cleanup_filtergraph(graph, ifps, ofps);
+            return Err(Error::FilterGraph(FilterGraphOperationError::ParseError(
+                FilterGraphParseError::InvalidArgument,
+            )));
+        }
+    }
+    for idx in 0..ofps.len() {
+        if ofps[idx].filter.is_null() {
+            error!(target: LOG_TARGET,
+                "output[{idx}] of filter graph '{graph_desc}' was never configured: \
+                 the graph's real output pads differ from the build-time assumption");
+            cleanup_filtergraph(graph, ifps, ofps);
+            return Err(Error::FilterGraph(FilterGraphOperationError::ParseError(
+                FilterGraphParseError::InvalidArgument,
+            )));
+        }
+    }
+
     //TODO disable_conversions
 
     ret = avfilter_graph_config(graph_ptr, null_mut());
