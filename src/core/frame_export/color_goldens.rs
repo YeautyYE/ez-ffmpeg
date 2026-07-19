@@ -10,8 +10,11 @@
 //! expected side and diverging sharply (>=20/255 on some channel) from the
 //! wrong side. That keeps the vectors robust across FFmpeg 7/8 (no brittle
 //! hand-authored sRGB constants; observed same-side diff is 0, wrong-side
-//! divergence 24-39). Everything runs under `cargo test --lib`, so it rides
-//! both CI FFmpeg lanes with no wiring.
+//! divergence 24-39). The one exception is `default_tier_matches_cli_bytes`,
+//! which compares against an external `ffmpeg` binary — it gates itself on a
+//! libswscale build match (strict under `EZ_FFMPEG_CLI`, see `cli_parity_gate`)
+//! instead of being self-relative. Everything runs under `cargo test --lib`,
+//! so it rides both CI FFmpeg lanes with no wiring.
 //!
 //! Fixture families:
 //! - **Tagged matrix fixtures** (`mpeg2video` + `setparams`): `colorspace`
@@ -127,10 +130,11 @@ fn generate_untagged(path: &Path, hex: &str, w: u32, h: u32) {
         });
 }
 
-/// The center-pixel RGB of the first extracted frame under `policy` (default
-/// precision tier).
+/// The center-pixel RGB of the first extracted frame under `policy`, pinned
+/// to [`ConversionPrecision::Standard`] explicitly — the legacy goldens must
+/// not move if the enum's `Default` ever changes.
 fn center_rgb(path: &Path, policy: ColorPolicy) -> [u8; 3] {
-    center_rgb_at(path, policy, ConversionPrecision::default())
+    center_rgb_at(path, policy, ConversionPrecision::Standard)
 }
 
 /// [`center_rgb`] with an explicit conversion-precision tier.
@@ -570,16 +574,126 @@ fn high_precision_preserves_matrix_attribution() {
     );
 }
 
-/// True if the system `ffmpeg` CLI is on PATH (the byte-parity golden needs
-/// it for the reference output; the test skips cleanly without it).
-fn ffmpeg_cli_available() -> bool {
-    Command::new("ffmpeg")
-        .arg("-version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+/// Runtime pin for the High-tier plumbing: on gradient-heavy content the two
+/// tiers must produce DIFFERENT bytes somewhere. The descriptor unit test
+/// proves the flag string is constructed; this proves the builder value
+/// actually reaches the graph — a regression that dropped
+/// `conversion_precision` on the way to `build_filter_desc` would make the
+/// tiers byte-identical here. Self-relative (tier vs tier on one fixture), so
+/// no dependency on a particular swscale build.
+#[test]
+fn high_tier_diverges_from_standard_at_runtime() {
+    let s = Scratch::new("tier_divergence");
+    let p = s.path("moving709.mkv");
+    let input = Input::from("testsrc2=s=320x240:r=10:d=0.5").set_format("lavfi");
+    let output = Output::from(p.to_str().unwrap()).set_video_codec("mpeg2video");
+    let ctx = FfmpegContext::builder()
+        .input(input)
+        .filter_desc("setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709")
+        .output(output)
+        .build()
+        .expect("divergence fixture build");
+    FfmpegScheduler::new(ctx)
+        .start()
+        .and_then(|sch| sch.wait())
+        .expect("divergence fixture encode");
+
+    let bytes_at = |precision| {
+        FrameExtractor::new(p.to_str().unwrap())
+            .conversion_precision(precision)
+            .pixel(PixelLayout::Rgb24)
+            .collect_frames()
+            .expect("extraction")
+            .iter()
+            .flat_map(|f| f.as_bytes().to_vec())
+            .collect::<Vec<u8>>()
+    };
+    let standard = bytes_at(ConversionPrecision::Standard);
+    let high = bytes_at(ConversionPrecision::High);
+    assert!(!standard.is_empty(), "fixture produced no frames");
+    assert_eq!(standard.len(), high.len(), "same geometry and frame count");
+    assert_ne!(
+        standard, high,
+        "High must change bytes on chroma edges — identical output means the \
+         precision knob never reached the filter graph"
+    );
+}
+
+/// How the CLI byte-parity golden resolves its reference binary.
+///
+/// Byte parity is only meaningful when the CLI links the exact libswscale
+/// build the crate links — a different build legitimately produces different
+/// bytes, and asserting against it would test version drift, not our default.
+/// The gate has two lanes:
+///
+/// * `EZ_FFMPEG_CLI=<path>` (the CI lane): STRICT. Every failure — missing
+///   binary, unparsable `-version` banner, libswscale mismatch, failing
+///   reference run — fails the test. This is the enforcing configuration.
+/// * Unset (developer machines): `ffmpeg` from PATH is probed. Exactly two
+///   conditions skip (with a stderr note): the binary is absent, or its
+///   libswscale differs from the crate's. Anything else — a probe error, a
+///   nonzero `-version` exit, an unparsable banner, a failing reference
+///   run — is a harness defect and fails loudly.
+enum CliGate {
+    Run { bin: String },
+    Skip(String),
+}
+
+fn cli_parity_gate() -> CliGate {
+    use std::io::ErrorKind;
+    let pinned = std::env::var("EZ_FFMPEG_CLI").ok();
+    let strict = pinned.is_some();
+    let bin = pinned.unwrap_or_else(|| "ffmpeg".to_string());
+    let out = match Command::new(&bin).arg("-version").output() {
+        Err(e) if e.kind() == ErrorKind::NotFound && !strict => {
+            return CliGate::Skip(format!("no `{bin}` on PATH"));
+        }
+        Err(e) => panic!("ffmpeg CLI probe `{bin} -version` failed: {e}"),
+        Ok(o) if !o.status.success() => panic!("`{bin} -version` exited with {}", o.status),
+        Ok(o) => o,
+    };
+    let banner = String::from_utf8_lossy(&out.stdout).into_owned();
+    let cli = parse_swscale_version(&banner).unwrap_or_else(|| {
+        panic!("could not parse a libswscale version out of `{bin} -version` output")
+    });
+    let ours = linked_swscale_version();
+    if cli != ours {
+        let msg = format!(
+            "`{bin}` links libswscale {}.{}.{}, the crate links {}.{}.{} — \
+             byte parity is only defined on the same build",
+            cli.0, cli.1, cli.2, ours.0, ours.1, ours.2
+        );
+        if strict {
+            panic!("{msg} (point EZ_FFMPEG_CLI at a matching binary)");
+        }
+        return CliGate::Skip(msg);
+    }
+    CliGate::Run { bin }
+}
+
+/// The libswscale version the crate itself links, as (major, minor, micro).
+fn linked_swscale_version() -> (u32, u32, u32) {
+    // SAFETY: plain version query, no preconditions.
+    let v = unsafe { ffmpeg_sys_next::swscale_version() };
+    (v >> 16, (v >> 8) & 0xff, v & 0xff)
+}
+
+/// Parses the `libswscale  a. b.  c / ...` line out of `ffmpeg -version`
+/// output (the run-time linked triple, left of the `/`).
+fn parse_swscale_version(banner: &str) -> Option<(u32, u32, u32)> {
+    let line = banner
+        .lines()
+        .find(|l| l.trim_start().starts_with("libswscale"))?;
+    let head = line.split('/').next()?;
+    let digits: String = head
+        .chars()
+        .filter(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    let mut it = digits.split('.').filter(|s| !s.is_empty());
+    let major = it.next()?.parse().ok()?;
+    let minor = it.next()?.parse().ok()?;
+    let micro = it.next()?.parse().ok()?;
+    Some((major, minor, micro))
 }
 
 #[test]
@@ -589,14 +703,18 @@ fn default_tier_matches_cli_bytes() {
     // default tier must produce byte-for-byte the output of the ffmpeg CLI
     // running the equivalent chain with DEFAULT scaler flags (no flags token
     // at all). This holds because an explicit `flags=bicubic` is
-    // byte-identical to swscale's CLI default configuration. Meaningful when
-    // the CLI links the same FFmpeg as the crate (the CI lanes do); a
-    // mismatched system ffmpeg would test swscale-version drift instead, so
-    // the guard below also skips on any CLI failure rather than asserting.
-    if !ffmpeg_cli_available() {
-        eprintln!("skipping default_tier_matches_cli_bytes: no ffmpeg CLI on PATH");
-        return;
-    }
+    // byte-identical to swscale's CLI default configuration. `cli_parity_gate`
+    // only lets the comparison run against a CLI linking the crate's own
+    // libswscale build (see its docs); under `EZ_FFMPEG_CLI` it never skips.
+    // Once the gate passes, EVERY failure below asserts — a broken reference
+    // run is a harness defect, not a skip.
+    let bin = match cli_parity_gate() {
+        CliGate::Run { bin } => bin,
+        CliGate::Skip(why) => {
+            eprintln!("skipping default_tier_matches_cli_bytes: {why}");
+            return;
+        }
+    };
     let s = Scratch::new("cli_parity");
     let p = s.path("moving709.mkv");
     let input = Input::from("testsrc2=s=320x240:r=10:d=1").set_format("lavfi");
@@ -615,7 +733,7 @@ fn default_tier_matches_cli_bytes() {
     // Reference: the CLI with default scaler flags, vsync passthrough (the
     // extractor's own frame-delivery discipline), rawvideo out.
     let raw = s.path("cli.raw");
-    let status = Command::new("ffmpeg")
+    let reference = Command::new(&bin)
         .args([
             "-y",
             "-v",
@@ -630,12 +748,14 @@ fn default_tier_matches_cli_bytes() {
             "rawvideo",
             raw.to_str().unwrap(),
         ])
-        .status();
-    let ok = status.map(|st| st.success()).unwrap_or(false);
-    if !ok {
-        eprintln!("skipping default_tier_matches_cli_bytes: reference ffmpeg run failed");
-        return;
-    }
+        .output()
+        .expect("spawn the reference ffmpeg run");
+    assert!(
+        reference.status.success(),
+        "reference ffmpeg run failed with {}:\n{}",
+        reference.status,
+        String::from_utf8_lossy(&reference.stderr)
+    );
     let cli_bytes = std::fs::read(&raw).expect("read CLI rawvideo output");
 
     let frames = FrameExtractor::new(p.to_str().unwrap())
