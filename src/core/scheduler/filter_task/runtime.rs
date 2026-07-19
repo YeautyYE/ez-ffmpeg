@@ -382,6 +382,24 @@ pub(super) unsafe fn fg_send_frame(
 
     let ifp = &ifps[input_filter_index];
 
+    // A deferred-init filter (movie/ladspa/lv2/libplacebo) can make the
+    // build-time probe assume an input pad that the real runtime parse never
+    // produces — e.g. a source-mode ladspa/lv2 plugin has zero input pads, so
+    // configure_filtergraph leaves this slot's buffersrc unset. FFmpeg
+    // dereferences the context unconditionally, so a null here must become a
+    // typed error, not a segfault.
+    if ifp.filter.is_null() {
+        error!(
+            target: LOG_TARGET,
+            "input[{input_filter_index}] of filter graph '{graph_desc}' has no configured buffer \
+             source (the graph's real input pads differ from the build-time assumption)"
+        );
+        frame_pool.release(frame_box.frame);
+        return Err(Error::FilterGraph(
+            FilterGraphOperationError::BufferSourceAddFrameError(FilterGraphError::InvalidArgument),
+        ));
+    }
+
     (*frame).pts = av_rescale_q((*frame).pts, (*frame).time_base, ifp.time_base);
     (*frame).duration = av_rescale_q((*frame).duration, (*frame).time_base, ifp.time_base);
     (*frame).time_base = ifp.time_base;
