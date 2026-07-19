@@ -879,6 +879,65 @@ pub enum OpenOutputError {
 
     #[error("Attachment mimetype must not be empty (file '{0}')")]
     AttachmentEmptyMimetype(String),
+
+    /// A per-output video filter ([`Output::set_video_filter`]) was combined
+    /// with stream copy for the same output's video — either
+    /// `set_video_codec("copy")` or a copy stream map covering a video
+    /// stream. Mirrors the FFmpeg CLI error for `-vf` + `-c:v copy`
+    /// ("Filtering and streamcopy cannot be used together",
+    /// ffmpeg_mux_init.c streamcopy_init).
+    ///
+    /// [`Output::set_video_filter`]: crate::core::context::output::Output::set_video_filter
+    #[error(
+        "Filtergraph '{0}' was specified, but codec copy was selected for the \
+         output's video stream. Filtering and streamcopy cannot be used together"
+    )]
+    FilterWithStreamCopy(String),
+
+    /// A per-output video filter ([`Output::set_video_filter`]) was set on an
+    /// output whose video stream is fed by a context-level filtergraph
+    /// (`FfmpegContextBuilder::filter_desc`). Mirrors the FFmpeg CLI error for
+    /// `-vf` + `-filter_complex` on the same stream (ffmpeg_mux_init.c
+    /// ost_get_filters: "Simple and complex filtering cannot be used together
+    /// for the same stream").
+    ///
+    /// [`Output::set_video_filter`]: crate::core::context::output::Output::set_video_filter
+    #[error(
+        "Filtergraph '{0}' was specified for a video stream fed from a \
+         context-level filtergraph. Simple and complex filtering cannot be \
+         used together for the same stream"
+    )]
+    SimpleAndComplexFilter(String),
+
+    /// A per-output simple filtergraph must be a linear chain: exactly one
+    /// input pad and one output pad (fftools fg_create_simple,
+    /// ffmpeg_filter.c "Simple filtergraph ... was expected to have exactly
+    /// 1 input and 1 output"). Descriptions that split, merge or source
+    /// streams belong in the context-level `filter_desc`.
+    #[error(
+        "Simple filtergraph '{desc}' was expected to have exactly 1 input and \
+         1 output, but it has {inputs} input pad(s) and {outputs} output \
+         pad(s); use FfmpegContextBuilder::filter_desc for complex graphs"
+    )]
+    SimpleFilterInvalidShape {
+        desc: String,
+        inputs: usize,
+        outputs: usize,
+    },
+
+    /// A per-output simple filtergraph's pads must match the stream's media
+    /// type (fftools fg_create_simple: "Filtergraph has a %s output, cannot
+    /// connect it to %s output stream") — e.g. an audio chain like `anull`
+    /// cannot be attached as a video filter.
+    #[error(
+        "Simple filtergraph '{desc}' has a {found} pad, cannot connect it to \
+         the {expected} stream of this output"
+    )]
+    SimpleFilterMediaTypeMismatch {
+        desc: String,
+        found: String,
+        expected: String,
+    },
 }
 
 impl From<i32> for OpenOutputError {
@@ -1445,7 +1504,10 @@ mod tests {
     #[test]
     fn frame_source_thread_exited_equals_itself() {
         use super::Error;
-        assert_eq!(Error::FrameSourceThreadExited, Error::FrameSourceThreadExited);
+        assert_eq!(
+            Error::FrameSourceThreadExited,
+            Error::FrameSourceThreadExited
+        );
         assert_ne!(Error::FrameSourceThreadExited, Error::NotStarted);
     }
 

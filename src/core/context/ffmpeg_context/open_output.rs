@@ -71,6 +71,14 @@ unsafe fn open_output_file(
         )
         .into());
     }
+    // -vf + -c:v copy: the filter would need a decode/encode cycle that copy
+    // skips, so the CLI refuses the pair (ffmpeg_mux_init.c streamcopy_init)
+    // and so do we — silently dropping the filter would corrupt intent. Copy
+    // stream maps covering a video stream are caught later, in map_manual,
+    // once specifiers are expanded against the opened inputs.
+    if let (Some(filter), Some("copy")) = (&output.video_filter, output.video_codec.as_deref()) {
+        return Err(OpenOutputError::FilterWithStreamCopy(filter.clone()).into());
+    }
 
     let mut out_fmt_ctx = null_mut();
     // Frees out_fmt_ctx (and, for custom IO, its AVIO + callback box) on any
@@ -319,6 +327,7 @@ unsafe fn open_output_file(
         output.subtitle_disable,
         output.data_disable,
         pix_fmt,
+        output.video_filter.clone(),
         crate::core::context::pre_mux_queue::PreMuxQueueConfig {
             max_packets: output.max_muxing_queue_size,
             data_threshold: output.muxing_queue_data_threshold,

@@ -199,6 +199,11 @@ pub(crate) struct Muxer {
     // Parsed from string in open_output_file, stored as AVPixelFormat
     pub(crate) pix_fmt: Option<ffmpeg_sys_next::AVPixelFormat>,
 
+    /// Per-output simple video filter chain (`Output::set_video_filter`,
+    /// FFmpeg `-vf`). Consumed by `init_simple_filtergraph`, which uses it in
+    /// place of the default `null` chain for this output's video stream.
+    pub(crate) video_filter: Option<String>,
+
     // Auto-conversion tuning (NEW-SC-03): sws/swr option strings requested by
     // this output for the auto-inserted scale/aresample filters. Threaded into
     // the output's OutputFilterOptions in configure_output_filter_opts; the
@@ -310,6 +315,7 @@ impl Muxer {
         subtitle_disable: bool,
         data_disable: bool,
         pix_fmt: Option<ffmpeg_sys_next::AVPixelFormat>,
+        video_filter: Option<String>,
         pre_mux_queue_config: PreMuxQueueConfig,
         sws_opts: Option<String>,
         swr_opts: Option<String>,
@@ -376,6 +382,7 @@ impl Muxer {
             subtitle_disable,
             data_disable,
             pix_fmt,
+            video_filter,
             sws_opts,
             swr_opts,
             attachments,
