@@ -32,6 +32,10 @@ pub struct PacketInfo {
     is_corrupt: bool,
     is_video: bool,
     is_audio: bool,
+    /// Payload bytes, captured only when
+    /// [`set_capture_data`](PacketScanner::set_capture_data) enabled it.
+    /// `Arc` keeps the struct cheap to clone either way.
+    data: Option<std::sync::Arc<[u8]>>,
 }
 
 impl PacketInfo {
@@ -84,6 +88,14 @@ impl PacketInfo {
     pub fn is_audio(&self) -> bool {
         self.is_audio
     }
+
+    /// The packet payload, when capture was enabled via
+    /// [`PacketScanner::set_capture_data`] (`None` otherwise). Useful for
+    /// content-level comparisons, e.g. verifying NAL layout of demuxed
+    /// samples.
+    pub fn data(&self) -> Option<&[u8]> {
+        self.data.as_deref()
+    }
 }
 
 /// A stateful packet-level scanner for media files.
@@ -113,6 +125,7 @@ pub struct PacketScanner {
     fmt_ctx_box: FormatContext,
     pkt: *mut AVPacket,
     streams: Vec<StreamInfo>,
+    capture_data: bool,
 }
 
 // SAFETY: PacketScanner owns its AVFormatContext and AVPacket exclusively.
@@ -147,8 +160,16 @@ impl PacketScanner {
                 fmt_ctx_box,
                 pkt,
                 streams,
+                capture_data: false,
             })
         }
+    }
+
+    /// Enables (or disables) payload capture: when on, each returned
+    /// [`PacketInfo`] carries a copy of the packet bytes in
+    /// [`PacketInfo::data`]. Off by default — scanning stays copy-free.
+    pub fn set_capture_data(&mut self, capture: bool) {
+        self.capture_data = capture;
     }
 
     /// Seek to a timestamp in microseconds.
@@ -248,6 +269,12 @@ impl PacketScanner {
                 is_corrupt: (pkt.flags & AV_PKT_FLAG_CORRUPT) != 0,
                 is_video,
                 is_audio,
+                data: (self.capture_data && !pkt.data.is_null() && pkt.size > 0).then(|| {
+                    std::sync::Arc::from(std::slice::from_raw_parts(
+                        pkt.data,
+                        pkt.size as usize,
+                    ))
+                }),
             }))
         }
     }
