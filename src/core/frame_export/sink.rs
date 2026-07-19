@@ -2,11 +2,13 @@
 //!
 //! [`ExportSink`] is a `Never`-mode [`FrameFilter`] mounted on the null output's
 //! frame pipeline, downstream of `scale`/`format` and the vsync passthrough
-//! (S4). Per frame it: forwards end-of-stream markers untouched, applies the
-//! sampling decision (or, for `UniformN`, reads the input-side sampler's
-//! dup-count), packs the selected frame into an owned tight buffer, and delivers
-//! it over a bounded channel. It owns the exact `max_frames` cap (S5); the
-//! encoder-side `set_max_video_frames` is only an upstream terminator.
+//! (S4). Sampling happens on the INPUT side (the UniformN sampler and the
+//! EveryNth/EverySec selector run pre-filtergraph, so dropped frames never pay
+//! the conversion); this sink only re-checks `KeyframesOnly` (the post-graph
+//! `AV_FRAME_FLAG_KEY` belt over the decoder fast path), expands `UniformN`
+//! dup-counts, packs each delivered frame into an owned tight buffer, and
+//! streams it over a bounded channel. It owns the exact `max_frames` cap (S5);
+//! the encoder-side `set_max_video_frames` is only an upstream terminator.
 
 use super::frame::VideoFrame;
 use super::options::{PixelLayout, Sampling};
@@ -37,16 +39,8 @@ pub(crate) struct ExportSink {
     /// True for `UniformN`: selection happened on the input side, so this sink
     /// reads the `EMIT_COUNT` dup-count and expands rather than selecting.
     uniform: bool,
-    /// Countdown to the next `EveryNth` selection (0 means take this frame).
-    countdown: u64,
     /// Frames emitted so far (becomes each frame's `index`, enforces the cap).
     emitted: u64,
-    /// Next `EverySec` grid target in microseconds. `i128` so a boundary past
-    /// `i64::MAX` moves beyond every possible PTS (correctly ending selection)
-    /// instead of saturating and re-selecting.
-    next_target_us: Option<i128>,
-    /// `EverySec` step in microseconds (`> 0`, validated at build time).
-    every_sec_us: i64,
     /// Set once the receiver is gone or the cap is reached; stops emitting.
     done: bool,
 }
@@ -58,10 +52,6 @@ impl ExportSink {
         layout: PixelLayout,
         max_frames: Option<u64>,
     ) -> Self {
-        let every_sec_us = match sampling {
-            Sampling::EverySec(s) => (s * 1_000_000.0) as i64,
-            _ => 0,
-        };
         let uniform = matches!(sampling, Sampling::UniformN(_));
         Self {
             tx,
@@ -69,10 +59,7 @@ impl ExportSink {
             layout,
             max_frames,
             uniform,
-            countdown: 0,
             emitted: 0,
-            next_target_us: None,
-            every_sec_us,
             done: false,
         }
     }
@@ -102,58 +89,19 @@ impl ExportSink {
         Some(av_rescale_q(pts, tb, US_PER_SEC))
     }
 
-    /// Decides whether to select this frame, advancing the sampling state.
-    /// (Not used for `UniformN`, whose selection happens on the input side.)
+    /// Post-graph selection re-check. Only `KeyframesOnly` still decides here:
+    /// its input side is the `skip_frame=nokey` decoder fast path, and this
+    /// flag check is the belt over it (the KEY flag survives the graph). Every
+    /// other mode was fully decided on the input side — the UniformN sampler
+    /// and the EveryNth/EverySec selector — so unselected frames never reach
+    /// the graph's `scale`/`format` conversion at all.
     ///
     /// # Safety
     /// `p` must be a valid, non-null `AVFrame` pointer.
-    unsafe fn select(&mut self, p: *const AVFrame, pts_us: Option<i64>) -> bool {
+    unsafe fn select(&self, p: *const AVFrame) -> bool {
         match self.sampling {
-            Sampling::All => true,
-            Sampling::EveryNth(n) => {
-                // n >= 1 is validated at build time; guard anyway. A countdown
-                // (rather than `seen % n`) keeps this MSRV-1.80 safe — u64
-                // `is_multiple_of` is only stable since 1.87.
-                let n = n.max(1);
-                if self.countdown == 0 {
-                    self.countdown = n - 1;
-                    true
-                } else {
-                    self.countdown -= 1;
-                    false
-                }
-            }
             Sampling::KeyframesOnly => (*p).flags & AV_FRAME_FLAG_KEY != 0,
-            Sampling::EverySec(_) => {
-                let pts = match pts_us {
-                    Some(v) => v as i128,
-                    None => return false,
-                };
-                let step = self.every_sec_us.max(1) as i128;
-                match self.next_target_us {
-                    // First delivered frame anchors the grid (C1).
-                    None => {
-                        self.next_target_us = Some(pts + step);
-                        true
-                    }
-                    Some(target) => {
-                        if pts >= target {
-                            // Advance in O(1) to the smallest grid point strictly
-                            // past this frame. All-i128, unclamped: a huge gap can
-                            // neither hang nor overflow, and a boundary beyond
-                            // i64::MAX simply exceeds every future PTS. Each source
-                            // frame is selected at most once even across many steps.
-                            let advance = ((pts - target) / step + 1) * step;
-                            self.next_target_us = Some(target + advance);
-                            true
-                        } else {
-                            false
-                        }
-                    }
-                }
-            }
-            // Input-side selection; the sink expands the dup-count instead.
-            Sampling::UniformN(_) => true,
+            _ => true,
         }
     }
 
@@ -247,7 +195,7 @@ impl FrameFilter for ExportSink {
             return Ok(Some(frame));
         }
 
-        if !unsafe { self.select(p, pts_us) } {
+        if !unsafe { self.select(p) } {
             // Non-uniform modes only: a dropped frame does not reach the
             // encoder, so `set_max_video_frames` counts SELECTED frames 1:1.
             // (UniformN never takes this path; there the encoder sees unique
@@ -393,17 +341,17 @@ mod tests {
     #[test]
     fn keyframes_only_selects_by_key_flag() {
         let (tx, _rx) = crossbeam_channel::bounded(1);
-        let mut sink = ExportSink::new(tx, Sampling::KeyframesOnly, PixelLayout::Rgb24, None);
+        let sink = ExportSink::new(tx, Sampling::KeyframesOnly, PixelLayout::Rgb24, None);
         let key = flag_frame(true);
         let delta = flag_frame(false);
         // SAFETY: both frames are valid allocations owned by this test.
         unsafe {
             assert!(
-                sink.select(key.as_ptr(), Some(0)),
+                sink.select(key.as_ptr()),
                 "a KEY-flagged frame must be selected"
             );
             assert!(
-                !sink.select(delta.as_ptr(), Some(100_000)),
+                !sink.select(delta.as_ptr()),
                 "a delta frame must not be selected"
             );
         }

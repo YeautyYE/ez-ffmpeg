@@ -530,3 +530,53 @@ fn start_and_duration_window_bounds_output() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn every_sec_with_start_time_skips_gop_lead_in() {
+    // Inter-coded fixture with a single keyframe at t=0 (g=30): a 1.5 s start
+    // seeks back to that keyframe and the decoder replays 15 lead-in frames
+    // with negative re-zeroed pts before the in-graph trim drops them. The
+    // input-side selector must not anchor its EverySec grid on (or spend
+    // selections on) that lead-in: every delivered frame sits at/after the
+    // requested start, anchored at the first surviving frame.
+    use ez_ffmpeg::{FfmpegContext, FfmpegScheduler, Output};
+    let dir = std::env::temp_dir().join(format!("ez_fe_sec_gop_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("gop.mkv");
+    FfmpegScheduler::new(
+        FfmpegContext::builder()
+            .input(lavfi("testsrc2=s=16x16:r=10:d=3"))
+            .output(
+                Output::from(path.to_str().unwrap())
+                    .set_video_codec("mpeg2video")
+                    .set_video_codec_opt("g", "30"),
+            )
+            .build()
+            .expect("build GOP fixture"),
+    )
+    .start()
+    .and_then(|s| s.wait())
+    .expect("encode GOP fixture");
+
+    let frames = FrameExtractor::new(path.to_str().unwrap())
+        .sampling(Sampling::EverySec(0.5))
+        .start_time_us(1_500_000)
+        .collect_frames()
+        .expect("extraction");
+    // Remaining 1.5 s at one frame per 0.5 s => anchor + 2 grid points.
+    assert_eq!(frames.len(), 3, "got {:?}", pts_list(&frames));
+    let pts = pts_list(&frames);
+    assert!(
+        pts.iter().all(|&t| t >= 0),
+        "no pre-start frame may be selected: {pts:?}"
+    );
+    assert!(
+        pts.windows(2).all(|w| w[1] - w[0] >= 400_000),
+        "selections must follow the 0.5 s grid: {pts:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn pts_list(frames: &[ez_ffmpeg::frame_export::VideoFrame]) -> Vec<i64> {
+    frames.iter().filter_map(|f| f.pts_us()).collect()
+}
