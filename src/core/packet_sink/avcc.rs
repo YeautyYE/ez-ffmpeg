@@ -411,7 +411,8 @@ mod tests {
 
     #[test]
     fn splits_three_and_four_byte_start_codes() {
-        let nals = split_annexb(&annexb_config()).unwrap();
+        let config = annexb_config();
+        let nals = split_annexb(&config).unwrap();
         assert_eq!(nals, vec![SPS, PPS]);
     }
 
