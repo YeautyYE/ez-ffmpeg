@@ -296,7 +296,11 @@ experimental and may be reshaped in a future minor release.
 - **`FrameExtractor`** turns a video into owned, tightly packed 8-bit pixel
   buffers (`Rgb24`/`Rgba32`/`Gray8`) with frame sampling (`All`, `EveryNth`,
   `EverySec`, `KeyframesOnly`, `UniformN`), optional aspect-preserving resize,
-  and time windows.
+  and time windows. Pixel-format conversion defaults to the FFmpeg CLI's own
+  swscale configuration — byte-identical output, decode-bound throughput —
+  and `conversion_precision(ConversionPrecision::High)` opts into accurate
+  rounding + full chroma interpolation when last-bit chroma accuracy matters
+  more than speed.
 - **`SampleExtractor`** turns audio into owned, interleaved `f32` PCM;
   `for_whisper()` presets the 16 kHz mono shape ASR models consume.
 
