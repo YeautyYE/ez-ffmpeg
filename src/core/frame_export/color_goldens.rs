@@ -678,14 +678,18 @@ fn linked_swscale_version() -> (u32, u32, u32) {
     (v >> 16, (v >> 8) & 0xff, v & 0xff)
 }
 
-/// Parses the `libswscale  a. b.  c / ...` line out of `ffmpeg -version`
-/// output (the run-time linked triple, left of the `/`).
+/// Parses the `libswscale  a. b.  c /  a. b.  c` line out of `ffmpeg
+/// -version` output. The triple RIGHT of the `/` is the version the binary
+/// actually loads at run time (left is its compile-time header version);
+/// parity is defined against the run-time one, matching our own
+/// `swscale_version()` query. A line without `/` falls back to its only
+/// triple.
 fn parse_swscale_version(banner: &str) -> Option<(u32, u32, u32)> {
     let line = banner
         .lines()
         .find(|l| l.trim_start().starts_with("libswscale"))?;
-    let head = line.split('/').next()?;
-    let digits: String = head
+    let runtime = line.rsplit('/').next()?;
+    let digits: String = runtime
         .chars()
         .filter(|c| c.is_ascii_digit() || *c == '.')
         .collect();

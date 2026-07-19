@@ -506,7 +506,9 @@ mod tests {
     #[test]
     fn full_pool_drop_degrades_to_free() {
         let pool = BufferPool::new(1);
-        pool.recycler().try_send(Vec::with_capacity(8)).unwrap();
+        let pre_parked = Vec::with_capacity(8);
+        let pre_parked_ptr = pre_parked.as_ptr();
+        pool.recycler().try_send(pre_parked).unwrap();
         let vf = VideoFrame::new(
             1,
             1,
@@ -517,8 +519,17 @@ mod tests {
             Some(pool.recycler()),
         );
         drop(vf);
+        // Pointer identity pins BOTH sides of the claim: the pre-parked
+        // allocation survived the overflowing drop untouched, and (with the
+        // empty-pool check below) the frame's buffer was freed, not parked —
+        // a pool that lost every buffer and handed out a fresh allocation
+        // would fail here.
         let parked = pool.take(8);
-        assert!(parked.capacity() >= 8);
+        assert_eq!(
+            parked.as_ptr(),
+            pre_parked_ptr,
+            "take must return the pre-parked buffer itself"
+        );
         assert!(
             pool.rx.try_recv().is_err(),
             "the overflow buffer must have been freed, not parked"
