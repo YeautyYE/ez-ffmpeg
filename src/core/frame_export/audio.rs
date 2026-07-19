@@ -25,11 +25,13 @@ const WHISPER_SAMPLE_RATE: u32 = 16_000;
 /// [`collect_samples`](SampleExtractor::collect_samples) for one flat buffer.
 ///
 /// Defaults **preserve the source**: the source sample rate and channel layout
-/// pass through untouched, and only the sample *format* is pinned (packed `f32`).
-/// Normalization is opt-in — [`sample_rate`](Self::sample_rate) and
-/// [`channels`](Self::channels) insert a resample / downmix — so music and
-/// analysis users get no silent rate surprise. [`for_whisper`](Self::for_whisper)
-/// is a thin preset over those two setters.
+/// pass through untouched, and only the sample *format* is pinned (packed
+/// `f32`) — so the default output is whatever rate/channel shape the source
+/// has, NOT a model-ready 16 kHz mono stream. Normalization is opt-in —
+/// [`sample_rate`](Self::sample_rate) and [`channels`](Self::channels) insert
+/// a resample / channel-layout conversion — so music and analysis users get
+/// no silent rate surprise. Use [`for_whisper`](Self::for_whisper) (a thin
+/// preset over those two setters) when a speech model expects 16 kHz mono.
 ///
 /// ```no_run
 /// use ez_ffmpeg::frame_export::SampleExtractor;
@@ -99,7 +101,9 @@ impl SampleExtractor {
         self
     }
 
-    /// Downmixes to this channel layout (default: source layout).
+    /// Converts to this channel layout (default: source layout). The
+    /// conversion downmixes, upmixes, or passes through depending on the
+    /// source layout.
     pub fn channels(mut self, channels: Channels) -> Self {
         self.channels = Some(channels);
         self
@@ -184,7 +188,12 @@ impl SampleExtractor {
     }
 
     /// Runs to completion and flattens every exported chunk into one interleaved
-    /// `f32` buffer — the whisper-rs / candle handoff shape.
+    /// `f32` buffer. With explicit normalization (e.g.
+    /// [`for_whisper`](Self::for_whisper)) this is the whisper-rs / candle
+    /// handoff shape; with the source-preserving defaults it is simply the
+    /// source's own rate/channel shape, and the flat buffer carries no
+    /// rate/channel metadata — stream [`samples`](Self::samples) when you
+    /// need it per chunk.
     ///
     /// Memory is `duration_s × rate × channels × 4` bytes (1 h @ 16 kHz mono ≈
     /// 230 MB); use [`samples`](Self::samples) to stream when that is too large.

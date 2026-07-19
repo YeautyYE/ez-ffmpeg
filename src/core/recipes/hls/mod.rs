@@ -14,15 +14,18 @@
 //!   frame rate is used verbatim to derive a fixed GOP.
 //! - Single video stream plus a **single optional** audio stream
 //!   (`0:a:0?`). No audio groups, no per-rendition audio.
-//! - Keyframe alignment across renditions is achieved with **fixed-GOP codec
+//! - Keyframe alignment across renditions is pursued with **fixed-GOP codec
 //!   AVOptions** (`g` / `keyint_min` / `sc_threshold`, plus closed-GOP
 //!   `x264-params` for libx264) rather than
 //!   [`Output::set_force_key_frames`](crate::Output::set_force_key_frames),
-//!   which remains available for hand-built pipelines (a fixed GOP already
-//!   guarantees alignment under the CFR contract). Because every rendition
-//!   shares the same CFR input and the same GOP length, their keyframe PTS
-//!   sequences coincide, so segments split at the same PTS and are
-//!   cross-switchable.
+//!   which remains available for hand-built pipelines. With the same CFR
+//!   input and GOP length, renditions' keyframe PTS sequences coincide, so
+//!   segments split at the same PTS and are cross-switchable — as long as the
+//!   chosen encoder honors those options. The explicit fixed-GOP/no-scenecut
+//!   parameters are wired for libx264/libx265 (and encoders honoring the
+//!   generic `g`/`sc_threshold` AVOptions); an arbitrary encoder passed to
+//!   [`HlsLadder::video_codec`] may keep inserting scene-cut keyframes, and
+//!   this recipe cannot verify alignment after the fact.
 //!
 //! Segments are MPEG-TS by default; [`HlsLadder::segment_type`] switches the
 //! whole ladder to fragmented-MP4 segments (see [fMP4
