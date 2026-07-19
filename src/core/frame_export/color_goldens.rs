@@ -29,10 +29,12 @@
 //!   contract).
 
 use super::{
-    ColorPolicy, FrameExportError, FrameExtractor, PixelLayout, Sampling, YuvMatrix, YuvRange,
+    ColorPolicy, ConversionPrecision, FrameExportError, FrameExtractor, PixelLayout, Sampling,
+    YuvMatrix, YuvRange,
 };
 use crate::{FfmpegContext, FfmpegScheduler, Input, Output};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 const GUESS: ColorPolicy = ColorPolicy::TaggedOrResolutionGuess;
 
@@ -125,10 +127,17 @@ fn generate_untagged(path: &Path, hex: &str, w: u32, h: u32) {
         });
 }
 
-/// The center-pixel RGB of the first extracted frame under `policy`.
+/// The center-pixel RGB of the first extracted frame under `policy` (default
+/// precision tier).
 fn center_rgb(path: &Path, policy: ColorPolicy) -> [u8; 3] {
+    center_rgb_at(path, policy, ConversionPrecision::default())
+}
+
+/// [`center_rgb`] with an explicit conversion-precision tier.
+fn center_rgb_at(path: &Path, policy: ColorPolicy, precision: ConversionPrecision) -> [u8; 3] {
     let frames = FrameExtractor::new(path.to_str().unwrap())
         .color(policy)
+        .conversion_precision(precision)
         .pixel(PixelLayout::Rgb24)
         .max_frames(1)
         .collect_frames()
@@ -527,6 +536,131 @@ fn mid_stream_hdr_splice_is_typed_runtime_error() {
             ),
             "expected typed HdrRequiresToneMapping for {mode:?}, got {err:?}"
         );
+    }
+}
+
+#[test]
+fn high_precision_preserves_matrix_attribution() {
+    // The opt-in High tier changes rounding/interpolation, never color
+    // interpretation: the self-relative matrix wedge must hold under it
+    // exactly as it does under the default tier, and on flat color (no chroma
+    // edges, where the tiers' chroma reconstruction cannot differ) the two
+    // tiers must agree within the same rounding tolerance.
+    let s = Scratch::new("high_tier");
+    let p = s.path("red709.mkv");
+    generate(&p, "0xFF0000", "bt709", "mpeg2video");
+    let high_tagged = center_rgb_at(&p, ColorPolicy::Tagged, ConversionPrecision::High);
+    let high_709 = center_rgb_at(&p, LIMITED_709, ConversionPrecision::High);
+    let high_601 = center_rgb_at(&p, LIMITED_601, ConversionPrecision::High);
+    assert!(
+        max_channel_diff(high_tagged, high_709) <= 4,
+        "High-tier Tagged {high_tagged:?} should match High-tier Force(709) {high_709:?}"
+    );
+    assert!(
+        max_channel_diff(high_tagged, high_601) >= 20,
+        "High-tier Tagged {high_tagged:?} vs Force(601) {high_601:?} must diverge >=20"
+    );
+    // Cross-tier pin: the tiers may differ by rounding, nothing more, on flat
+    // color — a High tier that changed the MATRIX would blow this tolerance.
+    let default_tagged = center_rgb(&p, ColorPolicy::Tagged);
+    assert!(
+        max_channel_diff(high_tagged, default_tagged) <= 4,
+        "High tier {high_tagged:?} vs default tier {default_tagged:?} must agree \
+         within rounding on flat color"
+    );
+}
+
+/// True if the system `ffmpeg` CLI is on PATH (the byte-parity golden needs
+/// it for the reference output; the test skips cleanly without it).
+fn ffmpeg_cli_available() -> bool {
+    Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[test]
+fn default_tier_matches_cli_bytes() {
+    // The strongest pin on the CLI-consistent default: over a moving,
+    // gradient-heavy clip (testsrc2 — solid color would pass trivially), the
+    // default tier must produce byte-for-byte the output of the ffmpeg CLI
+    // running the equivalent chain with DEFAULT scaler flags (no flags token
+    // at all). This holds because an explicit `flags=bicubic` is
+    // byte-identical to swscale's CLI default configuration. Meaningful when
+    // the CLI links the same FFmpeg as the crate (the CI lanes do); a
+    // mismatched system ffmpeg would test swscale-version drift instead, so
+    // the guard below also skips on any CLI failure rather than asserting.
+    if !ffmpeg_cli_available() {
+        eprintln!("skipping default_tier_matches_cli_bytes: no ffmpeg CLI on PATH");
+        return;
+    }
+    let s = Scratch::new("cli_parity");
+    let p = s.path("moving709.mkv");
+    let input = Input::from("testsrc2=s=320x240:r=10:d=1").set_format("lavfi");
+    let output = Output::from(p.to_str().unwrap()).set_video_codec("mpeg2video");
+    let ctx = FfmpegContext::builder()
+        .input(input)
+        .filter_desc("setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709")
+        .output(output)
+        .build()
+        .expect("parity fixture build");
+    FfmpegScheduler::new(ctx)
+        .start()
+        .and_then(|sch| sch.wait())
+        .expect("parity fixture encode");
+
+    // Reference: the CLI with default scaler flags, vsync passthrough (the
+    // extractor's own frame-delivery discipline), rawvideo out.
+    let raw = s.path("cli.raw");
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-v",
+            "error",
+            "-i",
+            p.to_str().unwrap(),
+            "-vf",
+            "scale=iw:ih:in_color_matrix=auto:in_range=auto:out_range=full,format=rgb24",
+            "-fps_mode",
+            "passthrough",
+            "-f",
+            "rawvideo",
+            raw.to_str().unwrap(),
+        ])
+        .status();
+    let ok = status.map(|st| st.success()).unwrap_or(false);
+    if !ok {
+        eprintln!("skipping default_tier_matches_cli_bytes: reference ffmpeg run failed");
+        return;
+    }
+    let cli_bytes = std::fs::read(&raw).expect("read CLI rawvideo output");
+
+    let frames = FrameExtractor::new(p.to_str().unwrap())
+        .pixel(PixelLayout::Rgb24)
+        .collect_frames()
+        .expect("default-tier extraction");
+    assert!(!frames.is_empty(), "parity fixture produced no frames");
+    let ez_total: usize = frames.iter().map(|f| f.as_bytes().len()).sum();
+    assert_eq!(
+        ez_total,
+        cli_bytes.len(),
+        "frame count / geometry must match the CLI ({} frames of {} bytes)",
+        frames.len(),
+        frames[0].as_bytes().len()
+    );
+    let mut offset = 0usize;
+    for f in &frames {
+        let bytes = f.as_bytes();
+        assert_eq!(
+            bytes,
+            &cli_bytes[offset..offset + bytes.len()],
+            "frame {} diverges from the CLI reference bytes",
+            f.index()
+        );
+        offset += bytes.len();
     }
 }
 
