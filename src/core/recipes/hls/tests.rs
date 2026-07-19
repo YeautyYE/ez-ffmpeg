@@ -227,12 +227,10 @@ fn validate_rejects_codecs_injection_and_master_collision() {
 
 // ---- segment type wiring (rendition_output) ---------------------------
 
-/// Joins path components the same way `build_context` does, so the expected
-/// strings stay correct on every platform's separator.
-fn joined(parts: &[&str]) -> String {
-    let path: PathBuf = parts.iter().collect();
-    path.to_str().unwrap().to_string()
-}
+// Muxer-facing paths are forward-slash separated on every platform: native
+// joins already produce `/` on Unix, and `path_to_utf8` normalizes `\` on
+// Windows (the hls muxer splits paths on `/` only). The frozen expectations
+// below are therefore literal.
 
 fn opts(pairs: &[(&str, &str)]) -> HashMap<String, String> {
     pairs
@@ -256,10 +254,7 @@ fn mpegts_rendition_output_is_frozen() {
     let l = ladder();
     let output = l.rendition_output(0, &l.renditions[0], "180", "6").unwrap();
 
-    assert_eq!(
-        output.url.as_deref(),
-        Some(joined(&["out", "720p", "index.m3u8"]).as_str())
-    );
+    assert_eq!(output.url.as_deref(), Some("out/720p/index.m3u8"));
     assert_eq!(output.format.as_deref(), Some("hls"));
     assert_eq!(output.video_codec.as_deref(), Some("libx264"));
     assert_eq!(output.audio_codec.as_deref(), Some("aac"));
@@ -280,10 +275,7 @@ fn mpegts_rendition_output_is_frozen() {
         Some(opts(&[
             ("hls_time", "6"),
             ("hls_playlist_type", "vod"),
-            (
-                "hls_segment_filename",
-                joined(&["out", "720p", "seg_%05d.ts"]).as_str()
-            ),
+            ("hls_segment_filename", "out/720p/seg_%05d.ts"),
         ]))
     );
 
@@ -313,10 +305,7 @@ fn fmp4_rendition_output_wires_fmp4_options() {
         Some(opts(&[
             ("hls_time", "6"),
             ("hls_playlist_type", "vod"),
-            (
-                "hls_segment_filename",
-                joined(&["out", "720p", "seg_%05d.m4s"]).as_str()
-            ),
+            ("hls_segment_filename", "out/720p/seg_%05d.m4s"),
             ("hls_segment_type", "fmp4"),
             ("hls_fmp4_init_filename", "init.mp4"),
         ]))
