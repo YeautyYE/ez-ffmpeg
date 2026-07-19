@@ -4,7 +4,7 @@ use super::error::FrameExportError;
 use super::frame::VideoFrame;
 use super::guard::ColorGuard;
 use super::iter::FrameIter;
-use super::options::{ColorPolicy, PixelLayout, Sampling};
+use super::options::{ColorPolicy, ConversionPrecision, PixelLayout, Sampling};
 use super::resolve::{resolve_and_build_desc, ResolvePlan, UniformResolve};
 use super::sampler::{ExportSampler, UniformSpan};
 use super::selector::InputSelector;
@@ -31,6 +31,7 @@ pub struct FrameExtractor {
     height: Option<u32>,
     pixel: PixelLayout,
     color: ColorPolicy,
+    precision: ConversionPrecision,
     max_frames: Option<u64>,
     start_time_us: Option<i64>,
     duration_us: Option<i64>,
@@ -51,6 +52,7 @@ impl FrameExtractor {
             height: None,
             pixel: PixelLayout::Rgb24,
             color: ColorPolicy::Tagged,
+            precision: ConversionPrecision::Standard,
             max_frames: None,
             start_time_us: None,
             duration_us: None,
@@ -97,6 +99,16 @@ impl FrameExtractor {
     /// Sets the color-interpretation policy (default [`ColorPolicy::Tagged`]).
     pub fn color(mut self, policy: ColorPolicy) -> Self {
         self.color = policy;
+        self
+    }
+
+    /// Sets the swscale precision tier for the pixel-format conversion
+    /// (default [`ConversionPrecision::Standard`], which matches the FFmpeg
+    /// CLI's default scaler flags). [`ConversionPrecision::High`] opts into
+    /// accurate rounding + full chroma interpolation at a several-fold
+    /// conversion cost — see the enum docs for the tradeoff.
+    pub fn conversion_precision(mut self, precision: ConversionPrecision) -> Self {
+        self.precision = precision;
         self
     }
 
@@ -244,6 +256,7 @@ impl FrameExtractor {
             height: self.height,
             pixel: self.pixel,
             color: self.color,
+            precision: self.precision,
             input_side_sampling: matches!(
                 self.sampling,
                 Sampling::UniformN(_) | Sampling::EveryNth(_) | Sampling::EverySec(_)

@@ -103,7 +103,7 @@ mod color_goldens;
 pub use error::FrameExportError;
 pub use frame::VideoFrame;
 pub use iter::FrameIter;
-pub use options::{ColorPolicy, PixelLayout, Sampling, YuvMatrix, YuvRange};
+pub use options::{ColorPolicy, ConversionPrecision, PixelLayout, Sampling, YuvMatrix, YuvRange};
 pub use video::FrameExtractor;
 
 // --- Audio (PCM) sample export ---

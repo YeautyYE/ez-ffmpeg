@@ -8,7 +8,7 @@
 
 use super::error::FrameExportError;
 use super::guard::is_hdr;
-use super::options::{ColorPolicy, PixelLayout};
+use super::options::{ColorPolicy, ConversionPrecision, PixelLayout};
 use super::sampler::UniformSpan;
 use ffmpeg_sys_next::{
     av_find_best_stream, av_rescale_q, AVFormatContext, AVMediaType::AVMEDIA_TYPE_VIDEO,
@@ -24,6 +24,7 @@ pub(crate) struct ResolvePlan {
     pub(crate) height: Option<u32>,
     pub(crate) pixel: PixelLayout,
     pub(crate) color: ColorPolicy,
+    pub(crate) precision: ConversionPrecision,
     /// True for the modes that decide selection on the INPUT frame pipeline
     /// (`UniformN`, `EveryNth`, `EverySec`): those bind by media type when no
     /// explicit index is given, and can disagree with the graph's best-stream
@@ -277,11 +278,20 @@ fn build_filter_desc(stream_index: usize, plan: &ResolvePlan) -> String {
             range.in_range().to_string(),
         ),
     };
+    // `Standard` pins the FFmpeg CLI's default scaler flags explicitly (an
+    // explicit `flags=bicubic` is byte-identical to omitting the token), so
+    // swscale stays eligible for its unscaled fast-path converters. `High`
+    // trades those fast paths for accurate rounding + full chroma
+    // interpolation.
+    let flags = match plan.precision {
+        ConversionPrecision::Standard => "bicubic",
+        ConversionPrecision::High => "bicubic+accurate_rnd+full_chroma_int",
+    };
     // `[0:{idx}]` = input 0, ABSOLUTE stream index. `[{idx}:v]` would be wrong:
     // there the leading number is the INPUT-file index, so a resolved video at
     // stream 1 of a single input would reference a nonexistent input 1.
     format!(
-        "[0:{stream_index}]scale={size}:flags=bicubic+accurate_rnd+full_chroma_int:\
+        "[0:{stream_index}]scale={size}:flags={flags}:\
          in_color_matrix={matrix}:in_range={range}:out_range=full,format={pix}[export]",
         pix = plan.pixel.ffmpeg_format_name()
     )
@@ -304,6 +314,7 @@ mod tests {
             height,
             pixel,
             color,
+            precision: ConversionPrecision::Standard,
             input_side_sampling: false,
             uniform: None,
         }
@@ -311,10 +322,26 @@ mod tests {
 
     #[test]
     fn tagged_rgb_no_resize() {
+        // The default tier pins the CLI-default scaler flags: `bicubic` only,
+        // no precision flags — the color parameterization is unchanged.
         let d = build_filter_desc(
             0,
             &plan(None, None, PixelLayout::Rgb24, ColorPolicy::Tagged),
         );
+        assert_eq!(
+            d,
+            "[0:0]scale=iw:ih:flags=bicubic:\
+             in_color_matrix=auto:in_range=auto:out_range=full,format=rgb24[export]"
+        );
+    }
+
+    #[test]
+    fn high_precision_adds_accuracy_flags() {
+        // The opt-in tier re-adds the accurate-rounding + full-chroma flags and
+        // must change NOTHING else about the description.
+        let mut p = plan(None, None, PixelLayout::Rgb24, ColorPolicy::Tagged);
+        p.precision = ConversionPrecision::High;
+        let d = build_filter_desc(0, &p);
         assert_eq!(
             d,
             "[0:0]scale=iw:ih:flags=bicubic+accurate_rnd+full_chroma_int:\
