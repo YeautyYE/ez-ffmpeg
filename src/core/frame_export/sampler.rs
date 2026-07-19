@@ -69,12 +69,23 @@ impl SamplingClock {
     /// `track_delta` is false until the caller has anchored its grid: the very
     /// first real timestamp has no meaningful inter-frame delta.
     ///
+    /// Reads `pts` first: decoder processing normalizes it (including the
+    /// forced-framerate rewrite, which re-stamps `pts` AND `time_base` onto
+    /// the forced CFR grid while `best_effort_timestamp` keeps the container's
+    /// original ticks — pairing those with the rewritten time base mis-scales
+    /// every decision). `best_effort_timestamp` is only the fallback for
+    /// frames whose canonical `pts` is unset.
+    ///
     /// # Safety
     /// `p` must be a valid, non-null `AVFrame`.
     pub(crate) unsafe fn pts_us(&mut self, p: *const AVFrame, track_delta: bool) -> i64 {
         let tb = (*p).time_base;
-        let raw = (*p).best_effort_timestamp;
-        let raw = if raw == AV_NOPTS_VALUE { (*p).pts } else { raw };
+        let raw = (*p).pts;
+        let raw = if raw == AV_NOPTS_VALUE {
+            (*p).best_effort_timestamp
+        } else {
+            raw
+        };
         if tb.den != 0 && raw != AV_NOPTS_VALUE {
             let pts = av_rescale_q(raw, tb, US_PER_SEC);
             if track_delta {
