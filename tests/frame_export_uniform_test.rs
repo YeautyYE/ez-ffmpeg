@@ -122,6 +122,61 @@ fn uniform_n_start_only_spans_remaining_content() {
 }
 
 #[test]
+fn uniform_n_start_on_gop_video_stays_uniform() {
+    // Inter-coded fixture: 3 s @ 10 fps mpeg2video with a single keyframe at
+    // t=0 (g=30). A 1.5 s start therefore seeks back to the t=0 keyframe and
+    // the decoder replays 15 lead-in frames with NEGATIVE re-zeroed pts, which
+    // the in-graph trim drops. The sampler must anchor its grid at the first
+    // SURVIVING frame — anchoring on the lead-in shifted the whole grid a GOP
+    // early, the trim destroyed the stamped targets, and the sink backfilled
+    // with consecutive tail frames ([0,100,200,300] ms instead of a uniform
+    // spread). The intra-only mjpeg test above cannot catch this: its seek
+    // lands exactly on the request.
+    let dir = std::env::temp_dir().join(format!("ez_fe_uniform_gop_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("gop.mkv");
+    FfmpegScheduler::new(
+        FfmpegContext::builder()
+            .input(lavfi("testsrc2=s=16x16:r=10:d=3"))
+            .output(
+                Output::from(path.to_str().unwrap())
+                    .set_video_codec("mpeg2video")
+                    .set_video_codec_opt("g", "30"),
+            )
+            .build()
+            .expect("build GOP fixture"),
+    )
+    .start()
+    .and_then(|s| s.wait())
+    .expect("encode GOP fixture");
+
+    let frames = FrameExtractor::new(path.to_str().unwrap())
+        .sampling(Sampling::UniformN(4))
+        .start_time_us(1_500_000)
+        .collect_frames()
+        .expect("extraction");
+    assert_eq!(frames.len(), 4);
+    let pts: Vec<i64> = frames.iter().filter_map(|f| f.pts_us()).collect();
+    assert_eq!(pts.len(), 4, "every frame carries a timestamp: {pts:?}");
+    assert!(
+        pts.windows(2).all(|w| w[0] < w[1]),
+        "strictly increasing: {pts:?}"
+    );
+    assert!(pts[0] >= 0, "no pre-start frame may survive: {pts:?}");
+    // Ideal targets over the remaining 1.5 s sit ~375 ms apart. The pre-fix
+    // failure mode is a consecutive clump (100 ms gaps) at the window head.
+    assert!(
+        pts.windows(2).all(|w| w[1] - w[0] >= 300_000),
+        "targets must stay spread, not clump: {pts:?}"
+    );
+    assert!(
+        pts[3] - pts[0] >= 900_000,
+        "grid must cover the remaining span: {pts:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn nonpositive_duration_hint_is_rejected() {
     for bad in [0i64, -1] {
         let err = FrameExtractor::new(lavfi("testsrc2=s=16x16:r=10:d=1"))

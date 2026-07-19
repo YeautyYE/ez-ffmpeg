@@ -186,7 +186,14 @@ impl FrameExtractor {
             Box::new(ColorGuard::new(self.color)),
         );
         if let Some(n) = uniform_n {
-            let sampler = ExportSampler::new(n, span_cell.clone());
+            // With start_time_us the demux timeline is re-zeroed at the request
+            // and the in-graph trim drops pts < 0 — but the container seek
+            // lands on a keyframe at or BEFORE the request, so on GOP video
+            // this pipeline sees negative-pts lead-in first. The boundary makes
+            // the sampler skip that lead-in instead of anchoring its grid on
+            // frames the trim will destroy.
+            let trim_boundary = self.start_time_us.map(|_| 0i64);
+            let sampler = ExportSampler::new(n, span_cell.clone(), trim_boundary);
             builder = builder.filter("frame_export_sampler", Box::new(sampler));
         }
         // Bind to the explicit stream when given; otherwise the video stream
