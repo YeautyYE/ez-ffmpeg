@@ -42,6 +42,18 @@
 //! else BT.601) without ever overriding real tags. [`ColorPolicy::Force`] pins
 //! a specific matrix/range for all frames.
 //!
+//! # Conversion precision & throughput
+//!
+//! The pixel-format conversion runs the FFmpeg CLI's default swscale
+//! configuration ([`ConversionPrecision::Standard`]): an all-frames export is
+//! decode-bound — the same throughput class as an `ffmpeg -vf
+//! "scale=..,format=.."` run with default flags — and produces the same
+//! bytes. [`FrameExtractor::conversion_precision`] opts into
+//! [`ConversionPrecision::High`] (accurate rounding + full chroma
+//! interpolation) for consumers sensitive to last-bit chroma siting, at a
+//! several-fold conversion cost. The precision tier never changes color
+//! interpretation — matrix and range handling are identical in both tiers.
+//!
 //! # Audio (PCM) export
 //!
 //! [`SampleExtractor`] is the audio sibling: it decodes one input's audio into
