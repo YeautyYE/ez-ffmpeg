@@ -17,7 +17,7 @@ use crate::core::filter::frame_filter::{FrameFilter, FrameFilterError, RequestFr
 use crate::core::filter::frame_filter_context::FrameFilterContext;
 use crate::util::ffmpeg_utils::frame_is_eof_marker;
 use crate::util::frame_utils::ensure_software_format;
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender};
 use ffmpeg_next::Frame;
 use ffmpeg_sys_next::{
     av_dict_get, av_dict_set, av_rescale_q, AVFrame, AVMediaType, AVMediaType::AVMEDIA_TYPE_VIDEO,
@@ -29,6 +29,49 @@ const US_PER_SEC: AVRational = AVRational {
     num: 1,
     den: 1_000_000,
 };
+
+/// Recycles packed payload buffers between delivered frames.
+///
+/// Every [`VideoFrame`] carries a clone of `tx` and offers its buffer back on
+/// drop; `pack_bytes` reuses a returned buffer instead of allocating (and
+/// zeroing) a fresh one per frame. After warmup an iterate-and-drop consumer
+/// circulates 2–3 buffers with no per-frame allocation at all.
+/// [`VideoFrame::into_vec`] detaches its buffer, which is simply a pool miss —
+/// the next frame allocates fresh.
+///
+/// The channel is bounded, so a consumer that hoards frames (or clones made by
+/// the UniformN dup expansion) can never grow the pool past `slots` parked
+/// buffers; overflow and post-teardown returns degrade to a plain free.
+struct BufferPool {
+    tx: Sender<Vec<u8>>,
+    rx: Receiver<Vec<u8>>,
+}
+
+impl BufferPool {
+    fn new(slots: usize) -> Self {
+        let (tx, rx) = crossbeam_channel::bounded(slots.max(1));
+        Self { tx, rx }
+    }
+
+    /// The sender handed to each `VideoFrame` as its drop-time return path.
+    fn recycler(&self) -> Sender<Vec<u8>> {
+        self.tx.clone()
+    }
+
+    /// An EMPTY buffer with at least `total` capacity: a recycled one when a
+    /// fitting buffer is parked, else a fresh allocation. Undersized parked
+    /// buffers (a mid-stream resolution change shrank or grew the frames) are
+    /// freed rather than grown, so the pool never accumulates stale sizes.
+    fn take(&self, total: usize) -> Vec<u8> {
+        while let Ok(mut buf) = self.rx.try_recv() {
+            if buf.capacity() >= total {
+                buf.clear();
+                return buf;
+            }
+        }
+        Vec::with_capacity(total)
+    }
+}
 
 /// Packs post-graph frames and streams them to the consumer.
 pub(crate) struct ExportSink {
@@ -43,6 +86,8 @@ pub(crate) struct ExportSink {
     emitted: u64,
     /// Set once the receiver is gone or the cap is reached; stops emitting.
     done: bool,
+    /// Payload-buffer recycler shared with every delivered [`VideoFrame`].
+    pool: BufferPool,
 }
 
 impl ExportSink {
@@ -53,6 +98,10 @@ impl ExportSink {
         max_frames: Option<u64>,
     ) -> Self {
         let uniform = matches!(sampling, Sampling::UniformN(_));
+        // Steady state has up to `capacity` frames parked in the user channel,
+        // one held by the consumer, and one being packed — capacity + 2 slots
+        // bound the pool without ever starving it.
+        let pool = BufferPool::new(tx.capacity().unwrap_or(1).saturating_add(2));
         Self {
             tx,
             sampling,
@@ -61,6 +110,7 @@ impl ExportSink {
             uniform,
             emitted: 0,
             done: false,
+            pool,
         }
     }
 
@@ -114,7 +164,15 @@ impl ExportSink {
                 return false;
             }
         }
-        let vf = VideoFrame::new(w, h, self.layout, pts_us, self.emitted, data);
+        let vf = VideoFrame::new(
+            w,
+            h,
+            self.layout,
+            pts_us,
+            self.emitted,
+            data,
+            Some(self.pool.recycler()),
+        );
         match self.tx.send(vf) {
             Ok(()) => {
                 self.emitted += 1;
@@ -178,7 +236,7 @@ impl FrameFilter for ExportSink {
             if count == 0 {
                 return Ok(Some(frame));
             }
-            let (w, h, mut bytes) = unsafe { pack_bytes(p, self.layout)? };
+            let (w, h, mut bytes) = unsafe { pack_bytes(p, self.layout, &self.pool)? };
             let mut remaining = count;
             while remaining > 0 {
                 remaining -= 1;
@@ -202,7 +260,7 @@ impl FrameFilter for ExportSink {
             // frames while delivery counts duplicate expansions.)
             return Ok(None);
         }
-        let (w, h, bytes) = unsafe { pack_bytes(p, self.layout)? };
+        let (w, h, bytes) = unsafe { pack_bytes(p, self.layout, &self.pool)? };
         if self.deliver(w, h, pts_us, bytes) {
             // Forward the (unpacked) frame so the upstream terminator counts it.
             Ok(Some(frame))
@@ -244,10 +302,11 @@ unsafe fn read_and_strip_emit_count(frame: &mut Frame) -> u64 {
 }
 
 /// Packs a single packed-format plane into an owned, tight `(width, height,
-/// bytes)` buffer. Handles negative `linesize` (bottom-up frames) and rejects
-/// sizes that would overflow `usize`/`isize`. The graph pins `format=<pix>`, so
-/// a non-software or mismatched format here is an internal invariant violation,
-/// surfaced as an error rather than undefined behavior.
+/// bytes)` buffer (recycled from `pool` when possible). Handles negative
+/// `linesize` (bottom-up frames) and rejects sizes that would overflow
+/// `usize`/`isize`. The graph pins `format=<pix>`, so a non-software or
+/// mismatched format here is an internal invariant violation, surfaced as an
+/// error rather than undefined behavior.
 ///
 /// # Safety
 /// `p` must be a valid, non-null `AVFrame` whose `data[0]`/`linesize[0]` describe
@@ -255,6 +314,7 @@ unsafe fn read_and_strip_emit_count(frame: &mut Frame) -> u64 {
 unsafe fn pack_bytes(
     p: *const AVFrame,
     layout: PixelLayout,
+    pool: &BufferPool,
 ) -> Result<(u32, u32, Vec<u8>), FrameFilterError> {
     ensure_software_format((*p).format)
         .map_err(|e| -> FrameFilterError { format!("frame export: {e}").into() })?;
@@ -306,14 +366,23 @@ unsafe fn pack_bytes(
         return Err("frame export: source footprint exceeds isize::MAX".into());
     }
 
-    let mut out = vec![0u8; total];
+    // Recycled-or-fresh EMPTY buffer with `total` capacity: rows are appended
+    // into reserved capacity, so no zero pass ever touches the payload (the
+    // old `vec![0u8; total]` wrote every frame's 6 MB twice).
+    let mut out = pool.take(total);
+    debug_assert!(out.is_empty() && out.capacity() >= total);
     for row in 0..h {
         // With negative linesize, data[0] points to the top row and lower rows
         // sit at lower addresses; `base + row*linesize` walks them top-down.
         let src_row = base.offset(row as isize * linesize);
-        let dst = out.as_mut_ptr().add(row * row_bytes);
-        std::ptr::copy_nonoverlapping(src_row, dst, row_bytes);
+        // SAFETY: `src_row` starts one packed row; the linesize check above
+        // guarantees at least `row_bytes` readable bytes there and the
+        // `src_footprint` bound keeps every offset inside the plane.
+        let src = std::slice::from_raw_parts(src_row, row_bytes);
+        // Never reallocates (capacity >= total); appends exactly `row_bytes`.
+        out.extend_from_slice(src);
     }
+    debug_assert_eq!(out.len(), total);
     Ok((width as u32, height as u32, out))
 }
 
@@ -333,6 +402,63 @@ mod tests {
             }
             Frame::wrap(p)
         }
+    }
+
+    /// A dropped `VideoFrame` hands its buffer back to the pool; the next
+    /// `take` reuses that very allocation instead of allocating fresh.
+    #[test]
+    fn dropped_frame_recycles_its_buffer() {
+        let pool = BufferPool::new(2);
+        let mut first = pool.take(12);
+        first.extend_from_slice(&[7u8; 12]);
+        let ptr = first.as_ptr();
+        let vf = VideoFrame::new(
+            2,
+            2,
+            PixelLayout::Rgb24,
+            None,
+            0,
+            first,
+            Some(pool.recycler()),
+        );
+        drop(vf);
+        let reused = pool.take(12);
+        assert!(reused.is_empty(), "recycled buffers come back empty");
+        assert_eq!(
+            reused.as_ptr(),
+            ptr,
+            "the same allocation must circulate through the pool"
+        );
+    }
+
+    /// `into_vec` detaches the allocation: the caller keeps it, the pool
+    /// misses, and the payload survives untouched.
+    #[test]
+    fn into_vec_detaches_from_the_pool() {
+        let pool = BufferPool::new(2);
+        let mut buf = pool.take(3);
+        buf.extend_from_slice(&[1, 2, 3]);
+        let vf = VideoFrame::new(1, 1, PixelLayout::Rgb24, None, 0, buf, Some(pool.recycler()));
+        let owned = vf.into_vec();
+        assert_eq!(owned, vec![1, 2, 3]);
+        assert!(
+            pool.rx.try_recv().is_err(),
+            "a detached buffer must never reach the pool"
+        );
+    }
+
+    /// A parked buffer that no longer fits (resolution change) is freed, not
+    /// returned undersized — `take` always yields >= the requested capacity.
+    #[test]
+    fn undersized_parked_buffers_are_skipped() {
+        let pool = BufferPool::new(2);
+        pool.recycler().try_send(Vec::with_capacity(4)).unwrap();
+        let buf = pool.take(1024);
+        assert!(buf.capacity() >= 1024);
+        assert!(
+            pool.rx.try_recv().is_err(),
+            "the undersized buffer must have been drained and dropped"
+        );
     }
 
     /// The KEY-flag check is what keeps `KeyframesOnly` correct even when a
