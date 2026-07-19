@@ -80,6 +80,33 @@ impl PixelLayout {
     }
 }
 
+/// The swscale precision tier for the YUV → RGB (or gray) conversion.
+///
+/// This selects the rounding/interpolation quality of the pixel-format
+/// conversion only. Color interpretation — which matrix and range are applied
+/// ([`ColorPolicy`]) — is identical in both tiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ConversionPrecision {
+    /// The FFmpeg CLI's default swscale configuration (`flags=bicubic`, no
+    /// extra precision flags). This keeps swscale eligible for its fastest
+    /// converters — including the unscaled yuv420p → rgb24 special case — and
+    /// matches the bytes an `ffmpeg -vf "scale=..,format=.."` run with default
+    /// flags produces. This is the default.
+    #[default]
+    Standard,
+    /// Adds `accurate_rnd+full_chroma_int`: bit-accurate rounding plus full
+    /// chroma interpolation. Relative to
+    /// [`Standard`](ConversionPrecision::Standard) the mean difference is a
+    /// couple of steps per 8-bit channel; individual pixels on sharp chroma
+    /// edges can differ by more, because the two tiers reconstruct subsampled
+    /// chroma differently. The flags disable swscale's unscaled fast-path
+    /// converters, which multiplies the conversion cost several-fold (at
+    /// 1080p the conversion, not the decode, becomes the bottleneck). Opt in
+    /// when downstream consumers are sensitive to last-bit chroma siting.
+    High,
+}
+
 /// A YUV → RGB conversion matrix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
