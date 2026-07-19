@@ -20,6 +20,15 @@ fn tmp_path(name: &str) -> String {
     dir.join(name).to_string_lossy().into_owned()
 }
 
+/// Embeds a filesystem path in a `filter_desc`. Filtergraph text is parsed
+/// twice — the graph parser and the filter's option parser each consume one
+/// level of `\` escapes — so the `:` after a Windows drive letter needs a
+/// doubled escape. Separators are normalized to `/`, which Windows file APIs
+/// accept. On Unix paths this is the identity.
+fn graph_path(path: &str) -> String {
+    path.replace('\\', "/").replace(':', "\\\\:")
+}
+
 fn video_input() -> Input {
     Input::from("color=c=red:s=64x64:r=15:d=0.2").set_format("lavfi")
 }
@@ -59,7 +68,10 @@ fn missing_movie_source_builds_and_fails_at_run_time() {
 
     let ctx = FfmpegContext::builder()
         .input(video_input())
-        .filter_desc(format!("movie={missing}[wm];[0:v][wm]overlay[out]"))
+        .filter_desc(format!(
+            "movie={}[wm];[0:v][wm]overlay[out]",
+            graph_path(&missing)
+        ))
         .output(Output::from(tmp_path("movie_out.mp4").as_str()).set_video_codec("mpeg4"))
         .build()
         .expect("build() must not open the movie source");
@@ -83,7 +95,10 @@ fn build_does_not_create_or_truncate_a_filter_destination_file() {
 
     let ctx = FfmpegContext::builder()
         .input(video_input())
-        .filter_desc(format!("[0:v]metadata=mode=print:file={dest}[out]"))
+        .filter_desc(format!(
+            "[0:v]metadata=mode=print:file={}[out]",
+            graph_path(&dest)
+        ))
         .output(Output::from(tmp_path("metadata_out.mp4").as_str()).set_video_codec("mpeg4"))
         .build()
         .expect("valid config must build");
@@ -194,7 +209,10 @@ fn existing_movie_source_still_builds_and_runs() {
 
     let ctx = FfmpegContext::builder()
         .input(video_input())
-        .filter_desc(format!("movie={fixture}[wm];[0:v][wm]overlay[out]"))
+        .filter_desc(format!(
+            "movie={}[wm];[0:v][wm]overlay[out]",
+            graph_path(&fixture)
+        ))
         .output(Output::from(tmp_path("movie_ok_out.mp4").as_str()).set_video_codec("mpeg4"))
         .build()
         .expect("movie graph with an existing source must build");
