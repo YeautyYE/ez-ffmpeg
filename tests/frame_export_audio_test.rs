@@ -287,3 +287,23 @@ fn audio_index_pointing_at_video_stream_is_typed_error() {
         other => panic!("expected NotAnAudioStream, got {other:?}"),
     }
 }
+
+#[test]
+fn non_positive_input_recording_time_is_rejected() {
+    // A recording time preconfigured on the Input feeds the same atrim
+    // machinery as duration_us, where 0 means "no limit" — the validation
+    // must see the effective value (checked before any file I/O).
+    use ez_ffmpeg::frame_export::{FrameExportError, SampleExtractor};
+    use ez_ffmpeg::Input;
+    let err = SampleExtractor::new(Input::from("missing.mp4").set_recording_time_us(0))
+        .samples()
+        .err()
+        .expect("zero recording time must be rejected");
+    assert!(
+        matches!(
+            err,
+            ez_ffmpeg::error::Error::FrameExport(FrameExportError::InvalidOption(_))
+        ),
+        "got {err:?}"
+    );
+}

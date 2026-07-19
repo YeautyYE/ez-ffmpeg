@@ -580,3 +580,112 @@ fn every_sec_with_start_time_skips_gop_lead_in() {
 fn pts_list(frames: &[ez_ffmpeg::frame_export::VideoFrame]) -> Vec<i64> {
     frames.iter().filter_map(|f| f.pts_us()).collect()
 }
+
+#[test]
+fn sparse_sampling_multi_video_requires_explicit_index() {
+    // Input-side EveryNth/EverySec selection binds the first video stream by
+    // media type, while the export graph takes the best stream — on
+    // multi-video inputs the two can disagree and selection silently
+    // degrades. The ambiguity must be rejected exactly like UniformN's.
+    use ez_ffmpeg::{FfmpegContext, FfmpegScheduler, Output};
+    let dir = std::env::temp_dir().join(format!("ez_fe_sparse_mv_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("two_video.mkv");
+    FfmpegScheduler::new(
+        FfmpegContext::builder()
+            .input(lavfi("testsrc2=s=16x16:r=10:d=0.5"))
+            .filter_desc("[0:v]split=2[a][b]")
+            .output(
+                Output::from(path.to_str().unwrap())
+                    .set_video_codec("mpeg2video")
+                    .add_stream_map("[a]")
+                    .add_stream_map("[b]"),
+            )
+            .build()
+            .expect("build two-video fixture"),
+    )
+    .start()
+    .and_then(|s| s.wait())
+    .expect("encode two-video fixture");
+
+    let err = FrameExtractor::new(path.to_str().unwrap())
+        .sampling(Sampling::EveryNth(3))
+        .frames()
+        .err()
+        .expect("ambiguous multi-video EveryNth must be rejected");
+    assert!(
+        matches!(
+            err,
+            ez_ffmpeg::error::Error::FrameExport(
+                ez_ffmpeg::frame_export::FrameExportError::InvalidOption(_)
+            )
+        ),
+        "got {err:?}"
+    );
+
+    // An explicit index resolves the ambiguity: 5 frames, every 3rd => 2.
+    let frames = FrameExtractor::new(path.to_str().unwrap())
+        .sampling(Sampling::EveryNth(3))
+        .video_stream_index(0)
+        .collect_frames()
+        .expect("explicit index works");
+    assert_eq!(frames.len(), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn every_sec_respects_forced_framerate_clock() {
+    // Input::set_framerate re-stamps decoder pts AND time_base onto the
+    // forced CFR grid, while best_effort_timestamp keeps the container's
+    // original ticks. The sampling clock must read the canonical pts —
+    // pairing best_effort with the rewritten time base made EverySec select
+    // nearly every frame.
+    use ez_ffmpeg::{FfmpegContext, FfmpegScheduler, Output};
+    let dir = std::env::temp_dir().join(format!("ez_fe_forced_fps_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("cfr10.mkv");
+    FfmpegScheduler::new(
+        FfmpegContext::builder()
+            .input(lavfi("testsrc2=s=16x16:r=10:d=1"))
+            .output(Output::from(path.to_str().unwrap()).set_video_codec("mpeg2video"))
+            .build()
+            .expect("build fixture"),
+    )
+    .start()
+    .and_then(|s| s.wait())
+    .expect("encode fixture");
+
+    // 10 source frames forced to 20 fps span 0.5 s; a 0.15 s grid selects the
+    // anchor plus 3 ticks => 4 frames (the broken clock selected all 10).
+    let frames = FrameExtractor::new(Input::from(path.to_str().unwrap()).set_framerate(20, 1))
+        .sampling(Sampling::EverySec(0.15))
+        .collect_frames()
+        .expect("extraction");
+    assert!(
+        (3..=5).contains(&frames.len()),
+        "forced-framerate EverySec must follow the rewritten clock, got {} frames",
+        frames.len()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn non_positive_input_recording_time_is_rejected() {
+    // A recording time preconfigured on the Input feeds the same trim
+    // machinery as duration_us, where 0 means "no limit" to FFmpeg; the
+    // validation must see the effective value (checked before any file I/O,
+    // so a bogus path proves the ordering too).
+    let err = FrameExtractor::new(Input::from("missing.mp4").set_recording_time_us(0))
+        .frames()
+        .err()
+        .expect("zero recording time must be rejected");
+    assert!(
+        matches!(
+            err,
+            ez_ffmpeg::error::Error::FrameExport(
+                ez_ffmpeg::frame_export::FrameExportError::InvalidOption(_)
+            )
+        ),
+        "got {err:?}"
+    );
+}

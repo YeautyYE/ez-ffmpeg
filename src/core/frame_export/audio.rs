@@ -222,10 +222,13 @@ impl SampleExtractor {
         }
         // Mirrors FrameExtractor: atrim treats duration=0 as "no limit", so a
         // non-positive window must be rejected here or a live input runs
-        // unbounded instead of erroring.
-        if let Some(d) = self.duration_us {
+        // unbounded instead of erroring. Effective value: a recording time
+        // preconfigured on the Input feeds the same trim machinery.
+        if let Some(d) = self.duration_us.or(self.input.recording_time_us) {
             if d <= 0 {
-                return Err(invalid("duration_us must be > 0"));
+                return Err(invalid(
+                    "duration_us (or the Input's recording time) must be > 0",
+                ));
             }
         }
         Ok(())

@@ -160,8 +160,14 @@ impl FrameExtractor {
         };
         let span_cell: UniformSpan = std::sync::Arc::new(std::sync::OnceLock::new());
 
-        // Input decoder fast path + time window.
+        // Input decoder fast path + time window. The extractor's own options
+        // take precedence, but a start/duration preconfigured directly on the
+        // Input must feed the SAME machinery (trim boundary, span sizing) —
+        // otherwise it would reintroduce the GOP lead-in mis-anchoring the
+        // boundary exists to prevent.
         let mut input = self.input;
+        let effective_start = self.start_time_us.or(input.start_time_us);
+        let effective_duration = self.duration_us.or(input.recording_time_us);
         if matches!(self.sampling, Sampling::KeyframesOnly) {
             input = input.set_video_codec_opt("skip_frame", "nokey");
         }
@@ -170,11 +176,12 @@ impl FrameExtractor {
         }
         if let Some(dur) = self.duration_us {
             input = input.set_recording_time_us(dur);
-        } else if uniform_n.is_some() {
+        } else if uniform_n.is_some() && input.recording_time_us.is_none() {
             if let Some(hint) = self.duration_hint_us {
                 // The hint declares the sampled span; also use it as the demux
                 // stop boundary so an unbounded (live/piped) input terminates
-                // once the grid is covered instead of decoding forever.
+                // once the grid is covered instead of decoding forever. A
+                // recording time already set on the Input wins over the hint.
                 input = input.set_recording_time_us(hint);
             }
         }
@@ -186,13 +193,14 @@ impl FrameExtractor {
             "frame_export_color_guard",
             Box::new(ColorGuard::new(self.color)),
         );
-        // With start_time_us the demux timeline is re-zeroed at the request
-        // and the in-graph trim drops pts < 0 — but the container seek lands
-        // on a keyframe at or BEFORE the request, so on GOP video this
-        // pipeline sees negative-pts lead-in first. The boundary makes the
-        // input-side sampler/selector skip that lead-in instead of anchoring
-        // grids on (or spending selections on) frames the trim will destroy.
-        let trim_boundary = self.start_time_us.map(|_| 0i64);
+        // With a start time (from the extractor or preconfigured on the
+        // Input) the demux timeline is re-zeroed at the request and the
+        // in-graph trim drops pts < 0 — but the container seek lands on a
+        // keyframe at or BEFORE the request, so on GOP video this pipeline
+        // sees negative-pts lead-in first. The boundary makes the input-side
+        // sampler/selector skip that lead-in instead of anchoring grids on
+        // (or spending selections on) frames the trim will destroy.
+        let trim_boundary = effective_start.map(|_| 0i64);
         if let Some(n) = uniform_n {
             let sampler = ExportSampler::new(n, span_cell.clone(), trim_boundary);
             builder = builder.filter("frame_export_sampler", Box::new(sampler));
@@ -236,11 +244,15 @@ impl FrameExtractor {
             height: self.height,
             pixel: self.pixel,
             color: self.color,
+            input_side_sampling: matches!(
+                self.sampling,
+                Sampling::UniformN(_) | Sampling::EveryNth(_) | Sampling::EverySec(_)
+            ),
             uniform: uniform_n.map(|_| UniformResolve {
                 span_cell: span_cell.clone(),
                 duration_hint_us: self.duration_hint_us,
-                duration_us: self.duration_us,
-                start_time_us: self.start_time_us,
+                duration_us: effective_duration,
+                start_time_us: effective_start,
             }),
         };
         let resolver = move |demuxs: &[Demuxer]| -> crate::error::Result<FilterComplex> {
@@ -294,9 +306,14 @@ impl FrameExtractor {
         if self.max_frames == Some(0) {
             return Err(invalid("max_frames must be > 0"));
         }
-        if let Some(d) = self.duration_us {
+        // Effective value: a recording time preconfigured on the Input feeds
+        // the same trim machinery, where 0 means "no limit" to FFmpeg — the
+        // opposite of the documented meaning.
+        if let Some(d) = self.duration_us.or(self.input.recording_time_us) {
             if d <= 0 {
-                return Err(invalid("duration_us must be > 0"));
+                return Err(invalid(
+                    "duration_us (or the Input's recording time) must be > 0",
+                ));
             }
         }
         // The hint is only consumed by UniformN; other modes ignore it as

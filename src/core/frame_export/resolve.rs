@@ -24,6 +24,11 @@ pub(crate) struct ResolvePlan {
     pub(crate) height: Option<u32>,
     pub(crate) pixel: PixelLayout,
     pub(crate) color: ColorPolicy,
+    /// True for the modes that decide selection on the INPUT frame pipeline
+    /// (`UniformN`, `EveryNth`, `EverySec`): those bind by media type when no
+    /// explicit index is given, and can disagree with the graph's best-stream
+    /// pick on multi-video inputs.
+    pub(crate) input_side_sampling: bool,
     /// Present for `UniformN`: resolve the grid span and publish it.
     pub(crate) uniform: Option<UniformResolve>,
 }
@@ -47,16 +52,19 @@ pub(crate) unsafe fn resolve_and_build_desc(
     plan: &ResolvePlan,
 ) -> crate::error::Result<String> {
     let stream_index = resolve_stream_index(fmt_ctx, plan.stream_index)?;
-    if plan.uniform.is_some() {
-        // The input-side sampler binds by MEDIA TYPE when no explicit index is
-        // given, while this graph uses the best stream. With more than one video
-        // stream the two can disagree — the sampler would sample one stream while
-        // the graph exports another, breaking the exact-N contract. Reject the
-        // ambiguity instead of silently mis-sampling (checked before the HDR
-        // fast-fail so the actionable error wins on ambiguous HDR inputs).
+    if plan.input_side_sampling {
+        // The input-side sampler/selector binds by MEDIA TYPE when no explicit
+        // index is given, while this graph uses the best stream. With more than
+        // one video stream the two can disagree — selection would run on one
+        // stream while the graph exports another (UniformN breaks its exact-N
+        // contract; EveryNth/EverySec degrade toward selecting everything the
+        // exported stream delivers). Reject the ambiguity instead of silently
+        // mis-sampling (checked before the HDR fast-fail so the actionable
+        // error wins on ambiguous HDR inputs).
         if plan.stream_index.is_none() && count_video_streams(fmt_ctx) > 1 {
             return Err(FrameExportError::InvalidOption(
-                "UniformN on an input with multiple video streams requires video_stream_index()"
+                "UniformN/EveryNth/EverySec on an input with multiple video streams requires \
+                 video_stream_index()"
                     .to_string(),
             )
             .into());
@@ -296,6 +304,7 @@ mod tests {
             height,
             pixel,
             color,
+            input_side_sampling: false,
             uniform: None,
         }
     }
