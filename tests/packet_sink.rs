@@ -1,0 +1,376 @@
+//! Packet-sink delivery correctness (strict tier).
+//!
+//! Scenarios needing libx264 skip when the linked FFmpeg build lacks it (the
+//! CI build is configured without GPL components); the strict-tier validation
+//! logic itself is unit-tested encoder-free in `src/core/packet_sink/`.
+
+mod common;
+
+use common::{
+    have_encoder, parse_avcc_au, rational_eq, recording_sink, sink_packets, tmp_path_in,
+    wait_with_watchdog, SinkEv,
+};
+use ez_ffmpeg::packet_sink::{PacketSink, PacketSinkEvent};
+use ez_ffmpeg::stream_info::StreamInfo;
+use ez_ffmpeg::{AVRational, FfmpegContext, Input, Output};
+
+const TMP_SUBDIR: &str = "ez_ffmpeg_packet_sink";
+
+fn testsrc(seconds: u32) -> Input {
+    Input::from(format!("testsrc=size=320x240:rate=25:duration={seconds}")).set_format("lavfi")
+}
+
+fn x264_output(sink: PacketSink) -> Output {
+    Output::new_by_packet_sink(sink)
+        .set_video_codec("libx264")
+        .set_video_codec_opt("preset", "ultrafast")
+}
+
+fn run(input: Input, output: Output, scenario: &str) -> ez_ffmpeg::error::Result<()> {
+    wait_with_watchdog(
+        FfmpegContext::builder()
+            .input(input)
+            .output(output)
+            .build()
+            .unwrap()
+            .start()
+            .unwrap(),
+        120,
+        scenario,
+    )
+}
+
+/// Validates the strict-tier avcC structural contract (v1.2 three checks).
+fn assert_valid_avcc(avcc: &[u8]) {
+    assert!(avcc.len() >= 7, "avcC too short: {} bytes", avcc.len());
+    assert_eq!(avcc[0], 1, "configurationVersion");
+    assert_eq!(avcc[4] & 0x03, 3, "lengthSizeMinusOne must be 3 (4-byte)");
+    assert!(avcc[5] & 0x1F >= 1, "at least one SPS");
+}
+
+#[test]
+fn strict_happy_path_single_video_stream() {
+    if !have_encoder("libx264") {
+        eprintln!("skipping: libx264 not available in this FFmpeg build");
+        return;
+    }
+    let (sink, log) = recording_sink();
+    // Pin the output rate: the crate stamps a stream frame rate only when the
+    // pipeline decided one (fps conversion), and the strict tier reports it
+    // verbatim rather than guessing.
+    run(
+        testsrc(2),
+        x264_output(sink).set_framerate(25, 1),
+        "strict_happy_path",
+    )
+    .expect("job failed");
+
+    let events = log.lock().unwrap().clone();
+    assert!(events.len() >= 3, "expected info + packets + end");
+
+    // S9 exhaustive order: exactly one leading stream info, then only
+    // packets, then exactly one trailing on_end — nothing after it, nothing
+    // lost before it.
+    let SinkEv::Info { streams, thread } = &events[0] else {
+        panic!("first event must be on_stream_info, got {:?}", events[0]);
+    };
+    assert_eq!(streams.len(), 1);
+    let info = &streams[0];
+    assert_eq!(info.codec_name, "h264");
+    assert_eq!((info.width, info.height), (320, 240));
+    assert_eq!(info.frame_rate, Some(AVRational { num: 25, den: 1 }));
+    assert!(info.time_base.num > 0 && info.time_base.den > 0);
+    assert_valid_avcc(&info.extradata);
+
+    let last = events.len() - 1;
+    let SinkEv::End { thread: end_thread } = &events[last] else {
+        panic!("last event must be on_end, got {:?}", events[last]);
+    };
+    let mut delivered = 0usize;
+    let mut prev_dts: Option<i64> = None;
+    for event in &events[1..last] {
+        let SinkEv::Pkt(p) = event else {
+            panic!("only packets may sit between stream info and end: {event:?}");
+        };
+        delivered += 1;
+        // Every callback runs on the one delivery thread.
+        assert_eq!(p.thread, *thread);
+        assert_eq!(p.thread, *end_thread);
+        assert_eq!(p.stream_index, 0);
+        assert_eq!(p.time_base, info.time_base, "verbatim encoder time base");
+        // Single stream: the anchor stream is zero-based and non-negative.
+        assert!(p.dts >= 0, "anchor-stream dts must be non-negative");
+        assert!(p.pts >= p.dts, "pts must not precede dts");
+        assert!(p.duration > 0, "strict tier guarantees a positive duration");
+        if let Some(prev) = prev_dts {
+            assert!(p.dts > prev, "dts must be strictly increasing");
+        }
+        prev_dts = Some(p.dts);
+        // AU-complete AVCC payload, reparsed independently.
+        let nals = parse_avcc_au(&p.data);
+        assert!(
+            !nals
+                .iter()
+                .any(|n| matches!(n[0] & 0x1F, 7 | 8)),
+            "no in-band parameter sets in strict-tier AUs"
+        );
+    }
+    // 2 s at 25 fps, one AU per frame.
+    assert_eq!(delivered, 50, "no packet may be lost before on_end");
+
+    let packets = sink_packets(&log);
+    assert_eq!(packets[0].dts, 0, "first delivered dts anchors at zero");
+    assert!(packets[0].is_key, "the stream must open on an IDR");
+    let offset = packets[0].applied_offset;
+    assert!(
+        packets.iter().all(|p| p.applied_offset == offset),
+        "one shift per stream"
+    );
+}
+
+/// A4 semantic golden: the same pinned encoder configuration muxed to real
+/// fMP4 must yield the same access units (NAL-for-NAL and byte-for-byte),
+/// origin-aligned rational timestamps, durations and key flags as the sink
+/// delivery.
+#[test]
+fn golden_matches_fmp4_baseline() {
+    if !have_encoder("libx264") {
+        eprintln!("skipping: libx264 not available in this FFmpeg build");
+        return;
+    }
+    // Pinned configuration: no B-frames (decode order == presentation
+    // order on both paths), fixed GOP, no scene cut.
+    let pin = |output: Output| {
+        output
+            .set_video_codec("libx264")
+            .set_video_codec_opt("preset", "ultrafast")
+            .set_video_codec_opt("bf", "0")
+            .set_video_codec_opt("g", "25")
+            .set_video_codec_opt("sc_threshold", "0")
+    };
+
+    // Sink run.
+    let (sink, log) = recording_sink();
+    run(
+        testsrc(2),
+        pin(Output::new_by_packet_sink(sink)),
+        "golden_sink_run",
+    )
+    .expect("sink job failed");
+    let packets = sink_packets(&log);
+    assert!(!packets.is_empty());
+
+    // Baseline run: identical encode muxed by the real mp4 muxer into fMP4.
+    let baseline_path = tmp_path_in(TMP_SUBDIR, "golden_baseline.mp4");
+    run(
+        testsrc(2),
+        pin(Output::from(baseline_path.as_str()))
+            .set_format_opt("movflags", "+frag_keyframe+empty_moov"),
+        "golden_baseline_run",
+    )
+    .expect("baseline job failed");
+
+    let mut scanner =
+        ez_ffmpeg::packet_scanner::PacketScanner::open(baseline_path.as_str()).unwrap();
+    scanner.set_capture_data(true);
+    let video_tb = match scanner.video_stream().expect("baseline video stream") {
+        StreamInfo::Video { time_base, .. } => *time_base,
+        other => panic!("expected video stream info, got {other:?}"),
+    };
+    let baseline: Vec<_> = scanner
+        .packets()
+        .map(|p| p.expect("baseline packet"))
+        .filter(|p| p.is_video())
+        .collect();
+
+    assert_eq!(
+        packets.len(),
+        baseline.len(),
+        "sink and fMP4 must carry the same access units"
+    );
+    let sink_tb = packets[0].time_base;
+    let sink_dts0 = packets[0].dts; // 0 by the origin contract
+    let base_dts0 = baseline[0].dts().expect("baseline dts");
+    for (i, (sp, bp)) in packets.iter().zip(baseline.iter()).enumerate() {
+        // Primary caliber: normalized AU / NAL semantics.
+        let sink_nals = parse_avcc_au(&sp.data);
+        let base_nals = parse_avcc_au(bp.data().expect("captured baseline payload"));
+        assert_eq!(sink_nals, base_nals, "AU {i}: NAL sequence differs");
+        // Secondary caliber (pinned config): byte equality of the whole AU.
+        assert_eq!(
+            sp.data,
+            bp.data().unwrap(),
+            "AU {i}: byte-level payload differs"
+        );
+        // Origin-aligned rational timestamps + duration.
+        let b_pts = bp.pts().expect("baseline pts") - base_dts0;
+        let b_dts = bp.dts().expect("baseline dts") - base_dts0;
+        assert!(
+            rational_eq(sp.pts - sink_dts0, sink_tb, b_pts, video_tb),
+            "AU {i}: pts differs ({} @{}/{} vs {} @{}/{})",
+            sp.pts,
+            sink_tb.num,
+            sink_tb.den,
+            b_pts,
+            video_tb.num,
+            video_tb.den
+        );
+        assert!(
+            rational_eq(sp.dts - sink_dts0, sink_tb, b_dts, video_tb),
+            "AU {i}: dts differs"
+        );
+        assert!(
+            rational_eq(sp.duration, sink_tb, bp.duration(), video_tb),
+            "AU {i}: duration differs"
+        );
+        assert_eq!(sp.is_key, bp.is_keyframe(), "AU {i}: key flag differs");
+    }
+}
+
+#[test]
+fn av_job_shares_one_time_origin() {
+    if !have_encoder("libx264") {
+        eprintln!("skipping: libx264 not available in this FFmpeg build");
+        return;
+    }
+    let (sink, log) = recording_sink();
+    let output = Output::new_by_packet_sink(sink)
+        .add_stream_map("0:v")
+        .add_stream_map("1:a")
+        .set_video_codec("libx264")
+        .set_video_codec_opt("preset", "ultrafast")
+        .set_audio_codec("aac");
+    let result = wait_with_watchdog(
+        FfmpegContext::builder()
+            .input(testsrc(2))
+            .input(Input::from("sine=frequency=440:duration=2").set_format("lavfi"))
+            .output(output)
+            .build()
+            .unwrap()
+            .start()
+            .unwrap(),
+        120,
+        "av_shared_origin",
+    );
+    result.expect("av job failed");
+
+    let events = log.lock().unwrap().clone();
+    let SinkEv::Info { streams, .. } = &events[0] else {
+        panic!("first event must be on_stream_info");
+    };
+    assert_eq!(streams.len(), 2);
+    let audio = streams
+        .iter()
+        .find(|s| s.codec_name == "aac")
+        .expect("aac stream info");
+    assert!(
+        !audio.extradata.is_empty(),
+        "AAC must carry its AudioSpecificConfig"
+    );
+    assert_eq!(audio.sample_rate, 44100);
+    assert!(matches!(events.last(), Some(SinkEv::End { .. })));
+
+    let packets = sink_packets(&log);
+    let anchor = &packets[0];
+    assert_eq!(anchor.dts, 0, "the first delivered packet anchors at zero");
+
+    // Every stream's shift is the anchor's original dts rescaled into that
+    // stream's time base — reproduce it independently and require equality.
+    // (The anchor stream's own offset equals its original first dts.)
+    let dts0 = anchor.applied_offset;
+    let tb0 = anchor.time_base;
+    for info in streams {
+        let stream_packets: Vec<_> = packets
+            .iter()
+            .filter(|p| p.stream_index == info.stream_index)
+            .collect();
+        assert!(!stream_packets.is_empty(), "both streams must deliver");
+        let expected = unsafe {
+            ffmpeg_sys_next::av_rescale_q_rnd(
+                dts0,
+                tb0,
+                info.time_base,
+                ffmpeg_sys_next::AVRounding::AV_ROUND_NEAR_INF,
+            )
+        };
+        assert_eq!(
+            stream_packets[0].applied_offset, expected,
+            "stream {}: shared-origin shift mismatch",
+            info.stream_index
+        );
+        // Per-stream invariants hold on the shifted timeline too.
+        let mut prev: Option<i64> = None;
+        for p in &stream_packets {
+            assert!(p.pts >= p.dts);
+            assert!(p.duration > 0);
+            if let Some(prev) = prev {
+                assert!(p.dts > prev, "per-stream dts monotonicity");
+            }
+            prev = Some(p.dts);
+        }
+        if info.codec_name == "aac" {
+            assert!(stream_packets.iter().all(|p| p.is_key));
+        }
+    }
+}
+
+#[test]
+fn on_end_fires_after_recording_time_truncation() {
+    if !have_encoder("libx264") {
+        eprintln!("skipping: libx264 not available in this FFmpeg build");
+        return;
+    }
+    let (sink, log) = recording_sink();
+    run(
+        testsrc(4),
+        x264_output(sink).set_recording_time_us(800_000),
+        "recording_time_truncation",
+    )
+    .expect("truncated job failed");
+
+    let events = log.lock().unwrap().clone();
+    assert!(
+        matches!(events.last(), Some(SinkEv::End { .. })),
+        "configured truncation is a recognized terminal state"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, SinkEv::End { .. }))
+            .count(),
+        1
+    );
+    let packets = sink_packets(&log);
+    assert!(!packets.is_empty());
+    assert!(
+        packets.len() < 100,
+        "0.8 s of a 4 s input must not deliver the whole stream ({} packets)",
+        packets.len()
+    );
+}
+
+#[test]
+fn channel_adapter_delivers_owned_events_in_order() {
+    if !have_encoder("libx264") {
+        eprintln!("skipping: libx264 not available in this FFmpeg build");
+        return;
+    }
+    let (sink, receiver) = PacketSink::channel(1024);
+    run(testsrc(1), x264_output(sink), "channel_adapter").expect("job failed");
+
+    let events: Vec<_> = receiver.iter().collect();
+    assert!(matches!(events.first(), Some(PacketSinkEvent::StreamInfo(s)) if s.len() == 1));
+    assert!(matches!(events.last(), Some(PacketSinkEvent::End)));
+    let packets: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            PacketSinkEvent::Packet(p) => Some(p),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(packets.len(), 25);
+    assert_eq!(events.len(), packets.len() + 2, "info + packets + end only");
+    assert!(packets[0].is_key());
+    assert_eq!(packets[0].dts(), 0);
+    parse_avcc_au(packets[0].data());
+}

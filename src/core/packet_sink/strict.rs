@@ -629,3 +629,587 @@ fn check_inband_parameter_sets(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::context::PacketData;
+    use crate::core::packet_sink::{PacketSink, PacketSinkEvent};
+    use ffmpeg_next::packet::Mut;
+    use ffmpeg_sys_next::{
+        av_guess_format, av_mallocz, av_packet_new_side_data, avformat_alloc_output_context2,
+        avformat_free_context, avformat_new_stream, AVCodecID, AVMediaType,
+        AV_INPUT_BUFFER_PADDING_SIZE,
+    };
+    use std::ffi::CString;
+    use std::ptr::{null, null_mut};
+    use std::sync::{Arc, Mutex};
+
+    const SPS: &[u8] = &[0x67, 66, 0xC0, 0x1E, 0xAC, 0xD9, 0x40];
+    const PPS: &[u8] = &[0x68, 0xCE, 0x3C, 0x80];
+    const OTHER_SPS: &[u8] = &[0x67, 66, 0xC0, 0x28, 0xAC, 0xD9, 0x41];
+
+    fn annexb_config() -> Vec<u8> {
+        let mut v = vec![0, 0, 0, 1];
+        v.extend_from_slice(SPS);
+        v.extend_from_slice(&[0, 0, 1]);
+        v.extend_from_slice(PPS);
+        v
+    }
+
+    /// An Annex-B IDR access unit (one slice NAL).
+    fn idr_au() -> Vec<u8> {
+        vec![0, 0, 0, 1, 0x65, 0x88, 0x84, 0x21, 0xFF]
+    }
+
+    /// An Annex-B non-IDR access unit.
+    fn p_au() -> Vec<u8> {
+        vec![0, 0, 0, 1, 0x41, 0x9A, 0x21, 0x03]
+    }
+
+    /// Owns a dummy output context whose streams carry synthesized codecpar.
+    struct TestCtx {
+        ctx: *mut ffmpeg_sys_next::AVFormatContext,
+    }
+
+    impl TestCtx {
+        fn new() -> Self {
+            unsafe {
+                let name = CString::new("mp4").unwrap();
+                let fmt = av_guess_format(name.as_ptr(), null(), null());
+                assert!(!fmt.is_null());
+                let mut ctx = null_mut();
+                let ret = avformat_alloc_output_context2(&mut ctx, fmt, null(), null());
+                assert!(ret >= 0 && !ctx.is_null());
+                Self { ctx }
+            }
+        }
+
+        unsafe fn add_stream(
+            &self,
+            media_type: AVMediaType,
+            codec_id: AVCodecID,
+            extradata: Option<&[u8]>,
+            time_base: AVRational,
+        ) -> usize {
+            let st = avformat_new_stream(self.ctx, null());
+            assert!(!st.is_null());
+            let par = (*st).codecpar;
+            (*par).codec_type = media_type;
+            (*par).codec_id = codec_id;
+            if media_type == AVMediaType::AVMEDIA_TYPE_VIDEO {
+                (*par).width = 320;
+                (*par).height = 240;
+                (*st).avg_frame_rate = AVRational { num: 25, den: 1 };
+            } else {
+                (*par).sample_rate = 44100;
+                (*par).ch_layout.nb_channels = 2;
+                // Real audio encoders publish their frame size (AAC: 1024
+                // samples); the duration derivation relies on it.
+                (*par).frame_size = 1024;
+            }
+            if let Some(ed) = extradata {
+                let buf =
+                    av_mallocz(ed.len() + AV_INPUT_BUFFER_PADDING_SIZE as usize) as *mut u8;
+                std::ptr::copy_nonoverlapping(ed.as_ptr(), buf, ed.len());
+                (*par).extradata = buf;
+                (*par).extradata_size = ed.len() as i32;
+            }
+            (*st).time_base = time_base;
+            ((*self.ctx).nb_streams - 1) as usize
+        }
+
+        fn stream_count(&self) -> usize {
+            unsafe { (*self.ctx).nb_streams as usize }
+        }
+    }
+
+    impl Drop for TestCtx {
+        fn drop(&mut self) {
+            unsafe { avformat_free_context(self.ctx) }
+        }
+    }
+
+    fn video_ctx() -> TestCtx {
+        let ctx = TestCtx::new();
+        unsafe {
+            ctx.add_stream(
+                AVMediaType::AVMEDIA_TYPE_VIDEO,
+                AVCodecID::AV_CODEC_ID_H264,
+                Some(&annexb_config()),
+                AVRational { num: 1, den: 25 },
+            );
+        }
+        ctx
+    }
+
+    /// A sink that logs every event; returns the sink and the log.
+    fn recording_sink() -> (PacketSink, Arc<Mutex<Vec<PacketSinkEvent>>>) {
+        let events: Arc<Mutex<Vec<PacketSinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let (info_log, pkt_log, end_log, err_log) = (
+            events.clone(),
+            events.clone(),
+            events.clone(),
+            events.clone(),
+        );
+        let sink = PacketSink::builder()
+            .on_stream_info(move |infos| {
+                info_log
+                    .lock()
+                    .unwrap()
+                    .push(PacketSinkEvent::StreamInfo(infos.to_vec()));
+                0
+            })
+            .on_packet(move |view| {
+                pkt_log.lock().unwrap().push(PacketSinkEvent::Packet(
+                    crate::core::packet_sink::SinkPacket {
+                        stream_index: view.stream_index(),
+                        pts: view.pts(),
+                        dts: view.dts(),
+                        duration: view.duration(),
+                        time_base: view.time_base(),
+                        is_key: view.is_key(),
+                        applied_offset: view.applied_offset(),
+                        data: view.data().to_vec(),
+                    },
+                ));
+                0
+            })
+            .on_end(move || end_log.lock().unwrap().push(PacketSinkEvent::End))
+            .on_error(move |e| {
+                err_log
+                    .lock()
+                    .unwrap()
+                    .push(PacketSinkEvent::Error(e.clone()))
+            })
+            .build();
+        (sink, events)
+    }
+
+    fn packet(data: &[u8], pts: i64, dts: i64, tb: AVRational, stream_index: i32) -> PacketBox {
+        let mut packet = ffmpeg_next::Packet::copy(data);
+        unsafe {
+            let p = packet.as_mut_ptr();
+            (*p).pts = pts;
+            (*p).dts = dts;
+            (*p).time_base = tb;
+            (*p).stream_index = stream_index;
+            (*p).duration = 0;
+        }
+        PacketBox {
+            packet,
+            packet_data: PacketData {
+                dts_est: 0,
+                codec_type: AVMediaType::AVMEDIA_TYPE_VIDEO,
+                output_stream_index: stream_index,
+                is_copy: false,
+            },
+        }
+    }
+
+    fn collect(ctx: &TestCtx, sink: PacketSink) -> Result<PacketSinkWorker, PacketSinkError> {
+        unsafe { PacketSinkWorker::collect(ctx.ctx, ctx.stream_count(), sink) }
+    }
+
+    fn tb25() -> AVRational {
+        AVRational { num: 1, den: 25 }
+    }
+
+    #[test]
+    fn missing_extradata_fails_before_any_callback() {
+        let ctx = TestCtx::new();
+        unsafe {
+            ctx.add_stream(
+                AVMediaType::AVMEDIA_TYPE_VIDEO,
+                AVCodecID::AV_CODEC_ID_H264,
+                None,
+                tb25(),
+            );
+        }
+        let (sink, events) = recording_sink();
+        let err = match collect(&ctx, sink) {
+            Err(e) => e,
+            Ok(_) => panic!("collect must fail without extradata"),
+        };
+        assert!(matches!(
+            err,
+            PacketSinkError::MissingExtradata { stream_index: 0 }
+        ));
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "a configuration failure must precede every callback"
+        );
+    }
+
+    #[test]
+    fn collect_normalizes_annexb_extradata_to_avcc() {
+        let ctx = video_ctx();
+        let (sink, _events) = recording_sink();
+        let worker = collect(&ctx, sink).unwrap();
+        let info = &worker.infos[0];
+        let avcc = info.extradata();
+        assert_eq!(avcc[0], 1);
+        assert_eq!(avcc[4] & 0x03, 3, "4-byte NAL length prefixes");
+        assert!(avcc[5] & 0x1F >= 1, "at least one SPS");
+        assert_eq!(info.codec_name(), "h264");
+        assert_eq!(info.frame_rate(), Some(AVRational { num: 25, den: 1 }));
+    }
+
+    #[test]
+    fn happy_path_delivers_avcc_au_and_derives_duration() {
+        let ctx = video_ctx();
+        let (sink, events) = recording_sink();
+        let mut worker = collect(&ctx, sink).unwrap();
+        assert_eq!(worker.deliver_stream_info(), 0);
+        let mut pb = packet(&idr_au(), 4, 4, tb25(), 0);
+        assert_eq!(
+            unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) },
+            0
+        );
+        let events = events.lock().unwrap();
+        assert!(matches!(events[0], PacketSinkEvent::StreamInfo(_)));
+        let PacketSinkEvent::Packet(p) = &events[1] else {
+            panic!("expected a packet event");
+        };
+        // Anchor stream: first delivered dts is 0, offset carries the shift.
+        assert_eq!(p.dts(), 0);
+        assert_eq!(p.pts(), 0);
+        assert_eq!(p.applied_offset(), 4);
+        // duration 0 was derived from the 25 fps frame rate: one tick at 1/25.
+        assert_eq!(p.duration(), 1);
+        assert!(p.is_key());
+        // Payload is the length-prefixed rewrite of the Annex-B AU.
+        assert_eq!(p.data()[..4], [0, 0, 0, 5]);
+        assert_eq!(p.data()[4], 0x65);
+    }
+
+    #[test]
+    fn non_idr_slice_is_not_key() {
+        let ctx = video_ctx();
+        let (sink, events) = recording_sink();
+        let mut worker = collect(&ctx, sink).unwrap();
+        let mut pb = packet(&p_au(), 0, 0, tb25(), 0);
+        assert_eq!(unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) }, 0);
+        let events = events.lock().unwrap();
+        let PacketSinkEvent::Packet(p) = &events[0] else {
+            panic!("expected a packet event");
+        };
+        assert!(!p.is_key());
+    }
+
+    #[test]
+    fn s7_rejects_missing_and_disordered_timestamps() {
+        let ctx = video_ctx();
+        let (sink, _events) = recording_sink();
+        let mut worker = collect(&ctx, sink).unwrap();
+
+        let mut nopts = packet(&idr_au(), ffmpeg_sys_next::AV_NOPTS_VALUE, 0, tb25(), 0);
+        assert_eq!(
+            unsafe { worker.process_and_deliver(ctx.ctx, &mut nopts) },
+            AVERROR_EXTERNAL
+        );
+        assert!(matches!(
+            worker.pending_error_cloned(),
+            Some(PacketSinkError::MissingTimestamp { which: "pts", .. })
+        ));
+
+        // Fresh worker: pts earlier than dts.
+        let (sink, _events) = recording_sink();
+        let mut worker = collect(&ctx, sink).unwrap();
+        let mut bad = packet(&idr_au(), 1, 2, tb25(), 0);
+        assert_eq!(
+            unsafe { worker.process_and_deliver(ctx.ctx, &mut bad) },
+            AVERROR_EXTERNAL
+        );
+        assert!(matches!(
+            worker.pending_error_cloned(),
+            Some(PacketSinkError::PtsBeforeDts { .. })
+        ));
+
+        // Fresh worker: dts must strictly increase.
+        let (sink, _events) = recording_sink();
+        let mut worker = collect(&ctx, sink).unwrap();
+        let mut first = packet(&idr_au(), 0, 0, tb25(), 0);
+        assert_eq!(unsafe { worker.process_and_deliver(ctx.ctx, &mut first) }, 0);
+        let mut stale = packet(&p_au(), 5, 0, tb25(), 0);
+        assert_eq!(
+            unsafe { worker.process_and_deliver(ctx.ctx, &mut stale) },
+            AVERROR_EXTERNAL
+        );
+        assert!(matches!(
+            worker.pending_error_cloned(),
+            Some(PacketSinkError::NonMonotonicDts { .. })
+        ));
+
+        // Fresh worker: duplicate pts within the reorder window.
+        let (sink, _events) = recording_sink();
+        let mut worker = collect(&ctx, sink).unwrap();
+        let mut a = packet(&idr_au(), 3, 0, tb25(), 0);
+        assert_eq!(unsafe { worker.process_and_deliver(ctx.ctx, &mut a) }, 0);
+        let mut b = packet(&p_au(), 3, 1, tb25(), 0);
+        assert_eq!(
+            unsafe { worker.process_and_deliver(ctx.ctx, &mut b) },
+            AVERROR_EXTERNAL
+        );
+        assert!(matches!(
+            worker.pending_error_cloned(),
+            Some(PacketSinkError::DuplicatePts { pts: 3, .. })
+        ));
+    }
+
+    #[test]
+    fn duration_underivable_without_a_frame_rate_errors() {
+        let ctx = TestCtx::new();
+        unsafe {
+            let i = ctx.add_stream(
+                AVMediaType::AVMEDIA_TYPE_VIDEO,
+                AVCodecID::AV_CODEC_ID_H264,
+                Some(&annexb_config()),
+                tb25(),
+            );
+            let st = *(*ctx.ctx).streams.add(i);
+            (*st).avg_frame_rate = AVRational { num: 0, den: 0 };
+        }
+        let (sink, _events) = recording_sink();
+        let mut worker = collect(&ctx, sink).unwrap();
+        let mut pb = packet(&idr_au(), 0, 0, tb25(), 0);
+        assert_eq!(
+            unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) },
+            AVERROR_EXTERNAL
+        );
+        assert!(matches!(
+            worker.pending_error_cloned(),
+            Some(PacketSinkError::MissingDuration { .. })
+        ));
+    }
+
+    #[test]
+    fn s8_new_extradata_redundant_passes_and_change_errors() {
+        let ctx = video_ctx();
+        let (sink, _events) = recording_sink();
+        let mut worker = collect(&ctx, sink).unwrap();
+
+        // Redundant announcement (byte-identical Annex-B config): passes.
+        let mut same = packet(&idr_au(), 0, 0, tb25(), 0);
+        unsafe {
+            let config = annexb_config();
+            let sd = av_packet_new_side_data(
+                same.packet.as_mut_ptr(),
+                AV_PKT_DATA_NEW_EXTRADATA,
+                config.len(),
+            );
+            assert!(!sd.is_null());
+            std::ptr::copy_nonoverlapping(config.as_ptr(), sd, config.len());
+        }
+        assert_eq!(unsafe { worker.process_and_deliver(ctx.ctx, &mut same) }, 0);
+
+        // A different SPS is a mid-stream configuration change.
+        let mut changed = packet(&p_au(), 1, 1, tb25(), 0);
+        unsafe {
+            let mut config = vec![0, 0, 0, 1];
+            config.extend_from_slice(OTHER_SPS);
+            config.extend_from_slice(&[0, 0, 1]);
+            config.extend_from_slice(PPS);
+            let sd = av_packet_new_side_data(
+                changed.packet.as_mut_ptr(),
+                AV_PKT_DATA_NEW_EXTRADATA,
+                config.len(),
+            );
+            assert!(!sd.is_null());
+            std::ptr::copy_nonoverlapping(config.as_ptr(), sd, config.len());
+        }
+        assert_eq!(
+            unsafe { worker.process_and_deliver(ctx.ctx, &mut changed) },
+            AVERROR_EXTERNAL
+        );
+        assert!(matches!(
+            worker.pending_error_cloned(),
+            Some(PacketSinkError::ConfigChange { .. })
+        ));
+    }
+
+    #[test]
+    fn s8_param_change_projection_compares_typed_fields() {
+        let ctx = video_ctx();
+
+        // Equal dimensions: redundant, passes.
+        let (sink, _events) = recording_sink();
+        let mut worker = collect(&ctx, sink).unwrap();
+        let mut same = packet(&idr_au(), 0, 0, tb25(), 0);
+        unsafe {
+            let mut payload = 8u32.to_le_bytes().to_vec(); // DIMENSIONS flag
+            payload.extend_from_slice(&320i32.to_le_bytes());
+            payload.extend_from_slice(&240i32.to_le_bytes());
+            let sd = av_packet_new_side_data(
+                same.packet.as_mut_ptr(),
+                AV_PKT_DATA_PARAM_CHANGE,
+                payload.len(),
+            );
+            assert!(!sd.is_null());
+            std::ptr::copy_nonoverlapping(payload.as_ptr(), sd, payload.len());
+        }
+        assert_eq!(unsafe { worker.process_and_deliver(ctx.ctx, &mut same) }, 0);
+
+        // A resolution change is rejected typed.
+        let (sink, _events) = recording_sink();
+        let mut worker = collect(&ctx, sink).unwrap();
+        let mut changed = packet(&idr_au(), 0, 0, tb25(), 0);
+        unsafe {
+            let mut payload = 8u32.to_le_bytes().to_vec();
+            payload.extend_from_slice(&640i32.to_le_bytes());
+            payload.extend_from_slice(&480i32.to_le_bytes());
+            let sd = av_packet_new_side_data(
+                changed.packet.as_mut_ptr(),
+                AV_PKT_DATA_PARAM_CHANGE,
+                payload.len(),
+            );
+            assert!(!sd.is_null());
+            std::ptr::copy_nonoverlapping(payload.as_ptr(), sd, payload.len());
+        }
+        assert_eq!(
+            unsafe { worker.process_and_deliver(ctx.ctx, &mut changed) },
+            AVERROR_EXTERNAL
+        );
+        assert!(matches!(
+            worker.pending_error_cloned(),
+            Some(PacketSinkError::ConfigChange { .. })
+        ));
+    }
+
+    #[test]
+    fn inband_parameter_sets_are_rejected() {
+        let ctx = video_ctx();
+
+        // Equal to the baseline: still out-of-band-only in the strict tier.
+        let (sink, _events) = recording_sink();
+        let mut worker = collect(&ctx, sink).unwrap();
+        let mut au = annexb_config();
+        au.extend_from_slice(&[0, 0, 1, 0x65, 0x88, 0x84]);
+        let mut pb = packet(&au, 0, 0, tb25(), 0);
+        assert_eq!(
+            unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) },
+            AVERROR_EXTERNAL
+        );
+        assert!(matches!(
+            worker.pending_error_cloned(),
+            Some(PacketSinkError::InBandParameterSets { .. })
+        ));
+
+        // Different in-band sets are a configuration change.
+        let (sink, _events) = recording_sink();
+        let mut worker = collect(&ctx, sink).unwrap();
+        let mut au = vec![0, 0, 0, 1];
+        au.extend_from_slice(OTHER_SPS);
+        au.extend_from_slice(&[0, 0, 1, 0x65, 0x88, 0x84]);
+        let mut pb = packet(&au, 0, 0, tb25(), 0);
+        assert_eq!(
+            unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) },
+            AVERROR_EXTERNAL
+        );
+        assert!(matches!(
+            worker.pending_error_cloned(),
+            Some(PacketSinkError::ConfigChange { .. })
+        ));
+    }
+
+    #[test]
+    fn shared_origin_spans_streams_with_true_relative_offsets() {
+        let ctx = TestCtx::new();
+        unsafe {
+            ctx.add_stream(
+                AVMediaType::AVMEDIA_TYPE_VIDEO,
+                AVCodecID::AV_CODEC_ID_H264,
+                Some(&annexb_config()),
+                tb25(),
+            );
+            ctx.add_stream(
+                AVMediaType::AVMEDIA_TYPE_AUDIO,
+                AVCodecID::AV_CODEC_ID_AAC,
+                Some(&[0x12, 0x10]),
+                AVRational { num: 1, den: 44100 },
+            );
+        }
+        let (sink, events) = recording_sink();
+        let mut worker = collect(&ctx, sink).unwrap();
+
+        // First delivered packet: video dts 5 (at 1/25) anchors the origin.
+        let mut v = packet(&idr_au(), 5, 5, tb25(), 0);
+        assert_eq!(unsafe { worker.process_and_deliver(ctx.ctx, &mut v) }, 0);
+        // Audio at original dts 0 keeps its true relative offset: negative.
+        let mut a = packet(&[0x21, 0x10, 0x04], 0, 0, AVRational { num: 1, den: 44100 }, 1);
+        a.packet_data.codec_type = AVMediaType::AVMEDIA_TYPE_AUDIO;
+        assert_eq!(unsafe { worker.process_and_deliver(ctx.ctx, &mut a) }, 0);
+
+        let events = events.lock().unwrap();
+        let packets: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                PacketSinkEvent::Packet(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0].stream_index(), 0);
+        assert_eq!(packets[0].dts(), 0, "anchor stream starts at zero");
+        assert_eq!(packets[0].applied_offset(), 5);
+        // 5 ticks at 1/25 s = 0.2 s = 8820 ticks at 1/44100.
+        assert_eq!(packets[1].applied_offset(), 8820);
+        assert_eq!(packets[1].dts(), -8820, "earlier stream keeps its offset");
+        assert!(packets[1].is_key(), "audio packets are always key");
+        // AAC duration was derived from the codec frame size (1024 samples).
+        assert_eq!(packets[1].duration(), 1024);
+    }
+
+    #[test]
+    fn failing_packet_callback_stops_with_typed_error_and_no_on_end() {
+        let ctx = video_ctx();
+        let events: Arc<Mutex<Vec<PacketSinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let (end_log, err_log) = (events.clone(), events.clone());
+        let sink = PacketSink::builder()
+            .on_packet(|_| -7)
+            .on_end(move || end_log.lock().unwrap().push(PacketSinkEvent::End))
+            .on_error(move |e| {
+                err_log
+                    .lock()
+                    .unwrap()
+                    .push(PacketSinkEvent::Error(e.clone()))
+            })
+            .build();
+        let mut worker = collect(&ctx, sink).unwrap();
+        let mut pb = packet(&idr_au(), 0, 0, tb25(), 0);
+        let ret = unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) };
+        assert_eq!(ret, AVERROR_EXTERNAL);
+        assert_ne!(ret, ffmpeg_sys_next::AVERROR_EOF);
+        assert!(matches!(
+            worker.pending_error_cloned(),
+            Some(PacketSinkError::PacketCallbackFailed { code: -7, .. })
+        ));
+
+        // Terminal slot: the stashed error fires on_error, never on_end —
+        // even if every stream were terminal.
+        worker.finish(true, AVERROR_EXTERNAL, false, true);
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], PacketSinkEvent::Error(_)));
+    }
+
+    #[test]
+    fn finish_gate_matrix() {
+        let ctx = video_ctx();
+        let run = |all_done: bool, ret: i32, aborted: bool, task_error: bool| {
+            let (sink, events) = recording_sink();
+            let mut worker = collect(&ctx, sink).unwrap();
+            worker.finish(all_done, ret, aborted, task_error);
+            let events = events.lock().unwrap();
+            events
+                .iter()
+                .filter(|e| matches!(e, PacketSinkEvent::End))
+                .count()
+        };
+        assert_eq!(run(true, 0, false, false), 1, "healthy completion");
+        assert_eq!(run(false, 0, false, false), 0, "streams not terminal");
+        assert_eq!(run(true, -5, false, false), 0, "delivery error");
+        assert_eq!(run(true, 0, true, false), 0, "abort");
+        assert_eq!(run(true, 0, false, true), 0, "task error elsewhere");
+    }
+}
