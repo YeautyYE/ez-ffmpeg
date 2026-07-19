@@ -765,11 +765,19 @@ fn validate_rendition_name(name: &str) -> Result<()> {
 }
 
 /// Converts a path to an owned UTF-8 `String`, erroring on non-UTF-8 paths
-/// (FFmpeg option strings must be UTF-8).
+/// (FFmpeg option strings must be UTF-8). On Windows, separators are
+/// normalized to forward slashes: the hls muxer derives the fMP4 init
+/// segment's directory with a forward-slash-only `strrchr` on the playlist
+/// path (hlsenc has no DOS-path handling there), so a `\`-separated path
+/// silently drops `init.mp4` outside the rendition directory. Windows file
+/// APIs accept `/` throughout, so normalizing is lossless.
 fn path_to_utf8(path: &Path) -> Result<String> {
-    path.to_str().map(str::to_string).ok_or_else(|| {
+    let utf8 = path.to_str().map(str::to_string).ok_or_else(|| {
         Error::InvalidRecipeArg(format!("path is not valid UTF-8: {}", path.display()))
-    })
+    })?;
+    #[cfg(windows)]
+    let utf8 = utf8.replace('\\', "/");
+    Ok(utf8)
 }
 
 /// Creates `dir` (and parents), mapping I/O failures to a recipe argument error.

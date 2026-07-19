@@ -363,3 +363,14 @@ fn fmp4_master_text_declares_version_7() {
     let text = generate_master_playlist(&variants, l.segment_type.master_playlist_version());
     assert!(text.starts_with("#EXTM3U\n#EXT-X-VERSION:7\n"));
 }
+
+// Regression (Windows lane): the hls muxer locates the fMP4 init segment
+// with a forward-slash-only strrchr on the playlist path, so `\`-separated
+// option strings dropped init.mp4 outside the rendition directory. Paths
+// handed to FFmpeg must come out of path_to_utf8 with `/` separators.
+#[cfg(windows)]
+#[test]
+fn path_to_utf8_normalizes_separators_for_ffmpeg() {
+    let p = std::path::Path::new(r"out\360p\index.m3u8");
+    assert_eq!(path_to_utf8(p).unwrap(), "out/360p/index.m3u8");
+}
