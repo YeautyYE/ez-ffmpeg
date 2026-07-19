@@ -371,6 +371,15 @@ fn fmp4_master_text_declares_version_7() {
 #[cfg(windows)]
 #[test]
 fn path_to_utf8_normalizes_separators_for_ffmpeg() {
+    // Relative, drive-letter, and UNC paths all normalize to forward
+    // slashes (Windows file APIs and FFmpeg accept them); verbatim paths
+    // are prefix-sensitive and must pass through untouched.
     let p = std::path::Path::new(r"out\360p\index.m3u8");
     assert_eq!(path_to_utf8(p).unwrap(), "out/360p/index.m3u8");
+    let p = std::path::Path::new(r"C:\hls\360p\index.m3u8");
+    assert_eq!(path_to_utf8(p).unwrap(), "C:/hls/360p/index.m3u8");
+    let p = std::path::Path::new(r"\\server\share\360p\index.m3u8");
+    assert_eq!(path_to_utf8(p).unwrap(), "//server/share/360p/index.m3u8");
+    let p = std::path::Path::new(r"\\?\C:\hls\360p\index.m3u8");
+    assert_eq!(path_to_utf8(p).unwrap(), r"\\?\C:\hls\360p\index.m3u8");
 }

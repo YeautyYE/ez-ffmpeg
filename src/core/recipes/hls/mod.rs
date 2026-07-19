@@ -778,8 +778,15 @@ fn path_to_utf8(path: &Path) -> Result<String> {
     let utf8 = path.to_str().map(str::to_string).ok_or_else(|| {
         Error::InvalidRecipeArg(format!("path is not valid UTF-8: {}", path.display()))
     })?;
+    // Verbatim (`\\?\`) paths are prefix-sensitive: rewriting their
+    // separators would change which object the path names, so they pass
+    // through untouched (prefer regular paths for fMP4 output on Windows).
     #[cfg(windows)]
-    let utf8 = utf8.replace('\\', "/");
+    let utf8 = if utf8.starts_with(r"\\?\") {
+        utf8
+    } else {
+        utf8.replace('\\', "/")
+    };
     Ok(utf8)
 }
 
