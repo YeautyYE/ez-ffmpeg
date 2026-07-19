@@ -7,10 +7,18 @@
 //! metadata (`EZ_FFMPEG_EMIT_COUNT`) and the output sink clones the packed bytes
 //! that many times — O(1) frames regardless of the count.
 //!
-//! Grid (C1, corrected): anchor at the first DELIVERED frame `p0`; targets
-//! `t_i = p0 + (i + 0.5) * span / n` for `i in 0..n`; a target resolves to the
-//! frame "displayed at" it (the last real frame with `pts <= t_i`). The span
-//! (µs) is resolved at open time and published through a shared `OnceLock`.
+//! Grid (C1, corrected): anchor at the first delivered frame AT/AFTER the trim
+//! boundary, `p0`; targets `t_i = p0 + (i + 0.5) * span / n` for `i in 0..n`;
+//! a target resolves to the frame "displayed at" it (the last real frame with
+//! `pts <= t_i`). The span (µs) is resolved at open time and published through
+//! a shared `OnceLock`.
+//!
+//! Trim boundary: with `start_time_us`, the container seek lands on a keyframe
+//! at or BEFORE the request (up to a GOP early, minus an extra B-frame rewind),
+//! the timeline is re-zeroed at the request, and the filtergraph's trim drops
+//! every `pts < 0` frame — AFTER this pipeline. Anchoring on such lead-in
+//! frames would shift the whole grid early and let trim destroy stamped
+//! targets, so the sampler skips frames below the boundary outright.
 
 use super::error::FrameExportError;
 use crate::core::filter::frame_filter::{FrameFilter, FrameFilterError, RequestFrameMode};
@@ -38,6 +46,50 @@ const US_PER_SEC: AVRational = AVRational {
     den: 1_000_000,
 };
 
+/// Input-side sampling clock: a frame's µs PTS with a NOPTS fallback
+/// (`prev + delta`). Shared by the UniformN sampler and the EveryNth/EverySec
+/// input selector so the NOPTS policy cannot drift between them. Used ONLY for
+/// grid/selection decisions — the exported `pts_us` still comes from the real
+/// frame downstream.
+pub(crate) struct SamplingClock {
+    prev_pts_us: i64,
+    prev_delta_us: i64,
+}
+
+impl SamplingClock {
+    pub(crate) fn new() -> Self {
+        Self {
+            prev_pts_us: 0,
+            prev_delta_us: 0,
+        }
+    }
+
+    /// `track_delta` is false until the caller has anchored its grid: the very
+    /// first real timestamp has no meaningful inter-frame delta.
+    ///
+    /// # Safety
+    /// `p` must be a valid, non-null `AVFrame`.
+    pub(crate) unsafe fn pts_us(&mut self, p: *const AVFrame, track_delta: bool) -> i64 {
+        let tb = (*p).time_base;
+        let raw = (*p).best_effort_timestamp;
+        let raw = if raw == AV_NOPTS_VALUE { (*p).pts } else { raw };
+        if tb.den != 0 && raw != AV_NOPTS_VALUE {
+            let pts = av_rescale_q(raw, tb, US_PER_SEC);
+            if track_delta {
+                // saturating: extreme timestamp discontinuities must not overflow.
+                self.prev_delta_us = pts.saturating_sub(self.prev_pts_us).max(0);
+            }
+            self.prev_pts_us = pts;
+            pts
+        } else {
+            // No usable timestamp: extrapolate from the last real frame.
+            let est = self.prev_pts_us.saturating_add(self.prev_delta_us.max(1));
+            self.prev_pts_us = est;
+            est
+        }
+    }
+}
+
 /// Input-side exact-N frame sampler.
 pub(crate) struct ExportSampler {
     n: u32,
@@ -50,15 +102,16 @@ pub(crate) struct ExportSampler {
     cursor: i128,
     /// The frame currently held back, awaiting its displayed-target count.
     held: Option<Frame>,
-    /// Previous sampling PTS and inter-frame delta, for the NOPTS fallback.
-    prev_pts_us: i64,
-    prev_delta_us: i64,
+    /// Frames with sampling PTS below this are lead-in the in-graph trim will
+    /// drop (`Some(0)` when `start_time_us` re-zeroes the timeline); skipped.
+    trim_boundary_us: Option<i64>,
+    clock: SamplingClock,
     /// Debug bookkeeping: total copies the sink is asked to emit.
     emitted_targets: i128,
 }
 
 impl ExportSampler {
-    pub(crate) fn new(n: u32, span_cell: UniformSpan) -> Self {
+    pub(crate) fn new(n: u32, span_cell: UniformSpan, trim_boundary_us: Option<i64>) -> Self {
         Self {
             n,
             span_cell,
@@ -66,36 +119,18 @@ impl ExportSampler {
             span_us: 0,
             cursor: 0,
             held: None,
-            prev_pts_us: 0,
-            prev_delta_us: 0,
+            trim_boundary_us,
+            clock: SamplingClock::new(),
             emitted_targets: 0,
         }
     }
 
-    /// A frame's sampling PTS in µs, with a NOPTS fallback (`prev + delta`) used
-    /// ONLY for grid decisions — the exported `pts_us` still comes from the real
-    /// frame downstream.
+    /// A frame's sampling PTS in µs (see [`SamplingClock`]).
     ///
     /// # Safety
     /// `p` must be a valid, non-null `AVFrame`.
     unsafe fn sampling_pts_us(&mut self, p: *const AVFrame) -> i64 {
-        let tb = (*p).time_base;
-        let raw = (*p).best_effort_timestamp;
-        let raw = if raw == AV_NOPTS_VALUE { (*p).pts } else { raw };
-        if tb.den != 0 && raw != AV_NOPTS_VALUE {
-            let pts = av_rescale_q(raw, tb, US_PER_SEC);
-            if self.anchor_us.is_some() {
-                // saturating: extreme timestamp discontinuities must not overflow.
-                self.prev_delta_us = pts.saturating_sub(self.prev_pts_us).max(0);
-            }
-            self.prev_pts_us = pts;
-            pts
-        } else {
-            // No usable timestamp: extrapolate from the last real frame.
-            let est = self.prev_pts_us.saturating_add(self.prev_delta_us.max(1));
-            self.prev_pts_us = est;
-            est
-        }
+        self.clock.pts_us(p, self.anchor_us.is_some())
     }
 
     /// Count of targets strictly below `pts`, i.e. `|{ i in 0..n : t_i < pts }|`,
@@ -171,19 +206,27 @@ impl FrameFilter for ExportSampler {
             return Ok(Some(frame));
         }
 
-        // First delivered frame anchors the grid and reads the resolved span.
+        let f_pts = unsafe { self.sampling_pts_us(p) };
+
+        // Lead-in below the trim boundary: the in-graph trim discards these
+        // frames AFTER this pipeline, so anchoring or stamping on them would
+        // aim the grid at frames that never survive. Consume them here; the
+        // grid anchors at the first frame the trim will keep.
+        if self.trim_boundary_us.is_some_and(|b| f_pts < b) {
+            return Ok(None);
+        }
+
+        // First surviving frame anchors the grid and reads the resolved span.
         if self.anchor_us.is_none() {
             let span = *self.span_cell.get().ok_or_else(|| -> FrameFilterError {
                 "frame export: UniformN span was not resolved before the run started".into()
             })?;
-            let pts = unsafe { self.sampling_pts_us(p) };
-            self.anchor_us = Some(pts);
+            self.anchor_us = Some(f_pts);
             self.span_us = span.max(1);
             self.held = Some(frame);
             return Ok(None);
         }
 
-        let f_pts = unsafe { self.sampling_pts_us(p) };
         let new_count = self.targets_below(f_pts);
         let k = new_count - self.cursor;
         if k > 0 {
@@ -230,7 +273,7 @@ mod tests {
     use super::*;
 
     fn sampler(n: u32, p0: i64, span: i64) -> ExportSampler {
-        let mut s = ExportSampler::new(n, Arc::new(OnceLock::new()));
+        let mut s = ExportSampler::new(n, Arc::new(OnceLock::new()), None);
         s.anchor_us = Some(p0);
         s.span_us = span;
         s
