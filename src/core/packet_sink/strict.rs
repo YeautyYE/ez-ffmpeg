@@ -269,6 +269,8 @@ impl PacketSinkWorker {
         }
     }
 
+    /// # Safety
+    /// - Same contract as [`Self::process_and_deliver`] (its only caller).
     unsafe fn process(
         &mut self,
         out_fmt_ctx: *const AVFormatContext,
@@ -479,6 +481,11 @@ impl PacketSinkWorker {
 }
 
 /// Owned copy of a stream's extradata, `None` when absent/empty.
+///
+/// # Safety
+/// - `codecpar` must be a valid, non-null `AVCodecParameters` whose
+///   `extradata`/`extradata_size` pair is consistent (as populated by
+///   `avcodec_parameters_from_context`), alive for the call.
 unsafe fn extradata_bytes(codecpar: *const AVCodecParameters) -> Option<Vec<u8>> {
     let ptr = (*codecpar).extradata;
     let size = (*codecpar).extradata_size;
@@ -490,6 +497,11 @@ unsafe fn extradata_bytes(codecpar: *const AVCodecParameters) -> Option<Vec<u8>>
 
 /// S8: compare packet side data against the seeded baseline. Redundant
 /// (value-equal) announcements pass; any true change is a typed error.
+///
+/// # Safety
+/// - `pkt` must be a valid, non-null `AVPacket` whose
+///   `side_data`/`side_data_elems` array is consistent and alive for the
+///   call (each entry's `data`/`size` pair is read).
 unsafe fn check_side_data(
     state: &StreamState,
     stream_index: usize,
