@@ -26,6 +26,7 @@ This library:
 - Offers optional GPU-accelerated custom filters (wgpu) and a high-performance embedded RTMP server
 - Ships one-shot recipes (thumbnails/sprite sheets, animated GIF, HLS ABR ladders) and a detection/measurement API (black/silence/scene/crop/EBU R128 loudness) that returns typed Rust results instead of only FFmpeg logs
 - Exports decoded video frames (packed RGB) and audio (interleaved `f32` PCM) straight into memory for AI/CV/ASR pipelines, honoring color tags by default (experimental)
+- Pushes Rust-rendered frames into the encode/mux pipeline with `VideoWriter` — procedural video, in-memory MP4 generation, or live targets, with no demuxer involved (experimental)
 
 By abstracting the complexity of the raw C API, `ez-ffmpeg` simplifies configuring media pipelines, performing transcoding and filtering, and inspecting media streams.
 
@@ -39,7 +40,7 @@ Migrating a specific `ffmpeg` command? The crate docs include a [CLI-to-API mapp
 
 ## Version Requirements
 
-- **Rust:** Version 1.80.0 or higher.
+- **Rust:** Version 1.80.0 or higher for the default feature set. The optional `wgpu` GPU-filter feature pulls in the wgpu 26 dependency stack, which currently requires Rust 1.85+.
 - **FFmpeg:** Version 7.1 through 8.x (one build links either major; the bindings gate on the installed version).
 
 ## Documentation
@@ -156,11 +157,13 @@ What to expect:
   redistribute them.
 - **Capabilities:** the result is a *minimal* FFmpeg (`--disable-autodetect`,
   no external libraries): all native decoders (H.264, HEVC, AV1, VP9, AAC,
-  MP3, …), native encoders such as AAC/MJPEG/GIF, every muxer/demuxer, the
-  detection filters behind the analysis API (black/silence/scene/loudness),
-  and file/pipe I/O — but **no libx264** (HLS ladders must select another
-  encoder via `.video_codec(...)`), **no PNG/WebP encoders** (write thumbnails
-  as `.jpg`), and **no https/TLS**. See the capability matrix below.
+  MP3, …), native encoders such as AAC/MJPEG/GIF, the muxers/demuxers that
+  need no external dependency (dependency-gated ones — e.g. the WHIP muxer —
+  are omitted), the detection filters behind the analysis API
+  (black/silence/scene/loudness), and file/pipe I/O — but **no libx264**
+  (HLS ladders must select another encoder via `.video_codec(...)`),
+  **no PNG/WebP encoders** (write thumbnails as `.jpg`), and **no
+  https/TLS**. See the capability matrix below.
 
 To add GPL components, combine the documented `build-*` features — for example
 H.264 encoding via a **system-installed** libx264 (the feature links it, it
@@ -238,11 +241,11 @@ on your target triple, open an issue including the triple and FFmpeg version.
 <details>
 <summary>Windows static linking fails only when the project has both <code>main.rs</code> and <code>lib.rs</code></summary>
 
-Cargo builds both a binary and a library target, and the duplicated
-static-link arguments can conflict. Either remove `lib.rs`, disable the
-library target in `Cargo.toml` (`[lib]` with `crate-type = []`), or move the
-code into `main.rs`. See the `unresolved external symbol` section above for
-the accompanying system-library list.
+Projects with both a binary and a library target in the same package have
+hit unresolved FFmpeg symbols in Windows static builds. If you see this, use
+a single-target layout: move the code into `main.rs`, or split the library
+into its own package that the binary depends on. See the `unresolved
+external symbol` section above for the accompanying system-library list.
 (Reported in [#20](https://github.com/YeautyYE/ez-ffmpeg/issues/20).)
 
 </details>
@@ -298,9 +301,12 @@ experimental and may be reshaped in a future minor release.
   `for_whisper()` presets the 16 kHz mono shape ASR models consume.
 
 `Sampling::UniformN(n)` yields exactly `n` frames evenly spread over the
-duration — the fixed frame budget VLM/CLIP-style pipelines expect, padding
-short inputs by repeating nearby frames; supply `duration_hint_us()` when the
-duration cannot be probed (live/piped inputs).
+duration (fewer only if a lower `max_frames` cap wins) — the fixed frame
+budget VLM/CLIP-style pipelines expect, padding short inputs by repeating
+nearby frames; supply `duration_hint_us()` when the duration cannot be probed
+(live/piped inputs). The strategy is a single sequential decode of the
+(trimmed) input — no seek-per-target fast path — so budget accordingly on
+long files; `KeyframesOnly` is the fast sparse-thumbnail path.
 
 ```rust
 use ez_ffmpeg::frame_export::{FrameExtractor, SampleExtractor, Sampling};
@@ -337,6 +343,41 @@ side-by-side, and the other `frame_export` examples (`extract_rgb_frames`,
 `frame_sampling`, `uniform_thumbnails`, `keyframe_thumbnails`,
 `extract_whisper_pcm`, `ai_media_ingest`) for the full tour.
 
+## Frame Push: VideoWriter (Experimental)
+
+The write-side sibling of frame export: render frames in Rust and push them
+into a full FFmpeg pipeline — filters, any compatible encoder/container the
+linked build offers, or streaming targets — with no demuxer and no raw-byte
+plumbing. Constant frame rate, video only; the API is experimental and may be
+reshaped in a future minor release.
+
+```rust
+use ez_ffmpeg::{Output, VideoWriter};
+
+fn render(_i: usize) -> Vec<u8> {
+    vec![0u8; 640 * 360 * 4] // one tightly packed RGBA frame
+}
+
+fn main() -> Result<(), ez_ffmpeg::error::Error> {
+    // Pick an encoder explicitly: with a bare "out.mp4" the linked FFmpeg
+    // build chooses the container default (H.264 with libx264, else mpeg4).
+    let out = Output::from("out.mp4").set_video_codec("mpeg4").set_video_qscale(5);
+    let mut writer = VideoWriter::builder(640, 360).fps(30, 1).open(out)?;
+    for i in 0..90 {
+        writer.write_owned(render(i))?;
+    }
+    writer.finish()?; // drains the encoder, finalizes the container
+    Ok(())
+}
+```
+
+Frames are tightly packed plane bytes (`frame_size()` tells you exactly how
+many); `write()` applies backpressure through a bounded queue; `finish()` is
+the authoritative way to retrieve the pipeline's first error, and `abort()`
+discards the export. See `examples/frames_to_video` (procedural animation),
+`examples/bouncing_balls` (render loop with per-frame state), and
+`examples/in_memory_mp4` (encode into a `Vec<u8>` with custom output I/O).
+
 ## Streaming protocol outputs (WHIP / SRT)
 
 Whether a streaming output works depends on the FFmpeg build your process
@@ -371,13 +412,14 @@ Requirements, all imposed by the upstream muxer:
   supports OpenSSL or Schannel for DTLS; FFmpeg 8.1 accepts any of OpenSSL,
   GnuTLS, Schannel, or mbedTLS. Without one of these, the `whip` muxer is not
   compiled in — `capabilities::is_muxer_available("whip")` returns `false`.
-- **Video: H.264, Baseline or Constrained Baseline profile only, with
-  B-frames disabled.** The muxer supports only those H.264 profiles, and
-  real-time WebRTC playout does not reorder frames. `libx264` defaults to the
-  High profile, so you must set the profile explicitly (see the example). The
-  muxer reads the H.264 profile/level from global headers; ez-ffmpeg raises
-  the encoder's global-header flag automatically whenever a muxer requires
-  it, so that part needs no configuration.
+- **Video: H.264 with B-frames disabled.** The muxer rejects B-frames
+  (real-time WebRTC playout does not reorder frames) and needs the H.264
+  profile/level present in global headers — ez-ffmpeg raises the encoder's
+  global-header flag automatically whenever a muxer requires it, so that part
+  needs no configuration. The muxer writes whatever profile you encode into
+  the SDP; **Baseline/Constrained Baseline is the conservative
+  interoperability choice** for WebRTC playout (the example pins it), not a
+  muxer-enforced restriction.
 - **Audio: Opus at 48 kHz stereo** — the muxer enforces this combination.
 
 Discover the encoders your build offers with `ez_ffmpeg::codec::get_encoders()`.
@@ -402,7 +444,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .set_format("whip") // required: never auto-guessed from the URL
         .set_format_opt("authorization", "<token>") // raw token; FFmpeg itself adds "Bearer "
         .set_video_codec("libx264") // pick from codec::get_encoders()
-        .set_video_codec_opt("profile", "baseline") // WHIP: Baseline profile only
+        .set_video_codec_opt("profile", "baseline") // conservative WebRTC interop choice
         .set_video_codec_opt("bf", "0") // WHIP: no B-frames
         .set_audio_codec("libopus")
         .set_audio_sample_rate(48000) // the muxer requires 48 kHz stereo Opus
