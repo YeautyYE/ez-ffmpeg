@@ -173,6 +173,23 @@ fn uniform_n_start_on_gop_video_stays_uniform() {
         pts[3] - pts[0] >= 900_000,
         "grid must cover the remaining span: {pts:?}"
     );
+
+    // Same contract when the start time is preconfigured on the Input rather
+    // than set through the extractor: both must feed the same trim-boundary
+    // and span machinery.
+    let frames = FrameExtractor::new(
+        ez_ffmpeg::Input::from(path.to_str().unwrap()).set_start_time_us(1_500_000),
+    )
+    .sampling(Sampling::UniformN(4))
+    .collect_frames()
+    .expect("extraction with preconfigured Input start");
+    assert_eq!(frames.len(), 4);
+    let pts: Vec<i64> = frames.iter().filter_map(|f| f.pts_us()).collect();
+    assert!(pts[0] >= 0, "no pre-start frame may survive: {pts:?}");
+    assert!(
+        pts.windows(2).all(|w| w[1] - w[0] >= 300_000),
+        "preconfigured start must stay spread too: {pts:?}"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
