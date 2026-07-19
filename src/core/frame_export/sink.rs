@@ -59,12 +59,18 @@ impl BufferPool {
     }
 
     /// An EMPTY buffer with at least `total` capacity: a recycled one when a
-    /// fitting buffer is parked, else a fresh allocation. Undersized parked
-    /// buffers (a mid-stream resolution change shrank or grew the frames) are
-    /// freed rather than grown, so the pool never accumulates stale sizes.
+    /// fitting buffer is parked, else a fresh allocation. Parked buffers that
+    /// no longer fit the live geometry are freed rather than kept: undersized
+    /// ones cannot serve the request, and ones over 4x the request (a
+    /// mid-stream resolution drop) would otherwise pin their full allocation —
+    /// think one 8K RGB24 buffer at ~100 MB — for the rest of the run. The 4x
+    /// bound reuses across modest changes (1080p -> 720p) while a large drop
+    /// (4K -> thumbnail) converges the pool to the new size within `slots`
+    /// takes.
     fn take(&self, total: usize) -> Vec<u8> {
+        let max_keep = total.saturating_mul(4);
         while let Ok(mut buf) = self.rx.try_recv() {
-            if buf.capacity() >= total {
+            if buf.capacity() >= total && buf.capacity() <= max_keep {
                 buf.clear();
                 return buf;
             }
@@ -390,6 +396,7 @@ unsafe fn pack_bytes(
 mod tests {
     use super::*;
     use ffmpeg_sys_next::av_frame_alloc;
+    use ffmpeg_sys_next::AVPixelFormat::AV_PIX_FMT_RGB24;
 
     /// A minimal owned frame whose only meaningful field is `flags`.
     fn flag_frame(key: bool) -> Frame {
@@ -459,6 +466,141 @@ mod tests {
             pool.rx.try_recv().is_err(),
             "the undersized buffer must have been drained and dropped"
         );
+    }
+
+    /// A parked buffer far larger than the live frame (mid-stream resolution
+    /// drop) is freed, not kept: the pool must not pin one obsolete jumbo
+    /// allocation per slot for the rest of the run.
+    #[test]
+    fn oversized_parked_buffers_are_freed_on_shrink() {
+        let pool = BufferPool::new(2);
+        pool.recycler()
+            .try_send(Vec::with_capacity(1 << 20))
+            .unwrap();
+        let buf = pool.take(1024);
+        assert!(buf.capacity() >= 1024);
+        assert!(
+            buf.capacity() < (1 << 20),
+            "the jumbo buffer must have been dropped, not returned"
+        );
+        assert!(
+            pool.rx.try_recv().is_err(),
+            "the jumbo buffer must not remain parked either"
+        );
+    }
+
+    /// Modest geometry changes stay inside the 4x keep bound and reuse the
+    /// parked allocation.
+    #[test]
+    fn modestly_larger_parked_buffers_are_reused() {
+        let pool = BufferPool::new(2);
+        let big = Vec::with_capacity(8192);
+        let ptr = big.as_ptr();
+        pool.recycler().try_send(big).unwrap();
+        let buf = pool.take(4096); // 8192 <= 4 * 4096: within the keep bound
+        assert_eq!(buf.as_ptr(), ptr, "a within-bound buffer must be reused");
+    }
+
+    /// With the pool full, a dropping frame frees its buffer quietly instead
+    /// of blocking or panicking (the `try_send` overflow path).
+    #[test]
+    fn full_pool_drop_degrades_to_free() {
+        let pool = BufferPool::new(1);
+        pool.recycler().try_send(Vec::with_capacity(8)).unwrap();
+        let vf = VideoFrame::new(
+            1,
+            1,
+            PixelLayout::Rgb24,
+            None,
+            0,
+            vec![0u8; 3],
+            Some(pool.recycler()),
+        );
+        drop(vf);
+        let parked = pool.take(8);
+        assert!(parked.capacity() >= 8);
+        assert!(
+            pool.rx.try_recv().is_err(),
+            "the overflow buffer must have been freed, not parked"
+        );
+    }
+
+    /// Frames dropped on another thread still recycle — the channel is the
+    /// cross-thread return path (consumers routinely drop frames off the
+    /// packing thread).
+    #[test]
+    fn cross_thread_drop_recycles() {
+        let pool = BufferPool::new(2);
+        let mut buf = pool.take(12);
+        buf.extend_from_slice(&[9u8; 12]);
+        let ptr = buf.as_ptr() as usize;
+        let vf = VideoFrame::new(2, 2, PixelLayout::Rgb24, None, 0, buf, Some(pool.recycler()));
+        std::thread::spawn(move || drop(vf)).join().expect("drop thread");
+        let reused = pool.take(12);
+        assert_eq!(
+            reused.as_ptr() as usize,
+            ptr,
+            "a cross-thread drop must land back in the pool"
+        );
+    }
+
+    /// Backs a minimal packed-RGB24 AVFrame with caller-owned bytes. No
+    /// AVBuffer refs are attached, so dropping the frame never frees
+    /// `backing` — the test's Vec stays the owner.
+    unsafe fn synthetic_rgb24(backing: *mut u8, w: i32, h: i32, linesize: i32) -> Frame {
+        let p = av_frame_alloc();
+        assert!(!p.is_null());
+        (*p).format = AV_PIX_FMT_RGB24 as i32;
+        (*p).width = w;
+        (*p).height = h;
+        (*p).data[0] = backing;
+        (*p).linesize[0] = linesize;
+        Frame::wrap(p)
+    }
+
+    /// Padded positive stride: packing must copy exactly `row_bytes` per row
+    /// and skip the padding tail.
+    #[test]
+    fn pack_skips_positive_stride_padding() {
+        // 3x2 RGB24: 9 payload bytes per row, stride 12 (3 pad bytes 0xEE).
+        let mut backing = vec![0xEEu8; 24];
+        for row in 0..2usize {
+            for i in 0..9usize {
+                backing[row * 12 + i] = (row * 9 + i) as u8;
+            }
+        }
+        let pool = BufferPool::new(1);
+        // SAFETY: `backing` outlives the frame; geometry matches the buffer.
+        let (w, h, bytes) = unsafe {
+            let f = synthetic_rgb24(backing.as_mut_ptr(), 3, 2, 12);
+            pack_bytes(f.as_ptr(), PixelLayout::Rgb24, &pool).expect("pack")
+        };
+        assert_eq!((w, h), (3, 2));
+        let expected: Vec<u8> = (0u8..18).collect();
+        assert_eq!(bytes, expected, "payload rows only, no stride padding");
+    }
+
+    /// Negative linesize (bottom-up storage): `data[0]` points at the
+    /// display-top row, which sits at the END of the allocation; walking
+    /// `base + row * linesize` must still deliver rows in display order.
+    #[test]
+    fn pack_walks_negative_stride_top_down() {
+        // Memory layout: [display-bottom row][display-top row], stride 12.
+        let mut backing = vec![0xEEu8; 24];
+        for i in 0..9usize {
+            backing[i] = 100 + i as u8; // display bottom
+            backing[12 + i] = i as u8; // display top
+        }
+        let pool = BufferPool::new(1);
+        // SAFETY: base points at the top row (last stride slot); row 1 walks
+        // back to offset 0, still inside `backing`.
+        let (_, _, bytes) = unsafe {
+            let f = synthetic_rgb24(backing.as_mut_ptr().add(12), 3, 2, -12);
+            pack_bytes(f.as_ptr(), PixelLayout::Rgb24, &pool).expect("pack")
+        };
+        let mut expected: Vec<u8> = (0u8..9).collect();
+        expected.extend(100u8..109);
+        assert_eq!(bytes, expected, "display order: top row then bottom row");
     }
 
     /// The KEY-flag check is what keeps `KeyframesOnly` correct even when a
