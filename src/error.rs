@@ -258,6 +258,7 @@ impl PartialEq for Error {
             | (FrameFilterDstFinished, FrameFilterDstFinished)
             | (FrameFilterFrameDuplicateFailed, FrameFilterFrameDuplicateFailed)
             | (FrameFilterThreadExited, FrameFilterThreadExited)
+            | (FrameSourceThreadExited, FrameSourceThreadExited)
             | (EOF, EOF)
             | (Exit, Exit)
             | (Bug, Bug) => true,
@@ -1437,6 +1438,17 @@ pub enum PacketScannerError {
 
 #[cfg(test)]
 mod tests {
+    // Regression: FrameSourceThreadExited is payload-less, but the manual
+    // PartialEq whitelist omitted it, so the variant compared unequal to
+    // itself — breaking the impl's documented "structural equality for
+    // payload-less variants" contract.
+    #[test]
+    fn frame_source_thread_exited_equals_itself() {
+        use super::Error;
+        assert_eq!(Error::FrameSourceThreadExited, Error::FrameSourceThreadExited);
+        assert_ne!(Error::FrameSourceThreadExited, Error::NotStarted);
+    }
+
     // Regression: FilterGraphParseError declares PermissionDenied and NotSocket,
     // but its From<i32> once omitted them, so an EACCES/ENOTSOCK filtergraph
     // error degraded to UnknownError and the two declared variants were
