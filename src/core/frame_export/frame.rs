@@ -58,8 +58,9 @@ impl VideoFrame {
         self.layout
     }
 
-    /// Post-filter presentation time in microseconds, normalized to the stream
-    /// start. Vsync passthrough preserves the source timing one-to-one; `None`
+    /// Post-filter presentation time in microseconds, normalized to the start
+    /// of the extraction window (the stream start when no `start_time_us` was
+    /// set). Vsync passthrough preserves the source timing one-to-one; `None`
     /// when the frame carried no usable timestamp.
     pub fn pts_us(&self) -> Option<i64> {
         self.pts_us

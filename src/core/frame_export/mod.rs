@@ -45,10 +45,12 @@
 //! # Audio (PCM) export
 //!
 //! [`SampleExtractor`] is the audio sibling: it decodes one input's audio into
-//! owned, interleaved `f32` PCM — the shape whisper-rs / candle / ort consume.
-//! Defaults preserve the source rate and layout; [`SampleExtractor::sample_rate`]
-//! and [`SampleExtractor::channels`] opt into resample / downmix, and
-//! [`SampleExtractor::for_whisper`] presets 16 kHz mono.
+//! owned, interleaved `f32` PCM — the buffer layout whisper-rs / candle / ort
+//! consume. Defaults preserve the source rate and channel layout (models that
+//! expect a fixed shape need explicit normalization):
+//! [`SampleExtractor::sample_rate`] and [`SampleExtractor::channels`] opt into
+//! resample / channel conversion, and [`SampleExtractor::for_whisper`] presets
+//! the 16 kHz mono that speech models expect.
 //!
 //! ```no_run
 //! use ez_ffmpeg::frame_export::SampleExtractor;

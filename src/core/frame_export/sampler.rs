@@ -1,11 +1,13 @@
 //! Input-side exact-N sampler for [`Sampling::UniformN`](super::options::Sampling::UniformN).
 //!
-//! Placed on the input frame pipeline (pre-filtergraph, S2): only the selected
-//! frames reach `scale`, so a `UniformN(16)` over a long clip does 16 scales,
-//! not thousands. It never physically re-emits tail duplicates (which the EOS
-//! drain caps at 1024/filter): instead it stamps a *count* into one held frame's
-//! metadata (`EZ_FFMPEG_EMIT_COUNT`) and the output sink clones the packed bytes
-//! that many times — O(1) frames regardless of the count.
+//! Placed on the input frame pipeline (pre-filtergraph, S2): frames that lose
+//! the grid race are dropped before `scale`. The post-grid tail (~`1/(2n)` of
+//! the span) still passes through — and is scaled — because dropping it would
+//! starve the encoder-side termination path (see the passthrough branch
+//! below). It never physically re-emits tail duplicates (which the EOS drain
+//! caps at 1024/filter): instead it stamps a *count* into one held frame's
+//! metadata (`EZ_FFMPEG_EMIT_COUNT`) and the output sink clones the packed
+//! bytes that many times — O(1) frames regardless of the count.
 //!
 //! Grid (C1, corrected): anchor at the first delivered frame AT/AFTER the trim
 //! boundary, `p0`; targets `t_i = p0 + (i + 0.5) * span / n` for `i in 0..n`;

@@ -21,11 +21,18 @@ pub enum Sampling {
     /// `skip_frame=nokey` for a decode-time fast path, plus a key-flag check as a
     /// belt for codecs that ignore the hint.
     KeyframesOnly,
-    /// Exactly `n` frames, sampled uniformly by presentation time over the
-    /// (trimmed) duration — the standard VLM/CLIP primitive. Frames are chosen
-    /// pre-filtergraph (only the `n` selected frames are scaled). Short inputs
-    /// pad by repeating the nearest displayed frame; each repeat keeps that
-    /// frame's `pts_us`. Requires a resolvable duration (see `duration_hint_us`).
+    /// Exactly `n` frames (fewer only when a lower `max_frames` cap wins),
+    /// sampled uniformly by presentation time over the (trimmed) duration —
+    /// the standard VLM/CLIP primitive. Short inputs pad by repeating the
+    /// nearest displayed frame; each repeat keeps that frame's `pts_us`.
+    /// Requires a resolvable duration (see `duration_hint_us`).
+    ///
+    /// Cost model: the strategy is a single sequential decode of the (trimmed)
+    /// input — there is no seek-per-target fast path. Frames that lose the
+    /// grid race are dropped pre-filtergraph and pay no scaling, but once the
+    /// grid completes the remaining tail (~`1/(2n)` of the span) passes
+    /// through the graph — and is scaled — solely to keep the encoder-side
+    /// termination path fed.
     UniformN(u32),
 }
 

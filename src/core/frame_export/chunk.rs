@@ -3,9 +3,12 @@
 /// One exported block of decoded audio: owned, interleaved 32-bit float samples
 /// plus metadata.
 ///
-/// Samples are packed native-endian `f32` in the exact layout every whisper /
-/// candle / ort pipeline expects: [`as_slice`](AudioChunk::as_slice)`.len() ==
-/// frames * channels`, channels interleaved (`[L0, R0, L1, R1, …]` for stereo).
+/// Samples are packed native-endian `f32`, interleaved:
+/// [`as_slice`](AudioChunk::as_slice)`.len() == frames * channels`, channels
+/// interleaved (`[L0, R0, L1, R1, …]` for stereo) — the buffer layout
+/// whisper / candle / ort pipelines consume, at whatever sample rate and
+/// channel count this chunk reports (normalize via the extractor's
+/// `sample_rate`/`channels` options when a model needs a fixed shape).
 /// One chunk corresponds to one filtered `AVFrame`; the number of frames per
 /// chunk is not contractual (typically ~1024) and must not be relied upon.
 pub struct AudioChunk {
@@ -44,8 +47,10 @@ impl AudioChunk {
         }
     }
 
-    /// Presentation time in microseconds from the stream start, passed through
-    /// from the source frame. `None` when the frame carried no usable timestamp.
+    /// Presentation time in microseconds, passed through from the source
+    /// frame and normalized to the start of the extraction window (the stream
+    /// start when no `start_time_us` was set). `None` when the frame carried
+    /// no usable timestamp.
     pub fn pts_us(&self) -> Option<i64> {
         self.pts_us
     }
