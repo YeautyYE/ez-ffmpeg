@@ -211,6 +211,14 @@ impl SampleExtractor {
         if self.sample_rate == Some(0) {
             return Err(invalid("sample_rate must be > 0"));
         }
+        // Mirrors FrameExtractor: atrim treats duration=0 as "no limit", so a
+        // non-positive window must be rejected here or a live input runs
+        // unbounded instead of erroring.
+        if let Some(d) = self.duration_us {
+            if d <= 0 {
+                return Err(invalid("duration_us must be > 0"));
+            }
+        }
         Ok(())
     }
 }
@@ -238,6 +246,21 @@ mod tests {
     fn zero_sample_rate_is_rejected() {
         assert!(SampleExtractor::new("x.mp4")
             .sample_rate(0)
+            .validate()
+            .is_err());
+    }
+
+    // Regression: duration_us(0) used to pass validation and reach atrim as
+    // duration=0, which FFmpeg reads as "no limit" — the opposite of the
+    // documented meaning, and an unbounded run on live inputs.
+    #[test]
+    fn non_positive_duration_is_rejected() {
+        assert!(SampleExtractor::new("x.mp4")
+            .duration_us(0)
+            .validate()
+            .is_err());
+        assert!(SampleExtractor::new("x.mp4")
+            .duration_us(-1)
             .validate()
             .is_err());
     }
