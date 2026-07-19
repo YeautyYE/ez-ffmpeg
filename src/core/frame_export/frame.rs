@@ -15,11 +15,18 @@ pub struct VideoFrame {
     pts_us: Option<i64>,
     index: u64,
     data: Vec<u8>,
+    /// Drop-time return path to the producing run's buffer pool. `None` once
+    /// [`into_vec`](VideoFrame::into_vec) detaches the buffer (or when the
+    /// frame was built without a pool). Purely an allocation-recycling
+    /// channel: it never blocks and never affects the data contract.
+    recycle: Option<crossbeam_channel::Sender<Vec<u8>>>,
 }
 
 impl VideoFrame {
     /// Builds a frame from an already-packed, tight buffer. Crate-internal: the
     /// sink guarantees `data.len() == width * height * layout.bytes_per_pixel()`.
+    /// `recycle` is the sink pool's return path for the buffer (dropped frames
+    /// hand their allocation back for the next frame to reuse).
     pub(crate) fn new(
         width: u32,
         height: u32,
@@ -27,6 +34,7 @@ impl VideoFrame {
         pts_us: Option<i64>,
         index: u64,
         data: Vec<u8>,
+        recycle: Option<crossbeam_channel::Sender<Vec<u8>>>,
     ) -> Self {
         debug_assert_eq!(
             data.len(),
@@ -40,6 +48,7 @@ impl VideoFrame {
             pts_us,
             index,
             data,
+            recycle,
         }
     }
 
@@ -78,13 +87,27 @@ impl VideoFrame {
     }
 
     /// Consumes the frame and returns the owned packed buffer (no copy).
-    pub fn into_vec(self) -> Vec<u8> {
-        self.data
+    pub fn into_vec(mut self) -> Vec<u8> {
+        // Detach from the buffer pool first: `Drop` still runs for `self`, and
+        // with `recycle` cleared it has nothing to send — the caller owns the
+        // allocation outright and the pool simply allocates fresh next time.
+        self.recycle = None;
+        std::mem::take(&mut self.data)
     }
 
     /// Bytes per row: `width * layout.bytes_per_pixel()`.
     pub fn row_bytes(&self) -> usize {
         self.width as usize * self.layout.bytes_per_pixel()
+    }
+}
+
+impl Drop for VideoFrame {
+    fn drop(&mut self) {
+        if let Some(recycle) = self.recycle.take() {
+            // Non-blocking by design: a full pool or a finished run (receiver
+            // gone) just means the buffer is freed here instead of reused.
+            let _ = recycle.try_send(std::mem::take(&mut self.data));
+        }
     }
 }
 
