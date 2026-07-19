@@ -1,6 +1,6 @@
 # ez-ffmpeg Example: Thumbnail Extraction
 
-This example demonstrates how to extract thumbnail images from a video using `ez-ffmpeg`. Two examples are provided: one for generating a single thumbnail and another for generating multiple thumbnails.
+This example demonstrates how to extract thumbnail images from a video using `ez-ffmpeg`. Three examples are provided: generating a single thumbnail, generating multiple thumbnails, and a keyframe-only fast path for scrub previews.
 
 ## Examples
 
@@ -19,12 +19,22 @@ This example demonstrates how to extract thumbnail images from a video using `ez
 - **Input Video:** `test.mp4`
 - **Thumbnail Extraction:**
   - The same `scale` filter is applied to resize the video.
-- **Output:** Multiple frames are extracted and saved using a `%03d` pattern in the filename (e.g., `output_001.jpg`, `output_002.jpg`, etc.).
+- **Output:** The first five decoded frames (consecutive, from the start of the video) are saved using a `%03d` pattern in the filename (e.g., `output_001.jpg`, `output_002.jpg`, etc.). To space the images out in time instead, add a sampling filter such as `fps=1` to the filter description.
 - **FFmpeg Option:**
   - `set_max_video_frames(5)`: Limits the output to 5 video frames, generating multiple thumbnails.
+
+### Example 3: Fastest Single Thumbnail (Keyframes Only)
+
+- **Input Video:** `output_keyframe_source.mp4` — generated first by the example itself (a 12-second clip with a keyframe every second), because the bundled `test.mp4` holds a single keyframe at `t=0`.
+- **Thumbnail Extraction:**
+  - `set_start_time_us(5_300_000)` seeks the container close to the requested time.
+  - The decoder option `skip_frame=nokey` decodes keyframes only, skipping the keyframe-to-target pre-roll that the default seek path decodes frame by frame.
+- **Output:** `output_keyframe.jpg` — the first keyframe at or after the requested time (here the 6.0 s keyframe for a 5.3 s request; the captured frame snaps forward by up to one GOP).
+- **Trade-off:** fastest path for scrub previews and batch grids; use Examples 1/2 when the exact requested frame matters.
 
 ## When to Use
 
 - **Single Thumbnail Extraction:** Use this method when you need one preview image from the video.
-- **Multiple Thumbnails Extraction:** Use this method when you want several preview images at different intervals in the video.
+- **Multiple Thumbnails Extraction:** Use this method when you want several preview images from the video.
+- **Keyframe-Only Extraction:** Use this method when speed matters more than frame-exact placement (scrub previews, batch thumbnail grids).
 

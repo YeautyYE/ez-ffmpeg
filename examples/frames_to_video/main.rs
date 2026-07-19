@@ -23,8 +23,10 @@ const FPS: i32 = 30;
 const SECONDS: i32 = 8;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Choose the encoder explicitly. A bare "plasma.mp4" would fall back to
-    // mpeg4 at a low default bitrate; naming it lets us also set the quality.
+    // Choose the encoder explicitly. With a bare "plasma.mp4" the linked
+    // FFmpeg build picks the container default (H.264 when libx264 is
+    // compiled in, otherwise mpeg4); naming one keeps the example
+    // build-independent and lets us also set the quality.
     let output = Output::from("plasma.mp4")
         .set_video_codec("mpeg4")
         .set_video_qscale(5);

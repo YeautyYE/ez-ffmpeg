@@ -7,7 +7,8 @@ use std::io::{BufWriter, Write};
 ///
 /// UniformN is the fixed-budget sampler VLM/CLIP-style pipelines want: ask for
 /// 12 frames and get exactly 12, spread uniformly over the (trimmed) duration.
-/// Selection happens pre-filtergraph, so only the chosen frames are scaled.
+/// Selection happens pre-filtergraph: frames that lose the grid race skip the
+/// scaler (the post-grid tail still traverses the graph to drive termination).
 /// Part 1 pulls 12 thumbnails from a 10-second clip into a 4x3 contact sheet.
 /// Part 2 trims the same clip to 0.2 s and still asks for 8: when the window
 /// holds fewer distinct frames than requested, nearby frames repeat (each

@@ -3,7 +3,7 @@
 ## Functionality
 
 Renders a procedural "plasma" animation in Rust and pushes each RGBA frame
-straight into an encoded MP4 with [`VideoWriter`], without any intermediate
+straight into an encoded MP4 with `VideoWriter`, without any intermediate
 files or an `ffmpeg` subprocess.
 
 ## Equivalent FFmpeg Command
