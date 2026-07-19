@@ -259,11 +259,17 @@ unsafe fn build_nodes(seg: *mut AVFilterGraphSegment) -> Result<Vec<Vec<NodeStat
             let real_out = (*f).nb_outputs as usize;
 
             // A denied dynamic direction never ran init, so its real pad
-            // count is unknowable here: assume the parsed labels, with the
-            // one-pad minimum every such filter guarantees (movie's stream
-            // list refines the output count). Everything else is exact —
-            // static pads exist from creation, dynamic ones from
-            // init_topology_filters.
+            // count is unknowable here: assume the parsed labels, with a
+            // one-pad minimum (movie's stream list refines the output count).
+            // The minimum is a deliberate bet on effect posture: ladspa/lv2
+            // effect plugins and libplacebo really do create a first pad, and
+            // an unlabeled chain-head effect needs it to bind an input stream
+            // (matching the pre-probe build()-time init behavior). Source-mode
+            // ladspa/lv2 generator plugins create ZERO input pads, so for them
+            // the assumed pad is a fabrication — the runtime parse then leaves
+            // that slot's buffersrc null, which fg_send_frame rejects with a
+            // typed error. Everything else is exact — static pads exist from
+            // creation, dynamic ones from init_topology_filters.
             let (eff_in, exact_in) = if flags & AVFILTER_FLAG_DYNAMIC_INPUTS != 0 && denied {
                 (in_labels.len().max(1), false)
             } else {
@@ -592,7 +598,7 @@ mod tests {
     use super::*;
     use crate::core::scheduler::filter_task::graph_opts_apply;
     use ffmpeg_sys_next::{
-        avfilter_graph_segment_create_filters, avfilter_graph_segment_free,
+        avfilter_get_by_name, avfilter_graph_segment_create_filters, avfilter_graph_segment_free,
         avfilter_graph_segment_init, avfilter_graph_segment_link, avfilter_graph_segment_parse,
         AVFilterInOut,
     };
@@ -864,6 +870,33 @@ mod tests {
             assert_eq!(
                 sigs(&topo.outputs),
                 vec![("m".into(), AVMEDIA_TYPE_AUDIO, "amovie".into())]
+            );
+        }
+    }
+
+    // Pins the deliberate effect-posture bet for denied dynamic-input
+    // filters: an unlabeled chain-head lv2 probes to exactly ONE assumed
+    // input pad, so effect plugins keep binding an input stream the way the
+    // old build()-time init did. For source-mode (generator) plugins that
+    // pad is a fabrication with no runtime buffersrc behind it — that
+    // mismatch is caught by fg_send_frame's null-filter guard as a typed
+    // error. Changing the assumption here must be a conscious decision.
+    #[test]
+    fn lv2_chain_head_assumes_exactly_one_input_pad() {
+        crate::core::initialize_ffmpeg();
+        unsafe {
+            let name = CString::new("lv2").unwrap();
+            if avfilter_get_by_name(name.as_ptr()).is_null() {
+                return; // this FFmpeg build has no lv2 filter (optional lilv dependency)
+            }
+            let topo = probe_pads("lv2=plugin=x[out]")
+                .expect("probe must not load the (bogus) LV2 plugin");
+            assert_eq!(topo.inputs.len(), 1, "one assumed input pad, no more");
+            assert_eq!(topo.inputs[0].name, "lv2");
+            assert_eq!(topo.inputs[0].media_type, AVMEDIA_TYPE_AUDIO);
+            assert_eq!(
+                sigs(&topo.outputs),
+                vec![("out".into(), AVMEDIA_TYPE_AUDIO, "lv2".into())]
             );
         }
     }
