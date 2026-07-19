@@ -408,6 +408,13 @@ pub struct Output {
     /// Only effective when re-encoding (not when using stream copy).
     pub(crate) pix_fmt: Option<String>,
 
+    /// Per-output simple **video** filter chain (FFmpeg `-vf`), applied to
+    /// this output's re-encoded video stream through the implicit per-output
+    /// filtergraph (it replaces the default `null` chain). Must be a linear
+    /// chain: exactly one video input pad and one video output pad. `None` ⇒
+    /// the passthrough `null` chain. Set via [`Output::set_video_filter`].
+    pub(crate) video_filter: Option<String>,
+
     /// sws (libswscale) options for the `scale` filters libavfilter
     /// auto-inserts ahead of this output's encoder. Maps to the graph-level
     /// `AVFilterGraph.scale_sws_opts`. Default `None`. Set via
@@ -1481,6 +1488,69 @@ impl Output {
         self
     }
 
+    /// Sets a simple **video** filter chain for this output, equivalent to
+    /// FFmpeg `-vf` (`-filter:v`).
+    ///
+    /// The chain is applied to this output's **re-encoded** video stream: every
+    /// simple (non-`filter_complex`) video encode already runs through an
+    /// implicit per-output filtergraph whose description defaults to the
+    /// passthrough `null` chain, and this method replaces that `null` with the
+    /// given description. The filter text is passed to FFmpeg verbatim — the
+    /// same string the CLI accepts after `-vf` works here unchanged, e.g.
+    /// `"scale=1280:-2"` or `"fps=30,scale=640:360"`.
+    ///
+    /// Unlike [`FfmpegContextBuilder::filter_desc`], which creates one
+    /// context-level graph shared by all outputs, this filter belongs to this
+    /// `Output` alone: with several outputs, each can carry its own chain (or
+    /// none), matching how the CLI scopes `-vf` to the output file it precedes.
+    ///
+    /// # Contract
+    /// - **Linear chain only**: the description must have exactly one video
+    ///   input pad and one video output pad. Splitting/merging descriptions
+    ///   (e.g. `split`) fail the build with
+    ///   [`OpenOutputError::SimpleFilterInvalidShape`]; non-video chains (e.g.
+    ///   `anull`) fail with [`OpenOutputError::SimpleFilterMediaTypeMismatch`].
+    ///   Use [`FfmpegContextBuilder::filter_desc`] for complex graphs.
+    /// - **Re-encode only**: combining this with `set_video_codec("copy")` or
+    ///   a copy stream map covering a video stream fails the build with
+    ///   [`OpenOutputError::FilterWithStreamCopy`], matching the CLI's
+    ///   "Filtering and streamcopy cannot be used together".
+    /// - **Simple xor complex**: if this output's video is fed by a
+    ///   context-level filtergraph output, the build fails with
+    ///   [`OpenOutputError::SimpleAndComplexFilter`], matching the CLI's rule
+    ///   for `-vf` + `-filter_complex` on the same stream.
+    /// - **Audio is untouched**: only the video stream runs through this
+    ///   chain. There is no per-output audio (`-af`) equivalent yet.
+    ///
+    /// An **empty string clears** a previously set chain (restores the
+    /// implicit `null`). The description itself is validated when the context
+    /// is built; an invalid filter name surfaces as a
+    /// [`FilterGraphParseError`](crate::error::FilterGraphParseError) from
+    /// `build()`, not from this setter.
+    ///
+    /// **Equivalent FFmpeg command:**
+    /// ```sh
+    /// ffmpeg -i input.mp4 -vf scale=1280:-2 -c:a copy resized.mp4
+    /// ```
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// let output = Output::from("resized.mp4")
+    ///     .set_video_filter("scale=1280:-2") // -vf scale=1280:-2
+    ///     .set_audio_codec("copy");          // -c:a copy
+    /// ```
+    ///
+    /// [`FfmpegContextBuilder::filter_desc`]: crate::core::context::ffmpeg_context_builder::FfmpegContextBuilder::filter_desc
+    /// [`OpenOutputError::SimpleFilterInvalidShape`]: crate::error::OpenOutputError::SimpleFilterInvalidShape
+    /// [`OpenOutputError::SimpleFilterMediaTypeMismatch`]: crate::error::OpenOutputError::SimpleFilterMediaTypeMismatch
+    /// [`OpenOutputError::FilterWithStreamCopy`]: crate::error::OpenOutputError::FilterWithStreamCopy
+    /// [`OpenOutputError::SimpleAndComplexFilter`]: crate::error::OpenOutputError::SimpleAndComplexFilter
+    pub fn set_video_filter(mut self, filter_chain: impl Into<String>) -> Self {
+        let chain = filter_chain.into();
+        self.video_filter = if chain.is_empty() { None } else { Some(chain) };
+        self
+    }
+
     /// Sets sws (libswscale) options for the `scale` filters libavfilter
     /// **auto-inserts** to convert this output's frames to a format/size the
     /// encoder accepts (pixel format, resolution, color).
@@ -1591,6 +1661,7 @@ impl From<Box<dyn FnMut(&[u8]) -> i32 + Send>> for Output {
             subtitle_disable: false,
             data_disable: false,
             pix_fmt: None,
+            video_filter: None,
             sws_opts: None,
             swr_opts: None,
             attachments: Vec::new(),
@@ -1653,6 +1724,7 @@ impl From<String> for Output {
             subtitle_disable: false,
             data_disable: false,
             pix_fmt: None,
+            video_filter: None,
             sws_opts: None,
             swr_opts: None,
             attachments: Vec::new(),
@@ -1803,6 +1875,26 @@ mod tests {
             .set_muxing_queue_data_threshold(0);
         assert_eq!(output.max_muxing_queue_size, 0);
         assert_eq!(output.muxing_queue_data_threshold, 0);
+    }
+
+    #[test]
+    fn set_video_filter_stores_chain() {
+        let output = Output::from("out.mp4").set_video_filter("scale=1280:-2");
+        assert_eq!(output.video_filter.as_deref(), Some("scale=1280:-2"));
+    }
+
+    #[test]
+    fn set_video_filter_empty_clears() {
+        let output = Output::from("out.mp4")
+            .set_video_filter("scale=1280:-2")
+            .set_video_filter("");
+        assert_eq!(output.video_filter, None);
+    }
+
+    #[test]
+    fn video_filter_defaults_to_none() {
+        assert_eq!(Output::from("out.mp4").video_filter, None);
+        assert_eq!(Output::new_by_write_callback(|_| 0).video_filter, None);
     }
 
     #[test]
