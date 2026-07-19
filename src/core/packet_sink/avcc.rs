@@ -1,8 +1,9 @@
 //! H.264 Annex-B / AVCC normalization for the strict packet-sink tier.
 //!
-//! The mp4 muxer performs this conversion at its write site (`ff_nal_parse_units`
-//! + `ff_isom_write_avcc` in libavformat); a packet sink bypasses the muxer, so
-//! the same responsibility lives here. Two invariants matter:
+//! The mp4 muxer performs this conversion at its write site
+//! (`ff_nal_parse_units` and `ff_isom_write_avcc` in libavformat); a packet
+//! sink bypasses the muxer, so the same responsibility lives here. Two
+//! invariants matter:
 //!
 //! * NAL boundary detection follows FFmpeg's convention exactly (a NAL ends at
 //!   the next `00 00 01` triple; both 3- and 4-byte start codes are accepted),
