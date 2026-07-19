@@ -101,6 +101,9 @@ pub(crate) fn mux_init(
     // still owned (it reads each stream's media type); `None` unless the gate
     // fires.
     let sq_mux_plan = mux.sq_mux_plan();
+    // Packet-sink callbacks ride the same handoff as the context; `None` for
+    // every container-writing output.
+    let packet_sink = mux.take_packet_sink();
     // Take sole ownership of the output context out of the Muxer; move it by
     // value through the handoff. The move is the ownership transfer — no
     // null-the-source dance.
@@ -139,6 +142,7 @@ pub(crate) fn mux_init(
         mux.stream_count(),
         mux.format_opts.clone(),
         mux.bsf_chains.clone(),
+        packet_sink,
         mux.mux_start_gate(),
         mux.interrupt_state.clone(),
         packet_pool,
@@ -176,6 +180,7 @@ pub(crate) fn ready_to_init_mux(
         // context under live encoders. Computed while the output context is
         // still owned (reads stream types).
         let sq_mux_plan = mux.sq_mux_plan();
+        let packet_sink = mux.take_packet_sink();
         let out_fmt_ctx = mux
             .out_fmt_ctx
             .take()
@@ -301,6 +306,7 @@ pub(crate) fn ready_to_init_mux(
                         stream_count,
                         format_opts,
                         bsf_chains,
+                        packet_sink,
                         mux_start_gate,
                         interrupt_state,
                         packet_pool,
@@ -373,6 +379,7 @@ fn mux_task_start(
     stream_count: usize,
     format_opts: Option<HashMap<CString, CString>>,
     bsf_chains: StreamBsfChains,
+    packet_sink: Option<crate::core::packet_sink::PacketSink>,
     mux_start_gate: Arc<crate::core::context::MuxStartGate>,
     interrupt_state: Arc<crate::core::context::InterruptState>,
     packet_pool: ObjPool<Packet>,
@@ -384,6 +391,21 @@ fn mux_task_start(
     mux_done: MuxDoneGuard,
 ) -> crate::error::Result<()> {
     let Some(queue_sender) = queue_sender else {
+        // A packet sink with zero streams has nothing to deliver and no
+        // file to create: fail typed (before the callbacks could ever fire)
+        // instead of running the streamless open below against a context
+        // that has no URL.
+        if packet_sink.is_some() {
+            let error = crate::error::Error::PacketSink(crate::error::PacketSinkError::NoStreams);
+            fail_mux_init(
+                &scheduler_status,
+                &scheduler_result,
+                guard,
+                slot_guard,
+                crate::error::Error::PacketSink(crate::error::PacketSinkError::NoStreams),
+            );
+            return Err(error);
+        }
         // Zero-stream output (e.g. an AVFMT_NOSTREAMS muxer like ffmetadata): no mux
         // worker thread is spawned, so this branch — not `_mux_init` — is the only
         // place a file-backed streamless output gets opened. Open it here (deferred
@@ -435,6 +457,7 @@ fn mux_task_start(
         stream_count,
         format_opts,
         bsf_chains,
+        packet_sink,
         interrupt_state,
         packet_pool,
         input_controller,
@@ -506,6 +529,7 @@ fn _mux_init(
     stream_count: usize,
     format_opts: Option<HashMap<CString, CString>>,
     bsf_chains: StreamBsfChains,
+    packet_sink: Option<crate::core::packet_sink::PacketSink>,
     interrupt_state: Arc<crate::core::context::InterruptState>,
     packet_pool: ObjPool<Packet>,
     input_controller: Arc<InputController>,
@@ -590,48 +614,87 @@ fn _mux_init(
             }
         };
 
-    // Open the url-backed output file now (deferred from build() so build() neither
-    // creates nor truncates it; see open_output_file). Custom-IO and AVFMT_NOFILE
-    // outputs are no-ops. On failure, publish and tear down exactly like the
-    // write_header error path below (encoders parked on the pre-mux queues are joined
-    // before the context is freed). The error type is the same OpenOutput the build
-    // path used to return, only surfaced at run time now.
-    if let Err(open_ret) = unsafe { open_muxer_output(out_fmt_ctx_ptr) } {
-        error!("Error opening output: {}", av_err2str(open_ret));
-        fail_mux_init(
-            &scheduler_status,
-            &scheduler_result,
-            guard,
-            slot_guard,
-            crate::error::Error::OpenOutput(OpenOutputError::from(open_ret)),
-        );
-        return Err(crate::error::Error::OpenOutput(OpenOutputError::from(
-            open_ret,
-        )));
-    }
+    // Packet sink: nothing to open and no header to write. This is the S1
+    // collection point — every encoder finalized its codecpar (all streams
+    // ready), no packet was delivered — so collect and validate the
+    // strict-tier stream configuration here, in the slot the header write
+    // occupies for container outputs. A configuration failure (missing
+    // extradata, malformed avcC, unsupported stream) tears down exactly like
+    // a failed header write, before any sink callback has run. The
+    // `on_stream_info` INVOCATION is deferred to the worker prologue: S9
+    // promises every callback on the same thread, and this function runs on
+    // the ready-waiter thread.
+    let sink_worker = match packet_sink {
+        None => None,
+        Some(sink) => {
+            match unsafe {
+                crate::core::packet_sink::strict::PacketSinkWorker::collect(
+                    out_fmt_ctx_ptr,
+                    stream_count,
+                    sink,
+                )
+            } {
+                Ok(worker) => Some(worker),
+                Err(e) => {
+                    error!("Packet sink configuration invalid: {e}");
+                    fail_mux_init(
+                        &scheduler_status,
+                        &scheduler_result,
+                        guard,
+                        slot_guard,
+                        crate::error::Error::PacketSink(e.clone()),
+                    );
+                    return Err(crate::error::Error::PacketSink(e));
+                }
+            }
+        }
+    };
 
-    let ret = unsafe { avformat_write_header(out_fmt_ctx_ptr, opts.as_double_ptr()) };
-    if ret < 0 {
-        error!(
-            "Could not write header (incorrect codec parameters ?): {}",
-            av_err2str(ret)
-        );
-        fail_mux_init(
-            &scheduler_status,
-            &scheduler_result,
-            guard,
-            slot_guard,
-            Muxing(MuxingOperationError::WriteHeader(WriteHeaderError::from(
-                ret,
-            ))),
-        );
-        return Err(Muxing(MuxingOperationError::WriteHeader(
-            WriteHeaderError::from(ret),
-        )));
-    }
+    if sink_worker.is_none() {
+        // Open the url-backed output file now (deferred from build() so build()
+        // neither creates nor truncates it; see open_output_file). Custom-IO and
+        // AVFMT_NOFILE outputs are no-ops. On failure, publish and tear down
+        // exactly like the write_header error path below (encoders parked on the
+        // pre-mux queues are joined before the context is freed). The error type
+        // is the same OpenOutput the build path used to return, only surfaced at
+        // run time now.
+        if let Err(open_ret) = unsafe { open_muxer_output(out_fmt_ctx_ptr) } {
+            error!("Error opening output: {}", av_err2str(open_ret));
+            fail_mux_init(
+                &scheduler_status,
+                &scheduler_result,
+                guard,
+                slot_guard,
+                crate::error::Error::OpenOutput(OpenOutputError::from(open_ret)),
+            );
+            return Err(crate::error::Error::OpenOutput(OpenOutputError::from(
+                open_ret,
+            )));
+        }
 
-    for key in opts.leftover_keys() {
-        warn!("Option '{key}' was not recognized by output {mux_idx}");
+        let ret = unsafe { avformat_write_header(out_fmt_ctx_ptr, opts.as_double_ptr()) };
+        if ret < 0 {
+            error!(
+                "Could not write header (incorrect codec parameters ?): {}",
+                av_err2str(ret)
+            );
+            fail_mux_init(
+                &scheduler_status,
+                &scheduler_result,
+                guard,
+                slot_guard,
+                Muxing(MuxingOperationError::WriteHeader(WriteHeaderError::from(
+                    ret,
+                ))),
+            );
+            return Err(Muxing(MuxingOperationError::WriteHeader(
+                WriteHeaderError::from(ret),
+            )));
+        }
+
+        for key in opts.leftover_keys() {
+            warn!("Option '{key}' was not recognized by output {mux_idx}");
+        }
     }
 
     let oformat_flags = unsafe {
@@ -639,10 +702,16 @@ fn _mux_init(
         (*oformat).flags
     };
 
-    let format_name = unsafe {
-        CStr::from_ptr((*(*out_fmt_ctx_ptr).oformat).name)
-            .to_str()
-            .unwrap_or("unknown")
+    let format_name = if sink_worker.is_some() {
+        // The dummy parameter context says "mp4"; name the worker after what
+        // it actually does.
+        "packet_sink"
+    } else {
+        unsafe {
+            CStr::from_ptr((*(*out_fmt_ctx_ptr).oformat).name)
+                .to_str()
+                .unwrap_or("unknown")
+        }
     };
 
     // Handles for the spawn-failure branch below: the originals move into the
@@ -763,6 +832,20 @@ fn _mux_init(
 
         let mut nb_done = 0;
 
+        let mut ret = 0;
+
+        // Packet-sink worker state, moved into this closure with the guards.
+        // S1/S9: `on_stream_info` fires HERE — on the same worker thread as
+        // every later `on_packet`/`on_end`/`on_error`, after all encoders
+        // finalized their parameters (collection already ran at the header
+        // slot), before any packet is received. A negative return skips the
+        // receive loops entirely (the `ret < 0` guards below) and the job
+        // fails with the typed error at the post-loop mapping.
+        let mut sink_worker = sink_worker;
+        if let Some(sink) = sink_worker.as_mut() {
+            ret = sink.deliver_stream_info();
+        }
+
         // Bundle the stable muxer config and the mutable per-stream state threaded
         // through the sync-queue mux path. `cfg` holds SHARED refs, so the loop
         // below still uses `packet_pool` / `scheduler_status` / `mux_stream_nodes`
@@ -785,9 +868,8 @@ fn _mux_init(
             st_last_dts: &mut st_last_dts,
             stream_eof: &mut stream_eof,
             nb_done: &mut nb_done,
+            sink: sink_worker.as_mut(),
         };
-
-        let mut ret = 0;
 
         if let Some(mut sq) = sq_mux {
             // Reused scratch: released packets to write, and cascade-finished
@@ -980,6 +1062,13 @@ fn _mux_init(
         } else {
 
         loop {
+            // Only a packet sink can enter with ret < 0 (a rejected
+            // on_stream_info); container paths always break at the failing
+            // write itself. Nothing may be received — let alone delivered —
+            // after the failure.
+            if ret < 0 {
+                break;
+            }
             let result = pkt_receiver.recv_timeout(Duration::from_millis(100));
 
             if is_stopping(wait_until_not_paused(&scheduler_status)) {
@@ -1210,13 +1299,19 @@ fn _mux_init(
         }
 
         if ret < 0 && ret != AVERROR_EOF {
-            set_scheduler_error(
-                &scheduler_status,
-                &scheduler_result,
-                Muxing(MuxingOperationError::InterleavedWriteError(
-                    MuxingError::from(ret),
-                )),
-            );
+            // A packet-sink failure surfaces its stashed typed error (the
+            // sentinel i32 only says "stop"); container writes keep the
+            // muxing-error mapping.
+            let error = sink_worker
+                .as_ref()
+                .and_then(|sink| sink.pending_error_cloned())
+                .map(crate::error::Error::PacketSink)
+                .unwrap_or_else(|| {
+                    Muxing(MuxingOperationError::InterleavedWriteError(
+                        MuxingError::from(ret),
+                    ))
+                });
+            set_scheduler_error(&scheduler_status, &scheduler_result, error);
         }
 
         // H3: hold the STATUS_END grace open across the trailer AND the
@@ -1230,9 +1325,31 @@ fn _mux_init(
         let _finalizing = (ret >= 0 || ret == AVERROR_EOF)
             .then(|| interrupt_state.begin_output_finalize());
 
-        // write_trailer
+        // write_trailer (container outputs) / terminal callbacks (packet sink)
         let final_status = scheduler_status.load(Ordering::Acquire);
-        if final_status != STATUS_ABORT {
+        if let Some(sink) = sink_worker.as_mut() {
+            // Terminal gate (deliberately NOT `_finalizing`, which is also
+            // true when stop() cut the loop with packets still in flight):
+            // `on_end` requires every stream at a recognized terminal state —
+            // natural encoder EOF and configured truncation (recording_time,
+            // `-shortest` cascade) both count via `nb_done` — with nothing
+            // held back (packet-sink outputs have no BSFs and hold no
+            // packets), no delivery error (`ret >= 0`; a failing callback is
+            // never AVERROR_EOF), no abort, and no error recorded anywhere in
+            // the job. Otherwise a stashed delivery error fires `on_error`;
+            // cancellation and non-sink failures fire neither (the job result
+            // carries them).
+            let task_error = scheduler_result
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some();
+            sink.finish(
+                nb_done == stream_count,
+                ret,
+                final_status == STATUS_ABORT,
+                task_error,
+            );
+        } else if final_status != STATUS_ABORT {
             unsafe {
                 let ret = av_write_trailer(out_fmt_ctx.as_ptr());
                 if ret < 0 {
@@ -1863,6 +1980,9 @@ struct MuxWriteState<'a> {
     st_last_dts: &'a mut [i64],
     stream_eof: &'a mut [bool],
     nb_done: &'a mut usize,
+    /// Packet-sink delivery state; `Some` diverts `write_packet` from the
+    /// container write to callback delivery.
+    sink: Option<&'a mut crate::core::packet_sink::strict::PacketSinkWorker>,
 }
 
 /// # Safety
@@ -1878,6 +1998,18 @@ unsafe fn write_packet(
     state: &mut MuxWriteState,
     sq_packet_box: &mut PacketBox,
 ) -> i32 {
+    // Packet sink: divert to callback delivery ON THE ENCODER TIMELINE —
+    // deliberately before `mux_fixup_ts`, so the time base passes through
+    // verbatim and no muxer-side timestamp repair applies (the strict tier
+    // validates and rejects instead of repairing). `update_last_dts` already
+    // ran in the worker loop, so progress accounting is unaffected. Any
+    // negative return (never AVERROR_EOF) breaks the worker loop through the
+    // same path as a failed container write, with the typed error stashed in
+    // the sink state.
+    if let Some(sink) = state.sink.as_deref_mut() {
+        return sink.process_and_deliver(cfg.out_fmt_ctx.as_ptr(), sq_packet_box);
+    }
+
     mux_fixup_ts(cfg, state, sq_packet_box);
 
     (*sq_packet_box.packet.as_mut_ptr()).stream_index =
