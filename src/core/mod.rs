@@ -224,6 +224,19 @@ pub mod stream_info;
 /// ```
 pub mod packet_scanner;
 
+/// The **packet_sink** module delivers **encoded packets** to user callbacks
+/// instead of muxing them into container bytes — the packet-domain
+/// counterpart of the byte-domain `write_callback` output.
+///
+/// Build a [`PacketSink`](packet_sink::PacketSink) (or a
+/// [`PacketSink::channel`](packet_sink::PacketSink::channel) adapter) and hand
+/// it to [`Output::new_by_packet_sink`](crate::Output::new_by_packet_sink).
+/// The v1 strict tier is WebCodecs-aligned: avcC H.264 access units
+/// (libx264) and raw AAC frames with their AudioSpecificConfig. See the
+/// module documentation for the callback order and the blocking-backpressure
+/// contract.
+pub mod packet_sink;
+
 /// The **device** module provides cross-platform methods to query available audio and video
 /// input devices on the system. Depending on the target operating system, it internally
 /// delegates to different platform APIs or FFmpeg’s device capabilities:
