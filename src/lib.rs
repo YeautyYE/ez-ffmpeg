@@ -170,6 +170,7 @@ pub use self::core::filter;
 pub use self::core::frame_export;
 pub use self::core::hwaccel;
 pub use self::core::packet_scanner;
+pub use self::core::packet_sink;
 pub use self::core::recipes;
 pub use self::core::scheduler::ffmpeg_scheduler::FfmpegScheduler;
 pub use self::core::stream_info;

@@ -191,6 +191,9 @@ pub enum Error {
 
     #[error("Frame source thread failed to start")]
     FrameSourceThreadExited,
+
+    #[error("Packet sink error: {0}")]
+    PacketSink(#[from] PacketSinkError),
 }
 
 /// Builder/open-time validation errors for [`crate::VideoWriter`]. Exported here
@@ -467,6 +470,92 @@ pub enum MuxingOperationError {
 
     #[error("Thread exited")]
     ThreadExited,
+}
+
+/// Errors specific to packet-sink outputs (`Output::new_by_packet_sink`).
+///
+/// The strict tier fails fast: configuration problems surface from `build()`
+/// or from the job **before any sink callback runs**; per-packet violations
+/// stop the job with the offending packet never delivered. `Clone` is
+/// deliberate — the same value is recorded as the job error and handed to the
+/// sink's `on_error` callback.
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PacketSinkError {
+    #[error("{0} is not supported on packet-sink outputs")]
+    UnsupportedOption(&'static str),
+
+    #[error("stream copy is not supported on packet-sink outputs (strict tier requires encoded streams)")]
+    StreamCopyUnsupported,
+
+    #[error("{kind} streams are not supported on packet-sink outputs (strict tier)")]
+    UnsupportedStream { kind: &'static str },
+
+    #[error("encoder '{encoder}' is not on the strict-tier whitelist for {kind} (v1 accepts: {allowed})")]
+    EncoderNotWhitelisted {
+        kind: &'static str,
+        encoder: String,
+        allowed: &'static str,
+    },
+
+    #[error("packet-sink output has no streams")]
+    NoStreams,
+
+    #[error("output stream {stream_index}: encoder produced no extradata; the strict tier requires codec configuration (avcC / AudioSpecificConfig) before the first callback")]
+    MissingExtradata { stream_index: usize },
+
+    #[error("output stream {stream_index}: invalid codec configuration: {reason}")]
+    InvalidExtradata { stream_index: usize, reason: String },
+
+    #[error("output stream {stream_index}: packet carries no {which} (strict tier rejects AV_NOPTS_VALUE)")]
+    MissingTimestamp {
+        stream_index: usize,
+        which: &'static str,
+    },
+
+    #[error("output stream {stream_index}: non-monotonic dts (previous {prev}, current {current})")]
+    NonMonotonicDts {
+        stream_index: usize,
+        prev: i64,
+        current: i64,
+    },
+
+    #[error("output stream {stream_index}: duplicate pts {pts}")]
+    DuplicatePts { stream_index: usize, pts: i64 },
+
+    #[error("output stream {stream_index}: pts {pts} is earlier than dts {dts}")]
+    PtsBeforeDts {
+        stream_index: usize,
+        pts: i64,
+        dts: i64,
+    },
+
+    #[error("output stream {stream_index}: timestamp overflow while applying the shared time origin")]
+    TimestampOverflow { stream_index: usize },
+
+    #[error("output stream {stream_index}: packet duration is absent and cannot be derived (strict tier requires a positive duration)")]
+    MissingDuration { stream_index: usize },
+
+    #[error("output stream {stream_index}: malformed packet payload: {reason}")]
+    MalformedPacket {
+        stream_index: usize,
+        reason: String,
+    },
+
+    #[error("output stream {stream_index}: mid-stream configuration change ({what}); the strict tier requires an immutable stream configuration")]
+    ConfigChange {
+        stream_index: usize,
+        what: String,
+    },
+
+    #[error("output stream {stream_index}: in-band SPS/PPS parameter sets are not supported in the strict tier (WebCodecs avc requires out-of-band configuration)")]
+    InBandParameterSets { stream_index: usize },
+
+    #[error("on_stream_info callback rejected the stream configuration (returned {code})")]
+    StreamInfoCallbackFailed { code: i32 },
+
+    #[error("on_packet callback failed on output stream {stream_index} (returned {code})")]
+    PacketCallbackFailed { stream_index: usize, code: i32 },
 }
 
 #[derive(thiserror::Error, Debug)]
