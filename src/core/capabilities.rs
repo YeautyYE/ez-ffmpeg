@@ -29,6 +29,10 @@ use std::ptr::{null, null_mut};
 /// let has_whip = ez_ffmpeg::capabilities::is_muxer_available("whip");
 /// ```
 pub fn is_muxer_available(name: &str) -> bool {
+    // Device output formats (sdl2, alsa, pulse, ...) only enter the muxer
+    // iteration after avdevice registration; without this the answer would
+    // depend on whether some other crate API ran first in this process.
+    crate::core::initialize_ffmpeg();
     let Ok(name_cstr) = CString::new(name) else {
         return false;
     };
@@ -51,6 +55,9 @@ pub fn is_muxer_available(name: &str) -> bool {
 /// let has_srt = ez_ffmpeg::capabilities::is_output_protocol_available("srt");
 /// ```
 pub fn is_output_protocol_available(name: &str) -> bool {
+    // Same process-history concern as is_muxer_available: keep probe results
+    // independent of which crate API ran first.
+    crate::core::initialize_ffmpeg();
     let mut opaque: *mut c_void = null_mut();
     loop {
         let protocol = unsafe { avio_enum_protocols(&mut opaque, 1) };
