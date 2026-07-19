@@ -1,12 +1,16 @@
 //! Push raw video frames from Rust code into a full FFmpeg pipeline.
 //!
-//! [`VideoWriter`] is a narrow, ergonomic facade over the crate's existing
-//! [`Output`] surface: you build frames in memory (any packed
-//! `AVPixelFormat` — `rgba`, `rgb24`, `gray8`, `yuv420p`, `nv12`, …) and push
+//! [`VideoWriter`](crate::VideoWriter) is a narrow, ergonomic facade over the
+//! crate's existing [`Output`](crate::Output) surface: you build frames in
+//! memory (any packed or planar `AVPixelFormat` — `rgba`, `rgb24`, `gray8`,
+//! `yuv420p`, `nv12`, …, delivered as tightly packed plane bytes) and push
 //! them in, and they flow through the ordinary filter → encode → mux
-//! pipeline. Because the destination is a plain [`Output`], the writer
-//! inherits every capability the pipeline already has: any codec, container,
-//! filter chain, GPU frame pipeline, or RTMP target.
+//! pipeline. Because the destination is a plain [`Output`](crate::Output),
+//! the writer accepts any video encoder and container the linked FFmpeg build
+//! supports for that pairing, plus filter chains (one video input, one video
+//! output, with a directed input-to-output path), GPU frame pipelines, and
+//! RTMP targets. Out of scope: stream maps are rejected, and video
+//! stream-copy does not apply (frames are raw, so they are always encoded).
 //!
 //! **Experimental:** this API is new in 0.14 and its surface may still be
 //! refined in minor releases while it settles.
@@ -15,8 +19,9 @@
 //! use ez_ffmpeg::{Output, VideoWriter};
 //!
 //! # fn render(_i: usize) -> Vec<u8> { vec![0u8; 1920 * 1080 * 4] }
-//! // Pick an encoder explicitly: a bare "out.mp4" falls back to mpeg4 at a
-//! // low default bitrate, which looks poor at 1080p.
+//! // Pick an encoder explicitly: with a bare "out.mp4" the linked FFmpeg
+//! // build chooses the container default (H.264 when libx264 is compiled
+//! // in, otherwise mpeg4 at a low default bitrate).
 //! let out = Output::from("out.mp4").set_video_codec("mpeg4").set_video_qscale(5);
 //! let mut writer = VideoWriter::builder(1920, 1080).fps(30, 1).open(out)?;
 //! for i in 0..300 {
@@ -31,8 +36,9 @@
 //! - **Constant frame rate, video only.** Every pushed frame advances exactly
 //!   `den/num` seconds; there is no per-frame PTS and no audio. `write` takes
 //!   `&mut self` so the total frame order is fixed at compile time.
-//! - **Tight packing.** A frame is exactly [`frame_size`](VideoWriter::frame_size)
-//!   bytes: `av_image_get_buffer_size(pix_fmt, w, h, 1)`, planes concatenated in
+//! - **Tight packing.** A frame is exactly
+//!   [`frame_size`](crate::VideoWriter::frame_size) bytes:
+//!   `av_image_get_buffer_size(pix_fmt, w, h, 1)`, planes concatenated in
 //!   descriptor order with no row padding.
 //!
 //! # How it works
@@ -45,22 +51,24 @@
 //! decoder would. End of stream is an explicit in-band marker the worker
 //! enqueues when ingress closes, so frames still buffered inside filters
 //! (e.g. `reverse`) are flushed with correct tail timing. Teardown order is
-//! owned by [`VideoWriter`]:
+//! owned by [`VideoWriter`](crate::VideoWriter):
 //!
-//! - [`finish`](VideoWriter::finish) closes ingress (the worker emits the EOF
-//!   marker), then calls `wait()` — the authoritative way to retrieve the
-//!   pipeline's first error.
+//! - [`finish`](crate::VideoWriter::finish) closes ingress (the worker emits
+//!   the EOF marker), then calls `wait()` — the authoritative way to retrieve
+//!   the pipeline's first error.
 //! - [`Drop`] does the same and logs any error; it may block until the encoder
 //!   drains, so prefer `finish()` when you need the result.
-//! - [`abort`](VideoWriter::abort) discards the export (closes ingress, then
-//!   `abort()`s the scheduler); the partial output is not guaranteed playable.
+//! - [`abort`](crate::VideoWriter::abort) discards the export (closes ingress,
+//!   then `abort()`s the scheduler); the partial output is not guaranteed
+//!   playable.
 //!
 //! # Memory
 //!
 //! Only the **ingress** queue is bounded, by frame count: `queue_capacity`
-//! frames (an exact `frame_size` copy per slot with [`write`](VideoWriter::write);
-//! the caller's `Vec` as provided with [`write_owned`](VideoWriter::write_owned)),
-//! plus a bounded handful of in-flight frames in the internal channels.
+//! frames (an exact `frame_size` copy per slot with
+//! [`write`](crate::VideoWriter::write); the caller's `Vec` as provided with
+//! [`write_owned`](crate::VideoWriter::write_owned)), plus a bounded handful
+//! of in-flight frames in the internal channels.
 //! Filters that buffer (`reverse`, `tpad`, …), the codec's lookahead, and
 //! output I/O can each hold further data with no global limit — exactly as
 //! they do in any other job of this crate.
