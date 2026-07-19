@@ -255,6 +255,14 @@ pub(crate) struct Muxer {
     pub(crate) interrupt_state: Arc<crate::core::context::InterruptState>,
 
     pub(crate) mux_stream_nodes: Vec<Arc<SchNode>>,
+
+    /// Packet-sink callbacks for this output (`Some` = the mux worker
+    /// delivers packets to callbacks instead of writing the container).
+    /// Set by `open_output_file` right after construction; taken by
+    /// `mux_init`/`ready_to_init_mux` for the worker handoff. While `Some`,
+    /// stream binding enforces the strict-tier whitelist (see
+    /// `add_enc_stream` / `new_copy_stream`).
+    pub(crate) packet_sink: Option<crate::core::packet_sink::PacketSink>,
 }
 
 // SAFETY: Muxer can be sent to another thread. The raw FFmpeg pointers are only
@@ -392,7 +400,19 @@ impl Muxer {
             sws_opts,
             swr_opts,
             attachments,
+            packet_sink: None,
         }
+    }
+
+    /// Whether this output is a packet sink (delivery to callbacks instead of
+    /// a written container).
+    pub(crate) fn is_packet_sink(&self) -> bool {
+        self.packet_sink.is_some()
+    }
+
+    /// Takes the packet-sink callbacks for the mux worker handoff.
+    pub(crate) fn take_packet_sink(&mut self) -> Option<crate::core::packet_sink::PacketSink> {
+        self.packet_sink.take()
     }
 
     pub(crate) fn register_stream_source(
@@ -425,6 +445,14 @@ impl Muxer {
         src_node: Arc<SchNode>,
         single_stream_direct_input: bool,
     ) -> crate::error::Result<(Sender<FrameBox>, usize)> {
+        if self.is_packet_sink() {
+            // Strict-tier whitelist (v1): the delivery contract assumes one
+            // packet == one access unit, which is established for libx264
+            // only; audio must be AAC (AudioSpecificConfig configuration).
+            // Enforced here — where the resolved encoder is first known — so
+            // the job fails at build() with a typed error.
+            validate_packet_sink_encoder(media_type, enc)?;
+        }
         let (packet_sender, st, stream_index) = self.new_stream(src_node)?;
         let (frame_sender, frame_receiver) = crossbeam_channel::bounded(8);
 
@@ -435,6 +463,10 @@ impl Muxer {
                     self.framerate,
                     self.framerate_max,
                     self.out_fmt_ctx_ptr(),
+                    // The snapshot, not a fresh oformat read: a packet sink
+                    // pins these flags by policy (see open_output_file), and
+                    // for a real muxer the snapshot equals the oformat flags.
+                    self.oformat_flags,
                     self.copy_ts,
                     single_stream_direct_input,
                 )?
@@ -546,6 +578,12 @@ impl Muxer {
         *mut AVStream,
         usize,
     )> {
+        if self.is_packet_sink() {
+            // Copied packets carry no one-packet-one-AU guarantee and no
+            // encoder-owned configuration; the strict tier requires encoded
+            // streams.
+            return Err(crate::error::PacketSinkError::StreamCopyUnsupported.into());
+        }
         let (packet_sender, st, index) = self.new_stream(src)?;
         let (pre_sender, pre_receiver) = pre_mux_queue::channel(self.pre_mux_queue_config);
         self.src_pre_receivers.push(pre_receiver);
@@ -723,11 +761,62 @@ mod tests {
     }
 }
 
+/// Strict-tier whitelist for packet-sink outputs (see `add_enc_stream`).
+fn validate_packet_sink_encoder(
+    media_type: AVMediaType,
+    enc: *const AVCodec,
+) -> crate::error::Result<()> {
+    use crate::error::PacketSinkError;
+    let encoder_name = || {
+        if enc.is_null() {
+            "<none>".to_string()
+        } else {
+            // SAFETY: non-null AVCodec from avcodec_find_encoder*; `name` is
+            // static codec metadata.
+            unsafe { CStr::from_ptr((*enc).name).to_string_lossy().into_owned() }
+        }
+    };
+    match media_type {
+        AVMediaType::AVMEDIA_TYPE_VIDEO => {
+            let name = encoder_name();
+            if name != "libx264" {
+                return Err(PacketSinkError::EncoderNotWhitelisted {
+                    kind: "video",
+                    encoder: name,
+                    allowed: "libx264",
+                }
+                .into());
+            }
+        }
+        AVMediaType::AVMEDIA_TYPE_AUDIO => {
+            // SAFETY: same static-metadata read as above; null is rejected.
+            let is_aac =
+                !enc.is_null() && unsafe { (*enc).id } == ffmpeg_sys_next::AVCodecID::AV_CODEC_ID_AAC;
+            if !is_aac {
+                return Err(PacketSinkError::EncoderNotWhitelisted {
+                    kind: "audio",
+                    encoder: encoder_name(),
+                    allowed: "AAC encoders",
+                }
+                .into());
+            }
+        }
+        _ => {
+            return Err(PacketSinkError::UnsupportedStream {
+                kind: "non-audio/video",
+            }
+            .into())
+        }
+    }
+    Ok(())
+}
+
 unsafe fn determine_vsync_method(
     vsync_method: VSyncMethod,
     framerate: Option<AVRational>,
     framerate_max: Option<AVRational>,
     out_fmt_ctx: *mut AVFormatContext,
+    oformat_flags: i32,
     copy_ts: bool,
     single_stream_direct_input: bool,
 ) -> crate::error::Result<VSyncMethod> {
@@ -765,18 +854,17 @@ unsafe fn determine_vsync_method(
         } {
             VSyncMethod::VsyncVfr
         }
-        // 3. Otherwise, check the format flags
-        else {
-            let oformat = (*out_fmt_ctx).oformat;
-            if (*oformat).flags & AVFMT_VARIABLE_FPS != 0 {
-                if (*oformat).flags & AVFMT_NOTIMESTAMPS != 0 {
-                    VSyncMethod::VsyncPassthrough
-                } else {
-                    VSyncMethod::VsyncVfr
-                }
+        // 3. Otherwise, check the format flags (the caller's snapshot, so a
+        // packet-sink policy override participates instead of the dummy
+        // container's real flags).
+        else if oformat_flags & AVFMT_VARIABLE_FPS != 0 {
+            if oformat_flags & AVFMT_NOTIMESTAMPS != 0 {
+                VSyncMethod::VsyncPassthrough
             } else {
-                VSyncMethod::VsyncCfr
+                VSyncMethod::VsyncVfr
             }
+        } else {
+            VSyncMethod::VsyncCfr
         };
 
     // 4. A stream fed directly by a single-stream input keeps its original

@@ -85,6 +85,27 @@ unsafe fn open_output_file(
     // early return until the Muxer takes ownership below.
     let mut ctx_guard = crate::core::context::FmtCtxGuard::disarmed();
     let format = get_format(&output.format)?;
+    if output.packet_sink.is_some() {
+        // Packet sink: no container is written and no I/O exists, so every
+        // muxer-only option is a configuration error, surfaced typed at
+        // build time rather than silently ignored.
+        validate_packet_sink_options(output)?;
+        // Allocate a real-but-never-written mp4 context purely for parameter
+        // plumbing (`avformat_new_stream`, codecpar finalization, time-base
+        // adoption). No pb is installed and neither header nor trailer is
+        // ever written; the encoder-visible flags come from the explicit
+        // PacketSinkPolicy below, never from this container's own flags.
+        let dummy = get_format(&Some("mp4".to_string()))?;
+        let ret = avformat_alloc_output_context2(&mut out_fmt_ctx, dummy, null(), null());
+        if out_fmt_ctx.is_null() {
+            warn!(target: LOG_TARGET, "Error initializing the parameter context for packet_sink");
+            return Err(AllocOutputContextError::from(ret).into());
+        }
+        ctx_guard.arm(out_fmt_ctx, crate::raw::Mode::Output);
+    }
+    // Byte-domain sinks (URL / write_callback); exclusive with the
+    // packet-sink branch above, which armed the context already.
+    if output.packet_sink.is_none() {
     match &output.url {
         None => {
             if output.write_callback.is_none() {
@@ -180,6 +201,7 @@ unsafe fn open_output_file(
             // build() free of output-file side effects; the still-null `pb` closes as
             // a no-op if the job is torn down before it is opened.
         }
+        }
     }
 
     let recording_time_us = match output.stop_time_us {
@@ -195,10 +217,13 @@ unsafe fn open_output_file(
         }
     };
 
-    let url = output
-        .url
-        .clone()
-        .unwrap_or_else(|| format!("write_callback[{index}]"));
+    let url = output.url.clone().unwrap_or_else(|| {
+        if output.packet_sink.is_some() {
+            format!("packet_sink[{index}]")
+        } else {
+            format!("write_callback[{index}]")
+        }
+    });
 
     let video_codec_opts = convert_options(output.video_codec_opts.clone())?;
     let audio_codec_opts = convert_options(output.audio_codec_opts.clone())?;
@@ -284,7 +309,7 @@ unsafe fn open_output_file(
     } else {
         crate::raw::FormatContext::from_output(out_fmt_ctx)
     };
-    let mux = Muxer::new(
+    let mut mux = Muxer::new(
         url,
         fc,
         output.frame_pipelines.take(),
@@ -338,7 +363,48 @@ unsafe fn open_output_file(
         interrupt_state.clone(),
     );
 
+    if let Some(sink) = output.packet_sink.take() {
+        // PacketSinkPolicy: the encoder-visible muxing flags are pinned by
+        // the sink tier and overwrite the dummy container's snapshot —
+        // GLOBAL_HEADER (out-of-band codec configuration) and the vsync
+        // projection are policy decisions, not container accidents.
+        mux.oformat_flags =
+            crate::core::packet_sink::PacketSinkPolicy::for_tier(sink.tier).oformat_flags();
+        mux.packet_sink = Some(sink);
+    }
+
     Ok(mux)
+}
+
+/// Build-time validation for packet-sink outputs: every option that only
+/// makes sense for a written container is a typed configuration error.
+fn validate_packet_sink_options(output: &Output) -> Result<()> {
+    use crate::error::PacketSinkError;
+    let unsupported: &[(&'static str, bool)] = &[
+        ("set_format", output.format.is_some()),
+        ("set_seek_callback", output.seek_callback.is_some()),
+        (
+            "set_io_buffer_size",
+            output.io_buffer_size != crate::core::context::DEFAULT_CUSTOM_IO_BUFFER_SIZE,
+        ),
+        ("set_video_bsf", output.video_bsf.is_some()),
+        ("set_audio_bsf", output.audio_bsf.is_some()),
+        ("set_subtitle_bsf", output.subtitle_bsf.is_some()),
+        ("set_format_opt", output.format_opts.is_some()),
+        ("add_attachment", !output.attachments.is_empty()),
+        ("set_subtitle_codec", output.subtitle_codec.is_some()),
+    ];
+    for (option, set) in unsupported {
+        if *set {
+            return Err(PacketSinkError::UnsupportedOption(option).into());
+        }
+    }
+    if output.video_codec.as_deref() == Some("copy")
+        || output.audio_codec.as_deref() == Some("copy")
+    {
+        return Err(PacketSinkError::StreamCopyUnsupported.into());
+    }
+    Ok(())
 }
 
 fn get_format(format_option: &Option<String>) -> Result<*const AVOutputFormat> {

@@ -433,6 +433,13 @@ pub struct Output {
     /// time; the file is read then, so a missing/unreadable/empty/oversized
     /// file surfaces as an `Err` from the context build — never a panic.
     pub(crate) attachments: Vec<AttachmentSpec>,
+
+    /// Packet-sink callback bundle (`Output::new_by_packet_sink`): the output
+    /// delivers encoded packets to these callbacks instead of muxing them.
+    /// Mutually exclusive with `url`/`write_callback`; build validation
+    /// rejects muxer-only options (`set_format`, seek callback, IO buffer
+    /// size, bitstream filters, format options, attachments) on such outputs.
+    pub(crate) packet_sink: Option<crate::core::packet_sink::PacketSink>,
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -483,6 +490,41 @@ impl Output {
         F: FnMut(&[u8]) -> i32 + Send + 'static,
     {
         (Box::new(write_callback) as Box<dyn FnMut(&[u8]) -> i32 + Send>).into()
+    }
+
+    /// Creates an `Output` that delivers **encoded packets** to the given
+    /// [`PacketSink`](crate::packet_sink::PacketSink) callbacks instead of
+    /// muxing them into container bytes.
+    ///
+    /// No container is written and no I/O happens: `on_stream_info` fires
+    /// once with the finalized stream configuration (valid avcC for H.264,
+    /// AudioSpecificConfig for AAC), then each encoded packet is handed to
+    /// `on_packet` as a borrowed [`PacketView`](crate::packet_sink::PacketView).
+    /// See the [`packet_sink`](crate::packet_sink) module docs for the strict
+    /// tier contract, the callback order, and the **blocking backpressure**
+    /// behavior (a slow callback stalls the pipeline; nothing is dropped).
+    ///
+    /// Muxer-only options are rejected when the context is built:
+    /// `set_format`, `set_seek_callback`, `set_io_buffer_size`,
+    /// `set_format_opt(s)`, bitstream filters (`set_*_bsf`), attachments and
+    /// stream copy all fail with a typed
+    /// [`PacketSinkError`](crate::error::PacketSinkError). The v1 strict tier
+    /// accepts only whitelisted encoders (video: `libx264`; audio: AAC).
+    ///
+    /// ### Example
+    /// ```rust,ignore
+    /// use ez_ffmpeg::packet_sink::PacketSink;
+    ///
+    /// let sink = PacketSink::builder()
+    ///     .on_packet(|pkt| {
+    ///         println!("stream {} pts {}", pkt.stream_index(), pkt.pts());
+    ///         0
+    ///     })
+    ///     .build();
+    /// let output = Output::new_by_packet_sink(sink).set_video_codec("libx264");
+    /// ```
+    pub fn new_by_packet_sink(sink: crate::core::packet_sink::PacketSink) -> Self {
+        sink.into()
     }
 
     /// Sets the AVIO buffer size, in bytes, for a custom `write_callback` output.
@@ -1687,7 +1729,20 @@ impl From<Box<dyn FnMut(&[u8]) -> i32 + Send>> for Output {
             attachments: Vec::new(),
             shortest: false,
             shortest_buf_duration_us: 10_000_000,
+            packet_sink: None,
         }
+    }
+}
+
+impl From<crate::core::packet_sink::PacketSink> for Output {
+    fn from(sink: crate::core::packet_sink::PacketSink) -> Self {
+        // Reuse the write-callback defaults (url: None) instead of a third
+        // 50-line field literal; the placeholder callback is dropped here and
+        // a packet-sink output never installs AVIO.
+        let mut output: Self = (Box::new(|_: &[u8]| 0) as Box<dyn FnMut(&[u8]) -> i32 + Send>).into();
+        output.write_callback = None;
+        output.packet_sink = Some(sink);
+        output
     }
 }
 
@@ -1750,6 +1805,7 @@ impl From<String> for Output {
             attachments: Vec::new(),
             shortest: false,
             shortest_buf_duration_us: 10_000_000,
+            packet_sink: None,
         }
     }
 }
