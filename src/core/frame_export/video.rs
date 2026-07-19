@@ -7,6 +7,7 @@ use super::iter::FrameIter;
 use super::options::{ColorPolicy, PixelLayout, Sampling};
 use super::resolve::{resolve_and_build_desc, ResolvePlan, UniformResolve};
 use super::sampler::{ExportSampler, UniformSpan};
+use super::selector::InputSelector;
 use super::sink::ExportSink;
 use crate::core::context::demuxer::Demuxer;
 use crate::core::context::ffmpeg_context::FfmpegContext;
@@ -185,16 +186,20 @@ impl FrameExtractor {
             "frame_export_color_guard",
             Box::new(ColorGuard::new(self.color)),
         );
+        // With start_time_us the demux timeline is re-zeroed at the request
+        // and the in-graph trim drops pts < 0 — but the container seek lands
+        // on a keyframe at or BEFORE the request, so on GOP video this
+        // pipeline sees negative-pts lead-in first. The boundary makes the
+        // input-side sampler/selector skip that lead-in instead of anchoring
+        // grids on (or spending selections on) frames the trim will destroy.
+        let trim_boundary = self.start_time_us.map(|_| 0i64);
         if let Some(n) = uniform_n {
-            // With start_time_us the demux timeline is re-zeroed at the request
-            // and the in-graph trim drops pts < 0 — but the container seek
-            // lands on a keyframe at or BEFORE the request, so on GOP video
-            // this pipeline sees negative-pts lead-in first. The boundary makes
-            // the sampler skip that lead-in instead of anchoring its grid on
-            // frames the trim will destroy.
-            let trim_boundary = self.start_time_us.map(|_| 0i64);
             let sampler = ExportSampler::new(n, span_cell.clone(), trim_boundary);
             builder = builder.filter("frame_export_sampler", Box::new(sampler));
+        } else if let Some(selector) = InputSelector::for_sampling(&self.sampling, trim_boundary) {
+            // EveryNth/EverySec drop unselected frames before the filtergraph,
+            // so they never pay the scale/format conversion.
+            builder = builder.filter("frame_export_selector", Box::new(selector));
         }
         // Bind to the explicit stream when given; otherwise the video stream
         // by media type (the resolver's best-stream selection coincides for

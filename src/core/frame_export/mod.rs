@@ -91,6 +91,7 @@ mod iter;
 mod options;
 mod resolve;
 mod sampler;
+mod selector;
 mod sink;
 mod video;
 
