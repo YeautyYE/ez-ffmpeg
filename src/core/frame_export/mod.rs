@@ -44,15 +44,19 @@
 //!
 //! # Conversion precision & throughput
 //!
-//! The pixel-format conversion runs the FFmpeg CLI's default swscale
-//! configuration ([`ConversionPrecision::Standard`]): an all-frames export is
-//! decode-bound — the same throughput class as an `ffmpeg -vf
-//! "scale=..,format=.."` run with default flags — and produces the same
-//! bytes. [`FrameExtractor::conversion_precision`] opts into
+//! The conversion stage (any resize plus the pixel-format conversion, one
+//! swscale pass) runs the FFmpeg CLI's default swscale configuration
+//! ([`ConversionPrecision::Standard`]): an all-frames export runs in the same
+//! throughput class as an `ffmpeg -vf "scale=..,format=.."` run with default
+//! flags — on typical sources the decode, not the conversion, is the
+//! bottleneck — and produces the same bytes as that CLI run when both link
+//! the same libswscale build (asserted end-to-end by a golden test).
+//! [`FrameExtractor::conversion_precision`] opts into
 //! [`ConversionPrecision::High`] (accurate rounding + full chroma
-//! interpolation) for consumers sensitive to last-bit chroma siting, at a
-//! several-fold conversion cost. The precision tier never changes color
-//! interpretation — matrix and range handling are identical in both tiers.
+//! interpolation) when the last bit of precision matters more than
+//! throughput, at a several-fold conversion cost. The precision tier never
+//! changes color interpretation — matrix and range handling are identical in
+//! both tiers.
 //!
 //! # Audio (PCM) export
 //!

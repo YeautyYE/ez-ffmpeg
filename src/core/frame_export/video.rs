@@ -102,7 +102,8 @@ impl FrameExtractor {
         self
     }
 
-    /// Sets the swscale precision tier for the pixel-format conversion
+    /// Sets the swscale precision tier for the conversion stage — the single
+    /// swscale pass that runs any resize plus the pixel-format conversion
     /// (default [`ConversionPrecision::Standard`], which matches the FFmpeg
     /// CLI's default scaler flags). [`ConversionPrecision::High`] opts into
     /// accurate rounding + full chroma interpolation at a several-fold

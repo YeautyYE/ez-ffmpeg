@@ -80,11 +80,13 @@ impl PixelLayout {
     }
 }
 
-/// The swscale precision tier for the YUV → RGB (or gray) conversion.
+/// The swscale precision tier for the conversion stage.
 ///
-/// This selects the rounding/interpolation quality of the pixel-format
-/// conversion only. Color interpretation — which matrix and range are applied
-/// ([`ColorPolicy`]) — is identical in both tiers.
+/// The extractor runs any resize plus the pixel-format conversion as ONE
+/// swscale pass, and this tier sets that pass's scaler flags — so it affects
+/// resized output too, not only the YUV → RGB step. Color interpretation —
+/// which matrix and range are applied ([`ColorPolicy`]) — is identical in
+/// both tiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum ConversionPrecision {
@@ -95,15 +97,18 @@ pub enum ConversionPrecision {
     /// flags produces. This is the default.
     #[default]
     Standard,
-    /// Adds `accurate_rnd+full_chroma_int`: bit-accurate rounding plus full
-    /// chroma interpolation. Relative to
+    /// Adds `accurate_rnd+full_chroma_int`: accurate rounding plus full
+    /// horizontal chroma interpolation. Relative to
     /// [`Standard`](ConversionPrecision::Standard) the mean difference is a
     /// couple of steps per 8-bit channel; individual pixels on sharp chroma
     /// edges can differ by more, because the two tiers reconstruct subsampled
-    /// chroma differently. The flags disable swscale's unscaled fast-path
-    /// converters, which multiplies the conversion cost several-fold (at
-    /// 1080p the conversion, not the decode, becomes the bottleneck). Opt in
-    /// when downstream consumers are sensitive to last-bit chroma siting.
+    /// chroma differently — and `accurate_rnd` also changes rounding on
+    /// resized output, including single-plane formats like gray. The flags
+    /// disable swscale's unscaled fast-path converters, which multiplies the
+    /// conversion cost several-fold (at 1080p the conversion, not the decode,
+    /// becomes the bottleneck). Opt in when the last bit of rounding and
+    /// chroma reconstruction matters more than throughput — e.g. quality
+    /// metrics or golden-reference pipelines.
     High,
 }
 
