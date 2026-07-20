@@ -12,8 +12,9 @@
 //! `update_last_dts` already ran in the worker loop, on the original
 //! timeline, before this code sees the packet):
 //!
-//! 1. packet/stream time-base equality (the anchor math depends on it);
-//! 2. S8 configuration-change detection (side data vs. the seeded baseline);
+//! 1. S8 configuration-change detection (side data vs. the seeded baseline)
+//!    — a config change reports as such even when timestamps also broke;
+//! 2. packet/stream time-base equality (the anchor math depends on it);
 //! 3. S7 timestamp validation: reject missing timestamps, then shift onto the
 //!    shared origin, then enforce `pts >= dts`, strictly monotonic dts, and
 //!    no duplicate pts;
