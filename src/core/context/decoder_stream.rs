@@ -40,6 +40,10 @@ pub(crate) struct DecoderStream {
     /// Applied to `AVCodecContext.log_level_offset` when the decoder opens.
     pub(crate) log_level_offset: i32,
 
+    /// CLI-compat strict mode: decoder-option leftovers error instead of
+    /// warning (set from the owning demuxer).
+    pub(crate) strict_avoptions: bool,
+
     src: Option<Receiver<PacketBox>>,
     dsts: Vec<(Sender<FrameBox>, usize, Arc<[AtomicBool]>)>,
 }
@@ -62,6 +66,7 @@ impl DecoderStream {
         hwaccel_device: Option<String>,
         hwaccel_output_format: AVPixelFormat,
         log_level_offset: i32,
+        strict_avoptions: bool,
     ) -> Self {
         Self {
             stream_index,
@@ -81,6 +86,7 @@ impl DecoderStream {
             hwaccel_device,
             hwaccel_output_format,
             log_level_offset,
+            strict_avoptions,
             src: None,
             dsts: vec![],
         }

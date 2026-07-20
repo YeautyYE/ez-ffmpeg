@@ -209,6 +209,12 @@ pub struct Input {
     /// read input at specified rate.
     /// when set 1. read input at native frame rate.
     pub(crate) readrate: Option<f32>,
+    /// CLI-compat strict mode (crate-internal): leftover AVOptions error
+    /// instead of warning on every component this input feeds (demuxer open,
+    /// stream probe, decoder open). Set only by the `cli` feature's entry
+    /// points; the default builder path keeps today's warn behavior.
+    pub(crate) strict_avoptions: bool,
+
     pub(crate) start_time_us: Option<i64>,
     pub(crate) recording_time_us: Option<i64>,
     pub(crate) stop_time_us: Option<i64>,
@@ -1393,6 +1399,7 @@ impl From<Box<dyn FnMut(&mut [u8]) -> i32 + Send>> for Input {
             subtitle_codec_opts: None,
             exit_on_error: None,
             readrate: None,
+            strict_avoptions: false,
             start_time_us: None,
             recording_time_us: None,
             stop_time_us: None,
@@ -1428,6 +1435,7 @@ impl From<String> for Input {
             subtitle_codec_opts: None,
             exit_on_error: None,
             readrate: None,
+            strict_avoptions: false,
             start_time_us: None,
             recording_time_us: None,
             stop_time_us: None,

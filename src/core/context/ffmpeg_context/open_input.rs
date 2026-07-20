@@ -360,6 +360,12 @@ unsafe fn open_input_file(
         input_opts.remove(&CString::new("scan_all_pmts")?);
     }
     for key in input_opts.leftover_keys() {
+        if input.strict_avoptions {
+            return Err(Error::UnconsumedCliOption {
+                site: format!("input {index} (demuxer open)"),
+                option: key,
+            });
+        }
         warn!(target: LOG_TARGET, "Option '{key}' was not recognized by input {index}");
     }
 
@@ -447,6 +453,7 @@ unsafe fn open_input_file(
             None => AVRational { num: 0, den: 0 },
         },
         input.log_level_offset.unwrap_or(0),
+        input.strict_avoptions,
     )?;
 
     // `Demuxer` now owns the context (via its `Option<FormatContext>`); a failure
@@ -593,6 +600,12 @@ unsafe fn find_stream_info_if_enabled(
     for (stream_index, key) in probe_opts.leftover_keys() {
         if matches!(key.as_str(), "threads" | "lowres" | "codec_whitelist") {
             continue;
+        }
+        if input.strict_avoptions {
+            return Err(Error::UnconsumedCliOption {
+                site: format!("stream {stream_index} probe of input {index}"),
+                option: key,
+            });
         }
         warn!(target: LOG_TARGET,
             "Option '{key}' was not recognized while probing stream {stream_index} of input {index}"

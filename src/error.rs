@@ -194,6 +194,14 @@ pub enum Error {
 
     #[error("Packet sink error: {0}")]
     PacketSink(#[from] PacketSinkError),
+
+    /// Strict AVOption handling (CLI-compat pipelines): an option the caller
+    /// supplied was not consumed by the component it targeted. The default
+    /// builder path only WARNS about such leftovers; pipelines built through
+    /// the `cli` feature's entry points fail instead, mirroring fftools'
+    /// `check_avoptions` abort.
+    #[error("option '{option}' was not consumed by {site}; CLI-compat strict mode treats leftover AVOptions as errors")]
+    UnconsumedCliOption { site: String, option: String },
 }
 
 /// Builder/open-time validation errors for [`crate::VideoWriter`]. Exported here

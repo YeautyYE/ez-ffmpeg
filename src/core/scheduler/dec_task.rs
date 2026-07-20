@@ -924,6 +924,12 @@ fn dec_open(
             dec_opts.remove(&CString::new("threads").unwrap());
         }
         for key in dec_opts.leftover_keys() {
+            if dec_stream.strict_avoptions {
+                return Err(crate::error::Error::UnconsumedCliOption {
+                    site: format!("the decoder for stream {}", dec_stream.stream_index),
+                    option: key,
+                });
+            }
             warn!(
                 "Option '{key}' was not recognized by decoder for stream {}",
                 dec_stream.stream_index
