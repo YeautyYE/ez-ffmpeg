@@ -7,7 +7,9 @@
 //! - the scope is per-output (a second output stays untouched),
 //! - audio is never routed through the video chain,
 //! - every conflicting spelling is a typed build() error, mirroring the CLI
-//!   (streamcopy, complex-graph feeds, non-linear or non-video chains).
+//!   (streamcopy, complex-graph feeds — through ANY mapping spelling —
+//!   non-linear/disconnected/unreachable/non-video chains, and filters no
+//!   video stream ended up consuming).
 
 mod common;
 
@@ -67,6 +69,25 @@ fn av_fixture(name: &str) -> String {
             .build()
             .unwrap(),
         "av fixture",
+    )
+    .unwrap();
+    path
+}
+
+/// 0.5s audio-only fixture (stereo AAC in m4a).
+fn audio_fixture(name: &str) -> String {
+    let path = tmp_path(name);
+    run(
+        FfmpegContext::builder()
+            .input(Input::from("sine=frequency=440:sample_rate=44100").set_format("lavfi"))
+            .output(
+                Output::from(path.as_str())
+                    .set_audio_codec("aac")
+                    .set_recording_time_us(500_000),
+            )
+            .build()
+            .unwrap(),
+        "audio fixture",
     )
     .unwrap();
     path
@@ -228,7 +249,7 @@ fn audio_copy_rides_alongside_video_filter() {
 }
 
 #[test]
-fn empty_filter_clears_previous_chain() {
+fn clear_video_filter_restores_passthrough() {
     let input = video_fixture("clear_in.mp4");
     let out = tmp_path("clear_out.mp4");
     run(
@@ -238,15 +259,40 @@ fn empty_filter_clears_previous_chain() {
                 Output::from(out.as_str())
                     .set_video_codec("mpeg4")
                     .set_video_filter("scale=160:120")
-                    .set_video_filter(""),
+                    .clear_video_filter(),
             )
             .build()
             .unwrap(),
         "cleared filter",
     )
     .unwrap();
-    // The empty string restores the implicit passthrough chain.
     assert_eq!(video_dimensions(&out), (320, 240));
+}
+
+#[test]
+fn empty_filter_text_fails_like_cli() {
+    // -vf "" parity: the CLI fails to parse an empty graph; the empty
+    // description must not silently degrade to passthrough.
+    let input = video_fixture("empty_vf_in.mp4");
+    let err = build_err(
+        FfmpegContext::builder()
+            .input(input.as_str())
+            .output(
+                Output::from(tmp_path("empty_vf_out.mp4").as_str())
+                    .set_video_codec("mpeg4")
+                    .set_video_filter(""),
+            )
+            .build(),
+    );
+    // Shape or parse error — anything typed, never a silent pass.
+    let text = err.to_string();
+    assert!(
+        matches!(
+            &err,
+            Error::OpenOutput(OpenOutputError::SimpleFilterInvalidShape { .. })
+        ) || matches!(&err, Error::FilterGraphParse(_)),
+        "empty -vf must fail the build with a typed error, got: {text}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -388,11 +434,8 @@ fn multi_output_pad_chain_is_rejected() {
     assert!(
         matches!(
             &err,
-            Error::OpenOutput(OpenOutputError::SimpleFilterInvalidShape {
-                desc,
-                inputs: 1,
-                outputs: 2,
-            }) if desc == "split"
+            Error::OpenOutput(OpenOutputError::SimpleFilterInvalidShape { desc, reason })
+                if desc == "split" && reason.contains("found 1 and 2")
         ),
         "unexpected error: {err:?}"
     );
@@ -440,5 +483,297 @@ fn unknown_filter_name_fails_build() {
     assert!(
         matches!(err, Error::FilterGraphParse(_)),
         "an unknown filter name must fail build() with a parse error, got {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Review probes: mapping spellings must not bypass the simple/complex
+// conflict (fftools binds unlabeled graph outputs before manual/automatic
+// mapping and then errors in ost_get_filters).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn explicit_map_does_not_bypass_complex_conflict() {
+    let input = video_fixture("map_bypass_in.mp4");
+    let err = build_err(
+        FfmpegContext::builder()
+            .input(input.as_str())
+            .filter_desc("hue=s=0")
+            .output(
+                Output::from(tmp_path("map_bypass_out.mp4").as_str())
+                    .set_video_codec("mpeg4")
+                    .add_stream_map("0:v")
+                    .set_video_filter("scale=160:120"),
+            )
+            .build(),
+    );
+    assert!(
+        matches!(
+            &err,
+            Error::OpenOutput(OpenOutputError::SimpleAndComplexFilter(desc))
+                if desc == "scale=160:120"
+        ),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn disable_video_does_not_bypass_complex_conflict() {
+    let input = video_fixture("disable_bypass_in.mp4");
+    let err = build_err(
+        FfmpegContext::builder()
+            .input(input.as_str())
+            .filter_desc("hue=s=0")
+            .output(
+                Output::from(tmp_path("disable_bypass_out.mp4").as_str())
+                    .disable_video()
+                    .set_video_filter("scale=160:120"),
+            )
+            .build(),
+    );
+    assert!(
+        matches!(
+            &err,
+            Error::OpenOutput(OpenOutputError::SimpleAndComplexFilter(desc))
+                if desc == "scale=160:120"
+        ),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn multi_output_complex_conflict_hits_the_filtered_output() {
+    // A second output must not become a silent escape hatch for the complex
+    // graph while output #0 keeps its simple filter: fftools would bind the
+    // unlabeled graph to output #0 first and conflict there.
+    let input = video_fixture("multi_out_bypass_in.mp4");
+    let err = build_err(
+        FfmpegContext::builder()
+            .input(input.as_str())
+            .filter_desc("hue=s=0")
+            .output(
+                Output::from(tmp_path("multi_out_bypass_a.mp4").as_str())
+                    .set_video_codec("mpeg4")
+                    .add_stream_map("0:v")
+                    .set_video_filter("scale=160:120"),
+            )
+            .output(Output::from(tmp_path("multi_out_bypass_b.mp4").as_str()).set_video_codec("mpeg4"))
+            .build(),
+    );
+    assert!(
+        matches!(
+            &err,
+            Error::OpenOutput(OpenOutputError::SimpleAndComplexFilter(_))
+        ),
+        "unexpected error: {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Review probes: a configured filter no video stream consumed is a typed
+// error, never a silent drop.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn filter_on_audio_only_input_is_rejected() {
+    let input = audio_fixture("unused_audio_only_in.m4a");
+    let err = build_err(
+        FfmpegContext::builder()
+            .input(input.as_str())
+            .output(
+                Output::from(tmp_path("unused_audio_only_out.m4a").as_str())
+                    .set_audio_codec("aac")
+                    .set_video_filter("scale=160:120"),
+            )
+            .build(),
+    );
+    assert!(
+        matches!(
+            &err,
+            Error::OpenOutput(OpenOutputError::VideoFilterUnused(desc))
+                if desc == "scale=160:120"
+        ),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn filter_with_audio_only_maps_is_rejected() {
+    let input = av_fixture("unused_audio_maps_in.mp4");
+    let err = build_err(
+        FfmpegContext::builder()
+            .input(input.as_str())
+            .output(
+                Output::from(tmp_path("unused_audio_maps_out.m4a").as_str())
+                    .set_audio_codec("aac")
+                    .add_stream_map("0:a")
+                    .set_video_filter("scale=160:120"),
+            )
+            .build(),
+    );
+    assert!(
+        matches!(
+            &err,
+            Error::OpenOutput(OpenOutputError::VideoFilterUnused(_))
+        ),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn filter_with_unmatched_optional_video_map_is_rejected() {
+    // `0:v?` on an audio-only input matches nothing; the filter then has no
+    // stream to bind and must surface as unused, not vanish.
+    let input = audio_fixture("unused_optional_map_in.m4a");
+    let err = build_err(
+        FfmpegContext::builder()
+            .input(input.as_str())
+            .output(
+                Output::from(tmp_path("unused_optional_map_out.m4a").as_str())
+                    .set_audio_codec("aac")
+                    .add_stream_map("0:v?")
+                    .add_stream_map("0:a")
+                    .set_video_filter("scale=160:120"),
+            )
+            .build(),
+    );
+    assert!(
+        matches!(
+            &err,
+            Error::OpenOutput(OpenOutputError::VideoFilterUnused(_))
+        ),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn filter_with_disable_video_is_rejected() {
+    let input = av_fixture("unused_disable_in.mp4");
+    let err = build_err(
+        FfmpegContext::builder()
+            .input(input.as_str())
+            .output(
+                Output::from(tmp_path("unused_disable_out.m4a").as_str())
+                    .set_audio_codec("aac")
+                    .disable_video()
+                    .set_video_filter("scale=160:120"),
+            )
+            .build(),
+    );
+    assert!(
+        matches!(
+            &err,
+            Error::OpenOutput(OpenOutputError::VideoFilterUnused(_))
+        ),
+        "unexpected error: {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Review probes: topology beyond pad counts — disconnected, unreachable and
+// zero/multi-pad descriptions are all the promised typed shape error.
+// ---------------------------------------------------------------------------
+
+fn shape_reason(input: &str, filter: &str) -> String {
+    let err = build_err(
+        FfmpegContext::builder()
+            .input(input)
+            .output(
+                Output::from(tmp_path("shape_probe_out.mp4").as_str())
+                    .set_video_codec("mpeg4")
+                    .set_video_filter(filter),
+            )
+            .build(),
+    );
+    match err {
+        Error::OpenOutput(OpenOutputError::SimpleFilterInvalidShape { desc, reason }) => {
+            assert_eq!(desc, filter);
+            reason
+        }
+        other => panic!("expected SimpleFilterInvalidShape for {filter:?}, got: {other:?}"),
+    }
+}
+
+#[test]
+fn disconnected_graph_is_rejected() {
+    // Probes as 1 open input + 1 open output, but the pushed stream drains
+    // into the sink while the encoder consumes the unrelated source forever.
+    let input = video_fixture("shape_disconnected_in.mp4");
+    let reason = shape_reason(&input, "nullsink;color=c=black:s=64x64");
+    assert!(reason.contains("disconnected sub-graphs"), "reason: {reason}");
+}
+
+#[test]
+fn connected_but_unreachable_graph_is_rejected() {
+    let input = video_fixture("shape_unreachable_in.mp4");
+    let reason = shape_reason(
+        &input,
+        "color=c=black:s=64x64,split[o][aux];[aux][i]overlay,nullsink",
+    );
+    assert!(reason.contains("no directed path"), "reason: {reason}");
+}
+
+#[test]
+fn zero_input_graph_is_rejected() {
+    let input = video_fixture("shape_zero_in_in.mp4");
+    let reason = shape_reason(&input, "color=c=red:s=64x64");
+    assert!(reason.contains("found 0 and 1"), "reason: {reason}");
+}
+
+#[test]
+fn zero_output_graph_is_rejected() {
+    let input = video_fixture("shape_zero_out_in.mp4");
+    let reason = shape_reason(&input, "nullsink");
+    assert!(reason.contains("found 1 and 0"), "reason: {reason}");
+}
+
+#[test]
+fn multi_input_graph_is_rejected() {
+    let input = video_fixture("shape_multi_in_in.mp4");
+    let reason = shape_reason(&input, "overlay");
+    assert!(reason.contains("found 2 and 1"), "reason: {reason}");
+}
+
+// ---------------------------------------------------------------------------
+// Review probes: VideoWriter honors the Output-level chain.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn video_writer_honors_output_video_filter() {
+    use ez_ffmpeg::VideoWriter;
+
+    let out = tmp_path("writer_filter_out.mp4");
+    let mut writer = VideoWriter::builder(64, 48)
+        .open(
+            ez_ffmpeg::Output::from(out.as_str())
+                .set_video_codec("mpeg4")
+                .set_video_filter("scale=32:24"),
+        )
+        .unwrap();
+    let frame = vec![128u8; 64 * 48 * 4];
+    for _ in 0..5 {
+        writer.write(&frame).unwrap();
+    }
+    writer.finish().unwrap();
+    assert_eq!(video_dimensions(&out), (32, 24));
+}
+
+#[test]
+fn video_writer_rejects_conflicting_filter_descriptions() {
+    use ez_ffmpeg::VideoWriter;
+
+    let err = VideoWriter::builder(64, 48)
+        .filter_desc("hue=s=0")
+        .open(
+            ez_ffmpeg::Output::from(tmp_path("writer_conflict_out.mp4").as_str())
+                .set_video_codec("mpeg4")
+                .set_video_filter("scale=32:24"),
+        )
+        .map(|_| ())
+        .unwrap_err();
+    let text = err.to_string();
+    assert!(
+        text.contains("exactly one place"),
+        "expected the conflicting-filter error, got: {text}"
     );
 }
