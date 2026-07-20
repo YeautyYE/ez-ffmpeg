@@ -430,6 +430,13 @@ fn check_output_streams(muxs: &Vec<Muxer>) -> Result<()> {
         unsafe {
             let oformat = (*mux.out_fmt_ctx_ptr()).oformat;
             if !mux.has_src() && (*oformat).flags & AVFMT_NOSTREAMS == 0 {
+                // Packet sinks report their own typed zero-stream error; the
+                // AVFMT_NOSTREAMS escape does not apply to them (the dummy
+                // parameter container is an implementation detail).
+                if mux.is_packet_sink() {
+                    warn!("Packet-sink output does not contain any stream");
+                    return Err(crate::error::PacketSinkError::NoStreams.into());
+                }
                 warn!("Output file does not contain any stream");
                 return Err(OpenOutputError::NotContainStream.into());
             }
@@ -440,7 +447,7 @@ fn check_output_streams(muxs: &Vec<Muxer>) -> Result<()> {
 
 fn check_duplicate_inputs_outputs(inputs: &[Input], outputs: &[Output]) -> Result<()> {
     for output in outputs {
-        if let Some(output_url) = &output.url {
+        if let Some(output_url) = output.url() {
             for input in inputs {
                 if let Some(input_url) = &input.url {
                     if input_url == output_url {

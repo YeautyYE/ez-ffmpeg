@@ -38,6 +38,25 @@ unsafe fn open_output_file(
     copy_ts: bool,
     interrupt_state: &Arc<crate::core::context::InterruptState>,
 ) -> Result<Muxer> {
+    // Take the target first: an `Output` is single-use, and the typed
+    // discriminant — not URL/callback presence — drives validation and the
+    // context/RAII mode below.
+    let target = std::mem::replace(
+        &mut output.target,
+        crate::core::context::output::OutputTarget::Consumed,
+    );
+
+    // Packet-sink validation runs BEFORE any generic option validation or
+    // format lookup, so sink misconfiguration always surfaces as the
+    // documented typed `PacketSinkError` (a bad `set_format` name or an
+    // invalid IO buffer size must not win with a generic error first).
+    if matches!(
+        target,
+        crate::core::context::output::OutputTarget::PacketSink(_)
+    ) {
+        validate_packet_sink_options(output)?;
+    }
+
     // Deferred validation of stored builder options (the setters are
     // infallible and store values as given, like every other option).
     for (name, rate) in [
@@ -53,10 +72,12 @@ unsafe fn open_output_file(
             }
         }
     }
-    if output.io_buffer_size == 0 || output.io_buffer_size > i32::MAX as usize {
+    let io_buffer_size = output
+        .io_buffer_size
+        .unwrap_or(crate::core::context::DEFAULT_CUSTOM_IO_BUFFER_SIZE);
+    if io_buffer_size == 0 || io_buffer_size > i32::MAX as usize {
         return Err(OpenOutputError::InvalidOption(format!(
-            "set_io_buffer_size must be in 1..=i32::MAX, got {}",
-            output.io_buffer_size
+            "set_io_buffer_size must be in 1..=i32::MAX, got {io_buffer_size}"
         ))
         .into());
     }
@@ -85,37 +106,36 @@ unsafe fn open_output_file(
     // early return until the Muxer takes ownership below.
     let mut ctx_guard = crate::core::context::FmtCtxGuard::disarmed();
     let format = get_format(&output.format)?;
-    if output.packet_sink.is_some() {
-        // Packet sink: no container is written and no I/O exists, so every
-        // muxer-only option is a configuration error, surfaced typed at
-        // build time rather than silently ignored.
-        validate_packet_sink_options(output)?;
-        // Allocate a real-but-never-written mp4 context purely for parameter
-        // plumbing (`avformat_new_stream`, codecpar finalization, time-base
-        // adoption). No pb is installed and neither header nor trailer is
-        // ever written; the encoder-visible flags come from the explicit
-        // PacketSinkPolicy below, never from this container's own flags.
-        let dummy = get_format(&Some("mp4".to_string()))?;
-        let ret = avformat_alloc_output_context2(&mut out_fmt_ctx, dummy, null(), null());
-        if out_fmt_ctx.is_null() {
-            warn!(target: LOG_TARGET, "Error initializing the parameter context for packet_sink");
-            return Err(AllocOutputContextError::from(ret).into());
+    // Prepare the context per target. Callback ownership moves into the AVIO
+    // opaque here; the URL and the packet sink ride along for the naming /
+    // Muxer wiring below.
+    let prepared = match target {
+        crate::core::context::output::OutputTarget::Consumed => {
+            // An Output cannot be built twice; its callbacks are gone.
+            error!(target: LOG_TARGET, "output was already consumed by a previous build");
+            return Err(OpenOutputError::InvalidSink.into());
         }
-        ctx_guard.arm(out_fmt_ctx, crate::raw::Mode::Output);
-    }
-    // Byte-domain sinks (URL / write_callback); exclusive with the
-    // packet-sink branch above, which armed the context already.
-    if output.packet_sink.is_none() {
-    match &output.url {
-        None => {
-            if output.write_callback.is_none() {
-                error!(target: LOG_TARGET, "input url and write_callback is none.");
-                return Err(OpenOutputError::InvalidSink.into());
+        crate::core::context::output::OutputTarget::PacketSink(sink) => {
+            // Packet sink: no container is written and no I/O exists.
+            // Allocate a real-but-never-written mp4 context purely for
+            // parameter plumbing (`avformat_new_stream`, codecpar
+            // finalization, time-base adoption). No pb is installed and
+            // neither header nor trailer is ever written; the encoder-visible
+            // flags come from the explicit PacketSinkPolicy below, never from
+            // this container's own flags.
+            let dummy = get_format(&Some("mp4".to_string()))?;
+            let ret = avformat_alloc_output_context2(&mut out_fmt_ctx, dummy, null(), null());
+            if out_fmt_ctx.is_null() {
+                warn!(target: LOG_TARGET, "Error initializing the parameter context for packet_sink");
+                return Err(AllocOutputContextError::from(ret).into());
             }
-
-            let write_callback = output.write_callback.take().unwrap();
-
-            let avio_ctx_buffer_size = output.io_buffer_size;
+            ctx_guard.arm(out_fmt_ctx, crate::raw::Mode::Output);
+            PreparedTarget::PacketSink(sink)
+        }
+        crate::core::context::output::OutputTarget::CustomIo {
+            write: write_callback,
+        } => {
+            let avio_ctx_buffer_size = io_buffer_size;
             let mut avio_ctx_buffer = av_malloc(avio_ctx_buffer_size);
             if avio_ctx_buffer.is_null() {
                 return Err(OpenOutputError::OutOfMemory.into());
@@ -167,8 +187,9 @@ unsafe fn open_output_file(
             (*out_fmt_ctx).pb = avio_ctx;
             (*out_fmt_ctx).flags |= AVFMT_FLAG_CUSTOM_IO;
             ctx_guard.arm(out_fmt_ctx, crate::raw::Mode::OutputCustomIo);
+            PreparedTarget::CustomIo
         }
-        Some(url) => {
+        crate::core::context::output::OutputTarget::Url(url) => {
             let url_cstr = if url == "-" {
                 CString::new("pipe:")?
             } else {
@@ -200,9 +221,9 @@ unsafe fn open_output_file(
             // output, or from the streamless dispatch for a zero-stream one), keeping
             // build() free of output-file side effects; the still-null `pb` closes as
             // a no-op if the job is torn down before it is opened.
+            PreparedTarget::Url(url)
         }
-        }
-    }
+    };
 
     let recording_time_us = match output.stop_time_us {
         None => output.recording_time_us,
@@ -217,13 +238,11 @@ unsafe fn open_output_file(
         }
     };
 
-    let url = output.url.clone().unwrap_or_else(|| {
-        if output.packet_sink.is_some() {
-            format!("packet_sink[{index}]")
-        } else {
-            format!("write_callback[{index}]")
-        }
-    });
+    let url = match &prepared {
+        PreparedTarget::Url(url) => url.clone(),
+        PreparedTarget::CustomIo => format!("write_callback[{index}]"),
+        PreparedTarget::PacketSink(_) => format!("packet_sink[{index}]"),
+    };
 
     let video_codec_opts = convert_options(output.video_codec_opts.clone())?;
     let audio_codec_opts = convert_options(output.audio_codec_opts.clone())?;
@@ -231,7 +250,10 @@ unsafe fn open_output_file(
     let format_opts = convert_options(output.format_opts.clone())?;
     let format_opts = maybe_enable_image2_update(
         out_fmt_ctx,
-        output.url.as_deref(),
+        match &prepared {
+            PreparedTarget::Url(url) => Some(url.as_str()),
+            _ => None,
+        },
         output.max_video_frames,
         format_opts,
     );
@@ -280,15 +302,12 @@ unsafe fn open_output_file(
         None => None,
     };
 
-    // Ownership of out_fmt_ctx transfers to the Muxer. `release()` disarms the
-    // guard and hands back the pointer; wrap it in a `FormatContext` (custom-IO
-    // variant for the write_callback path — the same discriminant the old
-    // `is_set_write_callback` carried) and move it into the infallible
-    // `Muxer::new`. There is no `?` between here and construction, so the pointer
-    // always reaches its next Drop-home.
-    // SAFETY: out_fmt_ctx is a fully-initialized output context; for custom IO its
-    // pb/AVIO+box are already wired (see the arm(...,true) point above), which
-    // from_output_custom_io's teardown requires.
+    // Ownership of out_fmt_ctx transfers to the Muxer. `release_into()` disarms
+    // the guard and wraps the pointer in a `FormatContext` carrying the SAME
+    // teardown `Mode` the guard was armed with — the mode is decided once, at
+    // the target dispatch above, never re-inferred from URL presence (a
+    // packet sink has no URL yet is NOT custom AVIO). There is no `?` between
+    // here and construction, so the pointer always reaches its next Drop-home.
     // Materialize the per-media-type BSF chains into NUL-validated CStrings
     // now (build time): a NUL byte surfaces as the existing NulError -> Error
     // path here, before any thread is spawned. Empty strings were already
@@ -303,12 +322,7 @@ unsafe fn open_output_file(
             .transpose()?,
     };
 
-    let out_fmt_ctx = ctx_guard.release();
-    let fc = if output.url.is_none() {
-        crate::raw::FormatContext::from_output_custom_io(out_fmt_ctx)
-    } else {
-        crate::raw::FormatContext::from_output(out_fmt_ctx)
-    };
+    let fc = ctx_guard.release_into();
     let mut mux = Muxer::new(
         url,
         fc,
@@ -363,7 +377,7 @@ unsafe fn open_output_file(
         interrupt_state.clone(),
     );
 
-    if let Some(sink) = output.packet_sink.take() {
+    if let PreparedTarget::PacketSink(sink) = prepared {
         // PacketSinkPolicy: the encoder-visible muxing flags are pinned by
         // the sink tier and overwrite the dummy container's snapshot —
         // GLOBAL_HEADER (out-of-band codec configuration) and the vsync
@@ -376,23 +390,48 @@ unsafe fn open_output_file(
     Ok(mux)
 }
 
+/// The output target after context preparation: callbacks have moved into
+/// the AVIO opaque; what remains rides to the Muxer wiring (display name,
+/// image2 detection, sink handoff).
+enum PreparedTarget {
+    Url(String),
+    CustomIo,
+    PacketSink(crate::core::packet_sink::PacketSink),
+}
+
 /// Build-time validation for packet-sink outputs: every option that only
 /// makes sense for a written container is a typed configuration error.
+/// Runs before the generic option validation, so these typed errors always
+/// win. Setter *use* is what is rejected (`set_io_buffer_size` stores
+/// `Some`, even when set to the default value).
 fn validate_packet_sink_options(output: &Output) -> Result<()> {
     use crate::error::PacketSinkError;
     let unsupported: &[(&'static str, bool)] = &[
         ("set_format", output.format.is_some()),
         ("set_seek_callback", output.seek_callback.is_some()),
-        (
-            "set_io_buffer_size",
-            output.io_buffer_size != crate::core::context::DEFAULT_CUSTOM_IO_BUFFER_SIZE,
-        ),
+        ("set_io_buffer_size", output.io_buffer_size.is_some()),
         ("set_video_bsf", output.video_bsf.is_some()),
         ("set_audio_bsf", output.audio_bsf.is_some()),
         ("set_subtitle_bsf", output.subtitle_bsf.is_some()),
         ("set_format_opt", output.format_opts.is_some()),
         ("add_attachment", !output.attachments.is_empty()),
         ("set_subtitle_codec", output.subtitle_codec.is_some()),
+        // A packet sink writes no container, so container metadata can never
+        // land anywhere; silently accepting it would misrepresent delivery.
+        ("add_metadata", output.global_metadata.is_some()),
+        (
+            "add_stream_metadata",
+            !output.stream_metadata.is_empty(),
+        ),
+        (
+            "add_chapter_metadata",
+            !output.chapter_metadata.is_empty(),
+        ),
+        (
+            "add_program_metadata",
+            !output.program_metadata.is_empty(),
+        ),
+        ("map_metadata", !output.metadata_map.is_empty()),
     ];
     for (option, set) in unsupported {
         if *set {
@@ -403,6 +442,21 @@ fn validate_packet_sink_options(output: &Output) -> Result<()> {
         || output.audio_codec.as_deref() == Some("copy")
     {
         return Err(PacketSinkError::StreamCopyUnsupported.into());
+    }
+    // The strict tier owns AV_CODEC_FLAG_GLOBAL_HEADER (out-of-band codec
+    // configuration is the product). A user-supplied `flags` codec option is
+    // applied AFTER the policy flag and can clear or replace it (both
+    // `flags=-global_header` and an absolute `flags=x` assignment), so it is
+    // rejected up front rather than failing later with MissingExtradata.
+    for opts in [&output.video_codec_opts, &output.audio_codec_opts] {
+        if let Some(opts) = opts {
+            if opts.keys().any(|k| k == "flags") {
+                return Err(PacketSinkError::UnsupportedOption(
+                    "the 'flags' codec option (it can clear the global_header policy)",
+                )
+                .into());
+            }
+        }
     }
     Ok(())
 }

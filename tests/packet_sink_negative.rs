@@ -61,6 +61,16 @@ fn build_rejects_muxer_only_options() {
             "set_subtitle_codec",
             Output::new_by_packet_sink(noop_sink()).set_subtitle_codec("mov_text"),
         ),
+        (
+            "add_metadata",
+            Output::new_by_packet_sink(noop_sink()).add_metadata("title", "x"),
+        ),
+        (
+            "add_stream_metadata",
+            Output::new_by_packet_sink(noop_sink())
+                .add_stream_metadata("v:0", "language", "eng")
+                .expect("stream spec parses"),
+        ),
     ];
     for (expected, output) in cases {
         match build_err(testsrc(1), output) {
@@ -69,6 +79,54 @@ fn build_rejects_muxer_only_options() {
             }
             other => panic!("{expected}: expected UnsupportedOption, got {other:?}"),
         }
+    }
+}
+
+/// Sink validation must WIN against generic option validation: an invalid
+/// format name, an invalid IO buffer size, and a default-valued buffer size
+/// all surface as the documented typed error, never a generic
+/// `OpenOutputError` (the typed validator runs first and tracks setter USE,
+/// not the stored value).
+#[test]
+fn sink_validation_runs_before_generic_validation() {
+    match build_err(
+        testsrc(1),
+        Output::new_by_packet_sink(noop_sink()).set_format("no-such-format"),
+    ) {
+        Error::PacketSink(PacketSinkError::UnsupportedOption("set_format")) => {}
+        other => panic!("invalid format name must hit sink validation first, got {other:?}"),
+    }
+    match build_err(
+        testsrc(1),
+        Output::new_by_packet_sink(noop_sink()).set_io_buffer_size(0),
+    ) {
+        Error::PacketSink(PacketSinkError::UnsupportedOption("set_io_buffer_size")) => {}
+        other => panic!("invalid buffer size must hit sink validation first, got {other:?}"),
+    }
+    match build_err(
+        testsrc(1),
+        Output::new_by_packet_sink(noop_sink()).set_io_buffer_size(64 * 1024),
+    ) {
+        Error::PacketSink(PacketSinkError::UnsupportedOption("set_io_buffer_size")) => {}
+        other => panic!("default-valued buffer size must still be rejected, got {other:?}"),
+    }
+}
+
+/// The strict tier owns AV_CODEC_FLAG_GLOBAL_HEADER; a user `flags` codec
+/// option (such as `flags=-global_header`, the review probe) is applied after
+/// the policy flag and could clear it, so it is rejected typed at build time.
+#[test]
+fn build_rejects_codec_flags_that_could_clear_global_header() {
+    match build_err(
+        testsrc(1),
+        Output::new_by_packet_sink(noop_sink())
+            .set_video_codec("libx264")
+            .set_video_codec_opt("flags", "-global_header"),
+    ) {
+        Error::PacketSink(PacketSinkError::UnsupportedOption(option)) => {
+            assert!(option.contains("flags"), "got option {option}")
+        }
+        other => panic!("expected the flags rejection, got {other:?}"),
     }
 }
 
@@ -272,19 +330,17 @@ fn failing_packet_callback_stops_the_job_without_on_end() {
 }
 
 #[test]
-fn zero_stream_packet_sink_fails_at_build() {
+fn zero_stream_packet_sink_fails_typed_at_build() {
     // Audio-only input with every stream disabled: the packet sink maps no
-    // stream. The generic zero-stream build validation rejects it before the
-    // sink-specific NoStreams guard (which stays as defense in depth at the
-    // streamless dispatch) could ever run.
+    // stream. The zero-stream build validation reports the sink-specific
+    // typed error (NoStreams), not the generic container NotContainStream.
     match build_err(
         sine(1),
         Output::new_by_packet_sink(noop_sink())
             .disable_video()
             .disable_audio(),
     ) {
-        Error::OpenOutput(ez_ffmpeg::error::OpenOutputError::NotContainStream) => {}
         Error::PacketSink(PacketSinkError::NoStreams) => {}
-        other => panic!("expected a zero-stream rejection, got {other:?}"),
+        other => panic!("expected PacketSink(NoStreams), got {other:?}"),
     }
 }

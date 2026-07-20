@@ -34,6 +34,7 @@ use crate::core::context::{in_fmt_ctx_free, out_fmt_ctx_free};
 ///
 /// Shared with `FmtCtxGuard` (the open-time RAII guard in `crate::core::context`),
 /// which dispatches its Drop on the same discriminant.
+#[derive(Clone, Copy)]
 pub(crate) enum Mode {
     /// Input context opened from a URL/path (no custom AVIO).
     Input,
@@ -141,6 +142,22 @@ impl FormatContext {
             ptr,
             mode: Mode::OutputCustomIo,
         }
+    }
+
+    /// Take ownership of an already-initialized context with an explicitly
+    /// selected teardown [`Mode`] (used by `FmtCtxGuard::release_into`, which
+    /// preserves its arm-time mode instead of letting callers re-infer it).
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be non-null and satisfy the constructor contract of the
+    /// matching mode (`from_input` / `from_input_custom_io` / `from_output` /
+    /// `from_output_custom_io`). Ownership transfers to the returned value;
+    /// the caller must not free `ptr` again.
+    #[cfg_attr(docsrs, allow(dead_code))]
+    #[inline]
+    pub(crate) unsafe fn from_mode(ptr: *mut AVFormatContext, mode: Mode) -> Self {
+        Self { ptr, mode }
     }
 
     /// Borrow the raw pointer for FFI that reads or advances the context

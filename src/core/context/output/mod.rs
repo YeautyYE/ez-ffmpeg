@@ -13,57 +13,46 @@ pub(crate) use attachment::AttachmentSpec;
 // We require `+ Send` on callback types to ensure this.
 // Output is !Sync because FnMut callbacks require exclusive access.
 
-pub struct Output {
-    /// The URL of the output destination.
+/// Where an [`Output`]'s encoded data goes — exactly one of a URL/path, a
+/// custom byte-write callback, or a packet sink. One typed discriminant
+/// instead of correlated `Option` fields, so the build path selects the
+/// context/RAII mode by variant rather than inferring it from "no URL means
+/// custom AVIO".
+pub(crate) enum OutputTarget {
+    /// A file path or URL (e.g. `output.mp4`, `rtmp://...`); FFmpeg opens and
+    /// writes it at runtime mux initialization.
+    Url(String),
+    /// A custom byte sink: the muxed container bytes are handed to this
+    /// write callback through a custom AVIO context.
     ///
-    /// This specifies where the output stream will be written. It can be:
-    /// - A local file path (e.g., `file:///path/to/output.mp4`).
-    /// - A network destination (e.g., `rtmp://example.com/live/stream`).
-    /// - Any other URL supported by FFmpeg (e.g., `udp://...`, `http://...`).
-    ///
-    /// The URL must be valid. If the URL is invalid or unsupported, the library will
-    /// return an error when attempting to initialize the output stream.
-    pub(crate) url: Option<String>,
+    /// The callback receives a buffer of encoded container bytes and returns
+    /// the number of bytes written, or a negative `AVERROR` value (e.g.
+    /// `ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO)`) on failure.
+    CustomIo {
+        write: Box<dyn FnMut(&[u8]) -> i32 + Send>,
+    },
+    /// A packet sink: encoded packets are delivered to callbacks and no
+    /// container is written (see [`crate::packet_sink`]).
+    PacketSink(crate::core::packet_sink::PacketSink),
+    /// The target was moved into the muxer when the context was built. An
+    /// `Output` is single-use; this state only exists after `build()`.
+    Consumed,
+}
 
-    /// A callback function for custom data writing.
-    ///
-    /// The `write_callback` function allows you to provide custom logic for handling data
-    /// output from the encoding process. This is useful for scenarios where the output is
-    /// not written directly to a standard destination (like a file or URL), but instead to
-    /// a custom data sink, such as an in-memory buffer or a custom network destination.
-    ///
-    /// The callback receives a buffer of encoded data (`buf: &[u8]`) and should return the number of bytes
-    /// successfully written. If an error occurs, a negative value should be returned. For example:
-    /// - `ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO)` indicates an I/O error.
-    ///
-    /// ### Parameters:
-    /// - `buf: &[u8]`: A buffer containing the encoded data to be written.
-    ///
-    /// ### Return Value:
-    /// - **Positive Value**: The number of bytes successfully written.
-    /// - **Negative Value**: Indicates an error occurred, such as:
-    ///   - `ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO)`: General I/O error.
-    ///   - Custom-defined error codes depending on your implementation.
-    ///
-    /// ### Example:
-    /// ```rust,ignore
-    /// fn custom_write_callback(buf: &[u8]) -> i32 {
-    ///     println!("Writing data: {} bytes", buf.len());
-    ///     buf.len() as i32 // Return the number of bytes successfully written
-    /// }
-    /// ```
-    /// ### Note:
-    /// It is recommended to set the `format` field to the desired output format (e.g., `mp4`, `flv`, etc.)
-    /// when using a custom `write_callback`. The `format` ensures that FFmpeg processes the output
-    /// correctly for the specified format.
-    pub(crate) write_callback: Option<Box<dyn FnMut(&[u8]) -> i32 + Send>>,
+pub struct Output {
+    /// The output destination (URL, custom byte sink, or packet sink).
+    /// Moved out (leaving [`OutputTarget::Consumed`]) when the context is
+    /// built.
+    pub(crate) target: OutputTarget,
 
     /// Size of the AVIO buffer backing a custom `write_callback`, in bytes.
     /// Only used when the output is a callback (no URL). Larger values reduce
-    /// Rust↔FFmpeg round-trips for sequential/network sinks; the default is
+    /// Rust↔FFmpeg round-trips for sequential/network sinks; unset means
     /// [`DEFAULT_CUSTOM_IO_BUFFER_SIZE`](crate::core::context::DEFAULT_CUSTOM_IO_BUFFER_SIZE)
-    /// (64 KiB). Set via [`Output::set_io_buffer_size`].
-    pub(crate) io_buffer_size: usize,
+    /// (64 KiB). `Some` records that [`Output::set_io_buffer_size`] was
+    /// called — packet-sink validation must distinguish "set to the default
+    /// value" from "never set".
+    pub(crate) io_buffer_size: Option<usize>,
 
     /// FFmpeg `-max_muxing_queue_size` parity: per-stream packet cap for the
     /// pre-mux queue, applied only once
@@ -433,13 +422,6 @@ pub struct Output {
     /// time; the file is read then, so a missing/unreadable/empty/oversized
     /// file surfaces as an `Err` from the context build — never a panic.
     pub(crate) attachments: Vec<AttachmentSpec>,
-
-    /// Packet-sink callback bundle (`Output::new_by_packet_sink`): the output
-    /// delivers encoded packets to these callbacks instead of muxing them.
-    /// Mutually exclusive with `url`/`write_callback`; build validation
-    /// rejects muxer-only options (`set_format`, seek callback, IO buffer
-    /// size, bitstream filters, format options, attachments) on such outputs.
-    pub(crate) packet_sink: Option<crate::core::packet_sink::PacketSink>,
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -455,6 +437,80 @@ pub enum VSyncMethod {
 impl Output {
     pub fn new(url: impl Into<String>) -> Self {
         url.into().into()
+    }
+
+    /// The destination URL, when this output targets one.
+    pub(crate) fn url(&self) -> Option<&str> {
+        match &self.target {
+            OutputTarget::Url(url) => Some(url),
+            _ => None,
+        }
+    }
+
+    /// Whether this output delivers encoded packets to callbacks instead of
+    /// writing a container.
+    pub(crate) fn is_packet_sink(&self) -> bool {
+        matches!(self.target, OutputTarget::PacketSink(_))
+    }
+
+    /// The single field-literal constructor every public entry point funnels
+    /// through; the target discriminant is the only per-entry difference.
+    fn with_target(target: OutputTarget) -> Self {
+        Self {
+            target,
+            io_buffer_size: None,
+            max_muxing_queue_size: crate::core::context::pre_mux_queue::DEFAULT_PRE_MUX_MAX_PACKETS,
+            muxing_queue_data_threshold:
+                crate::core::context::pre_mux_queue::DEFAULT_PRE_MUX_DATA_THRESHOLD,
+            seek_callback: None,
+            frame_pipelines: None,
+            stream_map_specs: vec![],
+            stream_maps: vec![],
+            format: None,
+            video_codec: None,
+            audio_codec: None,
+            subtitle_codec: None,
+            video_bsf: None,
+            audio_bsf: None,
+            subtitle_bsf: None,
+            start_time_us: None,
+            recording_time_us: None,
+            stop_time_us: None,
+            framerate: None,
+            framerate_max: None,
+            vsync_method: VSyncMethod::VsyncAuto,
+            bits_per_raw_sample: None,
+            audio_sample_rate: None,
+            audio_channels: None,
+            audio_sample_fmt: None,
+            video_qscale: None,
+            audio_qscale: None,
+            forced_kf_spec: None,
+            max_video_frames: None,
+            max_audio_frames: None,
+            max_subtitle_frames: None,
+            video_codec_opts: None,
+            audio_codec_opts: None,
+            subtitle_codec_opts: None,
+            format_opts: None,
+            global_metadata: None,
+            stream_metadata: Vec::new(),
+            chapter_metadata: HashMap::new(),
+            program_metadata: HashMap::new(),
+            metadata_map: Vec::new(),
+            auto_copy_metadata: true, // FFmpeg default: auto-copy enabled
+            video_disable: false,
+            audio_disable: false,
+            subtitle_disable: false,
+            data_disable: false,
+            pix_fmt: None,
+            video_filter: None,
+            sws_opts: None,
+            swr_opts: None,
+            attachments: Vec::new(),
+            shortest: false,
+            shortest_buf_duration_us: 10_000_000,
+        }
     }
 
     /// Creates a new `Output` instance with a custom write callback and format string.
@@ -541,7 +597,7 @@ impl Output {
     /// if `size` is 0 or exceeds `i32::MAX` (FFmpeg's `avio_alloc_context`
     /// takes an `int` buffer size).
     pub fn set_io_buffer_size(mut self, size: usize) -> Self {
-        self.io_buffer_size = size;
+        self.io_buffer_size = Some(size);
         self
     }
 
@@ -1671,142 +1727,22 @@ impl Output {
 }
 
 impl From<Box<dyn FnMut(&[u8]) -> i32 + Send>> for Output {
-    fn from(write_callback_and_format: Box<dyn FnMut(&[u8]) -> i32 + Send>) -> Self {
-        Self {
-            url: None,
-            write_callback: Some(write_callback_and_format),
-            io_buffer_size: crate::core::context::DEFAULT_CUSTOM_IO_BUFFER_SIZE,
-            max_muxing_queue_size: crate::core::context::pre_mux_queue::DEFAULT_PRE_MUX_MAX_PACKETS,
-            muxing_queue_data_threshold:
-                crate::core::context::pre_mux_queue::DEFAULT_PRE_MUX_DATA_THRESHOLD,
-            seek_callback: None,
-            frame_pipelines: None,
-            stream_map_specs: vec![],
-            stream_maps: vec![],
-            format: None,
-            video_codec: None,
-            audio_codec: None,
-            subtitle_codec: None,
-            video_bsf: None,
-            audio_bsf: None,
-            subtitle_bsf: None,
-            start_time_us: None,
-            recording_time_us: None,
-            stop_time_us: None,
-            framerate: None,
-            framerate_max: None,
-            vsync_method: VSyncMethod::VsyncAuto,
-            bits_per_raw_sample: None,
-            audio_sample_rate: None,
-            audio_channels: None,
-            audio_sample_fmt: None,
-            video_qscale: None,
-            audio_qscale: None,
-            forced_kf_spec: None,
-            max_video_frames: None,
-            max_audio_frames: None,
-            max_subtitle_frames: None,
-            video_codec_opts: None,
-            audio_codec_opts: None,
-            subtitle_codec_opts: None,
-            format_opts: None,
-            // Metadata fields - initialized with defaults
-            global_metadata: None,
-            stream_metadata: Vec::new(),
-            chapter_metadata: HashMap::new(),
-            program_metadata: HashMap::new(),
-            metadata_map: Vec::new(),
-            auto_copy_metadata: true, // FFmpeg default: auto-copy enabled
-            // Stream disable flags - initialized to false (all streams enabled)
-            video_disable: false,
-            audio_disable: false,
-            subtitle_disable: false,
-            data_disable: false,
-            pix_fmt: None,
-            video_filter: None,
-            sws_opts: None,
-            swr_opts: None,
-            attachments: Vec::new(),
-            shortest: false,
-            shortest_buf_duration_us: 10_000_000,
-            packet_sink: None,
-        }
+    fn from(write_callback: Box<dyn FnMut(&[u8]) -> i32 + Send>) -> Self {
+        Self::with_target(OutputTarget::CustomIo {
+            write: write_callback,
+        })
     }
 }
 
 impl From<crate::core::packet_sink::PacketSink> for Output {
     fn from(sink: crate::core::packet_sink::PacketSink) -> Self {
-        // Reuse the write-callback defaults (url: None) instead of a third
-        // 50-line field literal; the placeholder callback is dropped here and
-        // a packet-sink output never installs AVIO.
-        let mut output: Self = (Box::new(|_: &[u8]| 0) as Box<dyn FnMut(&[u8]) -> i32 + Send>).into();
-        output.write_callback = None;
-        output.packet_sink = Some(sink);
-        output
+        Self::with_target(OutputTarget::PacketSink(sink))
     }
 }
 
 impl From<String> for Output {
     fn from(url: String) -> Self {
-        Self {
-            url: Some(url),
-            write_callback: None,
-            io_buffer_size: crate::core::context::DEFAULT_CUSTOM_IO_BUFFER_SIZE,
-            max_muxing_queue_size: crate::core::context::pre_mux_queue::DEFAULT_PRE_MUX_MAX_PACKETS,
-            muxing_queue_data_threshold:
-                crate::core::context::pre_mux_queue::DEFAULT_PRE_MUX_DATA_THRESHOLD,
-            seek_callback: None,
-            frame_pipelines: None,
-            stream_map_specs: vec![],
-            stream_maps: vec![],
-            format: None,
-            video_codec: None,
-            audio_codec: None,
-            subtitle_codec: None,
-            video_bsf: None,
-            audio_bsf: None,
-            subtitle_bsf: None,
-            start_time_us: None,
-            recording_time_us: None,
-            stop_time_us: None,
-            framerate: None,
-            framerate_max: None,
-            vsync_method: VSyncMethod::VsyncAuto,
-            bits_per_raw_sample: None,
-            audio_sample_rate: None,
-            audio_channels: None,
-            audio_sample_fmt: None,
-            video_qscale: None,
-            audio_qscale: None,
-            forced_kf_spec: None,
-            max_video_frames: None,
-            max_audio_frames: None,
-            max_subtitle_frames: None,
-            video_codec_opts: None,
-            audio_codec_opts: None,
-            subtitle_codec_opts: None,
-            format_opts: None,
-            // Metadata fields - initialized with defaults
-            global_metadata: None,
-            stream_metadata: Vec::new(),
-            chapter_metadata: HashMap::new(),
-            program_metadata: HashMap::new(),
-            metadata_map: Vec::new(),
-            auto_copy_metadata: true, // FFmpeg default: auto-copy enabled
-            // Stream disable flags - initialized to false (all streams enabled)
-            video_disable: false,
-            audio_disable: false,
-            subtitle_disable: false,
-            data_disable: false,
-            pix_fmt: None,
-            video_filter: None,
-            sws_opts: None,
-            swr_opts: None,
-            attachments: Vec::new(),
-            shortest: false,
-            shortest_buf_duration_us: 10_000_000,
-            packet_sink: None,
-        }
+        Self::with_target(OutputTarget::Url(url))
     }
 }
 
@@ -1898,12 +1834,10 @@ mod tests {
     use super::{parse_forced_key_frames, Output};
 
     #[test]
-    fn io_buffer_size_defaults_to_64k() {
-        use crate::core::context::DEFAULT_CUSTOM_IO_BUFFER_SIZE;
-        assert_eq!(
-            Output::from("out.mp4").io_buffer_size,
-            DEFAULT_CUSTOM_IO_BUFFER_SIZE
-        );
+    fn io_buffer_size_is_unset_until_the_setter_runs() {
+        // `None` = "never set"; the effective 64 KiB default is applied at
+        // build time. Packet-sink validation needs the distinction.
+        assert_eq!(Output::from("out.mp4").io_buffer_size, None);
     }
 
     #[test]
@@ -1912,14 +1846,14 @@ mod tests {
             Output::from("out.mp4")
                 .set_io_buffer_size(1 << 20)
                 .io_buffer_size,
-            1 << 20
+            Some(1 << 20)
         );
     }
 
     #[test]
     fn set_io_buffer_size_stores_invalid_values_for_deferred_validation() {
         let output = Output::new_by_write_callback(|_| 0).set_io_buffer_size(0);
-        assert_eq!(output.io_buffer_size, 0);
+        assert_eq!(output.io_buffer_size, Some(0));
     }
 
     #[test]

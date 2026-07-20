@@ -254,7 +254,7 @@ fn mpegts_rendition_output_is_frozen() {
     let l = ladder();
     let output = l.rendition_output(0, &l.renditions[0], "180", "6").unwrap();
 
-    assert_eq!(output.url.as_deref(), Some("out/720p/index.m3u8"));
+    assert_eq!(output.url(), Some("out/720p/index.m3u8"));
     assert_eq!(output.format.as_deref(), Some("hls"));
     assert_eq!(output.video_codec.as_deref(), Some("libx264"));
     assert_eq!(output.audio_codec.as_deref(), Some("aac"));

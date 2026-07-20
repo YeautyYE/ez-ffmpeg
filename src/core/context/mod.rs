@@ -666,6 +666,24 @@ impl FmtCtxGuard {
         self.ctx = null_mut();
         ctx
     }
+
+    /// Relinquish ownership into a [`crate::raw::FormatContext`] carrying the
+    /// same teardown [`crate::raw::Mode`] this guard was armed with: the mode
+    /// is decided once, at the arm site, and preserved end-to-end — callers
+    /// never re-infer it from output shape.
+    ///
+    /// Panics if the guard is disarmed (nothing to release); callers invoke
+    /// this only after a successful `arm`.
+    pub(crate) fn release_into(&mut self) -> crate::raw::FormatContext {
+        let mode = self.mode;
+        let ctx = self.release();
+        assert!(!ctx.is_null(), "release_into on a disarmed FmtCtxGuard");
+        // SAFETY: `ctx` was armed as a valid, fully-initialized context of
+        // exactly this mode (for OutputCustomIo the AVIO/pb wiring precedes
+        // the arm); ownership transfers to the returned FormatContext and the
+        // guard is now disarmed, so no double free is possible.
+        unsafe { crate::raw::FormatContext::from_mode(ctx, mode) }
+    }
 }
 
 impl Drop for FmtCtxGuard {
