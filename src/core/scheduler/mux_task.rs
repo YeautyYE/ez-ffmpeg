@@ -1454,14 +1454,28 @@ fn _mux_init(
             // 3. join this muxer's own producers (encoders) and free its
             // context.
             drop(guard);
-            // 4. FULL-JOB SETTLEMENT BARRIER (only when this sink believes it
-            // succeeded — a locally failed sink dispatches promptly): every
-            // remaining failure source — sibling muxers (their context frees,
-            // including custom-IO capture destruction, run inside their
-            // threads before their slot release), filter graphs (whose final
-            // logging can panic late), demuxers, decoders, encoders, frame
-            // sources — records its panic/error BEFORE releasing its slot, so
-            // waiting for all peer slots settles the whole job.
+            // 4. FULL-JOB SETTLEMENT BARRIER. Registration is UNIFORM —
+            // every packet-sink worker reaching this terminal region counts
+            // as settled, before any terminal callback or capture
+            // destruction; only the WAIT is conditional:
+            //   - locally complete: register AND wait — the terminal
+            //     decision samples the settled result, so every remaining
+            //     failure source (sibling muxers, whose context frees
+            //     including custom-IO capture destruction run inside their
+            //     threads before their slot release; filter graphs, whose
+            //     final logging can panic late; demuxers, decoders,
+            //     encoders, frame sources — each records its panic/error
+            //     BEFORE releasing its slot) must have settled first;
+            //   - truncated/locally failed: register WITHOUT waiting and
+            //     dispatch the failure promptly — it delivers no on_end, so
+            //     it samples nothing. Registering is sound for the same
+            //     reason a barrier waiter counts itself out: its error is
+            //     already recorded (errors precede the terminal status) and
+            //     ALL of its remaining work is the panic-contained terminal
+            //     region, which can no longer fail the job. Skipping the
+            //     registration deadlocked mixed jobs: a healthy sibling
+            //     waited on the live-but-unregistered failed sink while the
+            //     failed sink's blocking terminal callback waited back.
             //
             // Deadlock argument — every wait edge this thread now has is the
             // peer-slot wait, and no peer can be waiting on this thread:
@@ -1472,13 +1486,17 @@ fn _mux_init(
             //       no channel into this muxer remains;
             //   (c) peers park only on their own sources/sinks or on the
             //       scheduler status, none of which this thread feeds;
-            //   (d) another packet sink at this same barrier is counted out
-            //       by the waiter count (live <= waiters), so two sinks
-            //       proceed without waiting on each other;
+            //   (d) every OTHER packet-sink worker registers here whatever
+            //       its outcome, so it is counted out of the condition
+            //       (live <= waiters) — sinks never wait on each other's
+            //       terminal callbacks, only for slots of workers that are
+            //       not yet in their terminal region;
             //   (e) wait()/stop()/abort() run on user threads outside the
             //       synchronizer and wait for slots, never the reverse.
             if locally_complete {
                 slot_guard.thread_sync.wait_for_peers_settled();
+            } else {
+                slot_guard.thread_sync.register_settled();
             }
 
             // 5. LINEARIZATION POINT: one fresh status load and one result
