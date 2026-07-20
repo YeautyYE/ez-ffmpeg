@@ -98,6 +98,139 @@ fn stop_mid_stream_fires_no_terminal_callback() {
     }
 }
 
+/// The correctness review's teardown probe: stop() must not return while a
+/// blocking callback-capture destructor is still running — user captures are
+/// destroyed at a defined point BEFORE the worker's thread slot releases.
+#[test]
+fn stop_returns_only_after_callback_captures_are_destroyed() {
+    if !have_encoder("libx264") {
+        eprintln!("skipping: libx264 not available in this FFmpeg build");
+        return;
+    }
+    let _lock = PROCESS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    /// A capture whose destructor takes measurable time and records its
+    /// completion.
+    struct SlowCapture {
+        destroyed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl Drop for SlowCapture {
+        fn drop(&mut self) {
+            std::thread::sleep(Duration::from_millis(400));
+            self.destroyed
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    let destroyed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let delivered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let capture = SlowCapture {
+        destroyed: destroyed.clone(),
+    };
+    let delivered_in_cb = delivered.clone();
+    let sink = ez_ffmpeg::packet_sink::PacketSink::builder(move |_pkt| {
+        // Keep the capture owned by the callback until the sink drops.
+        let _hold = &capture;
+        delivered_in_cb.store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    })
+    .build();
+
+    let scheduler = FfmpegContext::builder()
+        .input(paced_input())
+        .output(
+            Output::from(sink)
+                .set_video_codec("libx264")
+                .set_video_codec_opt("preset", "ultrafast")
+                .set_video_codec_opt("tune", "zerolatency"),
+        )
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+    // Let delivery begin so the callback (and its capture) provably moved to
+    // the worker.
+    let began = std::time::Instant::now();
+    while !delivered.load(std::sync::atomic::Ordering::Acquire)
+        && began.elapsed() < Duration::from_secs(10)
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        delivered.load(std::sync::atomic::Ordering::Acquire),
+        "no packet was delivered before the stop"
+    );
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let destroyed_probe = destroyed.clone();
+    std::thread::spawn(move || {
+        scheduler.stop().expect("stop() failed");
+        // Sampled the INSTANT stop() returns: the slow destructor must have
+        // completed already.
+        let _ = tx.send(destroyed_probe.load(std::sync::atomic::Ordering::Acquire));
+    });
+    let destroyed_when_stop_returned = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("stop() hung");
+    assert!(
+        destroyed_when_stop_returned,
+        "stop() returned while the callback-capture destructor was still running"
+    );
+}
+
+/// The channel review probe: capacity 1, a LIVE receiver that never drains,
+/// packets in flight — stop() must still terminate (the blocked bounded send
+/// observes cancellation), cleanly and without fabricating an error.
+#[test]
+fn stop_terminates_with_full_undrained_channel() {
+    if !have_encoder("libx264") {
+        eprintln!("skipping: libx264 not available in this FFmpeg build");
+        return;
+    }
+    let _lock = PROCESS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (sink, receiver) =
+        ez_ffmpeg::packet_sink::PacketSink::channel(std::num::NonZeroUsize::new(1).unwrap());
+    let scheduler = FfmpegContext::builder()
+        .input(paced_input())
+        .output(
+            Output::from(sink)
+                .set_video_codec("libx264")
+                .set_video_codec_opt("preset", "ultrafast")
+                .set_video_codec_opt("tune", "zerolatency"),
+        )
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+    // Give the pipeline time to fill the capacity-1 channel and block.
+    std::thread::sleep(Duration::from_millis(700));
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = scheduler.stop();
+        let _ = tx.send(result);
+    });
+    let result = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("stop() hung with a full, undrained channel");
+    result.expect("cooperative channel cancellation must not fabricate a job error");
+    // The receiver stayed alive the whole time; drain whatever landed.
+    let mut saw_end_or_error = false;
+    while let Ok(event) = receiver.try_recv() {
+        if matches!(
+            event,
+            ez_ffmpeg::packet_sink::PacketSinkEvent::End
+                | ez_ffmpeg::packet_sink::PacketSinkEvent::Error(_)
+        ) {
+            saw_end_or_error = true;
+        }
+    }
+    assert!(
+        !saw_end_or_error,
+        "cancellation must not produce a terminal sink event"
+    );
+}
+
 /// Dropping the running scheduler (no explicit stop) takes the RunningGuard
 /// path: same contract — clean exit, no terminal sink callback.
 #[test]
