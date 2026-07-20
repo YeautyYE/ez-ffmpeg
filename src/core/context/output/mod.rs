@@ -447,12 +447,6 @@ impl Output {
         }
     }
 
-    /// Whether this output delivers encoded packets to callbacks instead of
-    /// writing a container.
-    pub(crate) fn is_packet_sink(&self) -> bool {
-        matches!(self.target, OutputTarget::PacketSink(_))
-    }
-
     /// The single field-literal constructor every public entry point funnels
     /// through; the target discriminant is the only per-entry difference.
     fn with_target(target: OutputTarget) -> Self {

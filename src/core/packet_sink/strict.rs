@@ -148,7 +148,7 @@ impl PacketSinkWorker {
         stream_count: usize,
         sink: PacketSink,
         scheduler_status: &Arc<AtomicUsize>,
-    ) -> Result<Self, (PacketSink, PacketSinkError)> {
+    ) -> Result<Self, Box<(PacketSink, PacketSinkError)>> {
         // Tier dispatch: only Strict exists; new tiers add arms here.
         let super::PacketSinkTier::Strict = sink.tier;
 
@@ -170,19 +170,22 @@ impl PacketSinkWorker {
             // valid positive rational BEFORE any callback observes it (it
             // anchors rescaling and labels every delivered timestamp).
             if time_base.num <= 0 || time_base.den <= 0 {
-                return Err((
+                return Err(Box::new((
                     sink,
                     PacketSinkError::InvalidTimeBase {
                         stream_index,
                         num: time_base.num,
                         den: time_base.den,
                     },
-                ));
+                )));
             }
             let extradata = match extradata_bytes(codecpar) {
                 Some(bytes) => bytes,
                 None => {
-                    return Err((sink, PacketSinkError::MissingExtradata { stream_index }))
+                    return Err(Box::new((
+                        sink,
+                        PacketSinkError::MissingExtradata { stream_index },
+                    )))
                 }
             };
 
@@ -191,17 +194,17 @@ impl PacketSinkWorker {
                     // The encoder whitelist was enforced at build time; this
                     // guards the codec id itself (h264 only in v1).
                     if (*codecpar).codec_id != ffmpeg_sys_next::AVCodecID::AV_CODEC_ID_H264 {
-                        return Err((
+                        return Err(Box::new((
                             sink,
                             PacketSinkError::UnsupportedStream {
                                 kind: "non-H.264 video",
                             },
-                        ));
+                        )));
                     }
                     let (runtime, delivered) =
                         match AvcRuntime::from_extradata(&extradata, stream_index) {
                             Ok(pair) => pair,
-                            Err(e) => return Err((sink, e)),
+                            Err(e) => return Err(Box::new((sink, e))),
                         };
                     let fr = (*st).avg_frame_rate;
                     let frame_rate = (fr.num > 0 && fr.den > 0).then_some(fr);
@@ -221,12 +224,12 @@ impl PacketSinkWorker {
                 }
                 AVMEDIA_TYPE_AUDIO => {
                     if (*codecpar).codec_id != ffmpeg_sys_next::AVCodecID::AV_CODEC_ID_AAC {
-                        return Err((
+                        return Err(Box::new((
                             sink,
                             PacketSinkError::UnsupportedStream {
                                 kind: "non-AAC audio",
                             },
-                        ));
+                        )));
                     }
                     let runtime = AacRuntime::from_extradata(&extradata);
                     let info = PacketStreamInfo::Audio(AudioPacketConfig {
@@ -242,12 +245,12 @@ impl PacketSinkWorker {
                     (CodecRuntime::Aac(runtime), info, None)
                 }
                 _ => {
-                    return Err((
+                    return Err(Box::new((
                         sink,
                         PacketSinkError::UnsupportedStream {
                             kind: "non-audio/video",
                         },
-                    ))
+                    )))
                 }
             };
 
@@ -870,7 +873,7 @@ mod tests {
     fn collect(ctx: &TestCtx, sink: PacketSink) -> Result<PacketSinkWorker, PacketSinkError> {
         let status = Arc::new(AtomicUsize::new(0));
         unsafe { PacketSinkWorker::collect(ctx.ctx, ctx.stream_count(), sink, &status) }
-            .map_err(|(_sink, e)| e)
+            .map_err(|boxed| (*boxed).1)
     }
 
     fn tb25() -> AVRational {
