@@ -231,11 +231,14 @@ fn stop_terminates_with_full_undrained_channel() {
     );
 }
 
-/// The round-7 abort-window probe: abort() landing while the final packets
-/// are still being delivered must never let a terminal callback fire — the
-/// terminal decision reads the status fresh, after the job settled, not from
-/// a pre-wait snapshot. The last delivered packet blocks until abort() has
-/// provably been issued, making the race deterministic. Native AAC.
+/// The round-7 abort-window probe: abort() landing while packets are still
+/// being delivered must never let a terminal callback fire — the terminal
+/// decision reads the status fresh, after the job settled, not from a
+/// pre-wait snapshot. An ARBITRARY mid-stream packet (the 10th of ~40) is
+/// held until the abort store has had a generous grace to land — a timing
+/// heuristic, not a happens-before acknowledgement; the deterministic
+/// linearization-window pin is the held-logger probe in the unwind suite.
+/// Native AAC.
 #[test]
 fn abort_during_final_delivery_fires_no_terminal_callback() {
     let _lock = PROCESS_LOCK.lock().unwrap_or_else(|e| e.into_inner());

@@ -414,8 +414,12 @@ fn sibling_failure_after_sink_drain_reports_delivery_error_not_end() {
 /// container's custom-IO callback state is destroyed inside that worker's
 /// context free (before its slot release), and a panic THERE must still
 /// prevent on_end — the sink's barrier waits for the sibling's slot, behind
-/// which the panic was already recorded. Native AAC on both outputs, so CI
-/// exercises it without libx264.
+/// which the panic was already recorded. This is INVARIANT coverage of that
+/// ordering, not a deterministic reproduction of the original late-failure
+/// window (under the settled ordering the panic can land on either side of
+/// the sink's drain; both converge on no-on_end). The deterministic pin of
+/// the late window is the parked-filter probe in the unwind suite. Native
+/// AAC on both outputs, so CI exercises it without libx264.
 #[test]
 fn sibling_custom_io_destruction_panic_prevents_on_end() {
     /// Panics when the sibling worker frees its output context (unless that
