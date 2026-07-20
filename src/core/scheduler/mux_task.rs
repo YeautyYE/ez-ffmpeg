@@ -1494,9 +1494,9 @@ fn _mux_init(
             //   (e) wait()/stop()/abort() run on user threads outside the
             //       synchronizer and wait for slots, never the reverse.
             if locally_complete {
-                slot_guard.thread_sync.wait_for_peers_settled();
+                slot_guard.wait_for_peers_settled();
             } else {
-                slot_guard.thread_sync.register_settled();
+                slot_guard.register_settled();
             }
 
             // 5. LINEARIZATION POINT: one fresh status load and one result
@@ -1883,6 +1883,14 @@ struct MuxSlotGuard {
     armed: bool,
     thread_sync: ThreadSynchronizer,
     scheduler_status: Arc<AtomicUsize>,
+    /// Whether this slot registered as settled (packet-sink terminal
+    /// region). The registration's lifetime is the slot's lifetime: both
+    /// release paths pass this bit into `thread_done_with_settled`, which
+    /// removes the registration in the same critical section as the live
+    /// decrement — a departed register-only sink must leave no ghost
+    /// registration behind (`Counts` invariant: settled is a subset of
+    /// live).
+    settled_registered: std::cell::Cell<bool>,
 }
 
 impl MuxSlotGuard {
@@ -1891,11 +1899,27 @@ impl MuxSlotGuard {
             armed: true,
             thread_sync,
             scheduler_status,
+            settled_registered: std::cell::Cell::new(false),
         }
     }
 
     fn disarm(&mut self) {
         self.armed = false;
+    }
+
+    /// Registers this slot as settled (idempotent — at most one
+    /// registration per slot reaches the synchronizer).
+    fn register_settled(&self) {
+        if !self.settled_registered.replace(true) {
+            self.thread_sync.register_settled();
+        }
+    }
+
+    /// Registers this slot as settled, then blocks until every OTHER live
+    /// thread has either released its slot or registered here too.
+    fn wait_for_peers_settled(&self) {
+        self.register_settled();
+        self.thread_sync.wait_peers_settled();
     }
 
     /// Consuming manual release: disarm FIRST, then run the same
@@ -1908,9 +1932,10 @@ impl MuxSlotGuard {
     fn release(mut self) {
         self.disarm();
         let status = self.scheduler_status.clone();
-        self.thread_sync.thread_done_with(move || {
-            status.store(STATUS_END, Ordering::Release);
-        });
+        self.thread_sync
+            .thread_done_with_settled(self.settled_registered.get(), move || {
+                status.store(STATUS_END, Ordering::Release);
+            });
     }
 }
 
@@ -1923,8 +1948,9 @@ impl Drop for MuxSlotGuard {
         // best-effort, so choked demuxers exit within one poll) exactly as the
         // skipped manual release would have.
         let status = self.scheduler_status.clone();
-        self.thread_sync.thread_done_with(move || {
-            status.store(STATUS_END, Ordering::Release);
+        self.thread_sync
+            .thread_done_with_settled(self.settled_registered.get(), move || {
+                status.store(STATUS_END, Ordering::Release);
         });
     }
 }
