@@ -231,6 +231,58 @@ fn stop_terminates_with_full_undrained_channel() {
     );
 }
 
+/// The round-7 abort-window probe: abort() landing while the final packets
+/// are still being delivered must never let a terminal callback fire — the
+/// terminal decision reads the status fresh, after the job settled, not from
+/// a pre-wait snapshot. The last delivered packet blocks until abort() has
+/// provably been issued, making the race deterministic. Native AAC.
+#[test]
+fn abort_during_final_delivery_fires_no_terminal_callback() {
+    let _lock = PROCESS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (abort_request_tx, abort_request_rx) = std::sync::mpsc::channel::<()>();
+    let (abort_done_tx, abort_done_rx) = std::sync::mpsc::channel::<()>();
+
+    let log: common::SinkLog = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (end_log, err_log) = (log.clone(), log.clone());
+    let mut delivered = 0u32;
+    let sink = ez_ffmpeg::packet_sink::PacketSink::builder(move |_pkt| {
+        delivered += 1;
+        if delivered == 10 {
+            // Ask the controller to abort, and hold this packet until the
+            // abort has been issued — the terminal slot then must observe it.
+            let _ = abort_request_tx.send(());
+            let _ = abort_done_rx.recv_timeout(Duration::from_secs(10));
+        }
+        Ok(())
+    })
+    .on_end(move || {
+        end_log.lock().unwrap().push(SinkEv::End {
+            thread: std::thread::current().id(),
+        })
+    })
+    .on_delivery_error(move |e| err_log.lock().unwrap().push(SinkEv::Error(e.to_string())))
+    .build();
+
+    let scheduler = FfmpegContext::builder()
+        .input(Input::from("sine=frequency=440:duration=1").set_format("lavfi"))
+        .output(Output::from(sink).set_audio_codec("aac"))
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    abort_request_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("delivery never reached the abort point");
+    scheduler.abort();
+    let _ = abort_done_tx.send(());
+
+    // abort() is fire-and-forget; give the teardown a bounded window, then
+    // assert no terminal callback fired.
+    std::thread::sleep(Duration::from_millis(800));
+    assert_no_terminal_event(&log, "abort_during_final_delivery");
+}
+
 /// Encoder-independent lifecycle case (native AAC): stop() mid-stream on an
 /// audio-only sink terminates without a terminal callback — so CI without
 /// libx264 still exercises the real teardown machinery.

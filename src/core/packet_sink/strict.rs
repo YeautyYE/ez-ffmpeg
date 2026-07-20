@@ -31,7 +31,7 @@
 //! muxer's `i32` convention (a sentinel that is never `AVERROR_EOF`, so a
 //! failing callback can never masquerade as a healthy end of stream).
 
-use super::codec::{self, aac::AacRuntime, avc::AvcRuntime, CodecRuntime};
+use super::codec::{aac::AacRuntime, avc::AvcRuntime, CodecRuntime};
 use super::side_data;
 use super::timeline::{StreamTimeline, Timeline};
 use super::{
