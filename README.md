@@ -27,6 +27,7 @@ This library:
 - Ships one-shot recipes (thumbnails/sprite sheets, animated GIF, HLS ABR ladders) and a detection/measurement API (black/silence/scene/crop/EBU R128 loudness) that returns typed Rust results instead of only FFmpeg logs
 - Exports decoded video frames (packed RGB) and audio (interleaved `f32` PCM) straight into memory for AI/CV/ASR pipelines, honoring color tags by default (experimental)
 - Pushes Rust-rendered frames into the encode/mux pipeline with `VideoWriter` — procedural video, in-memory MP4 generation, or live targets, with no demuxer involved (experimental)
+- Exports encoded packets straight from the encoders — WebCodecs-ready H.264 access units and AAC frames delivered to callbacks, no container and no mux-then-demux round-trip (experimental)
 
 By abstracting the complexity of the raw C API, `ez-ffmpeg` simplifies configuring media pipelines, performing transcoding and filtering, and inspecting media streams.
 
@@ -382,6 +383,51 @@ the authoritative way to retrieve the pipeline's first error, and `abort()`
 discards the export. See `examples/frames_to_video` (procedural animation),
 `examples/bouncing_balls` (render loop with per-frame state), and
 `examples/in_memory_mp4` (encode into a `Vec<u8>` with custom output I/O).
+
+## Encoded Packet Export (Experimental)
+
+Consume the encoders' output directly — no container is written, no bytes are
+demuxed back. The strict tier is aligned with WebCodecs consumption: H.264
+arrives as avcC-configured, length-prefixed access units (with a ready-made
+`avc1.PPCCLL` codec string and the avcC `description`), AAC as raw frames with
+the `AudioSpecificConfig`. Feed a `VideoDecoder`/`AudioDecoder` in a WebView,
+packetize for RTP/SRT, forward over a WebSocket, or build fMP4 segments —
+without parsing container bytes first.
+
+```rust,ignore
+use ez_ffmpeg::packet_sink::PacketSink;
+use ez_ffmpeg::{FfmpegContext, Output};
+
+let sink = PacketSink::builder(|packet| {
+    // One H.264 access unit (AVCC layout), timestamps in stream ticks
+    // plus *_us conveniences, IDR-accurate keyframe flag.
+    send_chunk(packet.pts_us(), packet.is_key(), packet.data());
+    Ok(())
+})
+.on_stream_info(|streams| {
+    let video = streams[0].video().unwrap();
+    configure_decoder(video.codec_string(), video.codec_config());
+    Ok(())
+})
+.build();
+
+FfmpegContext::builder()
+    .input("input.mp4")
+    .output(Output::from(sink).set_video_codec("libx264"))
+    .build()?
+    .start()?
+    .wait()?;
+```
+
+Callbacks run on the delivery thread and block the pipeline while they run
+(bounded backpressure; nothing is dropped). For consumers on their own thread
+there is a bounded owned-event channel (`PacketSink::channel`) with a
+`FrameIter`-style iterator (`PacketSinkReceiver::into_events`). Strict-tier
+validation rejects anything it cannot promise: mid-stream configuration
+changes, non-monotonic timestamps, missing durations, non-whitelisted
+encoders (video is libx264-only in v1). See the `packet_sink` module docs for
+the delivery contract, and the `packet_sink_avc`, `packet_sink_aac_channel`
+and `packet_sink_av_transport` examples.
 
 ## Streaming protocol outputs (WHIP / SRT)
 

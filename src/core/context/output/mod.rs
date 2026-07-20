@@ -567,17 +567,20 @@ impl Output {
     /// [`PacketSinkError`](crate::error::PacketSinkError). The v1 strict tier
     /// accepts only whitelisted encoders (video: `libx264`; audio: AAC).
     ///
-    /// ### Example
-    /// ```rust,ignore
-    /// use ez_ffmpeg::packet_sink::PacketSink;
+    /// `Output::from(sink)` is the equivalent, crate-conventional spelling
+    /// and the one used throughout the documentation.
     ///
-    /// let sink = PacketSink::builder()
-    ///     .on_packet(|pkt| {
-    ///         println!("stream {} pts {}", pkt.stream_index(), pkt.pts());
-    ///         0
-    ///     })
-    ///     .build();
-    /// let output = Output::new_by_packet_sink(sink).set_video_codec("libx264");
+    /// ### Example
+    /// ```rust,no_run
+    /// use ez_ffmpeg::packet_sink::PacketSink;
+    /// use ez_ffmpeg::Output;
+    ///
+    /// let sink = PacketSink::builder(|packet| {
+    ///     println!("stream {} pts {}", packet.stream_index(), packet.pts());
+    ///     Ok(())
+    /// })
+    /// .build();
+    /// let output = Output::from(sink).set_video_codec("libx264");
     /// ```
     pub fn new_by_packet_sink(sink: crate::core::packet_sink::PacketSink) -> Self {
         sink.into()

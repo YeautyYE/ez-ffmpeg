@@ -27,6 +27,9 @@
 //!   - `hwaccel`: Helpers for enumerating and configuring hardware-accelerated video codecs
 //!     (CUDA, VAAPI, VideoToolbox, etc.).
 //!   - `codec`: Tools to list and inspect available encoders/decoders.
+//!   - `packet_sink`: Encoded-packet export — consume encoder output
+//!     (WebCodecs-style H.264 access units, AAC frames) directly through
+//!     callbacks, without writing a container.
 //!   - `device`: Utilities to discover system cameras, microphones, and other input devices.
 //!   - `filter`: Query FFmpeg's built-in filters and infrastructure for building custom frame-processing filters.
 //!   - `context`: Houses [`FfmpegContext`] for assembling an FFmpeg job.
