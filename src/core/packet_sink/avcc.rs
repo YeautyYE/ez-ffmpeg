@@ -57,16 +57,23 @@ pub(crate) fn split_annexb(data: &[u8]) -> Result<Vec<&[u8]>, String> {
 
     let mut nals = Vec::new();
     loop {
-        let end = find_startcode(data, pos).unwrap_or(data.len());
+        let mut end = find_startcode(data, pos).unwrap_or(data.len());
+        // FFmpeg's nal_parse_units trims trailing_zero_8bits from every NAL
+        // before length-prefixing (libavformat/nal.c); matching it keeps the
+        // AVCC output byte-identical to what the mp4 muxer would write.
+        while end > pos && data[end - 1] == 0 {
+            end -= 1;
+        }
         if end == pos {
             return Err("empty NAL unit".to_string());
         }
         nals.push(&data[pos..end]);
-        if end == data.len() {
+        if !data[end..].iter().any(|&b| b != 0) {
+            // Only trailing zeros remain: the stream ends after this NAL.
             break;
         }
-        // Skip the separator start code ((00)+ 01 — the triple search already
-        // guarantees at least two zeros before the 1).
+        // Skip the separator start code ((00)+ 01; the trim above may have
+        // folded this NAL's trailing zeros into the run before the 1).
         let mut next = end;
         while next < data.len() && data[next] == 0 {
             next += 1;
@@ -160,15 +167,30 @@ pub(crate) fn au_scan(nals: &[&[u8]]) -> AuScan {
     scan
 }
 
-/// Parsed parameter sets of one H.264 configuration, in original order — the
-/// canonical form used both to synthesize avcC and as the S8 fingerprint (the
-/// same sets can arrive wrapped as Annex-B extradata, avcC extradata or
-/// `NEW_EXTRADATA` side data; comparing wrapper bytes would misreport an
-/// unchanged configuration as changed).
+/// Parsed parameter sets of one H.264 configuration, in original order.
+/// avcC synthesis consumes this form (movenc preserves wrapper order); the S8
+/// fingerprint uses [`Self::into_canonical`], which is wrapper- AND
+/// order-independent (the same sets can arrive as Annex-B, avcC or
+/// `NEW_EXTRADATA` side data, in any order — neither wrapper bytes nor
+/// ordering constitutes a configuration change).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ParameterSets {
     pub(crate) sps: Vec<Vec<u8>>,
     pub(crate) pps: Vec<Vec<u8>>,
+}
+
+impl ParameterSets {
+    /// The canonical S8 fingerprint form: parameter sets sorted by identity
+    /// (byte content) with exact duplicates removed. Duplicate policy: a
+    /// repeated identical set is redundant, never a change; two sets that
+    /// differ in any byte are distinct identities.
+    pub(crate) fn into_canonical(mut self) -> Self {
+        self.sps.sort_unstable();
+        self.sps.dedup();
+        self.pps.sort_unstable();
+        self.pps.dedup();
+        self
+    }
 }
 
 /// Extracts parameter sets from extradata in either Annex-B or avcC form.
@@ -443,6 +465,46 @@ mod tests {
         // Round-trip: the produced AU splits back into the same NALs.
         let back = length_prefixed_nals(&out).unwrap();
         assert_eq!(back, nals);
+    }
+
+    /// FFmpeg-equivalence fixture: trailing_zero_8bits after a NAL (before a
+    /// following start code and at stream end) are trimmed exactly like
+    /// libavformat/nal.c before length-prefixing.
+    #[test]
+    fn trailing_zero_bytes_are_trimmed_like_ffmpeg() {
+        // NAL [65 AA] + two trailing zeros + 3-byte startcode + NAL [06 05].
+        let au = vec![0, 0, 0, 1, 0x65, 0xAA, 0, 0, 0, 0, 1, 0x06, 0x05];
+        let nals = split_annexb(&au).unwrap();
+        assert_eq!(nals, vec![&[0x65u8, 0xAA][..], &[0x06u8, 0x05][..]]);
+        let mut out = Vec::new();
+        write_length_prefixed(&nals, &mut out).unwrap();
+        assert_eq!(out, vec![0, 0, 0, 2, 0x65, 0xAA, 0, 0, 0, 2, 0x06, 0x05]);
+
+        // Trailing zeros at stream end are trimmed from the final NAL too.
+        let au = vec![0, 0, 0, 1, 0x65, 0xBB, 0, 0];
+        let nals = split_annexb(&au).unwrap();
+        assert_eq!(nals, vec![&[0x65u8, 0xBB][..]]);
+
+        // A NAL reduced to nothing by the trim is still an empty NAL.
+        assert!(split_annexb(&[0, 0, 0, 1, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn canonical_form_is_order_insensitive_and_deduplicated() {
+        let a = ParameterSets {
+            sps: vec![SPS.to_vec(), vec![0x67, 1, 2, 3]],
+            pps: vec![PPS.to_vec(), PPS.to_vec()],
+        };
+        let b = ParameterSets {
+            sps: vec![vec![0x67, 1, 2, 3], SPS.to_vec()],
+            pps: vec![PPS.to_vec()],
+        };
+        assert_ne!(a, b, "ordered forms differ");
+        assert_eq!(
+            a.clone().into_canonical(),
+            b.clone().into_canonical(),
+            "canonical forms are identical"
+        );
     }
 
     #[test]
