@@ -311,7 +311,6 @@ fn late_filter_worker_panic_prevents_on_end() {
     // needle check.
     *HOLD.lock().unwrap_or_else(|e| e.into_inner()) = Some("FilterGraph finished.");
     *TRIGGER.lock().unwrap_or_else(|e| e.into_inner()) = Some("FilterGraph finished.");
-    let _release_on_unwind = ReleaseOnDrop;
     let scheduler = FfmpegContext::builder()
         .input(Input::from("sine=frequency=440:duration=1").set_format("lavfi"))
         .output(Output::from(sink).set_audio_codec("aac"))
@@ -319,6 +318,10 @@ fn late_filter_worker_panic_prevents_on_end() {
         .unwrap()
         .start()
         .unwrap();
+    // Declared AFTER the scheduler: locals drop in reverse declaration
+    // order, so on an assertion panic this guard releases the parked
+    // worker BEFORE the scheduler's teardown starts waiting on it.
+    let _release_on_unwind = ReleaseOnDrop;
 
     // 1. The filter parks at its final log (its EOF already reached the
     // encoder — the pipeline keeps flowing).
@@ -405,7 +408,6 @@ fn abort_at_the_linearization_point_suppresses_the_terminal() {
     .build();
 
     *HOLD.lock().unwrap_or_else(|e| e.into_inner()) = Some("All streams finished");
-    let _release_on_unwind = ReleaseOnDrop;
     let scheduler = FfmpegContext::builder()
         .input(Input::from("sine=frequency=440:duration=1").set_format("lavfi"))
         .output(Output::from(sink).set_audio_codec("aac"))
@@ -413,6 +415,9 @@ fn abort_at_the_linearization_point_suppresses_the_terminal() {
         .unwrap()
         .start()
         .unwrap();
+    // AFTER the scheduler: must drop before scheduler teardown (see the
+    // filter probe).
+    let _release_on_unwind = ReleaseOnDrop;
 
     // Wait for the worker to park inside the window.
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -499,10 +504,8 @@ fn full_channel_sink_reports_a_sibling_failure_not_silence() {
             self.0.store(true, Ordering::Release);
         }
     }
-    let _open_gate_on_unwind = GateOnDrop(sibling_go.clone());
 
     *HOLD.lock().unwrap_or_else(|e| e.into_inner()) = Some("Packet sink muxer finished.");
-    let _release_on_unwind = ReleaseOnDrop;
     let scheduler = FfmpegContext::builder()
         .input(Input::from("sine=frequency=440:duration=2").set_format("lavfi"))
         .input(Input::from("sine=frequency=330:duration=2").set_format("lavfi"))
@@ -516,6 +519,11 @@ fn full_channel_sink_reports_a_sibling_failure_not_silence() {
         .unwrap()
         .start()
         .unwrap();
+    // AFTER the scheduler: on an assertion panic these drop FIRST (reverse
+    // declaration order), unparking the sibling gate and the held worker
+    // before scheduler teardown waits on them.
+    let _open_gate_on_unwind = GateOnDrop(sibling_go.clone());
+    let _release_on_unwind = ReleaseOnDrop;
 
     // 1. Take exactly the stream-info event, then stop draining. The
     // sibling reaches its (parked) failure point on its own input.
