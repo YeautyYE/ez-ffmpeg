@@ -217,6 +217,12 @@ mod tests {
         // follows, so 13 bits suffice.
         let runtime = AacRuntime::from_extradata(&[0xEA, 0x0A, 0x00], 0).unwrap();
         assert_eq!(runtime.codec_string(), "mp4a.40.29");
+        // The MINIMAL two-byte form pins the look-ahead's zero-padding at
+        // the end of the buffer: only 3 of the peeked 9 bits physically
+        // exist (the guard, like FFmpeg's show_bits, must not itself
+        // demand bits).
+        let runtime = AacRuntime::from_extradata(&[0xEA, 0x0A], 0).unwrap();
+        assert_eq!(runtime.codec_string(), "mp4a.40.29");
         // Escape AOT: 31 escape + 6-bit extension 2 => AOT 34; with the
         // frequency index (4) and channel configuration (1) that is 19
         // required bits, three bytes.
