@@ -44,47 +44,90 @@
 //! no component consumed fails the run (fftools `check_avoptions` parity)
 //! instead of the default builder path's warning.
 //!
-//! # Accepted options (generated from the manifest, revision 1)
+//! # The manifest (generated; revision-pinned by an exact-equality test)
 //!
-//! | option | scope | notes |
+//! <!-- manifest:begin -->
+//! Manifest revision 2; dialect: ffmpeg 7.1 command line.
+//!
+//! | option | scope | repeat | notes | maps to |
+//! |---|---|---|---|---|
+//! | `-y` | global | repeatable | flag | mandatory overwrite gate |
+//! | `-hide_banner` | global | repeatable | accepted, no in-process effect | none (documented no-op) |
+//! | `-nostdin` | global | repeatable | accepted, no in-process effect | none (documented no-op) |
+//! | `-stats` | global | repeatable | accepted, no in-process effect | none (documented no-op) |
+//! | `-nostats` | global | repeatable | accepted, no in-process effect | none (documented no-op) |
+//! | `-loglevel` | global | repeatable | accepted, no in-process effect | none (documented no-op) |
+//! | `-v` | global | repeatable | accepted, no in-process effect | none (documented no-op) |
+//! | `-ss` | input or output (position-scoped) | once | takes a value | Input::set_start_time_us / Output::set_start_time_us |
+//! | `-t` | input or output (position-scoped) | once | takes a value | Input::set_recording_time_us / Output::set_recording_time_us |
+//! | `-to` | input or output (position-scoped) | once | takes a value | Input::set_stop_time_us / Output::set_stop_time_us |
+//! | `-f` | input or output (position-scoped) | once | takes a value | Input::set_format / Output::set_format |
+//! | `-vn` | output | repeatable | flag | Output::disable_video |
+//! | `-an` | output | repeatable | flag | Output::disable_audio |
+//! | `-c:v` | output | once | takes a value | Output::set_video_codec |
+//! | `-c:a` | output | once | takes a value | Output::set_audio_codec |
+//! | `-b:v` | output | once | takes a value | Output::set_video_bitrate |
+//! | `-b:a` | output | once | takes a value | Output::set_audio_bitrate |
+//! | `-crf` | output | once | takes a value | Output::set_video_codec_opt("crf", …), libx264 only |
+//! | `-preset` | output | once | takes a value | Output::set_video_codec_opt("preset", …), libx264 only |
+//! | `-pix_fmt` | output | once | takes a value | Output::set_pix_fmt |
+//! | `-ar` | output | once | takes a value | Output::set_audio_sample_rate |
+//! | `-ac` | output | once | takes a value | Output::set_audio_channels |
+//! | `-frames:v` | output | once | takes a value | Output::set_max_video_frames(1) |
+//! | `-vf` | output | once | takes a value | Output::set_video_filter |
+//! | `-map` | output | accumulates | takes a value | Output::add_stream_map / add_stream_map_with_copy |
+//! | `-movflags` | output | once | takes a value | Output::set_format_opt("movflags", "+faststart") |
+//! | `-hls_time` | output | once | takes a value | Output::set_format_opt("hls_time", …) |
+//! | `-hls_playlist_type` | output | once | takes a value | Output::set_format_opt("hls_playlist_type", "vod") |
+//! | `-hls_list_size` | output | once | takes a value | Output::set_format_opt("hls_list_size", "0") |
+//! | `-hls_segment_filename` | output | once | takes a value | Output::set_format_opt("hls_segment_filename", …) |
+//!
+//! Verified shapes (may execute; each is backed by a semantic golden and a
+//! compile-pinned emitted example):
+//!
+//! | id | shape | container |
 //! |---|---|---|
-//! | `-y` | global | flag |
-//! | `-hide_banner` | global | accepted, no in-process effect |
-//! | `-nostdin` | global | accepted, no in-process effect |
-//! | `-stats` | global | accepted, no in-process effect |
-//! | `-nostats` | global | accepted, no in-process effect |
-//! | `-loglevel` | global | accepted, no in-process effect |
-//! | `-v` | global | accepted, no in-process effect |
-//! | `-ss` | input or output (position-scoped) | takes a value |
-//! | `-t` | input or output (position-scoped) | takes a value |
-//! | `-to` | input or output (position-scoped) | takes a value |
-//! | `-f` | input or output (position-scoped) | takes a value |
-//! | `-vn` | output | flag |
-//! | `-an` | output | flag |
-//! | `-c:v` | output | takes a value |
-//! | `-c:a` | output | takes a value |
-//! | `-b:v` | output | takes a value |
-//! | `-b:a` | output | takes a value |
-//! | `-crf` | output | takes a value |
-//! | `-preset` | output | takes a value |
-//! | `-pix_fmt` | output | takes a value |
-//! | `-ar` | output | takes a value |
-//! | `-ac` | output | takes a value |
-//! | `-frames:v` | output | takes a value |
-//! | `-vf` | output | takes a value |
-//! | `-map` | output | takes a value |
-//! | `-movflags` | output | takes a value |
-//! | `-hls_time` | output | takes a value |
-//! | `-hls_playlist_type` | output | takes a value |
-//! | `-hls_list_size` | output | takes a value |
-//! | `-hls_segment_filename` | output | takes a value |
+//! | V1 | H.264/AAC transcode (crf + preset) | `.mp4` |
+//! | V2 | re-encoded clip (input -ss, output -t) | `.mp4` |
+//! | V3 | audio extract (-vn, AAC) | `.m4a` |
+//! | V4 | single-frame thumbnail (input -ss, -an, mjpeg) | `.jpg` |
+//! | V5 | scaled H.264/AAC transcode (-vf scale) | `.mp4` |
+//! | V6 | single-rendition VOD HLS | `.m3u8` |
 //!
-//! Structural limits (Round 1): single input, single output, canonical
-//! `[options] -i INPUT [options] OUTPUT` order, mandatory `-y`, decimal
-//! seconds for every time value, `-vf` limited to one simple `scale=…`,
-//! `-map` limited to basic index form in filterless commands, HLS limited to
-//! the exact single-rendition VOD option set. Excluded spellings are
-//! rejected with a reason and, where one exists, the supported alternative.
+//! Unverified entries (emit-only: code generation with a scaffolding banner,
+//! execution refused):
+//!
+//! | id | shape |
+//! |---|---|
+//! | U1 | input-side trim (-ss + -t before -i) |
+//! | U2 | faststart remux (explicit per-media copy) |
+//! | U3 | scale with audio copy |
+//! | U4 | thumbnail recipe shape (-vf + -frames:v) |
+//! | U5 | audio extract via stream copy |
+//! | U6 | PCM / resampled audio extract |
+//! | U7 | partial HLS option set |
+//! | U8 | mapped transcode (basic index maps) |
+//! | U9 | mapped audio copy |
+//! | U10 | cross-scope trim pair (input -t, output -to) |
+//! | U11 | output-side seek transcode |
+//! | U12 | bitrate-driven transcode |
+//! | U13 | pixel-format transcode |
+//! | U14 | explicit input format (e.g. lavfi) |
+//! | U15 | container-defaults remux |
+//! | U16 | video-codec-only transcode |
+//! | U17 | transcode without preset |
+//! | U18 | transcode with audio bitrate |
+//! | U19 | audio+video codec selection only |
+//! | U20 | transcode shape with unpinned values/container |
+//! | U21 | clip shape with unpinned values/container |
+//! | U22 | audio-extract shape with unpinned values/container |
+//! | U23 | thumbnail shape with unpinned values/container |
+//! | U24 | scaled-transcode shape with unpinned values/container |
+//! | U25 | VOD HLS shape with unpinned values/container |
+//!
+//! Everything else — including parseable option sets outside both tables — is
+//! rejected with a typed diagnostic.
+//! <!-- manifest:end -->
 //!
 //! # String form
 //!
@@ -109,6 +152,8 @@ mod tokenize;
 
 #[cfg(all(test, not(docsrs)))]
 mod corpus_tests;
+#[cfg(all(test, not(docsrs)))]
+mod golden_tests;
 #[cfg(all(test, not(docsrs)))]
 mod strict_tests;
 
@@ -167,19 +212,46 @@ fn run_from_tokens(args: &[String]) -> Result<FfmpegContext, CliError> {
     let ir = parse::parse(args)?;
     match manifest::classify(&ir) {
         ShapeStatus::Verified(_) => {}
-        ShapeStatus::Unverified => {
+        ShapeStatus::Unverified(_) => {
             return Err(CliError::NotVerified {
+                parsed_options: ir.fingerprint().iter().map(|s| s.to_string()).collect(),
+            });
+        }
+        ShapeStatus::Unmatched => {
+            return Err(CliError::UnmatchedShape {
                 parsed_options: ir.fingerprint().iter().map(|s| s.to_string()).collect(),
             });
         }
     }
     check_runtime_profile()?;
+    // Hard simple-filter prerequisite: a -vf command may only execute when
+    // the input's video stream is structurally unique — no stream selection
+    // may stand between the filter and its source. Probe AFTER the profile
+    // gate (the gate must fail before any I/O) and before the pipeline
+    // build.
+    if ir.output.video_filter.is_some() {
+        let infos = crate::core::stream_info::find_all_stream_infos(ir.input.url.clone())
+            .map_err(CliError::Build)?;
+        let video_streams = infos
+            .iter()
+            .filter(|info| matches!(info, crate::core::stream_info::StreamInfo::Video { .. }))
+            .count();
+        if video_streams != 1 {
+            return Err(CliError::AmbiguousFilterSource { video_streams });
+        }
+    }
     lower::lower(&ir).into_context().map_err(CliError::Build)
 }
 
 fn emit_from_tokens(args: &[String]) -> Result<String, CliError> {
     let ir = parse::parse(args)?;
     let status = manifest::classify(&ir);
+    if status == ShapeStatus::Unmatched {
+        // No silent scaffolding class: unenumerated shapes get nothing.
+        return Err(CliError::UnmatchedShape {
+            parsed_options: ir.fingerprint().iter().map(|s| s.to_string()).collect(),
+        });
+    }
     Ok(emit::emit(&lower::lower(&ir), args, &status))
 }
 

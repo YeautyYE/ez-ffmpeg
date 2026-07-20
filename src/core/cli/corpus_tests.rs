@@ -67,6 +67,8 @@ fn rejected(cmd: &str, expect: &str, fragment: &str) {
         CliError::ConflictingOptions { .. } => "ConflictingOptions",
         CliError::MissingOverwriteFlag => "MissingOverwriteFlag",
         CliError::NotVerified { .. } => "NotVerified",
+        CliError::UnmatchedShape { .. } => "UnmatchedShape",
+        CliError::AmbiguousFilterSource { .. } => "AmbiguousFilterSource",
         CliError::UnverifiedRuntimeProfile { .. } => "UnverifiedRuntimeProfile",
         CliError::Build(_) => "Build",
     };
@@ -976,6 +978,22 @@ fn corpus_default_codecs_remux() {
     emit_only("ffmpeg -i in.mov -y out.mp4");
 }
 
+#[test]
+fn corpus_unenumerated_shapes_are_rejected_not_scaffolded() {
+    // Parses cleanly, but the fingerprint matches neither manifest table:
+    // run AND emit refuse — no silent scaffolding class exists.
+    rejected(
+        "ffmpeg -i in.mp4 -ac 1 -y out.mp4",
+        "UnmatchedShape",
+        "not in the compatibility manifest",
+    );
+    rejected(
+        "ffmpeg -i in.mp4 -f mp4 -y out2.mp4",
+        "UnmatchedShape",
+        "nothing is generated for unenumerated shapes",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // No-panic property sweep (the fuzz obligation, deterministic form).
 // ---------------------------------------------------------------------------
@@ -1036,3 +1054,4 @@ fn corpus_no_panic_argv_sweep() {
         let _ = super::emit_rust_code_from_args(args);
     }
 }
+

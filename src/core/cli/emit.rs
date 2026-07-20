@@ -20,14 +20,20 @@ pub(crate) fn emit(job: &LoweredJob, command: &[String], status: &ShapeStatus) -
         && job.input.stop_time_us.is_none();
 
     let mut out = String::new();
-    header(&mut out, command, status, plain_input);
+    header(
+        &mut out,
+        command,
+        status,
+        plain_input,
+        job.output.video_filter.is_some(),
+    );
 
     // Recognized no-op globals: named instead of silently swallowed.
     for noop in &job.noops {
         match &noop.value {
             Some(value) => out.push_str(&format!(
                 "// {} {}: not applicable in-process (no-op)\n",
-                noop.flag, value
+                noop.flag, comment_text(value)
             )),
             None => out.push_str(&format!(
                 "// {}: not applicable in-process (no-op)\n",
@@ -55,7 +61,7 @@ pub(crate) fn emit(job: &LoweredJob, command: &[String], status: &ShapeStatus) -
             line(
                 &mut out,
                 4,
-                &format!(".set_format({}) // -f {format}", lit(format)),
+                &format!(".set_format({}) // -f {}", lit(format), comment_text(format)),
             );
         }
         if let Some(us) = job.input.start_time_us {
@@ -96,7 +102,7 @@ pub(crate) fn emit(job: &LoweredJob, command: &[String], status: &ShapeStatus) -
         line(
             &mut out,
             4,
-            &format!(".set_format({}) // -f {format}", lit(format)),
+            &format!(".set_format({}) // -f {}", lit(format), comment_text(format)),
         );
     }
     if o.video_disable {
@@ -109,28 +115,28 @@ pub(crate) fn emit(job: &LoweredJob, command: &[String], status: &ShapeStatus) -
         line(
             &mut out,
             4,
-            &format!(".set_video_codec({}) // -c:v {codec}", lit(codec)),
+            &format!(".set_video_codec({}) // -c:v {}", lit(codec), comment_text(codec)),
         );
     }
     if let Some(codec) = &o.audio_codec {
         line(
             &mut out,
             4,
-            &format!(".set_audio_codec({}) // -c:a {codec}", lit(codec)),
+            &format!(".set_audio_codec({}) // -c:a {}", lit(codec), comment_text(codec)),
         );
     }
     if let Some(bitrate) = &o.video_bitrate {
         line(
             &mut out,
             4,
-            &format!(".set_video_bitrate({}) // -b:v {bitrate}", lit(bitrate)),
+            &format!(".set_video_bitrate({}) // -b:v {}", lit(bitrate), comment_text(bitrate)),
         );
     }
     if let Some(bitrate) = &o.audio_bitrate {
         line(
             &mut out,
             4,
-            &format!(".set_audio_bitrate({}) // -b:a {bitrate}", lit(bitrate)),
+            &format!(".set_audio_bitrate({}) // -b:a {}", lit(bitrate), comment_text(bitrate)),
         );
     }
     for (key, value) in &o.video_codec_opts {
@@ -138,9 +144,11 @@ pub(crate) fn emit(job: &LoweredJob, command: &[String], status: &ShapeStatus) -
             &mut out,
             4,
             &format!(
-                ".set_video_codec_opt({}, {}) // -{key} {value}",
+                ".set_video_codec_opt({}, {}) // -{} {}",
                 lit(key),
-                lit(value)
+                lit(value),
+                comment_text(key),
+                comment_text(value)
             ),
         );
     }
@@ -149,9 +157,11 @@ pub(crate) fn emit(job: &LoweredJob, command: &[String], status: &ShapeStatus) -
             &mut out,
             4,
             &format!(
-                ".set_format_opt({}, {}) // -{key} {value}",
+                ".set_format_opt({}, {}) // -{} {}",
                 lit(key),
-                lit(value)
+                lit(value),
+                comment_text(key),
+                comment_text(value)
             ),
         );
     }
@@ -159,7 +169,7 @@ pub(crate) fn emit(job: &LoweredJob, command: &[String], status: &ShapeStatus) -
         line(
             &mut out,
             4,
-            &format!(".set_pix_fmt({}) // -pix_fmt {pix_fmt}", lit(pix_fmt)),
+            &format!(".set_pix_fmt({}) // -pix_fmt {}", lit(pix_fmt), comment_text(pix_fmt)),
         );
     }
     if let Some(rate) = o.audio_sample_rate {
@@ -187,7 +197,7 @@ pub(crate) fn emit(job: &LoweredJob, command: &[String], status: &ShapeStatus) -
         line(
             &mut out,
             4,
-            &format!(".set_video_filter({}) // -vf {filter}", lit(filter)),
+            &format!(".set_video_filter({}) // -vf {}", lit(filter), comment_text(filter)),
         );
     }
     for (map, copy) in &o.stream_maps {
@@ -196,15 +206,16 @@ pub(crate) fn emit(job: &LoweredJob, command: &[String], status: &ShapeStatus) -
                 &mut out,
                 4,
                 &format!(
-                    ".add_stream_map_with_copy({}) // -map {map} + copy",
-                    lit(map)
+                    ".add_stream_map_with_copy({}) // -map {} + copy",
+                    lit(map),
+                    comment_text(map)
                 ),
             );
         } else {
             line(
                 &mut out,
                 4,
-                &format!(".add_stream_map({}) // -map {map}", lit(map)),
+                &format!(".add_stream_map({}) // -map {}", lit(map), comment_text(map)),
             );
         }
     }
@@ -240,9 +251,19 @@ pub(crate) fn emit(job: &LoweredJob, command: &[String], status: &ShapeStatus) -
     out
 }
 
-fn header(out: &mut String, command: &[String], status: &ShapeStatus, plain_input: bool) {
+fn header(
+    out: &mut String,
+    command: &[String],
+    status: &ShapeStatus,
+    plain_input: bool,
+    vf_precondition: bool,
+) {
     out.push_str("// Generated from an ffmpeg command by the ez-ffmpeg CLI-compat emitter.\n");
-    out.push_str(&format!("// command: ffmpeg {}\n", requote(command)));
+    out.push_str(&format!(
+        "// command: ffmpeg {}
+",
+        comment_text(&requote(command))
+    ));
     out.push_str(&format!(
         "// dialect: {DIALECT}; manifest: r{MANIFEST_REVISION}; crate: ez-ffmpeg {}; cargo features: none required\n",
         env!("CARGO_PKG_VERSION")
@@ -260,15 +281,28 @@ fn header(out: &mut String, command: &[String], status: &ShapeStatus, plain_inpu
                 )),
             }
         }
-        ShapeStatus::Unverified => {
-            out.push_str(
-                "// status: UNVERIFIED SCAFFOLDING — this command shape has no semantic golden\n\
-                 // in the compatibility manifest. The code below compiles against the ez-ffmpeg\n\
-                 // builder API, but its behavior has NOT been checked against the ffmpeg CLI and\n\
-                 // must not be treated as a faithful translation. Review every call before use;\n\
-                 // in-process execution (from_cli / from_cli_args) refuses this shape.\n",
-            );
+        ShapeStatus::Unverified(id) => {
+            let entry = super::manifest::unverified_entry(id);
+            let summary = entry.map(|e| e.summary).unwrap_or("unverified");
+            out.push_str(&format!(
+                "// status: UNVERIFIED SCAFFOLDING — manifest entry {id} ({summary}).\n\
+                 // This shape has no semantic golden. The code below compiles against the\n\
+                 // ez-ffmpeg builder API, but its behavior has NOT been checked against the\n\
+                 // ffmpeg CLI and must not be treated as a faithful translation. Review every\n\
+                 // call before use; in-process execution (from_cli / from_cli_args) refuses\n\
+                 // this shape.\n"
+            ));
         }
+        ShapeStatus::Unmatched => {
+            unreachable!("emit is never invoked for unmatched shapes (emit_from_tokens rejects)")
+        }
+    }
+    if vf_precondition {
+        out.push_str(
+            "// precondition: -vf requires the input to contain exactly ONE video stream;\n\
+             // in-process execution enforces this after probing (see from_cli_args), and\n\
+             // this generated code inherits the same assumption.\n",
+        );
     }
     out.push('\n');
     // Import exactly what the program uses: a plain `.input("url")` never
@@ -293,6 +327,22 @@ fn line(out: &mut String, level: usize, text: &str) {
 /// control characters and passes unicode through — exactly a valid literal.
 fn lit(s: &str) -> String {
     format!("{s:?}")
+}
+
+/// User text rendered inside a generated `//` comment. Control characters
+/// (newlines above all) are escape-rendered so no token can break out of the
+/// comment and inject source — a quoted newline in an argv token must never
+/// become a real newline in generated code.
+fn comment_text(s: &str) -> String {
+    s.chars()
+        .flat_map(|c| {
+            if c.is_control() {
+                c.escape_debug().collect::<Vec<_>>()
+            } else {
+                vec![c]
+            }
+        })
+        .collect()
 }
 
 /// Microsecond literals with `_` thousands separators, matching the crate's
@@ -373,7 +423,7 @@ mod tests {
             emit_cmd("ffmpeg -i in.mkv -c:v libx264 -crf 23 -preset fast -c:a aac -y out.mp4");
         assert!(code.contains("// status: verified shape V1"));
         assert!(code.contains("dialect: ffmpeg 7.1 command line"));
-        assert!(code.contains("manifest: r1"));
+        assert!(code.contains("manifest: r2"));
         assert!(code.contains(".set_video_codec(\"libx264\") // -c:v libx264"));
         assert!(code.contains(".set_video_codec_opt(\"crf\", \"23\") // -crf 23"));
         assert!(code.contains(".set_video_codec_opt(\"preset\", \"fast\") // -preset fast"));
@@ -433,7 +483,9 @@ mod tests {
         // Parses (all tokens classify) but matches no golden-backed shape.
         let code = emit_cmd("ffmpeg -i in.mp4 -c:v mpeg4 -y out.avi");
         assert!(code.contains("UNVERIFIED SCAFFOLDING"));
-        assert!(code.contains("refuses this shape"));
+        // The banner cites the manifest entry that admitted the shape.
+        assert!(code.contains("manifest entry U16 (video-codec-only transcode)"));
+        assert!(code.contains("refuses"));
         // The scaffolding must never claim equivalence.
         assert!(!code.to_lowercase().contains("equivalent"));
     }
@@ -447,25 +499,37 @@ mod tests {
     }
 
     #[test]
-    fn emitted_v1_program_is_pinned_and_compiled() {
-        // examples/cli_emitted_transcode.rs is this exact emission, checked
-        // in and built by `cargo build --examples`: every emitted call is
-        // proven to exist against the real crate API, byte for byte.
-        let code =
-            emit_cmd("ffmpeg -i in.mkv -c:v libx264 -crf 23 -preset fast -c:a aac -y out.mp4");
-        assert_eq!(
-            code,
-            include_str!("../../../examples/cli_emitted_transcode.rs")
-        );
-    }
-
-    #[test]
-    fn emitted_v2_program_is_pinned_and_compiled() {
-        // The Input::from branch (input-side options) of the emitter,
-        // compile-pinned via examples/cli_emitted_clip.rs.
-        let code =
-            emit_cmd("ffmpeg -ss 10 -i in.mp4 -t 20 -c:v libx264 -crf 23 -c:a aac -y clip.mp4");
-        assert_eq!(code, include_str!("../../../examples/cli_emitted_clip.rs"));
+    fn every_verified_shape_emission_is_pinned_and_compiled() {
+        // Each examples/cli_emitted_* file is the EXACT emission of its
+        // shape's canonical argv, checked in and built by cargo (examples
+        // compile as real targets), so every emitted call is proven against
+        // the real crate API byte for byte — and the golden runner executes
+        // these same binaries as its third lane.
+        use crate::core::cli::manifest::VERIFIED_SHAPES;
+        for shape in VERIFIED_SHAPES {
+            let code = crate::core::cli::emit_rust_code_from_args(shape.canonical_argv)
+                .unwrap_or_else(|e| panic!("emit of {} canonical argv failed: {e}", shape.id));
+            let pinned = match shape.emitted_example {
+                "cli_emitted_transcode" => {
+                    include_str!("../../../examples/cli_emitted_transcode.rs")
+                }
+                "cli_emitted_clip" => include_str!("../../../examples/cli_emitted_clip.rs"),
+                "cli_emitted_audio_extract" => {
+                    include_str!("../../../examples/cli_emitted_audio_extract.rs")
+                }
+                "cli_emitted_thumbnail" => {
+                    include_str!("../../../examples/cli_emitted_thumbnail.rs")
+                }
+                "cli_emitted_scale" => include_str!("../../../examples/cli_emitted_scale.rs"),
+                "cli_emitted_hls" => include_str!("../../../examples/cli_emitted_hls.rs"),
+                other => panic!("shape {} names an unpinned example {other}", shape.id),
+            };
+            assert_eq!(
+                code, pinned,
+                "examples/{}.rs drifted from the emitter; regenerate it",
+                shape.emitted_example
+            );
+        }
     }
 
     #[test]
