@@ -249,7 +249,8 @@ fn abort_during_final_delivery_fires_no_terminal_callback() {
         delivered += 1;
         if delivered == 10 {
             // Ask the controller to abort, and hold this packet until the
-            // abort has been issued — the terminal slot then must observe it.
+            // abort status has been stored — the terminal region then must
+            // observe it.
             let _ = abort_request_tx.send(());
             let _ = abort_done_rx.recv_timeout(Duration::from_secs(10));
         }
@@ -274,12 +275,17 @@ fn abort_during_final_delivery_fires_no_terminal_callback() {
     abort_request_rx
         .recv_timeout(Duration::from_secs(20))
         .expect("delivery never reached the abort point");
-    scheduler.abort();
+    // abort() consumes the scheduler and BLOCKS until every worker exits
+    // (RunningGuard's drop) — the held callback would deadlock it on this
+    // thread, so it runs on a helper. Its ABORT store is its first action;
+    // the grace below dwarfs the helper's spawn+store latency, so the store
+    // has landed before the held packet is released.
+    let abort_thread = std::thread::spawn(move || scheduler.abort());
+    std::thread::sleep(Duration::from_millis(500));
     let _ = abort_done_tx.send(());
-
-    // abort() is fire-and-forget; give the teardown a bounded window, then
-    // assert no terminal callback fired.
-    std::thread::sleep(Duration::from_millis(800));
+    abort_thread
+        .join()
+        .expect("abort() must return once the job tears down");
     assert_no_terminal_event(&log, "abort_during_final_delivery");
 }
 

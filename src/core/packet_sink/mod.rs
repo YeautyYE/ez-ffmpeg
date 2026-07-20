@@ -40,7 +40,11 @@
 //!    * `on_end` fires only when every output stream reached a recognized
 //!      terminal state (natural encoder EOF, or configured truncation such as
 //!      `set_recording_time_us` / `set_shortest`), everything was delivered,
-//!      and the whole job settled without an error.
+//!      and the whole job settled without an error: the delivery thread
+//!      first waits for every other job worker to finish (including sibling
+//!      outputs' teardown), then decides on one fresh status/result read —
+//!      the linearization point. An `abort()` that lands after that read is
+//!      indistinguishable from one after the callback.
 //!    * `on_delivery_error` fires when delivery stopped because of a
 //!      strict-tier violation or a failing callback, or when the job failed
 //!      elsewhere after this sink had already delivered everything.
