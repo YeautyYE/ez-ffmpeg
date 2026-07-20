@@ -854,3 +854,126 @@ fn filtered_output_receiving_the_graph_still_conflicts() {
         "unexpected error: {err:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Review probes (round 3): disable flags must not derail fftools-order
+// assignment — FFmpeg 7.1 puts an unlabeled graph on a -vn output and still
+// filters the next output. Legacy (no set_video_filter) ordering stays
+// pinned bit for bit.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn disabled_video_output_still_receives_the_graph_in_feature_jobs() {
+    // output #0: disable_video + audio map — fftools assigns the unlabeled
+    // complex-video graph here DESPITE -vn; output #1 keeps its own -vf.
+    let input = av_fixture("disable_assign_in.mp4");
+    let graphed = tmp_path("disable_assign_graphed.mp4");
+    let filtered = tmp_path("disable_assign_filtered.mp4");
+    run(
+        FfmpegContext::builder()
+            .input(input.as_str())
+            .filter_desc("hue=s=0")
+            .output(
+                Output::from(graphed.as_str())
+                    .set_video_codec("mpeg4")
+                    .set_audio_codec("aac")
+                    .disable_video()
+                    .add_stream_map("0:a"),
+            )
+            .output(
+                Output::from(filtered.as_str())
+                    .set_video_codec("mpeg4")
+                    .set_video_filter("scale=160:120"),
+            )
+            .build()
+            .unwrap(),
+        "disable_video output receives the graph, next output filters",
+    )
+    .unwrap();
+    // Output #0 carries the graph's video stream (despite disable_video)
+    // plus the mapped audio.
+    let infos = ez_ffmpeg::stream_info::find_all_stream_infos(&graphed).unwrap();
+    let videos = infos
+        .iter()
+        .filter(|info| matches!(info, StreamInfo::Video { .. }))
+        .count();
+    let audios = infos
+        .iter()
+        .filter(|info| matches!(info, StreamInfo::Audio { .. }))
+        .count();
+    assert_eq!(
+        (videos, audios),
+        (1, 1),
+        "output 0 must carry the graph video plus its mapped audio"
+    );
+    assert_eq!(video_dimensions(&filtered), (160, 120));
+}
+
+#[test]
+fn disabled_video_mirror_order_still_conflicts_on_the_filtered_output() {
+    // Mirror: the FILTERED output comes first, so the graph lands on it and
+    // conflicts — the disable_video output later changes nothing.
+    let input = av_fixture("disable_assign_flip_in.mp4");
+    let err = build_err(
+        FfmpegContext::builder()
+            .input(input.as_str())
+            .filter_desc("hue=s=0")
+            .output(
+                Output::from(tmp_path("disable_flip_a.mp4").as_str())
+                    .set_video_codec("mpeg4")
+                    .set_video_filter("scale=160:120"),
+            )
+            .output(
+                Output::from(tmp_path("disable_flip_b.m4a").as_str())
+                    .set_audio_codec("aac")
+                    .disable_video()
+                    .add_stream_map("0:a"),
+            )
+            .build(),
+    );
+    assert!(
+        matches!(
+            &err,
+            Error::OpenOutput(OpenOutputError::SimpleAndComplexFilter(desc))
+                if desc == "scale=160:120"
+        ),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn legacy_jobs_keep_the_mapless_only_unlabeled_binding_order() {
+    // Pin the no-feature ordering bit for bit: without set_video_filter
+    // anywhere, an output WITH maps is skipped by unlabeled assignment and
+    // the graph lands on the next map-less output (the pre-existing crate
+    // behavior every released caller relies on).
+    let input = video_fixture("legacy_order_in.mp4");
+    let mapped = tmp_path("legacy_order_mapped.mp4");
+    let graphed = tmp_path("legacy_order_graphed.mp4");
+    run(
+        FfmpegContext::builder()
+            .input(input.as_str())
+            .filter_desc("hue=s=0")
+            .output(
+                Output::from(mapped.as_str())
+                    .set_video_codec("mpeg4")
+                    .add_stream_map("0:v"),
+            )
+            .output(Output::from(graphed.as_str()).set_video_codec("mpeg4"))
+            .build()
+            .unwrap(),
+        "legacy unlabeled binding order",
+    )
+    .unwrap();
+    let count_videos = |path: &str| {
+        ez_ffmpeg::stream_info::find_all_stream_infos(path)
+            .unwrap()
+            .into_iter()
+            .filter(|info| matches!(info, StreamInfo::Video { .. }))
+            .count()
+    };
+    // Legacy: the mapped output gets ONLY its map; the map-less output gets
+    // the graph.
+    assert_eq!(count_videos(&mapped), 1, "mapped output must not receive the graph");
+    assert_eq!(count_videos(&graphed), 1, "map-less output receives the graph");
+}

@@ -338,12 +338,12 @@ pub(super) fn outputs_bind(
         }
 
         if fftools_unlabeled_order {
-            output_bind_by_unlabeled_filter(i, mux, filter_graphs, &mut auto_disable)?;
+            output_bind_by_unlabeled_filter(i, mux, filter_graphs, &mut auto_disable, true)?;
         }
 
         if mux.stream_maps.is_empty() {
             if !fftools_unlabeled_order {
-                output_bind_by_unlabeled_filter(i, mux, filter_graphs, &mut auto_disable)?;
+                output_bind_by_unlabeled_filter(i, mux, filter_graphs, &mut auto_disable, false)?;
             }
             /* pick the first stream of each type */
             map_auto_streams(i, mux, demuxs, filter_graphs, auto_disable)?;
@@ -1733,6 +1733,7 @@ fn output_bind_by_unlabeled_filter(
     mux: &mut Muxer,
     filter_graphs: &mut Vec<FilterGraph>,
     auto_disable: &mut i32,
+    assign_despite_disable: bool,
 ) -> Result<()> {
     let fg_len = filter_graphs.len();
 
@@ -1763,8 +1764,13 @@ fn output_bind_by_unlabeled_filter(
                 }
             }
 
-            // Check if this stream type is disabled
-            if *auto_disable & (1 << media_type as i32) != 0 {
+            // Legacy path: a disabled stream type skips assignment. In
+            // fftools order (feature jobs) the CLI assigns unlabeled graph
+            // outputs REGARDLESS of -vn/-an (create_streams' unlabeled loop
+            // has no disable gate; ffmpeg 7.1 puts the graph on a -vn output
+            // and happily filters the next one), so the pre-pass must not
+            // skip here either.
+            if !assign_despite_disable && *auto_disable & (1 << media_type as i32) != 0 {
                 continue;
             }
 
