@@ -777,3 +777,80 @@ fn video_writer_rejects_conflicting_filter_descriptions() {
         "expected the conflicting-filter error, got: {text}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Review probes (round 2): per-output assignment semantics of the
+// simple/complex conflict — an output the unlabeled graph does NOT land on
+// keeps its simple filter, exactly like FFmpeg 7.1; the output that receives
+// the graph still conflicts. Both orders covered.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unlabeled_graph_on_earlier_output_frees_a_later_simple_filter() {
+    // FFmpeg 7.1-legal layout: output #0 takes the unlabeled complex graph
+    // (bound before its explicit map, fftools create_streams order) and has
+    // no simple filter; output #1 runs its own -vf. This must SUCCEED.
+    let input = video_fixture("legal_layout_in.mp4");
+    let graphed = tmp_path("legal_layout_graphed.mp4");
+    let filtered = tmp_path("legal_layout_filtered.mp4");
+    run(
+        FfmpegContext::builder()
+            .input(input.as_str())
+            .filter_desc("hue=s=0")
+            .output(
+                Output::from(graphed.as_str())
+                    .set_video_codec("mpeg4")
+                    .add_stream_map("0:v"),
+            )
+            .output(
+                Output::from(filtered.as_str())
+                    .set_video_codec("mpeg4")
+                    .set_video_filter("scale=160:120"),
+            )
+            .build()
+            .unwrap(),
+        "unlabeled graph to output 0, simple filter on output 1",
+    )
+    .unwrap();
+    // Output #0 carries BOTH the complex-graph stream and the mapped stream
+    // (fftools binds unlabeled outputs in addition to explicit maps).
+    let video_streams = ez_ffmpeg::stream_info::find_all_stream_infos(&graphed)
+        .unwrap()
+        .into_iter()
+        .filter(|info| matches!(info, StreamInfo::Video { .. }))
+        .count();
+    assert_eq!(video_streams, 2, "output 0 must carry the graph and the mapped stream");
+    // Output #1's own filter applied.
+    assert_eq!(video_dimensions(&filtered), (160, 120));
+}
+
+#[test]
+fn filtered_output_receiving_the_graph_still_conflicts() {
+    // Order flipped: the FILTERED output comes first, so the unlabeled graph
+    // lands on it — fftools' ost_get_filters conflict, and ours.
+    let input = video_fixture("legal_layout_flip_in.mp4");
+    let err = build_err(
+        FfmpegContext::builder()
+            .input(input.as_str())
+            .filter_desc("hue=s=0")
+            .output(
+                Output::from(tmp_path("legal_flip_a.mp4").as_str())
+                    .set_video_codec("mpeg4")
+                    .set_video_filter("scale=160:120"),
+            )
+            .output(
+                Output::from(tmp_path("legal_flip_b.mp4").as_str())
+                    .set_video_codec("mpeg4")
+                    .add_stream_map("0:v"),
+            )
+            .build(),
+    );
+    assert!(
+        matches!(
+            &err,
+            Error::OpenOutput(OpenOutputError::SimpleAndComplexFilter(desc))
+                if desc == "scale=160:120"
+        ),
+        "unexpected error: {err:?}"
+    );
+}
