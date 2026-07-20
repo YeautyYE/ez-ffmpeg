@@ -1929,6 +1929,25 @@ mod tests {
         assert_eq!(Output::new_by_write_callback(|_| 0).video_filter, None);
     }
 
+    /// Constructor parity for the CLI-only flags: every public construction
+    /// path funnels through `with_target`, and the compiler only enforces
+    /// field PRESENCE there, not VALUES. A future field whose `with_target`
+    /// default were `true` would silently arm strict/uniqueness semantics on
+    /// every non-CLI pipeline; this pin turns that mistake into a red test.
+    #[test]
+    fn cli_only_flags_default_to_off_on_every_construction_path() {
+        let outputs = [
+            Output::from("out.mp4"),
+            Output::new_by_write_callback(|_| 0),
+            Output::new_by_packet_sink(crate::core::packet_sink::PacketSink::discard()),
+        ];
+        for output in outputs {
+            assert!(!output.strict_avoptions);
+            assert!(!output.require_unique_video_source);
+            assert_eq!(output.video_filter, None);
+        }
+    }
+
     #[test]
     fn parses_sorted_microseconds() {
         assert_eq!(
