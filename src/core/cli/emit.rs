@@ -361,6 +361,23 @@ mod tests {
     }
 
     #[test]
+    fn emitted_v1_program_is_pinned_and_compiled() {
+        // examples/cli_emitted_transcode.rs is this exact emission, checked
+        // in and built by `cargo build --examples`: every emitted call is
+        // proven to exist against the real crate API, byte for byte.
+        let code = emit_cmd("ffmpeg -i in.mkv -c:v libx264 -crf 23 -preset fast -c:a aac -y out.mp4");
+        assert_eq!(code, include_str!("../../../examples/cli_emitted_transcode.rs"));
+    }
+
+    #[test]
+    fn emitted_v2_program_is_pinned_and_compiled() {
+        // The Input::from branch (input-side options) of the emitter,
+        // compile-pinned via examples/cli_emitted_clip.rs.
+        let code = emit_cmd("ffmpeg -ss 10 -i in.mp4 -t 20 -c:v libx264 -crf 23 -c:a aac -y clip.mp4");
+        assert_eq!(code, include_str!("../../../examples/cli_emitted_clip.rs"));
+    }
+
+    #[test]
     fn faststart_remux_emit_is_unverified_with_explicit_copies() {
         let code = emit_cmd(
             "ffmpeg -i in.mp4 -c:v copy -c:a copy -movflags +faststart -y faststart.mp4",
