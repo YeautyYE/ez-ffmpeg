@@ -231,6 +231,29 @@ fn stop_terminates_with_full_undrained_channel() {
     );
 }
 
+/// Encoder-independent lifecycle case (native AAC): stop() mid-stream on an
+/// audio-only sink terminates without a terminal callback — so CI without
+/// libx264 still exercises the real teardown machinery.
+#[test]
+fn aac_stop_mid_stream_fires_no_terminal_callback() {
+    let _lock = PROCESS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (sink, log) = recording_sink();
+    let scheduler = FfmpegContext::builder()
+        .input(
+            Input::from("sine=frequency=440:duration=10")
+                .set_format("lavfi")
+                .set_readrate(0.2),
+        )
+        .output(Output::from(sink).set_audio_codec("aac"))
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    stop_with_watchdog(scheduler, 30, "aac_stop_mid_stream");
+    assert_no_terminal_event(&log, "aac_stop_mid_stream");
+}
+
 /// Dropping the running scheduler (no explicit stop) takes the RunningGuard
 /// path: same contract — clean exit, no terminal sink callback.
 #[test]
