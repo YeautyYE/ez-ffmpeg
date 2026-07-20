@@ -226,18 +226,27 @@ mod tests {
 
     #[test]
     fn splits_on_runs_of_whitespace() {
-        assert_eq!(ok("-i  in.mp4\t-y   out.mp4"), ["-i", "in.mp4", "-y", "out.mp4"]);
+        assert_eq!(
+            ok("-i  in.mp4\t-y   out.mp4"),
+            ["-i", "in.mp4", "-y", "out.mp4"]
+        );
     }
 
     #[test]
     fn strips_leading_ffmpeg_token() {
-        assert_eq!(ok("ffmpeg -i in.mp4 -y out.mp4"), ["-i", "in.mp4", "-y", "out.mp4"]);
+        assert_eq!(
+            ok("ffmpeg -i in.mp4 -y out.mp4"),
+            ["-i", "in.mp4", "-y", "out.mp4"]
+        );
         assert_eq!(ok("FFmpeg.EXE -y"), ["-y"]);
     }
 
     #[test]
     fn keeps_ffmpeg_when_not_leading() {
-        assert_eq!(ok("-i ffmpeg -y out.mp4"), ["-i", "ffmpeg", "-y", "out.mp4"]);
+        assert_eq!(
+            ok("-i ffmpeg -y out.mp4"),
+            ["-i", "ffmpeg", "-y", "out.mp4"]
+        );
     }
 
     #[test]
@@ -284,23 +293,38 @@ mod tests {
 
     #[test]
     fn unicode_inside_quotes_survives() {
-        assert_eq!(ok("-i '目录 一/クリップ.mov'"), ["-i", "目录 一/クリップ.mov"]);
+        assert_eq!(
+            ok("-i '目录 一/クリップ.mov'"),
+            ["-i", "目录 一/クリップ.mov"]
+        );
     }
 
     #[test]
     fn backslash_newline_continues_the_line() {
-        assert_eq!(ok("-i in.mp4 \\\n-y out.mp4"), ["-i", "in.mp4", "-y", "out.mp4"]);
+        assert_eq!(
+            ok("-i in.mp4 \\\n-y out.mp4"),
+            ["-i", "in.mp4", "-y", "out.mp4"]
+        );
     }
 
     #[test]
     fn backslash_crlf_continues_the_line() {
-        assert_eq!(ok("-i in.mp4 \\\r\n-y out.mp4"), ["-i", "in.mp4", "-y", "out.mp4"]);
+        assert_eq!(
+            ok("-i in.mp4 \\\r\n-y out.mp4"),
+            ["-i", "in.mp4", "-y", "out.mp4"]
+        );
     }
 
     #[test]
     fn caret_newline_continues_the_line() {
-        assert_eq!(ok("-i in.mp4 ^\n-y out.mp4"), ["-i", "in.mp4", "-y", "out.mp4"]);
-        assert_eq!(ok("-i in.mp4 ^\r\n-y out.mp4"), ["-i", "in.mp4", "-y", "out.mp4"]);
+        assert_eq!(
+            ok("-i in.mp4 ^\n-y out.mp4"),
+            ["-i", "in.mp4", "-y", "out.mp4"]
+        );
+        assert_eq!(
+            ok("-i in.mp4 ^\r\n-y out.mp4"),
+            ["-i", "in.mp4", "-y", "out.mp4"]
+        );
     }
 
     #[test]
@@ -394,7 +418,10 @@ mod tests {
     #[test]
     fn glob_characters_pass_through_literally() {
         // The documented no-match fallback: ffmpeg option grammar owns these.
-        assert_eq!(ok("-map 0:a:1? -vf scale=iw*2:ih"), ["-map", "0:a:1?", "-vf", "scale=iw*2:ih"]);
+        assert_eq!(
+            ok("-map 0:a:1? -vf scale=iw*2:ih"),
+            ["-map", "0:a:1?", "-vf", "scale=iw*2:ih"]
+        );
     }
 
     #[test]

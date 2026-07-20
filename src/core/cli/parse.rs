@@ -294,7 +294,11 @@ impl Parser {
             "-vn" => output.video_disabled = true,
             "-an" => output.audio_disabled = true,
             "-c:v" => {
-                dup_check(output.video_copy || output.video_codec.is_some(), name, index)?;
+                dup_check(
+                    output.video_copy || output.video_codec.is_some(),
+                    name,
+                    index,
+                )?;
                 if value == "copy" {
                     output.video_copy = true;
                 } else {
@@ -302,7 +306,11 @@ impl Parser {
                 }
             }
             "-c:a" => {
-                dup_check(output.audio_copy || output.audio_codec.is_some(), name, index)?;
+                dup_check(
+                    output.audio_copy || output.audio_codec.is_some(),
+                    name,
+                    index,
+                )?;
                 if value == "copy" {
                     output.audio_copy = true;
                 } else {
@@ -397,7 +405,11 @@ fn check_combinations(ir: &CliIr) -> Result<(), CliError> {
             );
         }
         if out.video_disabled {
-            return conflict("-vf", "-vn", "the filter could never apply: -vn removes video");
+            return conflict(
+                "-vf",
+                "-vn",
+                "the filter could never apply: -vn removes video",
+            );
         }
         if !out.maps.is_empty() {
             return conflict(

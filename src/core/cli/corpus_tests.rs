@@ -71,7 +71,10 @@ fn rejected(cmd: &str, expect: &str, fragment: &str) {
         CliError::Build(_) => "Build",
         _ => "other",
     };
-    assert_eq!(variant, expect, "{cmd:?} rejected with the wrong variant: {err}");
+    assert_eq!(
+        variant, expect,
+        "{cmd:?} rejected with the wrong variant: {err}"
+    );
     let display = err.to_string();
     assert!(
         display.contains(fragment),
@@ -89,12 +92,16 @@ fn rejected(cmd: &str, expect: &str, fragment: &str) {
 
 #[test]
 fn corpus_v1_transcode() {
-    runs_verified("ffmpeg -i no_such_fixture.mkv -c:v libx264 -crf 23 -preset fast -c:a aac -y out.mp4");
+    runs_verified(
+        "ffmpeg -i no_such_fixture.mkv -c:v libx264 -crf 23 -preset fast -c:a aac -y out.mp4",
+    );
 }
 
 #[test]
 fn corpus_v2_clip() {
-    runs_verified("ffmpeg -ss 10 -i no_such_fixture.mp4 -t 20 -c:v libx264 -crf 23 -c:a aac -y clip.mp4");
+    runs_verified(
+        "ffmpeg -ss 10 -i no_such_fixture.mp4 -t 20 -c:v libx264 -crf 23 -c:a aac -y clip.mp4",
+    );
 }
 
 #[test]
@@ -339,7 +346,11 @@ fn corpus_hardware_accel() {
 
 #[test]
 fn corpus_frame_rate_and_size() {
-    rejected("ffmpeg -i input.mp4 -r 30 -y out.mp4", "UnsupportedOption", "Round-1");
+    rejected(
+        "ffmpeg -i input.mp4 -r 30 -y out.mp4",
+        "UnsupportedOption",
+        "Round-1",
+    );
     rejected(
         "ffmpeg -i input.mp4 -s 1280x720 -y out.mp4",
         "UnsupportedOption",
@@ -349,7 +360,11 @@ fn corpus_frame_rate_and_size() {
 
 #[test]
 fn corpus_quality_scale_and_unsplit_bitrate() {
-    rejected("ffmpeg -i input.mp4 -q:v 2 -y out.mp4", "UnsupportedOption", "fixed-quality");
+    rejected(
+        "ffmpeg -i input.mp4 -q:v 2 -y out.mp4",
+        "UnsupportedOption",
+        "fixed-quality",
+    );
     rejected(
         "ffmpeg -i input.mp4 -b 2M -y out.mp4",
         "UnsupportedOption",
@@ -359,21 +374,49 @@ fn corpus_quality_scale_and_unsplit_bitrate() {
 
 #[test]
 fn corpus_threads_and_progress() {
-    rejected("ffmpeg -i in.mp4 -threads 4 -y out.mp4", "UnsupportedOption", "auto threading");
-    rejected("ffmpeg -i in.mp4 -progress p.txt -y out.mp4", "UnsupportedOption", "documented gap");
+    rejected(
+        "ffmpeg -i in.mp4 -threads 4 -y out.mp4",
+        "UnsupportedOption",
+        "auto threading",
+    );
+    rejected(
+        "ffmpeg -i in.mp4 -progress p.txt -y out.mp4",
+        "UnsupportedOption",
+        "documented gap",
+    );
 }
 
 #[test]
 fn corpus_codec_tags_and_never_overwrite() {
-    rejected("ffmpeg -i in.mp4 -tag:v hvc1 -y out.mp4", "UnsupportedOption", "documented gap");
-    rejected("ffmpeg -n -i in.mp4 -y out.mp4", "UnsupportedOption", "never-overwrite");
+    rejected(
+        "ffmpeg -i in.mp4 -tag:v hvc1 -y out.mp4",
+        "UnsupportedOption",
+        "documented gap",
+    );
+    rejected(
+        "ffmpeg -n -i in.mp4 -y out.mp4",
+        "UnsupportedOption",
+        "never-overwrite",
+    );
 }
 
 #[test]
 fn corpus_legacy_aliases_get_hints() {
-    rejected("ffmpeg -i in.mp4 -vcodec libx264 -y out.mp4", "UnsupportedOption", "did you mean `-c:v`?");
-    rejected("ffmpeg -i in.mp4 -acodec aac -y out.mp4", "UnsupportedOption", "did you mean `-c:a`?");
-    rejected("ffmpeg -i in.mp4 -vframes 1 -y out.jpg", "UnsupportedOption", "did you mean `-frames:v 1`?");
+    rejected(
+        "ffmpeg -i in.mp4 -vcodec libx264 -y out.mp4",
+        "UnsupportedOption",
+        "did you mean `-c:v`?",
+    );
+    rejected(
+        "ffmpeg -i in.mp4 -acodec aac -y out.mp4",
+        "UnsupportedOption",
+        "did you mean `-c:a`?",
+    );
+    rejected(
+        "ffmpeg -i in.mp4 -vframes 1 -y out.jpg",
+        "UnsupportedOption",
+        "did you mean `-frames:v 1`?",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -391,22 +434,38 @@ fn corpus_map_optional_suffix() {
 
 #[test]
 fn corpus_map_negative() {
-    rejected("ffmpeg -i in.mp4 -map -0:a -y out.mp4", "UnsupportedValue", "negative mappings");
+    rejected(
+        "ffmpeg -i in.mp4 -map -0:a -y out.mp4",
+        "UnsupportedValue",
+        "negative mappings",
+    );
 }
 
 #[test]
 fn corpus_map_label() {
-    rejected("ffmpeg -i in.mp4 -map '[vout]' -y out.mp4", "UnsupportedValue", "basic index maps");
+    rejected(
+        "ffmpeg -i in.mp4 -map '[vout]' -y out.mp4",
+        "UnsupportedValue",
+        "basic index maps",
+    );
 }
 
 #[test]
 fn corpus_map_second_input_index() {
-    rejected("ffmpeg -i in.mp4 -map 1:a -y out.mp4", "UnsupportedValue", "single-input");
+    rejected(
+        "ffmpeg -i in.mp4 -map 1:a -y out.mp4",
+        "UnsupportedValue",
+        "single-input",
+    );
 }
 
 #[test]
 fn corpus_map_subtitles() {
-    rejected("ffmpeg -i in.mkv -map 0:s -y out.mkv", "UnsupportedValue", "subtitle/data");
+    rejected(
+        "ffmpeg -i in.mkv -map 0:s -y out.mkv",
+        "UnsupportedValue",
+        "subtitle/data",
+    );
 }
 
 #[test]
@@ -461,9 +520,21 @@ fn corpus_map_with_filter() {
 
 #[test]
 fn corpus_indexed_per_stream_variants() {
-    rejected("ffmpeg -i in.mp4 -b:v:1 500k -y out.mp4", "UnsupportedOption", "per-stream indexed");
-    rejected("ffmpeg -i in.mp4 -crf:v:0 23 -y out.mp4", "UnsupportedOption", "per-stream indexed");
-    rejected("ffmpeg -i in.mp4 -c:v:0 libx264 -y out.mp4", "UnsupportedOption", "per-stream indexed");
+    rejected(
+        "ffmpeg -i in.mp4 -b:v:1 500k -y out.mp4",
+        "UnsupportedOption",
+        "per-stream indexed",
+    );
+    rejected(
+        "ffmpeg -i in.mp4 -crf:v:0 23 -y out.mp4",
+        "UnsupportedOption",
+        "per-stream indexed",
+    );
+    rejected(
+        "ffmpeg -i in.mp4 -c:v:0 libx264 -y out.mp4",
+        "UnsupportedOption",
+        "per-stream indexed",
+    );
 }
 
 #[test]
@@ -504,14 +575,28 @@ fn corpus_cross_scope_trim_pair_is_legal() {
 
 #[test]
 fn corpus_output_side_seek() {
-    emit_only("ffmpeg -i in.mp4 -ss 10 -t 20 -c:v libx264 -crf 23 -preset fast -c:a aac -y out.mp4");
+    emit_only(
+        "ffmpeg -i in.mp4 -ss 10 -t 20 -c:v libx264 -crf 23 -preset fast -c:a aac -y out.mp4",
+    );
 }
 
 #[test]
 fn corpus_time_value_grammar() {
-    rejected("ffmpeg -ss 00:01:30 -i in.mp4 -y out.mp4", "UnsupportedValue", "decimal seconds");
-    rejected("ffmpeg -ss -5 -i in.mp4 -y out.mp4", "UnsupportedValue", "signed times");
-    rejected("ffmpeg -i in.mp4 -t 10s -y out.mp4", "UnsupportedValue", "decimal seconds");
+    rejected(
+        "ffmpeg -ss 00:01:30 -i in.mp4 -y out.mp4",
+        "UnsupportedValue",
+        "decimal seconds",
+    );
+    rejected(
+        "ffmpeg -ss -5 -i in.mp4 -y out.mp4",
+        "UnsupportedValue",
+        "signed times",
+    );
+    rejected(
+        "ffmpeg -i in.mp4 -t 10s -y out.mp4",
+        "UnsupportedValue",
+        "decimal seconds",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -646,7 +731,11 @@ fn corpus_missing_files() {
 #[test]
 fn corpus_stdin_stdout_pipes() {
     rejected("ffmpeg -i - -y out.mp4", "UnsupportedLayout", "stdin");
-    rejected("ffmpeg -i in.mp4 -f mpegts -y -", "UnsupportedLayout", "stdout");
+    rejected(
+        "ffmpeg -i in.mp4 -f mpegts -y -",
+        "UnsupportedLayout",
+        "stdout",
+    );
 }
 
 #[test]
@@ -660,12 +749,20 @@ fn corpus_duplicate_option() {
 
 #[test]
 fn corpus_double_dash_is_an_unknown_option() {
-    rejected("ffmpeg -i in.mp4 -- -y out.mp4", "UnsupportedOption", "not in the CLI-compat subset");
+    rejected(
+        "ffmpeg -i in.mp4 -- -y out.mp4",
+        "UnsupportedOption",
+        "not in the CLI-compat subset",
+    );
 }
 
 #[test]
 fn corpus_unknown_option_with_hint() {
-    rejected("ffmpeg -i in.mp4 -vff scale=1:1 -y out.mp4", "UnsupportedOption", "did you mean `-vf`?");
+    rejected(
+        "ffmpeg -i in.mp4 -vff scale=1:1 -y out.mp4",
+        "UnsupportedOption",
+        "did you mean `-vf`?",
+    );
 }
 
 #[test]
@@ -683,9 +780,21 @@ fn corpus_unknown_option_without_hint() {
 
 #[test]
 fn corpus_disabled_stream_contradictions() {
-    rejected("ffmpeg -i in.mp4 -an -c:a aac -y out.mp4", "ConflictingOptions", "-an removes");
-    rejected("ffmpeg -i in.mp4 -vn -crf 23 -y out.m4a", "ConflictingOptions", "-vn removes");
-    rejected("ffmpeg -i in.mp4 -vn -an -y out.mp4", "ConflictingOptions", "no streams");
+    rejected(
+        "ffmpeg -i in.mp4 -an -c:a aac -y out.mp4",
+        "ConflictingOptions",
+        "-an removes",
+    );
+    rejected(
+        "ffmpeg -i in.mp4 -vn -crf 23 -y out.m4a",
+        "ConflictingOptions",
+        "-vn removes",
+    );
+    rejected(
+        "ffmpeg -i in.mp4 -vn -an -y out.mp4",
+        "ConflictingOptions",
+        "no streams",
+    );
 }
 
 #[test]
@@ -722,8 +831,16 @@ fn corpus_copy_with_reencode_knobs() {
 
 #[test]
 fn corpus_shell_redirect_and_pipe() {
-    rejected("ffmpeg -i in.mp4 -y out.mp4 2>&1", "Tokenize", "shell operator");
-    rejected("ffmpeg -i in.mp4 -y out.mp4 | cat", "Tokenize", "shell operator");
+    rejected(
+        "ffmpeg -i in.mp4 -y out.mp4 2>&1",
+        "Tokenize",
+        "shell operator",
+    );
+    rejected(
+        "ffmpeg -i in.mp4 -y out.mp4 | cat",
+        "Tokenize",
+        "shell operator",
+    );
 }
 
 #[test]
@@ -772,13 +889,15 @@ fn corpus_default_codecs_remux() {
 #[test]
 fn corpus_no_panic_property_sweep() {
     const ALPHABET: &[&str] = &[
-        " ", "-", "i", "c", ":", "v", "'", "\"", "\\", "\n", "^", "$", "0", "9", ".", "=",
-        "映", "🎬", "\t", "\r", "%", "?", "*", "[", "]", "y", "-i", "-y", "-c:v", "scale",
-        "map", "~", "#",
+        " ", "-", "i", "c", ":", "v", "'", "\"", "\\", "\n", "^", "$", "0", "9", ".", "=", "映",
+        "🎬", "\t", "\r", "%", "?", "*", "[", "]", "y", "-i", "-y", "-c:v", "scale", "map", "~",
+        "#",
     ];
     let mut state: u64 = 0x243F_6A88_85A3_08D3;
     let mut next = move || {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (state >> 33) as usize
     };
     for _ in 0..500 {

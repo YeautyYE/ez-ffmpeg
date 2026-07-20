@@ -11,9 +11,9 @@
 //! (`set_video_codec_opt`); `-movflags +faststart` and the `hls_*` keys ride
 //! the muxer dictionary (`set_format_opt`) with their CLI values verbatim.
 
+use crate::core::context::ffmpeg_context::FfmpegContext;
 use crate::core::context::input::Input;
 use crate::core::context::output::Output;
-use crate::core::context::ffmpeg_context::FfmpegContext;
 
 use super::ir::{CliIr, DurationKind, Noop};
 
@@ -110,7 +110,9 @@ pub(crate) fn lower(ir: &CliIr) -> LoweredJob {
         None => {}
     }
     if let Some(crf) = &out.crf {
-        output.video_codec_opts.push(("crf".to_string(), crf.clone()));
+        output
+            .video_codec_opts
+            .push(("crf".to_string(), crf.clone()));
     }
     if let Some(preset) = &out.preset {
         output
@@ -136,8 +138,8 @@ pub(crate) fn lower(ir: &CliIr) -> LoweredJob {
     for map in &out.maps {
         // Media-qualified maps inherit their media type's copy flag; the
         // parser already rejected unqualified maps combined with copy.
-        let copy = (map_selects(map, 'v') && out.video_copy)
-            || (map_selects(map, 'a') && out.audio_copy);
+        let copy =
+            (map_selects(map, 'v') && out.video_copy) || (map_selects(map, 'a') && out.audio_copy);
         output.stream_maps.push((map.clone(), copy));
     }
 

@@ -114,7 +114,11 @@ fn strict_muxer_leftover_fails_the_run() {
         .output(output)
         .build()
         .unwrap();
-    expect_unconsumed(run_to_completion(context), "no_such_mux_opt", "muxer leftover");
+    expect_unconsumed(
+        run_to_completion(context),
+        "no_such_mux_opt",
+        "muxer leftover",
+    );
 }
 
 #[test]
@@ -129,7 +133,11 @@ fn strict_encoder_leftover_fails_the_run() {
         .output(output)
         .build()
         .unwrap();
-    expect_unconsumed(run_to_completion(context), "no_such_enc_opt", "encoder leftover");
+    expect_unconsumed(
+        run_to_completion(context),
+        "no_such_enc_opt",
+        "encoder leftover",
+    );
 }
 
 #[test]
@@ -143,7 +151,11 @@ fn strict_decoder_leftover_fails_the_run() {
         .output(Output::from(tmp_path("strict_dec_out.mp4").as_str()).set_video_codec("mpeg4"))
         .build()
         .unwrap();
-    expect_unconsumed(run_to_completion(context), "no_such_dec_opt", "decoder leftover");
+    expect_unconsumed(
+        run_to_completion(context),
+        "no_such_dec_opt",
+        "decoder leftover",
+    );
 }
 
 #[test]
@@ -175,8 +187,8 @@ fn lowering_carries_the_golden_shape_fields() {
     // pin the V1 lowering field by field (strict-mode arming itself is
     // covered end to end by the site tests above).
     let args: Vec<String> = [
-        "-i", "in.mp4", "-c:v", "libx264", "-crf", "23", "-preset", "fast", "-c:a", "aac",
-        "-y", "out.mp4",
+        "-i", "in.mp4", "-c:v", "libx264", "-crf", "23", "-preset", "fast", "-c:a", "aac", "-y",
+        "out.mp4",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -198,10 +210,12 @@ fn lowering_carries_the_golden_shape_fields() {
 
 #[test]
 fn lowering_scopes_trims_per_side() {
-    let args: Vec<String> = ["-ss", "2.5", "-t", "1", "-i", "in.mp4", "-to", "8", "-y", "out.mp4"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let args: Vec<String> = [
+        "-ss", "2.5", "-t", "1", "-i", "in.mp4", "-to", "8", "-y", "out.mp4",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
     let ir = super::parse::parse(&args).unwrap();
     let job = super::lower::lower(&ir);
     assert_eq!(job.input.start_time_us, Some(2_500_000));
@@ -214,8 +228,8 @@ fn lowering_scopes_trims_per_side() {
 #[test]
 fn lowering_maps_copy_flags_per_media() {
     let args: Vec<String> = [
-        "-i", "in.mp4", "-map", "0:v:0", "-map", "0:a:0", "-c:v", "libx264", "-c:a", "copy",
-        "-y", "out.mp4",
+        "-i", "in.mp4", "-map", "0:v:0", "-map", "0:a:0", "-c:v", "libx264", "-c:a", "copy", "-y",
+        "out.mp4",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -231,9 +245,26 @@ fn lowering_maps_copy_flags_per_media() {
 #[test]
 fn lowering_hls_format_opts_in_cli_order() {
     let args: Vec<String> = [
-        "-i", "in.mp4", "-c:v", "libx264", "-crf", "23", "-c:a", "aac", "-f", "hls",
-        "-hls_time", "6", "-hls_playlist_type", "vod", "-hls_list_size", "0",
-        "-hls_segment_filename", "seg_%03d.ts", "-y", "out.m3u8",
+        "-i",
+        "in.mp4",
+        "-c:v",
+        "libx264",
+        "-crf",
+        "23",
+        "-c:a",
+        "aac",
+        "-f",
+        "hls",
+        "-hls_time",
+        "6",
+        "-hls_playlist_type",
+        "vod",
+        "-hls_list_size",
+        "0",
+        "-hls_segment_filename",
+        "seg_%03d.ts",
+        "-y",
+        "out.m3u8",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -247,18 +278,23 @@ fn lowering_hls_format_opts_in_cli_order() {
             ("hls_time".to_string(), "6".to_string()),
             ("hls_playlist_type".to_string(), "vod".to_string()),
             ("hls_list_size".to_string(), "0".to_string()),
-            ("hls_segment_filename".to_string(), "seg_%03d.ts".to_string()),
+            (
+                "hls_segment_filename".to_string(),
+                "seg_%03d.ts".to_string()
+            ),
         ]
     );
 }
 
 #[test]
 fn lowering_disables_and_rates() {
-    let args: Vec<String> =
-        ["-i", "in.mp4", "-vn", "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2", "-y", "out.m4a"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+    let args: Vec<String> = [
+        "-i", "in.mp4", "-vn", "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2", "-y",
+        "out.m4a",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
     let ir = super::parse::parse(&args).unwrap();
     let job = super::lower::lower(&ir);
     assert!(job.output.video_disable);
@@ -271,7 +307,17 @@ fn lowering_disables_and_rates() {
 #[test]
 fn lowering_thumbnail_and_movflags() {
     let args: Vec<String> = [
-        "-ss", "5", "-i", "in.mp4", "-an", "-c:v", "mjpeg", "-frames:v", "1", "-y", "thumb.jpg",
+        "-ss",
+        "5",
+        "-i",
+        "in.mp4",
+        "-an",
+        "-c:v",
+        "mjpeg",
+        "-frames:v",
+        "1",
+        "-y",
+        "thumb.jpg",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -283,7 +329,16 @@ fn lowering_thumbnail_and_movflags() {
     assert_eq!(job.output.max_video_frames, Some(1));
 
     let args: Vec<String> = [
-        "-i", "in.mp4", "-c:v", "copy", "-c:a", "copy", "-movflags", "+faststart", "-y", "f.mp4",
+        "-i",
+        "in.mp4",
+        "-c:v",
+        "copy",
+        "-c:a",
+        "copy",
+        "-movflags",
+        "+faststart",
+        "-y",
+        "f.mp4",
     ]
     .iter()
     .map(|s| s.to_string())

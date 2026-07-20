@@ -248,7 +248,10 @@ mod facade_tests {
             .unwrap_err();
         // Stripped "ffmpeg" leaves a parseable (unverified) command, proving
         // the token was not mistaken for an output path.
-        assert!(matches!(err, CliError::NotVerified { .. }), "unexpected error: {err}");
+        assert!(
+            matches!(err, CliError::NotVerified { .. }),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

@@ -172,7 +172,8 @@ pub(crate) fn classify(ir: &CliIr) -> ShapeStatus {
     for shape in VERIFIED_SHAPES {
         if fingerprint == shape.fingerprint
             && (shape.pins)(ir)
-            && output_extension(&ir.output.url).is_some_and(|e| e.eq_ignore_ascii_case(shape.output_ext))
+            && output_extension(&ir.output.url)
+                .is_some_and(|e| e.eq_ignore_ascii_case(shape.output_ext))
         {
             return ShapeStatus::Verified(shape.id);
         }
@@ -200,9 +201,7 @@ pub(crate) fn shape(id: &str) -> Option<&'static VerifiedShape> {
 /// drift from the manifest.
 #[cfg(test)]
 pub(crate) fn support_table_markdown() -> String {
-    let mut table = String::from(
-        "| option | scope | notes |\n|---|---|---|\n",
-    );
+    let mut table = String::from("| option | scope | notes |\n|---|---|---|\n");
     for spec in OPTION_TABLE {
         let scope = match spec.scope {
             ScopeRule::Global => "global",
@@ -238,7 +237,12 @@ mod tests {
         for shape in VERIFIED_SHAPES {
             let mut sorted = shape.fingerprint.to_vec();
             sorted.sort_unstable();
-            assert_eq!(shape.fingerprint, &sorted[..], "shape {} is not sorted", shape.id);
+            assert_eq!(
+                shape.fingerprint,
+                &sorted[..],
+                "shape {} is not sorted",
+                shape.id
+            );
         }
     }
 
@@ -310,6 +314,23 @@ mod tests {
                 table.contains(&format!("`{}`", spec.name)),
                 "support table is missing {}",
                 spec.name
+            );
+        }
+    }
+
+    #[test]
+    fn every_verified_shape_names_a_real_golden_test() {
+        // `verified` status is EARNED by a golden, never hand-asserted: each
+        // manifest entry must point at an existing test fn in
+        // tests/cli_goldens.rs (E.4's status model, mechanically enforced).
+        let goldens = include_str!("../../../tests/cli_goldens.rs");
+        for shape in VERIFIED_SHAPES {
+            let needle = format!("fn {}(", shape.golden);
+            assert!(
+                goldens.contains(&needle),
+                "shape {} claims golden `{}` but tests/cli_goldens.rs has no such test",
+                shape.id,
+                shape.golden
             );
         }
     }

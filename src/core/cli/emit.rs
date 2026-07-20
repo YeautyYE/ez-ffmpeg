@@ -46,31 +46,58 @@ pub(crate) fn emit(job: &LoweredJob, command: &[String], status: &ShapeStatus) -
         line(&mut out, 2, &format!(".input({})", lit(&job.input.url)));
     } else {
         line(&mut out, 2, ".input(");
-        line(&mut out, 3, &format!("Input::from({})", lit(&job.input.url)));
+        line(
+            &mut out,
+            3,
+            &format!("Input::from({})", lit(&job.input.url)),
+        );
         if let Some(format) = &job.input.format {
-            line(&mut out, 4, &format!(".set_format({}) // -f {format}", lit(format)));
+            line(
+                &mut out,
+                4,
+                &format!(".set_format({}) // -f {format}", lit(format)),
+            );
         }
         if let Some(us) = job.input.start_time_us {
             line(
                 &mut out,
                 4,
-                &format!(".set_start_time_us({}) // -ss (input side, seconds -> microseconds)", num(us)),
+                &format!(
+                    ".set_start_time_us({}) // -ss (input side, seconds -> microseconds)",
+                    num(us)
+                ),
             );
         }
         if let Some(us) = job.input.recording_time_us {
-            line(&mut out, 4, &format!(".set_recording_time_us({}) // -t (input side)", num(us)));
+            line(
+                &mut out,
+                4,
+                &format!(".set_recording_time_us({}) // -t (input side)", num(us)),
+            );
         }
         if let Some(us) = job.input.stop_time_us {
-            line(&mut out, 4, &format!(".set_stop_time_us({}) // -to (input side)", num(us)));
+            line(
+                &mut out,
+                4,
+                &format!(".set_stop_time_us({}) // -to (input side)", num(us)),
+            );
         }
         line(&mut out, 2, ")");
     }
 
     line(&mut out, 2, ".output(");
-    line(&mut out, 3, &format!("Output::from({})", lit(&job.output.url)));
+    line(
+        &mut out,
+        3,
+        &format!("Output::from({})", lit(&job.output.url)),
+    );
     let o = &job.output;
     if let Some(format) = &o.format {
-        line(&mut out, 4, &format!(".set_format({}) // -f {format}", lit(format)));
+        line(
+            &mut out,
+            4,
+            &format!(".set_format({}) // -f {format}", lit(format)),
+        );
     }
     if o.video_disable {
         line(&mut out, 4, ".disable_video() // -vn");
@@ -79,39 +106,75 @@ pub(crate) fn emit(job: &LoweredJob, command: &[String], status: &ShapeStatus) -
         line(&mut out, 4, ".disable_audio() // -an");
     }
     if let Some(codec) = &o.video_codec {
-        line(&mut out, 4, &format!(".set_video_codec({}) // -c:v {codec}", lit(codec)));
+        line(
+            &mut out,
+            4,
+            &format!(".set_video_codec({}) // -c:v {codec}", lit(codec)),
+        );
     }
     if let Some(codec) = &o.audio_codec {
-        line(&mut out, 4, &format!(".set_audio_codec({}) // -c:a {codec}", lit(codec)));
+        line(
+            &mut out,
+            4,
+            &format!(".set_audio_codec({}) // -c:a {codec}", lit(codec)),
+        );
     }
     if let Some(bitrate) = &o.video_bitrate {
-        line(&mut out, 4, &format!(".set_video_bitrate({}) // -b:v {bitrate}", lit(bitrate)));
+        line(
+            &mut out,
+            4,
+            &format!(".set_video_bitrate({}) // -b:v {bitrate}", lit(bitrate)),
+        );
     }
     if let Some(bitrate) = &o.audio_bitrate {
-        line(&mut out, 4, &format!(".set_audio_bitrate({}) // -b:a {bitrate}", lit(bitrate)));
+        line(
+            &mut out,
+            4,
+            &format!(".set_audio_bitrate({}) // -b:a {bitrate}", lit(bitrate)),
+        );
     }
     for (key, value) in &o.video_codec_opts {
         line(
             &mut out,
             4,
-            &format!(".set_video_codec_opt({}, {}) // -{key} {value}", lit(key), lit(value)),
+            &format!(
+                ".set_video_codec_opt({}, {}) // -{key} {value}",
+                lit(key),
+                lit(value)
+            ),
         );
     }
     for (key, value) in &o.format_opts {
         line(
             &mut out,
             4,
-            &format!(".set_format_opt({}, {}) // -{key} {value}", lit(key), lit(value)),
+            &format!(
+                ".set_format_opt({}, {}) // -{key} {value}",
+                lit(key),
+                lit(value)
+            ),
         );
     }
     if let Some(pix_fmt) = &o.pix_fmt {
-        line(&mut out, 4, &format!(".set_pix_fmt({}) // -pix_fmt {pix_fmt}", lit(pix_fmt)));
+        line(
+            &mut out,
+            4,
+            &format!(".set_pix_fmt({}) // -pix_fmt {pix_fmt}", lit(pix_fmt)),
+        );
     }
     if let Some(rate) = o.audio_sample_rate {
-        line(&mut out, 4, &format!(".set_audio_sample_rate({rate}) // -ar {rate}"));
+        line(
+            &mut out,
+            4,
+            &format!(".set_audio_sample_rate({rate}) // -ar {rate}"),
+        );
     }
     if let Some(channels) = o.audio_channels {
-        line(&mut out, 4, &format!(".set_audio_channels({channels}) // -ac {channels}"));
+        line(
+            &mut out,
+            4,
+            &format!(".set_audio_channels({channels}) // -ac {channels}"),
+        );
     }
     if let Some(frames) = o.max_video_frames {
         line(
@@ -121,31 +184,53 @@ pub(crate) fn emit(job: &LoweredJob, command: &[String], status: &ShapeStatus) -
         );
     }
     if let Some(filter) = &o.video_filter {
-        line(&mut out, 4, &format!(".set_video_filter({}) // -vf {filter}", lit(filter)));
+        line(
+            &mut out,
+            4,
+            &format!(".set_video_filter({}) // -vf {filter}", lit(filter)),
+        );
     }
     for (map, copy) in &o.stream_maps {
         if *copy {
             line(
                 &mut out,
                 4,
-                &format!(".add_stream_map_with_copy({}) // -map {map} + copy", lit(map)),
+                &format!(
+                    ".add_stream_map_with_copy({}) // -map {map} + copy",
+                    lit(map)
+                ),
             );
         } else {
-            line(&mut out, 4, &format!(".add_stream_map({}) // -map {map}", lit(map)));
+            line(
+                &mut out,
+                4,
+                &format!(".add_stream_map({}) // -map {map}", lit(map)),
+            );
         }
     }
     if let Some(us) = o.start_time_us {
         line(
             &mut out,
             4,
-            &format!(".set_start_time_us({}) // -ss (output side: decode, then discard)", num(us)),
+            &format!(
+                ".set_start_time_us({}) // -ss (output side: decode, then discard)",
+                num(us)
+            ),
         );
     }
     if let Some(us) = o.recording_time_us {
-        line(&mut out, 4, &format!(".set_recording_time_us({}) // -t", num(us)));
+        line(
+            &mut out,
+            4,
+            &format!(".set_recording_time_us({}) // -t", num(us)),
+        );
     }
     if let Some(us) = o.stop_time_us {
-        line(&mut out, 4, &format!(".set_stop_time_us({}) // -to", num(us)));
+        line(
+            &mut out,
+            4,
+            &format!(".set_stop_time_us({}) // -to", num(us)),
+        );
     }
     line(&mut out, 2, ")");
     line(&mut out, 2, ".build()?");
@@ -284,7 +369,8 @@ mod tests {
 
     #[test]
     fn verified_emit_carries_dialect_and_shape() {
-        let code = emit_cmd("ffmpeg -i in.mkv -c:v libx264 -crf 23 -preset fast -c:a aac -y out.mp4");
+        let code =
+            emit_cmd("ffmpeg -i in.mkv -c:v libx264 -crf 23 -preset fast -c:a aac -y out.mp4");
         assert!(code.contains("// status: verified shape V1"));
         assert!(code.contains("dialect: ffmpeg 7.1 command line"));
         assert!(code.contains("manifest: r1"));
@@ -365,23 +451,27 @@ mod tests {
         // examples/cli_emitted_transcode.rs is this exact emission, checked
         // in and built by `cargo build --examples`: every emitted call is
         // proven to exist against the real crate API, byte for byte.
-        let code = emit_cmd("ffmpeg -i in.mkv -c:v libx264 -crf 23 -preset fast -c:a aac -y out.mp4");
-        assert_eq!(code, include_str!("../../../examples/cli_emitted_transcode.rs"));
+        let code =
+            emit_cmd("ffmpeg -i in.mkv -c:v libx264 -crf 23 -preset fast -c:a aac -y out.mp4");
+        assert_eq!(
+            code,
+            include_str!("../../../examples/cli_emitted_transcode.rs")
+        );
     }
 
     #[test]
     fn emitted_v2_program_is_pinned_and_compiled() {
         // The Input::from branch (input-side options) of the emitter,
         // compile-pinned via examples/cli_emitted_clip.rs.
-        let code = emit_cmd("ffmpeg -ss 10 -i in.mp4 -t 20 -c:v libx264 -crf 23 -c:a aac -y clip.mp4");
+        let code =
+            emit_cmd("ffmpeg -ss 10 -i in.mp4 -t 20 -c:v libx264 -crf 23 -c:a aac -y clip.mp4");
         assert_eq!(code, include_str!("../../../examples/cli_emitted_clip.rs"));
     }
 
     #[test]
     fn faststart_remux_emit_is_unverified_with_explicit_copies() {
-        let code = emit_cmd(
-            "ffmpeg -i in.mp4 -c:v copy -c:a copy -movflags +faststart -y faststart.mp4",
-        );
+        let code =
+            emit_cmd("ffmpeg -i in.mp4 -c:v copy -c:a copy -movflags +faststart -y faststart.mp4");
         assert!(code.contains("UNVERIFIED SCAFFOLDING"));
         assert!(code.contains(".set_video_codec(\"copy\") // -c:v copy"));
         assert!(code.contains(".set_audio_codec(\"copy\") // -c:a copy"));
