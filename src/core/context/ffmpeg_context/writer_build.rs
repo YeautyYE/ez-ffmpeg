@@ -59,9 +59,21 @@ pub(crate) fn build_writer_context(
         return Err(WriterError::StreamMapsUnsupported.into());
     }
 
-    // The graph between the pushed frames and the encoder. "null" mirrors
-    // init_simple_filtergraph's implicit per-output video graph.
-    let desc = filter_desc.unwrap_or("null");
+    // The graph between the pushed frames and the encoder. Two spellings can
+    // supply it — VideoWriterBuilder::filter_desc and the opened Output's
+    // set_video_filter — with a strict rule: exactly one. Both at once is
+    // rejected (ConflictingFilterDescriptions) rather than silently picking
+    // a winner; with neither, "null" mirrors init_simple_filtergraph's
+    // implicit per-output video graph.
+    let output_video_filter = muxs[0].video_filter.clone();
+    let desc = match (filter_desc, output_video_filter.as_deref()) {
+        (Some(_), Some(_)) => {
+            return Err(WriterError::ConflictingFilterDescriptions.into());
+        }
+        (Some(writer_desc), None) => writer_desc,
+        (None, Some(output_desc)) => output_desc,
+        (None, None) => "null",
+    };
 
     // Validate the description's shape BEFORE building: exactly one video
     // input pad, one video output pad, and one connected component.
