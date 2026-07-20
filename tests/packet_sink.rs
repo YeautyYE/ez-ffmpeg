@@ -539,6 +539,144 @@ fn two_sinks_settle_and_both_reach_their_terminals() {
     );
 }
 
+/// The MIXED healthy/truncated settlement cycle: sink A drains cleanly and
+/// waits at the barrier; paced sink B is truncated by a sibling failure.
+/// B must REGISTER as settled on reaching its terminal region (uniform
+/// registration) before dispatching its failure callback — a
+/// register-only-when-healthy rule left A waiting on the live-but-
+/// unregistered B while B's blocking terminal callback waited back on A's.
+/// Both on_delivery_error callbacks rendezvous under a bounded timeout.
+#[test]
+fn mixed_truncated_and_healthy_sinks_settle_without_deadlock() {
+    let (tx_a, rx_a) = std::sync::mpsc::channel::<()>();
+    let (tx_b, rx_b) = std::sync::mpsc::channel::<()>();
+    let met_a = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let met_b = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let delivered_a = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+    let (met, count) = (met_a.clone(), delivered_a.clone());
+    let sink_a = ez_ffmpeg::packet_sink::PacketSink::builder(move |_pkt| {
+        count.fetch_add(1, std::sync::atomic::Ordering::Release);
+        Ok(())
+    })
+    .on_delivery_error(move |_e| {
+        let _ = tx_a.send(());
+        met.store(
+            rx_b.recv_timeout(std::time::Duration::from_secs(10)).is_ok(),
+            std::sync::atomic::Ordering::Release,
+        );
+    })
+    .build();
+    let met = met_b.clone();
+    let sink_b = ez_ffmpeg::packet_sink::PacketSink::builder(move |_pkt| {
+        // Pacing: B is reliably mid-delivery when the sibling failure lands.
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        Ok(())
+    })
+    .on_delivery_error(move |_e| {
+        let _ = tx_b.send(());
+        met.store(
+            rx_a.recv_timeout(std::time::Duration::from_secs(10)).is_ok(),
+            std::sync::atomic::Ordering::Release,
+        );
+    })
+    .build();
+
+    // The sibling parks at its failure point (nothing recorded yet) until
+    // the test confirms A has drained and entered settlement.
+    let sibling_failing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sibling_go = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (failing_cb, go_cb) = (sibling_failing.clone(), sibling_go.clone());
+    let mut written = 0usize;
+    let sibling = Output::new_by_write_callback(move |buf: &[u8]| {
+        written += buf.len();
+        if written > 1024 {
+            failing_cb.store(true, std::sync::atomic::Ordering::Release);
+            while !go_cb.load(std::sync::atomic::Ordering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO)
+        } else {
+            buf.len() as i32
+        }
+    })
+    .set_format("mpegts")
+    .set_audio_codec("aac")
+    .set_io_buffer_size(512);
+    struct GateOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for GateOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    let scheduler = FfmpegContext::builder()
+        .input(Input::from("sine=frequency=440:duration=0.2").set_format("lavfi"))
+        .input(Input::from("sine=frequency=330:duration=2").set_format("lavfi"))
+        .input(Input::from("sine=frequency=550:duration=2").set_format("lavfi"))
+        .output(
+            Output::from(sink_a)
+                .set_audio_codec("aac")
+                .add_stream_map("0:a"),
+        )
+        .output(
+            Output::from(sink_b)
+                .set_audio_codec("aac")
+                .add_stream_map("1:a"),
+        )
+        .output(sibling.add_stream_map("2:a"))
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+    // AFTER the scheduler: on an assertion panic this drops first and
+    // unparks the sibling before scheduler teardown waits on it.
+    let _open_gate_on_unwind = GateOnDrop(sibling_go.clone());
+
+    // 1. The sibling reaches its parked failure point.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !sibling_failing.load(std::sync::atomic::Ordering::Acquire) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the sibling never reached its write-failure point"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    // 2. A drains (delivery quiescence) and sits at the settlement barrier
+    // while paced B is still mid-delivery.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut last = delivered_a.load(std::sync::atomic::Ordering::Acquire);
+    let mut stable_since = std::time::Instant::now();
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            std::time::Instant::now() < deadline,
+            "sink A's delivery never quiesced"
+        );
+        let now_count = delivered_a.load(std::sync::atomic::Ordering::Acquire);
+        if now_count != last {
+            last = now_count;
+            stable_since = std::time::Instant::now();
+        } else if stable_since.elapsed() >= std::time::Duration::from_millis(500) {
+            break;
+        }
+    }
+    assert!(last > 0, "sink A must have delivered packets");
+    // 3. Release the failure: B is truncated mid-delivery and must
+    // register-then-dispatch; A's barrier must admit the registered B.
+    sibling_go.store(true, std::sync::atomic::Ordering::Release);
+
+    let result = wait_with_watchdog(scheduler, 120, "mixed_settlement");
+    assert!(result.is_err(), "the sibling write failure must fail the job");
+    assert!(
+        met_a.load(std::sync::atomic::Ordering::Acquire)
+            && met_b.load(std::sync::atomic::Ordering::Acquire),
+        "both failure callbacks must run concurrently-reachable (a truncated \
+         sink that skips settlement registration parks the healthy sibling \
+         past the rendezvous window)"
+    );
+}
+
 /// Multi-sink terminal containment: one sink's on_end panics AFTER the job
 /// settled; the panic is contained — the sibling sink's on_end still stands
 /// and wait() returns Ok. Without containment the panic re-arms the worker

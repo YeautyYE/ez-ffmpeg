@@ -121,20 +121,7 @@ impl ThreadSynchronizer {
     /// scheduler result and status are settled up to the caller's own
     /// remaining actions.
     pub(crate) fn wait_for_peers_settled(&self) {
-        let mut counter = self
-            .inner
-            .counter
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Registration and wakeup are ONE protocol under the counter lock: a
-        // registration can itself flip `live <= waiters` to true for peers
-        // already parked below (slot releases are the only other notifier),
-        // so every registrant wakes the condvar. Without this, sink A parks,
-        // sink B's registration satisfies the condition, B proceeds into its
-        // (possibly blocking) terminal callbacks without releasing its slot,
-        // and A sleeps forever — a lost wakeup, not a cycle.
-        self.inner.settlement_waiters.fetch_add(1, Ordering::AcqRel);
-        self.inner.condvar.notify_all();
+        let mut counter = self.register_settled_locked();
         while *counter > self.inner.settlement_waiters.load(Ordering::Acquire) {
             counter = self
                 .inner
@@ -142,6 +129,36 @@ impl ThreadSynchronizer {
                 .wait(counter)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
+    }
+
+    /// Registers the calling thread as settled WITHOUT waiting for peers —
+    /// for a packet-sink worker whose terminal region delivers a failure:
+    /// it samples nothing (no `on_end` to gate), so it has no reason to
+    /// wait, but a peer parked in [`Self::wait_for_peers_settled`] must not
+    /// keep waiting for it — its error is already recorded (errors precede
+    /// the terminal status) and everything left on it is the contained
+    /// terminal dispatch, which can no longer fail the job.
+    pub(crate) fn register_settled(&self) {
+        drop(self.register_settled_locked());
+    }
+
+    /// The one registration protocol, under the counter lock: a registration
+    /// can itself flip `live <= waiters` to true for peers already parked in
+    /// the barrier (slot releases are the only other notifier), so every
+    /// registrant wakes the condvar. Without this, sink A parks, sink B's
+    /// registration satisfies the condition, B proceeds into its (possibly
+    /// blocking) terminal callbacks without releasing its slot, and A sleeps
+    /// forever — a lost wakeup, not a cycle. Returns the held lock so the
+    /// waiting variant re-checks under the same acquisition.
+    fn register_settled_locked(&self) -> std::sync::MutexGuard<'_, usize> {
+        let counter = self
+            .inner
+            .counter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.inner.settlement_waiters.fetch_add(1, Ordering::AcqRel);
+        self.inner.condvar.notify_all();
+        counter
     }
 
     pub(crate) fn wait_for_all_threads(&self) {
