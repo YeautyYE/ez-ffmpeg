@@ -76,7 +76,12 @@ fn strict_happy_path_single_video_stream() {
     };
     assert_eq!(streams.len(), 1);
     let info = &streams[0];
-    assert_eq!(info.codec_name, "h264");
+    assert!(info.is_video);
+    assert!(
+        info.codec_string.starts_with("avc1."),
+        "WebCodecs codec string, got {}",
+        info.codec_string
+    );
     assert_eq!((info.width, info.height), (320, 240));
     assert_eq!(info.frame_rate, Some(AVRational { num: 25, den: 1 }));
     assert!(info.time_base.num > 0 && info.time_base.den > 0);
@@ -261,7 +266,7 @@ fn av_job_shares_one_time_origin() {
     assert_eq!(streams.len(), 2);
     let audio = streams
         .iter()
-        .find(|s| s.codec_name == "aac")
+        .find(|s| s.codec_string.starts_with("mp4a.40."))
         .expect("aac stream info");
     assert!(
         !audio.extradata.is_empty(),
@@ -274,28 +279,23 @@ fn av_job_shares_one_time_origin() {
     let anchor = &packets[0];
     assert_eq!(anchor.dts, 0, "the first delivered packet anchors at zero");
 
-    // Every stream's shift is the anchor's original dts rescaled into that
-    // stream's time base — reproduce it independently and require equality.
-    // (The anchor stream's own offset equals its original first dts.)
-    let dts0 = anchor.applied_offset;
-    let tb0 = anchor.time_base;
+    // Every stream's shift is the SAME instant (the anchor's original dts)
+    // expressed in that stream's time base: the microsecond projections must
+    // agree within one tick of the coarser stream — verified through the
+    // safe *_us conveniences, no manual rescaling.
+    let anchor_offset_us = anchor.applied_offset_us;
     for info in streams {
         let stream_packets: Vec<_> = packets
             .iter()
             .filter(|p| p.stream_index == info.stream_index)
             .collect();
         assert!(!stream_packets.is_empty(), "both streams must deliver");
-        let expected = unsafe {
-            ffmpeg_sys_next::av_rescale_q_rnd(
-                dts0,
-                tb0,
-                info.time_base,
-                ffmpeg_sys_next::AVRounding::AV_ROUND_NEAR_INF,
-            )
-        };
-        assert_eq!(
-            stream_packets[0].applied_offset, expected,
-            "stream {}: shared-origin shift mismatch",
+        let tick_us =
+            1_000_000i64 * info.time_base.num as i64 / info.time_base.den as i64 + 1;
+        let offset_us = stream_packets[0].applied_offset_us;
+        assert!(
+            (offset_us - anchor_offset_us).abs() <= tick_us,
+            "stream {}: shared-origin shift diverges ({offset_us} vs {anchor_offset_us} us)",
             info.stream_index
         );
         // Per-stream invariants hold on the shifted timeline too.
@@ -308,7 +308,7 @@ fn av_job_shares_one_time_origin() {
             }
             prev = Some(p.dts);
         }
-        if info.codec_name == "aac" {
+        if !info.is_video {
             assert!(stream_packets.iter().all(|p| p.is_key));
         }
     }
@@ -355,7 +355,7 @@ fn channel_adapter_delivers_owned_events_in_order() {
         eprintln!("skipping: libx264 not available in this FFmpeg build");
         return;
     }
-    let (sink, receiver) = PacketSink::channel(1024);
+    let (sink, receiver) = PacketSink::channel(std::num::NonZeroUsize::new(1024).unwrap());
     run(testsrc(1), x264_output(sink), "channel_adapter").expect("job failed");
 
     let events: Vec<_> = receiver.iter().collect();

@@ -1,12 +1,19 @@
-//! Collect encoded H.264 access units in memory — no container, no I/O.
+//! Map encoded H.264 access units onto a WebCodecs-style decoder feed — no
+//! container, no I/O, bounded memory.
 //!
-//! A packet sink is the packet-domain counterpart of the byte-domain write
-//! callback: instead of muxed container bytes, the callbacks receive each
-//! encoded packet as a WebCodecs-style access unit (avcC layout, 4-byte NAL
-//! length prefixes) plus a one-time stream configuration whose `extradata`
-//! is a ready-to-use `AVCDecoderConfigurationRecord`. Feed the pair to a
-//! `VideoDecoder`, an RTP packetizer, or your own transport — no demuxing
-//! round-trip required.
+//! A packet sink delivers what a `VideoDecoder` (or an RTP packetizer)
+//! actually consumes:
+//!
+//! * one stream configuration with a ready-made RFC 6381 codec string
+//!   (`avc1.PPCCLL`) and the avcC record (the WebCodecs `description`);
+//! * per access unit: AVCC payload (4-byte NAL length prefixes),
+//!   microsecond timestamp/duration, and an IDR-accurate key/delta flag.
+//!
+//! The consumer is a [`PacketSinkHandler`]: one stateful object receives
+//! every callback serially on the delivery thread — no `Arc<Mutex<_>>`
+//! ceremony — and feeds mapped chunks to a stub "decoder" that keeps only
+//! counters and the latest chunk, so memory stays bounded no matter how long
+//! the stream runs.
 //!
 //! Requires an FFmpeg build with libx264 (the strict tier's v1 whitelist).
 //!
@@ -16,17 +23,114 @@
 //! cargo run --example packet_sink_avc
 //! ```
 
-use ez_ffmpeg::packet_sink::PacketSink;
+use ez_ffmpeg::packet_sink::{
+    PacketCallbackError, PacketCallbackResult, PacketSink, PacketSinkHandler, PacketStreamInfo,
+    PacketView,
+};
 use ez_ffmpeg::{FfmpegContext, Input, Output};
-use std::sync::{Arc, Mutex};
 
-/// One collected access unit.
-struct CollectedAu {
-    pts: i64,
-    dts: i64,
-    duration: i64,
-    is_key: bool,
-    data: Vec<u8>,
+/// The WebCodecs `VideoDecoderConfig` fields this pipeline produces.
+struct DecoderConfig {
+    codec: String,
+    description: Vec<u8>,
+    coded_width: i32,
+    coded_height: i32,
+}
+
+/// One WebCodecs `EncodedVideoChunk`-shaped sample (scalar fields only —
+/// a real feed would also copy the payload out of the borrowed view).
+struct Chunk {
+    timestamp_us: i64,
+    duration_us: i64,
+    key: bool,
+    byte_length: usize,
+}
+
+/// Stand-in for a real `VideoDecoder`: swallow chunks, keep counters and the
+/// last chunk only — bounded memory by construction.
+#[derive(Default)]
+struct StubDecoder {
+    chunks: usize,
+    key_chunks: usize,
+    total_bytes: usize,
+    last_chunk: Option<Chunk>,
+}
+
+impl StubDecoder {
+    fn configure(&mut self, config: DecoderConfig) {
+        println!(
+            "decoder.configure(codec: \"{}\", description: {} bytes, codedWidth: {}, codedHeight: {})",
+            config.codec,
+            config.description.len(),
+            config.coded_width,
+            config.coded_height
+        );
+    }
+
+    fn decode(&mut self, chunk: Chunk) {
+        self.chunks += 1;
+        self.key_chunks += usize::from(chunk.key);
+        self.total_bytes += chunk.byte_length;
+        self.last_chunk = Some(chunk);
+    }
+}
+
+/// The packet-sink consumer: maps stream info and packets onto the stub
+/// decoder. All methods run serially on the delivery thread, so plain
+/// `&mut self` state suffices.
+struct WebCodecsFeed {
+    decoder: StubDecoder,
+}
+
+impl PacketSinkHandler for WebCodecsFeed {
+    fn on_stream_info(&mut self, streams: &[PacketStreamInfo]) -> PacketCallbackResult {
+        let video = streams
+            .iter()
+            .find_map(PacketStreamInfo::video)
+            .ok_or_else(|| PacketCallbackError::new("no video stream configured"))?;
+        self.decoder.configure(DecoderConfig {
+            codec: video.codec_string().to_owned(),
+            description: video.codec_config().to_vec(),
+            coded_width: video.width(),
+            coded_height: video.height(),
+        });
+        if let Some(sar) = video.sample_aspect_ratio() {
+            println!("display aspect hint: SAR {}/{}", sar.num, sar.den);
+        }
+        Ok(())
+    }
+
+    fn on_packet(&mut self, packet: &PacketView<'_>) -> PacketCallbackResult {
+        // NOTE: this runs on the delivery thread and blocks the encoding
+        // pipeline while it runs; the borrowed view dies with this call, so
+        // anything kept must be copied out.
+        self.decoder.decode(Chunk {
+            timestamp_us: packet.pts_us(),
+            duration_us: packet.duration_us(),
+            key: packet.is_key(),
+            byte_length: packet.data().len(),
+        });
+        Ok(())
+    }
+
+    fn on_end(&mut self) {
+        println!(
+            "delivery finished cleanly: {} chunks ({} key, {} bytes total)",
+            self.decoder.chunks, self.decoder.key_chunks, self.decoder.total_bytes
+        );
+        if let Some(last) = &self.decoder.last_chunk {
+            println!(
+                "last chunk: timestamp {} us, duration {} us, {}",
+                last.timestamp_us,
+                last.duration_us,
+                if last.key { "key" } else { "delta" }
+            );
+        }
+    }
+
+    fn on_delivery_error(&mut self, error: &ez_ffmpeg::packet_sink::PacketSinkError) {
+        eprintln!("delivery failed: {error}");
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -38,81 +142,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Shared collection the callbacks write into. The borrowed `PacketView`
-    // is only valid during the callback, so everything kept is copied out.
-    let config: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-    let aus: Arc<Mutex<Vec<CollectedAu>>> = Arc::new(Mutex::new(Vec::new()));
-    let time_base = Arc::new(Mutex::new((1, 25)));
-
-    let sink = {
-        let (config, aus, time_base) = (config.clone(), aus.clone(), time_base.clone());
-        PacketSink::builder()
-            .on_stream_info(move |infos| {
-                // Exactly once, before any packet: the avcC decoder
-                // configuration (WebCodecs `description`).
-                let info = &infos[0];
-                *config.lock().unwrap() = info.extradata().to_vec();
-                *time_base.lock().unwrap() = (info.time_base().num, info.time_base().den);
-                0
-            })
-            .on_packet(move |pkt| {
-                // NOTE: this callback runs on the delivery thread and blocks
-                // the encoding pipeline while it runs — copy out and return.
-                aus.lock().unwrap().push(CollectedAu {
-                    pts: pkt.pts(),
-                    dts: pkt.dts(),
-                    duration: pkt.duration(),
-                    is_key: pkt.is_key(),
-                    data: pkt.data().to_vec(),
-                });
-                0
-            })
-            .on_end(|| println!("delivery finished cleanly"))
-            .on_error(|e| eprintln!("delivery failed: {e}"))
-            .build()
-    };
-
-    // Two seconds of synthetic 25 fps video, straight into the sink.
+    // Two seconds of synthetic 25 fps video, straight into the handler.
+    let sink = PacketSink::from_handler(WebCodecsFeed {
+        decoder: StubDecoder::default(),
+    });
     FfmpegContext::builder()
         .input(Input::from("testsrc=size=640x360:rate=25:duration=2").set_format("lavfi"))
         .output(
-            Output::new_by_packet_sink(sink)
+            Output::from(sink)
                 .set_video_codec("libx264")
                 .set_video_codec_opt("preset", "ultrafast"),
         )
         .build()?
         .start()?
         .wait()?;
-
-    let config = config.lock().unwrap();
-    let aus = aus.lock().unwrap();
-    let (tb_num, tb_den) = *time_base.lock().unwrap();
-    let total_bytes: usize = aus.iter().map(|au| au.data.len()).sum();
-    let key_count = aus.iter().filter(|au| au.is_key).count();
-
-    println!(
-        "avcC configuration: {} bytes (version {}, {} SPS)",
-        config.len(),
-        config[0],
-        config[5] & 0x1F
-    );
-    println!(
-        "collected {} access units ({} bytes total, {} key), time base {}/{}",
-        aus.len(),
-        total_bytes,
-        key_count,
-        tb_num,
-        tb_den
-    );
-    for au in aus.iter().take(3) {
-        println!(
-            "  au: pts={} dts={} duration={} key={} first NAL length={}",
-            au.pts,
-            au.dts,
-            au.duration,
-            au.is_key,
-            u32::from_be_bytes([au.data[0], au.data[1], au.data[2], au.data[3]])
-        );
-    }
     Ok(())
 }

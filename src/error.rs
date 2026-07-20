@@ -479,7 +479,7 @@ pub enum MuxingOperationError {
 /// stop the job with the offending packet never delivered. `Clone` is
 /// deliberate — the same value is recorded as the job error and handed to the
 /// sink's `on_error` callback.
-#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+#[derive(thiserror::Error, Debug, Clone)]
 #[non_exhaustive]
 pub enum PacketSinkError {
     #[error("{0} is not supported on packet-sink outputs")]
@@ -567,11 +567,24 @@ pub enum PacketSinkError {
     #[error("output stream {stream_index}: in-band SPS/PPS parameter sets are not supported in the strict tier (WebCodecs avc requires out-of-band configuration)")]
     InBandParameterSets { stream_index: usize },
 
-    #[error("on_stream_info callback rejected the stream configuration (returned {code})")]
-    StreamInfoCallbackFailed { code: i32 },
+    #[error("on_stream_info callback rejected the stream configuration: {error}")]
+    StreamInfoCallbackFailed {
+        #[source]
+        error: crate::core::packet_sink::PacketCallbackError,
+    },
 
-    #[error("on_packet callback failed on output stream {stream_index} (returned {code})")]
-    PacketCallbackFailed { stream_index: usize, code: i32 },
+    #[error("on_packet callback failed on output stream {stream_index}: {error}")]
+    PacketCallbackFailed {
+        stream_index: usize,
+        #[source]
+        error: crate::core::packet_sink::PacketCallbackError,
+    },
+
+    #[error("the packet-sink channel receiver was dropped; delivery cancelled")]
+    ChannelDisconnected,
+
+    #[error("the job failed after this packet sink finished delivering: {message}")]
+    JobFailed { message: String },
 }
 
 #[derive(thiserror::Error, Debug)]

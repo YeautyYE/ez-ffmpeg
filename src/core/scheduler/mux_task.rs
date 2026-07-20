@@ -632,6 +632,7 @@ fn _mux_init(
                     out_fmt_ctx_ptr,
                     stream_count,
                     sink,
+                    &scheduler_status,
                 )
             } {
                 Ok(worker) => Some(worker),
@@ -1272,17 +1273,34 @@ fn _mux_init(
         if ret < 0 && ret != AVERROR_EOF {
             // A packet-sink failure surfaces its stashed typed error (the
             // sentinel i32 only says "stop"); container writes keep the
-            // muxing-error mapping.
-            let error = sink_worker
+            // muxing-error mapping. A sink whose channel send observed the
+            // job stopping and bailed out COOPERATIVELY records nothing —
+            // that exit is the callback-side twin of this loop's own
+            // `is_stopping` break, not an error.
+            let sink_error = sink_worker
                 .as_ref()
-                .and_then(|sink| sink.pending_error_cloned())
-                .map(crate::error::Error::PacketSink)
-                .unwrap_or_else(|| {
-                    Muxing(MuxingOperationError::InterleavedWriteError(
-                        MuxingError::from(ret),
-                    ))
-                });
-            set_scheduler_error(&scheduler_status, &scheduler_result, error);
+                .and_then(|sink| sink.pending_error_cloned());
+            match sink_error {
+                Some(e) => set_scheduler_error(
+                    &scheduler_status,
+                    &scheduler_result,
+                    crate::error::Error::PacketSink(e),
+                ),
+                None => {
+                    let cancelled = sink_worker
+                        .as_ref()
+                        .is_some_and(|sink| sink.cancelled_cleanly());
+                    if !cancelled {
+                        set_scheduler_error(
+                            &scheduler_status,
+                            &scheduler_result,
+                            Muxing(MuxingOperationError::InterleavedWriteError(
+                                MuxingError::from(ret),
+                            )),
+                        );
+                    }
+                }
+            }
         }
 
         // H3: hold the STATUS_END grace open across the trailer AND the

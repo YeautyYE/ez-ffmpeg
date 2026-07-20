@@ -1,28 +1,28 @@
-# ez-ffmpeg Example: Packet Sink (AVC Access Units)
+# ez-ffmpeg Example: Packet Sink (WebCodecs-Style AVC Feed)
 
 ## Functionality
 
-Encodes synthetic video with libx264 and collects the **encoded packets**
-directly — no container is written and no bytes are demuxed back. The packet
-sink delivers:
+Encodes synthetic video with libx264 and maps the **encoded packets** straight
+onto a WebCodecs-style decoder feed — no container is written and no bytes are
+demuxed back:
 
-- one `on_stream_info` callback carrying a valid avcC
-  (`AVCDecoderConfigurationRecord`) — the WebCodecs `description`;
-- one `on_packet` callback per access unit, in AVCC layout (4-byte NAL length
-  prefixes), with zero-based timestamps, a positive duration and an
-  IDR-accurate `is_key` flag;
-- a terminal `on_end` once every stream finished cleanly.
+- `on_stream_info` supplies a ready-made `VideoDecoderConfig`: the RFC 6381
+  codec string (`avc1.PPCCLL`), the avcC record (`description`), coded
+  dimensions and the sample aspect ratio;
+- `on_packet` supplies `EncodedVideoChunk`-shaped samples: AVCC payload
+  (4-byte NAL length prefixes), microsecond timestamp/duration via the `*_us`
+  conveniences, and an IDR-accurate key/delta flag;
+- `on_end` reports a clean finish.
 
-This replaces the mux-then-demux round-trip when feeding a `VideoDecoder`,
-an RTP/SRT packetizer, or any consumer that wants codec packets instead of a
-container byte stream. Callbacks run on the delivery thread and block the
-pipeline while they run — copy data out and return (see the `packet_sink`
-module docs for the backpressure contract).
+The consumer is a single stateful `PacketSinkHandler` — callbacks run serially
+on the delivery thread, so the handler needs no locking — and the stub decoder
+keeps only counters plus the latest chunk, so memory stays bounded for streams
+of any length. Callbacks block the encoding pipeline while they run; see the
+`packet_sink` module docs for the backpressure contract.
 
 ## How to Run
 
 1. Use an FFmpeg build that includes libx264 (the strict tier's v1 encoder
    whitelist); the example prints a notice and exits otherwise.
 2. From the repository root, run `cargo run --example packet_sink_avc`.
-3. The program prints the avcC size and a summary of the collected access
-   units.
+3. The program prints the decoder configuration and a delivery summary.
