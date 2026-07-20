@@ -6,8 +6,9 @@
 //!   wrappers, avcC synthesis mirroring `ff_isom_write_avcc` (including the
 //!   chroma/bit-depth extension), the SPS bit reader;
 //! * [`AvcRuntime`] — the per-stream state machine the orchestrator drives:
-//!   one-traversal payload normalization via the streaming NAL walkers, IDR
-//!   classification, S8 parameter-set fingerprinting and the in-band policy.
+//!   payload normalization via the streaming NAL walkers (a census walk
+//!   then a write walk for Annex-B input), IDR classification, S8
+//!   parameter-set fingerprinting and the in-band policy.
 
 use super::super::nal_framing::{
     push_length_prefixed, walk_annexb, walk_length_prefixed, NAL_LENGTH_SIZE, NAL_PPS, NAL_SPS,

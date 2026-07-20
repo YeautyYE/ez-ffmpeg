@@ -466,16 +466,23 @@ fn full_channel_sink_reports_a_sibling_failure_not_silence() {
 
     let (sink, receiver) =
         ez_ffmpeg::packet_sink::PacketSink::channel(std::num::NonZeroUsize::new(1).unwrap());
-    // The sibling fails hard right past its header. No test-side gating:
-    // the failure's timing relative to the wedge is irrelevant — once the
-    // job is stopping with a recorded error, the sink's NEXT blocked send
-    // into the undrained capacity-one channel classifies it (a gated
-    // failure would instead stall forever behind the input controller's
-    // choke once the wedged sink lags).
+    // The sibling's write callback PARKS at its failure point (test-local
+    // gate, before any error is recorded or published) so the test can
+    // guarantee the sink is already wedged in its blocking send when the
+    // failure lands — the exact window the classification governs. A
+    // guard releases the gate on unwind so an early assertion failure
+    // cannot deadlock scheduler teardown.
+    let sibling_failing = Arc::new(AtomicBool::new(false));
+    let sibling_go = Arc::new(AtomicBool::new(false));
+    let (failing_cb, go_cb) = (sibling_failing.clone(), sibling_go.clone());
     let mut written = 0usize;
     let sibling = Output::new_by_write_callback(move |buf: &[u8]| {
         written += buf.len();
         if written > 1024 {
+            failing_cb.store(true, Ordering::Release);
+            while !go_cb.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
             ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO)
         } else {
             buf.len() as i32
@@ -486,6 +493,13 @@ fn full_channel_sink_reports_a_sibling_failure_not_silence() {
     // Small AVIO buffer: TS writes flush continuously, so the EIO lands
     // during the run rather than at one big trailer flush.
     .set_io_buffer_size(512);
+    struct GateOnDrop(Arc<AtomicBool>);
+    impl Drop for GateOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    let _open_gate_on_unwind = GateOnDrop(sibling_go.clone());
 
     *HOLD.lock().unwrap_or_else(|e| e.into_inner()) = Some("Packet sink muxer finished.");
     let _release_on_unwind = ReleaseOnDrop;
@@ -503,17 +517,29 @@ fn full_channel_sink_reports_a_sibling_failure_not_silence() {
         .start()
         .unwrap();
 
-    // 1. Take exactly the stream-info event, then stop draining: the
-    // capacity-one channel wedges the sink in its blocking send while the
-    // sibling (its own input) runs into its EIO.
+    // 1. Take exactly the stream-info event, then stop draining. The
+    // sibling reaches its (parked) failure point on its own input.
     match receiver.recv_timeout(Duration::from_secs(20)) {
         Ok(ez_ffmpeg::packet_sink::PacketSinkEvent::StreamInfo(_)) => {}
         other => panic!("expected the stream-info event first, got {other:?}"),
     }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !sibling_failing.load(Ordering::Acquire) {
+        assert!(
+            Instant::now() < deadline,
+            "the sibling never reached its write-failure point"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    // 2. With the sibling parked (nothing recorded yet), the sink wedges:
+    // the consumed stream-info freed one slot, the first packet fills it,
+    // the second blocks. Then the released sibling records its error and
+    // publishes the stopping status INTO that blocked send.
+    std::thread::sleep(Duration::from_millis(600));
+    sibling_go.store(true, Ordering::Release);
 
-    // 2. The sink observes the failure-driven stop from its blocked send,
-    // classifies it, exits its loop and parks at the sink-only completion
-    // log — BEFORE the terminal dispatch.
+    // 3. The sink classifies the failure-driven stop, exits its loop and
+    // parks at the sink-only completion log — BEFORE the terminal dispatch.
     let deadline = Instant::now() + Duration::from_secs(30);
     while !HELD.load(Ordering::Acquire) {
         assert!(
