@@ -192,8 +192,8 @@ fn check_runtime_profile() -> Result<(), CliError> {
     let (ac_major, ac_minor) = pair(avcodec);
     let (af_major, af_minor) = pair(avformat);
 
-    let verified = VERIFIED_PROFILES.iter().any(|(_, ac, af)| {
-        (ac_major, ac_minor) == (ac.0, ac.1) && (af_major, af_minor) == (af.0, af.1)
+    let verified = VERIFIED_PROFILES.iter().any(|profile| {
+        (ac_major, ac_minor) == profile.avcodec && (af_major, af_minor) == profile.avformat
     });
     if verified {
         return Ok(());
@@ -203,7 +203,16 @@ fn check_runtime_profile() -> Result<(), CliError> {
         linked_avformat: format!("{af_major}.{af_minor}"),
         verified: VERIFIED_PROFILES
             .iter()
-            .map(|(name, ac, af)| format!("{name} (avcodec {}.{}, avformat {}.{})", ac.0, ac.1, af.0, af.1))
+            .map(|profile| {
+                format!(
+                    "{} (avcodec {}.{}, avformat {}.{})",
+                    profile.name,
+                    profile.avcodec.0,
+                    profile.avcodec.1,
+                    profile.avformat.0,
+                    profile.avformat.1
+                )
+            })
             .collect::<Vec<_>>()
             .join(", "),
     })
