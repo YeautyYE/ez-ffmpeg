@@ -366,6 +366,7 @@ unsafe fn open_output_file(
         output.subtitle_disable,
         output.data_disable,
         pix_fmt,
+        output.require_unique_video_source,
         output.strict_avoptions,
         output.video_filter.clone(),
         crate::core::context::pre_mux_queue::PreMuxQueueConfig {

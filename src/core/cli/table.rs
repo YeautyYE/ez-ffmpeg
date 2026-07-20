@@ -69,6 +69,25 @@ pub(crate) enum ValueRule {
     LogLevel,
 }
 
+/// What an option addresses — the seven-tuple's media/stream selector,
+/// typed. The parser's no-op routing reads this (a `NoOp` row never reaches
+/// a lowering sink), and the docs render it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Selector {
+    /// Recognized, deliberately without an in-process effect.
+    NoOp,
+    /// Addresses the run itself (`-y`).
+    Run,
+    /// Addresses the container/file level (trims, formats, muxer options).
+    Container,
+    /// Addresses the video stream of its scope.
+    Video,
+    /// Addresses the audio stream of its scope.
+    Audio,
+    /// Addresses explicit stream selection (`-map`).
+    StreamMap,
+}
+
 /// What repeating an option within one scope means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Repeat {
@@ -92,8 +111,9 @@ pub(crate) struct OptSpec {
     pub(crate) scope: ScopeRule,
     pub(crate) arity: Arity,
     pub(crate) value: Option<ValueRule>,
-    /// Recognized but deliberately without an in-process effect.
-    pub(crate) noop: bool,
+    /// The media/stream selector this option addresses. `Selector::NoOp`
+    /// short-circuits lowering in the parser.
+    pub(crate) selector: Selector,
     pub(crate) repeat: Repeat,
     /// Where the option lands: the builder call (or interaction) that
     /// consumes it. Documentation-of-record, rendered into the support
@@ -101,13 +121,19 @@ pub(crate) struct OptSpec {
     pub(crate) sink: &'static str,
 }
 
-const fn flag(name: &'static str, scope: ScopeRule, repeat: Repeat, sink: &'static str) -> OptSpec {
+const fn flag(
+    name: &'static str,
+    scope: ScopeRule,
+    selector: Selector,
+    repeat: Repeat,
+    sink: &'static str,
+) -> OptSpec {
     OptSpec {
         name,
         scope,
         arity: Arity::Flag,
         value: None,
-        noop: false,
+        selector,
         repeat,
         sink,
     }
@@ -117,6 +143,7 @@ const fn value(
     name: &'static str,
     scope: ScopeRule,
     rule: ValueRule,
+    selector: Selector,
     repeat: Repeat,
     sink: &'static str,
 ) -> OptSpec {
@@ -125,7 +152,7 @@ const fn value(
         scope,
         arity: Arity::Value,
         value: Some(rule),
-        noop: false,
+        selector,
         repeat,
         sink,
     }
@@ -137,7 +164,7 @@ const fn noop_flag(name: &'static str) -> OptSpec {
         scope: ScopeRule::Global,
         arity: Arity::Flag,
         value: None,
-        noop: true,
+        selector: Selector::NoOp,
         repeat: Repeat::Free,
         sink: "none (documented no-op)",
     }
@@ -149,7 +176,7 @@ const fn noop_value(name: &'static str, rule: ValueRule) -> OptSpec {
         scope: ScopeRule::Global,
         arity: Arity::Value,
         value: Some(rule),
-        noop: true,
+        selector: Selector::NoOp,
         repeat: Repeat::Free,
         sink: "none (documented no-op)",
     }
@@ -162,6 +189,7 @@ pub(crate) const OPTION_TABLE: &[OptSpec] = &[
     flag(
         "-y",
         ScopeRule::Global,
+        Selector::Run,
         Repeat::Free,
         "mandatory overwrite gate",
     ),
@@ -176,6 +204,7 @@ pub(crate) const OPTION_TABLE: &[OptSpec] = &[
         "-ss",
         ScopeRule::InputOrOutput,
         ValueRule::Seconds,
+        Selector::Container,
         Repeat::Once,
         "Input::set_start_time_us / Output::set_start_time_us",
     ),
@@ -183,6 +212,7 @@ pub(crate) const OPTION_TABLE: &[OptSpec] = &[
         "-t",
         ScopeRule::InputOrOutput,
         ValueRule::Seconds,
+        Selector::Container,
         Repeat::Once,
         "Input::set_recording_time_us / Output::set_recording_time_us",
     ),
@@ -190,6 +220,7 @@ pub(crate) const OPTION_TABLE: &[OptSpec] = &[
         "-to",
         ScopeRule::InputOrOutput,
         ValueRule::Seconds,
+        Selector::Container,
         Repeat::Once,
         "Input::set_stop_time_us / Output::set_stop_time_us",
     ),
@@ -197,6 +228,7 @@ pub(crate) const OPTION_TABLE: &[OptSpec] = &[
         "-f",
         ScopeRule::InputOrOutput,
         ValueRule::FormatName,
+        Selector::Container,
         Repeat::Once,
         "Input::set_format / Output::set_format",
     ),
@@ -204,12 +236,14 @@ pub(crate) const OPTION_TABLE: &[OptSpec] = &[
     flag(
         "-vn",
         ScopeRule::OutputOnly,
+        Selector::Video,
         Repeat::Free,
         "Output::disable_video",
     ),
     flag(
         "-an",
         ScopeRule::OutputOnly,
+        Selector::Audio,
         Repeat::Free,
         "Output::disable_audio",
     ),
@@ -217,6 +251,7 @@ pub(crate) const OPTION_TABLE: &[OptSpec] = &[
         "-c:v",
         ScopeRule::OutputOnly,
         ValueRule::Codec,
+        Selector::Video,
         Repeat::Once,
         "Output::set_video_codec",
     ),
@@ -224,6 +259,7 @@ pub(crate) const OPTION_TABLE: &[OptSpec] = &[
         "-c:a",
         ScopeRule::OutputOnly,
         ValueRule::Codec,
+        Selector::Audio,
         Repeat::Once,
         "Output::set_audio_codec",
     ),
@@ -231,6 +267,7 @@ pub(crate) const OPTION_TABLE: &[OptSpec] = &[
         "-b:v",
         ScopeRule::OutputOnly,
         ValueRule::Bitrate,
+        Selector::Video,
         Repeat::Once,
         "Output::set_video_bitrate",
     ),
@@ -238,6 +275,7 @@ pub(crate) const OPTION_TABLE: &[OptSpec] = &[
         "-b:a",
         ScopeRule::OutputOnly,
         ValueRule::Bitrate,
+        Selector::Audio,
         Repeat::Once,
         "Output::set_audio_bitrate",
     ),
@@ -245,6 +283,7 @@ pub(crate) const OPTION_TABLE: &[OptSpec] = &[
         "-crf",
         ScopeRule::OutputOnly,
         ValueRule::Crf,
+        Selector::Video,
         Repeat::Once,
         "Output::set_video_codec_opt(\"crf\", …), libx264 only",
     ),
@@ -252,6 +291,7 @@ pub(crate) const OPTION_TABLE: &[OptSpec] = &[
         "-preset",
         ScopeRule::OutputOnly,
         ValueRule::Preset,
+        Selector::Video,
         Repeat::Once,
         "Output::set_video_codec_opt(\"preset\", …), libx264 only",
     ),
@@ -259,6 +299,7 @@ pub(crate) const OPTION_TABLE: &[OptSpec] = &[
         "-pix_fmt",
         ScopeRule::OutputOnly,
         ValueRule::PixFmt,
+        Selector::Video,
         Repeat::Once,
         "Output::set_pix_fmt",
     ),
@@ -266,6 +307,7 @@ pub(crate) const OPTION_TABLE: &[OptSpec] = &[
         "-ar",
         ScopeRule::OutputOnly,
         ValueRule::PositiveInt,
+        Selector::Audio,
         Repeat::Once,
         "Output::set_audio_sample_rate",
     ),
@@ -273,6 +315,7 @@ pub(crate) const OPTION_TABLE: &[OptSpec] = &[
         "-ac",
         ScopeRule::OutputOnly,
         ValueRule::PositiveInt,
+        Selector::Audio,
         Repeat::Once,
         "Output::set_audio_channels",
     ),
@@ -280,6 +323,7 @@ pub(crate) const OPTION_TABLE: &[OptSpec] = &[
         "-frames:v",
         ScopeRule::OutputOnly,
         ValueRule::FramesOne,
+        Selector::Video,
         Repeat::Once,
         "Output::set_max_video_frames(1)",
     ),
@@ -287,6 +331,7 @@ pub(crate) const OPTION_TABLE: &[OptSpec] = &[
         "-vf",
         ScopeRule::OutputOnly,
         ValueRule::ScaleFilter,
+        Selector::Video,
         Repeat::Once,
         "Output::set_video_filter",
     ),
@@ -294,6 +339,7 @@ pub(crate) const OPTION_TABLE: &[OptSpec] = &[
         "-map",
         ScopeRule::OutputOnly,
         ValueRule::MapBasic,
+        Selector::StreamMap,
         Repeat::Accumulate,
         "Output::add_stream_map / add_stream_map_with_copy",
     ),
@@ -301,6 +347,7 @@ pub(crate) const OPTION_TABLE: &[OptSpec] = &[
         "-movflags",
         ScopeRule::OutputOnly,
         ValueRule::MovflagsFaststart,
+        Selector::Container,
         Repeat::Once,
         "Output::set_format_opt(\"movflags\", \"+faststart\")",
     ),
@@ -309,6 +356,7 @@ pub(crate) const OPTION_TABLE: &[OptSpec] = &[
         "-hls_time",
         ScopeRule::OutputOnly,
         ValueRule::HlsTime,
+        Selector::Container,
         Repeat::Once,
         "Output::set_format_opt(\"hls_time\", …)",
     ),
@@ -316,6 +364,7 @@ pub(crate) const OPTION_TABLE: &[OptSpec] = &[
         "-hls_playlist_type",
         ScopeRule::OutputOnly,
         ValueRule::HlsPlaylistVod,
+        Selector::Container,
         Repeat::Once,
         "Output::set_format_opt(\"hls_playlist_type\", \"vod\")",
     ),
@@ -323,6 +372,7 @@ pub(crate) const OPTION_TABLE: &[OptSpec] = &[
         "-hls_list_size",
         ScopeRule::OutputOnly,
         ValueRule::HlsListSizeZero,
+        Selector::Container,
         Repeat::Once,
         "Output::set_format_opt(\"hls_list_size\", \"0\")",
     ),
@@ -330,6 +380,7 @@ pub(crate) const OPTION_TABLE: &[OptSpec] = &[
         "-hls_segment_filename",
         ScopeRule::OutputOnly,
         ValueRule::Path,
+        Selector::Container,
         Repeat::Once,
         "Output::set_format_opt(\"hls_segment_filename\", …)",
     ),
@@ -979,6 +1030,37 @@ mod tests {
                 "{} is missing its lowering binding",
                 spec.name
             );
+        }
+    }
+
+    #[test]
+    fn sink_bindings_reference_real_builder_methods() {
+        // The lowering column must not rot: every `Input::x` / `Output::x`
+        // it cites has to exist as a real method in the builder sources. (A
+        // fully causal typed lowering program is the recorded residual; this
+        // pins the names against renames meanwhile.)
+        let haystack = concat!(
+            include_str!("../context/output/mod.rs"),
+            include_str!("../context/output/codec_opts.rs"),
+            include_str!("../context/input.rs"),
+        );
+        for spec in OPTION_TABLE {
+            let mut rest = spec.sink;
+            while let Some(pos) = rest.find("::") {
+                let after = &rest[pos + 2..];
+                let method: String = after
+                    .chars()
+                    .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_')
+                    .collect();
+                if !method.is_empty() {
+                    assert!(
+                        haystack.contains(&format!("fn {method}")),
+                        "{}: sink cites `{method}`, which is not a builder method",
+                        spec.name
+                    );
+                }
+                rest = after;
+            }
         }
     }
 

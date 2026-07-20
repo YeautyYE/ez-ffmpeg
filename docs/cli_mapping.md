@@ -6,7 +6,9 @@ ez-ffmpeg equivalents. The **Kind** column tells you *how* the mapping works:
 - **typed** — a dedicated builder method with a typed signature.
 - **option** — a string key/value forwarded to FFmpeg's option system
   (`AVOption`); the same names the CLI accepts, without the leading dash.
-- **filter** — expressed as an FFmpeg filtergraph string via
+- **filter** — expressed as an FFmpeg filtergraph string: a simple per-output
+  `-vf` chain via [`Output::set_video_filter`](crate::Output::set_video_filter),
+  complex/multi-input graphs via the context-level
   [`filter_desc`](crate::core::context::ffmpeg_context_builder::FfmpegContextBuilder::filter_desc).
 - **recipe** — a one-shot helper that owns the whole workflow.
 - **gap** — not implemented; the notes state the failure mode and workaround.

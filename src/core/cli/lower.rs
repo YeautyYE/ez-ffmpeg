@@ -180,6 +180,9 @@ impl LoweredJob {
 
         let mut output = Output::from(self.output.url);
         output.strict_avoptions = true;
+        // The hard simple-filter prerequisite rides the SAME opening the
+        // pipeline executes with (outputs_bind checks the built demuxers).
+        output.require_unique_video_source = self.output.video_filter.is_some();
         if let Some(format) = self.output.format {
             output = output.set_format(format);
         }

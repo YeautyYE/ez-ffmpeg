@@ -20,11 +20,11 @@
 
 use super::ir::CliIr;
 #[cfg(test)]
-use super::table::{Arity, Repeat, ScopeRule, OPTION_TABLE};
+use super::table::{Arity, Repeat, ScopeRule, Selector, OPTION_TABLE};
 
 /// Manifest revision. Bump on ANY change to the accept surface, the shape
 /// tables, or a rejection reason. Emitted code headers carry this value.
-pub(crate) const MANIFEST_REVISION: u32 = 2;
+pub(crate) const MANIFEST_REVISION: u32 = 3;
 
 /// The CLI dialect this parser implements: the option grammar was written
 /// against the FFmpeg 7.1 command-line documentation and fftools sources.
@@ -55,6 +55,27 @@ pub(crate) const VERIFIED_PROFILES: &[RuntimeProfile] = &[RuntimeProfile {
     avformat: (61, 7),
 }];
 
+/// The semantic oracle a verified shape is judged by. The golden suite's
+/// runner iterates [`VERIFIED_SHAPES`] and dispatches on this enum with an
+/// EXHAUSTIVE match: adding a verified row forces choosing an oracle, and
+/// adding an oracle variant without wiring its assertions fails to compile.
+/// No name coincidence can satisfy the linkage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GoldenOracle {
+    /// Full A/V transcode: stream identity + h264/aac pins.
+    Transcode,
+    /// Trimmed clip: shared oracle + the absolute duration window.
+    Clip,
+    /// Audio extract: audio-only pin + stream-identity (disposition) proof.
+    AudioExtract,
+    /// Single-frame thumbnail: pixel parity, conditional byte parity.
+    Thumbnail,
+    /// Scaled transcode: output geometry pin.
+    Scale,
+    /// VOD HLS: playlist tags, segment topology and durations, three lanes.
+    Hls,
+}
+
 /// One golden-backed shape: a fixed scope-qualified option set (the
 /// fingerprint), pinned values where the golden pinned them, the output
 /// extension the golden produced, and the canonical argv the golden tests
@@ -66,8 +87,9 @@ pub(crate) struct VerifiedShape {
     /// Sorted scope-qualified option keys, exactly as
     /// [`CliIr::fingerprint`] produces them.
     pub(crate) fingerprint: &'static [&'static str],
-    /// Golden test that earns the `verified` status (`golden_tests`).
-    pub(crate) golden: &'static str,
+    /// The typed semantic oracle that earns the `verified` status
+    /// (dispatched exhaustively by `golden_tests`).
+    pub(crate) oracle: GoldenOracle,
     /// Extra pinned-value predicate beyond the fingerprint.
     pub(crate) pins: fn(&CliIr) -> bool,
     /// Output extension the golden pinned (muxer identity is part of the
@@ -115,7 +137,7 @@ pub(crate) const VERIFIED_SHAPES: &[VerifiedShape] = &[
         id: "V1",
         summary: "H.264/AAC transcode (crf + preset)",
         fingerprint: &["out:-c:a", "out:-c:v", "out:-crf", "out:-preset"],
-        golden: "golden_v1_transcode",
+        oracle: GoldenOracle::Transcode,
         pins: pins_v1,
         output_ext: "mp4",
         canonical_argv: &[
@@ -128,7 +150,7 @@ pub(crate) const VERIFIED_SHAPES: &[VerifiedShape] = &[
         id: "V2",
         summary: "re-encoded clip (input -ss, output -t)",
         fingerprint: &["in:-ss", "out:-c:a", "out:-c:v", "out:-crf", "out:-t"],
-        golden: "golden_v2_clip",
+        oracle: GoldenOracle::Clip,
         pins: pins_v2,
         output_ext: "mp4",
         canonical_argv: &[
@@ -141,7 +163,7 @@ pub(crate) const VERIFIED_SHAPES: &[VerifiedShape] = &[
         id: "V3",
         summary: "audio extract (-vn, AAC)",
         fingerprint: &["out:-b:a", "out:-c:a", "out:-vn"],
-        golden: "golden_v3_audio_extract",
+        oracle: GoldenOracle::AudioExtract,
         pins: pins_v3,
         output_ext: "m4a",
         canonical_argv: &[
@@ -153,7 +175,7 @@ pub(crate) const VERIFIED_SHAPES: &[VerifiedShape] = &[
         id: "V4",
         summary: "single-frame thumbnail (input -ss, -an, mjpeg)",
         fingerprint: &["in:-ss", "out:-an", "out:-c:v", "out:-frames:v"],
-        golden: "golden_v4_thumbnail",
+        oracle: GoldenOracle::Thumbnail,
         pins: pins_v4,
         output_ext: "jpg",
         canonical_argv: &[
@@ -175,7 +197,7 @@ pub(crate) const VERIFIED_SHAPES: &[VerifiedShape] = &[
         id: "V5",
         summary: "scaled H.264/AAC transcode (-vf scale)",
         fingerprint: &["out:-c:a", "out:-c:v", "out:-crf", "out:-preset", "out:-vf"],
-        golden: "golden_v5_scale",
+        oracle: GoldenOracle::Scale,
         pins: pins_v1,
         output_ext: "mp4",
         canonical_argv: &[
@@ -209,7 +231,7 @@ pub(crate) const VERIFIED_SHAPES: &[VerifiedShape] = &[
             "out:-hls_segment_filename",
             "out:-hls_time",
         ],
-        golden: "golden_v6_hls",
+        oracle: GoldenOracle::Hls,
         pins: pins_v6,
         output_ext: "m3u8",
         canonical_argv: &[
@@ -469,7 +491,9 @@ pub(crate) fn manifest_docs_markdown() -> String {
     out.push_str(&format!(
         "Manifest revision {MANIFEST_REVISION}; dialect: {DIALECT}.\n\n"
     ));
-    out.push_str("| option | scope | repeat | notes | maps to |\n|---|---|---|---|---|\n");
+    out.push_str(
+        "| option | scope | selector | repeat | notes | maps to |\n|---|---|---|---|---|---|\n",
+    );
     for spec in OPTION_TABLE {
         let scope = match spec.scope {
             ScopeRule::Global => "global",
@@ -481,16 +505,24 @@ pub(crate) fn manifest_docs_markdown() -> String {
             Repeat::Accumulate => "accumulates",
             Repeat::Free => "repeatable",
         };
-        let notes = if spec.noop {
+        let notes = if spec.selector == Selector::NoOp {
             "accepted, no in-process effect"
         } else if spec.arity == Arity::Flag {
             "flag"
         } else {
             "takes a value"
         };
+        let selector = match spec.selector {
+            Selector::NoOp => "no-op",
+            Selector::Run => "run",
+            Selector::Container => "container",
+            Selector::Video => "video",
+            Selector::Audio => "audio",
+            Selector::StreamMap => "stream map",
+        };
         out.push_str(&format!(
-            "| `{}` | {} | {} | {} | {} |\n",
-            spec.name, scope, repeat, notes, spec.sink
+            "| `{}` | {} | {} | {} | {} | {} |\n",
+            spec.name, scope, selector, repeat, notes, spec.sink
         ));
     }
     out.push_str(

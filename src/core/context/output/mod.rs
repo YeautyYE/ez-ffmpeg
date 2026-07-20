@@ -397,6 +397,13 @@ pub struct Output {
     /// Only effective when re-encoding (not when using stream copy).
     pub(crate) pix_fmt: Option<String>,
 
+    /// CLI-compat only (crate-internal): the hard simple-filter
+    /// prerequisite — when set, context binding fails unless the opened
+    /// input carries exactly one video stream. Set by the `cli` feature's
+    /// lowering for `-vf` commands; never by the public builder API.
+    #[cfg_attr(not(feature = "cli"), allow(dead_code))]
+    pub(crate) require_unique_video_source: bool,
+
     /// CLI-compat strict mode (crate-internal): leftover AVOptions error
     /// instead of warning on every component this output drives (muxer,
     /// encoders). Set only by the `cli` feature's entry points; the default
@@ -504,6 +511,7 @@ impl Output {
             subtitle_disable: false,
             data_disable: false,
             pix_fmt: None,
+            require_unique_video_source: false,
             strict_avoptions: false,
             video_filter: None,
             sws_opts: None,

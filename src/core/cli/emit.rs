@@ -309,10 +309,10 @@ fn header(
         ShapeStatus::Verified(id) => {
             match super::manifest::shape(id) {
                 Some(shape) => out.push_str(&format!(
-                    "// status: verified shape {id} ({}) — backed by the semantic golden \
-                     `{}` against the ffmpeg CLI; canonical emission compile-pinned as \
-                     examples/{}.rs\n",
-                    shape.summary, shape.golden, shape.emitted_example
+                    "// status: verified shape {id} ({}) — verified by the manifest-driven \
+                     semantic golden suite (oracle: {:?}) against the ffmpeg CLI; canonical \
+                     emission compile-pinned as examples/{}.rs\n",
+                    shape.summary, shape.oracle, shape.emitted_example
                 )),
                 None => out.push_str(&format!(
                     "// status: verified shape {id} — backed by a semantic golden against the ffmpeg CLI\n"
@@ -461,7 +461,7 @@ mod tests {
             emit_cmd("ffmpeg -i in.mkv -c:v libx264 -crf 23 -preset fast -c:a aac -y out.mp4");
         assert!(code.contains("// status: verified shape V1"));
         assert!(code.contains("dialect: ffmpeg 7.1 command line"));
-        assert!(code.contains("manifest: r2"));
+        assert!(code.contains("manifest: r3"));
         assert!(code.contains(".set_video_codec(\"libx264\") // -c:v libx264"));
         assert!(code.contains(".set_video_codec_opt(\"crf\", \"23\") // -crf 23"));
         assert!(code.contains(".set_video_codec_opt(\"preset\", \"fast\") // -preset fast"));
