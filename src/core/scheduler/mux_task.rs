@@ -1503,20 +1503,30 @@ fn _mux_init(
             } else {
                 None
             };
-            sink.finish(nb_done == stream_count, ret, aborted, job_error);
-
-            // 6. Defined user-capture destruction: after the queue closed,
-            // the job settled and the terminal fired; BEFORE the slot
-            // release, so stop() cannot return while a blocking destructor
-            // still runs. ONE containment boundary wraps the ENTIRE
-            // post-terminal region — the capture drop AND the failure
-            // logging (a user-installed logger can itself panic) — so
-            // nothing after the terminal can re-arm the panic publisher and
-            // override the settled result a delivered on_end promised.
+            // 6. POST-SETTLEMENT REGION, all of it under ONE panic
+            // containment boundary: the terminal dispatch (finish() runs the
+            // user's on_end/on_delivery_error), the capture drops AND the
+            // failure logging (a user-installed logger can itself panic).
+            // After the barrier the only code left on this thread is user
+            // code and logging; containing it is what makes a barrier peer's
+            // "registered = settled" sound — nothing here can re-arm the
+            // panic publisher or change the settled result another sink's
+            // delivered on_end already promised. Still this worker thread
+            // (S9); before the slot release, so stop() cannot return while a
+            // blocking terminal callback or destructor runs.
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(sink))).is_err() {
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    sink.finish(nb_done == stream_count, ret, aborted, job_error)
+                }))
+                .is_err()
+                {
                     // Best-effort: a panic from this log call is swallowed by
                     // the outer boundary.
+                    error!(
+                        "packet sink terminal callback panicked; the settled job result is preserved"
+                    );
+                }
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(sink))).is_err() {
                     error!(
                         "packet sink consumer state panicked during teardown; the settled job result is preserved"
                     );

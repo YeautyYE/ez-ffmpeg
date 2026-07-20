@@ -22,6 +22,11 @@ struct Inner {
     /// definition for the rest of its (single-job) life, and keeping it
     /// counted lets a peer proceed without waiting for this thread's
     /// terminal dispatch — only for its slot, which releases afterwards.
+    /// Sound because a barrier caller's ENTIRE post-settlement region
+    /// (terminal callbacks, capture drops, logging) is panic-contained: a
+    /// peer counted out here can no longer change the settled job result.
+    /// Mutated only under the `counter` lock (see the lost-wakeup note in
+    /// the barrier).
     settlement_waiters: AtomicUsize,
     #[cfg(feature = "async")]
     waker: Mutex<Option<std::task::Waker>>,
@@ -116,12 +121,20 @@ impl ThreadSynchronizer {
     /// scheduler result and status are settled up to the caller's own
     /// remaining actions.
     pub(crate) fn wait_for_peers_settled(&self) {
-        self.inner.settlement_waiters.fetch_add(1, Ordering::AcqRel);
         let mut counter = self
             .inner
             .counter
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Registration and wakeup are ONE protocol under the counter lock: a
+        // registration can itself flip `live <= waiters` to true for peers
+        // already parked below (slot releases are the only other notifier),
+        // so every registrant wakes the condvar. Without this, sink A parks,
+        // sink B's registration satisfies the condition, B proceeds into its
+        // (possibly blocking) terminal callbacks without releasing its slot,
+        // and A sleeps forever — a lost wakeup, not a cycle.
+        self.inner.settlement_waiters.fetch_add(1, Ordering::AcqRel);
+        self.inner.condvar.notify_all();
         while *counter > self.inner.settlement_waiters.load(Ordering::Acquire) {
             counter = self
                 .inner
@@ -308,26 +321,46 @@ mod settlement_tests {
     }
 
     /// Two concurrent barrier callers (two packet sinks) count each other
-    /// out and both proceed — the mutual-settlement deadlock cannot form.
+    /// out and both proceed WITHOUT any slot release supplying the wakeup:
+    /// the slots stay held (parked on a gate) until both barriers passed —
+    /// exactly the lost-wakeup shape, where the second registration itself
+    /// must wake the first, already-parked waiter.
     #[test]
-    fn two_waiters_settle_each_other() {
+    fn two_waiters_settle_each_other_before_any_slot_release() {
         let sync = ThreadSynchronizer::new();
         sync.thread_start();
         sync.thread_start();
+        let passed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gate = Arc::new(AtomicBool::new(false));
         let mut handles = Vec::new();
-        for _ in 0..2 {
+        for i in 0..2 {
             let sync_w = sync.clone();
+            let passed_w = passed.clone();
+            let gate_w = gate.clone();
             handles.push(std::thread::spawn(move || {
+                if i == 1 {
+                    // Deterministic ordering: thread 0 parks first, then this
+                    // registration must wake it.
+                    std::thread::sleep(Duration::from_millis(80));
+                }
                 sync_w.wait_for_peers_settled();
+                passed_w.fetch_add(1, Ordering::AcqRel);
+                while !gate_w.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
                 sync_w.thread_done_with(|| {});
             }));
         }
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        for handle in handles {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while passed.load(Ordering::Acquire) < 2 {
             assert!(
                 std::time::Instant::now() < deadline,
-                "mutual settlement deadlocked"
+                "a settlement waiter was lost while every slot stayed held (lost wakeup)"
             );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        gate.store(true, Ordering::Release);
+        for handle in handles {
             handle.join().unwrap();
         }
         sync.wait_for_all_threads();

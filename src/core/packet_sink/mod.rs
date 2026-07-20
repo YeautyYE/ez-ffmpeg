@@ -70,14 +70,18 @@
 //! * initial configuration failure (missing/malformed extradata, whitelist
 //!   violations) — the job fails before any callback runs;
 //! * cancellation (`stop()` with packets still in flight, `abort()`);
-//! * a panicking callback — the job fails with a worker-panic error and no
-//!   further sink callback is invoked.
+//! * a panicking DELIVERY callback (`on_stream_info`, `on_packet`) — the job
+//!   fails with a worker-panic error and no further sink callback is
+//!   invoked.
 //!
-//! Single carve-out: once the terminal callback has fired, the consumer's
-//! captures are destroyed at the worker's defined teardown point; a panic in
-//! one of those `Drop` implementations is caught, logged at error level, and
-//! does NOT override the already-settled job result (a delivered `on_end`
-//! still yields `wait() == Ok`).
+//! Single carve-out — the post-settlement region: once the job has settled
+//! and the terminal decision is made, everything that remains on the
+//! delivery thread is user code (the terminal callback itself, then the
+//! destruction of the consumer's captures at the defined teardown point).
+//! A panic ANYWHERE in that region — `on_end`, `on_delivery_error`, or a
+//! capture's `Drop` — is caught, logged at error level, and does NOT change
+//! the already-settled job result (a delivered or decided `on_end` still
+//! yields `wait() == Ok`, and a failing job keeps its original error).
 //!
 //! # Backpressure: callbacks block the pipeline
 //!
@@ -246,7 +250,8 @@ pub trait PacketSinkHandler: Send + 'static {
     /// One delivered packet; the borrowed view is valid only for this call.
     fn on_packet(&mut self, packet: &PacketView<'_>) -> PacketCallbackResult;
 
-    /// Terminal success (see the module docs for the exact gate).
+    /// Terminal success (see the module docs for the exact gate). A panic
+    /// here is contained and cannot change the settled job result.
     fn on_end(&mut self) {}
 
     /// Terminal failure. For delivery-path errors (strict-tier violations,
