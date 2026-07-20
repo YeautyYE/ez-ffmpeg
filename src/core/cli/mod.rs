@@ -106,6 +106,10 @@ mod parse;
 mod table;
 mod tokenize;
 
+#[cfg(all(test, not(docsrs)))]
+mod corpus_tests;
+#[cfg(all(test, not(docsrs)))]
+mod strict_tests;
 
 pub use error::{CliError, CliScope};
 
