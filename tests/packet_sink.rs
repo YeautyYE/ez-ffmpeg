@@ -482,6 +482,50 @@ fn blocked_sibling_stays_interruptible_while_sink_finalizes() {
     drop(accept_thread);
 }
 
+/// The round-7 correctness probe: a delivered on_end must imply wait() ==
+/// Ok. The single documented carve-out is user code failing AFTER the fact —
+/// here a callback capture whose Drop panics during teardown: the panic is
+/// caught at the worker's defined destruction point, logged, and must NOT
+/// override the settled result. Native AAC, so CI exercises it everywhere.
+#[test]
+fn on_end_survives_a_panicking_capture_destructor() {
+    struct PanicOnDrop;
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            panic!("consumer capture panicked during teardown");
+        }
+    }
+
+    let ended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ended_cb = ended.clone();
+    let capture = PanicOnDrop;
+    let sink = ez_ffmpeg::packet_sink::PacketSink::builder(move |_pkt| {
+        let _hold = &capture;
+        Ok(())
+    })
+    .on_end(move || {
+        ended_cb.store(true, std::sync::atomic::Ordering::Release);
+    })
+    .build();
+
+    let result = wait_with_watchdog(
+        FfmpegContext::builder()
+            .input(Input::from("sine=frequency=440:duration=1").set_format("lavfi"))
+            .output(Output::from(sink).set_audio_codec("aac"))
+            .build()
+            .unwrap()
+            .start()
+            .unwrap(),
+        60,
+        "on_end_drop_panic",
+    );
+    assert!(
+        ended.load(std::sync::atomic::Ordering::Acquire),
+        "the healthy job must deliver on_end"
+    );
+    result.expect("a capture Drop panic after on_end must not fail the settled job");
+}
+
 /// Native-AAC end-to-end delivery through the owned-run iterator — runs on
 /// FFmpeg builds without GPL components, so CI exercises real delivery (not
 /// just compile/skip paths) everywhere. Also covers into_events(): events

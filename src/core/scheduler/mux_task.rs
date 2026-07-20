@@ -234,6 +234,14 @@ pub(crate) fn ready_to_init_mux(
             // the post-loop block. Handed to mux_task_start on the all-ready
             // branch (leaving `None` here).
             let mut guard = Some(guard);
+            // Packet-sink user callbacks. Declared AFTER `guard` and BEFORE
+            // the registration barrier and panic publisher, so unwind
+            // destroys them AFTER the panic is published (and registration
+            // awaited) but BEFORE the teardown guard closes the queues,
+            // joins the encoders and frees the context — the same defined
+            // destruction point every explicit path provides, ahead of the
+            // slot release.
+            let mut packet_sink = packet_sink;
             // on unwind the explicit wait_enc_registered calls (all-ready /
             // early-exit) are skipped, so `guard`'s Drop would join only the
             // already-queued handles and free the context while start() is still
@@ -266,7 +274,6 @@ pub(crate) fn ready_to_init_mux(
                 }
             };
             let mut queue_sender = queue_sender;
-            let mut packet_sink = packet_sink;
             loop {
                 let result = receiver.recv_timeout(Duration::from_millis(100));
 
@@ -416,6 +423,7 @@ fn mux_task_start(
             fail_mux_init(
                 &scheduler_status,
                 &scheduler_result,
+                MuxInitQueues::NONE,
                 guard,
                 slot_guard,
                 crate::error::Error::PacketSink(crate::error::PacketSinkError::NoStreams),
@@ -442,6 +450,7 @@ fn mux_task_start(
             fail_mux_init(
                 &scheduler_status,
                 &scheduler_result,
+                MuxInitQueues::NONE,
                 guard,
                 slot_guard,
                 crate::error::Error::OpenOutput(OpenOutputError::from(open_ret)),
@@ -577,13 +586,22 @@ fn _mux_init(
     let mux_done = mux_done;
     // Packet-sink user callbacks (populated after collection below). Declared
     // BEFORE `_panic_status` so that on unwind user destructors run AFTER the
-    // error is published and BEFORE the guards join/free/release — the same
+    // panic is published and BEFORE the guards join/free/release — the same
     // defined destruction point the worker frame provides.
     let mut sink_worker_slot: Option<crate::core::packet_sink::strict::PacketSinkWorker> = None;
     let _panic_status = MuxPanicStatusGuard {
         scheduler_status: scheduler_status.clone(),
         scheduler_result: scheduler_result.clone(),
     };
+    // The queue receivers, extracted from the guard and declared LAST: on
+    // unwind they drop FIRST, closing the live and pre-mux queues (waking
+    // parked encoders) before the panic publisher runs and before any user
+    // capture is destroyed — receiver -> publisher -> callbacks -> join/free
+    // -> slot, exactly the worker frame's order. The live receiver is
+    // restored into the guard at the worker handoff; explicit failure paths
+    // hand both to `fail_mux_init`, which drops them in the same order.
+    let mut pkt_receiver = guard.take_pkt_receiver();
+    let src_pre_receivers = guard.take_pre_receivers();
 
     // The teardown guard owns the output context; on every failure return it
     // moves into fail_mux_init, whose drop joins this muxer's encoders BEFORE
@@ -623,6 +641,10 @@ fn _mux_init(
                 fail_mux_init(
                     &scheduler_status,
                     &scheduler_result,
+                    MuxInitQueues {
+                        pkt_receiver: pkt_receiver.take(),
+                        pre_receivers: src_pre_receivers,
+                    },
                     guard,
                     slot_guard,
                     Muxing(MuxingOperationError::BitstreamFilterInit(
@@ -659,7 +681,15 @@ fn _mux_init(
                 &scheduler_status,
             )
         } {
-            Ok(worker) => sink_worker_slot = Some(worker),
+            Ok(worker) => {
+                // S1 observability (and the panic-injection seam the unwind
+                // regression uses): configuration is collected, callbacks are
+                // owned by this frame, nothing has been delivered.
+                debug!(
+                    "Packet sink configuration collected for output {mux_idx}: {stream_count} streams"
+                );
+                sink_worker_slot = Some(worker);
+            }
             Err(boxed) => {
                 let (sink, e) = *boxed;
                 error!("Packet sink configuration invalid: {e}");
@@ -668,6 +698,10 @@ fn _mux_init(
                 fail_mux_init(
                     &scheduler_status,
                     &scheduler_result,
+                    MuxInitQueues {
+                        pkt_receiver: pkt_receiver.take(),
+                        pre_receivers: src_pre_receivers,
+                    },
                     guard,
                     slot_guard,
                     crate::error::Error::PacketSink(e.clone()),
@@ -691,6 +725,10 @@ fn _mux_init(
             fail_mux_init(
                 &scheduler_status,
                 &scheduler_result,
+                MuxInitQueues {
+                    pkt_receiver: pkt_receiver.take(),
+                    pre_receivers: src_pre_receivers,
+                },
                 guard,
                 slot_guard,
                 crate::error::Error::OpenOutput(OpenOutputError::from(open_ret)),
@@ -710,6 +748,10 @@ fn _mux_init(
             fail_mux_init(
                 &scheduler_status,
                 &scheduler_result,
+                MuxInitQueues {
+                    pkt_receiver: pkt_receiver.take(),
+                    pre_receivers: src_pre_receivers,
+                },
                 guard,
                 slot_guard,
                 Muxing(MuxingOperationError::WriteHeader(WriteHeaderError::from(
@@ -762,7 +804,10 @@ fn _mux_init(
     // `slot_guard` are still locals (the established teardown order), not after the
     // handoff where `guard_slot`/`src_pre_receivers` would drop out of order.
     let thread_name = format!("muxer{mux_idx}:{format_name}");
-    let src_pre_receivers = guard.take_pre_receivers();
+    // The live receiver rides to the worker inside the guard again (the
+    // worker prologue takes it back out); the unwind-ordering extraction
+    // above only needed it as a local while this frame could still panic.
+    guard.restore_pkt_receiver(pkt_receiver.take());
     let guard_slot: MuxWorkerHandoff = Arc::new(Mutex::new((
         Some(guard),
         Some(slot_guard),
@@ -1361,66 +1406,89 @@ fn _mux_init(
         let _finalizing = ((ret >= 0 || ret == AVERROR_EOF) && sink_worker.is_none())
             .then(|| interrupt_state.begin_output_finalize());
 
-        // write_trailer (container outputs) / terminal callbacks (packet sink)
-        let final_status = scheduler_status.load(Ordering::Acquire);
-        if let Some(sink) = sink_worker.as_mut() {
-            // Terminal gate (deliberately NOT `_finalizing`, which is also
-            // true when stop() cut the loop with packets still in flight):
-            // `on_end` requires every stream at a recognized terminal state —
-            // natural encoder EOF and configured truncation (recording_time,
-            // `-shortest` cascade) both count via `nb_done` — with nothing
-            // held back (packet-sink outputs have no BSFs and hold no
-            // packets), no delivery error (`ret >= 0`; a failing callback is
-            // never AVERROR_EOF), no abort, and a STABLE job result.
-            let locally_complete = ret >= 0
-                && nb_done == stream_count
-                && final_status != STATUS_ABORT
-                && sink.pending_error_cloned().is_none();
+        // ---- Packet-sink terminal path (returns; containers continue below).
+        if let Some(mut sink) = sink_worker.take() {
+            debug!("Muxer finished.");
+            // Sequence EVERY crate-side failure source BEFORE the terminal
+            // decision, so a delivered on_end implies wait() == Ok (the one
+            // carve-out — user-capture Drop panics AFTER the terminal — is
+            // caught below and cannot change the settled result):
+            // 1. close the live queue (wakes any sender);
+            drop(pkt_receiver);
+            // 2. stream bookkeeping (idempotent);
+            for node in &mux_stream_nodes {
+                if let SchNode::MuxStream {
+                    source_finished, ..
+                } = node.as_ref()
+                {
+                    source_finished.store(true, Ordering::Release);
+                }
+            }
+            // 3. terminal coordination: report this muxer's own completion
+            // FIRST (dropping the completion guard — also the F1 order: the
+            // publish must precede the encoder join), then, when locally
+            // complete, wait until every other muxer settled. Two sinks both
+            // report before waiting, so they cannot deadlock on each other;
+            // ABORT short-circuits the wait.
+            let locally_complete =
+                ret >= 0 && nb_done == stream_count && sink.pending_error_cloned().is_none();
+            let remaining = mux_done
+                .as_ref()
+                .expect("mux_done consumed before the terminal slot")
+                .remaining_handle();
+            drop(mux_done.take());
             if locally_complete {
-                // Terminal coordinator: report this muxer's own logical
-                // completion FIRST (dropping the completion guard), then wait
-                // until every other muxer settled — only then is the job
-                // result stable enough to promise success (a sibling can
-                // still fail after our drain; sampling the result before it
-                // settles produced on_end followed by wait() == Err). Two
-                // sinks both report before waiting, so they cannot deadlock
-                // on each other; ABORT short-circuits the wait.
-                let remaining = mux_done
-                    .as_ref()
-                    .expect("mux_done consumed before the terminal slot")
-                    .remaining_handle();
-                drop(mux_done.take());
-                let mut aborted = false;
                 while remaining.load(Ordering::Acquire) > 0 {
                     if scheduler_status.load(Ordering::Acquire) == STATUS_ABORT {
-                        aborted = true;
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(1));
                 }
-                // The settled job outcome: an error recorded by ANY task
-                // (first-error-wins) means no on_end — the sink reports it as
-                // a delivery error instead, and wait() keeps the original.
-                let job_error = scheduler_result
+            }
+            input_controller.update_locked(&scheduler_status);
+            // 4. join this muxer's own producers (encoders) and free the
+            // context — the last crate-side failure source; any error they
+            // published landed before the reads below.
+            drop(guard);
+
+            // Terminal decision on a FRESH status read, atomic with the
+            // dispatch — no stale pre-wait snapshot can admit an
+            // abort-raced on_end (the old single-sink window skipped the
+            // coordinator loop entirely and reused a snapshot from before
+            // it). An error recorded by ANY task (first-error-wins) means no
+            // on_end — the sink reports it as JobFailed while wait() keeps
+            // the original.
+            let aborted = scheduler_status.load(Ordering::Acquire) == STATUS_ABORT;
+            let job_error = if locally_complete && !aborted {
+                scheduler_result
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .as_ref()
                     .and_then(|result| result.as_ref().err())
-                    .map(|e| e.to_string());
-                sink.finish(true, ret, aborted, job_error);
+                    .map(|e| e.to_string())
             } else {
-                // Delivery error / cancellation / abort: a stashed delivery
-                // error fires `on_delivery_error`; cancellation and non-sink
-                // failures fire neither (the job result carries them). No
-                // coordination needed — nothing here promises success.
-                sink.finish(
-                    nb_done == stream_count,
-                    ret,
-                    final_status == STATUS_ABORT,
-                    None,
+                None
+            };
+            sink.finish(nb_done == stream_count, ret, aborted, job_error);
+
+            // Defined user-capture destruction: after the queue closed, the
+            // job settled and the terminal fired; BEFORE the slot release, so
+            // stop() cannot return while a blocking destructor still runs.
+            // The single carve-out: a consumer Drop panic here is caught and
+            // logged — it must not override the settled job result a
+            // delivered on_end already promised.
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(sink))).is_err() {
+                error!(
+                    "packet sink consumer state panicked during teardown; the settled job result is preserved"
                 );
             }
-        } else if final_status != STATUS_ABORT {
+            slot_guard.release();
+            return;
+        }
+
+        // ---- Container terminal path.
+        let final_status = scheduler_status.load(Ordering::Acquire);
+        if final_status != STATUS_ABORT {
             unsafe {
                 let ret = av_write_trailer(out_fmt_ctx.as_ptr());
                 if ret < 0 {
@@ -1478,13 +1546,6 @@ fn _mux_init(
         // balancing pass from running the fallback, so a demuxer feeding ONLY
         // this finished output can stay choked until the sibling finishes.
         input_controller.update_locked(&scheduler_status);
-
-        // Packet-sink user callbacks are destroyed HERE — after the queue
-        // receiver closed and every terminal event fired, BEFORE the encoder
-        // join / context free and (critically) before the thread slot
-        // releases: stop() must not return while a blocking callback-capture
-        // destructor is still running.
-        drop(sink_worker);
 
         // Ordered teardown: join this muxer's encoders, THEN free the output
         // context (the guard's Drop). Freeing before the slot release below
@@ -1622,15 +1683,45 @@ unsafe fn open_muxer_output(out_fmt_ctx: *mut AVFormatContext) -> std::result::R
 /// the error), and the slot must stay held until the context free completed
 /// (a woken wait()/stop() drops the InterruptState that the free's custom-IO
 /// callbacks dereference).
+/// The `_mux_init` frame's queue receivers, bundled for the failure path: the
+/// frame holds them as late-declared locals purely for unwind-drop ordering,
+/// so its explicit failure arms must hand them over to be closed in the same
+/// load-bearing order. `NONE` stands in on paths where the teardown guard
+/// still owns the receivers (the streamless dispatch) and closes them itself.
+struct MuxInitQueues {
+    pkt_receiver: Option<Receiver<PacketBox>>,
+    pre_receivers: Vec<PreMuxQueueReceiver>,
+}
+
+impl MuxInitQueues {
+    const NONE: Self = Self {
+        pkt_receiver: None,
+        pre_receivers: Vec::new(),
+    };
+
+    /// Closes the queues in the load-bearing order: the live queue first (a
+    /// sender blocked in `send()` wakes with `SendError` the moment the sole
+    /// receiver drops), then the pre-mux queues (their Drop wakes parked
+    /// senders into `Disconnected`).
+    fn close(self) {
+        drop(self.pkt_receiver);
+        drop(self.pre_receivers);
+    }
+}
+
 fn fail_mux_init(
     scheduler_status: &Arc<AtomicUsize>,
     scheduler_result: &Arc<Mutex<Option<crate::error::Result<()>>>>,
+    queues: MuxInitQueues,
     guard: MuxTeardownGuard,
     slot_guard: MuxSlotGuard,
     error: crate::error::Error,
     packet_sink: Option<crate::core::packet_sink::PacketSink>,
 ) {
     set_scheduler_error(scheduler_status, scheduler_result, error);
+    // Close the queues FIRST, waking parked encoders into their terminal
+    // exit before the guard's join below.
+    queues.close();
     drop(guard);
     // Packet-sink user callbacks (when this failure owns them): destroyed
     // after the error is published and the teardown joined/freed, BEFORE the
@@ -1919,6 +2010,14 @@ impl MuxTeardownGuard {
     /// still drops FIRST — unblocking senders before the guard's join.
     fn take_pkt_receiver(&mut self) -> Option<Receiver<PacketBox>> {
         self.pkt_receiver.take()
+    }
+
+    /// Puts the live-queue receiver back for the worker handoff (the
+    /// `_mux_init` frame holds it as a late-declared local purely for
+    /// unwind-drop ordering).
+    fn restore_pkt_receiver(&mut self, receiver: Option<Receiver<PacketBox>>) {
+        debug_assert!(self.pkt_receiver.is_none());
+        self.pkt_receiver = receiver;
     }
 
     /// Success path only (the worker spawned and is consuming): hands the
@@ -2634,6 +2733,7 @@ mod tests {
         fail_mux_init(
             &scheduler_status,
             &scheduler_result,
+            MuxInitQueues::NONE,
             MuxTeardownGuard::for_test(),
             MuxSlotGuard::armed(thread_sync.clone(), scheduler_status.clone()),
             Muxing(MuxingOperationError::ThreadExited),
