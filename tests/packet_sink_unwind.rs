@@ -91,6 +91,19 @@ fn disarm_all() {
     RELEASE.store(false, Ordering::Release);
 }
 
+/// Arms with a HOLD scenario and guarantees the parked worker is released
+/// even when the test thread panics before its manual `RELEASE` (otherwise
+/// the scheduler teardown would wait forever on the parked thread and hang
+/// the whole binary). The manual release remains the ordering-relevant one;
+/// this late store is idempotent.
+struct ReleaseOnDrop;
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        RELEASE.store(true, Ordering::Release);
+    }
+}
+
 /// Sets its flag from `Drop` — observed AFTER `wait()` returns, it proves the
 /// callback captures were destroyed before the job reported completion.
 struct FlagOnDrop(Arc<AtomicBool>);
@@ -298,6 +311,7 @@ fn late_filter_worker_panic_prevents_on_end() {
     // needle check.
     *HOLD.lock().unwrap_or_else(|e| e.into_inner()) = Some("FilterGraph finished.");
     *TRIGGER.lock().unwrap_or_else(|e| e.into_inner()) = Some("FilterGraph finished.");
+    let _release_on_unwind = ReleaseOnDrop;
     let scheduler = FfmpegContext::builder()
         .input(Input::from("sine=frequency=440:duration=1").set_format("lavfi"))
         .output(Output::from(sink).set_audio_codec("aac"))
@@ -366,7 +380,12 @@ fn late_filter_worker_panic_prevents_on_end() {
 /// The linearization point: the worker is HELD between its last packet
 /// completion (`nb_done` reached, "All streams finished" traced) and the
 /// terminal region; an abort issued in that window must be observed by the
-/// post-settlement status load and suppress BOTH terminal callbacks.
+/// post-settlement status load and suppress BOTH terminal callbacks. This
+/// pins the CURRENT contract (the fresh pre-dispatch load); it does not
+/// discriminate the older implementation, whose load also sat after this
+/// hold point — the settlement family's discriminating evidence is the
+/// parked-filter probe. The 500 ms grace below is a scheduling heuristic
+/// for the helper's ABORT store, not a happens-before acknowledgement.
 #[test]
 fn abort_at_the_linearization_point_suppresses_the_terminal() {
     let _lock = PROCESS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -386,6 +405,7 @@ fn abort_at_the_linearization_point_suppresses_the_terminal() {
     .build();
 
     *HOLD.lock().unwrap_or_else(|e| e.into_inner()) = Some("All streams finished");
+    let _release_on_unwind = ReleaseOnDrop;
     let scheduler = FfmpegContext::builder()
         .input(Input::from("sine=frequency=440:duration=1").set_format("lavfi"))
         .output(Output::from(sink).set_audio_codec("aac"))
@@ -428,5 +448,106 @@ fn abort_at_the_linearization_point_suppresses_the_terminal() {
     assert!(
         evs.is_empty(),
         "an abort observed at the linearization point suppresses BOTH terminal callbacks: {evs:?}"
+    );
+}
+
+/// Failure-driven shutdown must NOT be classified as cancellation: a
+/// capacity-one channel sink is wedged in its blocking send when a sibling
+/// output (own input, gated EIO) fails. The blocked send observes the
+/// stopping status WITH a recorded job error, abandons as
+/// failure-truncation (not Cancelled), and the terminal — held at the
+/// sink-only completion log while the test drains the channel to guarantee
+/// capacity — must deliver `Error(JobFailed)`, never silence.
+#[test]
+fn full_channel_sink_reports_a_sibling_failure_not_silence() {
+    let _lock = PROCESS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    install_logger_once();
+    disarm_all();
+
+    let (sink, receiver) =
+        ez_ffmpeg::packet_sink::PacketSink::channel(std::num::NonZeroUsize::new(1).unwrap());
+    // The sibling fails hard right past its header. No test-side gating:
+    // the failure's timing relative to the wedge is irrelevant — once the
+    // job is stopping with a recorded error, the sink's NEXT blocked send
+    // into the undrained capacity-one channel classifies it (a gated
+    // failure would instead stall forever behind the input controller's
+    // choke once the wedged sink lags).
+    let mut written = 0usize;
+    let sibling = Output::new_by_write_callback(move |buf: &[u8]| {
+        written += buf.len();
+        if written > 1024 {
+            ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO)
+        } else {
+            buf.len() as i32
+        }
+    })
+    .set_format("mpegts")
+    .set_audio_codec("aac")
+    // Small AVIO buffer: TS writes flush continuously, so the EIO lands
+    // during the run rather than at one big trailer flush.
+    .set_io_buffer_size(512);
+
+    *HOLD.lock().unwrap_or_else(|e| e.into_inner()) = Some("Packet sink muxer finished.");
+    let _release_on_unwind = ReleaseOnDrop;
+    let scheduler = FfmpegContext::builder()
+        .input(Input::from("sine=frequency=440:duration=2").set_format("lavfi"))
+        .input(Input::from("sine=frequency=330:duration=2").set_format("lavfi"))
+        .output(
+            Output::from(sink)
+                .set_audio_codec("aac")
+                .add_stream_map("0:a"),
+        )
+        .output(sibling.add_stream_map("1:a"))
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    // 1. Take exactly the stream-info event, then stop draining: the
+    // capacity-one channel wedges the sink in its blocking send while the
+    // sibling (its own input) runs into its EIO.
+    match receiver.recv_timeout(Duration::from_secs(20)) {
+        Ok(ez_ffmpeg::packet_sink::PacketSinkEvent::StreamInfo(_)) => {}
+        other => panic!("expected the stream-info event first, got {other:?}"),
+    }
+
+    // 2. The sink observes the failure-driven stop from its blocked send,
+    // classifies it, exits its loop and parks at the sink-only completion
+    // log — BEFORE the terminal dispatch.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !HELD.load(Ordering::Acquire) {
+        assert!(
+            Instant::now() < deadline,
+            "the sink worker never exited its delivery loop"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    // 4. Drain the channel so the (best-effort) terminal event has
+    // guaranteed capacity, then release the terminal.
+    while receiver.try_recv().is_ok() {}
+    RELEASE.store(true, Ordering::Release);
+
+    let result = wait_with_watchdog(scheduler, 60, "full_channel_sibling_failure");
+    disarm_all();
+    assert!(
+        result.is_err(),
+        "the sibling write failure must fail the job"
+    );
+
+    let mut saw_job_failed = false;
+    while let Ok(event) = receiver.try_recv() {
+        match event {
+            ez_ffmpeg::packet_sink::PacketSinkEvent::End => {
+                panic!("End must not be delivered when the job failed elsewhere")
+            }
+            ez_ffmpeg::packet_sink::PacketSinkEvent::Error(
+                ez_ffmpeg::error::PacketSinkError::JobFailed { .. },
+            ) => saw_job_failed = true,
+            _ => {}
+        }
+    }
+    assert!(
+        saw_job_failed,
+        "a failure-driven stop observed by the wedged send must surface as Error(JobFailed), not silence"
     );
 }
