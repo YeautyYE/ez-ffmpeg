@@ -546,6 +546,10 @@ fn two_sinks_settle_and_both_reach_their_terminals() {
 /// register-only-when-healthy rule left A waiting on the live-but-
 /// unregistered B while B's blocking terminal callback waited back on A's.
 /// Both on_delivery_error callbacks rendezvous under a bounded timeout.
+/// Covers the window where the truncated sink still HOLDS its slot; the
+/// post-release accounting (a departed register-only sink must leave no
+/// ghost registration) is covered by
+/// `on_end_waits_for_live_peers_after_a_register_only_sink_departs`.
 #[test]
 fn mixed_truncated_and_healthy_sinks_settle_without_deadlock() {
     let (tx_a, rx_a) = std::sync::mpsc::channel::<()>();
@@ -674,6 +678,172 @@ fn mixed_truncated_and_healthy_sinks_settle_without_deadlock() {
         "both failure callbacks must run concurrently-reachable (a truncated \
          sink that skips settlement registration parks the healthy sibling \
          past the rendezvous window)"
+    );
+}
+
+/// The settlement accounting LIFETIME: after a register-only sink departs
+/// (truncated by clean stop(), registered, dispatched nothing, released its
+/// slot), a healthy sink at the barrier must keep waiting while any
+/// ordinary peer is still live — a ghost registration outliving its slot
+/// admitted on_end while a sibling's capture destruction was still pending,
+/// and its panic then failed the "already successful" job (on_end => Ok
+/// violated). Complements `mixed_truncated_and_healthy_sinks_settle_...`,
+/// which covers the window where the truncated sink still HOLDS its slot;
+/// this test covers the accounting after it RELEASES it.
+#[test]
+fn on_end_waits_for_live_peers_after_a_register_only_sink_departs() {
+    let a_events: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let b_events: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let delivered_a = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+    let (ev_end, ev_err, count) = (a_events.clone(), a_events.clone(), delivered_a.clone());
+    let sink_a = ez_ffmpeg::packet_sink::PacketSink::builder(move |_pkt| {
+        count.fetch_add(1, std::sync::atomic::Ordering::Release);
+        Ok(())
+    })
+    .on_end(move || ev_end.lock().unwrap().push("end".to_string()))
+    .on_delivery_error(move |e| ev_err.lock().unwrap().push(format!("error: {e}")))
+    .build();
+    let (ev_end, ev_err) = (b_events.clone(), b_events.clone());
+    let sink_b = ez_ffmpeg::packet_sink::PacketSink::builder(move |_pkt| {
+        // Pacing: B is reliably mid-delivery (truncated, register-only)
+        // when stop() lands.
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        Ok(())
+    })
+    .on_end(move || ev_end.lock().unwrap().push("end".to_string()))
+    .on_delivery_error(move |e| ev_err.lock().unwrap().push(format!("error: {e}")))
+    .build();
+
+    // The sibling's custom-IO capture PARKS in its Drop (context free,
+    // slot still held) and then panics — the live peer the healthy sink
+    // must keep waiting for.
+    let capture_parked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let capture_gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    struct ParkThenPanicOnDrop {
+        parked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        gate: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl Drop for ParkThenPanicOnDrop {
+        fn drop(&mut self) {
+            self.parked.store(true, std::sync::atomic::Ordering::Release);
+            while !self.gate.load(std::sync::atomic::Ordering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            if !std::thread::panicking() {
+                panic!("sibling capture panicked during context destruction");
+            }
+        }
+    }
+    let bomb = ParkThenPanicOnDrop {
+        parked: capture_parked.clone(),
+        gate: capture_gate.clone(),
+    };
+    let sibling = Output::new_by_write_callback(move |buf: &[u8]| {
+        let _hold = &bomb;
+        buf.len() as i32
+    })
+    .set_format("mpegts")
+    .set_audio_codec("aac");
+    struct GateOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for GateOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    let scheduler = FfmpegContext::builder()
+        .input(Input::from("sine=frequency=440:duration=0.2").set_format("lavfi"))
+        .input(Input::from("sine=frequency=330:duration=2").set_format("lavfi"))
+        .input(Input::from("sine=frequency=550:duration=2").set_format("lavfi"))
+        .output(
+            Output::from(sink_a)
+                .set_audio_codec("aac")
+                .add_stream_map("0:a"),
+        )
+        .output(
+            Output::from(sink_b)
+                .set_audio_codec("aac")
+                .add_stream_map("1:a"),
+        )
+        .output(sibling.add_stream_map("2:a"))
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+    // AFTER the scheduler (declaration-order lesson): an assertion panic
+    // opens the capture gate before anything waits on the parked sibling.
+    let _open_gate_on_unwind = GateOnDrop(capture_gate.clone());
+
+    // 1. A drains and sits at the settlement barrier.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut last = delivered_a.load(std::sync::atomic::Ordering::Acquire);
+    let mut stable_since = std::time::Instant::now();
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            std::time::Instant::now() < deadline,
+            "sink A's delivery never quiesced"
+        );
+        let now_count = delivered_a.load(std::sync::atomic::Ordering::Acquire);
+        if now_count != last {
+            last = now_count;
+            stable_since = std::time::Instant::now();
+        } else if stable_since.elapsed() >= std::time::Duration::from_millis(500) {
+            break;
+        }
+    }
+    assert!(last > 0, "sink A must have delivered packets");
+
+    // 2. Clean stop(): B truncates mid-delivery (register-only, silent per
+    // the stop contract, releases its slot); the sibling's teardown parks
+    // in its capture Drop with its slot still held. stop() blocks until
+    // every slot releases, so it runs on a helper thread.
+    let stop_thread = std::thread::spawn(move || scheduler.stop());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !capture_parked.load(std::sync::atomic::Ordering::Acquire) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the sibling capture never reached its parked destruction"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    // 3. THE DISCRIMINATOR: while the never-registered sibling is live
+    // (parked in its capture Drop), A's barrier must hold — no on_end.
+    // A ghost registration from the departed B admitted A here.
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    assert!(
+        a_events.lock().unwrap().is_empty(),
+        "no terminal may fire while a never-registered peer is still live: {:?}",
+        a_events.lock().unwrap()
+    );
+
+    // 4. Release: the capture panics (recorded as the sibling worker's
+    // panic BEFORE its slot release), A passes the barrier and reports the
+    // settled failure — never on_end.
+    capture_gate.store(true, std::sync::atomic::Ordering::Release);
+    let result = stop_thread.join().expect("stop() must return");
+    match result {
+        Err(ez_ffmpeg::error::Error::WorkerPanicked(name)) => {
+            assert!(name.contains("muxer"), "expected the sibling muxer, got {name:?}");
+        }
+        other => panic!("expected WorkerPanicked from the sibling capture, got {other:?}"),
+    }
+    let evs = a_events.lock().unwrap().clone();
+    assert!(
+        !evs.iter().any(|e| e == "end"),
+        "on_end must not fire when the settled job failed: {evs:?}"
+    );
+    assert!(
+        evs.iter().any(|e| e.starts_with("error")),
+        "the settled failure surfaces as on_delivery_error: {evs:?}"
+    );
+    assert!(
+        b_events.lock().unwrap().is_empty(),
+        "a cleanly stopped mid-delivery sink stays silent: {:?}",
+        b_events.lock().unwrap()
     );
 }
 

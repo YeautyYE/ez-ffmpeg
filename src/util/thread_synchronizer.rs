@@ -3,7 +3,6 @@
 //! live workers behind a condvar instead, because threads are detached
 //! `std::thread` spawns whose handles the scheduler does not keep.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 #[derive(Clone)]
@@ -12,33 +11,46 @@ pub struct ThreadSynchronizer {
 }
 
 struct Inner {
-    counter: Mutex<usize>,
+    counter: Mutex<Counts>,
     condvar: Condvar,
-    /// Number of scheduler threads currently parked in
-    /// [`ThreadSynchronizer::wait_for_peers_settled`]. A waiter counts
-    /// itself (and its fellow waiters) out of the settlement condition, so
-    /// two packet sinks at the barrier cannot deadlock on each other. Never
-    /// decremented: a thread that reached the barrier is settled-by-
-    /// definition for the rest of its (single-job) life, and keeping it
-    /// counted lets a peer proceed without waiting for this thread's
-    /// terminal dispatch — only for its slot, which releases afterwards.
-    /// Sound because a barrier caller's ENTIRE post-settlement region
-    /// (terminal callbacks, capture drops, logging) is panic-contained: a
-    /// peer counted out here can no longer change the settled job result.
-    /// Mutated only under the `counter` lock (see the lost-wakeup note in
-    /// the barrier).
-    settlement_waiters: AtomicUsize,
     #[cfg(feature = "async")]
     waker: Mutex<Option<std::task::Waker>>,
+}
+
+/// Live-thread and settlement accounting, one mutex, one invariant:
+/// **`settled` is a subset of `live`** — a settlement registration is state
+/// OF a live slot (each packet-sink worker registers its own slot at most
+/// once, mediated by its slot guard), and the release critical section
+/// removes the registration together with the live decrement. That subset
+/// invariant is what makes the barrier predicate `live <= settled` mean
+/// "every live thread is a settled sink": were registrations to outlive
+/// their slots (the old never-decremented counter), a departed register-only
+/// sink would leave a ghost registration that admits a later waiter while
+/// unrelated workers are still live — and its `on_end` would fire before
+/// the job settled.
+///
+/// A registered thread is counted out of the settlement condition, so
+/// packet sinks never wait on each other's terminal callbacks. Sound
+/// because a sink's ENTIRE post-settlement region (terminal callbacks,
+/// capture drops, logging) is panic-contained: a peer counted out here can
+/// no longer change the settled job result.
+struct Counts {
+    /// Threads holding a slot (started, not yet released).
+    live: usize,
+    /// Live threads registered as settled (packet-sink workers in their
+    /// terminal region).
+    settled: usize,
 }
 
 impl ThreadSynchronizer {
     pub(crate) fn new() -> Self {
         Self {
             inner: Arc::new(Inner {
-                counter: Mutex::new(0),
+                counter: Mutex::new(Counts {
+                    live: 0,
+                    settled: 0,
+                }),
                 condvar: Condvar::new(),
-                settlement_waiters: AtomicUsize::new(0),
                 #[cfg(feature = "async")]
                 waker: Mutex::new(None),
             }),
@@ -46,12 +58,12 @@ impl ThreadSynchronizer {
     }
 
     pub(crate) fn thread_start(&self) {
-        let mut counter = self
+        let mut counts = self
             .inner
             .counter
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *counter += 1;
+        counts.live += 1;
     }
 
     /// Decrements the counter; when this was the last thread, runs `on_last`
@@ -60,6 +72,17 @@ impl ThreadSynchronizer {
     /// and storing afterwards loses the (already consumed) async waker and
     /// leaves the future pending forever.
     pub(crate) fn thread_done_with(&self, on_last: impl FnOnce()) {
+        self.thread_done_with_settled(false, on_last);
+    }
+
+    /// Releases the calling thread's slot; `registered` says whether this
+    /// thread registered as settled (packet-sink slot guards carry that
+    /// bit). Live decrement and registration removal happen in the SAME
+    /// critical section — splitting them (a separate lock, a detached
+    /// atomic, an independent RAII token dropping at its own time) reopens
+    /// the stale-accounting window where `settled` is not a subset of
+    /// `live`.
+    pub(crate) fn thread_done_with_settled(&self, registered: bool, on_last: impl FnOnce()) {
         // Take the waker to fire it OUTSIDE the counter lock. `Waker::wake()` is
         // a safe API with no panic guarantee; called while holding the counter
         // mutex a panicking waker would POISON it, and a re-entrant release (an
@@ -71,14 +94,22 @@ impl ThreadSynchronizer {
         #[cfg(feature = "async")]
         let mut waker_to_fire: Option<std::task::Waker> = None;
         {
-            let mut counter = self
+            let mut counts = self
                 .inner
                 .counter
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *counter -= 1;
+            counts.live -= 1;
+            if registered {
+                debug_assert!(counts.settled > 0, "registration without a settled count");
+                counts.settled -= 1;
+            }
+            debug_assert!(
+                counts.settled <= counts.live,
+                "settled registrations must be a subset of live slots"
+            );
 
-            if *counter == 0 {
+            if counts.live == 0 {
                 on_last();
 
                 #[cfg(feature = "async")]
@@ -92,7 +123,7 @@ impl ThreadSynchronizer {
                 }
             }
             // Every release notifies (not only the last): settlement waiters
-            // park on this condvar with a `counter <= waiters` condition that
+            // park on this condvar with a `live <= settled` condition that
             // can become true on ANY peer's release. wait_for_all_threads
             // re-checks its own condition, so the broader wakeup is safe.
             self.inner.condvar.notify_all();
@@ -120,58 +151,67 @@ impl ThreadSynchronizer {
     /// (`ThreadDoneGuard`, `MuxPanicStatusGuard`), so once this returns the
     /// scheduler result and status are settled up to the caller's own
     /// remaining actions.
-    pub(crate) fn wait_for_peers_settled(&self) {
-        let mut counter = self.register_settled_locked();
-        while *counter > self.inner.settlement_waiters.load(Ordering::Acquire) {
-            counter = self
+    /// Registers the calling thread's LIVE slot as settled, under the one
+    /// counter lock: a registration can itself flip `live <= settled` to
+    /// true for peers already parked in the barrier (slot releases are the
+    /// only other notifier), so every registrant wakes the condvar. Without
+    /// this, sink A parks, sink B's registration satisfies the condition, B
+    /// proceeds into its (possibly blocking) terminal callbacks without
+    /// releasing its slot, and A sleeps forever — a lost wakeup, not a
+    /// cycle.
+    ///
+    /// The registration's lifetime is the SLOT's lifetime: the caller must
+    /// release with `thread_done_with_settled(true, ..)`, which removes it
+    /// in the same critical section as the live decrement (see [`Counts`]).
+    /// Callers register at most once per thread (the packet-sink slot guard
+    /// mediates). A register-only caller (a truncated sink that dispatches
+    /// its failure without waiting) therefore leaves NO ghost registration
+    /// behind: after it departs, live = {healthy sink, ordinary worker} = 2
+    /// vs settled = {healthy sink} = 1 keeps the healthy sink waiting, and
+    /// the ordinary worker's release (1 <= 1) is what admits it.
+    pub(crate) fn register_settled(&self) {
+        let mut counts = self
+            .inner
+            .counter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        counts.settled += 1;
+        debug_assert!(
+            counts.settled <= counts.live,
+            "settled registrations must be a subset of live slots"
+        );
+        self.inner.condvar.notify_all();
+    }
+
+    /// Blocks until every live thread is a settled (registered) packet-sink
+    /// worker: `live <= settled`. The caller registered its own slot first,
+    /// so it is counted out of its own condition.
+    pub(crate) fn wait_peers_settled(&self) {
+        let mut counts = self
+            .inner
+            .counter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while counts.live > counts.settled {
+            counts = self
                 .inner
                 .condvar
-                .wait(counter)
+                .wait(counts)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
     }
 
-    /// Registers the calling thread as settled WITHOUT waiting for peers —
-    /// for a packet-sink worker whose terminal region delivers a failure:
-    /// it samples nothing (no `on_end` to gate), so it has no reason to
-    /// wait, but a peer parked in [`Self::wait_for_peers_settled`] must not
-    /// keep waiting for it — its error is already recorded (errors precede
-    /// the terminal status) and everything left on it is the contained
-    /// terminal dispatch, which can no longer fail the job.
-    pub(crate) fn register_settled(&self) {
-        drop(self.register_settled_locked());
-    }
-
-    /// The one registration protocol, under the counter lock: a registration
-    /// can itself flip `live <= waiters` to true for peers already parked in
-    /// the barrier (slot releases are the only other notifier), so every
-    /// registrant wakes the condvar. Without this, sink A parks, sink B's
-    /// registration satisfies the condition, B proceeds into its (possibly
-    /// blocking) terminal callbacks without releasing its slot, and A sleeps
-    /// forever — a lost wakeup, not a cycle. Returns the held lock so the
-    /// waiting variant re-checks under the same acquisition.
-    fn register_settled_locked(&self) -> std::sync::MutexGuard<'_, usize> {
-        let counter = self
-            .inner
-            .counter
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.inner.settlement_waiters.fetch_add(1, Ordering::AcqRel);
-        self.inner.condvar.notify_all();
-        counter
-    }
-
     pub(crate) fn wait_for_all_threads(&self) {
-        let mut counter = self
+        let mut counts = self
             .inner
             .counter
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while *counter > 0 {
-            counter = self
+        while counts.live > 0 {
+            counts = self
                 .inner
                 .condvar
-                .wait(counter)
+                .wait(counts)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
     }
@@ -184,11 +224,11 @@ impl ThreadSynchronizer {
     /// is fully settled.
     #[cfg(feature = "async")]
     pub(crate) fn all_threads_done(&self) -> bool {
-        *self
-            .inner
+        self.inner
             .counter
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .live
             == 0
     }
 
@@ -303,13 +343,14 @@ mod settlement_tests {
     use std::time::Duration;
 
     /// A lone tracked thread is its own settlement: the barrier returns
-    /// immediately (live == waiters == 1).
+    /// immediately (live == settled == 1).
     #[test]
     fn sole_thread_settles_immediately() {
         let sync = ThreadSynchronizer::new();
         sync.thread_start();
-        sync.wait_for_peers_settled();
-        sync.thread_done_with(|| {});
+        sync.register_settled();
+        sync.wait_peers_settled();
+        sync.thread_done_with_settled(true, || {});
     }
 
     /// The barrier blocks while an unsettled peer holds a slot and wakes on
@@ -323,9 +364,10 @@ mod settlement_tests {
         let sync_w = sync.clone();
         let passed_w = passed.clone();
         let waiter = std::thread::spawn(move || {
-            sync_w.wait_for_peers_settled();
+            sync_w.register_settled();
+            sync_w.wait_peers_settled();
             passed_w.store(true, Ordering::Release);
-            sync_w.thread_done_with(|| {});
+            sync_w.thread_done_with_settled(true, || {});
         });
         std::thread::sleep(Duration::from_millis(80));
         assert!(
@@ -360,12 +402,13 @@ mod settlement_tests {
                     // registration must wake it.
                     std::thread::sleep(Duration::from_millis(80));
                 }
-                sync_w.wait_for_peers_settled();
+                sync_w.register_settled();
+                sync_w.wait_peers_settled();
                 passed_w.fetch_add(1, Ordering::AcqRel);
                 while !gate_w.load(Ordering::Acquire) {
                     std::thread::sleep(Duration::from_millis(2));
                 }
-                sync_w.thread_done_with(|| {});
+                sync_w.thread_done_with_settled(true, || {});
             }));
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -380,6 +423,46 @@ mod settlement_tests {
         for handle in handles {
             handle.join().unwrap();
         }
+        sync.wait_for_all_threads();
+    }
+
+    /// The registration lifetime is the SLOT lifetime: after a
+    /// register-only thread (a truncated sink) departs, its registration
+    /// must depart with it — a later barrier waiter must NOT be admitted
+    /// while an ordinary (never-registered) worker is still live. The
+    /// stale-accounting bug kept the ghost registration: live=2
+    /// {waiter, worker} vs waiters={ghost, waiter}=2 admitted the waiter
+    /// early.
+    #[test]
+    fn register_only_release_leaves_no_ghost_registration() {
+        let sync = ThreadSynchronizer::new();
+        sync.thread_start(); // healthy waiter
+        sync.thread_start(); // ordinary worker
+        sync.thread_start(); // truncated sink (register-only)
+
+        // Truncated sink: registers, dispatches nothing here, releases.
+        sync.register_settled();
+        sync.thread_done_with_settled(true, || {});
+
+        let passed = Arc::new(AtomicBool::new(false));
+        let sync_w = sync.clone();
+        let passed_w = passed.clone();
+        let waiter = std::thread::spawn(move || {
+            sync_w.register_settled();
+            sync_w.wait_peers_settled();
+            passed_w.store(true, Ordering::Release);
+            sync_w.thread_done_with_settled(true, || {});
+        });
+
+        // live = {waiter, worker} = 2, settled = {waiter} = 1: must hold.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !passed.load(Ordering::Acquire),
+            "a departed register-only thread must not leave a ghost registration that admits the waiter"
+        );
+        // The ordinary worker's release (1 <= 1) is what admits the waiter.
+        sync.thread_done_with(|| {});
+        waiter.join().unwrap();
         sync.wait_for_all_threads();
     }
 }
