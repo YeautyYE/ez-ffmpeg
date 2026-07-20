@@ -24,16 +24,31 @@ pub(crate) const MANIFEST_REVISION: u32 = 1;
 /// against the FFmpeg 7.1 command-line documentation and fftools sources.
 pub(crate) const DIALECT: &str = "ffmpeg 7.1 command line";
 
-/// Runtime profiles with a passing version-matched semantic suite:
-/// `(name, libavcodec major.minor, libavformat major.minor)`.
-///
+/// One verified runtime profile: an FFmpeg release line with a passing
+/// version-matched semantic suite. Micro versions vary per point release and
+/// are deliberately not pinned.
+pub(crate) struct RuntimeProfile {
+    pub(crate) name: &'static str,
+    /// libavcodec (major, minor).
+    pub(crate) avcodec: (u32, u32),
+    /// libavformat (major, minor).
+    pub(crate) avformat: (u32, u32),
+}
+
 /// FFmpeg 7.1 ships libavcodec 61.19 / libavformat 61.7; FFmpeg 8.1 ships
 /// libavcodec 62.28 / libavformat 62.12 (their `version.h` /
-/// `version_major.h`). Micro versions vary per point release and are
-/// deliberately not pinned.
-pub(crate) const VERIFIED_PROFILES: &[(&str, (u32, u32), (u32, u32))] = &[
-    ("FFmpeg 7.1", (61, 19), (61, 7)),
-    ("FFmpeg 8.1", (62, 28), (62, 12)),
+/// `version_major.h`).
+pub(crate) const VERIFIED_PROFILES: &[RuntimeProfile] = &[
+    RuntimeProfile {
+        name: "FFmpeg 7.1",
+        avcodec: (61, 19),
+        avformat: (61, 7),
+    },
+    RuntimeProfile {
+        name: "FFmpeg 8.1",
+        avcodec: (62, 28),
+        avformat: (62, 12),
+    },
 ];
 
 /// One golden-backed shape: a fixed scope-qualified option set (the
