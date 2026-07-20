@@ -71,6 +71,10 @@ fn build_rejects_muxer_only_options() {
                 .add_stream_metadata("v:0", "language", "eng")
                 .expect("stream spec parses"),
         ),
+        (
+            "disable_auto_copy_metadata",
+            Output::new_by_packet_sink(noop_sink()).disable_auto_copy_metadata(),
+        ),
     ];
     for (expected, output) in cases {
         match build_err(testsrc(1), output) {

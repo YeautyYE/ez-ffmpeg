@@ -174,11 +174,41 @@ pub(crate) fn build_avcc(sets: &ParameterSets) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// The RFC 6381 codec string for an avcC record: `avc1.PPCCLL` from the
-/// profile / constraint / level bytes.
-pub(crate) fn codec_string(avcc: &[u8]) -> String {
-    debug_assert!(avcc.len() >= 4);
-    format!("avc1.{:02X}{:02X}{:02X}", avcc[1], avcc[2], avcc[3])
+/// The derived codec projection of one H.264 configuration — the
+/// profile / compatibility / level bytes the stream configuration exposes
+/// (as fields and inside `avc1.PPCCLL`). Part of the composite S8 baseline:
+/// the SAME derivation, from the SAME source (the ordered first SPS that
+/// builds the delivered avcC), is compared against every `NEW_EXTRADATA`
+/// announcement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CodecProjection {
+    pub(crate) profile: u8,
+    pub(crate) compatibility: u8,
+    pub(crate) level: u8,
+}
+
+impl CodecProjection {
+    /// Derives the projection from parsed sets (ordered form; the first SPS
+    /// is the one avcC synthesis and `codec_string` use).
+    fn from_ordered_sets(sets: &ParameterSets) -> Result<Self, String> {
+        let first_sps = sets.sps.first().ok_or("no SPS")?;
+        if first_sps.len() < 4 {
+            return Err(format!("SPS too short ({} bytes)", first_sps.len()));
+        }
+        Ok(Self {
+            profile: first_sps[1],
+            compatibility: first_sps[2],
+            level: first_sps[3],
+        })
+    }
+
+    /// The RFC 6381 codec string, `avc1.PPCCLL`.
+    pub(crate) fn codec_string(&self) -> String {
+        format!(
+            "avc1.{:02X}{:02X}{:02X}",
+            self.profile, self.compatibility, self.level
+        )
+    }
 }
 
 /// Reads `chroma_format_idc` / bit depths from an SPS NAL (header byte
@@ -280,8 +310,15 @@ pub(crate) struct AvcRuntime {
     /// length-prefixed packets (validated in place). The forms never mix
     /// within one encoder.
     annexb_packets: bool,
-    /// Canonical parameter-set fingerprint (S8 baseline).
+    /// Composite S8 baseline, part 1: canonical parameter-set fingerprint
+    /// (wrapper- and order-independent set identities).
     baseline: ParameterSets,
+    /// Composite S8 baseline, part 2: the derived codec projection the
+    /// stream configuration exposes — same source as `on_stream_info`, so a
+    /// reordering that changes what consumers were told (profile /
+    /// compatibility / level) is a configuration change even when the set
+    /// identities are unchanged.
+    projection: CodecProjection,
 }
 
 impl AvcRuntime {
@@ -292,13 +329,18 @@ impl AvcRuntime {
     pub(crate) fn from_extradata(
         extradata: &[u8],
         stream_index: usize,
-    ) -> Result<(Self, Vec<u8>), PacketSinkError> {
+    ) -> Result<(Self, Vec<u8>, CodecProjection), PacketSinkError> {
         let invalid = |reason: String| PacketSinkError::InvalidExtradata {
             stream_index,
             reason,
         };
         let annexb_packets = extradata.first() != Some(&1);
         let ordered = parse_parameter_sets(extradata).map_err(invalid)?;
+        let projection = CodecProjection::from_ordered_sets(&ordered)
+            .map_err(|reason| PacketSinkError::InvalidExtradata {
+                stream_index,
+                reason,
+            })?;
         let delivered = if annexb_packets {
             build_avcc(&ordered).map_err(|reason| PacketSinkError::InvalidExtradata {
                 stream_index,
@@ -311,8 +353,10 @@ impl AvcRuntime {
             Self {
                 annexb_packets,
                 baseline: ordered.into_canonical(),
+                projection,
             },
             delivered,
+            projection,
         ))
     }
 
@@ -324,13 +368,35 @@ impl AvcRuntime {
         bytes: &[u8],
         stream_index: usize,
     ) -> Result<(), PacketSinkError> {
-        let sets = parse_parameter_sets(bytes)
-            .map_err(|reason| PacketSinkError::ConfigChange {
+        let ordered = parse_parameter_sets(bytes).map_err(|reason| {
+            PacketSinkError::ConfigChange {
                 stream_index,
                 what: format!("unparseable NEW_EXTRADATA ({reason})"),
-            })?
-            .into_canonical();
-        if sets != self.baseline {
+            }
+        })?;
+        // Composite baseline, part 2: the derived projection consumers were
+        // told (profile/compatibility/level, from the announcement's own
+        // ordered first SPS — the same derivation on_stream_info used). A
+        // reorder that changes it IS a configuration change even when the
+        // set identities below are unchanged.
+        let projection = CodecProjection::from_ordered_sets(&ordered).map_err(|reason| {
+            PacketSinkError::ConfigChange {
+                stream_index,
+                what: format!("unparseable NEW_EXTRADATA SPS ({reason})"),
+            }
+        })?;
+        if projection != self.projection {
+            return Err(PacketSinkError::ConfigChange {
+                stream_index,
+                what: format!(
+                    "derived codec projection changed ({} -> {})",
+                    self.projection.codec_string(),
+                    projection.codec_string()
+                ),
+            });
+        }
+        // Composite baseline, part 1: canonical set identities.
+        if ordered.into_canonical() != self.baseline {
             return Err(PacketSinkError::ConfigChange {
                 stream_index,
                 what: "NEW_EXTRADATA carries different parameter sets".to_string(),
@@ -358,13 +424,18 @@ impl AvcRuntime {
         };
         let (scan, data): (_, &'a [u8]) = if self.annexb_packets {
             scratch.clear();
-            // Exact output size is payload minus start codes plus 4 bytes per
-            // NAL; reserving input+16 covers every AU whose extra 3-byte
-            // start codes number at most 16 without a second sizing pass, and
-            // the buffer is reused across packets either way.
-            scratch.reserve(payload.len() + 16);
+            // Reserve the EXACT output size from a start-code census: a
+            // first, allocation-free walk sums `4 + trimmed_nal_len` per
+            // NAL, so the write walk below can never reallocate — not even
+            // for an AU with arbitrarily many 3-byte start codes. Both walks
+            // are linear scans of one AU; the census also front-loads the
+            // boundary validation.
+            let mut exact = 0usize;
+            walk_annexb(payload, |nal| exact += NAL_LENGTH_SIZE + nal.len())
+                .map_err(&malformed)?;
+            scratch.reserve(exact);
             let scan = walk_annexb(payload, |nal| push_length_prefixed(nal, scratch))
-                .map_err(malformed)?;
+                .map_err(&malformed)?;
             (scan, scratch.as_slice())
         } else {
             let scan = walk_length_prefixed(payload, |_| {}).map_err(malformed)?;
@@ -443,7 +514,12 @@ mod tests {
         let sps_len = SPS.len();
         let pps_len = PPS.len();
         assert_eq!(avcc.len(), 6 + 2 + sps_len + 1 + 2 + pps_len);
-        assert_eq!(codec_string(&avcc), "avc1.42C01E");
+        let projection = CodecProjection::from_ordered_sets(&sets).unwrap();
+        assert_eq!(projection.codec_string(), "avc1.42C01E");
+        assert_eq!(
+            (projection.profile, projection.compatibility, projection.level),
+            (66, 0xC0, 0x1E)
+        );
     }
 
     #[test]
@@ -464,7 +540,8 @@ mod tests {
         assert_eq!(tail[1], 0xF8, "bit_depth_luma_minus8");
         assert_eq!(tail[2], 0xF8, "bit_depth_chroma_minus8");
         assert_eq!(tail[3], 0, "numOfSequenceParameterSetExt");
-        assert_eq!(codec_string(&avcc), "avc1.64001E");
+        let projection = CodecProjection::from_ordered_sets(&sets).unwrap();
+        assert_eq!(projection.codec_string(), "avc1.64001E");
     }
 
     #[test]
@@ -503,7 +580,9 @@ mod tests {
 
     #[test]
     fn runtime_normalizes_annexb_and_passes_through_avcc() {
-        let (runtime, delivered) = AvcRuntime::from_extradata(&annexb_config(), 0).unwrap();
+        let (runtime, delivered, projection) =
+            AvcRuntime::from_extradata(&annexb_config(), 0).unwrap();
+        assert_eq!(projection.codec_string(), "avc1.42C01E");
         assert_eq!(delivered[0], 1);
         let mut scratch = Vec::new();
         let au = vec![0, 0, 0, 1, 0x65, 0x88, 0x80];
@@ -514,12 +593,44 @@ mod tests {
         // avcC-configured stream: packets are already length-prefixed and
         // pass through unchanged (zero copy).
         let avcc = build_avcc(&parse_parameter_sets(&annexb_config()).unwrap()).unwrap();
-        let (runtime, _) = AvcRuntime::from_extradata(&avcc, 0).unwrap();
+        let (runtime, _, _) = AvcRuntime::from_extradata(&avcc, 0).unwrap();
         let lp = vec![0, 0, 0, 2, 0x41, 0x9A];
         let mut scratch = Vec::new();
         let (is_key, data) = runtime.normalize_au(&lp, &mut scratch, 0).unwrap();
         assert!(!is_key);
         assert_eq!(data.as_ptr(), lp.as_ptr(), "pass-through must not copy");
+    }
+
+    /// A4 golden fixture (trailing zeros): the FULL production path
+    /// (`AvcRuntime::normalize_au` over an Annex-B AU that legally pads its
+    /// NAL units with trailing_zero_8bits) must produce the byte-exact AVCC
+    /// sample the mp4 muxer's `nal_parse_units` would write — trims applied,
+    /// 4-byte length prefixes, no padding bytes carried into the payload.
+    /// (Placed at the runtime layer because the integration harness cannot
+    /// inject a synthetic AU through a real encoder; this IS the delivery
+    /// code path.)
+    #[test]
+    fn a4_trailing_zero_fixture_matches_movenc_output() {
+        let (runtime, _, _) = AvcRuntime::from_extradata(&annexb_config(), 0).unwrap();
+        // SEI [06 05 FF] padded with two zeros, 3-byte start code, IDR slice
+        // [65 88 84] padded with one zero at stream end.
+        let au = vec![
+            0, 0, 0, 1, 0x06, 0x05, 0xFF, 0, 0, // SEI + trailing_zero_8bits
+            0, 0, 1, 0x65, 0x88, 0x84, 0, // IDR + trailing zero at end
+        ];
+        let mut scratch = Vec::new();
+        let (is_key, data) = runtime.normalize_au(&au, &mut scratch, 0).unwrap();
+        assert!(is_key);
+        // movenc-equivalent golden bytes: wb32(3) SEI, wb32(3) IDR — the
+        // padding is start-code framing, never sample payload.
+        assert_eq!(
+            data,
+            &[0, 0, 0, 3, 0x06, 0x05, 0xFF, 0, 0, 0, 3, 0x65, 0x88, 0x84]
+        );
+        // Census-based reservation: the exact final size was reserved before
+        // writing, so the conversion never reallocated mid-AU.
+        assert_eq!(data.len(), 14);
+        assert!(scratch.capacity() >= 14);
     }
 
     #[test]
