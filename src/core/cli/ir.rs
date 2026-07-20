@@ -23,6 +23,9 @@ pub(crate) enum DurationKind {
 pub(crate) struct DurationBound {
     pub(crate) kind: DurationKind,
     pub(crate) us: i64,
+    /// Argv index of the option token that set this bound (diagnostic
+    /// anchor for the same-scope -t/-to conflict).
+    pub(crate) token_index: usize,
 }
 
 /// A recognized no-op global (`-hide_banner`, `-loglevel …`, …): legal in the
@@ -113,6 +116,20 @@ pub(crate) struct CliIr {
     pub(crate) globals: GlobalsIr,
     pub(crate) input: InputIr,
     pub(crate) output: OutputIr,
+    /// Argv anchor per consumed option: `(scope-qualified canonical key,
+    /// index of the option token)`, first occurrence. Post-parse combination
+    /// diagnostics pull their positions from here.
+    pub(crate) spans: Vec<(String, usize)>,
+}
+
+impl CliIr {
+    /// First recorded argv index of a scope-qualified option key.
+    pub(crate) fn span(&self, key: &str) -> Option<usize> {
+        self.spans
+            .iter()
+            .find(|(recorded, _)| recorded == key)
+            .map(|(_, index)| *index)
+    }
 }
 
 impl CliIr {

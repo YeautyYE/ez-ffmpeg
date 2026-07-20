@@ -41,7 +41,9 @@ pub(crate) struct DecoderStream {
     pub(crate) log_level_offset: i32,
 
     /// CLI-compat strict mode: decoder-option leftovers error instead of
-    /// warning (set from the owning demuxer).
+    /// warning (set from the owning demuxer). Read only by the `cli`-gated
+    /// strict branch in dec_task.
+    #[cfg_attr(not(feature = "cli"), allow(dead_code))]
     pub(crate) strict_avoptions: bool,
 
     src: Option<Receiver<PacketBox>>,

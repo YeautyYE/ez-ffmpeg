@@ -9,6 +9,14 @@
 pub(crate) const CTA: &str =
     "want this supported? open an issue: https://github.com/YeautyYE/ez-ffmpeg/issues";
 
+/// ` (token #N)` when the position is known, empty otherwise.
+fn fmt_at(index: &Option<usize>) -> String {
+    match index {
+        Some(index) => format!(" (token #{index})"),
+        None => String::new(),
+    }
+}
+
 /// Where in the command an option was found (positional scoping: options
 /// apply to the next file on the command line).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +28,10 @@ pub enum CliScope {
     Input,
     /// After the input, before the output path: applies to the output file.
     Output,
+    /// After the output path: in ffmpeg grammar an option here would apply
+    /// to a FOLLOWING output file, which the single-output subset does not
+    /// have.
+    AfterOutput,
 }
 
 impl std::fmt::Display for CliScope {
@@ -28,6 +40,9 @@ impl std::fmt::Display for CliScope {
             CliScope::Global => write!(f, "global scope"),
             CliScope::Input => write!(f, "input #0"),
             CliScope::Output => write!(f, "output #0"),
+            CliScope::AfterOutput => {
+                write!(f, "after output #0 (would apply to a following output)")
+            }
         }
     }
 }
@@ -87,11 +102,14 @@ pub enum CliError {
     },
 
     /// Two options that cannot coexist (e.g. `-t` and `-to` in the same
-    /// scope, `-map` together with `-vf`).
-    #[error("conflicting options `{first}` and `{second}`\n  {reason}\n  {CTA}")]
+    /// scope, `-map` together with `-vf`). The indexes anchor each side's
+    /// first occurrence in the argv when known.
+    #[error("conflicting options `{first}`{} and `{second}`{}\n  {reason}\n  {CTA}", fmt_at(.first_index), fmt_at(.second_index))]
     ConflictingOptions {
         first: String,
         second: String,
+        first_index: Option<usize>,
+        second_index: Option<usize>,
         reason: String,
     },
 

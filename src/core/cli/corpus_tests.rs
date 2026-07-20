@@ -69,7 +69,6 @@ fn rejected(cmd: &str, expect: &str, fragment: &str) {
         CliError::NotVerified { .. } => "NotVerified",
         CliError::UnverifiedRuntimeProfile { .. } => "UnverifiedRuntimeProfile",
         CliError::Build(_) => "Build",
-        _ => "other",
     };
     assert_eq!(
         variant, expect,
@@ -425,10 +424,18 @@ fn corpus_legacy_aliases_get_hints() {
 
 #[test]
 fn corpus_map_optional_suffix() {
+    // Quoted: reaches the map grammar and gets the dedicated diagnostic.
     rejected(
-        "ffmpeg -i in.mp4 -map 0:a:1? -y out.mp4",
+        "ffmpeg -i in.mp4 -map '0:a:1?' -y out.mp4",
         "UnsupportedValue",
         "fails loudly if the stream is missing",
+    );
+    // Unquoted: the trailing metacharacter is a glob and dies in the
+    // tokenizer with the quoting hint.
+    rejected(
+        "ffmpeg -i in.mp4 -map 0:a:1? -y out.mp4",
+        "Tokenize",
+        "glob",
     );
 }
 
@@ -775,6 +782,88 @@ fn corpus_unknown_option_without_hint() {
 }
 
 // ---------------------------------------------------------------------------
+// Diagnostic anchoring: errors point at the exact offending token, with the
+// scope stated truthfully.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn corpus_value_errors_anchor_the_value_token() {
+    // tokens: 0=-i 1=in.mp4 2=-t 3=10s 4=-y 5=out.mp4 — the BAD token is #3.
+    let err = from_cli("ffmpeg -i in.mp4 -t 10s -y out.mp4").map(|_| ()).unwrap_err();
+    match &err {
+        CliError::UnsupportedValue { option, index, .. } => {
+            assert_eq!(option, "-t");
+            assert_eq!(*index, 3, "value errors must anchor the value token");
+        }
+        other => panic!("expected UnsupportedValue, got {other}"),
+    }
+
+    // tokens: ... 4=-crf 5=99 — the bad token is #5.
+    let err = from_cli("ffmpeg -i in.mp4 -c:v libx264 -crf 99 -y out.mp4").map(|_| ()).unwrap_err();
+    match &err {
+        CliError::UnsupportedValue { option, index, .. } => {
+            assert_eq!(option, "-crf");
+            assert_eq!(*index, 5);
+        }
+        other => panic!("expected UnsupportedValue, got {other}"),
+    }
+}
+
+#[test]
+fn corpus_conflicts_carry_both_positions() {
+    // tokens: 0=-i 1=in.mp4 2=-t 3=5 4=-to 5=8 …
+    let err = from_cli("ffmpeg -i in.mp4 -t 5 -to 8 -y out.mp4").map(|_| ()).unwrap_err();
+    match &err {
+        CliError::ConflictingOptions {
+            first,
+            second,
+            first_index,
+            second_index,
+            ..
+        } => {
+            assert_eq!((first.as_str(), second.as_str()), ("-t", "-to"));
+            assert_eq!(*first_index, Some(2));
+            assert_eq!(*second_index, Some(4));
+        }
+        other => panic!("expected ConflictingOptions, got {other}"),
+    }
+    let display = err.to_string();
+    assert!(display.contains("(token #2)"), "display: {display}");
+    assert!(display.contains("(token #4)"), "display: {display}");
+
+    // Post-parse combination conflicts resolve their anchors from the span
+    // table: tokens 2=-vf 4=-c:v 5=copy.
+    let err = from_cli("ffmpeg -i in.mp4 -vf scale=640:360 -c:v copy -y out.mp4").map(|_| ()).unwrap_err();
+    match &err {
+        CliError::ConflictingOptions {
+            first_index,
+            second_index,
+            ..
+        } => {
+            assert_eq!(*first_index, Some(2));
+            assert_eq!(*second_index, Some(4));
+        }
+        other => panic!("expected ConflictingOptions, got {other}"),
+    }
+}
+
+#[test]
+fn corpus_unknown_after_output_names_the_following_output_scope() {
+    // tokens: 0=-i 1=in.mp4 2=-y 3=out.mp4 4=-foo
+    let err = from_cli("ffmpeg -i in.mp4 -y out.mp4 -foo").map(|_| ()).unwrap_err();
+    match &err {
+        CliError::UnsupportedOption { index, scope, .. } => {
+            assert_eq!(*index, 4);
+            assert_eq!(
+                scope.to_string(),
+                "after output #0 (would apply to a following output)"
+            );
+        }
+        other => panic!("expected UnsupportedOption, got {other}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Contradictions.
 // ---------------------------------------------------------------------------
 
@@ -840,6 +929,15 @@ fn corpus_shell_redirect_and_pipe() {
         "ffmpeg -i in.mp4 -y out.mp4 | cat",
         "Tokenize",
         "shell operator",
+    );
+}
+
+#[test]
+fn corpus_unquoted_glob_input() {
+    rejected(
+        "ffmpeg -i *.mkv -c:v libx264 -crf 23 -preset fast -c:a aac -y out.mp4",
+        "Tokenize",
+        "glob",
     );
 }
 

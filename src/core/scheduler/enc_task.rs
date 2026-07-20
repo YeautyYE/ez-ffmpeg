@@ -1128,6 +1128,7 @@ fn set_encoder_opts(
         // check_avoptions errors out; we surface them as warnings). The
         // guard frees the leftovers, which previously leaked.
         for key in encoder_opts.leftover_keys() {
+            #[cfg(feature = "cli")]
             if enc_stream.strict_avoptions {
                 return Err(crate::error::Error::UnconsumedCliOption {
                     site: format!("the encoder for stream {}", enc_stream.stream_index),

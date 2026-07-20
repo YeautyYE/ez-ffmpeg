@@ -93,7 +93,8 @@
 //! backslash-newline continuation, plus caret-newline continuation as an
 //! explicitly named cmd.exe compatibility extension. No variables, globs,
 //! tilde, pipes, redirects, comments or command lists — those tokens are
-//! rejected, never emulated. Windows `cmd.exe` quoting is NOT reproduced:
+//! rejected, never emulated (unquoted `*`, `?` and `[` included: quote or
+//! escape a literal). Windows `cmd.exe` quoting is NOT reproduced:
 //! commands relying on `CommandLineToArgvW` backslash rules must use the
 //! argv form.
 

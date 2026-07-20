@@ -90,7 +90,7 @@ cli = []
 # environment. `docsrs` is intentionally NOT a Cargo feature, so
 # `cargo build --all-features` always compiles the real FFmpeg path and never
 # ships the crash-prone stub. Enable every real feature for full doc coverage.
-features = ["async", "opengl", "rtmp", "flv", "subtitle", "wgpu"]
+features = ["async", "opengl", "rtmp", "flv", "subtitle", "wgpu", "cli"]
 
 [dev-dependencies]
 env_logger = "0.10"

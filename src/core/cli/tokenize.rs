@@ -6,8 +6,11 @@
 //! continuation outside quotes. Everything else shell-flavored is REJECTED,
 //! not emulated: variables, command/process substitution, pipes, redirects,
 //! background/list operators, comments, tilde expansion, bare newlines.
-//! Glob characters (`*`, `?`, `[`) pass through literally (the no-match
-//! fallback every one-file ffmpeg command hits in a real shell).
+//! Unquoted glob metacharacters (`*`, `?`, `[`) are REJECTED per the
+//! documented contract — the shell would expand them against the caller's
+//! filesystem, so passing the literal through would silently diverge from
+//! any directory where the pattern matches. Quoted or escaped literals stay
+//! accepted.
 //!
 //! The scan walks `char_indices()` — CLI strings contain unicode paths, and
 //! byte-indexed slicing is banned in this codebase without a boundary proof.
@@ -119,6 +122,14 @@ pub(crate) fn tokenize(command: &str) -> Result<Vec<String>, CliError> {
                     tokens.push(std::mem::take(&mut current));
                     started = false;
                 }
+            }
+            '*' | '?' | '[' => {
+                return Err(err(
+                    offset,
+                    "unquoted glob metacharacter; the shell would expand it against the \
+                     filesystem, so the string form rejects it — quote or backslash-escape a \
+                     literal `*`, `?` or `[`",
+                ));
             }
             '|' | ';' | '&' | '<' | '>' | '(' | ')' => {
                 return Err(err(
@@ -416,12 +427,19 @@ mod tests {
     }
 
     #[test]
-    fn glob_characters_pass_through_literally() {
-        // The documented no-match fallback: ffmpeg option grammar owns these.
-        assert_eq!(
-            ok("-map 0:a:1? -vf scale=iw*2:ih"),
-            ["-map", "0:a:1?", "-vf", "scale=iw*2:ih"]
-        );
+    fn unquoted_glob_metacharacters_rejected() {
+        reject_msg("-i *.mkv -y out.mp4", "glob");
+        reject_msg("-map 0:a:1? -y out.mp4", "glob");
+        reject_msg("-i in[1].mp4 -y out.mp4", "glob");
+        reject_msg("-vf scale=iw*2:ih -y out.mp4", "glob");
+    }
+
+    #[test]
+    fn quoted_or_escaped_glob_literals_accepted() {
+        assert_eq!(ok("-map '0:a:1?'"), ["-map", "0:a:1?"]);
+        assert_eq!(ok(r#"-vf "scale=iw*2:ih""#), ["-vf", "scale=iw*2:ih"]);
+        assert_eq!(ok(r"-i in\[1\].mp4"), ["-i", "in[1].mp4"]);
+        assert_eq!(ok(r"-i \*.mkv"), ["-i", "*.mkv"]);
     }
 
     #[test]

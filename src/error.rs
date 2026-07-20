@@ -199,7 +199,9 @@ pub enum Error {
     /// supplied was not consumed by the component it targeted. The default
     /// builder path only WARNS about such leftovers; pipelines built through
     /// the `cli` feature's entry points fail instead, mirroring fftools'
-    /// `check_avoptions` abort.
+    /// `check_avoptions` abort. Only exists with the `cli` feature — the
+    /// feature-off API surface is unchanged.
+    #[cfg(feature = "cli")]
     #[error("option '{option}' was not consumed by {site}; CLI-compat strict mode treats leftover AVOptions as errors")]
     UnconsumedCliOption { site: String, option: String },
 }

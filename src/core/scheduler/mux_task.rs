@@ -552,6 +552,7 @@ fn mux_task_start(
     Ok(())
 }
 
+#[cfg_attr(not(feature = "cli"), allow(unused_variables))]
 fn _mux_init(
     mux_idx: usize,
     guard: MuxTeardownGuard,
@@ -788,6 +789,7 @@ fn _mux_init(
         }
 
         for key in opts.leftover_keys() {
+            #[cfg(feature = "cli")]
             if strict_avoptions {
                 let err = crate::error::Error::UnconsumedCliOption {
                     site: format!("the muxer of output {mux_idx}"),
