@@ -4,12 +4,13 @@
 //! frames out = frame export, PCM out = sample export, frames in =
 //! [`VideoWriter`](crate::VideoWriter), **encoded packets out = packet sink**).
 //! Instead of muxing packets into container bytes, the job hands each encoded
-//! packet to user callbacks, normalized for WebCodecs-style consumers.
+//! packet to a consumer, normalized for WebCodecs-style use.
 //!
 //! # Strict tier (v1)
 //!
-//! The only tier implemented today is [`PacketSinkTier::Strict`], aligned with
-//! WebCodecs `"avc"` / AAC consumption:
+//! The construction paths on [`PacketSink`] build a **strict-tier** sink —
+//! [`PacketView`], [`PacketStreamInfo`] and the callback bundle are the
+//! strict-tier contract, aligned with WebCodecs `"avc"` / AAC consumption:
 //!
 //! * **H.264 video** is delivered as avcC-configured, 4-byte length-prefixed,
 //!   access-unit-complete packets. The encoder whitelist is `libx264` only —
@@ -19,70 +20,101 @@
 //! * **AAC audio** is delivered as raw AAC frames; the stream configuration
 //!   carries the AudioSpecificConfig.
 //! * Anything else (subtitles, data streams, stream copy, bitstream filters)
-//!   is rejected up front with a typed [`PacketSinkError`](crate::error::PacketSinkError).
+//!   is rejected up front with a typed [`PacketSinkError`].
 //!
-//! Future tiers (generic passthrough, HEVC, Annex-B) extend
-//! [`PacketSinkTier`]; the enum and the delivered structs are
-//! `#[non_exhaustive]` so they can grow without breaking changes.
+//! Future tiers (generic passthrough, HEVC, Annex-B) will introduce their own
+//! construction paths and view/config types; everything here is
+//! `#[non_exhaustive]` so that growth is additive.
 //!
 //! # Callback order
 //!
-//! All callbacks run **serially on the muxing worker thread**, in this exact
-//! order:
+//! All callbacks run **serially on the one delivery (mux worker) thread** —
+//! never concurrently, never reentrantly — in this order:
 //!
-//! 1. `on_stream_info` — exactly once, after every encoder finalized its
-//!    parameters and **before any packet**. The video configuration is already
-//!    a valid avcC record here.
-//! 2. `on_packet` — zero or more times, per-stream dts-monotonic.
-//! 3. `on_end` **or** `on_error` — at most one of them, exactly once:
+//! 1. `on_stream_info` — at most once, after every encoder finalized its
+//!    parameters and **before any packet**. The video configuration is
+//!    already a valid avcC record here.
+//! 2. `on_packet` — zero or more times.
+//! 3. `on_end` **or** `on_delivery_error` — at most one of them, at most
+//!    once:
 //!    * `on_end` fires only when every output stream reached a recognized
 //!      terminal state (natural encoder EOF, or configured truncation such as
 //!      `set_recording_time_us` / `set_shortest`), everything was delivered,
-//!      and no error occurred.
-//!    * `on_error` fires when delivery stopped because of a strict-tier
-//!      violation or a failing callback.
-//!    * Neither fires when the job is cancelled (`stop()` with packets still
-//!      in flight, `abort()`) or when an unrelated pipeline task fails — the
-//!      job result returned by `wait()`/`stop()` carries the outcome.
+//!      and the whole job settled without an error.
+//!    * `on_delivery_error` fires when delivery stopped because of a
+//!      strict-tier violation or a failing callback, or when the job failed
+//!      elsewhere after this sink had already delivered everything.
+//!
+//! # Timestamp and ordering
+//!
+//! Timestamps are per-stream: within one stream, dts is strictly increasing
+//! and `pts >= dts`. **No cross-stream interleaving order is promised** —
+//! audio and video packets arrive in worker order, and a consumer must route
+//! by [`PacketView::stream_index`] rather than assume global ordering. All
+//! streams share one time origin (see [`PacketView::applied_offset`]). A
+//! packet that violates the strict contract (including a mid-stream
+//! configuration change) fails the job typed and is **never delivered**.
+//!
+//! # Failure and panic
+//!
+//! The scheduler result returned by `wait()`/`stop()` is **authoritative**;
+//! terminal callbacks are a convenience with deliberately narrower coverage.
+//! In these cases **no terminal sink callback fires at all**:
+//!
+//! * initial configuration failure (missing/malformed extradata, whitelist
+//!   violations) — the job fails before any callback runs;
+//! * cancellation (`stop()` with packets still in flight, `abort()`);
+//! * a panicking callback — the job fails with a worker-panic error and no
+//!   further sink callback is invoked.
 //!
 //! # Backpressure: callbacks block the pipeline
 //!
-//! **The callbacks run on the muxing worker thread. A slow `on_packet` blocks
-//! that thread, the bounded packet queue behind it fills, and the encoders
-//! stall — exactly the backpressure a slow container write exerts today.**
-//! No packet is ever silently dropped. If you need decoupling, copy the
-//! borrowed data out (it is only valid during the callback) and queue it
-//! yourself, or use [`PacketSink::channel`], which does that copy for you and
-//! blocks the pipeline only when its bounded channel is full.
+//! **The callbacks run on the delivery thread. A slow `on_packet` blocks that
+//! thread, the bounded packet queue behind it fills, and the encoders stall —
+//! exactly the backpressure a slow container write exerts today.** No packet
+//! is ever silently dropped. If you need decoupling, copy the borrowed data
+//! out (it is only valid during the callback) and queue it yourself, or use
+//! [`PacketSink::channel`], which does that copy for you and blocks the
+//! pipeline only while its bounded channel is full. The channel's blocking
+//! send observes job cancellation, so `stop()` terminates even with a full,
+//! undrained channel.
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```rust,no_run
 //! use ez_ffmpeg::packet_sink::PacketSink;
 //! use ez_ffmpeg::{FfmpegContext, Output};
 //!
-//! let sink = PacketSink::builder()
-//!     .on_stream_info(|infos| {
-//!         println!("streams: {}", infos.len());
-//!         0
-//!     })
-//!     .on_packet(|pkt| {
-//!         println!("stream {} pts {} ({} bytes)", pkt.stream_index(), pkt.pts(), pkt.data().len());
-//!         0
+//! fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let sink = PacketSink::builder(|packet| {
+//!         println!(
+//!             "stream {} pts {} ({} bytes)",
+//!             packet.stream_index(),
+//!             packet.pts(),
+//!             packet.data().len()
+//!         );
+//!         Ok(())
 //!     })
 //!     .on_end(|| println!("done"))
 //!     .build();
 //!
-//! FfmpegContext::builder()
-//!     .input("input.mp4")
-//!     .output(Output::new_by_packet_sink(sink).set_video_codec("libx264"))
-//!     .build()?
-//!     .start()?
-//!     .wait()?;
+//!     FfmpegContext::builder()
+//!         .input("input.mp4")
+//!         .output(Output::from(sink).set_video_codec("libx264"))
+//!         .build()?
+//!         .start()?
+//!         .wait()?;
+//!     Ok(())
+//! }
 //! ```
 
-use crate::error::PacketSinkError;
-use ffmpeg_sys_next::{AVMediaType, AVRational};
+pub use crate::error::PacketSinkError;
+use crate::core::scheduler::ffmpeg_scheduler::{is_stopping, FfmpegScheduler, Running};
+use ffmpeg_sys_next::{AVCodecID, AVMediaType, AVRational};
+use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 pub(crate) mod codec;
 pub(crate) mod nal_framing;
@@ -101,80 +133,337 @@ pub enum PacketSinkTier {
     Strict,
 }
 
-/// Per-stream configuration delivered once via `on_stream_info`, before any
-/// packet.
-#[non_exhaustive]
+/// Why a callback rejected delivery. Carries a message and an optional
+/// source error, both preserved on the job result via
+/// [`PacketSinkError::PacketCallbackFailed`].
 #[derive(Debug, Clone)]
-pub struct PacketStreamInfo {
-    pub(crate) stream_index: usize,
-    pub(crate) media_type: AVMediaType,
-    pub(crate) codec_name: String,
-    pub(crate) time_base: AVRational,
-    pub(crate) extradata: Vec<u8>,
-    pub(crate) width: i32,
-    pub(crate) height: i32,
-    pub(crate) frame_rate: Option<AVRational>,
-    pub(crate) sample_rate: i32,
-    pub(crate) channels: i32,
+pub struct PacketCallbackError {
+    message: String,
+    source: Option<Arc<dyn std::error::Error + Send + Sync + 'static>>,
+    pub(crate) kind: CallbackFailureKind,
 }
 
-impl PacketStreamInfo {
+/// Internal classification of a callback failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CallbackFailureKind {
+    /// A consumer-reported failure: the job stops with a typed error.
+    Failure,
+    /// The owned-channel receiver is gone: the job stops with
+    /// [`PacketSinkError::ChannelDisconnected`].
+    Disconnected,
+    /// The job is already stopping and a blocking send bailed out
+    /// cooperatively: NOT an error (mirrors the worker's stop observation).
+    Cancelled,
+}
+
+impl PacketCallbackError {
+    /// A failure described by a message.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            source: None,
+            kind: CallbackFailureKind::Failure,
+        }
+    }
+
+    /// A failure wrapping a source error (preserved on the job result).
+    pub fn with_source(
+        message: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            source: Some(Arc::new(source)),
+            kind: CallbackFailureKind::Failure,
+        }
+    }
+
+    pub(crate) fn disconnected() -> Self {
+        Self {
+            message: "packet-sink channel receiver dropped".to_string(),
+            source: None,
+            kind: CallbackFailureKind::Disconnected,
+        }
+    }
+
+    pub(crate) fn cancelled() -> Self {
+        Self {
+            message: "job stopping; blocking send cancelled".to_string(),
+            source: None,
+            kind: CallbackFailureKind::Cancelled,
+        }
+    }
+}
+
+impl std::fmt::Display for PacketCallbackError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for PacketCallbackError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|s| s.as_ref() as &(dyn std::error::Error + 'static))
+    }
+}
+
+/// What every fallible sink callback returns: `Ok(())` continues delivery, an
+/// error stops the job with a typed, source-preserving [`PacketSinkError`].
+pub type PacketCallbackResult = Result<(), PacketCallbackError>;
+
+/// A single stateful packet consumer. All methods run serially on the one
+/// delivery thread (never concurrently, never reentrantly), so `&mut self`
+/// state needs no locking. This is the strict-tier handler shape; see the
+/// [module docs](self) for the callback order and backpressure contract.
+pub trait PacketSinkHandler: Send + 'static {
+    /// One-time stream configuration, before any packet.
+    fn on_stream_info(&mut self, _streams: &[PacketStreamInfo]) -> PacketCallbackResult {
+        Ok(())
+    }
+
+    /// One delivered packet; the borrowed view is valid only for this call.
+    fn on_packet(&mut self, packet: &PacketView<'_>) -> PacketCallbackResult;
+
+    /// Terminal success (see the module docs for the exact gate).
+    fn on_end(&mut self) {}
+
+    /// Terminal delivery-path failure (the same error is also the job
+    /// result).
+    fn on_delivery_error(&mut self, _error: &PacketSinkError) {}
+}
+
+/// Per-stream video configuration delivered via `on_stream_info` —
+/// everything a WebCodecs `VideoDecoder` / fMP4 packager needs, precomputed.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct VideoPacketConfig {
+    pub(crate) stream_index: usize,
+    pub(crate) codec_id: AVCodecID,
+    pub(crate) codec_string: String,
+    pub(crate) codec_config: Vec<u8>,
+    pub(crate) time_base: AVRational,
+    pub(crate) width: i32,
+    pub(crate) height: i32,
+    pub(crate) sample_aspect_ratio: Option<AVRational>,
+    pub(crate) frame_rate: Option<AVRational>,
+}
+
+impl VideoPacketConfig {
     /// Output stream index; matches [`PacketView::stream_index`].
     pub fn stream_index(&self) -> usize {
         self.stream_index
     }
 
-    /// Media type of the stream (video or audio in the strict tier).
-    pub fn media_type(&self) -> AVMediaType {
-        self.media_type
+    /// FFmpeg codec id (`AV_CODEC_ID_H264` in the strict tier).
+    pub fn codec_id(&self) -> AVCodecID {
+        self.codec_id
     }
 
-    /// FFmpeg codec name (`"h264"`, `"aac"`).
-    pub fn codec_name(&self) -> &str {
-        &self.codec_name
+    /// RFC 6381 codec string (`"avc1.PPCCLL"`), suitable as the WebCodecs
+    /// `codec` value.
+    pub fn codec_string(&self) -> &str {
+        &self.codec_string
     }
 
-    /// Time base every timestamp of this stream is expressed in. This is the
-    /// encoder time base, passed through verbatim — no muxer rescaling.
+    /// The `AVCDecoderConfigurationRecord` (avcC), suitable as the WebCodecs
+    /// `description`.
+    pub fn codec_config(&self) -> &[u8] {
+        &self.codec_config
+    }
+
+    /// FFmpeg-oriented alias of [`codec_config`](Self::codec_config).
+    pub fn extradata(&self) -> &[u8] {
+        &self.codec_config
+    }
+
+    /// Time base every timestamp of this stream is expressed in (the encoder
+    /// time base, passed through verbatim).
     pub fn time_base(&self) -> AVRational {
         self.time_base
     }
 
-    /// Codec configuration record: a valid `AVCDecoderConfigurationRecord`
-    /// (avcC) for H.264, the `AudioSpecificConfig` for AAC. Suitable as the
-    /// WebCodecs `description`.
-    pub fn extradata(&self) -> &[u8] {
-        &self.extradata
-    }
-
-    /// Video width in pixels (0 for audio).
+    /// Coded width in pixels.
     pub fn width(&self) -> i32 {
         self.width
     }
 
-    /// Video height in pixels (0 for audio).
+    /// Coded height in pixels.
     pub fn height(&self) -> i32 {
         self.height
     }
 
-    /// Video frame rate, when known (`None` for audio and for VFR sources
-    /// whose rate could not be established).
+    /// Sample aspect ratio, when known.
+    pub fn sample_aspect_ratio(&self) -> Option<AVRational> {
+        self.sample_aspect_ratio
+    }
+
+    /// Nominal frame rate. `None` when the pipeline did not pin one (VFR
+    /// sources, and CFR jobs without an explicit output rate).
     pub fn frame_rate(&self) -> Option<AVRational> {
         self.frame_rate
     }
+}
 
-    /// Audio sample rate in Hz (0 for video).
+/// Per-stream audio configuration delivered via `on_stream_info`.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct AudioPacketConfig {
+    pub(crate) stream_index: usize,
+    pub(crate) codec_id: AVCodecID,
+    pub(crate) codec_string: String,
+    pub(crate) codec_config: Vec<u8>,
+    pub(crate) time_base: AVRational,
+    pub(crate) sample_rate: i32,
+    pub(crate) channels: i32,
+    pub(crate) channel_layout: String,
+}
+
+impl AudioPacketConfig {
+    /// Output stream index; matches [`PacketView::stream_index`].
+    pub fn stream_index(&self) -> usize {
+        self.stream_index
+    }
+
+    /// FFmpeg codec id (`AV_CODEC_ID_AAC` in the strict tier).
+    pub fn codec_id(&self) -> AVCodecID {
+        self.codec_id
+    }
+
+    /// RFC 6381 codec string (`"mp4a.40.X"`, X = audio object type).
+    pub fn codec_string(&self) -> &str {
+        &self.codec_string
+    }
+
+    /// The `AudioSpecificConfig`, suitable as the WebCodecs `description`.
+    pub fn codec_config(&self) -> &[u8] {
+        &self.codec_config
+    }
+
+    /// FFmpeg-oriented alias of [`codec_config`](Self::codec_config).
+    pub fn extradata(&self) -> &[u8] {
+        &self.codec_config
+    }
+
+    /// Time base every timestamp of this stream is expressed in.
+    pub fn time_base(&self) -> AVRational {
+        self.time_base
+    }
+
+    /// Sample rate in Hz.
     pub fn sample_rate(&self) -> i32 {
         self.sample_rate
     }
 
-    /// Audio channel count (0 for video).
+    /// Channel count.
     pub fn channels(&self) -> i32 {
         self.channels
     }
+
+    /// FFmpeg channel-layout description (e.g. `"stereo"`, `"5.1"`).
+    pub fn channel_layout(&self) -> &str {
+        &self.channel_layout
+    }
 }
 
-/// Borrowed view of one delivered packet.
+/// Per-stream configuration delivered once via `on_stream_info`, typed by
+/// media kind (mirrors the crate's `StreamInfo` shape).
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub enum PacketStreamInfo {
+    Video(VideoPacketConfig),
+    Audio(AudioPacketConfig),
+}
+
+impl PacketStreamInfo {
+    /// Output stream index; matches [`PacketView::stream_index`].
+    pub fn stream_index(&self) -> usize {
+        match self {
+            PacketStreamInfo::Video(v) => v.stream_index,
+            PacketStreamInfo::Audio(a) => a.stream_index,
+        }
+    }
+
+    /// Media type of the stream.
+    pub fn media_type(&self) -> AVMediaType {
+        match self {
+            PacketStreamInfo::Video(_) => AVMediaType::AVMEDIA_TYPE_VIDEO,
+            PacketStreamInfo::Audio(_) => AVMediaType::AVMEDIA_TYPE_AUDIO,
+        }
+    }
+
+    /// FFmpeg codec id.
+    pub fn codec_id(&self) -> AVCodecID {
+        match self {
+            PacketStreamInfo::Video(v) => v.codec_id,
+            PacketStreamInfo::Audio(a) => a.codec_id,
+        }
+    }
+
+    /// RFC 6381 codec string (`"avc1.PPCCLL"` / `"mp4a.40.X"`).
+    pub fn codec_string(&self) -> &str {
+        match self {
+            PacketStreamInfo::Video(v) => &v.codec_string,
+            PacketStreamInfo::Audio(a) => &a.codec_string,
+        }
+    }
+
+    /// Codec configuration record (avcC / AudioSpecificConfig).
+    pub fn codec_config(&self) -> &[u8] {
+        match self {
+            PacketStreamInfo::Video(v) => &v.codec_config,
+            PacketStreamInfo::Audio(a) => &a.codec_config,
+        }
+    }
+
+    /// FFmpeg-oriented alias of [`codec_config`](Self::codec_config).
+    pub fn extradata(&self) -> &[u8] {
+        self.codec_config()
+    }
+
+    /// Time base every timestamp of this stream is expressed in.
+    pub fn time_base(&self) -> AVRational {
+        match self {
+            PacketStreamInfo::Video(v) => v.time_base,
+            PacketStreamInfo::Audio(a) => a.time_base,
+        }
+    }
+
+    /// The video configuration, when this is a video stream.
+    pub fn video(&self) -> Option<&VideoPacketConfig> {
+        match self {
+            PacketStreamInfo::Video(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// The audio configuration, when this is an audio stream.
+    pub fn audio(&self) -> Option<&AudioPacketConfig> {
+        match self {
+            PacketStreamInfo::Audio(a) => Some(a),
+            _ => None,
+        }
+    }
+}
+
+/// Converts stream ticks to microseconds (exact rescale, round-nearest).
+fn ticks_to_us(ticks: i64, time_base: AVRational) -> i64 {
+    // SAFETY: pure integer arithmetic; every stream time base was validated
+    // positive at collection, and the target rational is a constant.
+    unsafe {
+        ffmpeg_sys_next::av_rescale_q(
+            ticks,
+            time_base,
+            AVRational {
+                num: 1,
+                den: 1_000_000,
+            },
+        )
+    }
+}
+
+/// Borrowed view of one delivered packet (strict tier).
 ///
 /// The view — including [`data`](Self::data) — is valid **only during the
 /// `on_packet` callback**; the underlying packet is recycled as soon as the
@@ -199,7 +488,8 @@ impl<'a> PacketView<'a> {
     }
 
     /// Presentation timestamp in [`time_base`](Self::time_base) units, on the
-    /// shared zero-based timeline (see [`applied_offset`](Self::applied_offset)).
+    /// shared zero-based timeline (see
+    /// [`applied_offset`](Self::applied_offset)).
     pub fn pts(&self) -> i64 {
         self.pts
     }
@@ -225,6 +515,26 @@ impl<'a> PacketView<'a> {
     /// [`PacketStreamInfo::time_base`]).
     pub fn time_base(&self) -> AVRational {
         self.time_base
+    }
+
+    /// [`pts`](Self::pts) in microseconds (exact rescale of the ticks).
+    pub fn pts_us(&self) -> i64 {
+        ticks_to_us(self.pts, self.time_base)
+    }
+
+    /// [`dts`](Self::dts) in microseconds.
+    pub fn dts_us(&self) -> i64 {
+        ticks_to_us(self.dts, self.time_base)
+    }
+
+    /// [`duration`](Self::duration) in microseconds.
+    pub fn duration_us(&self) -> i64 {
+        ticks_to_us(self.duration, self.time_base)
+    }
+
+    /// [`applied_offset`](Self::applied_offset) in microseconds.
+    pub fn applied_offset_us(&self) -> i64 {
+        ticks_to_us(self.applied_offset, self.time_base)
     }
 
     /// Whether this packet is a fresh-decoder-safe random access point.
@@ -253,10 +563,590 @@ impl<'a> PacketView<'a> {
     }
 
     /// The packet payload. H.264: one complete access unit, 4-byte
-    /// length-prefixed (AVCC), parameter sets carried out-of-band in
-    /// [`PacketStreamInfo::extradata`]. AAC: one raw AAC frame.
+    /// length-prefixed (AVCC), parameter sets carried out-of-band in the
+    /// stream configuration. AAC: one raw AAC frame.
     pub fn data(&self) -> &'a [u8] {
         self.data
+    }
+}
+
+pub(crate) type StreamInfoFn =
+    Box<dyn FnMut(&[PacketStreamInfo]) -> PacketCallbackResult + Send>;
+pub(crate) type PacketFn =
+    Box<dyn for<'a> FnMut(&PacketView<'a>) -> PacketCallbackResult + Send>;
+pub(crate) type EndFn = Box<dyn FnMut() + Send>;
+pub(crate) type DeliveryErrorFn = Box<dyn FnMut(&PacketSinkError) + Send>;
+
+/// How the sink dispatches callbacks: four independent closures, or one
+/// stateful handler. Either way every call runs serially on the delivery
+/// thread.
+enum SinkDispatch {
+    Closures {
+        on_stream_info: Option<StreamInfoFn>,
+        on_packet: PacketFn,
+        on_end: Option<EndFn>,
+        on_delivery_error: Option<DeliveryErrorFn>,
+    },
+    Handler(Box<dyn PacketSinkHandler>),
+}
+
+/// Slot the owned-channel adapter uses to observe job cancellation: the
+/// worker publishes the scheduler-status handle here at collection time, so a
+/// blocked bounded send can bail out when the job stops.
+pub(crate) type CancellationSlot = Arc<OnceLock<Arc<AtomicUsize>>>;
+
+/// The consumer bundle handed to `Output::from(sink)` /
+/// [`Output::new_by_packet_sink`](crate::Output::new_by_packet_sink).
+///
+/// Build one with [`PacketSink::builder`] (closures),
+/// [`PacketSink::from_handler`] (one stateful consumer) or
+/// [`PacketSink::channel`] (owned events over a bounded channel). All
+/// construction paths produce a **strict-tier** sink; see the
+/// [module docs](self) for the callback order and the **blocking
+/// backpressure** contract.
+pub struct PacketSink {
+    pub(crate) tier: PacketSinkTier,
+    dispatch: SinkDispatch,
+    /// `Some` only for channel-adapter sinks (see [`CancellationSlot`]).
+    pub(crate) cancellation: Option<CancellationSlot>,
+}
+
+impl std::fmt::Debug for PacketSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PacketSink")
+            .field("tier", &self.tier)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PacketSink {
+    /// Starts building a strict-tier sink around the required packet
+    /// consumer. `on_stream_info`, `on_end` and `on_delivery_error` are
+    /// optional extras on the returned builder — but a sink cannot exist
+    /// without a packet consumer (a job that encodes into nothing is a
+    /// configuration mistake, not a default; use [`PacketSink::discard`]
+    /// when discarding is genuinely intended).
+    pub fn builder<F>(on_packet: F) -> PacketSinkBuilder
+    where
+        F: for<'a> FnMut(&PacketView<'a>) -> PacketCallbackResult + Send + 'static,
+    {
+        PacketSinkBuilder {
+            tier: PacketSinkTier::Strict,
+            on_stream_info: None,
+            on_packet: Box::new(on_packet),
+            on_end: None,
+            on_delivery_error: None,
+        }
+    }
+
+    /// A sink that deliberately discards every packet (accepting them all).
+    /// Exists so intent is explicit — mainly for validation-only jobs and
+    /// tests.
+    pub fn discard() -> PacketSink {
+        PacketSink::builder(|_| Ok(())).build()
+    }
+
+    /// Builds a strict-tier sink around one stateful [`PacketSinkHandler`] —
+    /// the natural shape for consumers whose stream-info/packet/terminal
+    /// handling shares state (packagers, senders); callbacks are serial, so
+    /// the handler needs no locking.
+    pub fn from_handler<H: PacketSinkHandler>(handler: H) -> PacketSink {
+        PacketSink {
+            tier: PacketSinkTier::Strict,
+            dispatch: SinkDispatch::Handler(Box::new(handler)),
+            cancellation: None,
+        }
+    }
+
+    /// Builds a strict-tier sink that forwards everything over a **bounded**
+    /// channel of owned events, for consumers that want packets on their own
+    /// thread.
+    ///
+    /// Every payload is copied once into an owned [`EncodedPacket`] (one
+    /// additional adapter copy on top of any Annex-B normalization). The
+    /// channel preserves the callback contract: when it is full, the sending
+    /// callback **blocks the pipeline** until the consumer catches up — no
+    /// packet is dropped. **Drain the receiver concurrently** (its own
+    /// thread, or [`PacketSinkReceiver::into_events`]); draining only after
+    /// `wait()` deadlocks as soon as the channel fills, because `wait()`
+    /// needs the blocked worker to finish. The blocking send observes job
+    /// cancellation, so `stop()`/`abort()` (or a job failing elsewhere)
+    /// terminates even with a full, undrained channel. Dropping the receiver
+    /// cancels the job with [`PacketSinkError::ChannelDisconnected`].
+    ///
+    /// Terminal `End`/`Error` events are delivered best-effort: when the
+    /// channel is full and the consumer never drains, they are dropped —
+    /// sender disconnection (`Disconnected` on the receiver) is the
+    /// authoritative end-of-events signal either way.
+    pub fn channel(capacity: NonZeroUsize) -> (PacketSink, PacketSinkReceiver) {
+        let (tx, rx) = crossbeam_channel::bounded::<PacketSinkEvent>(capacity.get());
+        let cancellation: CancellationSlot = Arc::new(OnceLock::new());
+        let info_tx = tx.clone();
+        let info_cancel = cancellation.clone();
+        let pkt_tx = tx.clone();
+        let pkt_cancel = cancellation.clone();
+        let end_tx = tx.clone();
+        let err_tx = tx;
+        let mut sink = PacketSink::builder(move |packet: &PacketView<'_>| {
+            send_with_cancellation(
+                &pkt_tx,
+                &pkt_cancel,
+                PacketSinkEvent::Packet(EncodedPacket::from_view(packet)),
+            )
+        })
+        .on_stream_info(move |infos: &[PacketStreamInfo]| {
+            send_with_cancellation(
+                &info_tx,
+                &info_cancel,
+                PacketSinkEvent::StreamInfo(infos.to_vec()),
+            )
+        })
+        .on_end(move || {
+            // Best-effort terminal event: the job is already in its terminal
+            // state here (a cancellation-aware blocking send would be
+            // indistinguishable from try_send), and sender disconnection is
+            // the authoritative signal.
+            let _ = end_tx.try_send(PacketSinkEvent::End);
+        })
+        .on_delivery_error(move |e: &PacketSinkError| {
+            let _ = err_tx.try_send(PacketSinkEvent::Error(e.clone()));
+        })
+        .build();
+        sink.cancellation = Some(cancellation);
+        (sink, PacketSinkReceiver { inner: rx })
+    }
+
+    // ---- crate-internal dispatch (serial, delivery thread only) ----
+
+    pub(crate) fn dispatch_stream_info(
+        &mut self,
+        infos: &[PacketStreamInfo],
+    ) -> PacketCallbackResult {
+        match &mut self.dispatch {
+            SinkDispatch::Closures { on_stream_info, .. } => match on_stream_info {
+                Some(f) => f(infos),
+                None => Ok(()),
+            },
+            SinkDispatch::Handler(h) => h.on_stream_info(infos),
+        }
+    }
+
+    pub(crate) fn dispatch_packet(&mut self, packet: &PacketView<'_>) -> PacketCallbackResult {
+        match &mut self.dispatch {
+            SinkDispatch::Closures { on_packet, .. } => on_packet(packet),
+            SinkDispatch::Handler(h) => h.on_packet(packet),
+        }
+    }
+
+    pub(crate) fn dispatch_end(&mut self) {
+        match &mut self.dispatch {
+            SinkDispatch::Closures { on_end, .. } => {
+                if let Some(f) = on_end {
+                    f()
+                }
+            }
+            SinkDispatch::Handler(h) => h.on_end(),
+        }
+    }
+
+    pub(crate) fn dispatch_delivery_error(&mut self, error: &PacketSinkError) {
+        match &mut self.dispatch {
+            SinkDispatch::Closures {
+                on_delivery_error, ..
+            } => {
+                if let Some(f) = on_delivery_error {
+                    f(error)
+                }
+            }
+            SinkDispatch::Handler(h) => h.on_delivery_error(error),
+        }
+    }
+}
+
+/// Cancellation-aware bounded send: blocks (in bounded slices) while the
+/// channel is full, but bails out cooperatively once the job is stopping — so
+/// `stop()`/`abort()` (or a failure elsewhere) terminates even with a full,
+/// undrained channel — and reports a dropped receiver as a typed
+/// disconnection.
+fn send_with_cancellation(
+    tx: &crossbeam_channel::Sender<PacketSinkEvent>,
+    cancellation: &CancellationSlot,
+    event: PacketSinkEvent,
+) -> PacketCallbackResult {
+    let mut event = event;
+    loop {
+        match tx.send_timeout(event, Duration::from_millis(50)) {
+            Ok(()) => return Ok(()),
+            Err(crossbeam_channel::SendTimeoutError::Timeout(back)) => {
+                event = back;
+                if let Some(status) = cancellation.get() {
+                    if is_stopping(status.load(Ordering::Acquire)) {
+                        return Err(PacketCallbackError::cancelled());
+                    }
+                }
+            }
+            Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
+                return Err(PacketCallbackError::disconnected());
+            }
+        }
+    }
+}
+
+/// Builder for a strict-tier [`PacketSink`]; created by
+/// [`PacketSink::builder`] with the required packet consumer.
+pub struct PacketSinkBuilder {
+    tier: PacketSinkTier,
+    on_stream_info: Option<StreamInfoFn>,
+    on_packet: PacketFn,
+    on_end: Option<EndFn>,
+    on_delivery_error: Option<DeliveryErrorFn>,
+}
+
+impl PacketSinkBuilder {
+    /// Selects the delivery tier. Defaults to [`PacketSinkTier::Strict`], the
+    /// only tier in v1.
+    pub fn tier(mut self, tier: PacketSinkTier) -> Self {
+        self.tier = tier;
+        self
+    }
+
+    /// One-time stream configuration callback, invoked before any packet.
+    /// Return `Ok(())` to accept; an error fails the job before any packet is
+    /// delivered.
+    pub fn on_stream_info<F>(mut self, f: F) -> Self
+    where
+        F: FnMut(&[PacketStreamInfo]) -> PacketCallbackResult + Send + 'static,
+    {
+        self.on_stream_info = Some(Box::new(f));
+        self
+    }
+
+    /// Terminal success callback; see the [module docs](self) for the exact
+    /// gate. Never invoked after an error, a cancelled job, or lost packets.
+    pub fn on_end<F>(mut self, f: F) -> Self
+    where
+        F: FnMut() + Send + 'static,
+    {
+        self.on_end = Some(Box::new(f));
+        self
+    }
+
+    /// Terminal failure callback for delivery-path errors (strict-tier
+    /// violations, failing callbacks, a job error discovered while
+    /// finalizing). The same error is also returned by `wait()`/`stop()`.
+    /// Not invoked for cancellation or initial configuration failures — see
+    /// "Failure and panic" in the [module docs](self).
+    pub fn on_delivery_error<F>(mut self, f: F) -> Self
+    where
+        F: FnMut(&PacketSinkError) + Send + 'static,
+    {
+        self.on_delivery_error = Some(Box::new(f));
+        self
+    }
+
+    /// Finalizes the sink.
+    pub fn build(self) -> PacketSink {
+        PacketSink {
+            tier: self.tier,
+            dispatch: SinkDispatch::Closures {
+                on_stream_info: self.on_stream_info,
+                on_packet: self.on_packet,
+                on_end: self.on_end,
+                on_delivery_error: self.on_delivery_error,
+            },
+            cancellation: None,
+        }
+    }
+}
+
+/// Owned copy of one delivered packet, produced by [`PacketSink::channel`].
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct EncodedPacket {
+    pub(crate) stream_index: usize,
+    pub(crate) pts: i64,
+    pub(crate) dts: i64,
+    pub(crate) duration: i64,
+    pub(crate) time_base: AVRational,
+    pub(crate) is_key: bool,
+    pub(crate) applied_offset: i64,
+    pub(crate) data: Vec<u8>,
+}
+
+impl EncodedPacket {
+    fn from_view(view: &PacketView<'_>) -> Self {
+        Self {
+            stream_index: view.stream_index,
+            pts: view.pts,
+            dts: view.dts,
+            duration: view.duration,
+            time_base: view.time_base,
+            is_key: view.is_key,
+            applied_offset: view.applied_offset,
+            data: view.data.to_vec(),
+        }
+    }
+
+    /// Output stream index.
+    pub fn stream_index(&self) -> usize {
+        self.stream_index
+    }
+
+    /// Presentation timestamp; see [`PacketView::pts`].
+    pub fn pts(&self) -> i64 {
+        self.pts
+    }
+
+    /// Decode timestamp; see [`PacketView::dts`].
+    pub fn dts(&self) -> i64 {
+        self.dts
+    }
+
+    /// Packet duration; see [`PacketView::duration`].
+    pub fn duration(&self) -> i64 {
+        self.duration
+    }
+
+    /// Stream time base.
+    pub fn time_base(&self) -> AVRational {
+        self.time_base
+    }
+
+    /// [`pts`](Self::pts) in microseconds.
+    pub fn pts_us(&self) -> i64 {
+        ticks_to_us(self.pts, self.time_base)
+    }
+
+    /// [`dts`](Self::dts) in microseconds.
+    pub fn dts_us(&self) -> i64 {
+        ticks_to_us(self.dts, self.time_base)
+    }
+
+    /// [`duration`](Self::duration) in microseconds.
+    pub fn duration_us(&self) -> i64 {
+        ticks_to_us(self.duration, self.time_base)
+    }
+
+    /// [`applied_offset`](Self::applied_offset) in microseconds.
+    pub fn applied_offset_us(&self) -> i64 {
+        ticks_to_us(self.applied_offset, self.time_base)
+    }
+
+    /// Fresh-decoder-safe random access point; see [`PacketView::is_key`].
+    pub fn is_key(&self) -> bool {
+        self.is_key
+    }
+
+    /// Applied origin shift; see [`PacketView::applied_offset`].
+    pub fn applied_offset(&self) -> i64 {
+        self.applied_offset
+    }
+
+    /// The owned packet payload.
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// Consumes the packet, returning the payload.
+    pub fn into_data(self) -> Vec<u8> {
+        self.data
+    }
+}
+
+/// One event delivered over a [`PacketSink::channel`] adapter, mirroring the
+/// callback order: `StreamInfo`, then `Packet`s, then at most one terminal
+/// `End`/`Error` (terminal events are best-effort under a stalled consumer;
+/// sender disconnection is authoritative).
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub enum PacketSinkEvent {
+    /// The one-time stream configuration.
+    StreamInfo(Vec<PacketStreamInfo>),
+    /// One delivered packet.
+    Packet(EncodedPacket),
+    /// Terminal success.
+    End,
+    /// Terminal delivery-path failure.
+    Error(PacketSinkError),
+}
+
+/// Why [`PacketSinkReceiver::recv`] returned no event.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PacketRecvError {
+    /// The sending side is gone (job finished or failed; all events
+    /// consumed).
+    Disconnected,
+}
+
+impl std::fmt::Display for PacketRecvError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("packet-sink channel disconnected")
+    }
+}
+
+impl std::error::Error for PacketRecvError {}
+
+/// Why [`PacketSinkReceiver::try_recv`] returned no event.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PacketTryRecvError {
+    /// No event is currently queued.
+    Empty,
+    /// The sending side is gone.
+    Disconnected,
+}
+
+impl std::fmt::Display for PacketTryRecvError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PacketTryRecvError::Empty => f.write_str("no packet-sink event queued"),
+            PacketTryRecvError::Disconnected => f.write_str("packet-sink channel disconnected"),
+        }
+    }
+}
+
+impl std::error::Error for PacketTryRecvError {}
+
+/// Why [`PacketSinkReceiver::recv_timeout`] returned no event.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PacketRecvTimeoutError {
+    /// No event arrived within the timeout.
+    Timeout,
+    /// The sending side is gone.
+    Disconnected,
+}
+
+impl std::fmt::Display for PacketRecvTimeoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PacketRecvTimeoutError::Timeout => {
+                f.write_str("timed out waiting for a packet-sink event")
+            }
+            PacketRecvTimeoutError::Disconnected => {
+                f.write_str("packet-sink channel disconnected")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PacketRecvTimeoutError {}
+
+/// Receiving side of a [`PacketSink::channel`] adapter.
+///
+/// Drain it concurrently with the running job (its own thread, or
+/// [`into_events`](Self::into_events)); dropping the receiver cancels the
+/// job — the next delivery fails typed instead of blocking forever.
+pub struct PacketSinkReceiver {
+    inner: crossbeam_channel::Receiver<PacketSinkEvent>,
+}
+
+impl PacketSinkReceiver {
+    /// Blocks until the next event; [`PacketRecvError::Disconnected`] once
+    /// the sending side is gone and all events were consumed.
+    pub fn recv(&self) -> Result<PacketSinkEvent, PacketRecvError> {
+        self.inner.recv().map_err(|_| PacketRecvError::Disconnected)
+    }
+
+    /// Non-blocking receive, distinguishing an empty channel from a
+    /// disconnected one.
+    pub fn try_recv(&self) -> Result<PacketSinkEvent, PacketTryRecvError> {
+        self.inner.try_recv().map_err(|e| match e {
+            crossbeam_channel::TryRecvError::Empty => PacketTryRecvError::Empty,
+            crossbeam_channel::TryRecvError::Disconnected => PacketTryRecvError::Disconnected,
+        })
+    }
+
+    /// Receive with a timeout, distinguishing a timeout from disconnection.
+    pub fn recv_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<PacketSinkEvent, PacketRecvTimeoutError> {
+        self.inner.recv_timeout(timeout).map_err(|e| match e {
+            crossbeam_channel::RecvTimeoutError::Timeout => PacketRecvTimeoutError::Timeout,
+            crossbeam_channel::RecvTimeoutError::Disconnected => {
+                PacketRecvTimeoutError::Disconnected
+            }
+        })
+    }
+
+    /// Blocking iterator over events until the sender disconnects.
+    pub fn iter(&self) -> impl Iterator<Item = PacketSinkEvent> + '_ {
+        self.inner.iter()
+    }
+
+    /// Consumes the receiver and the running scheduler into a single
+    /// owned-run iterator (the frame-export `FrameIter` shape): events stream
+    /// out as they arrive, the scheduler is joined exactly once when the
+    /// channel drains, and a job error surfaces as one terminal `Err`.
+    /// Dropping the iterator mid-run releases the receiver FIRST (unblocking
+    /// a worker parked in the channel send), then aborts the job.
+    pub fn into_events(self, scheduler: FfmpegScheduler<Running>) -> PacketEventIter {
+        PacketEventIter {
+            rx: Some(self.inner),
+            scheduler: Some(scheduler),
+            terminated: false,
+        }
+    }
+}
+
+/// An owned-run iterator over [`PacketSinkEvent`]s; see
+/// [`PacketSinkReceiver::into_events`].
+pub struct PacketEventIter {
+    rx: Option<crossbeam_channel::Receiver<PacketSinkEvent>>,
+    scheduler: Option<FfmpegScheduler<Running>>,
+    terminated: bool,
+}
+
+impl PacketEventIter {
+    /// Joins the scheduler exactly once and maps its result to at most one
+    /// terminal error. Called when the channel disconnects.
+    fn finish(&mut self) -> Option<Result<PacketSinkEvent, crate::error::Error>> {
+        self.terminated = true;
+        // Drop the receiver before joining so a parked sender is released.
+        self.rx = None;
+        match self.scheduler.take() {
+            Some(scheduler) => match scheduler.wait() {
+                Ok(()) => None,
+                Err(e) => Some(Err(e)),
+            },
+            None => None,
+        }
+    }
+}
+
+impl Iterator for PacketEventIter {
+    type Item = Result<PacketSinkEvent, crate::error::Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.terminated {
+            return None;
+        }
+        let recv = match self.rx.as_ref() {
+            Some(rx) => rx.recv(),
+            None => return self.finish(),
+        };
+        match recv {
+            Ok(event) => Some(Ok(event)),
+            // Channel closed: the pipeline finished or died. Join once.
+            Err(_) => self.finish(),
+        }
+    }
+}
+
+impl std::iter::FusedIterator for PacketEventIter {}
+
+impl Drop for PacketEventIter {
+    fn drop(&mut self) {
+        // Drop the receiver FIRST (unblocks a worker parked in the channel
+        // send), THEN abort the scheduler (which joins the workers). Reversed
+        // order can deadlock: the worker only observes the abort between
+        // callbacks, but it is blocked inside one.
+        self.rx = None;
+        if let Some(scheduler) = self.scheduler.take() {
+            scheduler.abort();
+        }
     }
 }
 
@@ -310,311 +1200,12 @@ impl PacketSinkPolicy {
     }
 }
 
-pub(crate) type StreamInfoFn = Box<dyn FnMut(&[PacketStreamInfo]) -> i32 + Send>;
-pub(crate) type PacketFn = Box<dyn for<'a> FnMut(&PacketView<'a>) -> i32 + Send>;
-pub(crate) type EndFn = Box<dyn FnMut() + Send>;
-pub(crate) type ErrorFn = Box<dyn FnMut(&PacketSinkError) + Send>;
-
-/// The callback bundle handed to [`Output::new_by_packet_sink`](crate::Output::new_by_packet_sink).
-///
-/// Build one with [`PacketSink::builder`], or use [`PacketSink::channel`] for
-/// a ready-made owned/channel consumer. See the [module docs](self) for the
-/// callback order and the **blocking backpressure** contract.
-pub struct PacketSink {
-    pub(crate) tier: PacketSinkTier,
-    pub(crate) on_stream_info: StreamInfoFn,
-    pub(crate) on_packet: PacketFn,
-    pub(crate) on_end: EndFn,
-    pub(crate) on_error: ErrorFn,
-}
-
-impl std::fmt::Debug for PacketSink {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PacketSink")
-            .field("tier", &self.tier)
-            .finish_non_exhaustive()
-    }
-}
-
-impl PacketSink {
-    /// Starts building a packet sink. Unset callbacks default to accepting
-    /// no-ops.
-    pub fn builder() -> PacketSinkBuilder {
-        PacketSinkBuilder::default()
-    }
-
-    /// Builds a strict-tier sink that forwards everything over a **bounded**
-    /// channel of owned events, for consumers that want packets on their own
-    /// thread.
-    ///
-    /// Every payload is copied once into an owned [`SinkPacket`]. The channel
-    /// preserves the callback contract: when it is full, the sending callback
-    /// **blocks the pipeline** until the consumer catches up (no packet is
-    /// dropped). Dropping the [`PacketSinkReceiver`] cancels the job with a
-    /// typed error on the next delivery.
-    ///
-    /// `capacity` is clamped to at least 1.
-    pub fn channel(capacity: usize) -> (PacketSink, PacketSinkReceiver) {
-        let (tx, rx) = crossbeam_channel::bounded::<PacketSinkEvent>(capacity.max(1));
-        let info_tx = tx.clone();
-        let pkt_tx = tx.clone();
-        let end_tx = tx.clone();
-        let err_tx = tx;
-        let sink = PacketSink::builder()
-            .on_stream_info(move |infos: &[PacketStreamInfo]| {
-                match info_tx.send(PacketSinkEvent::StreamInfo(infos.to_vec())) {
-                    Ok(()) => 0,
-                    Err(_) => ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO),
-                }
-            })
-            .on_packet(move |view: &PacketView<'_>| {
-                match pkt_tx.send(PacketSinkEvent::Packet(SinkPacket::from_view(view))) {
-                    Ok(()) => 0,
-                    Err(_) => ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO),
-                }
-            })
-            .on_end(move || {
-                let _ = end_tx.send(PacketSinkEvent::End);
-            })
-            .on_error(move |e: &PacketSinkError| {
-                let _ = err_tx.send(PacketSinkEvent::Error(e.clone()));
-            })
-            .build();
-        (sink, PacketSinkReceiver { inner: rx })
-    }
-}
-
-/// Builder for [`PacketSink`]. Every callback is optional; unset ones default
-/// to accepting no-ops.
-#[derive(Default)]
-pub struct PacketSinkBuilder {
-    tier: PacketSinkTier,
-    on_stream_info: Option<StreamInfoFn>,
-    on_packet: Option<PacketFn>,
-    on_end: Option<EndFn>,
-    on_error: Option<ErrorFn>,
-}
-
-impl PacketSinkBuilder {
-    /// Selects the delivery tier. Defaults to [`PacketSinkTier::Strict`],
-    /// the only tier in v1.
-    pub fn tier(mut self, tier: PacketSinkTier) -> Self {
-        self.tier = tier;
-        self
-    }
-
-    /// One-time stream configuration callback, invoked before any packet.
-    /// Return `0` to accept; a negative value fails the job before any packet
-    /// is delivered.
-    pub fn on_stream_info<F>(mut self, f: F) -> Self
-    where
-        F: FnMut(&[PacketStreamInfo]) -> i32 + Send + 'static,
-    {
-        self.on_stream_info = Some(Box::new(f));
-        self
-    }
-
-    /// Per-packet callback. The [`PacketView`] (including its payload) is
-    /// valid only for the duration of the call. Return `0` to continue; a
-    /// negative value stops the job with
-    /// [`PacketSinkError::PacketCallbackFailed`](crate::error::PacketSinkError::PacketCallbackFailed)
-    /// (any negative value — including `AVERROR_EOF` — is a failure, never a
-    /// clean end). **This callback blocks the encoding pipeline while it
-    /// runs.**
-    pub fn on_packet<F>(mut self, f: F) -> Self
-    where
-        F: for<'a> FnMut(&PacketView<'a>) -> i32 + Send + 'static,
-    {
-        self.on_packet = Some(Box::new(f));
-        self
-    }
-
-    /// Terminal success callback; see the [module docs](self) for the exact
-    /// gate. Never invoked after an error, a cancelled job, or lost packets.
-    pub fn on_end<F>(mut self, f: F) -> Self
-    where
-        F: FnMut() + Send + 'static,
-    {
-        self.on_end = Some(Box::new(f));
-        self
-    }
-
-    /// Terminal failure callback for delivery-path errors (strict-tier
-    /// violations, failing callbacks). The same error is also returned by
-    /// `wait()`/`stop()`. Not invoked for cancellation or failures elsewhere
-    /// in the pipeline.
-    pub fn on_error<F>(mut self, f: F) -> Self
-    where
-        F: FnMut(&PacketSinkError) + Send + 'static,
-    {
-        self.on_error = Some(Box::new(f));
-        self
-    }
-
-    /// Finalizes the sink.
-    pub fn build(self) -> PacketSink {
-        PacketSink {
-            tier: self.tier,
-            on_stream_info: self.on_stream_info.unwrap_or_else(|| Box::new(|_| 0)),
-            on_packet: self.on_packet.unwrap_or_else(|| Box::new(|_| 0)),
-            on_end: self.on_end.unwrap_or_else(|| Box::new(|| {})),
-            on_error: self.on_error.unwrap_or_else(|| Box::new(|_| {})),
-        }
-    }
-}
-
-/// Owned copy of one delivered packet, produced by [`PacketSink::channel`].
-#[non_exhaustive]
-#[derive(Debug, Clone)]
-pub struct SinkPacket {
-    pub(crate) stream_index: usize,
-    pub(crate) pts: i64,
-    pub(crate) dts: i64,
-    pub(crate) duration: i64,
-    pub(crate) time_base: AVRational,
-    pub(crate) is_key: bool,
-    pub(crate) applied_offset: i64,
-    pub(crate) data: Vec<u8>,
-}
-
-impl SinkPacket {
-    fn from_view(view: &PacketView<'_>) -> Self {
-        Self {
-            stream_index: view.stream_index,
-            pts: view.pts,
-            dts: view.dts,
-            duration: view.duration,
-            time_base: view.time_base,
-            is_key: view.is_key,
-            applied_offset: view.applied_offset,
-            data: view.data.to_vec(),
-        }
-    }
-
-    /// Output stream index.
-    pub fn stream_index(&self) -> usize {
-        self.stream_index
-    }
-
-    /// Presentation timestamp; see [`PacketView::pts`].
-    pub fn pts(&self) -> i64 {
-        self.pts
-    }
-
-    /// Decode timestamp; see [`PacketView::dts`].
-    pub fn dts(&self) -> i64 {
-        self.dts
-    }
-
-    /// Packet duration; see [`PacketView::duration`].
-    pub fn duration(&self) -> i64 {
-        self.duration
-    }
-
-    /// Stream time base.
-    pub fn time_base(&self) -> AVRational {
-        self.time_base
-    }
-
-    /// Fresh-decoder-safe random access point; see [`PacketView::is_key`].
-    pub fn is_key(&self) -> bool {
-        self.is_key
-    }
-
-    /// Applied origin shift; see [`PacketView::applied_offset`].
-    pub fn applied_offset(&self) -> i64 {
-        self.applied_offset
-    }
-
-    /// The owned packet payload.
-    pub fn data(&self) -> &[u8] {
-        &self.data
-    }
-
-    /// Consumes the packet, returning the payload.
-    pub fn into_data(self) -> Vec<u8> {
-        self.data
-    }
-}
-
-/// One event delivered over a [`PacketSink::channel`] adapter, mirroring the
-/// callback order: `StreamInfo`, then `Packet`s, then at most one terminal
-/// `End`/`Error`.
-#[non_exhaustive]
-#[derive(Debug, Clone)]
-pub enum PacketSinkEvent {
-    /// The one-time stream configuration.
-    StreamInfo(Vec<PacketStreamInfo>),
-    /// One delivered packet.
-    Packet(SinkPacket),
-    /// Terminal success.
-    End,
-    /// Terminal delivery-path failure.
-    Error(PacketSinkError),
-}
-
-/// Receiving side of a [`PacketSink::channel`] adapter.
-///
-/// Dropping the receiver cancels the job: the next delivery fails with a
-/// typed error instead of blocking forever.
-pub struct PacketSinkReceiver {
-    inner: crossbeam_channel::Receiver<PacketSinkEvent>,
-}
-
-impl PacketSinkReceiver {
-    /// Blocks until the next event, or `None` once the sending side is gone
-    /// (the job finished or failed and the terminal event was consumed).
-    pub fn recv(&self) -> Option<PacketSinkEvent> {
-        self.inner.recv().ok()
-    }
-
-    /// Non-blocking receive.
-    pub fn try_recv(&self) -> Option<PacketSinkEvent> {
-        self.inner.try_recv().ok()
-    }
-
-    /// Receive with a timeout; `None` on timeout or disconnect.
-    pub fn recv_timeout(&self, timeout: std::time::Duration) -> Option<PacketSinkEvent> {
-        self.inner.recv_timeout(timeout).ok()
-    }
-
-    /// Blocking iterator over events until the sender disconnects.
-    pub fn iter(&self) -> impl Iterator<Item = PacketSinkEvent> + '_ {
-        self.inner.iter()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn builder_defaults_are_accepting_noops() {
-        let mut sink = PacketSink::builder().build();
-        assert_eq!(sink.tier, PacketSinkTier::Strict);
-        assert_eq!((sink.on_stream_info)(&[]), 0);
-        let view = PacketView {
-            stream_index: 0,
-            pts: 0,
-            dts: 0,
-            duration: 1,
-            time_base: AVRational { num: 1, den: 25 },
-            is_key: true,
-            applied_offset: 0,
-            data: &[0, 0, 0, 1, 0x65],
-        };
-        assert_eq!((sink.on_packet)(&view), 0);
-        (sink.on_end)();
-        (sink.on_error)(&crate::error::PacketSinkError::NoStreams);
-    }
-
-    #[test]
-    fn channel_adapter_forwards_events_in_order() {
-        let (mut sink, rx) = PacketSink::channel(8);
-        let infos = vec![];
-        assert_eq!((sink.on_stream_info)(&infos), 0);
-        let payload = [0u8, 0, 0, 1, 0x65];
-        let view = PacketView {
+    fn test_view(data: &[u8]) -> PacketView<'_> {
+        PacketView {
             stream_index: 0,
             pts: 10,
             dts: 5,
@@ -622,10 +1213,65 @@ mod tests {
             time_base: AVRational { num: 1, den: 25 },
             is_key: false,
             applied_offset: 3,
-            data: &payload,
-        };
-        assert_eq!((sink.on_packet)(&view), 0);
-        (sink.on_end)();
+            data,
+        }
+    }
+
+    #[test]
+    fn builder_requires_a_packet_consumer_and_discard_is_explicit() {
+        let mut sink = PacketSink::builder(|_| Ok(())).build();
+        assert_eq!(sink.tier, PacketSinkTier::Strict);
+        assert!(sink.dispatch_stream_info(&[]).is_ok());
+        let payload = [0u8, 0, 0, 1, 0x65];
+        assert!(sink.dispatch_packet(&test_view(&payload)).is_ok());
+        sink.dispatch_end();
+        sink.dispatch_delivery_error(&PacketSinkError::NoStreams);
+
+        let mut discard = PacketSink::discard();
+        assert!(discard.dispatch_packet(&test_view(&payload)).is_ok());
+    }
+
+    #[test]
+    fn handler_receives_serial_callbacks_with_shared_state() {
+        struct Counting {
+            packets: usize,
+        }
+        impl PacketSinkHandler for Counting {
+            fn on_packet(&mut self, _packet: &PacketView<'_>) -> PacketCallbackResult {
+                self.packets += 1;
+                if self.packets > 1 {
+                    Err(PacketCallbackError::new("enough"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let mut sink = PacketSink::from_handler(Counting { packets: 0 });
+        let payload = [0u8, 0, 0, 1, 0x65];
+        assert!(sink.dispatch_packet(&test_view(&payload)).is_ok());
+        let err = sink
+            .dispatch_packet(&test_view(&payload))
+            .expect_err("handler state must persist across calls");
+        assert_eq!(err.kind, CallbackFailureKind::Failure);
+        assert_eq!(err.to_string(), "enough");
+    }
+
+    #[test]
+    fn callback_error_preserves_its_source() {
+        let io = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "peer gone");
+        let err = PacketCallbackError::with_source("send failed", io);
+        assert_eq!(err.to_string(), "send failed");
+        let source = std::error::Error::source(&err).expect("source preserved");
+        assert!(source.to_string().contains("peer gone"));
+    }
+
+    #[test]
+    fn channel_adapter_forwards_events_in_order() {
+        let (mut sink, rx) = PacketSink::channel(NonZeroUsize::new(8).unwrap());
+        assert!(sink.dispatch_stream_info(&[]).is_ok());
+        let payload = [0u8, 0, 0, 1, 0x65];
+        assert!(sink.dispatch_packet(&test_view(&payload)).is_ok());
+        sink.dispatch_end();
         match rx.recv().unwrap() {
             PacketSinkEvent::StreamInfo(v) => assert!(v.is_empty()),
             other => panic!("expected StreamInfo, got {other:?}"),
@@ -637,26 +1283,81 @@ mod tests {
                 assert_eq!(p.applied_offset(), 3);
                 assert_eq!(p.data(), &payload);
                 assert!(!p.is_key());
+                // Tick conveniences: 10 ticks at 1/25 s = 400_000 us.
+                assert_eq!(p.pts_us(), 400_000);
+                assert_eq!(p.duration_us(), 40_000);
             }
             other => panic!("expected Packet, got {other:?}"),
         }
         assert!(matches!(rx.recv().unwrap(), PacketSinkEvent::End));
+        drop(sink);
+        assert!(matches!(rx.recv(), Err(PacketRecvError::Disconnected)));
     }
 
     #[test]
-    fn dropped_receiver_turns_sends_into_errors() {
-        let (mut sink, rx) = PacketSink::channel(1);
+    fn dropped_receiver_turns_sends_into_typed_disconnection() {
+        let (mut sink, rx) = PacketSink::channel(NonZeroUsize::new(1).unwrap());
         drop(rx);
-        let view = PacketView {
-            stream_index: 0,
-            pts: 0,
-            dts: 0,
-            duration: 1,
-            time_base: AVRational { num: 1, den: 25 },
-            is_key: true,
-            applied_offset: 0,
-            data: &[0, 0, 0, 1, 0x65],
-        };
-        assert!((sink.on_packet)(&view) < 0);
+        let payload = [0u8, 0, 0, 1, 0x65];
+        let err = sink
+            .dispatch_packet(&test_view(&payload))
+            .expect_err("send into a dropped receiver must fail");
+        assert_eq!(err.kind, CallbackFailureKind::Disconnected);
+    }
+
+    /// The review probe: a blocked bounded send with a live, undrained
+    /// receiver must observe the job stopping and bail out promptly.
+    #[test]
+    fn blocked_channel_send_observes_cancellation() {
+        let (mut sink, rx) = PacketSink::channel(NonZeroUsize::new(1).unwrap());
+        // Simulate the worker wiring: publish the scheduler-status handle.
+        let status = Arc::new(AtomicUsize::new(
+            crate::core::scheduler::ffmpeg_scheduler::STATUS_RUN,
+        ));
+        sink.cancellation
+            .as_ref()
+            .expect("channel sinks carry a cancellation slot")
+            .set(status.clone())
+            .ok();
+        // Fill the capacity-1 channel; the receiver never drains.
+        let payload = [0u8, 0, 0, 1, 0x65];
+        assert!(sink.dispatch_packet(&test_view(&payload)).is_ok());
+        // Flip to stopping from another thread; the blocked send must
+        // observe it and bail out with the cancellation kind.
+        let flip = status.clone();
+        let flipper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(120));
+            flip.store(
+                crate::core::scheduler::ffmpeg_scheduler::STATUS_END,
+                Ordering::Release,
+            );
+        });
+        let start = std::time::Instant::now();
+        let err = sink
+            .dispatch_packet(&test_view(&payload))
+            .expect_err("blocked send must cancel");
+        assert_eq!(err.kind, CallbackFailureKind::Cancelled);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "cancellation must be prompt"
+        );
+        flipper.join().unwrap();
+        drop(rx);
+    }
+
+    #[test]
+    fn recv_variants_distinguish_empty_timeout_disconnected() {
+        let (sink, rx) = PacketSink::channel(NonZeroUsize::new(1).unwrap());
+        assert_eq!(rx.try_recv().unwrap_err(), PacketTryRecvError::Empty);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(10)).unwrap_err(),
+            PacketRecvTimeoutError::Timeout
+        );
+        drop(sink);
+        assert_eq!(rx.try_recv().unwrap_err(), PacketTryRecvError::Disconnected);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(10)).unwrap_err(),
+            PacketRecvTimeoutError::Disconnected
+        );
     }
 }

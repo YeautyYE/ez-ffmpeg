@@ -27,7 +27,7 @@ fn build_err(input: Input, output: Output) -> Error {
 }
 
 fn noop_sink() -> PacketSink {
-    PacketSink::builder().build()
+    PacketSink::discard()
 }
 
 #[test]
@@ -262,33 +262,29 @@ fn failing_packet_callback_stops_the_job_without_on_end() {
     let log: common::SinkLog = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let (pkt_log, end_log, err_log) = (log.clone(), log.clone(), log.clone());
     let mut delivered = 0u32;
-    let sink = PacketSink::builder()
-        .on_packet(move |pkt| {
-            delivered += 1;
-            pkt_log.lock().unwrap().push(SinkEv::Pkt(common::SinkPkt {
-                stream_index: pkt.stream_index(),
-                pts: pkt.pts(),
-                dts: pkt.dts(),
-                duration: pkt.duration(),
-                time_base: pkt.time_base(),
-                is_key: pkt.is_key(),
-                applied_offset: pkt.applied_offset(),
-                data: Vec::new(),
-                thread: std::thread::current().id(),
-            }));
-            if delivered >= 3 {
-                -1
-            } else {
-                0
-            }
+    let sink = PacketSink::builder(move |pkt: &ez_ffmpeg::packet_sink::PacketView<'_>| {
+        delivered += 1;
+        pkt_log
+            .lock()
+            .unwrap()
+            .push(SinkEv::Pkt(common::SinkPkt::from_view(pkt)));
+        if delivered >= 3 {
+            Err(ez_ffmpeg::packet_sink::PacketCallbackError::new(
+                "consumer gave up",
+            ))
+        } else {
+            Ok(())
+        }
+    })
+    .on_end(move || {
+        end_log.lock().unwrap().push(SinkEv::End {
+            thread: std::thread::current().id(),
         })
-        .on_end(move || {
-            end_log.lock().unwrap().push(SinkEv::End {
-                thread: std::thread::current().id(),
-            })
-        })
-        .on_error(move |e| err_log.lock().unwrap().push(SinkEv::Error(e.to_string())))
-        .build();
+    })
+    .on_delivery_error(move |e: &PacketSinkError| {
+        err_log.lock().unwrap().push(SinkEv::Error(e.to_string()))
+    })
+    .build();
 
     let result = wait_with_watchdog(
         FfmpegContext::builder()
@@ -306,7 +302,10 @@ fn failing_packet_callback_stops_the_job_without_on_end() {
         "failing_callback",
     );
     match result {
-        Err(Error::PacketSink(PacketSinkError::PacketCallbackFailed { code: -1, .. })) => {}
+        Err(Error::PacketSink(PacketSinkError::PacketCallbackFailed {
+            stream_index: 0,
+            error,
+        })) => assert_eq!(error.to_string(), "consumer gave up"),
         other => panic!("expected the typed callback failure, got {other:?}"),
     }
 

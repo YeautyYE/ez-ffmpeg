@@ -43,7 +43,7 @@ pub fn wait_with_watchdog(
 
 // ---- packet-sink helpers (tests/packet_sink*.rs) ----
 
-use ez_ffmpeg::packet_sink::{PacketSink, PacketStreamInfo};
+use ez_ffmpeg::packet_sink::{PacketSink, PacketStreamInfo, PacketView};
 use ez_ffmpeg::AVRational;
 use std::sync::{Arc, Mutex};
 
@@ -60,13 +60,47 @@ pub fn have_encoder(name: &str) -> bool {
 #[derive(Clone, Debug)]
 pub struct SinkInfo {
     pub stream_index: usize,
-    pub codec_name: String,
+    pub is_video: bool,
+    pub codec_string: String,
     pub time_base: AVRational,
     pub extradata: Vec<u8>,
     pub width: i32,
     pub height: i32,
     pub frame_rate: Option<AVRational>,
     pub sample_rate: i32,
+    pub channel_layout: String,
+}
+
+impl SinkInfo {
+    fn from_info(info: &PacketStreamInfo) -> Self {
+        match info {
+            PacketStreamInfo::Video(v) => Self {
+                stream_index: v.stream_index(),
+                is_video: true,
+                codec_string: v.codec_string().to_string(),
+                time_base: v.time_base(),
+                extradata: v.codec_config().to_vec(),
+                width: v.width(),
+                height: v.height(),
+                frame_rate: v.frame_rate(),
+                sample_rate: 0,
+                channel_layout: String::new(),
+            },
+            PacketStreamInfo::Audio(a) => Self {
+                stream_index: a.stream_index(),
+                is_video: false,
+                codec_string: a.codec_string().to_string(),
+                time_base: a.time_base(),
+                extradata: a.codec_config().to_vec(),
+                width: 0,
+                height: 0,
+                frame_rate: None,
+                sample_rate: a.sample_rate(),
+                channel_layout: a.channel_layout().to_string(),
+            },
+            other => panic!("unexpected stream info variant: {other:?}"),
+        }
+    }
 }
 
 /// Owned copy of one delivered packet, as observed by a sink callback.
@@ -79,8 +113,26 @@ pub struct SinkPkt {
     pub time_base: AVRational,
     pub is_key: bool,
     pub applied_offset: i64,
+    pub applied_offset_us: i64,
     pub data: Vec<u8>,
     pub thread: std::thread::ThreadId,
+}
+
+impl SinkPkt {
+    pub fn from_view(pkt: &PacketView<'_>) -> Self {
+        Self {
+            stream_index: pkt.stream_index(),
+            pts: pkt.pts(),
+            dts: pkt.dts(),
+            duration: pkt.duration(),
+            time_base: pkt.time_base(),
+            is_key: pkt.is_key(),
+            applied_offset: pkt.applied_offset(),
+            applied_offset_us: pkt.applied_offset_us(),
+            data: pkt.data().to_vec(),
+            thread: std::thread::current().id(),
+        }
+    }
 }
 
 /// Everything a packet-sink job reported, in callback order.
@@ -104,47 +156,24 @@ pub fn recording_sink() -> (PacketSink, SinkLog) {
     let log: SinkLog = Arc::new(Mutex::new(Vec::new()));
     let (info_log, pkt_log, end_log, err_log) =
         (log.clone(), log.clone(), log.clone(), log.clone());
-    let sink = PacketSink::builder()
-        .on_stream_info(move |infos: &[PacketStreamInfo]| {
-            info_log.lock().unwrap().push(SinkEv::Info {
-                streams: infos
-                    .iter()
-                    .map(|i| SinkInfo {
-                        stream_index: i.stream_index(),
-                        codec_name: i.codec_name().to_string(),
-                        time_base: i.time_base(),
-                        extradata: i.extradata().to_vec(),
-                        width: i.width(),
-                        height: i.height(),
-                        frame_rate: i.frame_rate(),
-                        sample_rate: i.sample_rate(),
-                    })
-                    .collect(),
-                thread: std::thread::current().id(),
-            });
-            0
+    let sink = PacketSink::builder(move |pkt: &PacketView<'_>| {
+        pkt_log.lock().unwrap().push(SinkEv::Pkt(SinkPkt::from_view(pkt)));
+        Ok(())
+    })
+    .on_stream_info(move |infos: &[PacketStreamInfo]| {
+        info_log.lock().unwrap().push(SinkEv::Info {
+            streams: infos.iter().map(SinkInfo::from_info).collect(),
+            thread: std::thread::current().id(),
+        });
+        Ok(())
+    })
+    .on_end(move || {
+        end_log.lock().unwrap().push(SinkEv::End {
+            thread: std::thread::current().id(),
         })
-        .on_packet(move |pkt| {
-            pkt_log.lock().unwrap().push(SinkEv::Pkt(SinkPkt {
-                stream_index: pkt.stream_index(),
-                pts: pkt.pts(),
-                dts: pkt.dts(),
-                duration: pkt.duration(),
-                time_base: pkt.time_base(),
-                is_key: pkt.is_key(),
-                applied_offset: pkt.applied_offset(),
-                data: pkt.data().to_vec(),
-                thread: std::thread::current().id(),
-            }));
-            0
-        })
-        .on_end(move || {
-            end_log.lock().unwrap().push(SinkEv::End {
-                thread: std::thread::current().id(),
-            })
-        })
-        .on_error(move |e| err_log.lock().unwrap().push(SinkEv::Error(e.to_string())))
-        .build();
+    })
+    .on_delivery_error(move |e| err_log.lock().unwrap().push(SinkEv::Error(e.to_string())))
+    .build();
     (sink, log)
 }
 

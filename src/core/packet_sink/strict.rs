@@ -31,20 +31,24 @@
 //! muxer's `i32` convention (a sentinel that is never `AVERROR_EOF`, so a
 //! failing callback can never masquerade as a healthy end of stream).
 
-use super::codec::{aac::AacRuntime, avc::AvcRuntime, CodecRuntime};
+use super::codec::{self, aac::AacRuntime, avc::AvcRuntime, CodecRuntime};
 use super::side_data;
 use super::timeline::{StreamTimeline, Timeline};
-use super::{PacketSink, PacketStreamInfo, PacketView};
+use super::{
+    AudioPacketConfig, CallbackFailureKind, PacketCallbackError, PacketSink, PacketStreamInfo,
+    PacketView, VideoPacketConfig,
+};
 use crate::core::context::PacketBox;
 use crate::error::PacketSinkError;
 use ffmpeg_next::packet::Ref;
 use ffmpeg_sys_next::AVMediaType::{AVMEDIA_TYPE_AUDIO, AVMEDIA_TYPE_VIDEO};
 use ffmpeg_sys_next::AVPacketSideDataType::{AV_PKT_DATA_NEW_EXTRADATA, AV_PKT_DATA_PARAM_CHANGE};
 use ffmpeg_sys_next::{
-    av_get_audio_frame_duration2, av_rescale_q, avcodec_get_name, AVCodecParameters,
+    av_channel_layout_describe, av_get_audio_frame_duration2, av_rescale_q, AVCodecParameters,
     AVFormatContext, AVRational, AVERROR_EXTERNAL, AV_NOPTS_VALUE,
 };
-use std::ffi::CStr;
+use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
 
 /// Typed projections compared against `AV_PKT_DATA_PARAM_CHANGE` (which
 /// carries no parameter sets — only these fields).
@@ -72,6 +76,40 @@ enum Phase {
     Finished,
 }
 
+/// Why `process` stopped: a typed delivery error, or a cooperative
+/// cancellation (a blocking channel send observed the job stopping — the
+/// counterpart of the worker loop's own `is_stopping` exit, never an error).
+enum ProcessFailure {
+    Sink(PacketSinkError),
+    Cancelled,
+}
+
+impl From<PacketSinkError> for ProcessFailure {
+    fn from(e: PacketSinkError) -> Self {
+        ProcessFailure::Sink(e)
+    }
+}
+
+/// Maps a consumer callback error onto the delivery outcome.
+fn callback_failure(
+    error: PacketCallbackError,
+    stream_index: Option<usize>,
+) -> ProcessFailure {
+    match error.kind {
+        CallbackFailureKind::Cancelled => ProcessFailure::Cancelled,
+        CallbackFailureKind::Disconnected => {
+            ProcessFailure::Sink(PacketSinkError::ChannelDisconnected)
+        }
+        CallbackFailureKind::Failure => ProcessFailure::Sink(match stream_index {
+            Some(stream_index) => PacketSinkError::PacketCallbackFailed {
+                stream_index,
+                error,
+            },
+            None => PacketSinkError::StreamInfoCallbackFailed { error },
+        }),
+    }
+}
+
 /// Strict-tier worker state. Built at the header slot (before any callback),
 /// moved into the mux worker, consumed at the trailer slot.
 pub(crate) struct PacketSinkWorker {
@@ -90,6 +128,9 @@ pub(crate) struct PacketSinkWorker {
     scratch: Vec<u8>,
     stream_info_delivered: bool,
     phase: Phase,
+    /// A blocking channel send observed the job stopping and bailed out
+    /// cooperatively: delivery stopped, but it is NOT an error.
+    cancelled: bool,
 }
 
 impl PacketSinkWorker {
@@ -106,9 +147,17 @@ impl PacketSinkWorker {
         out_fmt_ctx: *mut AVFormatContext,
         stream_count: usize,
         sink: PacketSink,
+        scheduler_status: &Arc<AtomicUsize>,
     ) -> Result<Self, PacketSinkError> {
         // Tier dispatch: only Strict exists; new tiers add arms here.
         let super::PacketSinkTier::Strict = sink.tier;
+
+        // Wire the owned-channel cancellation observer: a blocked bounded
+        // send can now bail out when the job stops (nothing is wired for
+        // plain callback sinks).
+        if let Some(slot) = &sink.cancellation {
+            let _ = slot.set(scheduler_status.clone());
+        }
 
         let mut infos = Vec::with_capacity(stream_count);
         let mut streams = Vec::with_capacity(stream_count);
@@ -116,9 +165,6 @@ impl PacketSinkWorker {
             let st = *(*out_fmt_ctx).streams.add(stream_index);
             let codecpar = (*st).codecpar;
             let media_type = (*codecpar).codec_type;
-            let codec_name = CStr::from_ptr(avcodec_get_name((*codecpar).codec_id))
-                .to_string_lossy()
-                .into_owned();
             let time_base = (*st).time_base;
             // Required S7 precondition: every advertised time base must be a
             // valid positive rational BEFORE any callback observes it (it
@@ -133,7 +179,7 @@ impl PacketSinkWorker {
             let extradata = extradata_bytes(codecpar)
                 .ok_or(PacketSinkError::MissingExtradata { stream_index })?;
 
-            let (codec, delivered_extradata, frame_rate) = match media_type {
+            let (codec, info, frame_rate) = match media_type {
                 AVMEDIA_TYPE_VIDEO => {
                     // The encoder whitelist was enforced at build time; this
                     // guards the codec id itself (h264 only in v1).
@@ -146,7 +192,19 @@ impl PacketSinkWorker {
                         AvcRuntime::from_extradata(&extradata, stream_index)?;
                     let fr = (*st).avg_frame_rate;
                     let frame_rate = (fr.num > 0 && fr.den > 0).then_some(fr);
-                    (CodecRuntime::Avc(runtime), delivered, frame_rate)
+                    let sar = (*codecpar).sample_aspect_ratio;
+                    let info = PacketStreamInfo::Video(VideoPacketConfig {
+                        stream_index,
+                        codec_id: (*codecpar).codec_id,
+                        codec_string: codec::avc::codec_string(&delivered),
+                        codec_config: delivered,
+                        time_base,
+                        width: (*codecpar).width,
+                        height: (*codecpar).height,
+                        sample_aspect_ratio: (sar.num > 0 && sar.den > 0).then_some(sar),
+                        frame_rate,
+                    });
+                    (CodecRuntime::Avc(runtime), info, frame_rate)
                 }
                 AVMEDIA_TYPE_AUDIO => {
                     if (*codecpar).codec_id != ffmpeg_sys_next::AVCodecID::AV_CODEC_ID_AAC {
@@ -154,11 +212,18 @@ impl PacketSinkWorker {
                             kind: "non-AAC audio",
                         });
                     }
-                    (
-                        CodecRuntime::Aac(AacRuntime::from_extradata(&extradata)),
-                        extradata.clone(),
-                        None,
-                    )
+                    let runtime = AacRuntime::from_extradata(&extradata);
+                    let info = PacketStreamInfo::Audio(AudioPacketConfig {
+                        stream_index,
+                        codec_id: (*codecpar).codec_id,
+                        codec_string: runtime.codec_string(),
+                        codec_config: extradata.clone(),
+                        time_base,
+                        sample_rate: (*codecpar).sample_rate,
+                        channels: (*codecpar).ch_layout.nb_channels,
+                        channel_layout: describe_channel_layout(codecpar),
+                    });
+                    (CodecRuntime::Aac(runtime), info, None)
                 }
                 _ => {
                     return Err(PacketSinkError::UnsupportedStream {
@@ -167,18 +232,7 @@ impl PacketSinkWorker {
                 }
             };
 
-            infos.push(PacketStreamInfo {
-                stream_index,
-                media_type,
-                codec_name,
-                time_base,
-                extradata: delivered_extradata,
-                width: (*codecpar).width,
-                height: (*codecpar).height,
-                frame_rate,
-                sample_rate: (*codecpar).sample_rate,
-                channels: (*codecpar).ch_layout.nb_channels,
-            });
+            infos.push(info);
             streams.push(StreamRuntime {
                 codec,
                 time_base,
@@ -203,6 +257,7 @@ impl PacketSinkWorker {
             scratch: Vec::new(),
             stream_info_delivered: false,
             phase: Phase::Running,
+            cancelled: false,
         })
     }
 
@@ -215,12 +270,25 @@ impl PacketSinkWorker {
             return 0;
         }
         self.stream_info_delivered = true;
-        let code = (self.sink.on_stream_info)(&self.infos);
-        if code < 0 {
-            self.pending_error = Some(PacketSinkError::StreamInfoCallbackFailed { code });
+        if let Err(cb) = self.sink.dispatch_stream_info(&self.infos) {
+            match callback_failure(cb, None) {
+                ProcessFailure::Cancelled => self.cancelled = true,
+                ProcessFailure::Sink(e) => {
+                    if self.pending_error.is_none() {
+                        self.pending_error = Some(e);
+                    }
+                }
+            }
             return AVERROR_EXTERNAL;
         }
         0
+    }
+
+    /// Whether delivery stopped via cooperative cancellation with no error
+    /// recorded (the worker then exits like a plain stop, publishing
+    /// nothing).
+    pub(crate) fn cancelled_cleanly(&self) -> bool {
+        self.cancelled && self.pending_error.is_none()
     }
 
     /// The first delivery-path error, for publication as the job error.
@@ -244,7 +312,11 @@ impl PacketSinkWorker {
     ) -> i32 {
         match self.process(out_fmt_ctx, packet_box) {
             Ok(()) => 0,
-            Err(e) => {
+            Err(ProcessFailure::Cancelled) => {
+                self.cancelled = true;
+                AVERROR_EXTERNAL
+            }
+            Err(ProcessFailure::Sink(e)) => {
                 if self.pending_error.is_none() {
                     self.pending_error = Some(e);
                 }
@@ -259,7 +331,7 @@ impl PacketSinkWorker {
         &mut self,
         out_fmt_ctx: *const AVFormatContext,
         packet_box: &mut PacketBox,
-    ) -> Result<(), PacketSinkError> {
+    ) -> Result<(), ProcessFailure> {
         debug_assert!(
             matches!(self.phase, Phase::Running),
             "packet processed after the terminal slot"
@@ -276,22 +348,24 @@ impl PacketSinkWorker {
         {
             let pkt_tb = (*pkt).time_base;
             if pkt_tb.num != stream_tb.num || pkt_tb.den != stream_tb.den {
-                return Err(PacketSinkError::PacketTimeBaseMismatch {
+                return Err(ProcessFailure::from(PacketSinkError::PacketTimeBaseMismatch {
                     stream_index,
                     packet_num: pkt_tb.num,
                     packet_den: pkt_tb.den,
                     stream_num: stream_tb.num,
                     stream_den: stream_tb.den,
-                });
+                }));
             }
         }
 
         // 2. S8: mid-stream configuration change detection over checked
         // side-data iteration.
         for entry in side_data::entries(pkt) {
-            let (sd_type, bytes) = entry.map_err(|reason| PacketSinkError::MalformedPacket {
-                stream_index,
-                reason,
+            let (sd_type, bytes) = entry.map_err(|reason| {
+                ProcessFailure::from(PacketSinkError::MalformedPacket {
+                    stream_index,
+                    reason,
+                })
             })?;
             if sd_type == AV_PKT_DATA_NEW_EXTRADATA {
                 self.streams[stream_index]
@@ -311,16 +385,16 @@ impl PacketSinkWorker {
         let orig_pts = (*pkt).pts;
         let orig_dts = (*pkt).dts;
         if orig_dts == AV_NOPTS_VALUE {
-            return Err(PacketSinkError::MissingTimestamp {
+            return Err(ProcessFailure::from(PacketSinkError::MissingTimestamp {
                 stream_index,
                 which: "dts",
-            });
+            }));
         }
         if orig_pts == AV_NOPTS_VALUE {
-            return Err(PacketSinkError::MissingTimestamp {
+            return Err(ProcessFailure::from(PacketSinkError::MissingTimestamp {
                 stream_index,
                 which: "pts",
-            });
+            }));
         }
 
         // Anchor the shared origin on the first delivered packet (delivery
@@ -331,10 +405,12 @@ impl PacketSinkWorker {
         let applied_offset = self.timeline.offset(stream_index);
         let pts = orig_pts
             .checked_sub(applied_offset)
-            .ok_or(PacketSinkError::TimestampOverflow { stream_index })?;
+            .ok_or(PacketSinkError::TimestampOverflow { stream_index })
+            .map_err(ProcessFailure::from)?;
         let dts = orig_dts
             .checked_sub(applied_offset)
-            .ok_or(PacketSinkError::TimestampOverflow { stream_index })?;
+            .ok_or(PacketSinkError::TimestampOverflow { stream_index })
+            .map_err(ProcessFailure::from)?;
         self.streams[stream_index]
             .timeline
             .observe(stream_index, pts, dts)?;
@@ -343,10 +419,10 @@ impl PacketSinkWorker {
         let size = (*pkt).size;
         let data_ptr = (*pkt).data;
         if data_ptr.is_null() || size <= 0 {
-            return Err(PacketSinkError::MalformedPacket {
+            return Err(ProcessFailure::from(PacketSinkError::MalformedPacket {
                 stream_index,
                 reason: "empty payload (a packet must carry one complete frame)".to_string(),
-            });
+            }));
         }
         let payload = std::slice::from_raw_parts(data_ptr, size as usize);
         let stream = &self.streams[stream_index];
@@ -362,7 +438,9 @@ impl PacketSinkWorker {
         let stream = &self.streams[stream_index];
         let mut duration = (*pkt).duration;
         if duration < 0 {
-            return Err(PacketSinkError::MissingDuration { stream_index });
+            return Err(ProcessFailure::from(PacketSinkError::MissingDuration {
+                stream_index,
+            }));
         }
         if duration == 0 {
             duration = match &stream.codec {
@@ -399,7 +477,9 @@ impl PacketSinkWorker {
             };
         }
         if duration <= 0 {
-            return Err(PacketSinkError::MissingDuration { stream_index });
+            return Err(ProcessFailure::from(PacketSinkError::MissingDuration {
+                stream_index,
+            }));
         }
 
         // 7. Deliver. The borrowed view (including `data`) dies with the call.
@@ -413,9 +493,8 @@ impl PacketSinkWorker {
             applied_offset,
             data,
         };
-        let code = (self.sink.on_packet)(&view);
-        if code < 0 {
-            return Err(PacketSinkError::PacketCallbackFailed { stream_index, code });
+        if let Err(cb) = self.sink.dispatch_packet(&view) {
+            return Err(callback_failure(cb, Some(stream_index)));
         }
         Ok(())
     }
@@ -441,12 +520,35 @@ impl PacketSinkWorker {
             return;
         }
         if let Some(e) = self.pending_error.take() {
-            (self.sink.on_error)(&e);
+            self.sink.dispatch_delivery_error(&e);
             return;
         }
         if ret >= 0 && all_streams_terminal && !task_error {
-            (self.sink.on_end)();
+            self.sink.dispatch_end();
         }
+    }
+}
+
+/// FFmpeg's textual channel-layout description (e.g. "stereo"), empty when
+/// the layout cannot be described.
+///
+/// # Safety
+/// - `codecpar` must be a valid, non-null `AVCodecParameters` with an
+///   initialized `ch_layout`, alive for the call.
+unsafe fn describe_channel_layout(codecpar: *const AVCodecParameters) -> String {
+    let mut buf = [0u8; 128];
+    let n = av_channel_layout_describe(
+        &(*codecpar).ch_layout,
+        buf.as_mut_ptr() as *mut libc::c_char,
+        buf.len(),
+    );
+    if n > 0 {
+        match std::ffi::CStr::from_bytes_until_nul(&buf) {
+            Ok(c) => c.to_string_lossy().into_owned(),
+            Err(_) => String::new(),
+        }
+    } else {
+        String::new()
     }
 }
 
@@ -565,7 +667,7 @@ fn check_param_change(
 mod tests {
     use super::*;
     use crate::core::context::PacketData;
-    use crate::core::packet_sink::{PacketSink, PacketSinkEvent};
+    use crate::core::packet_sink::{EncodedPacket, PacketSink, PacketSinkEvent};
     use ffmpeg_next::packet::Mut;
     use ffmpeg_sys_next::{
         av_guess_format, av_mallocz, av_packet_new_side_data, avformat_alloc_output_context2,
@@ -683,37 +785,37 @@ mod tests {
             events.clone(),
             events.clone(),
         );
-        let sink = PacketSink::builder()
-            .on_stream_info(move |infos| {
-                info_log
-                    .lock()
-                    .unwrap()
-                    .push(PacketSinkEvent::StreamInfo(infos.to_vec()));
-                0
-            })
-            .on_packet(move |view| {
-                pkt_log.lock().unwrap().push(PacketSinkEvent::Packet(
-                    crate::core::packet_sink::SinkPacket {
-                        stream_index: view.stream_index(),
-                        pts: view.pts(),
-                        dts: view.dts(),
-                        duration: view.duration(),
-                        time_base: view.time_base(),
-                        is_key: view.is_key(),
-                        applied_offset: view.applied_offset(),
-                        data: view.data().to_vec(),
-                    },
-                ));
-                0
-            })
-            .on_end(move || end_log.lock().unwrap().push(PacketSinkEvent::End))
-            .on_error(move |e| {
-                err_log
-                    .lock()
-                    .unwrap()
-                    .push(PacketSinkEvent::Error(e.clone()))
-            })
-            .build();
+        let sink = PacketSink::builder(move |view: &PacketView<'_>| {
+            pkt_log
+                .lock()
+                .unwrap()
+                .push(PacketSinkEvent::Packet(EncodedPacket {
+                    stream_index: view.stream_index(),
+                    pts: view.pts(),
+                    dts: view.dts(),
+                    duration: view.duration(),
+                    time_base: view.time_base(),
+                    is_key: view.is_key(),
+                    applied_offset: view.applied_offset(),
+                    data: view.data().to_vec(),
+                }));
+            Ok(())
+        })
+        .on_stream_info(move |infos| {
+            info_log
+                .lock()
+                .unwrap()
+                .push(PacketSinkEvent::StreamInfo(infos.to_vec()));
+            Ok(())
+        })
+        .on_end(move || end_log.lock().unwrap().push(PacketSinkEvent::End))
+        .on_delivery_error(move |e| {
+            err_log
+                .lock()
+                .unwrap()
+                .push(PacketSinkEvent::Error(e.clone()))
+        })
+        .build();
         (sink, events)
     }
 
@@ -739,7 +841,8 @@ mod tests {
     }
 
     fn collect(ctx: &TestCtx, sink: PacketSink) -> Result<PacketSinkWorker, PacketSinkError> {
-        unsafe { PacketSinkWorker::collect(ctx.ctx, ctx.stream_count(), sink) }
+        let status = Arc::new(AtomicUsize::new(0));
+        unsafe { PacketSinkWorker::collect(ctx.ctx, ctx.stream_count(), sink, &status) }
     }
 
     fn tb25() -> AVRational {
@@ -782,8 +885,11 @@ mod tests {
         assert_eq!(avcc[0], 1);
         assert_eq!(avcc[4] & 0x03, 3, "4-byte NAL length prefixes");
         assert!(avcc[5] & 0x1F >= 1, "at least one SPS");
-        assert_eq!(info.codec_name(), "h264");
-        assert_eq!(info.frame_rate(), Some(AVRational { num: 25, den: 1 }));
+        let video = info.video().expect("typed video configuration");
+        assert_eq!(video.codec_id(), AVCodecID::AV_CODEC_ID_H264);
+        assert!(video.codec_string().starts_with("avc1."));
+        assert_eq!(video.frame_rate(), Some(AVRational { num: 25, den: 1 }));
+        assert_eq!((video.width(), video.height()), (320, 240));
     }
 
     #[test]
@@ -1096,25 +1202,29 @@ mod tests {
         let ctx = video_ctx();
         let events: Arc<Mutex<Vec<PacketSinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let (end_log, err_log) = (events.clone(), events.clone());
-        let sink = PacketSink::builder()
-            .on_packet(|_| -7)
-            .on_end(move || end_log.lock().unwrap().push(PacketSinkEvent::End))
-            .on_error(move |e| {
-                err_log
-                    .lock()
-                    .unwrap()
-                    .push(PacketSinkEvent::Error(e.clone()))
-            })
-            .build();
+        let sink = PacketSink::builder(|_: &PacketView<'_>| {
+            Err(PacketCallbackError::new("test consumer failure"))
+        })
+        .on_end(move || end_log.lock().unwrap().push(PacketSinkEvent::End))
+        .on_delivery_error(move |e| {
+            err_log
+                .lock()
+                .unwrap()
+                .push(PacketSinkEvent::Error(e.clone()))
+        })
+        .build();
         let mut worker = collect(&ctx, sink).unwrap();
         let mut pb = packet(&idr_au(), 0, 0, tb25(), 0);
         let ret = unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) };
         assert_eq!(ret, AVERROR_EXTERNAL);
         assert_ne!(ret, ffmpeg_sys_next::AVERROR_EOF);
-        assert!(matches!(
-            worker.pending_error_cloned(),
-            Some(PacketSinkError::PacketCallbackFailed { code: -7, .. })
-        ));
+        match worker.pending_error_cloned() {
+            Some(PacketSinkError::PacketCallbackFailed {
+                stream_index: 0,
+                error,
+            }) => assert_eq!(error.to_string(), "test consumer failure"),
+            other => panic!("expected the typed callback failure, got {other:?}"),
+        }
 
         // Terminal slot: the stashed error fires on_error, never on_end —
         // even if every stream were terminal.
