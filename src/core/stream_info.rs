@@ -636,6 +636,7 @@ pub(crate) fn init_format_context(url: impl Into<String>) -> Result<FormatContex
     let url = url.into();
     // Test-only single-opening observability shares the demuxer open log:
     // probing APIs are input openings too.
+    #[cfg(test)]
     crate::core::context::ffmpeg_context::open_input::record_input_open(&url);
     let url_cstr = CString::new(url)?;
 
