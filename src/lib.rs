@@ -163,6 +163,8 @@ pub(crate) mod raw;
 
 pub use self::core::analysis;
 pub use self::core::capabilities;
+#[cfg(feature = "cli")]
+pub use self::core::cli;
 pub use self::core::codec;
 pub use self::core::container_info;
 pub use self::core::context::ffmpeg_context::FfmpegContext;

@@ -81,6 +81,7 @@ subtitle = [
     "dep:unicode-linebreak",
 ]
 static = ["ffmpeg-next/static"]
+cli = []
 
 [package.metadata.docs.rs]
 # docs.rs sets the `DOCS_RS` env var; `build.rs` turns it into `--cfg docsrs`,
