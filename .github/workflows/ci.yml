@@ -154,7 +154,7 @@ jobs:
       # compile-time signature pins (e.g. the opengl typed-error fn-pointer
       # bindings) that only a test build type-checks. `--no-run` is headless-safe.
       - name: Build tests (all features, no run)
-        run: cargo test --lib --all-features ${{ matrix.ffmpeg-features }} --no-run
+        run: cargo test --lib --tests --all-features ${{ matrix.ffmpeg-features }} --no-run
 
       # The crate's default feature set is empty (`default = []`), yet every job
       # here builds `--all-features`; this proves the no-feature build and its cfg
@@ -243,7 +243,7 @@ jobs:
           key: ${{ runner.os }}-cargo-sources-v1-${{ hashFiles('**/Cargo.toml') }}
 
       - name: Test
-        run: cargo test --lib --test build_probe --test builder_option_validation --test frame_export_test --test frame_export_uniform_test --test frame_export_audio_test --test hls_fmp4 --test video_writer --test rawvideo_seek_gating --features async,rtmp,flv,subtitle,wgpu ${{ matrix.ffmpeg-features }}
+        run: cargo test --lib --test build_probe --test builder_option_validation --test frame_export_test --test frame_export_uniform_test --test frame_export_audio_test --test hls_fmp4 --test video_writer --test rawvideo_seek_gating --test per_output_video_filter --features async,rtmp,flv,subtitle,wgpu ${{ matrix.ffmpeg-features }}
 
       - name: Doctests
         run: cargo test --doc --features async,rtmp,flv,subtitle,wgpu ${{ matrix.ffmpeg-features }}
@@ -427,7 +427,7 @@ jobs:
         run: cargo build --features "${{ matrix.build_features }}" --verbose
 
       - name: Build all non-static feature tests
-        run: cargo test --lib --features "${{ matrix.build_features }}" --no-run
+        run: cargo test --lib --tests --features "${{ matrix.build_features }}" --no-run
 
       # This keeps the crate's own default feature set empty while carrying only
       # the dependency feature needed to provision source-built FFmpeg 8.1 on
@@ -440,7 +440,7 @@ jobs:
       # hardware-encoder tests stay compile-only. The remaining suite exercises
       # the platform scheduler, device, socket, RTMP, subtitle, and async paths.
       - name: Run CPU-only library tests
-        run: cargo test --lib --test build_probe --test builder_option_validation --test frame_export_test --test frame_export_uniform_test --test frame_export_audio_test --test hls_fmp4 --test video_writer --test rawvideo_seek_gating --features "${{ matrix.test_features }}" ${{ matrix.test_args }}
+        run: cargo test --lib --test build_probe --test builder_option_validation --test frame_export_test --test frame_export_uniform_test --test frame_export_audio_test --test hls_fmp4 --test video_writer --test rawvideo_seek_gating --test per_output_video_filter --features "${{ matrix.test_features }}" ${{ matrix.test_args }}
 
   docs:
     name: Docs (docsrs cfg compile)
