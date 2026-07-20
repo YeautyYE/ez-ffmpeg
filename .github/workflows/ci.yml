@@ -243,7 +243,13 @@ jobs:
           key: ${{ runner.os }}-cargo-sources-v1-${{ hashFiles('**/Cargo.toml') }}
 
       - name: Test
-        run: cargo test --lib --test build_probe --test builder_option_validation --test frame_export_test --test frame_export_uniform_test --test frame_export_audio_test --test hls_fmp4 --test video_writer --test rawvideo_seek_gating --test per_output_video_filter --features async,rtmp,flv,subtitle,wgpu ${{ matrix.ffmpeg-features }}
+        run: cargo test --lib --test build_probe --test builder_option_validation --test frame_export_test --test frame_export_uniform_test --test frame_export_audio_test --test hls_fmp4 --test video_writer --test rawvideo_seek_gating --test per_output_video_filter --test packet_sink --test packet_sink_negative --test packet_sink_teardown --features async,rtmp,flv,subtitle,wgpu ${{ matrix.ffmpeg-features }}
+
+      # The packet-sink examples are API surface: keep them compiling on the
+      # runtime lane (native-AAC cases in the suites above do real work even
+      # without libx264; x264 cases self-skip at runtime).
+      - name: Check packet-sink examples
+        run: cargo check --example packet_sink_avc --example packet_sink_aac_channel --example packet_sink_av_transport ${{ matrix.ffmpeg-features }}
 
       - name: Doctests
         run: cargo test --doc --features async,rtmp,flv,subtitle,wgpu ${{ matrix.ffmpeg-features }}
@@ -440,7 +446,10 @@ jobs:
       # hardware-encoder tests stay compile-only. The remaining suite exercises
       # the platform scheduler, device, socket, RTMP, subtitle, and async paths.
       - name: Run CPU-only library tests
-        run: cargo test --lib --test build_probe --test builder_option_validation --test frame_export_test --test frame_export_uniform_test --test frame_export_audio_test --test hls_fmp4 --test video_writer --test rawvideo_seek_gating --test per_output_video_filter --features "${{ matrix.test_features }}" ${{ matrix.test_args }}
+        run: cargo test --lib --test build_probe --test builder_option_validation --test frame_export_test --test frame_export_uniform_test --test frame_export_audio_test --test hls_fmp4 --test video_writer --test rawvideo_seek_gating --test per_output_video_filter --test packet_sink --test packet_sink_negative --test packet_sink_teardown --features "${{ matrix.test_features }}" ${{ matrix.test_args }}
+
+      - name: Check packet-sink examples
+        run: cargo check --example packet_sink_avc --example packet_sink_aac_channel --example packet_sink_av_transport --features "${{ matrix.test_features }}"
 
   docs:
     name: Docs (docsrs cfg compile)
@@ -522,4 +531,4 @@ jobs:
             --test shortest --test frame_pipeline_hardening \
             --test build_probe --test frame_export_test \
             --test frame_export_uniform_test --test frame_export_audio_test \
-            --test video_writer
+            --test video_writer --test packet_sink_teardown
