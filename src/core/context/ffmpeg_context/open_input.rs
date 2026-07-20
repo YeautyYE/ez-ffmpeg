@@ -98,6 +98,22 @@ pub(super) fn open_input_files(
     Ok(demuxs)
 }
 
+/// Test-only observability: every input opening records its URL. Regressions
+/// use it to PROVE single-opening properties — e.g. the CLI layer's `-vf`
+/// uniqueness gate must validate on the pipeline's own demuxer instead of a
+/// second probe opening. Entries are URL-keyed and tests use unique paths,
+/// so concurrently running tests do not disturb each other's counts.
+#[cfg(test)]
+pub(crate) static INPUT_OPEN_LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn record_input_open(url: &str) {
+    INPUT_OPEN_LOG.lock().unwrap().push(url.to_string());
+}
+
+#[cfg(not(test))]
+pub(crate) fn record_input_open(_url: &str) {}
+
 #[cfg(docsrs)]
 unsafe fn open_input_file(
     index: usize,
@@ -115,6 +131,9 @@ unsafe fn open_input_file(
     copy_ts: bool,
     interrupt_state: &Arc<crate::core::context::InterruptState>,
 ) -> Result<Demuxer> {
+    if let Some(url) = &input.url {
+        record_input_open(url);
+    }
     // Deferred validation of stored builder options (the setters are
     // infallible and store values as given, like every other option).
     if let Some((num, den)) = input.framerate {

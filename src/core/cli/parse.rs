@@ -366,7 +366,10 @@ impl Parser {
                 output.frames_v = Some(1);
             }
             "-vf" => set_once_str(&mut output.video_filter, name, value, index)?,
-            "-map" => output.maps.push(value),
+            "-map" => {
+                output.maps.push(value);
+                output.map_indexes.push(index);
+            }
             "-movflags" => {
                 dup_check(output.movflags_faststart, name, index)?;
                 output.movflags_faststart = true;
@@ -425,14 +428,26 @@ fn display_span(ir: &CliIr, name: &str) -> Option<usize> {
     // a fixed priority: `-hls_*` covers the four hls keys, and the synthetic
     // `-c` (from the unqualified-map × per-media-copy conflict) covers
     // whichever of -c:v / -c:a appeared first.
-    let candidates: &[&str] = match base {
-        "-hls_*" => &[
+    let candidates: Vec<&str> = match base {
+        "-hls_*" => vec![
             "out:-hls_time",
             "out:-hls_playlist_type",
             "out:-hls_list_size",
             "out:-hls_segment_filename",
         ],
-        "-c" => &["out:-c:v", "out:-c:a"],
+        // The synthetic `-c copy`: only the occurrences whose VALUE is
+        // actually `copy` participate — `-c:v libx264 -c:a copy` must anchor
+        // the -c:a token, not the earlier non-copy -c:v.
+        "-c" => {
+            let mut keys = Vec::new();
+            if ir.output.video_copy {
+                keys.push("out:-c:v");
+            }
+            if ir.output.audio_copy {
+                keys.push("out:-c:a");
+            }
+            keys
+        }
         _ => {
             return ir
                 .span(&format!("out:{base}"))
@@ -578,27 +593,35 @@ fn check_combinations(ir: &CliIr) -> Result<(), CliError> {
     // with that media type's copy flag statically; an unqualified index map
     // (`0`, `0:1`) cannot — the CLI would resolve the stream's type by
     // probing, which classification must not depend on.
-    for map in &out.maps {
+    for (position, map) in out.maps.iter().enumerate() {
+        // Anchor the OFFENDING occurrence, not the first map: the span table
+        // only keeps the first `-map`, so per-occurrence indexes ride the IR.
+        let map_conflict = |second: &str, reason: &str| {
+            Err(CliError::ConflictingOptions {
+                first: "-map".to_string(),
+                second: second.to_string(),
+                first_index: out.map_indexes.get(position).copied(),
+                second_index: display_span(ir, second),
+                reason: reason.to_string(),
+            })
+        };
         let media = map.split(':').nth(1).and_then(|s| s.chars().next());
         let qualified = matches!(media, Some('v') | Some('a'));
         if !qualified && (out.video_copy || out.audio_copy) {
-            return conflict(
-                "-map",
+            return map_conflict(
                 "-c copy",
                 "an index-only map cannot be classified against per-media copy without \
                  probing the input; use media-qualified maps (0:v… / 0:a…)",
             );
         }
         if media == Some('v') && out.video_disabled {
-            return conflict(
-                "-map",
+            return map_conflict(
                 "-vn",
                 "contradictory: the map selects a video stream that -vn removes",
             );
         }
         if media == Some('a') && out.audio_disabled {
-            return conflict(
-                "-map",
+            return map_conflict(
                 "-an",
                 "contradictory: the map selects an audio stream that -an removes",
             );

@@ -78,7 +78,7 @@ use std::sync::Arc;
 mod fg_bind;
 #[cfg(not(docsrs))]
 mod fg_probe;
-mod open_input;
+pub(crate) mod open_input;
 mod open_output;
 mod opt_util;
 mod writer_build;

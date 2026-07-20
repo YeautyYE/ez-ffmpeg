@@ -258,10 +258,14 @@ fn facade_built_pipelines_arm_strict_mode_at_the_leftover_sites() {
     }
 
     // Contrast: the same pipeline built through the plain builder stays
-    // lenient (never break userspace).
+    // lenient (never break userspace). Codec-independent on purpose: the
+    // video-only fixture goes to an explicit MPEG-4 MP4 output, so the
+    // assertion is reached even on minimal FFmpeg builds without an H.264
+    // encoder (a bare .m4a target would auto-select h264 for the video
+    // stream and die in EncoderUnavailable before asserting anything).
     let context = FfmpegContext::builder()
         .input(Input::from(mp4_fixture("facade_lenient_in.mp4")))
-        .output(Output::from(tmp_path("facade_lenient_out.m4a").as_str()).set_audio_codec("aac"))
+        .output(Output::from(tmp_path("facade_lenient_out.mp4").as_str()).set_video_codec("mpeg4"))
         .build()
         .unwrap();
     assert!(

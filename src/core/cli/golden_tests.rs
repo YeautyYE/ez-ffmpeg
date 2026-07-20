@@ -969,6 +969,76 @@ fn vf_uniqueness_is_checked_on_the_executed_opening() {
     }
 }
 
+/// Mechanism proof for the uniqueness gate: building a `-vf` command through
+/// the facade must open its input EXACTLY ONCE. The retired implementation
+/// probed with `find_all_stream_infos` and then built — two openings — and
+/// this assertion fails against it (verified on the pre-fix commit in a
+/// scratch worktree; see the disposition table). URL-keyed counting keeps
+/// concurrent tests out of each other's tallies.
+#[test]
+fn vf_uniqueness_gate_opens_the_input_exactly_once() {
+    let dir = tmp_dir("single_opening");
+    let fixture = dir
+        .join("single_opening_probe.mp4")
+        .to_string_lossy()
+        .into_owned();
+    if !std::path::Path::new(&fixture).exists() {
+        run_context(
+            FfmpegContext::builder()
+                .input(Input::from("testsrc2=size=320x240:rate=30:duration=1").set_format("lavfi"))
+                .output(Output::from(fixture.as_str()).set_video_codec("mpeg4"))
+                .build()
+                .unwrap(),
+            "single-opening fixture",
+        );
+    }
+    let opens_of = |path: &str| {
+        crate::core::context::ffmpeg_context::open_input::INPUT_OPEN_LOG
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|url| url.as_str() == path)
+            .count()
+    };
+    let before = opens_of(&fixture);
+    let out = dir.join("scaled.mp4").to_string_lossy().into_owned();
+    let args: Vec<String> = [
+        "-i",
+        fixture.as_str(),
+        "-vf",
+        "scale=64:-2",
+        "-c:v",
+        "libx264",
+        "-crf",
+        "23",
+        "-preset",
+        "fast",
+        "-c:a",
+        "aac",
+        "-y",
+        out.as_str(),
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    match from_cli_args(&args) {
+        Ok(context) => {
+            drop(context);
+            assert!(linked_profile_verified());
+            assert_eq!(
+                opens_of(&fixture) - before,
+                1,
+                "the uniqueness gate must ride the pipeline's single opening"
+            );
+        }
+        Err(CliError::UnverifiedRuntimeProfile { .. }) if !linked_profile_verified() => {
+            // The profile gate fires before any I/O: zero openings.
+            assert_eq!(opens_of(&fixture) - before, 0);
+        }
+        Err(other) => panic!("single-video -vf build failed unexpectedly: {other}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // V4 helpers.
 // ---------------------------------------------------------------------------

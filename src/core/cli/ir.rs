@@ -89,6 +89,10 @@ pub(crate) struct OutputIr {
     pub(crate) video_filter: Option<String>,
     /// `-map` values, basic index form only (`0`, `0:v`, `0:a:1`, …).
     pub(crate) maps: Vec<String>,
+    /// Argv index of each `-map` OPTION token, parallel to `maps` — the
+    /// accumulate policy keeps only the first shared span in the span table,
+    /// so per-occurrence conflicts anchor through this instead.
+    pub(crate) map_indexes: Vec<usize>,
     /// Exact `-movflags +faststart`.
     pub(crate) movflags_faststart: bool,
     /// `-hls_time`, seconds as spelled.
