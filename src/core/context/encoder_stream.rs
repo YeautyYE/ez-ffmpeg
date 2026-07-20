@@ -49,6 +49,9 @@ pub(crate) struct EncoderStream {
     /// `-shortest` sync-queue handle; `None` unless the mux built `sq_enc` and this
     /// stream is an encoded-A/V member. Set by the scheduler before `enc_init`.
     sync_queue: Option<EncSyncHandle>,
+    /// CLI-compat strict mode: encoder-option leftovers error instead of
+    /// warning (set from the owning muxer).
+    pub(crate) strict_avoptions: bool,
 }
 
 impl EncoderStream {
@@ -64,6 +67,7 @@ impl EncoderStream {
         dst: Sender<PacketBox>,
         dst_pre: PreMuxQueueSender,
         mux_start_gate: Arc<crate::core::context::MuxStartGate>,
+        strict_avoptions: bool,
     ) -> Self {
         Self {
             stream_index,
@@ -78,6 +82,7 @@ impl EncoderStream {
             dst_pre: Some(dst_pre),
             mux_start_gate: Some(mux_start_gate),
             sync_queue: None,
+            strict_avoptions,
         }
     }
 

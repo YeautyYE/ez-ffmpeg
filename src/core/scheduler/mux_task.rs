@@ -152,6 +152,7 @@ pub(crate) fn mux_init(
         mux.recording_time_us,
         mux.stream_count(),
         mux.format_opts.clone(),
+        mux.strict_avoptions,
         mux.bsf_chains.clone(),
         packet_sink,
         mux.mux_start_gate(),
@@ -215,6 +216,7 @@ pub(crate) fn ready_to_init_mux(
         let nb_streams_ready = mux.nb_streams_ready.clone();
         let enc_registered = mux.enc_registered.clone();
         let format_opts = mux.format_opts.clone();
+        let strict_avoptions = mux.strict_avoptions;
         let bsf_chains = mux.bsf_chains.clone();
 
         let result = std::thread::Builder::new().name(format!("ready-to-init-muxer{mux_idx}")).spawn(move || {
@@ -324,6 +326,7 @@ pub(crate) fn ready_to_init_mux(
                         recording_time_us,
                         stream_count,
                         format_opts,
+                        strict_avoptions,
                         bsf_chains,
                         packet_sink.take(),
                         mux_start_gate,
@@ -401,6 +404,7 @@ fn mux_task_start(
     recording_time_us: Option<i64>,
     stream_count: usize,
     format_opts: Option<HashMap<CString, CString>>,
+    strict_avoptions: bool,
     bsf_chains: StreamBsfChains,
     packet_sink: Option<crate::core::packet_sink::PacketSink>,
     mux_start_gate: Arc<crate::core::context::MuxStartGate>,
@@ -483,6 +487,7 @@ fn mux_task_start(
         recording_time_us,
         stream_count,
         format_opts,
+        strict_avoptions,
         bsf_chains,
         packet_sink,
         interrupt_state,
@@ -555,6 +560,7 @@ fn _mux_init(
     recording_time_us: Option<i64>,
     stream_count: usize,
     format_opts: Option<HashMap<CString, CString>>,
+    strict_avoptions: bool,
     bsf_chains: StreamBsfChains,
     packet_sink: Option<crate::core::packet_sink::PacketSink>,
     interrupt_state: Arc<crate::core::context::InterruptState>,
@@ -782,6 +788,30 @@ fn _mux_init(
         }
 
         for key in opts.leftover_keys() {
+            if strict_avoptions {
+                let err = crate::error::Error::UnconsumedCliOption {
+                    site: format!("the muxer of output {mux_idx}"),
+                    option: key.clone(),
+                };
+                // Same teardown order as the write_header failure above: publish,
+                // join this muxer's encoders, free the context, release the slot.
+                fail_mux_init(
+                    &scheduler_status,
+                    &scheduler_result,
+                    MuxInitQueues {
+                        pkt_receiver: pkt_receiver.take(),
+                        pre_receivers: src_pre_receivers,
+                    },
+                    guard,
+                    slot_guard,
+                    crate::error::Error::UnconsumedCliOption {
+                        site: format!("the muxer of output {mux_idx}"),
+                        option: key,
+                    },
+                    None,
+                );
+                return Err(err);
+            }
             warn!("Option '{key}' was not recognized by output {mux_idx}");
         }
     }

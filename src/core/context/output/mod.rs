@@ -397,6 +397,12 @@ pub struct Output {
     /// Only effective when re-encoding (not when using stream copy).
     pub(crate) pix_fmt: Option<String>,
 
+    /// CLI-compat strict mode (crate-internal): leftover AVOptions error
+    /// instead of warning on every component this output drives (muxer,
+    /// encoders). Set only by the `cli` feature's entry points; the default
+    /// builder path keeps today's warn behavior.
+    pub(crate) strict_avoptions: bool,
+
     /// Per-output simple **video** filter chain (FFmpeg `-vf`), applied to
     /// this output's re-encoded video stream through the implicit per-output
     /// filtergraph (it replaces the default `null` chain). Must be a linear
@@ -498,6 +504,7 @@ impl Output {
             subtitle_disable: false,
             data_disable: false,
             pix_fmt: None,
+            strict_avoptions: false,
             video_filter: None,
             sws_opts: None,
             swr_opts: None,

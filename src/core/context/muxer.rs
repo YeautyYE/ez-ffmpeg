@@ -199,6 +199,11 @@ pub(crate) struct Muxer {
     // Parsed from string in open_output_file, stored as AVPixelFormat
     pub(crate) pix_fmt: Option<ffmpeg_sys_next::AVPixelFormat>,
 
+    /// CLI-compat strict mode: forwarded from `Output::strict_avoptions` to
+    /// the mux worker (muxer leftovers) and every `EncoderStream` (encoder
+    /// leftovers).
+    pub(crate) strict_avoptions: bool,
+
     /// Per-output simple video filter chain (`Output::set_video_filter`,
     /// FFmpeg `-vf`). Consumed by `init_simple_filtergraph`, which uses it in
     /// place of the default `null` chain for this output's video stream.
@@ -328,6 +333,7 @@ impl Muxer {
         subtitle_disable: bool,
         data_disable: bool,
         pix_fmt: Option<ffmpeg_sys_next::AVPixelFormat>,
+        strict_avoptions: bool,
         video_filter: Option<String>,
         pre_mux_queue_config: PreMuxQueueConfig,
         sws_opts: Option<String>,
@@ -395,6 +401,7 @@ impl Muxer {
             subtitle_disable,
             data_disable,
             pix_fmt,
+            strict_avoptions,
             video_filter,
             video_filter_bound: false,
             sws_opts,
@@ -520,6 +527,7 @@ impl Muxer {
             packet_sender,
             pre_packet_sender,
             self.mux_start_gate.clone(),
+            self.strict_avoptions,
         );
         self.streams.push(stream);
         Ok((frame_sender, stream_index))

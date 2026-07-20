@@ -143,6 +143,7 @@ impl Demuxer {
         ts_scale: f64,
         framerate: AVRational,
         log_level_offset: i32,
+        strict_avoptions: bool,
     ) -> crate::error::Result<Self> {
         // `in_fmt_ctx` is owned here: if `init_streams` fails, it drops exactly
         // once (input-side free), which is why no external guard is needed across
@@ -161,6 +162,7 @@ impl Demuxer {
             hwaccel_output_format,
             framerate,
             log_level_offset,
+            strict_avoptions,
         )?;
 
         Ok(Self {
@@ -204,6 +206,7 @@ impl Demuxer {
         hwaccel_output_format: Option<String>,
         forced_framerate: AVRational,
         log_level_offset: i32,
+        strict_avoptions: bool,
     ) -> crate::error::Result<Vec<DecoderStream>> {
         unsafe {
             let stream_count = (*fmt_ctx).nb_streams;
@@ -287,6 +290,7 @@ impl Demuxer {
                     hwaccel_device,
                     hwaccel_output_format,
                     log_level_offset,
+                    strict_avoptions,
                 );
                 streams.push(stream);
             }
