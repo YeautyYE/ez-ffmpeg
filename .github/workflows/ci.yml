@@ -243,7 +243,7 @@ jobs:
           key: ${{ runner.os }}-cargo-sources-v1-${{ hashFiles('**/Cargo.toml') }}
 
       - name: Test
-        run: cargo test --lib --test build_probe --test builder_option_validation --test frame_export_test --test frame_export_uniform_test --test frame_export_audio_test --test hls_fmp4 --test video_writer --test rawvideo_seek_gating --test per_output_video_filter --test packet_sink --test packet_sink_negative --test packet_sink_teardown --test packet_sink_unwind --features async,rtmp,flv,subtitle,wgpu ${{ matrix.ffmpeg-features }}
+        run: cargo test --lib --test build_probe --test builder_option_validation --test frame_export_test --test frame_export_uniform_test --test frame_export_audio_test --test hls_fmp4 --test video_writer --test rawvideo_seek_gating --test per_output_video_filter --test packet_sink --test packet_sink_negative --test packet_sink_teardown --test packet_sink_unwind --test cli_emit_hardening --features async,rtmp,flv,subtitle,wgpu,cli ${{ matrix.ffmpeg-features }}
 
       # The packet-sink examples are API surface: keep them compiling on the
       # runtime lane (native-AAC cases in the suites above do real work even
@@ -252,7 +252,77 @@ jobs:
         run: cargo check --example packet_sink_avc --example packet_sink_aac_channel --example packet_sink_av_transport ${{ matrix.ffmpeg-features }}
 
       - name: Doctests
-        run: cargo test --doc --features async,rtmp,flv,subtitle,wgpu ${{ matrix.ffmpeg-features }}
+        run: cargo test --doc --features async,rtmp,flv,subtitle,wgpu,cli ${{ matrix.ffmpeg-features }}
+
+  cli-goldens:
+    # Strict semantic-golden lane for the cli feature: builds a
+    # version-matched FFmpeg WITH programs and libx264 (GPL is fine for CI
+    # testing; nothing GPL ships in the crate) and runs the golden suite with
+    # EZ_FFMPEG_CLI pointing at that binary, so a skip IS a failure. The
+    # verified-profile table only lists lines whose lane has passed here:
+    # 7.1 today. An 8.1 row is a matrix addition (same recipe, release/8.1
+    # branch and an ffmpeg81full cache key) once the build matrix carries it.
+    name: CLI goldens (FFmpeg ${{ matrix.ffmpeg }}, strict)
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ffmpeg: "7.1"
+            branch: release/7.1
+            prefix: ffmpeg71full
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install FFmpeg build toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            nasm yasm clang pkg-config make git zlib1g-dev libx264-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache FFmpeg ${{ matrix.ffmpeg }} full install
+        uses: actions/cache@v6
+        with:
+          path: ~/${{ matrix.prefix }}
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ matrix.prefix }}-shared-v1
+
+      - name: Build FFmpeg ${{ matrix.ffmpeg }} with programs (if not cached)
+        run: |
+          if [ ! -x "$HOME/${{ matrix.prefix }}/bin/ffmpeg" ]; then
+            git clone --depth=1 -b ${{ matrix.branch }} https://github.com/FFmpeg/FFmpeg ffmpeg-golden-src
+            cd ffmpeg-golden-src
+            ./configure --prefix="$HOME/${{ matrix.prefix }}" \
+                        --disable-doc \
+                        --disable-static --enable-shared \
+                        --enable-gpl --enable-libx264
+            make -j"$(nproc)"
+            make install
+          fi
+
+      - name: Point pkg-config at the golden FFmpeg
+        run: |
+          echo "PKG_CONFIG_PATH=$HOME/${{ matrix.prefix }}/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$HOME/${{ matrix.prefix }}/lib" >> "$GITHUB_ENV"
+
+      - name: Cache cargo sources
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-sources-v1-${{ hashFiles('**/Cargo.toml') }}
+
+      - name: Build the pinned emitted examples
+        run: cargo build --features cli --examples
+
+      - name: Run the cli suite with strict goldens
+        run: |
+          EZ_FFMPEG_CLI="$HOME/${{ matrix.prefix }}/bin/ffmpeg" cargo test --features cli --lib cli::
+
+      - name: Emit-hardening integration tests
+        run: cargo test --features cli --test cli_emit_hardening
 
   platform:
     name: Platform (${{ matrix.platform }}, FFmpeg ${{ matrix.ffmpeg }})
