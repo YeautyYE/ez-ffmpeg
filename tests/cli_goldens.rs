@@ -134,12 +134,9 @@ fn av_fixture(name: &str) -> String {
     }
     run(
         FfmpegContext::builder()
+            .input(Input::from("testsrc2=size=320x240:rate=30:duration=16").set_format("lavfi"))
             .input(
-                Input::from("testsrc2=size=320x240:rate=30:duration=16").set_format("lavfi"),
-            )
-            .input(
-                Input::from("sine=frequency=440:sample_rate=44100:duration=16")
-                    .set_format("lavfi"),
+                Input::from("sine=frequency=440:sample_rate=44100:duration=16").set_format("lavfi"),
             )
             .output(
                 Output::from(path.as_str())
@@ -166,12 +163,10 @@ fn multi_audio_fixture(name: &str) -> String {
         FfmpegContext::builder()
             .input(Input::from("testsrc2=size=320x240:rate=30:duration=4").set_format("lavfi"))
             .input(
-                Input::from("sine=frequency=440:sample_rate=44100:duration=4")
-                    .set_format("lavfi"),
+                Input::from("sine=frequency=440:sample_rate=44100:duration=4").set_format("lavfi"),
             )
             .input(
-                Input::from("anullsrc=channel_layout=stereo:sample_rate=48000")
-                    .set_format("lavfi"),
+                Input::from("anullsrc=channel_layout=stereo:sample_rate=48000").set_format("lavfi"),
             )
             .output(
                 Output::from(path.as_str())
@@ -263,11 +258,19 @@ fn summarize(path: &str) -> Vec<StreamSummary> {
 fn assert_same_media(ours: &str, theirs: &str) {
     let a = summarize(ours);
     let b = summarize(theirs);
-    assert_eq!(a.len(), b.len(), "stream count differs ({ours} vs {theirs})");
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "stream count differs ({ours} vs {theirs})"
+    );
     for (i, (x, y)) in a.iter().zip(&b).enumerate() {
         assert_eq!(x.kind, y.kind, "stream {i} type differs");
         assert_eq!(x.codec, y.codec, "stream {i} codec differs");
-        assert_eq!((x.width, x.height), (y.width, y.height), "stream {i} geometry differs");
+        assert_eq!(
+            (x.width, x.height),
+            (y.width, y.height),
+            "stream {i} geometry differs"
+        );
         assert_eq!(
             (x.sample_rate, x.channels),
             (y.sample_rate, y.channels),
@@ -408,13 +411,38 @@ fn golden_v3_audio_extract() {
         run_reference(
             &bin,
             &[
-                "-y", "-v", "error",
-                "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30:duration=4",
-                "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
-                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100:duration=4",
-                "-map", "0:v", "-map", "1:a", "-map", "2:a",
-                "-disposition:a:0", "0", "-disposition:a:1", "default",
-                "-c:v", "mpeg4", "-c:a", "aac", "-t", "4", &fixture_b,
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x240:rate=30:duration=4",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=channel_layout=stereo:sample_rate=48000",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=44100:duration=4",
+                "-map",
+                "0:v",
+                "-map",
+                "1:a",
+                "-map",
+                "2:a",
+                "-disposition:a:0",
+                "0",
+                "-disposition:a:1",
+                "default",
+                "-c:v",
+                "mpeg4",
+                "-c:a",
+                "aac",
+                "-t",
+                "4",
+                &fixture_b,
             ]
             .iter()
             .map(|s| s.to_string())
@@ -443,10 +471,22 @@ fn golden_v4_thumbnail() {
     let out_ours = tmp_path("golden_v4_ours.jpg");
     let out_theirs = tmp_path("golden_v4_theirs.jpg");
     let args = |out: &str| -> Vec<String> {
-        ["-ss", "5", "-i", &fixture, "-an", "-c:v", "mjpeg", "-frames:v", "1", "-y", out]
-            .iter()
-            .map(|s| s.to_string())
-            .collect()
+        [
+            "-ss",
+            "5",
+            "-i",
+            &fixture,
+            "-an",
+            "-c:v",
+            "mjpeg",
+            "-frames:v",
+            "1",
+            "-y",
+            out,
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
     };
     let bin = match cli_gate() {
         CliGate::Run { bin } => bin,
@@ -502,10 +542,7 @@ fn decode_rgb(path: &str) -> (Vec<u8>, (u32, u32)) {
         .unwrap_or_else(|e| panic!("decoding {path} failed: {e}"));
     assert_eq!(frames.len(), 1, "{path} must contain exactly one frame");
     let frame = &frames[0];
-    (
-        frame.as_bytes().to_vec(),
-        (frame.width(), frame.height()),
-    )
+    (frame.as_bytes().to_vec(), (frame.width(), frame.height()))
 }
 
 /// Full libavcodec triple of the reference binary, from its version banner.
@@ -540,8 +577,20 @@ fn golden_v5_scale() {
     let out_theirs = tmp_path("golden_v5_theirs.mp4");
     let args = |out: &str| -> Vec<String> {
         [
-            "-i", &fixture, "-vf", "scale=192:-2", "-c:v", "libx264", "-crf", "23", "-preset",
-            "fast", "-c:a", "aac", "-y", out,
+            "-i",
+            &fixture,
+            "-vf",
+            "scale=192:-2",
+            "-c:v",
+            "libx264",
+            "-crf",
+            "23",
+            "-preset",
+            "fast",
+            "-c:a",
+            "aac",
+            "-y",
+            out,
         ]
         .iter()
         .map(|s| s.to_string())
@@ -613,10 +662,16 @@ fn golden_v6_hls() {
     let theirs = parse_playlist(&format!("{dir_theirs}/out.m3u8"));
 
     // HLS-specific oracle: playlist tags, topology, naming, ENDLIST.
-    assert!(ours.vod, "crate playlist must declare EXT-X-PLAYLIST-TYPE:VOD");
+    assert!(
+        ours.vod,
+        "crate playlist must declare EXT-X-PLAYLIST-TYPE:VOD"
+    );
     assert!(theirs.vod, "reference playlist must declare VOD");
     assert!(ours.endlist, "crate playlist must end with EXT-X-ENDLIST");
-    assert!(theirs.endlist, "reference playlist must end with EXT-X-ENDLIST");
+    assert!(
+        theirs.endlist,
+        "reference playlist must end with EXT-X-ENDLIST"
+    );
     assert!(
         ours.segments.len() >= 2,
         "the 16s fixture must produce multiple segments, got {:?}",
@@ -626,7 +681,10 @@ fn golden_v6_hls() {
         ours.segments, theirs.segments,
         "segment topology/naming must match the CLI"
     );
-    assert_eq!(ours.target_duration, theirs.target_duration, "EXT-X-TARGETDURATION differs");
+    assert_eq!(
+        ours.target_duration, theirs.target_duration,
+        "EXT-X-TARGETDURATION differs"
+    );
     assert_eq!(
         ours.durations.len(),
         theirs.durations.len(),
@@ -657,9 +715,12 @@ struct Playlist {
 }
 
 fn parse_playlist(path: &str) -> Playlist {
-    let text = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("playlist {path} unreadable: {e}"));
-    assert!(text.starts_with("#EXTM3U"), "{path} is not an m3u8 playlist");
+    let text =
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("playlist {path} unreadable: {e}"));
+    assert!(
+        text.starts_with("#EXTM3U"),
+        "{path} is not an m3u8 playlist"
+    );
     let mut playlist = Playlist {
         vod: false,
         endlist: false,

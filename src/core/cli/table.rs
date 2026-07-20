@@ -150,12 +150,28 @@ pub(crate) const OPTION_TABLE: &[OptSpec] = &[
     value("-frames:v", ScopeRule::OutputOnly, ValueRule::FramesOne),
     value("-vf", ScopeRule::OutputOnly, ValueRule::ScaleFilter),
     value("-map", ScopeRule::OutputOnly, ValueRule::MapBasic),
-    value("-movflags", ScopeRule::OutputOnly, ValueRule::MovflagsFaststart),
+    value(
+        "-movflags",
+        ScopeRule::OutputOnly,
+        ValueRule::MovflagsFaststart,
+    ),
     // Single-rendition VOD HLS.
     value("-hls_time", ScopeRule::OutputOnly, ValueRule::HlsTime),
-    value("-hls_playlist_type", ScopeRule::OutputOnly, ValueRule::HlsPlaylistVod),
-    value("-hls_list_size", ScopeRule::OutputOnly, ValueRule::HlsListSizeZero),
-    value("-hls_segment_filename", ScopeRule::OutputOnly, ValueRule::Path),
+    value(
+        "-hls_playlist_type",
+        ScopeRule::OutputOnly,
+        ValueRule::HlsPlaylistVod,
+    ),
+    value(
+        "-hls_list_size",
+        ScopeRule::OutputOnly,
+        ValueRule::HlsListSizeZero,
+    ),
+    value(
+        "-hls_segment_filename",
+        ScopeRule::OutputOnly,
+        ValueRule::Path,
+    ),
 ];
 
 pub(crate) fn lookup(name: &str) -> Option<&'static OptSpec> {
@@ -256,9 +272,7 @@ pub(crate) fn validate_value(
     };
 
     match rule {
-        ValueRule::Seconds => {
-            parse_seconds_us(value).map(|_| ()).map_err(fail)
-        }
+        ValueRule::Seconds => parse_seconds_us(value).map(|_| ()).map_err(fail),
         ValueRule::Codec => {
             if !value.is_empty()
                 && value
@@ -332,7 +346,9 @@ pub(crate) fn validate_value(
             {
                 Ok(())
             } else {
-                Err(fail("container/demuxer names use [a-z0-9_] only".to_string()))
+                Err(fail(
+                    "container/demuxer names use [a-z0-9_] only".to_string(),
+                ))
             }
         }
         ValueRule::MovflagsFaststart => {
@@ -346,7 +362,9 @@ pub(crate) fn validate_value(
         }
         ValueRule::HlsTime => match parse_seconds_us(value) {
             Ok(us) if us > 0 => Ok(()),
-            _ => Err(fail("hls_time must be a positive decimal number of seconds".to_string())),
+            _ => Err(fail(
+                "hls_time must be a positive decimal number of seconds".to_string(),
+            )),
         },
         ValueRule::HlsPlaylistVod => {
             if value == "vod" {
@@ -476,8 +494,7 @@ fn validate_map_basic(value: &str) -> Result<(), String> {
     match (parts.next(), parts.next(), parts.next()) {
         (None, _, _) => Ok(()),
         (Some(sel), rest, None) => {
-            let stream_ok =
-                |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+            let stream_ok = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
             match sel {
                 "v" | "a" => match rest {
                     None => Ok(()),
@@ -541,7 +558,9 @@ mod tests {
         assert_eq!(parse_seconds_us("10").unwrap(), 10_000_000);
         assert_eq!(parse_seconds_us("2.5").unwrap(), 2_500_000);
         assert_eq!(parse_seconds_us("0").unwrap(), 0);
-        for bad in ["00:01:30", "-5", "+5", "10s", "1e3", "", ".", "1.", ".5", "1.2.3"] {
+        for bad in [
+            "00:01:30", "-5", "+5", "10s", "1e3", "", ".", "1.", ".5", "1.2.3",
+        ] {
             assert!(parse_seconds_us(bad).is_err(), "expected Err for {bad:?}");
         }
     }
@@ -552,7 +571,10 @@ mod tests {
         assert!(check(ValueRule::Crf, "23").is_ok());
         assert!(check(ValueRule::Crf, "51").is_ok());
         for bad in ["52", "-1", "abc", "23.5"] {
-            assert!(check(ValueRule::Crf, bad).is_err(), "expected Err for {bad:?}");
+            assert!(
+                check(ValueRule::Crf, bad).is_err(),
+                "expected Err for {bad:?}"
+            );
         }
     }
 
@@ -566,10 +588,16 @@ mod tests {
     #[test]
     fn bitrate_spellings() {
         for good in ["192k", "2M", "500000", "2600K"] {
-            assert!(check(ValueRule::Bitrate, good).is_ok(), "expected Ok for {good:?}");
+            assert!(
+                check(ValueRule::Bitrate, good).is_ok(),
+                "expected Ok for {good:?}"
+            );
         }
         for bad in ["192q", "k", "", "1.5M", "192 k"] {
-            assert!(check(ValueRule::Bitrate, bad).is_err(), "expected Err for {bad:?}");
+            assert!(
+                check(ValueRule::Bitrate, bad).is_err(),
+                "expected Err for {bad:?}"
+            );
         }
     }
 
@@ -582,8 +610,16 @@ mod tests {
 
     #[test]
     fn scale_filter_simple_forms_only() {
-        for good in ["scale=1280:-2", "scale=iw/2:ih/2", "scale=w=640:h=360", "scale=320:240"] {
-            assert!(check(ValueRule::ScaleFilter, good).is_ok(), "expected Ok for {good:?}");
+        for good in [
+            "scale=1280:-2",
+            "scale=iw/2:ih/2",
+            "scale=w=640:h=360",
+            "scale=320:240",
+        ] {
+            assert!(
+                check(ValueRule::ScaleFilter, good).is_ok(),
+                "expected Ok for {good:?}"
+            );
         }
         for bad in [
             "scale=1280:-2,crop=64:64",
@@ -592,17 +628,35 @@ mod tests {
             "[0:v]scale=1:1[v]",
             "scale=",
         ] {
-            assert!(check(ValueRule::ScaleFilter, bad).is_err(), "expected Err for {bad:?}");
+            assert!(
+                check(ValueRule::ScaleFilter, bad).is_err(),
+                "expected Err for {bad:?}"
+            );
         }
     }
 
     #[test]
     fn map_basic_forms() {
         for good in ["0", "0:v", "0:a", "0:v:0", "0:a:1", "0:1"] {
-            assert!(check(ValueRule::MapBasic, good).is_ok(), "expected Ok for {good:?}");
+            assert!(
+                check(ValueRule::MapBasic, good).is_ok(),
+                "expected Ok for {good:?}"
+            );
         }
-        for bad in ["0:a:1?", "-0:v", "[vout]", "1:a", "0:s", "0:m:language:eng", "0:v:0:x", "p:1"] {
-            assert!(check(ValueRule::MapBasic, bad).is_err(), "expected Err for {bad:?}");
+        for bad in [
+            "0:a:1?",
+            "-0:v",
+            "[vout]",
+            "1:a",
+            "0:s",
+            "0:m:language:eng",
+            "0:v:0:x",
+            "p:1",
+        ] {
+            assert!(
+                check(ValueRule::MapBasic, bad).is_err(),
+                "expected Err for {bad:?}"
+            );
         }
     }
 
