@@ -80,8 +80,10 @@ fn assert_type_checks(code: &str, name: &str) {
             String::from_utf8_lossy(&out.stderr)
         ));
     }
-    panic!("generated program {name} failed to type-check against every candidate rlib:\n{}",
-        failures.join("\n---\n"));
+    panic!(
+        "generated program {name} failed to type-check against every candidate rlib:\n{}",
+        failures.join("\n---\n")
+    );
 }
 
 /// Sanity: the harness itself must be able to compile a benign emission —

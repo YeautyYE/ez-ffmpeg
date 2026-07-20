@@ -159,7 +159,12 @@ const fn noop_value(name: &'static str, rule: ValueRule) -> OptSpec {
 /// is not a table row.
 pub(crate) const OPTION_TABLE: &[OptSpec] = &[
     // Globals.
-    flag("-y", ScopeRule::Global, Repeat::Free, "mandatory overwrite gate"),
+    flag(
+        "-y",
+        ScopeRule::Global,
+        Repeat::Free,
+        "mandatory overwrite gate",
+    ),
     noop_flag("-hide_banner"),
     noop_flag("-nostdin"),
     noop_flag("-stats"),
@@ -196,8 +201,18 @@ pub(crate) const OPTION_TABLE: &[OptSpec] = &[
         "Input::set_format / Output::set_format",
     ),
     // Output stream selection / codecs.
-    flag("-vn", ScopeRule::OutputOnly, Repeat::Free, "Output::disable_video"),
-    flag("-an", ScopeRule::OutputOnly, Repeat::Free, "Output::disable_audio"),
+    flag(
+        "-vn",
+        ScopeRule::OutputOnly,
+        Repeat::Free,
+        "Output::disable_video",
+    ),
+    flag(
+        "-an",
+        ScopeRule::OutputOnly,
+        Repeat::Free,
+        "Output::disable_audio",
+    ),
     value(
         "-c:v",
         ScopeRule::OutputOnly,
@@ -551,8 +566,7 @@ pub(crate) fn validate_value(
             while let Some(component) = components.next() {
                 let last = components.peek().is_none();
                 let is_flag = matches!(component, "repeat" | "level");
-                let is_level =
-                    LOG_LEVELS.contains(&component) || component.parse::<i32>().is_ok();
+                let is_level = LOG_LEVELS.contains(&component) || component.parse::<i32>().is_ok();
                 let ok = if last { is_flag || is_level } else { is_flag };
                 if !ok {
                     valid = false;
@@ -843,11 +857,34 @@ mod tests {
 
     #[test]
     fn loglevel_flag_prefix_grammar() {
-        for good in ["error", "info", "32", "repeat", "level", "repeat+info", "level+debug", "repeat+level+warning"] {
-            assert!(check(ValueRule::LogLevel, good).is_ok(), "expected Ok for {good:?}");
+        for good in [
+            "error",
+            "info",
+            "32",
+            "repeat",
+            "level",
+            "repeat+info",
+            "level+debug",
+            "repeat+level+warning",
+        ] {
+            assert!(
+                check(ValueRule::LogLevel, good).is_ok(),
+                "expected Ok for {good:?}"
+            );
         }
-        for bad in ["banana", "banana+error", "error+repeat", "info+debug", "", "+", "repeat+"] {
-            assert!(check(ValueRule::LogLevel, bad).is_err(), "expected Err for {bad:?}");
+        for bad in [
+            "banana",
+            "banana+error",
+            "error+repeat",
+            "info+debug",
+            "",
+            "+",
+            "repeat+",
+        ] {
+            assert!(
+                check(ValueRule::LogLevel, bad).is_err(),
+                "expected Err for {bad:?}"
+            );
         }
     }
 
@@ -886,8 +923,8 @@ mod tests {
     fn parser_duplicate_handling_matches_the_repeat_column() {
         // The seven-field table is the single source: feed every row a
         // doubled spelling and require the parser to agree with `repeat`.
-        use super::super::parse::parse;
         use super::super::error::CliError;
+        use super::super::parse::parse;
         for spec in OPTION_TABLE {
             let one = match spec.value {
                 Some(rule) => format!("{} {}", spec.name, sample_value(rule)),
