@@ -111,9 +111,6 @@ pub(crate) fn record_input_open(url: &str) {
     INPUT_OPEN_LOG.lock().unwrap().push(url.to_string());
 }
 
-#[cfg(not(test))]
-pub(crate) fn record_input_open(_url: &str) {}
-
 #[cfg(docsrs)]
 unsafe fn open_input_file(
     index: usize,
@@ -131,6 +128,7 @@ unsafe fn open_input_file(
     copy_ts: bool,
     interrupt_state: &Arc<crate::core::context::InterruptState>,
 ) -> Result<Demuxer> {
+    #[cfg(test)]
     if let Some(url) = &input.url {
         record_input_open(url);
     }
