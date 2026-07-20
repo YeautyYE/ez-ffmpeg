@@ -121,6 +121,16 @@ impl PacketSinkWorker {
                 .to_string_lossy()
                 .into_owned();
             let time_base = (*st).time_base;
+            // Required S7 precondition: every advertised time base must be a
+            // valid positive rational BEFORE any callback observes it (it
+            // anchors rescaling and labels every delivered timestamp).
+            if time_base.num <= 0 || time_base.den <= 0 {
+                return Err(PacketSinkError::InvalidTimeBase {
+                    stream_index,
+                    num: time_base.num,
+                    den: time_base.den,
+                });
+            }
             let extradata = extradata_bytes(codecpar)
                 .ok_or(PacketSinkError::MissingExtradata { stream_index })?;
 
@@ -132,7 +142,7 @@ impl PacketSinkWorker {
                         return Err(PacketSinkError::UnsupportedStream { kind: "non-H.264 video" });
                     }
                     let annexb_packets = extradata.first() != Some(&1);
-                    let sets = avcc::parse_parameter_sets(&extradata).map_err(|reason| {
+                    let ordered_sets = avcc::parse_parameter_sets(&extradata).map_err(|reason| {
                         PacketSinkError::InvalidExtradata {
                             stream_index,
                             reason,
@@ -144,7 +154,10 @@ impl PacketSinkWorker {
                     // otherwise. The strict-tier structural checks (version 1,
                     // >=1 SPS/PPS, 4-byte lengths) hold on both paths.
                     let delivered = if annexb_packets {
-                        avcc::build_avcc(&sets).map_err(|reason| {
+                        // Built from the ORIGINAL ordering (movenc preserves
+                        // wrapper order); only the S8 fingerprint below is
+                        // canonicalized.
+                        avcc::build_avcc(&ordered_sets).map_err(|reason| {
                             PacketSinkError::InvalidExtradata {
                                 stream_index,
                                 reason,
@@ -159,7 +172,7 @@ impl PacketSinkWorker {
                         StreamKind::H264 { annexb_packets },
                         delivered,
                         ConfigBaseline {
-                            parameter_sets: Some(sets),
+                            parameter_sets: Some(ordered_sets.into_canonical()),
                             extradata,
                             width: (*codecpar).width,
                             height: (*codecpar).height,
@@ -280,6 +293,24 @@ impl PacketSinkWorker {
         debug_assert!(stream_index < self.streams.len());
         let pkt = packet_box.packet.as_ptr();
 
+        // 0. The packet must be labeled in the stream's advertised time base:
+        // the anchor is computed from packet values while delivery is labeled
+        // with the stream time base, so a mismatch would silently corrupt the
+        // shared-origin math and every delivered timestamp.
+        {
+            let stream_tb = self.streams[stream_index].time_base;
+            let pkt_tb = (*pkt).time_base;
+            if pkt_tb.num != stream_tb.num || pkt_tb.den != stream_tb.den {
+                return Err(PacketSinkError::PacketTimeBaseMismatch {
+                    stream_index,
+                    packet_num: pkt_tb.num,
+                    packet_den: pkt_tb.den,
+                    stream_num: stream_tb.num,
+                    stream_den: stream_tb.den,
+                });
+            }
+        }
+
         // 1. S8: mid-stream configuration change detection.
         check_side_data(&self.streams[stream_index], stream_index, pkt)?;
 
@@ -345,12 +376,17 @@ impl PacketSinkWorker {
                 });
             }
         }
-        // Duplicate-pts window: `pts >= dts` plus strictly increasing dts
-        // means any recorded pts at or below the new dts can never repeat.
-        state.pending_pts.retain(|&p| p > dts);
+        // Duplicate-pts window. Membership is checked BEFORE pruning: a
+        // recorded pts equal to the NEW dts is exactly the boundary a
+        // duplicate can still collide with (e.g. (pts 3, dts 0) followed by
+        // (pts 3, dts 3)); pruning first forgot it. After the check, values
+        // at or below the new dts can never recur (`pts >= dts` plus strictly
+        // increasing dts) and are dropped, bounding the window to the
+        // encoder's reorder depth.
         if state.pending_pts.contains(&pts) {
             return Err(PacketSinkError::DuplicatePts { stream_index, pts });
         }
+        state.pending_pts.retain(|&p| p > dts);
         state.pending_pts.push(pts);
         state.last_dts = Some(dts);
 
@@ -515,14 +551,17 @@ unsafe fn check_side_data(
             match (&state.kind, &state.baseline.parameter_sets) {
                 (StreamKind::H264 { .. }, Some(baseline_sets)) => {
                     // Normalize before comparing: the same parameter sets can
-                    // arrive as Annex-B, avcC or raw side data; wrapper bytes
-                    // would misreport an unchanged configuration.
-                    let sets = avcc::parse_parameter_sets(bytes).map_err(|reason| {
-                        PacketSinkError::ConfigChange {
+                    // arrive as Annex-B, avcC or raw side data, and in any
+                    // order — both wrapper bytes and ordering would misreport
+                    // an unchanged configuration. The baseline is stored in
+                    // canonical (identity-sorted, deduplicated) form; the
+                    // announcement is canonicalized the same way.
+                    let sets = avcc::parse_parameter_sets(bytes)
+                        .map_err(|reason| PacketSinkError::ConfigChange {
                             stream_index,
                             what: format!("unparseable NEW_EXTRADATA ({reason})"),
-                        }
-                    })?;
+                        })?
+                        .into_canonical();
                     if &sets != baseline_sets {
                         return Err(PacketSinkError::ConfigChange {
                             stream_index,
@@ -574,7 +613,10 @@ fn check_param_change(
             let bytes: [u8; 4] = data
                 .get(pos..pos + 4)
                 .and_then(|s| s.try_into().ok())
-                .ok_or_else(|| malformed("truncated"))?;
+                .ok_or_else(|| PacketSinkError::MalformedPacket {
+                    stream_index,
+                    reason: "PARAM_CHANGE side data: truncated".to_string(),
+                })?;
             pos += 4;
             Ok(i32::from_le_bytes(bytes))
         }
@@ -587,8 +629,25 @@ fn check_param_change(
             what: format!("PARAM_CHANGE with unrecognized flags {flags:#x}"),
         });
     }
+    // Exact-length validation per flag combination: the payload is 4 bytes of
+    // flags plus exactly the fields the flags select. Trailing garbage (or a
+    // flags=0 announcement padded with junk) is a malformed announcement, not
+    // a redundant one.
+    let expected_len = 4
+        + if flags & SAMPLE_RATE_FLAG != 0 { 4 } else { 0 }
+        + if flags & DIMENSIONS_FLAG != 0 { 8 } else { 0 };
+    if data.len() != expected_len {
+        return Err(malformed(&format!(
+            "payload is {} bytes, flags {flags:#x} require exactly {expected_len}",
+            data.len()
+        )));
+    }
     if flags & SAMPLE_RATE_FLAG != 0 {
         let sample_rate = read_i32(data)?;
+        // FFmpeg's own param-change handler rejects non-positive rates.
+        if sample_rate <= 0 {
+            return Err(malformed(&format!("sample rate {sample_rate} out of range")));
+        }
         if sample_rate != state.baseline.sample_rate {
             return Err(PacketSinkError::ConfigChange {
                 stream_index,
@@ -602,6 +661,14 @@ fn check_param_change(
     if flags & DIMENSIONS_FLAG != 0 {
         let width = read_i32(data)?;
         let height = read_i32(data)?;
+        // av_image_check_size bound: positive and (w+128)*(h+128) within
+        // INT_MAX/8 addressable pixels.
+        let plausible = width > 0
+            && height > 0
+            && (width as i64 + 128) * (height as i64 + 128) < (i32::MAX as i64) / 8;
+        if !plausible {
+            return Err(malformed(&format!("dimensions {width}x{height} out of range")));
+        }
         if width != state.baseline.width || height != state.baseline.height {
             return Err(PacketSinkError::ConfigChange {
                 stream_index,
@@ -1203,6 +1270,182 @@ mod tests {
         let events = events.lock().unwrap();
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0], PacketSinkEvent::Error(_)));
+    }
+
+    /// The three independent review counterexamples for the duplicate-PTS
+    /// boundary: a recorded pts equal to the NEW packet's dts must still be
+    /// caught (membership is checked before pruning).
+    #[test]
+    fn duplicate_pts_boundary_counterexamples() {
+        for (first, second) in [((1, 0), (1, 1)), ((2, 0), (2, 2)), ((3, 0), (3, 3))] {
+            let ctx = video_ctx();
+            let (sink, _events) = recording_sink();
+            let mut worker = collect(&ctx, sink).unwrap();
+            let mut a = packet(&idr_au(), first.0, first.1, tb25(), 0);
+            assert_eq!(unsafe { worker.process_and_deliver(ctx.ctx, &mut a) }, 0);
+            let mut b = packet(&p_au(), second.0, second.1, tb25(), 0);
+            assert_eq!(
+                unsafe { worker.process_and_deliver(ctx.ctx, &mut b) },
+                AVERROR_EXTERNAL,
+                "({},{}) then ({},{}) must be rejected",
+                first.0,
+                first.1,
+                second.0,
+                second.1
+            );
+            assert!(matches!(
+                worker.pending_error_cloned(),
+                Some(PacketSinkError::DuplicatePts { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn invalid_stream_time_base_fails_before_any_callback() {
+        let ctx = TestCtx::new();
+        unsafe {
+            ctx.add_stream(
+                AVMediaType::AVMEDIA_TYPE_VIDEO,
+                AVCodecID::AV_CODEC_ID_H264,
+                Some(&annexb_config()),
+                AVRational { num: 0, den: 25 },
+            );
+        }
+        let (sink, events) = recording_sink();
+        let err = match collect(&ctx, sink) {
+            Err(e) => e,
+            Ok(_) => panic!("collect must reject a zero-numerator time base"),
+        };
+        assert!(matches!(
+            err,
+            PacketSinkError::InvalidTimeBase {
+                stream_index: 0,
+                num: 0,
+                den: 25
+            }
+        ));
+        assert!(events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn packet_time_base_mismatch_is_rejected() {
+        let ctx = video_ctx();
+        let (sink, _events) = recording_sink();
+        let mut worker = collect(&ctx, sink).unwrap();
+        let mut pb = packet(&idr_au(), 0, 0, AVRational { num: 1, den: 30 }, 0);
+        assert_eq!(
+            unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) },
+            AVERROR_EXTERNAL
+        );
+        assert!(matches!(
+            worker.pending_error_cloned(),
+            Some(PacketSinkError::PacketTimeBaseMismatch {
+                packet_den: 30,
+                stream_den: 25,
+                ..
+            })
+        ));
+    }
+
+    /// PARAM_CHANGE payloads must be EXACTLY as long as their flags require:
+    /// flags=0 plus junk, and a valid projection with trailing bytes, are
+    /// malformed announcements — not redundant ones.
+    #[test]
+    fn param_change_exact_length_and_ranges() {
+        let ctx = video_ctx();
+        let cases: Vec<(Vec<u8>, &str)> = vec![
+            // flags = 0 followed by junk.
+            {
+                let mut v = 0u32.to_le_bytes().to_vec();
+                v.push(0xAB);
+                (v, "flags=0 with trailing junk")
+            },
+            // Valid equal dimensions followed by one trailing byte.
+            {
+                let mut v = 8u32.to_le_bytes().to_vec();
+                v.extend_from_slice(&320i32.to_le_bytes());
+                v.extend_from_slice(&240i32.to_le_bytes());
+                v.push(0);
+                (v, "valid projection with trailing byte")
+            },
+            // Out-of-range dimensions (zero width).
+            {
+                let mut v = 8u32.to_le_bytes().to_vec();
+                v.extend_from_slice(&0i32.to_le_bytes());
+                v.extend_from_slice(&240i32.to_le_bytes());
+                (v, "zero width")
+            },
+        ];
+        for (payload, what) in cases {
+            let (sink, _events) = recording_sink();
+            let mut worker = collect(&ctx, sink).unwrap();
+            let mut pb = packet(&idr_au(), 0, 0, tb25(), 0);
+            unsafe {
+                let sd = av_packet_new_side_data(
+                    pb.packet.as_mut_ptr(),
+                    AV_PKT_DATA_PARAM_CHANGE,
+                    payload.len(),
+                );
+                assert!(!sd.is_null());
+                std::ptr::copy_nonoverlapping(payload.as_ptr(), sd, payload.len());
+            }
+            assert_eq!(
+                unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) },
+                AVERROR_EXTERNAL,
+                "{what} must be rejected"
+            );
+            assert!(matches!(
+                worker.pending_error_cloned(),
+                Some(PacketSinkError::MalformedPacket { .. })
+            ));
+        }
+    }
+
+    /// S8 fingerprint is order-independent: the same SPS/PPS identities in a
+    /// different wrapper order are NOT a configuration change.
+    #[test]
+    fn reordered_parameter_sets_are_not_a_config_change() {
+        // Baseline with TWO SPS entries (order A, B).
+        let mut config = vec![0, 0, 0, 1];
+        config.extend_from_slice(SPS);
+        config.extend_from_slice(&[0, 0, 1]);
+        config.extend_from_slice(OTHER_SPS);
+        config.extend_from_slice(&[0, 0, 1]);
+        config.extend_from_slice(PPS);
+        let ctx = TestCtx::new();
+        unsafe {
+            ctx.add_stream(
+                AVMediaType::AVMEDIA_TYPE_VIDEO,
+                AVCodecID::AV_CODEC_ID_H264,
+                Some(&config),
+                tb25(),
+            );
+        }
+        let (sink, _events) = recording_sink();
+        let mut worker = collect(&ctx, sink).unwrap();
+
+        // NEW_EXTRADATA announcing the SAME sets in the opposite order.
+        let mut swapped = vec![0, 0, 0, 1];
+        swapped.extend_from_slice(OTHER_SPS);
+        swapped.extend_from_slice(&[0, 0, 1]);
+        swapped.extend_from_slice(SPS);
+        swapped.extend_from_slice(&[0, 0, 1]);
+        swapped.extend_from_slice(PPS);
+        let mut pb = packet(&idr_au(), 0, 0, tb25(), 0);
+        unsafe {
+            let sd = av_packet_new_side_data(
+                pb.packet.as_mut_ptr(),
+                AV_PKT_DATA_NEW_EXTRADATA,
+                swapped.len(),
+            );
+            assert!(!sd.is_null());
+            std::ptr::copy_nonoverlapping(swapped.as_ptr(), sd, swapped.len());
+        }
+        assert_eq!(
+            unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) },
+            0,
+            "reordered identical parameter sets must pass"
+        );
     }
 
     #[test]

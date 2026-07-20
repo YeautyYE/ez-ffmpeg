@@ -507,6 +507,22 @@ pub enum PacketSinkError {
     #[error("output stream {stream_index}: invalid codec configuration: {reason}")]
     InvalidExtradata { stream_index: usize, reason: String },
 
+    #[error("output stream {stream_index}: invalid time base {num}/{den} (positive numerator and denominator required)")]
+    InvalidTimeBase {
+        stream_index: usize,
+        num: i32,
+        den: i32,
+    },
+
+    #[error("output stream {stream_index}: packet time base {packet_num}/{packet_den} differs from the stream time base {stream_num}/{stream_den}")]
+    PacketTimeBaseMismatch {
+        stream_index: usize,
+        packet_num: i32,
+        packet_den: i32,
+        stream_num: i32,
+        stream_den: i32,
+    },
+
     #[error("output stream {stream_index}: packet carries no {which} (strict tier rejects AV_NOPTS_VALUE)")]
     MissingTimestamp {
         stream_index: usize,
