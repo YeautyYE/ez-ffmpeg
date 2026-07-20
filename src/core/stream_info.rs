@@ -633,7 +633,11 @@ pub(crate) fn init_format_context(url: impl Into<String>) -> Result<FormatContex
 
     // Convert URL before allocating FFmpeg resources so a NUL-byte error
     // cannot leak the AVFormatContext.
-    let url_cstr = CString::new(url.into())?;
+    let url = url.into();
+    // Test-only single-opening observability shares the demuxer open log:
+    // probing APIs are input openings too.
+    crate::core::context::ffmpeg_context::open_input::record_input_open(&url);
+    let url_cstr = CString::new(url)?;
 
     // SAFETY: All FFmpeg allocations are paired with their cleanup on every
     // error path (avformat_close_input). avformat_open_input takes ownership

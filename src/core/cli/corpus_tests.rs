@@ -931,6 +931,58 @@ fn corpus_collective_conflict_names_anchor_the_earliest_occurrence() {
 }
 
 #[test]
+fn corpus_copy_side_anchor_is_value_aware_and_maps_anchor_their_occurrence() {
+    // Reviewer command 1: tokens 2=-map 3=0 4=-c:v 5=libx264 6=-c:a 7=copy —
+    // the conflicting copy is the -c:a occurrence at #6, NOT the earlier
+    // non-copy -c:v at #4.
+    let err = from_cli("ffmpeg -i in.mp4 -map 0 -c:v libx264 -c:a copy -y out.mp4")
+        .map(|_| ())
+        .unwrap_err();
+    match &err {
+        CliError::ConflictingOptions {
+            first,
+            second,
+            first_index,
+            second_index,
+            ..
+        } => {
+            assert_eq!((first.as_str(), second.as_str()), ("-map", "-c copy"));
+            assert_eq!(*first_index, Some(2));
+            assert_eq!(
+                *second_index,
+                Some(6),
+                "the anchor must be the occurrence whose value is copy"
+            );
+        }
+        other => panic!("expected ConflictingOptions, got {other}"),
+    }
+
+    // Reviewer command 2: tokens 2=-map 3=0:v 4=-map 5=0 6=-c:a 7=copy —
+    // the OFFENDING unqualified map is the second occurrence at #4; the
+    // legal first map at #2 must not be blamed.
+    let err = from_cli("ffmpeg -i in.mp4 -map 0:v -map 0 -c:a copy -y out.mp4")
+        .map(|_| ())
+        .unwrap_err();
+    match &err {
+        CliError::ConflictingOptions {
+            first,
+            first_index,
+            second_index,
+            ..
+        } => {
+            assert_eq!(first, "-map");
+            assert_eq!(
+                *first_index,
+                Some(4),
+                "the offending occurrence, not the first map, is the anchor"
+            );
+            assert_eq!(*second_index, Some(6));
+        }
+        other => panic!("expected ConflictingOptions, got {other}"),
+    }
+}
+
+#[test]
 fn corpus_unknown_after_output_names_the_following_output_scope() {
     // tokens: 0=-i 1=in.mp4 2=-y 3=out.mp4 4=-foo
     let err = from_cli("ffmpeg -i in.mp4 -y out.mp4 -foo")
