@@ -564,10 +564,17 @@ impl PacketSinkWorker {
             self.sink.dispatch_delivery_error(&e);
             return;
         }
+        if self.cancelled {
+            // A delivery interrupted by cancellation stays silent (the
+            // documented stop()/abort() contract) even when some other
+            // worker recorded an error for the same shutdown.
+            return;
+        }
         if let Some(message) = job_error {
-            // The sink itself drained cleanly, but the JOB failed (a sibling
-            // output, an upstream task): success must not be promised, and
-            // the consumer learns why. wait() keeps the original error.
+            // The JOB failed (a sibling output, an upstream task) — whether
+            // this sink had drained fully or the failure truncated its
+            // delivery: success must not be promised, and the consumer
+            // learns why. wait() keeps the original error.
             self.sink
                 .dispatch_delivery_error(&PacketSinkError::JobFailed { message });
             return;
