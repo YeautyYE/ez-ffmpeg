@@ -84,8 +84,11 @@
 use crate::error::PacketSinkError;
 use ffmpeg_sys_next::{AVMediaType, AVRational};
 
-pub(crate) mod avcc;
+pub(crate) mod codec;
+pub(crate) mod nal_framing;
+pub(crate) mod side_data;
 pub(crate) mod strict;
+pub(crate) mod timeline;
 
 /// Delivery tier of a packet sink. Only [`Strict`](PacketSinkTier::Strict)
 /// exists in v1; the enum is `#[non_exhaustive]` so later tiers (generic
