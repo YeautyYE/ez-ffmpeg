@@ -22,10 +22,13 @@ impl AacRuntime {
     /// reader: audioObjectType (5 bits, escape value 31 followed by 6
     /// extension bits), samplingFrequencyIndex (4 bits, index 15 followed
     /// by a 24-bit explicit frequency), channelConfiguration (4 bits), and
-    /// for the SBR/PS signaled types (AOT 5 and 29) the
-    /// extensionSamplingFrequencyIndex with its own index-15 case.
-    /// Truncation inside any field is a typed error — zero bits are never
-    /// silently substituted.
+    /// for the SBR/PS signaled types (AOT 5 and 29) the full direct
+    /// extension block: extensionSamplingFrequencyIndex (with its own
+    /// index-15 case), the second GetAudioObjectType, and — when that
+    /// secondary type is ER BSAC (22) — the extensionChannelConfiguration.
+    /// Reserved sampling-frequency indexes (13/14) and channel
+    /// configuration 15 are rejected. Truncation inside any field is a
+    /// typed error — zero bits are never silently substituted.
     pub(crate) fn from_extradata(
         extradata: &[u8],
         stream_index: usize,
@@ -77,6 +80,23 @@ impl<'a> AscBits<'a> {
         Self { data, pos: 0 }
     }
 
+    /// Peeks `count` bits (<= 32) without consuming, zero-padded past the
+    /// end of the config — mirroring FFmpeg's `show_bits` semantics for the
+    /// W6132 Annex look-ahead, where the guard must not itself demand bits.
+    fn peek(&self, count: usize) -> u32 {
+        let mut value = 0u32;
+        for offset in 0..count {
+            let pos = self.pos + offset;
+            let bit = if pos < self.data.len() * 8 {
+                (self.data[pos / 8] >> (7 - pos % 8)) & 1
+            } else {
+                0
+            };
+            value = (value << 1) | bit as u32;
+        }
+        value
+    }
+
     /// Reads `count` bits (<= 32) or reports which `field` was truncated.
     fn read(&mut self, count: usize, field: &str) -> Result<u32, String> {
         debug_assert!(count <= 32);
@@ -98,28 +118,77 @@ impl<'a> AscBits<'a> {
     }
 }
 
-/// Parses the required AudioSpecificConfig prefix (through the channel
-/// configuration, plus the extension sampling-frequency index for AOT 5/29)
-/// and returns the audio object type. ISO/IEC 14496-3 GetAudioObjectType()
-/// plus the leading AudioSpecificConfig fields.
+/// One ISO/IEC 14496-3 GetAudioObjectType(): 5 bits, escape value 31
+/// followed by 6 extension bits.
+fn read_object_type(bits: &mut AscBits<'_>, field: &str, ext_field: &str) -> Result<u32, String> {
+    let aot = bits.read(5, field)?;
+    if aot == 31 {
+        return Ok(32 + bits.read(6, ext_field)?);
+    }
+    Ok(aot)
+}
+
+/// One sampling-frequency field: a 4-bit index whose value 15 is followed
+/// by a 24-bit explicit frequency. Indexes 13 and 14 are reserved
+/// (FFmpeg's decoder rejects them via its `sampling_index > 12` check).
+fn read_sampling_frequency(
+    bits: &mut AscBits<'_>,
+    field: &str,
+    explicit_field: &str,
+) -> Result<(), String> {
+    let index = bits.read(4, field)?;
+    if index == 13 || index == 14 {
+        return Err(format!("reserved {field} {index}"));
+    }
+    if index == 15 {
+        bits.read(24, explicit_field)?;
+    }
+    Ok(())
+}
+
+/// Parses the required AudioSpecificConfig prefix and returns the audio
+/// object type — mirroring `ff_mpeg4audio_get_config_gb` (FFmpeg
+/// libavcodec/mpeg4audio.c) through the direct-SBR/PS extension block:
+/// audioObjectType, samplingFrequencyIndex (with the index-15 explicit
+/// case), channelConfiguration (15 is outside the ISO channel table and
+/// rejected), and for AOT 5/29 the extensionSamplingFrequencyIndex plus a
+/// SECOND GetAudioObjectType, whose value 22 (ER BSAC) is followed by the
+/// extensionChannelConfiguration. AOT 29 honors the W6132 Annex MP3onMP4
+/// look-ahead: when the next 3 bits have a low bit set and the following
+/// 6 are zero, the extension block is absent.
 fn parse_required_asc_prefix(asc: &[u8]) -> Result<u32, String> {
     let mut bits = AscBits::new(asc);
-    let mut aot = bits.read(5, "audioObjectType")?;
-    if aot == 31 {
-        aot = 32 + bits.read(6, "audioObjectTypeExt")?;
-    }
+    let aot = read_object_type(&mut bits, "audioObjectType", "audioObjectTypeExt")?;
     if aot == 0 {
         return Err("AudioSpecificConfig declares the null audio object type".to_string());
     }
-    let freq_index = bits.read(4, "samplingFrequencyIndex")?;
-    if freq_index == 15 {
-        bits.read(24, "explicit samplingFrequency")?;
+    read_sampling_frequency(&mut bits, "samplingFrequencyIndex", "explicit samplingFrequency")?;
+    let channel_config = bits.read(4, "channelConfiguration")?;
+    if channel_config == 15 {
+        return Err("channelConfiguration 15 is outside the channel table".to_string());
     }
-    bits.read(4, "channelConfiguration")?;
-    if aot == 5 || aot == 29 {
-        let ext_index = bits.read(4, "extensionSamplingFrequencyIndex")?;
-        if ext_index == 15 {
-            bits.read(24, "explicit extensionSamplingFrequency")?;
+    let parse_extension = match aot {
+        5 => true,
+        // W6132 Annex YYYY draft MP3onMP4 (mirrors the FFmpeg guard).
+        29 => !(bits.peek(3) & 0x03 != 0 && bits.peek(9) & 0x3F == 0),
+        _ => false,
+    };
+    if parse_extension {
+        read_sampling_frequency(
+            &mut bits,
+            "extensionSamplingFrequencyIndex",
+            "explicit extensionSamplingFrequency",
+        )?;
+        let secondary = read_object_type(
+            &mut bits,
+            "extension audioObjectType",
+            "extension audioObjectTypeExt",
+        )?;
+        if secondary == 0 {
+            return Err("extension audioObjectType is the null object type".to_string());
+        }
+        if secondary == 22 {
+            bits.read(4, "extensionChannelConfiguration")?;
         }
     }
     Ok(aot)
@@ -135,10 +204,19 @@ mod tests {
         // bits fit in two bytes).
         let runtime = AacRuntime::from_extradata(&[0x12, 0x10], 0).unwrap();
         assert_eq!(runtime.codec_string(), "mp4a.40.2");
-        // HE-AAC (SBR): AOT 5, 48 kHz (index 3), stereo, extension index 8 —
-        // 17 required bits, three bytes.
-        let runtime = AacRuntime::from_extradata(&[0x29, 0x94, 0x00], 0).unwrap();
+        // HE-AAC (SBR): AOT 5, 48 kHz (index 3), stereo, extension index 8,
+        // secondary object type AAC-LC (2) — 22 required bits, three bytes.
+        let runtime = AacRuntime::from_extradata(&[0x29, 0x94, 0x08], 0).unwrap();
         assert_eq!(runtime.codec_string(), "mp4a.40.5");
+        // Direct SBR with secondary ER BSAC (22): the
+        // extensionChannelConfiguration (1) completes the prefix — 26
+        // required bits, four bytes.
+        let runtime = AacRuntime::from_extradata(&[0x29, 0x94, 0x58, 0x40], 0).unwrap();
+        assert_eq!(runtime.codec_string(), "mp4a.40.5");
+        // AOT 29 tripping the W6132 MP3onMP4 look-ahead: no extension block
+        // follows, so 13 bits suffice.
+        let runtime = AacRuntime::from_extradata(&[0xEA, 0x0A, 0x00], 0).unwrap();
+        assert_eq!(runtime.codec_string(), "mp4a.40.29");
         // Escape AOT: 31 escape + 6-bit extension 2 => AOT 34; with the
         // frequency index (4) and channel configuration (1) that is 19
         // required bits, three bytes.
@@ -149,7 +227,7 @@ mod tests {
     #[test]
     fn per_field_truncation_is_rejected_typed() {
         // (fixture, the field the truncation lands in)
-        let cases: [(&[u8], &str); 6] = [
+        let cases: [(&[u8], &str); 8] = [
             (&[], "audioObjectType"),
             // AOT 2 + 3 bits of the frequency index.
             (&[0x12], "samplingFrequencyIndex"),
@@ -164,6 +242,15 @@ mod tests {
             // AOT 5 needs the extension sampling-frequency index: 17 bits
             // required, 16 present.
             (&[0x28, 0x10], "extensionSamplingFrequencyIndex"),
+            // A byte-aligned cut INSIDE a non-escape secondary object type
+            // is geometrically unreachable (it spans bits 17-21 of a
+            // 24-bit third byte), so the secondary field's truncation
+            // coverage is the escape path: secondary escape marker 11111
+            // with only 3 of its 6 extension bits present.
+            (&[0x29, 0x94, 0x7C], "extension audioObjectTypeExt"),
+            // Secondary ER BSAC (22) demands the extension channel
+            // configuration: 24 bits present, 26 required.
+            (&[0x29, 0x94, 0x58], "extensionChannelConfiguration"),
         ];
         for (bad, field) in cases {
             match AacRuntime::from_extradata(bad, 3) {
@@ -189,11 +276,54 @@ mod tests {
             Err(other) => panic!("expected truncation, got {other:?}"),
             Ok(_) => panic!("expected InvalidExtradata, got a valid runtime"),
         }
-        // The null audio object type is not a usable configuration.
+        // The null audio object type is not a usable configuration — for
+        // the primary AND the secondary (direct-SBR) object type.
         assert!(matches!(
             AacRuntime::from_extradata(&[0x00, 0x10], 3),
             Err(PacketSinkError::InvalidExtradata { .. })
         ));
+        match AacRuntime::from_extradata(&[0x29, 0x94, 0x00], 3) {
+            Err(PacketSinkError::InvalidExtradata { reason, .. }) => {
+                assert!(reason.contains("null object type"), "got {reason:?}");
+            }
+            Err(other) => panic!("expected InvalidExtradata, got {other:?}"),
+            Ok(_) => panic!("expected InvalidExtradata, got a valid runtime"),
+        }
+    }
+
+    #[test]
+    fn reserved_and_out_of_table_field_values_are_rejected() {
+        // Reserved sampling-frequency index 13 (and 14): AOT 2, index 13.
+        match AacRuntime::from_extradata(&[0x16, 0x90], 3) {
+            Err(PacketSinkError::InvalidExtradata { reason, .. }) => {
+                assert!(
+                    reason.contains("reserved samplingFrequencyIndex 13"),
+                    "got {reason:?}"
+                );
+            }
+            Err(other) => panic!("expected InvalidExtradata, got {other:?}"),
+            Ok(_) => panic!("expected InvalidExtradata, got a valid runtime"),
+        }
+        // channelConfiguration 15 is outside the ISO channel table.
+        match AacRuntime::from_extradata(&[0x12, 0x78], 3) {
+            Err(PacketSinkError::InvalidExtradata { reason, .. }) => {
+                assert!(reason.contains("channelConfiguration 15"), "got {reason:?}");
+            }
+            Err(other) => panic!("expected InvalidExtradata, got {other:?}"),
+            Ok(_) => panic!("expected InvalidExtradata, got a valid runtime"),
+        }
+        // The reserved rule applies to the extension index too: AOT 5,
+        // main index 3, stereo, extension index 13.
+        match AacRuntime::from_extradata(&[0x29, 0x96, 0x88], 3) {
+            Err(PacketSinkError::InvalidExtradata { reason, .. }) => {
+                assert!(
+                    reason.contains("reserved extensionSamplingFrequencyIndex 13"),
+                    "got {reason:?}"
+                );
+            }
+            Err(other) => panic!("expected InvalidExtradata, got {other:?}"),
+            Ok(_) => panic!("expected InvalidExtradata, got a valid runtime"),
+        }
     }
 
     #[test]
