@@ -180,7 +180,10 @@ impl FfmpegContextBuilder {
     }
 
     /// Adds a single [`Output`] to the builder, representing a single output
-    /// destination (file path, URL, or custom write callback).
+    /// destination: a file path or URL, a custom write callback (muxed
+    /// container bytes), or a packet sink
+    /// ([`Output::from(PacketSink)`](crate::packet_sink::PacketSink) —
+    /// encoded packets delivered to callbacks, no container written).
     ///
     /// Calling this multiple times adds multiple outputs (e.g., for transcoding
     /// to different formats simultaneously).
