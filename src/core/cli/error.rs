@@ -126,6 +126,22 @@ pub enum CliError {
     #[error("command shape is not verified for execution\n  parsed options: [{}]\n  only shapes backed by a semantic golden may run; use emit_rust_code / emit_rust_code_from_args to generate unverified scaffolding code instead\n  {CTA}", .parsed_options.join(", "))]
     NotVerified { parsed_options: Vec<String> },
 
+    /// Every token classified, but the command's option-set fingerprint
+    /// matches neither a verified shape nor a documented emit-only entry.
+    /// The manifest enumerates its emit surface explicitly — arbitrary
+    /// combinations are rejected, not silently scaffolded.
+    #[error("command shape is not in the compatibility manifest\n  parsed options: [{}]\n  neither a verified shape nor a documented emit-only entry; nothing is generated for unenumerated shapes\n  {CTA}", .parsed_options.join(", "))]
+    UnmatchedShape { parsed_options: Vec<String> },
+
+    /// A `-vf` command's source stream is not structurally unique: the
+    /// opened input carries more or fewer than exactly one video stream.
+    /// The CLI would score-select one stream and filter it; the subset runs
+    /// the filter only when no selection is involved at all (the hard
+    /// simple-filter prerequisite), so ambiguous inputs are rejected after
+    /// probing instead of silently filtering a chosen stream.
+    #[error("-vf requires an input with exactly one video stream; this input has {video_streams}\n  the ffmpeg CLI would score-select one stream to filter; the subset only executes filters over a structurally unique source\n  {CTA}")]
+    AmbiguousFilterSource { video_streams: usize },
+
     /// The linked FFmpeg libraries are not one of the verified runtime
     /// profiles. Raised before any I/O.
     #[error("linked FFmpeg is not a verified runtime profile\n  linked: libavcodec {linked_avcodec}, libavformat {linked_avformat}; verified profiles: {verified}\n  emit_rust_code still works — only in-process execution is gated\n  {CTA}")]

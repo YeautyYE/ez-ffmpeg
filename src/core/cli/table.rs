@@ -69,6 +69,23 @@ pub(crate) enum ValueRule {
     LogLevel,
 }
 
+/// What repeating an option within one scope means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Repeat {
+    /// A second occurrence in the same scope is rejected (the CLI silently
+    /// keeps the last value, which the subset refuses to reproduce).
+    Once,
+    /// Every occurrence accumulates (`-map`).
+    Accumulate,
+    /// Repetition is idempotent/harmless and accepted (`-y`, `-vn`, no-ops).
+    Free,
+}
+
+/// The manifest's seven-field option registration (D.1's tuple): canonical
+/// name, positional scope, arity, value grammar, repeat policy, no-op
+/// status, and the lowering binding the option lands in. The parser's
+/// duplicate handling must agree with `repeat` — a conformance test feeds
+/// every row a doubled spelling and checks the behavior against this table.
 pub(crate) struct OptSpec {
     /// Canonical spelling as typed on the command line.
     pub(crate) name: &'static str,
@@ -77,25 +94,40 @@ pub(crate) struct OptSpec {
     pub(crate) value: Option<ValueRule>,
     /// Recognized but deliberately without an in-process effect.
     pub(crate) noop: bool,
+    pub(crate) repeat: Repeat,
+    /// Where the option lands: the builder call (or interaction) that
+    /// consumes it. Documentation-of-record, rendered into the support
+    /// table.
+    pub(crate) sink: &'static str,
 }
 
-const fn flag(name: &'static str, scope: ScopeRule) -> OptSpec {
+const fn flag(name: &'static str, scope: ScopeRule, repeat: Repeat, sink: &'static str) -> OptSpec {
     OptSpec {
         name,
         scope,
         arity: Arity::Flag,
         value: None,
         noop: false,
+        repeat,
+        sink,
     }
 }
 
-const fn value(name: &'static str, scope: ScopeRule, rule: ValueRule) -> OptSpec {
+const fn value(
+    name: &'static str,
+    scope: ScopeRule,
+    rule: ValueRule,
+    repeat: Repeat,
+    sink: &'static str,
+) -> OptSpec {
     OptSpec {
         name,
         scope,
         arity: Arity::Value,
         value: Some(rule),
         noop: false,
+        repeat,
+        sink,
     }
 }
 
@@ -106,6 +138,8 @@ const fn noop_flag(name: &'static str) -> OptSpec {
         arity: Arity::Flag,
         value: None,
         noop: true,
+        repeat: Repeat::Free,
+        sink: "none (documented no-op)",
     }
 }
 
@@ -116,6 +150,8 @@ const fn noop_value(name: &'static str, rule: ValueRule) -> OptSpec {
         arity: Arity::Value,
         value: Some(rule),
         noop: true,
+        repeat: Repeat::Free,
+        sink: "none (documented no-op)",
     }
 }
 
@@ -123,7 +159,7 @@ const fn noop_value(name: &'static str, rule: ValueRule) -> OptSpec {
 /// is not a table row.
 pub(crate) const OPTION_TABLE: &[OptSpec] = &[
     // Globals.
-    flag("-y", ScopeRule::Global),
+    flag("-y", ScopeRule::Global, Repeat::Free, "mandatory overwrite gate"),
     noop_flag("-hide_banner"),
     noop_flag("-nostdin"),
     noop_flag("-stats"),
@@ -131,46 +167,156 @@ pub(crate) const OPTION_TABLE: &[OptSpec] = &[
     noop_value("-loglevel", ValueRule::LogLevel),
     noop_value("-v", ValueRule::LogLevel),
     // Trims and container selection (position-scoped).
-    value("-ss", ScopeRule::InputOrOutput, ValueRule::Seconds),
-    value("-t", ScopeRule::InputOrOutput, ValueRule::Seconds),
-    value("-to", ScopeRule::InputOrOutput, ValueRule::Seconds),
-    value("-f", ScopeRule::InputOrOutput, ValueRule::FormatName),
+    value(
+        "-ss",
+        ScopeRule::InputOrOutput,
+        ValueRule::Seconds,
+        Repeat::Once,
+        "Input::set_start_time_us / Output::set_start_time_us",
+    ),
+    value(
+        "-t",
+        ScopeRule::InputOrOutput,
+        ValueRule::Seconds,
+        Repeat::Once,
+        "Input::set_recording_time_us / Output::set_recording_time_us",
+    ),
+    value(
+        "-to",
+        ScopeRule::InputOrOutput,
+        ValueRule::Seconds,
+        Repeat::Once,
+        "Input::set_stop_time_us / Output::set_stop_time_us",
+    ),
+    value(
+        "-f",
+        ScopeRule::InputOrOutput,
+        ValueRule::FormatName,
+        Repeat::Once,
+        "Input::set_format / Output::set_format",
+    ),
     // Output stream selection / codecs.
-    flag("-vn", ScopeRule::OutputOnly),
-    flag("-an", ScopeRule::OutputOnly),
-    value("-c:v", ScopeRule::OutputOnly, ValueRule::Codec),
-    value("-c:a", ScopeRule::OutputOnly, ValueRule::Codec),
-    value("-b:v", ScopeRule::OutputOnly, ValueRule::Bitrate),
-    value("-b:a", ScopeRule::OutputOnly, ValueRule::Bitrate),
-    value("-crf", ScopeRule::OutputOnly, ValueRule::Crf),
-    value("-preset", ScopeRule::OutputOnly, ValueRule::Preset),
-    value("-pix_fmt", ScopeRule::OutputOnly, ValueRule::PixFmt),
-    value("-ar", ScopeRule::OutputOnly, ValueRule::PositiveInt),
-    value("-ac", ScopeRule::OutputOnly, ValueRule::PositiveInt),
-    value("-frames:v", ScopeRule::OutputOnly, ValueRule::FramesOne),
-    value("-vf", ScopeRule::OutputOnly, ValueRule::ScaleFilter),
-    value("-map", ScopeRule::OutputOnly, ValueRule::MapBasic),
+    flag("-vn", ScopeRule::OutputOnly, Repeat::Free, "Output::disable_video"),
+    flag("-an", ScopeRule::OutputOnly, Repeat::Free, "Output::disable_audio"),
+    value(
+        "-c:v",
+        ScopeRule::OutputOnly,
+        ValueRule::Codec,
+        Repeat::Once,
+        "Output::set_video_codec",
+    ),
+    value(
+        "-c:a",
+        ScopeRule::OutputOnly,
+        ValueRule::Codec,
+        Repeat::Once,
+        "Output::set_audio_codec",
+    ),
+    value(
+        "-b:v",
+        ScopeRule::OutputOnly,
+        ValueRule::Bitrate,
+        Repeat::Once,
+        "Output::set_video_bitrate",
+    ),
+    value(
+        "-b:a",
+        ScopeRule::OutputOnly,
+        ValueRule::Bitrate,
+        Repeat::Once,
+        "Output::set_audio_bitrate",
+    ),
+    value(
+        "-crf",
+        ScopeRule::OutputOnly,
+        ValueRule::Crf,
+        Repeat::Once,
+        "Output::set_video_codec_opt(\"crf\", …), libx264 only",
+    ),
+    value(
+        "-preset",
+        ScopeRule::OutputOnly,
+        ValueRule::Preset,
+        Repeat::Once,
+        "Output::set_video_codec_opt(\"preset\", …), libx264 only",
+    ),
+    value(
+        "-pix_fmt",
+        ScopeRule::OutputOnly,
+        ValueRule::PixFmt,
+        Repeat::Once,
+        "Output::set_pix_fmt",
+    ),
+    value(
+        "-ar",
+        ScopeRule::OutputOnly,
+        ValueRule::PositiveInt,
+        Repeat::Once,
+        "Output::set_audio_sample_rate",
+    ),
+    value(
+        "-ac",
+        ScopeRule::OutputOnly,
+        ValueRule::PositiveInt,
+        Repeat::Once,
+        "Output::set_audio_channels",
+    ),
+    value(
+        "-frames:v",
+        ScopeRule::OutputOnly,
+        ValueRule::FramesOne,
+        Repeat::Once,
+        "Output::set_max_video_frames(1)",
+    ),
+    value(
+        "-vf",
+        ScopeRule::OutputOnly,
+        ValueRule::ScaleFilter,
+        Repeat::Once,
+        "Output::set_video_filter",
+    ),
+    value(
+        "-map",
+        ScopeRule::OutputOnly,
+        ValueRule::MapBasic,
+        Repeat::Accumulate,
+        "Output::add_stream_map / add_stream_map_with_copy",
+    ),
     value(
         "-movflags",
         ScopeRule::OutputOnly,
         ValueRule::MovflagsFaststart,
+        Repeat::Once,
+        "Output::set_format_opt(\"movflags\", \"+faststart\")",
     ),
     // Single-rendition VOD HLS.
-    value("-hls_time", ScopeRule::OutputOnly, ValueRule::HlsTime),
+    value(
+        "-hls_time",
+        ScopeRule::OutputOnly,
+        ValueRule::HlsTime,
+        Repeat::Once,
+        "Output::set_format_opt(\"hls_time\", …)",
+    ),
     value(
         "-hls_playlist_type",
         ScopeRule::OutputOnly,
         ValueRule::HlsPlaylistVod,
+        Repeat::Once,
+        "Output::set_format_opt(\"hls_playlist_type\", \"vod\")",
     ),
     value(
         "-hls_list_size",
         ScopeRule::OutputOnly,
         ValueRule::HlsListSizeZero,
+        Repeat::Once,
+        "Output::set_format_opt(\"hls_list_size\", \"0\")",
     ),
     value(
         "-hls_segment_filename",
         ScopeRule::OutputOnly,
         ValueRule::Path,
+        Repeat::Once,
+        "Output::set_format_opt(\"hls_segment_filename\", …)",
     ),
 ];
 
@@ -710,6 +856,93 @@ mod tests {
         assert_eq!(nearest_option("-crff"), Some("-crf"));
         assert_eq!(nearest_option("-vff"), Some("-vf"));
         assert_eq!(nearest_option("-completely_unrelated"), None);
+    }
+
+    /// A representative valid value per rule, for the repeat-policy
+    /// conformance sweep.
+    fn sample_value(rule: ValueRule) -> &'static str {
+        match rule {
+            ValueRule::Seconds => "5",
+            ValueRule::Codec => "libx264",
+            ValueRule::Bitrate => "1M",
+            ValueRule::Crf => "23",
+            ValueRule::Preset => "fast",
+            ValueRule::PositiveInt => "2",
+            ValueRule::PixFmt => "yuv420p",
+            ValueRule::FramesOne => "1",
+            ValueRule::ScaleFilter => "scale=64:64",
+            ValueRule::MapBasic => "0:v",
+            ValueRule::FormatName => "mp4",
+            ValueRule::MovflagsFaststart => "+faststart",
+            ValueRule::HlsTime => "6",
+            ValueRule::HlsPlaylistVod => "vod",
+            ValueRule::HlsListSizeZero => "0",
+            ValueRule::Path => "seg.ts",
+            ValueRule::LogLevel => "info",
+        }
+    }
+
+    #[test]
+    fn parser_duplicate_handling_matches_the_repeat_column() {
+        // The seven-field table is the single source: feed every row a
+        // doubled spelling and require the parser to agree with `repeat`.
+        use super::super::parse::parse;
+        use super::super::error::CliError;
+        for spec in OPTION_TABLE {
+            let one = match spec.value {
+                Some(rule) => format!("{} {}", spec.name, sample_value(rule)),
+                None => spec.name.to_string(),
+            };
+            let doubled = format!("{one} {one}");
+            let cmd: Vec<String> = match spec.scope {
+                ScopeRule::Global => format!("{doubled} -i in.mp4 -y out.mp4"),
+                ScopeRule::InputOrOutput => format!("{doubled} -i in.mp4 -y out.mp4"),
+                ScopeRule::OutputOnly => format!("-i in.mp4 {doubled} -y out.mp4"),
+            }
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+            let result = parse(&cmd);
+            match spec.repeat {
+                Repeat::Once => {
+                    assert!(
+                        matches!(
+                            &result,
+                            Err(CliError::UnsupportedLayout { reason, .. })
+                                if reason.contains("more than once")
+                        ),
+                        "{}: a doubled Once option must be rejected as a duplicate, got {:?}",
+                        spec.name,
+                        result.as_ref().err().map(|e| e.to_string())
+                    );
+                }
+                Repeat::Accumulate | Repeat::Free => {
+                    // Duplication itself must NOT be the failure; later
+                    // combination rules may still fire (e.g. -crf without
+                    // libx264), which is fine — assert only that no
+                    // duplicate-shaped rejection appeared.
+                    if let Err(err) = &result {
+                        let display = err.to_string();
+                        assert!(
+                            !display.contains("more than once"),
+                            "{}: repetition should be tolerated, got: {display}",
+                            spec.name
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_row_names_its_sink() {
+        for spec in OPTION_TABLE {
+            assert!(
+                !spec.sink.is_empty(),
+                "{} is missing its lowering binding",
+                spec.name
+            );
+        }
     }
 
     #[test]
