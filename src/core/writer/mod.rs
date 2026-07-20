@@ -154,6 +154,17 @@ pub enum WriterError {
         video_output_pads: usize,
     },
 
+    /// Both [`VideoWriterBuilder::filter_desc`] and the opened `Output`'s
+    /// `set_video_filter` were configured. The writer runs exactly one
+    /// filter chain between the pushed frames and the encoder, and guessing
+    /// which of the two the caller meant would silently ignore the other —
+    /// configure the chain in exactly one place.
+    #[error(
+        "both VideoWriterBuilder::filter_desc and Output::set_video_filter are set; \
+         configure the writer's filter chain in exactly one place"
+    )]
+    ConflictingFilterDescriptions,
+
     /// The `filter_desc` parses into more than one disconnected filter
     /// component (e.g. `"nullsink;color=..."`). The pushed frames would feed
     /// one part while an unrelated part feeds (or starves) the encoder — an
@@ -411,6 +422,11 @@ impl VideoWriterBuilder {
     /// deliberately routes the pushed stream into a sink through a
     /// stream-routing filter (multi-stream `concat`, …) runs exactly as
     /// declared, like it would in the CLI.
+    ///
+    /// The opened `Output`'s `set_video_filter` supplies the same chain from
+    /// the output side and is honored when this builder-level description is
+    /// absent; setting BOTH fails with
+    /// [`WriterError::ConflictingFilterDescriptions`].
     pub fn filter_desc(mut self, desc: impl Into<String>) -> Self {
         self.filter_desc = Some(desc.into());
         self
@@ -420,8 +436,11 @@ impl VideoWriterBuilder {
     /// first frame. `output` carries the [`Output`] capabilities that make
     /// sense for a single pushed video stream: codec, codec options, format,
     /// format options (`movflags`…), write/seek callbacks, frame pipelines
-    /// (wgpu…), bitrate, qscale, frame limits. Stream maps are the exception
-    /// and are rejected ([`WriterError::StreamMapsUnsupported`]) — there is
+    /// (wgpu…), bitrate, qscale, frame limits, and `set_video_filter` (used
+    /// when no builder-level [`filter_desc`](Self::filter_desc) is set;
+    /// both at once is
+    /// [`WriterError::ConflictingFilterDescriptions`]). Stream maps are the
+    /// exception and are rejected ([`WriterError::StreamMapsUnsupported`]) — there is
     /// only one stream to map. A format that cannot actually carry the video
     /// stream is not second-guessed at build time: it surfaces as a pipeline
     /// error from [`finish`](VideoWriter::finish), like any other muxer
