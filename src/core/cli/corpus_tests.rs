@@ -760,3 +760,62 @@ fn corpus_input_format_override() {
 fn corpus_default_codecs_remux() {
     emit_only("ffmpeg -i in.mov -y out.mp4");
 }
+
+// ---------------------------------------------------------------------------
+// No-panic property sweep (the fuzz obligation, deterministic form).
+// ---------------------------------------------------------------------------
+
+/// Every generated string must classify (Ok or a typed Err) — the tokenizer
+/// and scoper must never panic, whatever byte salad arrives. The generator
+/// is a seeded LCG over an alphabet chosen to stress quoting, escapes,
+/// continuations, multi-byte characters and option-shaped fragments.
+#[test]
+fn corpus_no_panic_property_sweep() {
+    const ALPHABET: &[&str] = &[
+        " ", "-", "i", "c", ":", "v", "'", "\"", "\\", "\n", "^", "$", "0", "9", ".", "=",
+        "映", "🎬", "\t", "\r", "%", "?", "*", "[", "]", "y", "-i", "-y", "-c:v", "scale",
+        "map", "~", "#",
+    ];
+    let mut state: u64 = 0x243F_6A88_85A3_08D3;
+    let mut next = move || {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (state >> 33) as usize
+    };
+    for _ in 0..500 {
+        let len = next() % 24;
+        let mut cmd = String::new();
+        for _ in 0..len {
+            cmd.push_str(ALPHABET[next() % ALPHABET.len()]);
+        }
+        // The property is totality, not acceptance.
+        let _ = from_cli(&cmd).map(|_| ());
+        let _ = emit_rust_code(&cmd);
+    }
+}
+
+/// argv-form totality: raw token vectors (no tokenizer in front) with hostile
+/// shapes must classify without panicking.
+#[test]
+fn corpus_no_panic_argv_sweep() {
+    let hostile: &[&[&str]] = &[
+        &[],
+        &[""],
+        &["-"],
+        &["--"],
+        &["-i"],
+        &["-i", ""],
+        &["-i", "-i"],
+        &["-ss"],
+        &["-ss", "-ss", "-i", "x", "-y", "y.mp4"],
+        &["-c:v", "-c:a", "-i", "x", "-y", "y.mp4"],
+        &["🎬", "-y"],
+        &["-i", "🎬", "-y", "映画.mp4"],
+        &["-map", "", "-i", "x", "-y", "y.mp4"],
+        &["-vf", "", "-i", "x", "-y", "y.mp4"],
+        &["-y", "-y", "-i", "x", "out.mp4"],
+    ];
+    for args in hostile {
+        let _ = super::from_cli_args(args).map(|_| ());
+        let _ = super::emit_rust_code_from_args(args);
+    }
+}
