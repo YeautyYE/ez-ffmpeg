@@ -161,10 +161,15 @@ fn strict_decoder_leftover_fails_the_run() {
 #[test]
 fn default_path_still_warns_and_succeeds() {
     // Never break userspace: without the strict flag, the same bogus options
-    // stay warnings and the job completes.
+    // stay warnings and the job completes — all five sites covered,
+    // including the per-stream probe path.
     let fixture = mp4_fixture("lenient_in.mp4");
     let input = Input::from(fixture)
         .set_format_opt("no_such_demux_opt", "1")
+        .set_find_stream_info_codec_opts(
+            0,
+            vec![("no_such_probe_opt".to_string(), "1".to_string())],
+        )
         .set_video_codec_opt("no_such_dec_opt", "1");
     let output = Output::from(tmp_path("lenient_out.mp4").as_str())
         .set_video_codec("mpeg4")

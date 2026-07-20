@@ -360,6 +360,7 @@ unsafe fn open_input_file(
         input_opts.remove(&CString::new("scan_all_pmts")?);
     }
     for key in input_opts.leftover_keys() {
+        #[cfg(feature = "cli")]
         if input.strict_avoptions {
             return Err(Error::UnconsumedCliOption {
                 site: format!("input {index} (demuxer open)"),
@@ -601,6 +602,7 @@ unsafe fn find_stream_info_if_enabled(
         if matches!(key.as_str(), "threads" | "lowres" | "codec_whitelist") {
             continue;
         }
+        #[cfg(feature = "cli")]
         if input.strict_avoptions {
             return Err(Error::UnconsumedCliOption {
                 site: format!("stream {stream_index} probe of input {index}"),

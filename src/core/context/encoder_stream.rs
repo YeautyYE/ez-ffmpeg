@@ -50,7 +50,9 @@ pub(crate) struct EncoderStream {
     /// stream is an encoded-A/V member. Set by the scheduler before `enc_init`.
     sync_queue: Option<EncSyncHandle>,
     /// CLI-compat strict mode: encoder-option leftovers error instead of
-    /// warning (set from the owning muxer).
+    /// warning (set from the owning muxer). Read only by the `cli`-gated
+    /// strict branch in enc_task.
+    #[cfg_attr(not(feature = "cli"), allow(dead_code))]
     pub(crate) strict_avoptions: bool,
 }
 

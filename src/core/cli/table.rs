@@ -395,12 +395,30 @@ pub(crate) fn validate_value(
             }
         }
         ValueRule::LogLevel => {
-            let level = value.rsplit('+').next().unwrap_or(value);
-            if LOG_LEVELS.contains(&level) || level.parse::<i32>().is_ok() {
+            // FFmpeg's -loglevel grammar: `[flag+...]level` where the flags
+            // are `repeat` and `level`, joined by `+`; the trailing component
+            // may itself be a flag (bare `repeat` keeps the current level) or
+            // a named/numeric level. EVERY component must be known —
+            // `banana+error` is invalid in the CLI and must be here too.
+            let mut components = value.split('+').peekable();
+            let mut valid = value != "+" && !value.is_empty();
+            while let Some(component) = components.next() {
+                let last = components.peek().is_none();
+                let is_flag = matches!(component, "repeat" | "level");
+                let is_level =
+                    LOG_LEVELS.contains(&component) || component.parse::<i32>().is_ok();
+                let ok = if last { is_flag || is_level } else { is_flag };
+                if !ok {
+                    valid = false;
+                    break;
+                }
+            }
+            if valid {
                 Ok(())
             } else {
                 Err(fail(format!(
-                    "unknown log level; expected one of {} or an integer",
+                    "invalid log level; the grammar is [repeat+][level+]LEVEL with LEVEL one \
+                     of {} or an integer",
                     LOG_LEVELS.join(", ")
                 )))
             }
@@ -675,6 +693,16 @@ mod tests {
         assert!(check(ValueRule::HlsListSizeZero, "5").is_err());
         assert!(check(ValueRule::HlsTime, "6").is_ok());
         assert!(check(ValueRule::HlsTime, "0").is_err());
+    }
+
+    #[test]
+    fn loglevel_flag_prefix_grammar() {
+        for good in ["error", "info", "32", "repeat", "level", "repeat+info", "level+debug", "repeat+level+warning"] {
+            assert!(check(ValueRule::LogLevel, good).is_ok(), "expected Ok for {good:?}");
+        }
+        for bad in ["banana", "banana+error", "error+repeat", "info+debug", "", "+", "repeat+"] {
+            assert!(check(ValueRule::LogLevel, bad).is_err(), "expected Err for {bad:?}");
+        }
     }
 
     #[test]

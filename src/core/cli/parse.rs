@@ -25,6 +25,7 @@ pub(crate) fn parse(args: &[String]) -> Result<CliIr, CliError> {
         output: None,
         pending_input: InputIr::default(),
         pending_output: OutputIr::default(),
+        spans: Vec::new(),
     };
 
     let mut iter = args.iter().enumerate().peekable();
@@ -45,7 +46,7 @@ pub(crate) fn parse(args: &[String]) -> Result<CliIr, CliError> {
         if is_option_token(token) {
             let value_slot = match lookup(token) {
                 Some(spec) if spec.arity == Arity::Value => {
-                    let Some((_, value)) = iter.next() else {
+                    let Some((value_index, value)) = iter.next() else {
                         return Err(CliError::UnsupportedValue {
                             option: token.clone(),
                             value: String::new(),
@@ -53,7 +54,7 @@ pub(crate) fn parse(args: &[String]) -> Result<CliIr, CliError> {
                             reason: format!("missing value after {token}"),
                         });
                     };
-                    Some(value.clone())
+                    Some((value.clone(), value_index))
                 }
                 _ => None,
             };
@@ -80,11 +81,15 @@ struct Parser {
     output: Option<OutputIr>,
     pending_input: InputIr,
     pending_output: OutputIr,
+    /// First argv index per scope-qualified option key (diagnostic anchors).
+    spans: Vec<(String, usize)>,
 }
 
 impl Parser {
     fn scope(&self) -> CliScope {
-        if self.input.is_none() {
+        if self.output.is_some() {
+            CliScope::AfterOutput
+        } else if self.input.is_none() {
             CliScope::Input
         } else {
             CliScope::Output
@@ -164,7 +169,7 @@ impl Parser {
     fn apply_option(
         &mut self,
         name: &str,
-        value: Option<String>,
+        value: Option<(String, usize)>,
         index: usize,
     ) -> Result<(), CliError> {
         let Some(spec) = lookup(name) else {
@@ -174,10 +179,9 @@ impl Parser {
         // Scope admission first, so `-crf 23 -i in.mp4` is "output option in
         // input position", not a mystery later.
         let scope = self.scope();
-        let after_output = self.output.is_some();
         match spec.scope {
             ScopeRule::Global => {}
-            _ if after_output => {
+            _ if scope == CliScope::AfterOutput => {
                 return Err(CliError::UnsupportedLayout {
                     token: name.to_string(),
                     index,
@@ -200,14 +204,16 @@ impl Parser {
             _ => {}
         }
 
-        if let (Some(rule), Some(value)) = (spec.value, value.as_deref()) {
-            table::validate_value(rule, name, value, index)?;
+        // A bad value is anchored to the VALUE token, not the option that
+        // introduced it.
+        if let (Some(rule), Some((value, value_index))) = (spec.value, value.as_ref()) {
+            table::validate_value(rule, name, value, *value_index)?;
         }
 
         if spec.noop {
             self.globals.noops.push(Noop {
                 flag: name.to_string(),
-                value,
+                value: value.map(|(text, _)| text),
             });
             return Ok(());
         }
@@ -216,7 +222,16 @@ impl Parser {
             return Ok(());
         }
 
-        let value = value.unwrap_or_default();
+        // Diagnostic anchor: first occurrence of each consumed option.
+        let span_key = match scope {
+            CliScope::Input => format!("in:{name}"),
+            _ => format!("out:{name}"),
+        };
+        if !self.spans.iter().any(|(key, _)| key == &span_key) {
+            self.spans.push((span_key, index));
+        }
+
+        let value = value.map(|(text, _)| text).unwrap_or_default();
         match self.scope() {
             CliScope::Input => self.apply_input_option(name, value, index),
             _ => self.apply_output_option(name, value, index),
@@ -377,6 +392,7 @@ impl Parser {
             globals: self.globals,
             input,
             output,
+            spans: self.spans,
         };
         check_combinations(&ir)?;
         Ok(ir)
@@ -385,12 +401,33 @@ impl Parser {
 
 /// Cross-option rules that only make sense once the whole command is parsed.
 /// Each is a distinct, documented conflict — never a silent drop.
+/// Argv anchor for a conflict participant, resolved from the IR's span
+/// table. Display names may carry a ` copy` suffix (`-c:v copy`) or the
+/// collective `-hls_*`; both resolve to their recorded option keys.
+fn display_span(ir: &CliIr, name: &str) -> Option<usize> {
+    let base = name.strip_suffix(" copy").unwrap_or(name);
+    if base == "-hls_*" {
+        return [
+            "out:-hls_time",
+            "out:-hls_playlist_type",
+            "out:-hls_list_size",
+            "out:-hls_segment_filename",
+        ]
+        .iter()
+        .find_map(|key| ir.span(key));
+    }
+    ir.span(&format!("out:{base}"))
+        .or_else(|| ir.span(&format!("in:{base}")))
+}
+
 fn check_combinations(ir: &CliIr) -> Result<(), CliError> {
     let out = &ir.output;
     let conflict = |first: &str, second: &str, reason: &str| {
         Err(CliError::ConflictingOptions {
             first: first.to_string(),
             second: second.to_string(),
+            first_index: display_span(ir, first),
+            second_index: display_span(ir, second),
             reason: reason.to_string(),
         })
     };
@@ -619,6 +656,8 @@ fn set_duration(
         return Err(CliError::ConflictingOptions {
             first: first.to_string(),
             second: second.to_string(),
+            first_index: Some(existing.token_index),
+            second_index: Some(index),
             reason: "-t and -to in the SAME scope: the CLI resolves this pair with a \
                      precedence rule (-t wins); the subset rejects the pair instead of \
                      silently dropping one (cross-scope pairs remain legal)"
@@ -628,6 +667,7 @@ fn set_duration(
     *slot = Some(DurationBound {
         kind,
         us: parse_seconds_us(value).expect("validated seconds"),
+        token_index: index,
     });
     Ok(())
 }
