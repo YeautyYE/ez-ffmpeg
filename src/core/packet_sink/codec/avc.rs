@@ -405,10 +405,13 @@ impl AvcRuntime {
         Ok(())
     }
 
-    /// One-traversal payload normalization: validates NAL boundaries,
-    /// classifies types and (for Annex-B input) rewrites into `scratch` as a
-    /// 4-byte length-prefixed access unit — no per-packet allocation; the
-    /// already-length-prefixed path is validate-only and zero-copy.
+    /// Payload normalization: validates NAL boundaries, classifies types
+    /// and (for Annex-B input) rewrites into `scratch` as a 4-byte
+    /// length-prefixed access unit. Annex-B input takes TWO linear walks —
+    /// an allocation-free census that reserves the exact output size, then
+    /// the write walk, which therefore never reallocates. The
+    /// already-length-prefixed path is a single validate-only pass,
+    /// zero-copy.
     ///
     /// Returns `(is_key, payload)` where `is_key` is IDR presence and
     /// `payload` borrows either `scratch` or the input.
