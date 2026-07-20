@@ -101,59 +101,20 @@ impl FormatContext {
         }
     }
 
-    /// Take ownership of an already-allocated **output** context written to a
-    /// file/URL (no custom AVIO).
-    ///
-    /// # Safety
-    ///
-    /// `ptr` must be non-null and returned by a successful
-    /// `avformat_alloc_output_context2`. On drop, a file-backed `pb` is closed
-    /// (`avio_closep`, unless `AVFMT_NOFILE`) and the context freed
-    /// (`out_fmt_ctx_free(ptr, false)` → `avformat_free_context`). Ownership
-    /// transfers to the returned value; the caller must not free `ptr` again.
-    // Dead only under docsrs, where the output open path (its sole caller) is
-    // `#[cfg(not(docsrs))]`; the normal build wires it, so suppress there only.
-    #[cfg_attr(docsrs, allow(dead_code))]
-    #[inline]
-    pub(crate) unsafe fn from_output(ptr: *mut AVFormatContext) -> Self {
-        Self {
-            ptr,
-            mode: Mode::Output,
-        }
-    }
-
-    /// Take ownership of an already-allocated **output** context that uses a
-    /// custom write/seek AVIO callback (`AVFMT_FLAG_CUSTOM_IO`).
-    ///
-    /// # Safety
-    ///
-    /// `ptr` must be non-null with a custom `AVIOContext` already wired into
-    /// `(*ptr).pb` (its `opaque` a `Box`-allocated callback state owned by this
-    /// context). Constructing this **before** `pb` is wired would leak the AVIO +
-    /// `Box` on drop, since teardown reads `(*ptr).pb`. On drop the AVIO context,
-    /// its buffer, and the `Box` are reclaimed then the context is freed
-    /// (`out_fmt_ctx_free(ptr, true)`). Ownership transfers to the returned value.
-    // Dead only under docsrs, where the output open path (its sole caller) is
-    // `#[cfg(not(docsrs))]`; the normal build wires it, so suppress there only.
-    #[cfg_attr(docsrs, allow(dead_code))]
-    #[inline]
-    pub(crate) unsafe fn from_output_custom_io(ptr: *mut AVFormatContext) -> Self {
-        Self {
-            ptr,
-            mode: Mode::OutputCustomIo,
-        }
-    }
-
     /// Take ownership of an already-initialized context with an explicitly
     /// selected teardown [`Mode`] (used by `FmtCtxGuard::release_into`, which
     /// preserves its arm-time mode instead of letting callers re-infer it).
     ///
     /// # Safety
     ///
-    /// `ptr` must be non-null and satisfy the constructor contract of the
-    /// matching mode (`from_input` / `from_input_custom_io` / `from_output` /
-    /// `from_output_custom_io`). Ownership transfers to the returned value;
-    /// the caller must not free `ptr` again.
+    /// `ptr` must be non-null and initialized per the matching mode's
+    /// teardown expectations: inputs opened by `avformat_open_input` (custom
+    /// AVIO wired for [`Mode::InputCustomIo`]); outputs allocated by
+    /// `avformat_alloc_output_context2` (on drop a file-backed `pb` is
+    /// closed for [`Mode::Output`], and for [`Mode::OutputCustomIo`] the AVIO
+    /// context, its buffer and the callback `Box` behind `pb` are reclaimed —
+    /// so `pb` must already be wired when that mode is selected). Ownership
+    /// transfers to the returned value; the caller must not free `ptr` again.
     #[cfg_attr(docsrs, allow(dead_code))]
     #[inline]
     pub(crate) unsafe fn from_mode(ptr: *mut AVFormatContext, mode: Mode) -> Self {

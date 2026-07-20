@@ -69,6 +69,17 @@ fn build_sq_mux(plan: SqMuxPlan, stream_count: usize) -> SqMux {
     }
 }
 
+/// The worker handoff: teardown guard, thread-slot guard and (for packet
+/// sinks) the user-callback worker, moved into the spawned closure — or
+/// reclaimed in order by the spawn-failure path.
+type MuxWorkerHandoff = Arc<
+    Mutex<(
+        Option<MuxTeardownGuard>,
+        Option<MuxSlotGuard>,
+        Option<crate::core::packet_sink::strict::PacketSinkWorker>,
+    )>,
+>;
+
 /// `frame_end` for a mux packet (`sync_queue.c:126`): `pts + duration` in the
 /// packet's own time base, or `None` when the packet carries no pts. Packets
 /// have no `frame_samples`, so `nb_samples` is always 0.
@@ -649,7 +660,8 @@ fn _mux_init(
             )
         } {
             Ok(worker) => sink_worker_slot = Some(worker),
-            Err((sink, e)) => {
+            Err(boxed) => {
+                let (sink, e) = *boxed;
                 error!("Packet sink configuration invalid: {e}");
                 // The user callbacks ride into the ordered failure teardown:
                 // published error -> join/free -> USER DROPS -> slot release.
@@ -751,7 +763,7 @@ fn _mux_init(
     // handoff where `guard_slot`/`src_pre_receivers` would drop out of order.
     let thread_name = format!("muxer{mux_idx}:{format_name}");
     let src_pre_receivers = guard.take_pre_receivers();
-    let guard_slot = Arc::new(Mutex::new((
+    let guard_slot: MuxWorkerHandoff = Arc::new(Mutex::new((
         Some(guard),
         Some(slot_guard),
         sink_worker_slot.take(),
@@ -1535,13 +1547,7 @@ fn fail_mux_worker_spawn(
     scheduler_status: &Arc<AtomicUsize>,
     scheduler_result: &Arc<Mutex<Option<crate::error::Result<()>>>>,
     src_pre_receivers: Vec<PreMuxQueueReceiver>,
-    guard_slot: &Arc<
-        Mutex<(
-            Option<MuxTeardownGuard>,
-            Option<MuxSlotGuard>,
-            Option<crate::core::packet_sink::strict::PacketSinkWorker>,
-        )>,
-    >,
+    guard_slot: &MuxWorkerHandoff,
 ) {
     set_scheduler_error(
         scheduler_status,

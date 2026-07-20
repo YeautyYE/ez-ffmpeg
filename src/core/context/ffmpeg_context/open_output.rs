@@ -448,14 +448,15 @@ fn validate_packet_sink_options(output: &Output) -> Result<()> {
     // applied AFTER the policy flag and can clear or replace it (both
     // `flags=-global_header` and an absolute `flags=x` assignment), so it is
     // rejected up front rather than failing later with MissingExtradata.
-    for opts in [&output.video_codec_opts, &output.audio_codec_opts] {
-        if let Some(opts) = opts {
-            if opts.keys().any(|k| k == "flags") {
-                return Err(PacketSinkError::UnsupportedOption(
-                    "the 'flags' codec option (it can clear the global_header policy)",
-                )
-                .into());
-            }
+    for opts in [&output.video_codec_opts, &output.audio_codec_opts]
+        .into_iter()
+        .flatten()
+    {
+        if opts.keys().any(|k| k == "flags") {
+            return Err(PacketSinkError::UnsupportedOption(
+                "the 'flags' codec option (it can clear the global_header policy)",
+            )
+            .into());
         }
     }
     Ok(())
