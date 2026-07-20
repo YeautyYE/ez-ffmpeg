@@ -54,6 +54,10 @@ fn build_rejects_muxer_only_options() {
             Output::new_by_packet_sink(noop_sink()).set_audio_bsf("aac_adtstoasc"),
         ),
         (
+            "set_video_filter",
+            Output::new_by_packet_sink(noop_sink()).set_video_filter("scale=1280:-2"),
+        ),
+        (
             "set_format_opt",
             Output::new_by_packet_sink(noop_sink()).set_format_opt("movflags", "+faststart"),
         ),
@@ -150,6 +154,24 @@ fn build_rejects_stream_copy() {
     ) {
         Error::PacketSink(PacketSinkError::StreamCopyUnsupported) => {}
         other => panic!("expected StreamCopyUnsupported via map, got {other:?}"),
+    }
+}
+
+/// A sink output carrying BOTH a video filter and `-c:v copy` must surface the
+/// filter rejection: the unsupported-option matrix runs before the stream-copy
+/// check inside sink validation, and sink validation runs before the generic
+/// `FilterWithStreamCopy` container check. Pinning the precedence keeps the
+/// diagnostic stable for the one config that trips all three rules.
+#[test]
+fn filter_rejection_wins_over_stream_copy_on_sinks() {
+    match build_err(
+        testsrc(1),
+        Output::new_by_packet_sink(noop_sink())
+            .set_video_filter("scale=1280:-2")
+            .set_video_codec("copy"),
+    ) {
+        Error::PacketSink(PacketSinkError::UnsupportedOption("set_video_filter")) => {}
+        other => panic!("expected the set_video_filter rejection, got {other:?}"),
     }
 }
 

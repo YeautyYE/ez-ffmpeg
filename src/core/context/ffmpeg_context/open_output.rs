@@ -415,6 +415,11 @@ fn validate_packet_sink_options(output: &Output) -> Result<()> {
         ("set_video_bsf", output.video_bsf.is_some()),
         ("set_audio_bsf", output.audio_bsf.is_some()),
         ("set_subtitle_bsf", output.subtitle_bsf.is_some()),
+        // The strict tier delivers encoded packets; per-output video filters
+        // are container-output features for now. Rejecting the pair here also
+        // keeps sink outputs out of the filter binding pre-pass, so a sink can
+        // never flip the job-wide fftools unlabeled binding order.
+        ("set_video_filter", output.video_filter.is_some()),
         ("set_format_opt", output.format_opts.is_some()),
         ("add_attachment", !output.attachments.is_empty()),
         ("set_subtitle_codec", output.subtitle_codec.is_some()),
