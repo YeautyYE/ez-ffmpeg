@@ -293,51 +293,58 @@ pub(super) fn outputs_bind(
         }
     }
 
+    // Resolved -vf matrix (each rule enforced at its own assignment point,
+    // so no spelling can dodge it and no legal layout is over-rejected):
+    //   complex video  -> SimpleAndComplexFilter, raised where an unlabeled
+    //                     graph output is ACTUALLY assigned to an output
+    //                     that carries a simple filter
+    //                     (output_bind_by_unlabeled_filter), or where a
+    //                     labeled graph output is mapped to one (map_manual).
+    //                     When any output uses set_video_filter, unlabeled
+    //                     assignment runs in fftools order — for every
+    //                     output, before its manual/automatic mapping
+    //                     (ffmpeg_mux_init.c create_streams) — so explicit
+    //                     maps cannot reroute the graph past the conflict,
+    //                     while an output the graph does NOT land on keeps
+    //                     its own simple filter, exactly like FFmpeg.
+    //   video copy     -> FilterWithStreamCopy (open_output_file for
+    //                     -c:v copy, map_manual for copy maps);
+    //   direct encode  -> the filter binds in init_simple_filtergraph,
+    //                     which records the consumption;
+    //   no video       -> VideoFilterUnused (postcondition below).
+    //
+    // The fftools-order pass is scoped to jobs that use the per-output
+    // filter: with no set_video_filter anywhere, the legacy order (unlabeled
+    // binding only for map-less outputs) is preserved bit for bit for
+    // existing callers.
+    let fftools_unlabeled_order = muxs.iter().any(|mux| mux.video_filter.is_some());
+
     for (i, mux) in muxs.iter_mut().enumerate() {
-        // Resolved -vf matrix, enforced in this order so no spelling can
-        // dodge its rule:
-        //   complex video  -> SimpleAndComplexFilter (here, before any
-        //                     mapping branch — fftools binds unlabeled graph
-        //                     outputs before manual/automatic mapping
-        //                     (ffmpeg_mux_init.c create_streams) and then
-        //                     hits ost_get_filters' conflict, so maps or
-        //                     disable flags must not bypass it);
-        //   video copy     -> FilterWithStreamCopy (open_output_file for
-        //                     -c:v copy, map_manual for copy maps);
-        //   direct encode  -> the filter binds in init_simple_filtergraph,
-        //                     which records the consumption;
-        //   no video       -> VideoFilterUnused (postcondition below).
-        if let Some(video_filter) = &mux.video_filter {
-            let pending_unlabeled_video = filter_graphs.iter().any(|fg| {
-                fg.outputs.iter().any(|output_filter| {
-                    (output_filter.linklabel.is_empty() || output_filter.linklabel == "out")
-                        && !output_filter.has_dst()
-                        && output_filter.media_type == AVMEDIA_TYPE_VIDEO
-                })
-            });
-            if pending_unlabeled_video {
-                return Err(OpenOutputError::SimpleAndComplexFilter(video_filter.clone()).into());
-            }
+        // Initialize auto_disable with muxer's stream disable flags
+        // FFmpeg reference: fftools/ffmpeg_mux_init.c:1891-1895
+        // auto_disable bitmask: 1 << AVMEDIA_TYPE_* disables that stream type
+        let mut auto_disable = 0i32;
+        if mux.video_disable {
+            auto_disable |= 1 << (AVMEDIA_TYPE_VIDEO as i32);
+        }
+        if mux.audio_disable {
+            auto_disable |= 1 << (AVMEDIA_TYPE_AUDIO as i32);
+        }
+        if mux.subtitle_disable {
+            auto_disable |= 1 << (AVMEDIA_TYPE_SUBTITLE as i32);
+        }
+        if mux.data_disable {
+            auto_disable |= 1 << (AVMEDIA_TYPE_DATA as i32);
+        }
+
+        if fftools_unlabeled_order {
+            output_bind_by_unlabeled_filter(i, mux, filter_graphs, &mut auto_disable)?;
         }
 
         if mux.stream_maps.is_empty() {
-            // Initialize auto_disable with muxer's stream disable flags
-            // FFmpeg reference: fftools/ffmpeg_mux_init.c:1891-1895
-            // auto_disable bitmask: 1 << AVMEDIA_TYPE_* disables that stream type
-            let mut auto_disable = 0i32;
-            if mux.video_disable {
-                auto_disable |= 1 << (AVMEDIA_TYPE_VIDEO as i32);
+            if !fftools_unlabeled_order {
+                output_bind_by_unlabeled_filter(i, mux, filter_graphs, &mut auto_disable)?;
             }
-            if mux.audio_disable {
-                auto_disable |= 1 << (AVMEDIA_TYPE_AUDIO as i32);
-            }
-            if mux.subtitle_disable {
-                auto_disable |= 1 << (AVMEDIA_TYPE_SUBTITLE as i32);
-            }
-            if mux.data_disable {
-                auto_disable |= 1 << (AVMEDIA_TYPE_DATA as i32);
-            }
-            output_bind_by_unlabeled_filter(i, mux, filter_graphs, &mut auto_disable)?;
             /* pick the first stream of each type */
             map_auto_streams(i, mux, demuxs, filter_graphs, auto_disable)?;
         } else {
@@ -1734,6 +1741,27 @@ fn output_bind_by_unlabeled_filter(
 
         for i in 0..filter_graph.outputs.len() {
             let media_type = filter_graph.outputs[i].media_type;
+
+            // Per-assignment simple/complex conflict: THIS output is about to
+            // receive an unlabeled graph output. If it also carries a simple
+            // video filter, that is fftools' ost_get_filters error — checked
+            // BEFORE the disable-flag skip, because fftools binds unlabeled
+            // outputs regardless of -vn and errors on the filter anyway. An
+            // output the graph does not land on is free to keep its filter.
+            {
+                let output_filter = &filter_graph.outputs[i];
+                let assignable = (output_filter.linklabel.is_empty()
+                    || output_filter.linklabel == "out")
+                    && !output_filter.has_dst();
+                if assignable && media_type == AVMEDIA_TYPE_VIDEO {
+                    if let Some(video_filter) = &mux.video_filter {
+                        return Err(OpenOutputError::SimpleAndComplexFilter(
+                            video_filter.clone(),
+                        )
+                        .into());
+                    }
+                }
+            }
 
             // Check if this stream type is disabled
             if *auto_disable & (1 << media_type as i32) != 0 {
