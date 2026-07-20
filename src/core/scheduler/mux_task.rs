@@ -1488,7 +1488,7 @@ fn _mux_init(
             //       scheduler status, none of which this thread feeds;
             //   (d) every OTHER packet-sink worker registers here whatever
             //       its outcome, so it is counted out of the condition
-            //       (live <= waiters) — sinks never wait on each other's
+            //       (live <= settled) — sinks never wait on each other's
             //       terminal callbacks, only for slots of workers that are
             //       not yet in their terminal region;
             //   (e) wait()/stop()/abort() run on user threads outside the
