@@ -32,8 +32,8 @@
 
 use std::process::Command;
 
-use super::manifest::{VerifiedShape, VERIFIED_SHAPES};
-use super::{from_cli_args, CliError};
+use super::manifest::{GoldenOracle, VerifiedShape, VERIFIED_SHAPES};
+use super::{from_cli_args, linked_profile_verified, CliError};
 use crate::core::container_info::{get_duration_us, get_metadata};
 use crate::core::context::ffmpeg_context::FfmpegContext;
 use crate::core::context::input::Input;
@@ -42,6 +42,28 @@ use crate::core::stream_info::{find_all_stream_infos, StreamInfo};
 
 const DURATION_TOLERANCE_US: i64 = 200_000;
 const FIXTURE_TITLE: &str = "cli compat golden fixture";
+
+/// Overwrite sentinel: LARGER than every artifact any golden produces, so a
+/// writer that appended or rewrote in place without truncating would leave a
+/// stale tail and fail the size assertion below.
+const PRESEED_LEN: usize = 8 * 1024 * 1024;
+
+fn preseed(path: &str) {
+    std::fs::write(path, vec![0xABu8; PRESEED_LEN]).unwrap();
+}
+
+/// The truncation proof: the final artifact must be strictly smaller than
+/// the oversized sentinel it replaced (a valid-media probe alone cannot
+/// exclude a stale tail past the new content).
+fn assert_truncated(label: &str, path: &str) {
+    let len = std::fs::metadata(path)
+        .unwrap_or_else(|e| panic!("{label}: output {path} missing: {e}"))
+        .len() as usize;
+    assert!(
+        len < PRESEED_LEN,
+        "{label}: {path} is {len} bytes, not smaller than the {PRESEED_LEN}-byte sentinel —          the -y overwrite did not truncate"
+    );
+}
 
 fn tmp_dir(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("ez_ffmpeg_cli_goldens_{}", std::process::id()));
@@ -150,7 +172,14 @@ fn run_reference(bin: &str, args: &[String], cwd: Option<&std::path::Path>) {
 // ---------------------------------------------------------------------------
 
 /// 16s 320x240@30 A/V fixture (mpeg4 + stereo AAC), long enough for several
-/// HLS segments.
+/// HLS segments — and KEYFRAME-DENSE by construction: a full-frame negation
+/// toggles at every integer second, so the x264 re-encode of every golden
+/// places IDR scene cuts each second. That is what makes the V6 oracle
+/// sensitive to the `hls_time` lowering: on smooth content x264's default
+/// keyint (250 ≈ 8.3s) pins every playlist to the same ~8.3s segmentation
+/// regardless of hls_time (measured: hls_time 2/6/7 identical), while on
+/// this fixture hls_time 6 yields 6/6/4 (target 6) and the muxer default
+/// of 2 would yield eight 2s segments — a dropped lowering cannot pass.
 fn av_fixture() -> String {
     let path = std::env::temp_dir()
         .join(format!("ez_ffmpeg_cli_goldens_{}", std::process::id()))
@@ -169,6 +198,7 @@ fn av_fixture() -> String {
             .output(
                 Output::from(path.as_str())
                     .set_video_codec("mpeg4")
+                    .set_video_filter("negate=enable='lt(mod(t,2),1)'")
                     .set_audio_codec("aac")
                     .add_metadata("title", FIXTURE_TITLE),
             )
@@ -386,15 +416,31 @@ fn canonical_input(shape: &VerifiedShape) -> &'static str {
 
 /// Runs the shape's canonical command through all three lanes. Returns
 /// `None` when the reference gate skips (lenient mode only).
-fn run_shape(shape_id: &str) -> Option<GoldenRun> {
-    let shape = VERIFIED_SHAPES
-        .iter()
-        .find(|shape| shape.id == shape_id)
-        .unwrap_or_else(|| panic!("no manifest entry for shape {shape_id}"));
+fn run_shape(shape: &VerifiedShape) -> Option<GoldenRun> {
+    // Profile-aware: on a non-verified linked line the semantic lanes cannot
+    // run; the honest assertion is that from_cli_args fails with the typed
+    // profile error for this shape's canonical command.
+    if !linked_profile_verified() {
+        let args: Vec<String> = shape.canonical_argv.iter().map(|s| s.to_string()).collect();
+        match from_cli_args(&args) {
+            Err(CliError::UnverifiedRuntimeProfile { .. }) => {
+                eprintln!(
+                    "{}: linked profile not verified; asserted the typed profile failure",
+                    shape.id
+                );
+                return None;
+            }
+            Ok(_) => panic!("{}: runtime must refuse a non-verified profile", shape.id),
+            Err(other) => panic!(
+                "{}: expected UnverifiedRuntimeProfile on this linked build, got: {other}",
+                shape.id
+            ),
+        }
+    }
     let bin = match cli_gate() {
         CliGate::Run { bin } => bin,
         CliGate::Skip(reason) => {
-            eprintln!("skipping {}: {reason}", shape.golden);
+            eprintln!("skipping {}: {reason}", shape.id);
             return None;
         }
     };
@@ -415,9 +461,11 @@ fn run_shape(shape_id: &str) -> Option<GoldenRun> {
         .to_string_lossy()
         .into_owned();
 
-    // Overwrite semantics ride every lane: -y must truncate pre-existing
-    // garbage into valid media.
-    std::fs::write(&ours_output, b"garbage, not media").unwrap();
+    // Overwrite semantics ride ALL THREE lanes: -y must truncate an
+    // oversized pre-existing file into the real artifact (reference CLI
+    // included — its overwrite behavior is part of the parity claim).
+    preseed(&ours_output);
+    preseed(&theirs_output);
 
     let context = from_cli_args(&ours_args).unwrap_or_else(|e| {
         panic!(
@@ -425,8 +473,10 @@ fn run_shape(shape_id: &str) -> Option<GoldenRun> {
             shape.id
         )
     });
-    run_context(context, shape.golden);
+    run_context(context, shape.id);
     run_reference(&bin, &theirs_args, None);
+    assert_truncated(&format!("{} ours", shape.id), &ours_output);
+    assert_truncated(&format!("{} theirs", shape.id), &theirs_output);
 
     // Lane 3: the compile-pinned emitted program, run in a scratch cwd whose
     // canonical file names resolve to the same fixture.
@@ -439,7 +489,7 @@ fn run_shape(shape_id: &str) -> Option<GoldenRun> {
         .join(&canonical_output)
         .to_string_lossy()
         .into_owned();
-    std::fs::write(&emitted_output, b"garbage, not media").unwrap();
+    preseed(&emitted_output);
     let example = example_binary(shape.emitted_example);
     let out = Command::new(&example)
         .current_dir(&emitted_dir)
@@ -451,6 +501,7 @@ fn run_shape(shape_id: &str) -> Option<GoldenRun> {
         shape.emitted_example,
         String::from_utf8_lossy(&out.stderr)
     );
+    assert_truncated(&format!("{} emitted", shape.id), &emitted_output);
 
     // The three-lane oracle: in-process vs CLI, emitted vs CLI.
     assert_same_media(
@@ -496,12 +547,30 @@ fn example_binary(name: &str) -> std::path::PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// The six goldens (each named by its manifest entry).
+// THE golden test: one parameterized runner driven by the manifest. Every
+// VERIFIED_SHAPES row is executed against its typed oracle through an
+// exhaustive match — a new verified row cannot land without choosing an
+// oracle, and a new oracle variant cannot land without assertions here.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn golden_v1_transcode() {
-    let Some(run) = run_shape("V1") else { return };
+fn verified_shapes_pass_their_semantic_goldens() {
+    for shape in VERIFIED_SHAPES {
+        let Some(run) = run_shape(shape) else {
+            continue;
+        };
+        match shape.oracle {
+            GoldenOracle::Transcode => oracle_transcode(&run),
+            GoldenOracle::Clip => oracle_clip(&run),
+            GoldenOracle::AudioExtract => oracle_audio_extract(&run),
+            GoldenOracle::Thumbnail => oracle_thumbnail(&run),
+            GoldenOracle::Scale => oracle_scale(&run),
+            GoldenOracle::Hls => oracle_hls(&run),
+        }
+    }
+}
+
+fn oracle_transcode(run: &GoldenRun) {
     let ours = summarize(&run.ours_output);
     assert_eq!(ours.len(), 2);
     assert_eq!(ours[0].codec, "h264");
@@ -513,9 +582,7 @@ fn golden_v1_transcode() {
     );
 }
 
-#[test]
-fn golden_v2_clip() {
-    let Some(run) = run_shape("V2") else { return };
+fn oracle_clip(run: &GoldenRun) {
     // -ss 10 on a 16s fixture with -t 20: ~6s remain; both engines agreed
     // (three-lane oracle), pin the absolute window too.
     let duration = get_duration_us(&run.ours_output).unwrap();
@@ -525,9 +592,7 @@ fn golden_v2_clip() {
     );
 }
 
-#[test]
-fn golden_v3_audio_extract() {
-    let Some(run) = run_shape("V3") else { return };
+fn oracle_audio_extract(run: &GoldenRun) {
     let ours = summarize(&run.ours_output);
     assert_eq!(ours.len(), 1, "-vn output must be audio-only");
     assert_eq!(ours[0].codec, "aac");
@@ -618,9 +683,7 @@ fn golden_v3_audio_extract() {
     );
 }
 
-#[test]
-fn golden_v4_thumbnail() {
-    let Some(run) = run_shape("V4") else { return };
+fn oracle_thumbnail(run: &GoldenRun) {
     let ours = summarize(&run.ours_output);
     assert_eq!(ours.len(), 1, "-an single-frame output must be video-only");
     assert_eq!(ours[0].codec, "mjpeg");
@@ -665,17 +728,13 @@ fn golden_v4_thumbnail() {
     }
 }
 
-#[test]
-fn golden_v5_scale() {
-    let Some(run) = run_shape("V5") else { return };
+fn oracle_scale(run: &GoldenRun) {
     let ours = summarize(&run.ours_output);
     // 320x240 -> width 1280, -2 keeps the 4:3 height even: 960.
     assert_eq!((ours[0].width, ours[0].height), (1280, 960));
 }
 
-#[test]
-fn golden_v6_hls() {
-    let Some(run) = run_shape("V6") else { return };
+fn oracle_hls(run: &GoldenRun) {
     let ours_playlist = run.ours_output.clone();
     let theirs_playlist = run.theirs_output.clone();
     let emitted_playlist = run.emitted_output.clone();
@@ -711,19 +770,55 @@ fn golden_v6_hls() {
         emitted.segments, theirs.segments,
         "emitted segment topology must match"
     );
+    // Segmentation oracle across ALL THREE lanes: target duration and every
+    // per-segment duration. On the keyframe-dense fixture these are the
+    // fields the hls_time lowering controls (dropping it falls back to the
+    // muxer default of 2 and produces eight 2s segments instead).
     assert_eq!(
         ours.target_duration, theirs.target_duration,
         "EXT-X-TARGETDURATION differs"
+    );
+    assert_eq!(
+        emitted.target_duration, theirs.target_duration,
+        "emitted EXT-X-TARGETDURATION differs"
+    );
+    assert_eq!(
+        ours.target_duration,
+        Some(6),
+        "hls_time 6 on the 1s-IDR fixture must yield target duration 6"
     );
     assert_eq!(
         ours.durations.len(),
         theirs.durations.len(),
         "EXTINF count differs"
     );
+    assert_eq!(
+        emitted.durations.len(),
+        theirs.durations.len(),
+        "emitted EXTINF count differs"
+    );
     for (i, (a, b)) in ours.durations.iter().zip(&theirs.durations).enumerate() {
         assert!(
             (a - b).abs() <= 0.2,
             "segment {i} duration differs: {a} vs {b}"
+        );
+    }
+    for (i, (a, b)) in emitted.durations.iter().zip(&theirs.durations).enumerate() {
+        assert!(
+            (a - b).abs() <= 0.2,
+            "emitted segment {i} duration differs: {a} vs {b}"
+        );
+    }
+    let expected = [6.0, 6.0, 4.0];
+    assert_eq!(
+        ours.durations.len(),
+        expected.len(),
+        "expected a 6/6/4 split"
+    );
+    for (i, (a, e)) in ours.durations.iter().zip(&expected).enumerate() {
+        assert!(
+            (a - e).abs() <= 0.2,
+            "segment {i}: expected ~{e}s on the keyframe-dense fixture, got {a}"
         );
     }
     // Every named segment must exist on disk with real payload, in the
@@ -792,6 +887,84 @@ fn vf_execution_rejects_multi_video_inputs() {
         Err(CliError::AmbiguousFilterSource { video_streams }) => {
             assert_eq!(video_streams, 2);
         }
+        Err(CliError::UnverifiedRuntimeProfile { .. }) if !linked_profile_verified() => {}
+        Err(other) => panic!("expected AmbiguousFilterSource, got: {other}"),
+    }
+}
+
+/// The TOCTOU regression: uniqueness must hold on the opening the pipeline
+/// executes with. A path first observed with ONE video stream is swapped for
+/// two-video content before the run — the in-binding check must still
+/// reject, because it validates the demuxers the job actually opened, not
+/// any earlier observation.
+#[test]
+fn vf_uniqueness_is_checked_on_the_executed_opening() {
+    let dir = tmp_dir("mutable_input");
+    let path = dir.join("mutable.mp4").to_string_lossy().into_owned();
+
+    // Step 1: single-video content at the path; an external observer sees 1.
+    run_context(
+        FfmpegContext::builder()
+            .input(Input::from("testsrc2=size=320x240:rate=30:duration=1").set_format("lavfi"))
+            .output(Output::from(path.as_str()).set_video_codec("mpeg4"))
+            .build()
+            .unwrap(),
+        "single-video first content",
+    );
+    let observed = find_all_stream_infos(&path)
+        .unwrap()
+        .into_iter()
+        .filter(|info| matches!(info, StreamInfo::Video { .. }))
+        .count();
+    assert_eq!(observed, 1, "precondition: the path starts unique");
+
+    // Step 2: the file mutates to two video streams before the run.
+    let two_video = dir.join("two_video_src.mp4").to_string_lossy().into_owned();
+    if !std::path::Path::new(&two_video).exists() {
+        run_context(
+            FfmpegContext::builder()
+                .input(Input::from("testsrc2=size=320x240:rate=30:duration=1").set_format("lavfi"))
+                .input(Input::from("testsrc2=size=160x120:rate=30:duration=1").set_format("lavfi"))
+                .output(
+                    Output::from(two_video.as_str())
+                        .set_video_codec("mpeg4")
+                        .add_stream_map("0:v")
+                        .add_stream_map("1:v"),
+                )
+                .build()
+                .unwrap(),
+            "two-video replacement content",
+        );
+    }
+    std::fs::copy(&two_video, &path).unwrap();
+
+    // Step 3: the run must reject based on ITS OWN opening.
+    let out = dir.join("scaled.mp4").to_string_lossy().into_owned();
+    let args: Vec<String> = [
+        "-i",
+        path.as_str(),
+        "-vf",
+        "scale=64:-2",
+        "-c:v",
+        "libx264",
+        "-crf",
+        "23",
+        "-preset",
+        "fast",
+        "-c:a",
+        "aac",
+        "-y",
+        out.as_str(),
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    match from_cli_args(&args) {
+        Ok(_) => panic!("the mutated two-video input must be rejected"),
+        Err(CliError::AmbiguousFilterSource { video_streams }) => {
+            assert_eq!(video_streams, 2);
+        }
+        Err(CliError::UnverifiedRuntimeProfile { .. }) if !linked_profile_verified() => {}
         Err(other) => panic!("expected AmbiguousFilterSource, got: {other}"),
     }
 }

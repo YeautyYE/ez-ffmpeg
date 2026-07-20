@@ -1,7 +1,7 @@
 // Generated from an ffmpeg command by the ez-ffmpeg CLI-compat emitter.
 // command: ffmpeg -i in.mkv -c:v libx264 -crf 23 -preset fast -c:a aac -y out.mp4
-// dialect: ffmpeg 7.1 command line; manifest: r2; crate: ez-ffmpeg 0.14.0; cargo features: none required
-// status: verified shape V1 (H.264/AAC transcode (crf + preset)) — backed by the semantic golden `golden_v1_transcode` against the ffmpeg CLI; canonical emission compile-pinned as examples/cli_emitted_transcode.rs
+// dialect: ffmpeg 7.1 command line; manifest: r3; crate: ez-ffmpeg 0.14.0; cargo features: none required
+// status: verified shape V1 (H.264/AAC transcode (crf + preset)) — verified by the manifest-driven semantic golden suite (oracle: Transcode) against the ffmpeg CLI; canonical emission compile-pinned as examples/cli_emitted_transcode.rs
 
 use ez_ffmpeg::{FfmpegContext, Output};
 

@@ -199,6 +199,12 @@ pub(crate) struct Muxer {
     // Parsed from string in open_output_file, stored as AVPixelFormat
     pub(crate) pix_fmt: Option<ffmpeg_sys_next::AVPixelFormat>,
 
+    /// CLI-compat only: fail binding unless the opened input has exactly one
+    /// video stream (the `-vf` structural-uniqueness prerequisite, checked
+    /// in `outputs_bind` on the executed demuxers).
+    #[cfg_attr(not(feature = "cli"), allow(dead_code))]
+    pub(crate) require_unique_video_source: bool,
+
     /// CLI-compat strict mode: forwarded from `Output::strict_avoptions` to
     /// the mux worker (muxer leftovers) and every `EncoderStream` (encoder
     /// leftovers).
@@ -333,6 +339,7 @@ impl Muxer {
         subtitle_disable: bool,
         data_disable: bool,
         pix_fmt: Option<ffmpeg_sys_next::AVPixelFormat>,
+        require_unique_video_source: bool,
         strict_avoptions: bool,
         video_filter: Option<String>,
         pre_mux_queue_config: PreMuxQueueConfig,
@@ -401,6 +408,7 @@ impl Muxer {
             subtitle_disable,
             data_disable,
             pix_fmt,
+            require_unique_video_source,
             strict_avoptions,
             video_filter,
             video_filter_bound: false,

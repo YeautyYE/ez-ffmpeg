@@ -187,6 +187,90 @@ fn default_path_still_warns_and_succeeds() {
 }
 
 #[test]
+fn facade_built_pipelines_arm_strict_mode_at_the_leftover_sites() {
+    // End-to-end pin of the strict prerequisite: a command admitted by
+    // from_cli_args must arm strict AVOption mode on the pipeline it builds
+    // — on the muxer (mux/enc leftover sites) AND on every decoder stream
+    // (dec leftover site). The site behavior itself is proven by the tests
+    // above; this closes the facade-to-flag gap they left.
+    // An A/V fixture: the V3-shaped command below extracts its audio track.
+    let fixture = tmp_path("facade_strict_in.mp4");
+    if !std::path::Path::new(&fixture).exists() {
+        FfmpegContext::builder()
+            .input(lavfi_video_input())
+            .input(
+                Input::from("sine=frequency=440:sample_rate=44100:duration=0.3")
+                    .set_format("lavfi"),
+            )
+            .output(
+                Output::from(fixture.as_str())
+                    .set_video_codec("mpeg4")
+                    .set_audio_codec("aac"),
+            )
+            .build()
+            .unwrap()
+            .start()
+            .unwrap()
+            .wait()
+            .unwrap();
+    }
+    let out = tmp_path("facade_strict_out.m4a");
+    let args: Vec<String> = [
+        "-i",
+        fixture.as_str(),
+        "-vn",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-y",
+        out.as_str(),
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    match crate::core::cli::from_cli_args(&args) {
+        Ok(context) => {
+            assert!(
+                crate::core::cli::linked_profile_verified(),
+                "runtime success on a non-verified profile"
+            );
+            assert!(
+                context.muxs.iter().all(|mux| mux.strict_avoptions),
+                "the built muxer must carry strict AVOption mode"
+            );
+            assert!(
+                context
+                    .demuxs
+                    .iter()
+                    .flat_map(|demux| demux.get_streams().iter())
+                    .all(|stream| stream.strict_avoptions),
+                "every decoder stream must carry strict AVOption mode"
+            );
+        }
+        Err(crate::core::cli::CliError::UnverifiedRuntimeProfile { .. }) => {
+            assert!(
+                !crate::core::cli::linked_profile_verified(),
+                "profile failure on a verified linked build"
+            );
+        }
+        Err(other) => panic!("facade-admitted command failed unexpectedly: {other}"),
+    }
+
+    // Contrast: the same pipeline built through the plain builder stays
+    // lenient (never break userspace).
+    let context = FfmpegContext::builder()
+        .input(Input::from(mp4_fixture("facade_lenient_in.mp4")))
+        .output(Output::from(tmp_path("facade_lenient_out.m4a").as_str()).set_audio_codec("aac"))
+        .build()
+        .unwrap();
+    assert!(
+        context.muxs.iter().all(|mux| !mux.strict_avoptions),
+        "the default builder path must stay lenient"
+    );
+}
+
+#[test]
 fn lowering_carries_the_golden_shape_fields() {
     // The lowered plan is the single artifact both run and emit consume;
     // pin the V1 lowering field by field (strict-mode arming itself is

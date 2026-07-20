@@ -1,7 +1,7 @@
 // Generated from an ffmpeg command by the ez-ffmpeg CLI-compat emitter.
 // command: ffmpeg -ss 5 -i in.mp4 -an -c:v mjpeg -frames:v 1 -y thumb.jpg
-// dialect: ffmpeg 7.1 command line; manifest: r2; crate: ez-ffmpeg 0.14.0; cargo features: none required
-// status: verified shape V4 (single-frame thumbnail (input -ss, -an, mjpeg)) — backed by the semantic golden `golden_v4_thumbnail` against the ffmpeg CLI; canonical emission compile-pinned as examples/cli_emitted_thumbnail.rs
+// dialect: ffmpeg 7.1 command line; manifest: r3; crate: ez-ffmpeg 0.14.0; cargo features: none required
+// status: verified shape V4 (single-frame thumbnail (input -ss, -an, mjpeg)) — verified by the manifest-driven semantic golden suite (oracle: Thumbnail) against the ffmpeg CLI; canonical emission compile-pinned as examples/cli_emitted_thumbnail.rs
 
 use ez_ffmpeg::{FfmpegContext, Input, Output};
 

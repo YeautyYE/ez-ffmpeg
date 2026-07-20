@@ -210,7 +210,7 @@ impl Parser {
             table::validate_value(rule, name, value, *value_index)?;
         }
 
-        if spec.noop {
+        if spec.selector == table::Selector::NoOp {
             self.globals.noops.push(Noop {
                 flag: name.to_string(),
                 value: value.map(|(text, _)| text),
@@ -421,18 +421,25 @@ impl Parser {
 /// collective `-hls_*`; both resolve to their recorded option keys.
 fn display_span(ir: &CliIr, name: &str) -> Option<usize> {
     let base = name.strip_suffix(" copy").unwrap_or(name);
-    if base == "-hls_*" {
-        return [
+    // Collective names anchor at the EARLIEST participating occurrence, not
+    // a fixed priority: `-hls_*` covers the four hls keys, and the synthetic
+    // `-c` (from the unqualified-map × per-media-copy conflict) covers
+    // whichever of -c:v / -c:a appeared first.
+    let candidates: &[&str] = match base {
+        "-hls_*" => &[
             "out:-hls_time",
             "out:-hls_playlist_type",
             "out:-hls_list_size",
             "out:-hls_segment_filename",
-        ]
-        .iter()
-        .find_map(|key| ir.span(key));
-    }
-    ir.span(&format!("out:{base}"))
-        .or_else(|| ir.span(&format!("in:{base}")))
+        ],
+        "-c" => &["out:-c:v", "out:-c:a"],
+        _ => {
+            return ir
+                .span(&format!("out:{base}"))
+                .or_else(|| ir.span(&format!("in:{base}")));
+        }
+    };
+    candidates.iter().filter_map(|key| ir.span(key)).min()
 }
 
 fn check_combinations(ir: &CliIr) -> Result<(), CliError> {

@@ -195,6 +195,15 @@ pub enum Error {
     #[error("Packet sink error: {0}")]
     PacketSink(#[from] PacketSinkError),
 
+    /// CLI-compat pipelines only: a `-vf` command was lowered onto an input
+    /// whose OPENED demuxer does not carry exactly one video stream. The
+    /// check runs on the demuxer instance the pipeline actually executes
+    /// with (no separate probe opening, no TOCTOU window). The facade maps
+    /// this to its public `AmbiguousFilterSource` diagnostic.
+    #[cfg(feature = "cli")]
+    #[error("the per-output video filter requires exactly one video stream in the input; the opened input has {video_streams}")]
+    AmbiguousVideoSource { video_streams: usize },
+
     /// Strict AVOption handling (CLI-compat pipelines): an option the caller
     /// supplied was not consumed by the component it targeted. The default
     /// builder path only WARNS about such leftovers; pipelines built through

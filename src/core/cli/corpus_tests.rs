@@ -5,8 +5,9 @@
 //! - `runs_verified`: classification passes and the shape is golden-backed;
 //!   `from_cli` proceeds past every gate (proven here by reaching the
 //!   pipeline-build stage, which fails on the deliberately nonexistent
-//!   fixture path — a `CliError::Build` is the success signal; real
-//!   execution is `tests/cli_goldens.rs`' job);
+//!   fixture path — a `CliError::Build` is the success signal on a verified
+//!   linked profile, the typed `UnverifiedRuntimeProfile` on any other; real
+//!   execution is `cli::golden_tests`' job);
 //! - `emit_only`: parses completely, but no golden covers the shape;
 //!   `from_cli` refuses with `NotVerified`, the emitter labels its output
 //!   "unverified scaffolding";
@@ -25,10 +26,15 @@ use super::{emit_rust_code, from_cli};
 /// proof that no CLI-layer gate stopped it.
 #[track_caller]
 fn runs_verified(cmd: &str) {
+    // Profile-aware: on a verified linked profile the command passes every
+    // CLI gate and fails at pipeline build (nonexistent fixture); on a
+    // non-verified profile the typed profile failure is the CORRECT runtime
+    // behavior. Emission is profile-independent either way.
     match from_cli(cmd) {
         Ok(_) => panic!("corpus fixtures must not exist, yet {cmd:?} built"),
-        Err(CliError::Build(_)) => {}
-        Err(other) => panic!("{cmd:?} should reach the build stage, got: {other}"),
+        Err(CliError::Build(_)) if super::linked_profile_verified() => {}
+        Err(CliError::UnverifiedRuntimeProfile { .. }) if !super::linked_profile_verified() => {}
+        Err(other) => panic!("{cmd:?} should reach the build stage (or the typed profile failure on a non-verified line), got: {other}"),
     }
     let code = emit_rust_code(cmd).unwrap();
     assert!(
@@ -852,6 +858,73 @@ fn corpus_conflicts_carry_both_positions() {
         } => {
             assert_eq!(*first_index, Some(2));
             assert_eq!(*second_index, Some(4));
+        }
+        other => panic!("expected ConflictingOptions, got {other}"),
+    }
+}
+
+#[test]
+fn corpus_collective_conflict_names_anchor_the_earliest_occurrence() {
+    // Synthetic `-c copy`: tokens 2=-map 3=0 4=-c:v 5=copy 6=-c:a 7=aac —
+    // the collective anchors -c:v at token #4 (earliest of -c:v/-c:a).
+    let err = from_cli("ffmpeg -i in.mp4 -map 0 -c:v copy -c:a aac -y out.mp4")
+        .map(|_| ())
+        .unwrap_err();
+    match &err {
+        CliError::ConflictingOptions {
+            first,
+            second,
+            first_index,
+            second_index,
+            ..
+        } => {
+            assert_eq!((first.as_str(), second.as_str()), ("-map", "-c copy"));
+            assert_eq!(*first_index, Some(2));
+            assert_eq!(
+                *second_index,
+                Some(4),
+                "collective -c must anchor its earliest member"
+            );
+        }
+        other => panic!("expected ConflictingOptions, got {other}"),
+    }
+
+    // `-hls_*` aggregate: tokens ... -hls_playlist_type appears FIRST here,
+    // so the aggregate must anchor it, not the fixed table order.
+    let err = from_cli(
+        "ffmpeg -i in.mp4 -c:v libx264 -crf 23 -c:a aac -hls_playlist_type vod -hls_time 6 -y out.m3u8",
+    )
+    .map(|_| ())
+    .unwrap_err();
+    match &err {
+        CliError::ConflictingOptions {
+            first, first_index, ..
+        } => {
+            assert_eq!(first, "-hls_*");
+            // tokens: 0=-i 1=in.mp4 2=-c:v 3=libx264 4=-crf 5=23 6=-c:a
+            // 7=aac 8=-hls_playlist_type 9=vod 10=-hls_time 11=6
+            assert_eq!(
+                *first_index,
+                Some(8),
+                "aggregate must anchor the earliest hls key"
+            );
+        }
+        other => panic!("expected ConflictingOptions, got {other}"),
+    }
+
+    // Disabled-stream contradiction carries both sides too:
+    // tokens 2=-an 3=-c:a 4=aac.
+    let err = from_cli("ffmpeg -i in.mp4 -an -c:a aac -y out.mp4")
+        .map(|_| ())
+        .unwrap_err();
+    match &err {
+        CliError::ConflictingOptions {
+            first_index,
+            second_index,
+            ..
+        } => {
+            assert_eq!(*first_index, Some(2));
+            assert_eq!(*second_index, Some(3));
         }
         other => panic!("expected ConflictingOptions, got {other}"),
     }

@@ -320,6 +320,22 @@ pub(super) fn outputs_bind(
     let fftools_unlabeled_order = muxs.iter().any(|mux| mux.video_filter.is_some());
 
     for (i, mux) in muxs.iter_mut().enumerate() {
+        // CLI-compat `-vf` structural uniqueness, validated on the demuxer
+        // instances THIS pipeline executes with — not on a separate probe
+        // opening, so a mutable file or URL cannot slip a second video
+        // stream in between validation and execution.
+        #[cfg(feature = "cli")]
+        if mux.require_unique_video_source {
+            let video_streams = demuxs
+                .iter()
+                .flat_map(|demux| demux.get_streams().iter())
+                .filter(|stream| stream.codec_type == AVMEDIA_TYPE_VIDEO)
+                .count();
+            if video_streams != 1 {
+                return Err(Error::AmbiguousVideoSource { video_streams });
+            }
+        }
+
         // Initialize auto_disable with muxer's stream disable flags
         // FFmpeg reference: fftools/ffmpeg_mux_init.c:1891-1895
         // auto_disable bitmask: 1 << AVMEDIA_TYPE_* disables that stream type
