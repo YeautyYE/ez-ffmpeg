@@ -1486,9 +1486,14 @@ fn _mux_init(
             // lands after this load is indistinguishable from one after the
             // callback and is deliberately not chased. An error recorded by
             // ANY task (first-error-wins) means no on_end — the sink reports
-            // it as JobFailed while wait() keeps the original.
+            // it as JobFailed while wait() keeps the original. The result
+            // read also covers a TRUNCATED drain: a job failure that stopped
+            // this sink mid-delivery reports as JobFailed too (errors are
+            // recorded BEFORE the terminal status publishes, so a stopping
+            // status caused by a failure always has the error visible here),
+            // while a clean stop() records nothing and stays silent.
             let aborted = scheduler_status.load(Ordering::Acquire) == STATUS_ABORT;
-            let job_error = if locally_complete && !aborted {
+            let job_error = if !aborted {
                 scheduler_result
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)

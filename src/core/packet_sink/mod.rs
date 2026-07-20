@@ -47,7 +47,9 @@
 //!      indistinguishable from one after the callback.
 //!    * `on_delivery_error` fires when delivery stopped because of a
 //!      strict-tier violation or a failing callback, or when the job failed
-//!      elsewhere after this sink had already delivered everything.
+//!      elsewhere — whether that failure landed after this sink delivered
+//!      everything or truncated its delivery. Clean cancellation stays
+//!      silent.
 //!
 //! # Timestamp and ordering
 //!
@@ -249,9 +251,10 @@ pub trait PacketSinkHandler: Send + 'static {
 
     /// Terminal failure. For delivery-path errors (strict-tier violations,
     /// failing callbacks) the same error is also the job result. When the
-    /// JOB failed elsewhere after this sink drained cleanly, the callback
-    /// receives a synthesized [`PacketSinkError::JobFailed`] summarizing that
-    /// failure, while `wait()`/`stop()` keep the original error.
+    /// JOB failed elsewhere (after this sink drained or truncating its
+    /// delivery), the callback receives a synthesized
+    /// [`PacketSinkError::JobFailed`] summarizing that failure, while
+    /// `wait()`/`stop()` keep the original error.
     fn on_delivery_error(&mut self, _error: &PacketSinkError) {}
 }
 
@@ -868,11 +871,11 @@ impl PacketSinkBuilder {
 
     /// Terminal failure callback. For delivery-path errors (strict-tier
     /// violations, failing callbacks) the same error is also returned by
-    /// `wait()`/`stop()`; when the JOB failed elsewhere after this sink
-    /// drained cleanly, the callback receives a synthesized
-    /// [`PacketSinkError::JobFailed`] summarizing that failure while the job
-    /// keeps its original error. Not invoked for cancellation or initial
-    /// configuration failures — see "Failure and panic" in the
+    /// `wait()`/`stop()`; when the JOB failed elsewhere (after this sink
+    /// drained or truncating its delivery), the callback receives a
+    /// synthesized [`PacketSinkError::JobFailed`] summarizing that failure
+    /// while the job keeps its original error. Not invoked for cancellation
+    /// or initial configuration failures — see "Failure and panic" in the
     /// [module docs](self).
     pub fn on_delivery_error<F>(mut self, f: F) -> Self
     where
