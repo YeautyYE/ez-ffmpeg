@@ -482,6 +482,58 @@ fn blocked_sibling_stays_interruptible_while_sink_finalizes() {
     drop(accept_thread);
 }
 
+/// Native-AAC end-to-end delivery through the owned-run iterator — runs on
+/// FFmpeg builds without GPL components, so CI exercises real delivery (not
+/// just compile/skip paths) everywhere. Also covers into_events(): events
+/// stream while the job runs and the scheduler is joined exactly once.
+#[test]
+fn aac_only_delivery_streams_through_into_events() {
+    let (sink, receiver) =
+        ez_ffmpeg::packet_sink::PacketSink::channel(std::num::NonZeroUsize::new(4).unwrap());
+    let scheduler = FfmpegContext::builder()
+        .input(Input::from("sine=frequency=440:duration=2").set_format("lavfi"))
+        .output(Output::from(sink).set_audio_codec("aac"))
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let mut saw_info = false;
+    let mut saw_end = false;
+    let mut packets = 0usize;
+    let mut prev_dts: Option<i64> = None;
+    for event in receiver.into_events(scheduler) {
+        match event.expect("job failed") {
+            ez_ffmpeg::packet_sink::PacketSinkEvent::StreamInfo(streams) => {
+                assert!(!saw_info, "stream info must arrive exactly once");
+                saw_info = true;
+                assert_eq!(streams.len(), 1);
+                let audio = streams[0].audio().expect("audio configuration");
+                assert_eq!(audio.codec_string(), "mp4a.40.2");
+                assert!(!audio.codec_config().is_empty(), "ASC must be present");
+                assert_eq!(audio.sample_rate(), 44100);
+                assert!(!audio.channel_layout().is_empty());
+            }
+            ez_ffmpeg::packet_sink::PacketSinkEvent::Packet(packet) => {
+                assert!(saw_info, "no packet before the stream info");
+                assert!(!saw_end, "no packet after End");
+                packets += 1;
+                assert!(packet.is_key(), "every AAC frame is a sync sample");
+                assert!(packet.duration() > 0);
+                if let Some(prev) = prev_dts {
+                    assert!(packet.dts() > prev, "per-stream dts monotonicity");
+                }
+                prev_dts = Some(packet.dts());
+                assert!(!packet.data().is_empty());
+            }
+            ez_ffmpeg::packet_sink::PacketSinkEvent::End => saw_end = true,
+            other => panic!("unexpected event {other:?}"),
+        }
+    }
+    assert!(saw_info && saw_end, "info and End must both arrive");
+    assert!(packets > 50, "2 s of AAC is ~86 frames, got {packets}");
+}
+
 #[test]
 fn channel_adapter_delivers_owned_events_in_order() {
     if !have_encoder("libx264") {
