@@ -75,7 +75,9 @@ pub(crate) struct VerifiedShape {
     pub(crate) output_ext: &'static str,
     /// The canonical command (program name stripped, relative paths). The
     /// golden runner substitutes paths; the checked-in emitted example is
-    /// exactly `emit(canonical_argv)`.
+    /// exactly `emit(canonical_argv)`. Consumed by the cfg(test) golden
+    /// runner and pin tests — data-of-record in production builds.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) canonical_argv: &'static [&'static str],
     /// Basename of the compile-pinned emitted example under `examples/`.
     pub(crate) emitted_example: &'static str,
@@ -142,7 +144,9 @@ pub(crate) const VERIFIED_SHAPES: &[VerifiedShape] = &[
         golden: "golden_v3_audio_extract",
         pins: pins_v3,
         output_ext: "m4a",
-        canonical_argv: &["-i", "in.mp4", "-vn", "-c:a", "aac", "-b:a", "192k", "-y", "out.m4a"],
+        canonical_argv: &[
+            "-i", "in.mp4", "-vn", "-c:a", "aac", "-b:a", "192k", "-y", "out.m4a",
+        ],
         emitted_example: "cli_emitted_audio_extract",
     },
     VerifiedShape {
@@ -153,7 +157,16 @@ pub(crate) const VERIFIED_SHAPES: &[VerifiedShape] = &[
         pins: pins_v4,
         output_ext: "jpg",
         canonical_argv: &[
-            "-ss", "5", "-i", "in.mp4", "-an", "-c:v", "mjpeg", "-frames:v", "1", "-y",
+            "-ss",
+            "5",
+            "-i",
+            "in.mp4",
+            "-an",
+            "-c:v",
+            "mjpeg",
+            "-frames:v",
+            "1",
+            "-y",
             "thumb.jpg",
         ],
         emitted_example: "cli_emitted_thumbnail",
@@ -166,8 +179,20 @@ pub(crate) const VERIFIED_SHAPES: &[VerifiedShape] = &[
         pins: pins_v1,
         output_ext: "mp4",
         canonical_argv: &[
-            "-i", "in.mp4", "-vf", "scale=1280:-2", "-c:v", "libx264", "-crf", "23", "-preset",
-            "fast", "-c:a", "aac", "-y", "scaled.mp4",
+            "-i",
+            "in.mp4",
+            "-vf",
+            "scale=1280:-2",
+            "-c:v",
+            "libx264",
+            "-crf",
+            "23",
+            "-preset",
+            "fast",
+            "-c:a",
+            "aac",
+            "-y",
+            "scaled.mp4",
         ],
         emitted_example: "cli_emitted_scale",
     },
@@ -188,9 +213,26 @@ pub(crate) const VERIFIED_SHAPES: &[VerifiedShape] = &[
         pins: pins_v6,
         output_ext: "m3u8",
         canonical_argv: &[
-            "-i", "in.mp4", "-c:v", "libx264", "-crf", "23", "-c:a", "aac", "-f", "hls",
-            "-hls_time", "6", "-hls_playlist_type", "vod", "-hls_list_size", "0",
-            "-hls_segment_filename", "seg_%03d.ts", "-y", "out.m3u8",
+            "-i",
+            "in.mp4",
+            "-c:v",
+            "libx264",
+            "-crf",
+            "23",
+            "-c:a",
+            "aac",
+            "-f",
+            "hls",
+            "-hls_time",
+            "6",
+            "-hls_playlist_type",
+            "vod",
+            "-hls_list_size",
+            "0",
+            "-hls_segment_filename",
+            "seg_%03d.ts",
+            "-y",
+            "out.m3u8",
         ],
         emitted_example: "cli_emitted_hls",
     },
@@ -310,7 +352,13 @@ pub(crate) const UNVERIFIED_SHAPES: &[UnverifiedShape] = &[
     UnverifiedShape {
         id: "U18",
         summary: "transcode with audio bitrate",
-        fingerprint: &["out:-b:a", "out:-c:a", "out:-c:v", "out:-crf", "out:-preset"],
+        fingerprint: &[
+            "out:-b:a",
+            "out:-c:a",
+            "out:-c:v",
+            "out:-crf",
+            "out:-preset",
+        ],
     },
     UnverifiedShape {
         id: "U19",

@@ -164,8 +164,7 @@ fn av_fixture() -> String {
         FfmpegContext::builder()
             .input(Input::from("testsrc2=size=320x240:rate=30:duration=16").set_format("lavfi"))
             .input(
-                Input::from("sine=frequency=440:sample_rate=44100:duration=16")
-                    .set_format("lavfi"),
+                Input::from("sine=frequency=440:sample_rate=44100:duration=16").set_format("lavfi"),
             )
             .output(
                 Output::from(path.as_str())
@@ -199,12 +198,10 @@ fn multi_audio_fixture() -> String {
         FfmpegContext::builder()
             .input(Input::from("testsrc2=size=320x240:rate=30:duration=16").set_format("lavfi"))
             .input(
-                Input::from("sine=frequency=440:sample_rate=44100:duration=16")
-                    .set_format("lavfi"),
+                Input::from("sine=frequency=440:sample_rate=44100:duration=16").set_format("lavfi"),
             )
             .input(
-                Input::from("anullsrc=channel_layout=stereo:sample_rate=48000")
-                    .set_format("lavfi"),
+                Input::from("anullsrc=channel_layout=stereo:sample_rate=48000").set_format("lavfi"),
             )
             .output(
                 Output::from(path.as_str())
@@ -228,7 +225,11 @@ fn multi_audio_fixture() -> String {
             _ => None,
         })
         .collect();
-    assert_eq!(channel_counts, vec![1, 2], "fixture must be mono-then-stereo");
+    assert_eq!(
+        channel_counts,
+        vec![1, 2],
+        "fixture must be mono-then-stereo"
+    );
     path
 }
 
@@ -309,7 +310,11 @@ fn container_title(path: &str) -> Option<String> {
 fn assert_same_media(label: &str, ours: &str, theirs: &str) {
     let a = summarize(ours);
     let b = summarize(theirs);
-    assert_eq!(a.len(), b.len(), "{label}: stream count differs ({ours} vs {theirs})");
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "{label}: stream count differs ({ours} vs {theirs})"
+    );
     for (i, (x, y)) in a.iter().zip(&b).enumerate() {
         assert_eq!(x.kind, y.kind, "{label}: stream {i} type differs");
         assert_eq!(x.codec, y.codec, "{label}: stream {i} codec differs");
@@ -401,7 +406,10 @@ fn run_shape(shape_id: &str) -> Option<GoldenRun> {
     let theirs_dir = tmp_dir(&format!("{}_theirs", shape.id));
     let ours_args = materialize(shape, &fixture, &ours_dir);
     let theirs_args = materialize(shape, &fixture, &theirs_dir);
-    let ours_output = ours_dir.join(&canonical_output).to_string_lossy().into_owned();
+    let ours_output = ours_dir
+        .join(&canonical_output)
+        .to_string_lossy()
+        .into_owned();
     let theirs_output = theirs_dir
         .join(&canonical_output)
         .to_string_lossy()
@@ -411,8 +419,12 @@ fn run_shape(shape_id: &str) -> Option<GoldenRun> {
     // garbage into valid media.
     std::fs::write(&ours_output, b"garbage, not media").unwrap();
 
-    let context = from_cli_args(&ours_args)
-        .unwrap_or_else(|e| panic!("{}: from_cli_args rejected the canonical command: {e}", shape.id));
+    let context = from_cli_args(&ours_args).unwrap_or_else(|e| {
+        panic!(
+            "{}: from_cli_args rejected the canonical command: {e}",
+            shape.id
+        )
+    });
     run_context(context, shape.golden);
     run_reference(&bin, &theirs_args, None);
 
@@ -476,7 +488,10 @@ fn example_binary(name: &str) -> std::path::PathBuf {
         .status()
         .expect("failed to spawn cargo to build the emitted example");
     assert!(status.success(), "building example {name} failed");
-    assert!(path.exists(), "example binary {path:?} still missing after build");
+    assert!(
+        path.exists(),
+        "example binary {path:?} still missing after build"
+    );
     path
 }
 
@@ -536,13 +551,38 @@ fn golden_v3_audio_extract() {
         run_reference(
             &run.bin,
             &[
-                "-y", "-v", "error",
-                "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30:duration=4",
-                "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
-                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100:duration=4",
-                "-map", "0:v", "-map", "1:a", "-map", "2:a",
-                "-disposition:a:0", "0", "-disposition:a:1", "default",
-                "-c:v", "mpeg4", "-c:a", "aac", "-t", "4", &fixture_b,
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x240:rate=30:duration=4",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=channel_layout=stereo:sample_rate=48000",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=44100:duration=4",
+                "-map",
+                "0:v",
+                "-map",
+                "1:a",
+                "-map",
+                "2:a",
+                "-disposition:a:0",
+                "0",
+                "-disposition:a:1",
+                "default",
+                "-c:v",
+                "mpeg4",
+                "-c:a",
+                "aac",
+                "-t",
+                "4",
+                &fixture_b,
             ]
             .iter()
             .map(|s| s.to_string())
@@ -550,13 +590,21 @@ fn golden_v3_audio_extract() {
             None,
         );
     }
-    let out_ours = tmp_dir("V3b_ours").join("out.m4a").to_string_lossy().into_owned();
-    let out_theirs = tmp_dir("V3b_theirs").join("out.m4a").to_string_lossy().into_owned();
+    let out_ours = tmp_dir("V3b_ours")
+        .join("out.m4a")
+        .to_string_lossy()
+        .into_owned();
+    let out_theirs = tmp_dir("V3b_theirs")
+        .join("out.m4a")
+        .to_string_lossy()
+        .into_owned();
     let args = |out: &str| -> Vec<String> {
-        ["-i", &fixture_b, "-vn", "-c:a", "aac", "-b:a", "192k", "-y", out]
-            .iter()
-            .map(|s| s.to_string())
-            .collect()
+        [
+            "-i", &fixture_b, "-vn", "-c:a", "aac", "-b:a", "192k", "-y", out,
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
     };
     let context = from_cli_args(&args(&out_ours)).expect("V3 fixture B must pass the gates");
     run_context(context, "golden v3 fixture B");
@@ -590,9 +638,18 @@ fn golden_v4_thumbnail() {
     let (theirs_px, theirs_dims) = decode_rgb(&run.theirs_output);
     let (emitted_px, emitted_dims) = decode_rgb(&run.emitted_output);
     assert_eq!(ours_dims, theirs_dims, "thumbnail geometry differs");
-    assert_eq!(emitted_dims, theirs_dims, "emitted thumbnail geometry differs");
-    assert_eq!(ours_px, theirs_px, "thumbnails must decode to identical pixels");
-    assert_eq!(emitted_px, theirs_px, "emitted thumbnail pixels must match the CLI");
+    assert_eq!(
+        emitted_dims, theirs_dims,
+        "emitted thumbnail geometry differs"
+    );
+    assert_eq!(
+        ours_px, theirs_px,
+        "thumbnails must decode to identical pixels"
+    );
+    assert_eq!(
+        emitted_px, theirs_px,
+        "emitted thumbnail pixels must match the CLI"
+    );
     if cli_avcodec_triple(&run.bin) == Some(linked_avcodec_triple()) {
         let ours_bytes = std::fs::read(&run.ours_output).unwrap();
         let theirs_bytes = std::fs::read(&run.theirs_output).unwrap();
@@ -632,20 +689,42 @@ fn golden_v6_hls() {
     let emitted = parse_playlist(&emitted_playlist);
 
     for (label, playlist) in [("ours", &ours), ("theirs", &theirs), ("emitted", &emitted)] {
-        assert!(playlist.vod, "{label}: playlist must declare EXT-X-PLAYLIST-TYPE:VOD");
-        assert!(playlist.endlist, "{label}: playlist must end with EXT-X-ENDLIST");
+        assert!(
+            playlist.vod,
+            "{label}: playlist must declare EXT-X-PLAYLIST-TYPE:VOD"
+        );
+        assert!(
+            playlist.endlist,
+            "{label}: playlist must end with EXT-X-ENDLIST"
+        );
     }
     assert!(
         ours.segments.len() >= 2,
         "the 16s fixture must produce multiple segments, got {:?}",
         ours.segments
     );
-    assert_eq!(ours.segments, theirs.segments, "segment topology/naming must match the CLI");
-    assert_eq!(emitted.segments, theirs.segments, "emitted segment topology must match");
-    assert_eq!(ours.target_duration, theirs.target_duration, "EXT-X-TARGETDURATION differs");
-    assert_eq!(ours.durations.len(), theirs.durations.len(), "EXTINF count differs");
+    assert_eq!(
+        ours.segments, theirs.segments,
+        "segment topology/naming must match the CLI"
+    );
+    assert_eq!(
+        emitted.segments, theirs.segments,
+        "emitted segment topology must match"
+    );
+    assert_eq!(
+        ours.target_duration, theirs.target_duration,
+        "EXT-X-TARGETDURATION differs"
+    );
+    assert_eq!(
+        ours.durations.len(),
+        theirs.durations.len(),
+        "EXTINF count differs"
+    );
     for (i, (a, b)) in ours.durations.iter().zip(&theirs.durations).enumerate() {
-        assert!((a - b).abs() <= 0.2, "segment {i} duration differs: {a} vs {b}");
+        assert!(
+            (a - b).abs() <= 0.2,
+            "segment {i} duration differs: {a} vs {b}"
+        );
     }
     // Every named segment must exist on disk with real payload, in the
     // in-process and emitted lanes alike.
@@ -675,12 +754,8 @@ fn vf_execution_rejects_multi_video_inputs() {
     if !std::path::Path::new(&fixture).exists() {
         run_context(
             FfmpegContext::builder()
-                .input(
-                    Input::from("testsrc2=size=320x240:rate=30:duration=1").set_format("lavfi"),
-                )
-                .input(
-                    Input::from("testsrc2=size=160x120:rate=30:duration=1").set_format("lavfi"),
-                )
+                .input(Input::from("testsrc2=size=320x240:rate=30:duration=1").set_format("lavfi"))
+                .input(Input::from("testsrc2=size=160x120:rate=30:duration=1").set_format("lavfi"))
                 .output(
                     Output::from(fixture.as_str())
                         .set_video_codec("mpeg4")
@@ -773,7 +848,10 @@ struct Playlist {
 fn parse_playlist(path: &str) -> Playlist {
     let text =
         std::fs::read_to_string(path).unwrap_or_else(|e| panic!("playlist {path} unreadable: {e}"));
-    assert!(text.starts_with("#EXTM3U"), "{path} is not an m3u8 playlist");
+    assert!(
+        text.starts_with("#EXTM3U"),
+        "{path} is not an m3u8 playlist"
+    );
     let mut playlist = Playlist {
         vod: false,
         endlist: false,

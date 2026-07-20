@@ -1,7 +1,7 @@
 // Generated from an ffmpeg command by the ez-ffmpeg CLI-compat emitter.
 // command: ffmpeg -i in.mp4 -c:v libx264 -crf 23 -c:a aac -f hls -hls_time 6 -hls_playlist_type vod -hls_list_size 0 -hls_segment_filename seg_%03d.ts -y out.m3u8
 // dialect: ffmpeg 7.1 command line; manifest: r2; crate: ez-ffmpeg 0.14.0; cargo features: none required
-// status: verified shape V6 (single-rendition VOD HLS) — backed by the semantic golden `golden_v6_hls` against the ffmpeg CLI
+// status: verified shape V6 (single-rendition VOD HLS) — backed by the semantic golden `golden_v6_hls` against the ffmpeg CLI; canonical emission compile-pinned as examples/cli_emitted_hls.rs
 
 use ez_ffmpeg::{FfmpegContext, Output};
 

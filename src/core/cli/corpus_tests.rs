@@ -791,7 +791,9 @@ fn corpus_unknown_option_without_hint() {
 #[test]
 fn corpus_value_errors_anchor_the_value_token() {
     // tokens: 0=-i 1=in.mp4 2=-t 3=10s 4=-y 5=out.mp4 — the BAD token is #3.
-    let err = from_cli("ffmpeg -i in.mp4 -t 10s -y out.mp4").map(|_| ()).unwrap_err();
+    let err = from_cli("ffmpeg -i in.mp4 -t 10s -y out.mp4")
+        .map(|_| ())
+        .unwrap_err();
     match &err {
         CliError::UnsupportedValue { option, index, .. } => {
             assert_eq!(option, "-t");
@@ -801,7 +803,9 @@ fn corpus_value_errors_anchor_the_value_token() {
     }
 
     // tokens: ... 4=-crf 5=99 — the bad token is #5.
-    let err = from_cli("ffmpeg -i in.mp4 -c:v libx264 -crf 99 -y out.mp4").map(|_| ()).unwrap_err();
+    let err = from_cli("ffmpeg -i in.mp4 -c:v libx264 -crf 99 -y out.mp4")
+        .map(|_| ())
+        .unwrap_err();
     match &err {
         CliError::UnsupportedValue { option, index, .. } => {
             assert_eq!(option, "-crf");
@@ -814,7 +818,9 @@ fn corpus_value_errors_anchor_the_value_token() {
 #[test]
 fn corpus_conflicts_carry_both_positions() {
     // tokens: 0=-i 1=in.mp4 2=-t 3=5 4=-to 5=8 …
-    let err = from_cli("ffmpeg -i in.mp4 -t 5 -to 8 -y out.mp4").map(|_| ()).unwrap_err();
+    let err = from_cli("ffmpeg -i in.mp4 -t 5 -to 8 -y out.mp4")
+        .map(|_| ())
+        .unwrap_err();
     match &err {
         CliError::ConflictingOptions {
             first,
@@ -835,7 +841,9 @@ fn corpus_conflicts_carry_both_positions() {
 
     // Post-parse combination conflicts resolve their anchors from the span
     // table: tokens 2=-vf 4=-c:v 5=copy.
-    let err = from_cli("ffmpeg -i in.mp4 -vf scale=640:360 -c:v copy -y out.mp4").map(|_| ()).unwrap_err();
+    let err = from_cli("ffmpeg -i in.mp4 -vf scale=640:360 -c:v copy -y out.mp4")
+        .map(|_| ())
+        .unwrap_err();
     match &err {
         CliError::ConflictingOptions {
             first_index,
@@ -852,7 +860,9 @@ fn corpus_conflicts_carry_both_positions() {
 #[test]
 fn corpus_unknown_after_output_names_the_following_output_scope() {
     // tokens: 0=-i 1=in.mp4 2=-y 3=out.mp4 4=-foo
-    let err = from_cli("ffmpeg -i in.mp4 -y out.mp4 -foo").map(|_| ()).unwrap_err();
+    let err = from_cli("ffmpeg -i in.mp4 -y out.mp4 -foo")
+        .map(|_| ())
+        .unwrap_err();
     match &err {
         CliError::UnsupportedOption { index, scope, .. } => {
             assert_eq!(*index, 4);
@@ -1054,4 +1064,3 @@ fn corpus_no_panic_argv_sweep() {
         let _ = super::emit_rust_code_from_args(args);
     }
 }
-

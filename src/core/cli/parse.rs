@@ -222,13 +222,28 @@ impl Parser {
             return Ok(());
         }
 
-        // Diagnostic anchor: first occurrence of each consumed option.
+        // Diagnostic anchor: first occurrence of each consumed option — and
+        // the manifest's repeat policy, enforced centrally from the table
+        // (the per-sink setters keep their own guards only as invariants).
         let span_key = match scope {
             CliScope::Input => format!("in:{name}"),
             _ => format!("out:{name}"),
         };
-        if !self.spans.iter().any(|(key, _)| key == &span_key) {
-            self.spans.push((span_key, index));
+        match self.spans.iter().find(|(key, _)| key == &span_key) {
+            Some((_, first_index)) if spec.repeat == table::Repeat::Once => {
+                return Err(CliError::UnsupportedLayout {
+                    token: name.to_string(),
+                    index,
+                    reason: format!(
+                        "{name} appears more than once in the same scope (first at token \
+                         #{first_index}); the CLI silently keeps the last value, which the \
+                         subset refuses to reproduce — the option lands in {}",
+                        spec.sink
+                    ),
+                });
+            }
+            Some(_) => {}
+            None => self.spans.push((span_key, index)),
         }
 
         let value = value.map(|(text, _)| text).unwrap_or_default();

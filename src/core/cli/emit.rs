@@ -33,7 +33,8 @@ pub(crate) fn emit(job: &LoweredJob, command: &[String], status: &ShapeStatus) -
         match &noop.value {
             Some(value) => out.push_str(&format!(
                 "// {} {}: not applicable in-process (no-op)\n",
-                noop.flag, comment_text(value)
+                noop.flag,
+                comment_text(value)
             )),
             None => out.push_str(&format!(
                 "// {}: not applicable in-process (no-op)\n",
@@ -61,7 +62,11 @@ pub(crate) fn emit(job: &LoweredJob, command: &[String], status: &ShapeStatus) -
             line(
                 &mut out,
                 4,
-                &format!(".set_format({}) // -f {}", lit(format), comment_text(format)),
+                &format!(
+                    ".set_format({}) // -f {}",
+                    lit(format),
+                    comment_text(format)
+                ),
             );
         }
         if let Some(us) = job.input.start_time_us {
@@ -102,7 +107,11 @@ pub(crate) fn emit(job: &LoweredJob, command: &[String], status: &ShapeStatus) -
         line(
             &mut out,
             4,
-            &format!(".set_format({}) // -f {}", lit(format), comment_text(format)),
+            &format!(
+                ".set_format({}) // -f {}",
+                lit(format),
+                comment_text(format)
+            ),
         );
     }
     if o.video_disable {
@@ -115,28 +124,44 @@ pub(crate) fn emit(job: &LoweredJob, command: &[String], status: &ShapeStatus) -
         line(
             &mut out,
             4,
-            &format!(".set_video_codec({}) // -c:v {}", lit(codec), comment_text(codec)),
+            &format!(
+                ".set_video_codec({}) // -c:v {}",
+                lit(codec),
+                comment_text(codec)
+            ),
         );
     }
     if let Some(codec) = &o.audio_codec {
         line(
             &mut out,
             4,
-            &format!(".set_audio_codec({}) // -c:a {}", lit(codec), comment_text(codec)),
+            &format!(
+                ".set_audio_codec({}) // -c:a {}",
+                lit(codec),
+                comment_text(codec)
+            ),
         );
     }
     if let Some(bitrate) = &o.video_bitrate {
         line(
             &mut out,
             4,
-            &format!(".set_video_bitrate({}) // -b:v {}", lit(bitrate), comment_text(bitrate)),
+            &format!(
+                ".set_video_bitrate({}) // -b:v {}",
+                lit(bitrate),
+                comment_text(bitrate)
+            ),
         );
     }
     if let Some(bitrate) = &o.audio_bitrate {
         line(
             &mut out,
             4,
-            &format!(".set_audio_bitrate({}) // -b:a {}", lit(bitrate), comment_text(bitrate)),
+            &format!(
+                ".set_audio_bitrate({}) // -b:a {}",
+                lit(bitrate),
+                comment_text(bitrate)
+            ),
         );
     }
     for (key, value) in &o.video_codec_opts {
@@ -169,7 +194,11 @@ pub(crate) fn emit(job: &LoweredJob, command: &[String], status: &ShapeStatus) -
         line(
             &mut out,
             4,
-            &format!(".set_pix_fmt({}) // -pix_fmt {}", lit(pix_fmt), comment_text(pix_fmt)),
+            &format!(
+                ".set_pix_fmt({}) // -pix_fmt {}",
+                lit(pix_fmt),
+                comment_text(pix_fmt)
+            ),
         );
     }
     if let Some(rate) = o.audio_sample_rate {
@@ -197,7 +226,11 @@ pub(crate) fn emit(job: &LoweredJob, command: &[String], status: &ShapeStatus) -
         line(
             &mut out,
             4,
-            &format!(".set_video_filter({}) // -vf {}", lit(filter), comment_text(filter)),
+            &format!(
+                ".set_video_filter({}) // -vf {}",
+                lit(filter),
+                comment_text(filter)
+            ),
         );
     }
     for (map, copy) in &o.stream_maps {
@@ -215,7 +248,11 @@ pub(crate) fn emit(job: &LoweredJob, command: &[String], status: &ShapeStatus) -
             line(
                 &mut out,
                 4,
-                &format!(".add_stream_map({}) // -map {}", lit(map), comment_text(map)),
+                &format!(
+                    ".add_stream_map({}) // -map {}",
+                    lit(map),
+                    comment_text(map)
+                ),
             );
         }
     }
@@ -273,8 +310,9 @@ fn header(
             match super::manifest::shape(id) {
                 Some(shape) => out.push_str(&format!(
                     "// status: verified shape {id} ({}) — backed by the semantic golden \
-                     `{}` against the ffmpeg CLI\n",
-                    shape.summary, shape.golden
+                     `{}` against the ffmpeg CLI; canonical emission compile-pinned as \
+                     examples/{}.rs\n",
+                    shape.summary, shape.golden, shape.emitted_example
                 )),
                 None => out.push_str(&format!(
                     "// status: verified shape {id} — backed by a semantic golden against the ffmpeg CLI\n"
