@@ -204,6 +204,11 @@ pub(crate) struct Muxer {
     /// place of the default `null` chain for this output's video stream.
     pub(crate) video_filter: Option<String>,
 
+    /// Whether a configured `video_filter` was actually consumed by a direct
+    /// encoded-video graph. `outputs_bind`'s postcondition turns a configured
+    /// but unbound filter into `VideoFilterUnused` instead of dropping it.
+    pub(crate) video_filter_bound: bool,
+
     // Auto-conversion tuning (NEW-SC-03): sws/swr option strings requested by
     // this output for the auto-inserted scale/aresample filters. Threaded into
     // the output's OutputFilterOptions in configure_output_filter_opts; the
@@ -383,6 +388,7 @@ impl Muxer {
             data_disable,
             pix_fmt,
             video_filter,
+            video_filter_bound: false,
             sws_opts,
             swr_opts,
             attachments,

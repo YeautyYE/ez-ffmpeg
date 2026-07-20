@@ -1521,10 +1521,24 @@ impl Output {
     ///   for `-vf` + `-filter_complex` on the same stream.
     /// - **Audio is untouched**: only the video stream runs through this
     ///   chain. There is no per-output audio (`-af`) equivalent yet.
+    /// - **Must be consumed**: if the output ends up with no re-encoded
+    ///   video stream at all (audio-only input, [`disable_video`], maps that
+    ///   match no video stream), the build fails with
+    ///   [`OpenOutputError::VideoFilterUnused`] instead of silently dropping
+    ///   the chain.
+    /// - **VideoWriter**: a [`VideoWriter`](crate::VideoWriter) opening this
+    ///   `Output` honors the chain when no builder-level `filter_desc` is
+    ///   set; configuring both fails with
+    ///   [`WriterError::ConflictingFilterDescriptions`](crate::core::writer::WriterError::ConflictingFilterDescriptions).
     ///
-    /// An **empty string clears** a previously set chain (restores the
-    /// implicit `null`). The description itself is validated when the context
-    /// is built; an invalid filter name surfaces as a
+    /// [`disable_video`]: Self::disable_video
+    /// [`OpenOutputError::VideoFilterUnused`]: crate::error::OpenOutputError::VideoFilterUnused
+    ///
+    /// An **empty string is kept** and fails the build like `-vf ""` fails
+    /// the CLI (an empty graph parses to zero pads); use
+    /// [`clear_video_filter`](Self::clear_video_filter) to remove a
+    /// previously set chain. The description itself is validated when the
+    /// context is built; an invalid filter name surfaces as a
     /// [`FilterGraphParseError`](crate::error::FilterGraphParseError) from
     /// `build()`, not from this setter.
     ///
@@ -1546,8 +1560,14 @@ impl Output {
     /// [`OpenOutputError::FilterWithStreamCopy`]: crate::error::OpenOutputError::FilterWithStreamCopy
     /// [`OpenOutputError::SimpleAndComplexFilter`]: crate::error::OpenOutputError::SimpleAndComplexFilter
     pub fn set_video_filter(mut self, filter_chain: impl Into<String>) -> Self {
-        let chain = filter_chain.into();
-        self.video_filter = if chain.is_empty() { None } else { Some(chain) };
+        self.video_filter = Some(filter_chain.into());
+        self
+    }
+
+    /// Removes a previously set [`set_video_filter`](Self::set_video_filter)
+    /// chain, restoring the implicit passthrough (`null`) graph.
+    pub fn clear_video_filter(mut self) -> Self {
+        self.video_filter = None;
         self
     }
 
@@ -1884,10 +1904,20 @@ mod tests {
     }
 
     #[test]
-    fn set_video_filter_empty_clears() {
+    fn set_video_filter_keeps_empty_string() {
+        // -vf "" parity: the empty description is preserved and fails the
+        // build like the CLI's own empty-graph parse failure.
         let output = Output::from("out.mp4")
             .set_video_filter("scale=1280:-2")
             .set_video_filter("");
+        assert_eq!(output.video_filter.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn clear_video_filter_resets() {
+        let output = Output::from("out.mp4")
+            .set_video_filter("scale=1280:-2")
+            .clear_video_filter();
         assert_eq!(output.video_filter, None);
     }
 
