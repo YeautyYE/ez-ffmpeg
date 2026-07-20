@@ -589,6 +589,13 @@ fn _mux_init(
     // panic is published and BEFORE the guards join/free/release — the same
     // defined destruction point the worker frame provides.
     let mut sink_worker_slot: Option<crate::core::packet_sink::strict::PacketSinkWorker> = None;
+    // Failed-collection recovery slot at the SAME ordering position: the
+    // error arm below moves the returned bundle here before any
+    // panic-capable statement, so a logger panic in that arm also unwinds
+    // publisher-then-captures ordered.
+    // (Declared without an initializer: only the error arm assigns it, and
+    // drop order follows the declaration position regardless.)
+    let mut sink_bundle_slot: Option<crate::core::packet_sink::PacketSink>;
     let _panic_status = MuxPanicStatusGuard {
         scheduler_status: scheduler_status.clone(),
         scheduler_result: scheduler_result.clone(),
@@ -682,16 +689,25 @@ fn _mux_init(
             )
         } {
             Ok(worker) => {
-                // S1 observability (and the panic-injection seam the unwind
-                // regression uses): configuration is collected, callbacks are
+                // Ownership reaches the ordered slot BEFORE any panic-capable
+                // statement: the log below is the panic-injection seam the
+                // unwind regression uses, and a panic there must unwind with
+                // the captures already in publisher-then-captures position.
+                sink_worker_slot = Some(worker);
+                // S1 observability: configuration is collected, callbacks are
                 // owned by this frame, nothing has been delivered.
                 debug!(
                     "Packet sink configuration collected for output {mux_idx}: {stream_count} streams"
                 );
-                sink_worker_slot = Some(worker);
             }
             Err(boxed) => {
-                let (sink, e) = *boxed;
+                // Recover the bundle into the ordered slot FIRST — the error
+                // log below can panic (user-installed logger).
+                let e = {
+                    let (sink, e) = *boxed;
+                    sink_bundle_slot = Some(sink);
+                    e
+                };
                 error!("Packet sink configuration invalid: {e}");
                 // The user callbacks ride into the ordered failure teardown:
                 // published error -> join/free -> USER DROPS -> slot release.
@@ -705,7 +721,7 @@ fn _mux_init(
                     guard,
                     slot_guard,
                     crate::error::Error::PacketSink(e.clone()),
-                    Some(sink),
+                    sink_bundle_slot.take(),
                 );
                 return Err(crate::error::Error::PacketSink(e));
             }
@@ -1412,10 +1428,16 @@ fn _mux_init(
             // Sequence EVERY crate-side failure source BEFORE the terminal
             // decision, so a delivered on_end implies wait() == Ok (the one
             // carve-out — user-capture Drop panics AFTER the terminal — is
-            // caught below and cannot change the settled result):
+            // contained below and cannot change the settled result):
             // 1. close the live queue (wakes any sender);
             drop(pkt_receiver);
-            // 2. stream bookkeeping (idempotent);
+            // 2. stream bookkeeping, own-completion report and the input-
+            // controller update — IMMEDIATELY, before ANY waiting: a sibling
+            // muxer can depend on a choked demuxer whose only release edge is
+            // this update, so deferring it past a wait on that sibling is a
+            // deadlock cycle (sink → sibling mux → choked input → this
+            // update). Dropping the completion guard before the encoder join
+            // is also the F1 order.
             for node in &mux_stream_nodes {
                 if let SchNode::MuxStream {
                     source_finished, ..
@@ -1424,40 +1446,47 @@ fn _mux_init(
                     source_finished.store(true, Ordering::Release);
                 }
             }
-            // 3. terminal coordination: report this muxer's own completion
-            // FIRST (dropping the completion guard — also the F1 order: the
-            // publish must precede the encoder join), then, when locally
-            // complete, wait until every other muxer settled. Two sinks both
-            // report before waiting, so they cannot deadlock on each other;
-            // ABORT short-circuits the wait.
             let locally_complete =
                 ret >= 0 && nb_done == stream_count && sink.pending_error_cloned().is_none();
-            let remaining = mux_done
-                .as_ref()
-                .expect("mux_done consumed before the terminal slot")
-                .remaining_handle();
             drop(mux_done.take());
-            if locally_complete {
-                while remaining.load(Ordering::Acquire) > 0 {
-                    if scheduler_status.load(Ordering::Acquire) == STATUS_ABORT {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-            }
             input_controller.update_locked(&scheduler_status);
-            // 4. join this muxer's own producers (encoders) and free the
-            // context — the last crate-side failure source; any error they
-            // published landed before the reads below.
+            // 3. join this muxer's own producers (encoders) and free its
+            // context.
             drop(guard);
+            // 4. FULL-JOB SETTLEMENT BARRIER (only when this sink believes it
+            // succeeded — a locally failed sink dispatches promptly): every
+            // remaining failure source — sibling muxers (their context frees,
+            // including custom-IO capture destruction, run inside their
+            // threads before their slot release), filter graphs (whose final
+            // logging can panic late), demuxers, decoders, encoders, frame
+            // sources — records its panic/error BEFORE releasing its slot, so
+            // waiting for all peer slots settles the whole job.
+            //
+            // Deadlock argument — every wait edge this thread now has is the
+            // peer-slot wait, and no peer can be waiting on this thread:
+            //   (a) this sink's streams are marked finished and the input
+            //       controller updated ABOVE, before the wait begins — the
+            //       only release edge producers had into this output;
+            //   (b) its queue receivers are closed and its encoders joined —
+            //       no channel into this muxer remains;
+            //   (c) peers park only on their own sources/sinks or on the
+            //       scheduler status, none of which this thread feeds;
+            //   (d) another packet sink at this same barrier is counted out
+            //       by the waiter count (live <= waiters), so two sinks
+            //       proceed without waiting on each other;
+            //   (e) wait()/stop()/abort() run on user threads outside the
+            //       synchronizer and wait for slots, never the reverse.
+            if locally_complete {
+                slot_guard.thread_sync.wait_for_peers_settled();
+            }
 
-            // Terminal decision on a FRESH status read, atomic with the
-            // dispatch — no stale pre-wait snapshot can admit an
-            // abort-raced on_end (the old single-sink window skipped the
-            // coordinator loop entirely and reused a snapshot from before
-            // it). An error recorded by ANY task (first-error-wins) means no
-            // on_end — the sink reports it as JobFailed while wait() keeps
-            // the original.
+            // 5. LINEARIZATION POINT: one fresh status load and one result
+            // read AFTER full settlement decide the terminal. An abort or
+            // error observed here suppresses/repaints on_end; an abort that
+            // lands after this load is indistinguishable from one after the
+            // callback and is deliberately not chased. An error recorded by
+            // ANY task (first-error-wins) means no on_end — the sink reports
+            // it as JobFailed while wait() keeps the original.
             let aborted = scheduler_status.load(Ordering::Acquire) == STATUS_ABORT;
             let job_error = if locally_complete && !aborted {
                 scheduler_result
@@ -1471,17 +1500,23 @@ fn _mux_init(
             };
             sink.finish(nb_done == stream_count, ret, aborted, job_error);
 
-            // Defined user-capture destruction: after the queue closed, the
-            // job settled and the terminal fired; BEFORE the slot release, so
-            // stop() cannot return while a blocking destructor still runs.
-            // The single carve-out: a consumer Drop panic here is caught and
-            // logged — it must not override the settled job result a
-            // delivered on_end already promised.
-            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(sink))).is_err() {
-                error!(
-                    "packet sink consumer state panicked during teardown; the settled job result is preserved"
-                );
-            }
+            // 6. Defined user-capture destruction: after the queue closed,
+            // the job settled and the terminal fired; BEFORE the slot
+            // release, so stop() cannot return while a blocking destructor
+            // still runs. ONE containment boundary wraps the ENTIRE
+            // post-terminal region — the capture drop AND the failure
+            // logging (a user-installed logger can itself panic) — so
+            // nothing after the terminal can re-arm the panic publisher and
+            // override the settled result a delivered on_end promised.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(sink))).is_err() {
+                    // Best-effort: a panic from this log call is swallowed by
+                    // the outer boundary.
+                    error!(
+                        "packet sink consumer state panicked during teardown; the settled job result is preserved"
+                    );
+                }
+            }));
             slot_guard.release();
             return;
         }
@@ -1771,13 +1806,6 @@ impl MuxDoneGuard {
         }
     }
 
-    /// The shared muxer-completion counter, for the packet-sink terminal
-    /// coordinator: a sink reports its own completion (dropping this guard)
-    /// and then waits for the counter to reach zero before promising job
-    /// success.
-    fn remaining_handle(&self) -> Arc<AtomicUsize> {
-        self.remaining.clone()
-    }
 }
 
 impl Drop for MuxDoneGuard {

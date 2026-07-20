@@ -352,9 +352,9 @@ fn on_end_fires_after_recording_time_truncation() {
 /// The correctness review's two-output probe: a SIBLING output failing after
 /// this sink drained must never let the sink report success — on_end from a
 /// transiently clean snapshot followed by wait() == Err was the bug. The
-/// terminal coordinator waits for the job to settle; the sink then reports
-/// the job failure through on_delivery_error and wait() keeps the original
-/// error.
+/// settlement barrier waits for every job thread to settle; the sink then
+/// reports the job failure through on_delivery_error and wait() keeps the
+/// original error.
 #[test]
 fn sibling_failure_after_sink_drain_reports_delivery_error_not_end() {
     if !have_encoder("libx264") {
@@ -407,6 +407,67 @@ fn sibling_failure_after_sink_drain_reports_delivery_error_not_end() {
         matches!(events.last(), Some(SinkEv::Error(message)) if !message.is_empty()),
         "the settled job failure surfaces as on_delivery_error, got {:?}",
         events.last()
+    );
+}
+
+/// Settlement covers sibling TEARDOWN, not just sibling I/O: a sibling
+/// container's custom-IO callback state is destroyed inside that worker's
+/// context free (before its slot release), and a panic THERE must still
+/// prevent on_end — the sink's barrier waits for the sibling's slot, behind
+/// which the panic was already recorded. Native AAC on both outputs, so CI
+/// exercises it without libx264.
+#[test]
+fn sibling_custom_io_destruction_panic_prevents_on_end() {
+    /// Panics when the sibling worker frees its output context (unless that
+    /// thread is already unwinding — never double-panics).
+    struct PanicOnDrop;
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            if !std::thread::panicking() {
+                panic!("sibling custom-IO capture panicked during context destruction");
+            }
+        }
+    }
+
+    let (sink, log) = recording_sink();
+    let bomb = PanicOnDrop;
+    let sibling = Output::new_by_write_callback(move |buf: &[u8]| {
+        let _hold = &bomb;
+        buf.len() as i32
+    })
+    .set_format("mpegts")
+    .set_audio_codec("aac");
+
+    let result = wait_with_watchdog(
+        FfmpegContext::builder()
+            .input(Input::from("sine=frequency=440:duration=1").set_format("lavfi"))
+            .output(Output::from(sink).set_audio_codec("aac").add_stream_map("0:a"))
+            .output(sibling.add_stream_map("0:a"))
+            .build()
+            .unwrap()
+            .start()
+            .unwrap(),
+        120,
+        "sibling_destruction_panic",
+    );
+    match result {
+        Err(ez_ffmpeg::error::Error::WorkerPanicked(name)) => {
+            assert!(
+                name.contains("muxer"),
+                "expected the sibling muxer's panic, got {name:?}"
+            );
+        }
+        other => panic!("expected WorkerPanicked from the sibling teardown, got {other:?}"),
+    }
+
+    let events = log.lock().unwrap().clone();
+    assert!(
+        !events.iter().any(|e| matches!(e, SinkEv::End { .. })),
+        "on_end must not fire when a sibling's teardown panicked: {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(e, SinkEv::Error(_))),
+        "the sibling teardown failure surfaces as on_delivery_error: {events:?}"
     );
 }
 

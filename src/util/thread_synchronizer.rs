@@ -3,6 +3,7 @@
 //! live workers behind a condvar instead, because threads are detached
 //! `std::thread` spawns whose handles the scheduler does not keep.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 #[derive(Clone)]
@@ -13,6 +14,15 @@ pub struct ThreadSynchronizer {
 struct Inner {
     counter: Mutex<usize>,
     condvar: Condvar,
+    /// Number of scheduler threads currently parked in
+    /// [`ThreadSynchronizer::wait_for_peers_settled`]. A waiter counts
+    /// itself (and its fellow waiters) out of the settlement condition, so
+    /// two packet sinks at the barrier cannot deadlock on each other. Never
+    /// decremented: a thread that reached the barrier is settled-by-
+    /// definition for the rest of its (single-job) life, and keeping it
+    /// counted lets a peer proceed without waiting for this thread's
+    /// terminal dispatch — only for its slot, which releases afterwards.
+    settlement_waiters: AtomicUsize,
     #[cfg(feature = "async")]
     waker: Mutex<Option<std::task::Waker>>,
 }
@@ -23,6 +33,7 @@ impl ThreadSynchronizer {
             inner: Arc::new(Inner {
                 counter: Mutex::new(0),
                 condvar: Condvar::new(),
+                settlement_waiters: AtomicUsize::new(0),
                 #[cfg(feature = "async")]
                 waker: Mutex::new(None),
             }),
@@ -64,7 +75,6 @@ impl ThreadSynchronizer {
 
             if *counter == 0 {
                 on_last();
-                self.inner.condvar.notify_one();
 
                 #[cfg(feature = "async")]
                 {
@@ -76,6 +86,11 @@ impl ThreadSynchronizer {
                         .take();
                 }
             }
+            // Every release notifies (not only the last): settlement waiters
+            // park on this condvar with a `counter <= waiters` condition that
+            // can become true on ANY peer's release. wait_for_all_threads
+            // re-checks its own condition, so the broader wakeup is safe.
+            self.inner.condvar.notify_all();
         }
 
         // Fire outside the lock and CONTAIN a panicking waker: it must neither
@@ -84,6 +99,35 @@ impl ThreadSynchronizer {
         #[cfg(feature = "async")]
         if let Some(waker) = waker_to_fire {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || waker.wake()));
+        }
+    }
+
+    /// Full-job settlement barrier for a scheduler-tracked thread: blocks
+    /// until every OTHER tracked thread — sibling muxers (whose context
+    /// frees precede their release), demuxers, decoders, filter graphs,
+    /// encoders, frame sources — has released its slot. The caller's own
+    /// slot stays held (its release still gates `wait()`/`stop()`), and the
+    /// condition is `live <= waiters`: every thread parked here counts
+    /// itself out, so concurrent callers (two packet sinks) proceed without
+    /// waiting on each other.
+    ///
+    /// Every worker records its panic/error BEFORE releasing its slot
+    /// (`ThreadDoneGuard`, `MuxPanicStatusGuard`), so once this returns the
+    /// scheduler result and status are settled up to the caller's own
+    /// remaining actions.
+    pub(crate) fn wait_for_peers_settled(&self) {
+        self.inner.settlement_waiters.fetch_add(1, Ordering::AcqRel);
+        let mut counter = self
+            .inner
+            .counter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *counter > self.inner.settlement_waiters.load(Ordering::Acquire) {
+            counter = self
+                .inner
+                .condvar
+                .wait(counter)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
     }
 
@@ -218,6 +262,75 @@ mod tests {
             handle.join().unwrap(),
             "the last-thread closure must run before any waiter wakes"
         );
+    }
+}
+
+#[cfg(test)]
+mod settlement_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// A lone tracked thread is its own settlement: the barrier returns
+    /// immediately (live == waiters == 1).
+    #[test]
+    fn sole_thread_settles_immediately() {
+        let sync = ThreadSynchronizer::new();
+        sync.thread_start();
+        sync.wait_for_peers_settled();
+        sync.thread_done_with(|| {});
+    }
+
+    /// The barrier blocks while an unsettled peer holds a slot and wakes on
+    /// that peer's release.
+    #[test]
+    fn barrier_waits_for_the_peer_release() {
+        let sync = ThreadSynchronizer::new();
+        sync.thread_start(); // caller
+        sync.thread_start(); // peer
+        let passed = Arc::new(AtomicBool::new(false));
+        let sync_w = sync.clone();
+        let passed_w = passed.clone();
+        let waiter = std::thread::spawn(move || {
+            sync_w.wait_for_peers_settled();
+            passed_w.store(true, Ordering::Release);
+            sync_w.thread_done_with(|| {});
+        });
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(
+            !passed.load(Ordering::Acquire),
+            "the barrier must hold while the peer slot is live"
+        );
+        sync.thread_done_with(|| {}); // peer releases
+        waiter.join().unwrap();
+        assert!(passed.load(Ordering::Acquire));
+    }
+
+    /// Two concurrent barrier callers (two packet sinks) count each other
+    /// out and both proceed — the mutual-settlement deadlock cannot form.
+    #[test]
+    fn two_waiters_settle_each_other() {
+        let sync = ThreadSynchronizer::new();
+        sync.thread_start();
+        sync.thread_start();
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let sync_w = sync.clone();
+            handles.push(std::thread::spawn(move || {
+                sync_w.wait_for_peers_settled();
+                sync_w.thread_done_with(|| {});
+            }));
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        for handle in handles {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "mutual settlement deadlocked"
+            );
+            handle.join().unwrap();
+        }
+        sync.wait_for_all_threads();
     }
 }
 
