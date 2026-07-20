@@ -590,6 +590,11 @@ pub(super) struct WriterFilterShape {
     /// output but 2 components: the pushed frames would feed a sink while an
     /// unrelated source feeds the encoder — possibly forever.
     pub(super) components: usize,
+    /// Media types of the open input/output pads, in pad order. The
+    /// per-output simple-filter validation (`opt_util::init_simple_filtergraph`)
+    /// reports type mismatches from these; the writer keeps using the counts.
+    pub(super) input_pad_types: Vec<AVMediaType>,
+    pub(super) output_pad_types: Vec<AVMediaType>,
     /// Whether the open OUTPUT pad's filter is reachable from the open INPUT
     /// pad's filter following the DIRECTED (producer -> consumer) links.
     /// Weak connectivity is not enough: in
@@ -649,6 +654,8 @@ pub(super) fn probe_writer_filter_shape(filter_desc: &str) -> Result<WriterFilte
                 .filter(|p| p.media_type == AVMEDIA_TYPE_VIDEO)
                 .count()
         };
+        let types =
+            |pads: &[fg_probe::ProbedPad]| pads.iter().map(|p| p.media_type).collect::<Vec<_>>();
         let output_reachable = match (&topology.inputs[..], &topology.outputs[..]) {
             ([input], [output]) => node_reaches(input.node, output.node, &topology.edges),
             _ => false,
@@ -658,6 +665,8 @@ pub(super) fn probe_writer_filter_shape(filter_desc: &str) -> Result<WriterFilte
             video_input_pads: video(&topology.inputs),
             output_pads: topology.outputs.len(),
             video_output_pads: video(&topology.outputs),
+            input_pad_types: types(&topology.inputs),
+            output_pad_types: types(&topology.outputs),
             components: topology.filter_components,
             output_reachable,
         })

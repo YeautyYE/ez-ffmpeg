@@ -909,21 +909,34 @@ pub enum OpenOutputError {
     )]
     SimpleAndComplexFilter(String),
 
-    /// A per-output simple filtergraph must be a linear chain: exactly one
-    /// input pad and one output pad (fftools fg_create_simple,
-    /// ffmpeg_filter.c "Simple filtergraph ... was expected to have exactly
-    /// 1 input and 1 output"). Descriptions that split, merge or source
+    /// A per-output simple filtergraph must be one connected linear chain:
+    /// exactly one video input pad, one video output pad, a single connected
+    /// component, and a directed path from the input to the output (fftools
+    /// fg_create_simple's contract plus the topology rules a simple graph
+    /// implies — a disconnected or unreachable description would encode
+    /// unrelated frames or hang instead of filtering the stream). `reason`
+    /// names the violated rule. Descriptions that split, merge or source
     /// streams belong in the context-level `filter_desc`.
     #[error(
-        "Simple filtergraph '{desc}' was expected to have exactly 1 input and \
-         1 output, but it has {inputs} input pad(s) and {outputs} output \
-         pad(s); use FfmpegContextBuilder::filter_desc for complex graphs"
+        "Simple filtergraph '{desc}' is not a single connected chain: {reason}; \
+         use FfmpegContextBuilder::filter_desc for complex graphs"
     )]
-    SimpleFilterInvalidShape {
-        desc: String,
-        inputs: usize,
-        outputs: usize,
-    },
+    SimpleFilterInvalidShape { desc: String, reason: String },
+
+    /// A configured [`Output::set_video_filter`] chain that no re-encoded
+    /// video stream ended up consuming: the output has no video stream at all
+    /// (audio-only input, `disable_video()`, or maps that matched no video
+    /// stream). The ffmpeg CLI silently ignores `-vf` in that situation; the
+    /// crate refuses instead of dropping configuration on the floor.
+    ///
+    /// [`Output::set_video_filter`]: crate::core::context::output::Output::set_video_filter
+    #[error(
+        "video filter '{0}' was configured, but the output ended up with no \
+         re-encoded video stream to run it (audio-only input, disable_video(), \
+         or maps matching no video stream); remove the filter or map a video \
+         stream"
+    )]
+    VideoFilterUnused(String),
 
     /// A per-output simple filtergraph's pads must match the stream's media
     /// type (fftools fg_create_simple: "Filtergraph has a %s output, cannot

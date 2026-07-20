@@ -1,4 +1,4 @@
-use super::fg_bind::{ifilter_bind_ist, init_filter_graph};
+use super::fg_bind::{ifilter_bind_ist, init_filter_graph, probe_writer_filter_shape};
 use super::*;
 
 /// Process metadata for output file
@@ -294,6 +294,32 @@ pub(super) fn outputs_bind(
     }
 
     for (i, mux) in muxs.iter_mut().enumerate() {
+        // Resolved -vf matrix, enforced in this order so no spelling can
+        // dodge its rule:
+        //   complex video  -> SimpleAndComplexFilter (here, before any
+        //                     mapping branch — fftools binds unlabeled graph
+        //                     outputs before manual/automatic mapping
+        //                     (ffmpeg_mux_init.c create_streams) and then
+        //                     hits ost_get_filters' conflict, so maps or
+        //                     disable flags must not bypass it);
+        //   video copy     -> FilterWithStreamCopy (open_output_file for
+        //                     -c:v copy, map_manual for copy maps);
+        //   direct encode  -> the filter binds in init_simple_filtergraph,
+        //                     which records the consumption;
+        //   no video       -> VideoFilterUnused (postcondition below).
+        if let Some(video_filter) = &mux.video_filter {
+            let pending_unlabeled_video = filter_graphs.iter().any(|fg| {
+                fg.outputs.iter().any(|output_filter| {
+                    (output_filter.linklabel.is_empty() || output_filter.linklabel == "out")
+                        && !output_filter.has_dst()
+                        && output_filter.media_type == AVMEDIA_TYPE_VIDEO
+                })
+            });
+            if pending_unlabeled_video {
+                return Err(OpenOutputError::SimpleAndComplexFilter(video_filter.clone()).into());
+            }
+        }
+
         if mux.stream_maps.is_empty() {
             // Initialize auto_disable with muxer's stream disable flags
             // FFmpeg reference: fftools/ffmpeg_mux_init.c:1891-1895
@@ -317,6 +343,16 @@ pub(super) fn outputs_bind(
         } else {
             for stream_map in mux.stream_maps.clone() {
                 map_manual(i, mux, &stream_map, filter_graphs, demuxs)?;
+            }
+        }
+
+        // Filter-consumption postcondition: a configured -vf that no direct
+        // encoded-video stream consumed (audio-only input or maps,
+        // disable_video, an optional video map that matched nothing) must
+        // not be dropped silently.
+        if let Some(video_filter) = &mux.video_filter {
+            if !mux.video_filter_bound {
+                return Err(OpenOutputError::VideoFilterUnused(video_filter.clone()).into());
             }
         }
 
@@ -1431,6 +1467,58 @@ fn media_type_name(media_type: AVMediaType) -> &'static str {
     }
 }
 
+/// Shape rules for a per-output simple video filter, checked on the same
+/// topology probe the writer path uses (fg_bind): exactly one video input
+/// pad, one video output pad, one connected component, and a directed
+/// input->output path. Violations are the promised typed errors, including
+/// the zero-pad cases init_filter_graph would otherwise report generically
+/// (fftools fg_create_simple's contract, plus the topology rules a simple
+/// chain implies).
+fn validate_simple_video_filter(desc: &str, expected: AVMediaType) -> Result<()> {
+    let shape = probe_writer_filter_shape(desc)?;
+    if shape.input_pads != 1 || shape.output_pads != 1 {
+        return Err(OpenOutputError::SimpleFilterInvalidShape {
+            desc: desc.to_string(),
+            reason: format!(
+                "expected exactly 1 input pad and 1 output pad, found {} and {}",
+                shape.input_pads, shape.output_pads
+            ),
+        }
+        .into());
+    }
+    for pad_type in [shape.input_pad_types[0], shape.output_pad_types[0]] {
+        if pad_type != expected {
+            return Err(OpenOutputError::SimpleFilterMediaTypeMismatch {
+                desc: desc.to_string(),
+                found: media_type_name(pad_type).to_string(),
+                expected: media_type_name(expected).to_string(),
+            }
+            .into());
+        }
+    }
+    if shape.components > 1 {
+        return Err(OpenOutputError::SimpleFilterInvalidShape {
+            desc: desc.to_string(),
+            reason: format!(
+                "it parses into {} disconnected sub-graphs, so the stream would not flow \
+                 through the whole description",
+                shape.components
+            ),
+        }
+        .into());
+    }
+    if !shape.output_reachable {
+        return Err(OpenOutputError::SimpleFilterInvalidShape {
+            desc: desc.to_string(),
+            reason: "no directed path leads from its input pad to its output pad, so the \
+                     encoded stream would not contain the filtered frames"
+                .to_string(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 fn init_simple_filtergraph(
     demux: &mut Demuxer,
     stream_index: usize,
@@ -1446,6 +1534,18 @@ fn init_simple_filtergraph(
     // The implicit per-output graph defaults to a passthrough chain; a
     // per-output video filter (Output::set_video_filter, FFmpeg -vf)
     // replaces the video `null`. Audio has no per-output filter yet.
+    if codec_type == AVMEDIA_TYPE_VIDEO {
+        if let Some(custom_desc) = mux.video_filter.as_deref() {
+            // User-supplied text enters the graph here — validate its
+            // topology BEFORE building. Pad counts alone are not enough
+            // ("nullsink;color=..." probes as 1 open input + 1 open output
+            // while the stream drains into the sink and the encoder consumes
+            // the unrelated source forever), so require the full simple-chain
+            // shape. The literal "null"/"anull" defaults need no probe.
+            validate_simple_video_filter(custom_desc, codec_type)?;
+            mux.video_filter_bound = true;
+        }
+    }
     let filter_desc = if codec_type == AVMEDIA_TYPE_VIDEO {
         mux.video_filter.as_deref().unwrap_or("null")
     } else {
@@ -1456,33 +1556,6 @@ fn init_simple_filtergraph(
     // / set_swr_opts) flows in through the bound OutputFilterOptions instead and
     // is resolved in filter_task::configure_filtergraph.
     let mut filter_graph = init_filter_graph(filter_graphs.len(), filter_desc, None, None, None)?;
-
-    // fftools fg_create_simple contract (ffmpeg_filter.c): a simple per-output
-    // graph must be a linear chain — exactly one input pad and one output pad,
-    // both of the stream's media type. The code below binds pad 0 on each side
-    // only, so any extra pad would dangle; reject the shape up front exactly
-    // like the CLI does for `-vf`.
-    if filter_graph.inputs.len() != 1 || filter_graph.outputs.len() != 1 {
-        return Err(OpenOutputError::SimpleFilterInvalidShape {
-            desc: filter_graph.graph_desc.clone(),
-            inputs: filter_graph.inputs.len(),
-            outputs: filter_graph.outputs.len(),
-        }
-        .into());
-    }
-    for pad_type in [
-        filter_graph.inputs[0].media_type,
-        filter_graph.outputs[0].media_type,
-    ] {
-        if pad_type != codec_type {
-            return Err(OpenOutputError::SimpleFilterMediaTypeMismatch {
-                desc: filter_graph.graph_desc.clone(),
-                found: media_type_name(pad_type).to_string(),
-                expected: media_type_name(codec_type).to_string(),
-            }
-            .into());
-        }
-    }
 
     ifilter_bind_ist(&mut filter_graph, 0, stream_index, demux)?;
     // fftools ost->ist rule: fed directly by a single-stream input
@@ -1673,18 +1746,6 @@ fn output_bind_by_unlabeled_filter(
                     || output_filter.has_dst()
                 {
                     continue;
-                }
-
-                // This output's video is about to be fed by a context-level
-                // graph; a per-output video filter has nowhere to apply, so
-                // refuse the pair like the CLI (ffmpeg_mux_init.c
-                // ost_get_filters) instead of silently dropping it.
-                if media_type == AVMEDIA_TYPE_VIDEO {
-                    if let Some(video_filter) = &mux.video_filter {
-                        return Err(
-                            OpenOutputError::SimpleAndComplexFilter(video_filter.clone()).into(),
-                        );
-                    }
                 }
 
                 choose_encoder(mux, output_filter.media_type)?
