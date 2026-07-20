@@ -558,6 +558,9 @@ pub enum PacketSinkError {
         reason: String,
     },
 
+    #[error("output stream {stream_index}: packet processed outside the delivery phase (internal sequencing violation)")]
+    PhaseViolation { stream_index: usize },
+
     #[error("output stream {stream_index}: mid-stream configuration change ({what}); the strict tier requires an immutable stream configuration")]
     ConfigChange {
         stream_index: usize,

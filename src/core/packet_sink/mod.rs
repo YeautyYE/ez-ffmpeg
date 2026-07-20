@@ -67,6 +67,12 @@
 //! * a panicking callback — the job fails with a worker-panic error and no
 //!   further sink callback is invoked.
 //!
+//! Single carve-out: once the terminal callback has fired, the consumer's
+//! captures are destroyed at the worker's defined teardown point; a panic in
+//! one of those `Drop` implementations is caught, logged at error level, and
+//! does NOT override the already-settled job result (a delivered `on_end`
+//! still yields `wait() == Ok`).
+//!
 //! # Backpressure: callbacks block the pipeline
 //!
 //! **The callbacks run on the delivery thread. A slow `on_packet` blocks that
@@ -125,6 +131,14 @@ pub(crate) mod timeline;
 /// Delivery tier of a packet sink. Only [`Strict`](PacketSinkTier::Strict)
 /// exists in v1; the enum is `#[non_exhaustive]` so later tiers (generic
 /// passthrough, HEVC, Annex-B) are additive.
+///
+/// The strict construction paths ([`PacketSink::builder`],
+/// [`PacketSink::from_handler`], [`PacketSink::channel`]) do NOT take a tier:
+/// they are strict-tier by definition, because their callback bundle is typed
+/// to the strict [`PacketView`]/[`PacketStreamInfo`] contract (mandatory
+/// `i64` timestamps and durations). A future tier arrives as its own
+/// constructor with its own view/config/callback types — never by routing a
+/// different tier through the strict bundle.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PacketSinkTier {
@@ -229,8 +243,11 @@ pub trait PacketSinkHandler: Send + 'static {
     /// Terminal success (see the module docs for the exact gate).
     fn on_end(&mut self) {}
 
-    /// Terminal delivery-path failure (the same error is also the job
-    /// result).
+    /// Terminal failure. For delivery-path errors (strict-tier violations,
+    /// failing callbacks) the same error is also the job result. When the
+    /// JOB failed elsewhere after this sink drained cleanly, the callback
+    /// receives a synthesized [`PacketSinkError::JobFailed`] summarizing that
+    /// failure, while `wait()`/`stop()` keep the original error.
     fn on_delivery_error(&mut self, _error: &PacketSinkError) {}
 }
 
@@ -242,6 +259,9 @@ pub struct VideoPacketConfig {
     pub(crate) stream_index: usize,
     pub(crate) codec_id: AVCodecID,
     pub(crate) codec_string: String,
+    pub(crate) profile: u8,
+    pub(crate) compatibility: u8,
+    pub(crate) level: u8,
     pub(crate) codec_config: Vec<u8>,
     pub(crate) time_base: AVRational,
     pub(crate) width: i32,
@@ -265,6 +285,24 @@ impl VideoPacketConfig {
     /// `codec` value.
     pub fn codec_string(&self) -> &str {
         &self.codec_string
+    }
+
+    /// H.264 `profile_idc` (the avcC `AVCProfileIndication`; e.g. 66 =
+    /// Baseline, 77 = Main, 100 = High). Same source as
+    /// [`codec_string`](Self::codec_string).
+    pub fn profile(&self) -> u8 {
+        self.profile
+    }
+
+    /// The avcC `profile_compatibility` byte (constraint-set flags).
+    pub fn compatibility(&self) -> u8 {
+        self.compatibility
+    }
+
+    /// H.264 `level_idc` (the avcC `AVCLevelIndication`; e.g. 30 = level
+    /// 3.0, 0x1F = level 3.1).
+    pub fn level(&self) -> u8 {
+        self.level
     }
 
     /// The `AVCDecoderConfigurationRecord` (avcC), suitable as the WebCodecs
@@ -803,13 +841,6 @@ pub struct PacketSinkBuilder {
 }
 
 impl PacketSinkBuilder {
-    /// Selects the delivery tier. Defaults to [`PacketSinkTier::Strict`], the
-    /// only tier in v1.
-    pub fn tier(mut self, tier: PacketSinkTier) -> Self {
-        self.tier = tier;
-        self
-    }
-
     /// One-time stream configuration callback, invoked before any packet.
     /// Return `Ok(())` to accept; an error fails the job before any packet is
     /// delivered.
@@ -831,11 +862,14 @@ impl PacketSinkBuilder {
         self
     }
 
-    /// Terminal failure callback for delivery-path errors (strict-tier
-    /// violations, failing callbacks, a job error discovered while
-    /// finalizing). The same error is also returned by `wait()`/`stop()`.
-    /// Not invoked for cancellation or initial configuration failures — see
-    /// "Failure and panic" in the [module docs](self).
+    /// Terminal failure callback. For delivery-path errors (strict-tier
+    /// violations, failing callbacks) the same error is also returned by
+    /// `wait()`/`stop()`; when the JOB failed elsewhere after this sink
+    /// drained cleanly, the callback receives a synthesized
+    /// [`PacketSinkError::JobFailed`] summarizing that failure while the job
+    /// keeps its original error. Not invoked for cancellation or initial
+    /// configuration failures — see "Failure and panic" in the
+    /// [module docs](self).
     pub fn on_delivery_error<F>(mut self, f: F) -> Self
     where
         F: FnMut(&PacketSinkError) + Send + 'static,

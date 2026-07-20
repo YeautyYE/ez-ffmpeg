@@ -432,6 +432,9 @@ fn validate_packet_sink_options(output: &Output) -> Result<()> {
             !output.program_metadata.is_empty(),
         ),
         ("map_metadata", !output.metadata_map.is_empty()),
+        // auto_copy_metadata only governs container metadata propagation;
+        // toggling it on a sink is a configuration mistake like the rest.
+        ("disable_auto_copy_metadata", !output.auto_copy_metadata),
     ];
     for (option, set) in unsupported {
         if *set {

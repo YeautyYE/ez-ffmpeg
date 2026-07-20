@@ -69,7 +69,10 @@ struct StreamRuntime {
 
 /// Delivery phase: explicit, one-way transitions instead of correlated flags.
 enum Phase {
-    /// Collected and (once `stream_info_delivered`) delivering.
+    /// Configuration collected; `on_stream_info` has not run yet. No packet
+    /// may be processed in this phase.
+    Collected,
+    /// Stream info delivered; packets flow.
     Running,
     /// Terminal callback dispatched (or deliberately suppressed); nothing may
     /// fire twice.
@@ -126,7 +129,6 @@ pub(crate) struct PacketSinkWorker {
     pending_error: Option<PacketSinkError>,
     /// Reused Annex-B -> AVCC conversion buffer (high-water sized).
     scratch: Vec<u8>,
-    stream_info_delivered: bool,
     phase: Phase,
     /// A blocking channel send observed the job stopping and bailed out
     /// cooperatively: delivery stopped, but it is NOT an error.
@@ -201,18 +203,24 @@ impl PacketSinkWorker {
                             },
                         )));
                     }
-                    let (runtime, delivered) =
+                    let (runtime, delivered, projection) =
                         match AvcRuntime::from_extradata(&extradata, stream_index) {
-                            Ok(pair) => pair,
+                            Ok(parts) => parts,
                             Err(e) => return Err(Box::new((sink, e))),
                         };
                     let fr = (*st).avg_frame_rate;
                     let frame_rate = (fr.num > 0 && fr.den > 0).then_some(fr);
                     let sar = (*codecpar).sample_aspect_ratio;
+                    // Single source: the codec string AND the typed
+                    // profile/compatibility/level fields all come from the
+                    // same derived projection the S8 baseline compares.
                     let info = PacketStreamInfo::Video(VideoPacketConfig {
                         stream_index,
                         codec_id: (*codecpar).codec_id,
-                        codec_string: codec::avc::codec_string(&delivered),
+                        codec_string: projection.codec_string(),
+                        profile: projection.profile,
+                        compatibility: projection.compatibility,
+                        level: projection.level,
                         codec_config: delivered,
                         time_base,
                         width: (*codecpar).width,
@@ -231,7 +239,10 @@ impl PacketSinkWorker {
                             },
                         )));
                     }
-                    let runtime = AacRuntime::from_extradata(&extradata);
+                    let runtime = match AacRuntime::from_extradata(&extradata, stream_index) {
+                        Ok(runtime) => runtime,
+                        Err(e) => return Err(Box::new((sink, e))),
+                    };
                     let info = PacketStreamInfo::Audio(AudioPacketConfig {
                         stream_index,
                         codec_id: (*codecpar).codec_id,
@@ -277,21 +288,20 @@ impl PacketSinkWorker {
             timeline: Timeline::new(),
             pending_error: None,
             scratch: Vec::new(),
-            stream_info_delivered: false,
-            phase: Phase::Running,
+            phase: Phase::Collected,
             cancelled: false,
         })
     }
 
     /// Invokes `on_stream_info` exactly once, on the worker thread, before
-    /// any packet; a second call is a guarded no-op. Returns `0` or the
-    /// sentinel error code.
+    /// any packet: the `Collected -> Running` phase transition. A repeated
+    /// call is an idempotent no-op (returns `0` without re-invoking the
+    /// callback), as is a call after the terminal phase.
     pub(crate) fn deliver_stream_info(&mut self) -> i32 {
-        if self.stream_info_delivered {
-            debug_assert!(false, "on_stream_info delivered twice");
+        if !matches!(self.phase, Phase::Collected) {
             return 0;
         }
-        self.stream_info_delivered = true;
+        self.phase = Phase::Running;
         if let Err(cb) = self.sink.dispatch_stream_info(&self.infos) {
             match callback_failure(cb, None) {
                 ProcessFailure::Cancelled => self.cancelled = true,
@@ -354,34 +364,23 @@ impl PacketSinkWorker {
         out_fmt_ctx: *const AVFormatContext,
         packet_box: &mut PacketBox,
     ) -> Result<(), ProcessFailure> {
-        debug_assert!(
-            matches!(self.phase, Phase::Running),
-            "packet processed after the terminal slot"
-        );
         let stream_index = packet_box.packet_data.output_stream_index as usize;
         debug_assert!(stream_index < self.streams.len());
+        // Real phase guard (not debug-only): a packet may only be processed
+        // while Running — after the one-time stream info, before the
+        // terminal slot. Anything else is an internal sequencing violation
+        // and fails typed instead of silently delivering out of contract.
+        if !matches!(self.phase, Phase::Running) {
+            return Err(ProcessFailure::from(PacketSinkError::PhaseViolation {
+                stream_index,
+            }));
+        }
         let pkt = packet_box.packet.as_ptr();
 
-        // 1. The packet must be labeled in the stream's advertised time base:
-        // the anchor is computed from packet values while delivery is labeled
-        // with the stream time base, so a mismatch would silently corrupt the
-        // shared-origin math and every delivered timestamp.
-        let stream_tb = self.streams[stream_index].time_base;
-        {
-            let pkt_tb = (*pkt).time_base;
-            if pkt_tb.num != stream_tb.num || pkt_tb.den != stream_tb.den {
-                return Err(ProcessFailure::from(PacketSinkError::PacketTimeBaseMismatch {
-                    stream_index,
-                    packet_num: pkt_tb.num,
-                    packet_den: pkt_tb.den,
-                    stream_num: stream_tb.num,
-                    stream_den: stream_tb.den,
-                }));
-            }
-        }
-
-        // 2. S8: mid-stream configuration change detection over checked
-        // side-data iteration.
+        // 1. S8 FIRST (consensus order): mid-stream configuration change
+        // detection over checked side-data iteration — a packet carrying
+        // both configuration-change evidence and a timestamp/time-base
+        // fault must report the configuration change.
         for entry in side_data::entries(pkt) {
             let (sd_type, bytes) = entry.map_err(|reason| {
                 ProcessFailure::from(PacketSinkError::MalformedPacket {
@@ -402,8 +401,27 @@ impl PacketSinkWorker {
             }
         }
 
-        // 3. S7: timestamps. Missing values are rejected before anything else
-        // (the origin cannot anchor on AV_NOPTS_VALUE).
+        // 2. S7: time bases and timestamps. The packet must be labeled in
+        // the stream's advertised time base — the anchor is computed from
+        // packet values while delivery is labeled with the stream time base,
+        // so a mismatch would silently corrupt the shared-origin math.
+        let stream_tb = self.streams[stream_index].time_base;
+        {
+            let pkt_tb = (*pkt).time_base;
+            if pkt_tb.num != stream_tb.num || pkt_tb.den != stream_tb.den {
+                return Err(ProcessFailure::from(
+                    PacketSinkError::PacketTimeBaseMismatch {
+                        stream_index,
+                        packet_num: pkt_tb.num,
+                        packet_den: pkt_tb.den,
+                        stream_num: stream_tb.num,
+                        stream_den: stream_tb.den,
+                    },
+                ));
+            }
+        }
+        // Missing values are rejected before anything else (the origin
+        // cannot anchor on AV_NOPTS_VALUE).
         let orig_pts = (*pkt).pts;
         let orig_dts = (*pkt).dts;
         if orig_dts == AV_NOPTS_VALUE {
@@ -929,6 +947,9 @@ mod tests {
         let (sink, events) = recording_sink();
         let mut worker = collect(&ctx, sink).unwrap();
         assert_eq!(worker.deliver_stream_info(), 0);
+        // Documented idempotence: a repeated call is a no-op that does not
+        // re-invoke the callback (the single Info event below proves it).
+        assert_eq!(worker.deliver_stream_info(), 0);
         let mut pb = packet(&idr_au(), 4, 4, tb25(), 0);
         assert_eq!(
             unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) },
@@ -956,11 +977,12 @@ mod tests {
         let ctx = video_ctx();
         let (sink, events) = recording_sink();
         let mut worker = collect(&ctx, sink).unwrap();
+        assert_eq!(worker.deliver_stream_info(), 0);
         let mut pb = packet(&p_au(), 0, 0, tb25(), 0);
         assert_eq!(unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) }, 0);
         let events = events.lock().unwrap();
-        let PacketSinkEvent::Packet(p) = &events[0] else {
-            panic!("expected a packet event");
+        let PacketSinkEvent::Packet(p) = &events[1] else {
+            panic!("expected a packet event after the stream info");
         };
         assert!(!p.is_key());
     }
@@ -970,6 +992,7 @@ mod tests {
         let ctx = video_ctx();
         let (sink, _events) = recording_sink();
         let mut worker = collect(&ctx, sink).unwrap();
+        assert_eq!(worker.deliver_stream_info(), 0);
 
         let mut nopts = packet(&idr_au(), ffmpeg_sys_next::AV_NOPTS_VALUE, 0, tb25(), 0);
         assert_eq!(
@@ -984,6 +1007,7 @@ mod tests {
         // Fresh worker: pts earlier than dts.
         let (sink, _events) = recording_sink();
         let mut worker = collect(&ctx, sink).unwrap();
+        assert_eq!(worker.deliver_stream_info(), 0);
         let mut bad = packet(&idr_au(), 1, 2, tb25(), 0);
         assert_eq!(
             unsafe { worker.process_and_deliver(ctx.ctx, &mut bad) },
@@ -997,6 +1021,7 @@ mod tests {
         // Fresh worker: dts must strictly increase.
         let (sink, _events) = recording_sink();
         let mut worker = collect(&ctx, sink).unwrap();
+        assert_eq!(worker.deliver_stream_info(), 0);
         let mut first = packet(&idr_au(), 0, 0, tb25(), 0);
         assert_eq!(unsafe { worker.process_and_deliver(ctx.ctx, &mut first) }, 0);
         let mut stale = packet(&p_au(), 5, 0, tb25(), 0);
@@ -1012,6 +1037,7 @@ mod tests {
         // Fresh worker: duplicate pts within the reorder window.
         let (sink, _events) = recording_sink();
         let mut worker = collect(&ctx, sink).unwrap();
+        assert_eq!(worker.deliver_stream_info(), 0);
         let mut a = packet(&idr_au(), 3, 0, tb25(), 0);
         assert_eq!(unsafe { worker.process_and_deliver(ctx.ctx, &mut a) }, 0);
         let mut b = packet(&p_au(), 3, 1, tb25(), 0);
@@ -1040,6 +1066,7 @@ mod tests {
         }
         let (sink, _events) = recording_sink();
         let mut worker = collect(&ctx, sink).unwrap();
+        assert_eq!(worker.deliver_stream_info(), 0);
         let mut pb = packet(&idr_au(), 0, 0, tb25(), 0);
         assert_eq!(
             unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) },
@@ -1056,6 +1083,7 @@ mod tests {
         let ctx = video_ctx();
         let (sink, _events) = recording_sink();
         let mut worker = collect(&ctx, sink).unwrap();
+        assert_eq!(worker.deliver_stream_info(), 0);
 
         // Redundant announcement (byte-identical Annex-B config): passes.
         let mut same = packet(&idr_au(), 0, 0, tb25(), 0);
@@ -1103,6 +1131,7 @@ mod tests {
         // Equal dimensions: redundant, passes.
         let (sink, _events) = recording_sink();
         let mut worker = collect(&ctx, sink).unwrap();
+        assert_eq!(worker.deliver_stream_info(), 0);
         let mut same = packet(&idr_au(), 0, 0, tb25(), 0);
         unsafe {
             let mut payload = 8u32.to_le_bytes().to_vec(); // DIMENSIONS flag
@@ -1121,6 +1150,7 @@ mod tests {
         // A resolution change is rejected typed.
         let (sink, _events) = recording_sink();
         let mut worker = collect(&ctx, sink).unwrap();
+        assert_eq!(worker.deliver_stream_info(), 0);
         let mut changed = packet(&idr_au(), 0, 0, tb25(), 0);
         unsafe {
             let mut payload = 8u32.to_le_bytes().to_vec();
@@ -1151,6 +1181,7 @@ mod tests {
         // Equal to the baseline: still out-of-band-only in the strict tier.
         let (sink, _events) = recording_sink();
         let mut worker = collect(&ctx, sink).unwrap();
+        assert_eq!(worker.deliver_stream_info(), 0);
         let mut au = annexb_config();
         au.extend_from_slice(&[0, 0, 1, 0x65, 0x88, 0x84]);
         let mut pb = packet(&au, 0, 0, tb25(), 0);
@@ -1166,6 +1197,7 @@ mod tests {
         // Different in-band sets are a configuration change.
         let (sink, _events) = recording_sink();
         let mut worker = collect(&ctx, sink).unwrap();
+        assert_eq!(worker.deliver_stream_info(), 0);
         let mut au = vec![0, 0, 0, 1];
         au.extend_from_slice(OTHER_SPS);
         au.extend_from_slice(&[0, 0, 1, 0x65, 0x88, 0x84]);
@@ -1199,6 +1231,7 @@ mod tests {
         }
         let (sink, events) = recording_sink();
         let mut worker = collect(&ctx, sink).unwrap();
+        assert_eq!(worker.deliver_stream_info(), 0);
 
         // First delivered packet: video dts 5 (at 1/25) anchors the origin.
         let mut v = packet(&idr_au(), 5, 5, tb25(), 0);
@@ -1245,6 +1278,7 @@ mod tests {
         })
         .build();
         let mut worker = collect(&ctx, sink).unwrap();
+        assert_eq!(worker.deliver_stream_info(), 0);
         let mut pb = packet(&idr_au(), 0, 0, tb25(), 0);
         let ret = unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) };
         assert_eq!(ret, AVERROR_EXTERNAL);
@@ -1274,6 +1308,7 @@ mod tests {
             let ctx = video_ctx();
             let (sink, _events) = recording_sink();
             let mut worker = collect(&ctx, sink).unwrap();
+        assert_eq!(worker.deliver_stream_info(), 0);
             let mut a = packet(&idr_au(), first.0, first.1, tb25(), 0);
             assert_eq!(unsafe { worker.process_and_deliver(ctx.ctx, &mut a) }, 0);
             let mut b = packet(&p_au(), second.0, second.1, tb25(), 0);
@@ -1325,6 +1360,7 @@ mod tests {
         let ctx = video_ctx();
         let (sink, _events) = recording_sink();
         let mut worker = collect(&ctx, sink).unwrap();
+        assert_eq!(worker.deliver_stream_info(), 0);
         let mut pb = packet(&idr_au(), 0, 0, AVRational { num: 1, den: 30 }, 0);
         assert_eq!(
             unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) },
@@ -1372,6 +1408,7 @@ mod tests {
         for (payload, what) in cases {
             let (sink, _events) = recording_sink();
             let mut worker = collect(&ctx, sink).unwrap();
+        assert_eq!(worker.deliver_stream_info(), 0);
             let mut pb = packet(&idr_au(), 0, 0, tb25(), 0);
             unsafe {
                 let sd = av_packet_new_side_data(
@@ -1394,11 +1431,58 @@ mod tests {
         }
     }
 
-    /// S8 fingerprint is order-independent: the same SPS/PPS identities in a
-    /// different wrapper order are NOT a configuration change.
+    /// Composite S8 baseline: reordering the same SPS/PPS identities is not
+    /// a configuration change — UNLESS the reorder changes the DERIVED codec
+    /// projection consumers were told (profile/compatibility/level from the
+    /// first SPS, the same source as on_stream_info). Both directions pinned.
     #[test]
-    fn reordered_parameter_sets_are_not_a_config_change() {
-        // Baseline with TWO SPS entries (order A, B).
+    fn reorder_is_config_change_only_when_the_projection_changes() {
+        // Second SPS with an IDENTICAL projection (bytes 1..4) but a
+        // different tail: reorder must pass.
+        const SAME_PROJ_SPS: &[u8] = &[0x67, 66, 0xC0, 0x1E, 0xAA, 0x11, 0x22];
+        let mut config = vec![0, 0, 0, 1];
+        config.extend_from_slice(SPS);
+        config.extend_from_slice(&[0, 0, 1]);
+        config.extend_from_slice(SAME_PROJ_SPS);
+        config.extend_from_slice(&[0, 0, 1]);
+        config.extend_from_slice(PPS);
+        let ctx = TestCtx::new();
+        unsafe {
+            ctx.add_stream(
+                AVMediaType::AVMEDIA_TYPE_VIDEO,
+                AVCodecID::AV_CODEC_ID_H264,
+                Some(&config),
+                tb25(),
+            );
+        }
+        let (sink, _events) = recording_sink();
+        let mut worker = collect(&ctx, sink).unwrap();
+        assert_eq!(worker.deliver_stream_info(), 0);
+        let mut swapped = vec![0, 0, 0, 1];
+        swapped.extend_from_slice(SAME_PROJ_SPS);
+        swapped.extend_from_slice(&[0, 0, 1]);
+        swapped.extend_from_slice(SPS);
+        swapped.extend_from_slice(&[0, 0, 1]);
+        swapped.extend_from_slice(PPS);
+        let mut pb = packet(&idr_au(), 0, 0, tb25(), 0);
+        unsafe {
+            let sd = av_packet_new_side_data(
+                pb.packet.as_mut_ptr(),
+                AV_PKT_DATA_NEW_EXTRADATA,
+                swapped.len(),
+            );
+            assert!(!sd.is_null());
+            std::ptr::copy_nonoverlapping(swapped.as_ptr(), sd, swapped.len());
+        }
+        assert_eq!(
+            unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) },
+            0,
+            "reordered identical sets with an unchanged projection must pass"
+        );
+
+        // Same identities, but the reorder changes the first SPS's level
+        // byte — the derived projection consumers were told changes, so it
+        // IS a configuration change even though the canonical sets match.
         let mut config = vec![0, 0, 0, 1];
         config.extend_from_slice(SPS);
         config.extend_from_slice(&[0, 0, 1]);
@@ -1416,8 +1500,7 @@ mod tests {
         }
         let (sink, _events) = recording_sink();
         let mut worker = collect(&ctx, sink).unwrap();
-
-        // NEW_EXTRADATA announcing the SAME sets in the opposite order.
+        assert_eq!(worker.deliver_stream_info(), 0);
         let mut swapped = vec![0, 0, 0, 1];
         swapped.extend_from_slice(OTHER_SPS);
         swapped.extend_from_slice(&[0, 0, 1]);
@@ -1436,8 +1519,34 @@ mod tests {
         }
         assert_eq!(
             unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) },
-            0,
-            "reordered identical parameter sets must pass"
+            AVERROR_EXTERNAL,
+            "a reorder that changes the derived projection must be rejected"
+        );
+        assert!(matches!(
+            worker.pending_error_cloned(),
+            Some(PacketSinkError::ConfigChange { .. })
+        ));
+    }
+
+    /// The real (not debug-only) phase guard: a packet before stream-info
+    /// readiness is a typed sequencing violation and delivers nothing.
+    #[test]
+    fn packets_before_stream_info_are_a_phase_violation() {
+        let ctx = video_ctx();
+        let (sink, events) = recording_sink();
+        let mut worker = collect(&ctx, sink).unwrap();
+        let mut pb = packet(&idr_au(), 0, 0, tb25(), 0);
+        assert_eq!(
+            unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) },
+            AVERROR_EXTERNAL
+        );
+        assert!(matches!(
+            worker.pending_error_cloned(),
+            Some(PacketSinkError::PhaseViolation { stream_index: 0 })
+        ));
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "nothing may be delivered out of phase"
         );
     }
 
@@ -1447,6 +1556,7 @@ mod tests {
         let run = |all_done: bool, ret: i32, aborted: bool, job_error: Option<String>| {
             let (sink, events) = recording_sink();
             let mut worker = collect(&ctx, sink).unwrap();
+        assert_eq!(worker.deliver_stream_info(), 0);
             worker.finish(all_done, ret, aborted, job_error);
             // Finish is a one-way phase transition: a second call must be a
             // no-op and can never fire a second terminal event.
