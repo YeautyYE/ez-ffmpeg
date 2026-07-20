@@ -148,7 +148,7 @@ impl PacketSinkWorker {
         stream_count: usize,
         sink: PacketSink,
         scheduler_status: &Arc<AtomicUsize>,
-    ) -> Result<Self, PacketSinkError> {
+    ) -> Result<Self, (PacketSink, PacketSinkError)> {
         // Tier dispatch: only Strict exists; new tiers add arms here.
         let super::PacketSinkTier::Strict = sink.tier;
 
@@ -170,26 +170,39 @@ impl PacketSinkWorker {
             // valid positive rational BEFORE any callback observes it (it
             // anchors rescaling and labels every delivered timestamp).
             if time_base.num <= 0 || time_base.den <= 0 {
-                return Err(PacketSinkError::InvalidTimeBase {
-                    stream_index,
-                    num: time_base.num,
-                    den: time_base.den,
-                });
+                return Err((
+                    sink,
+                    PacketSinkError::InvalidTimeBase {
+                        stream_index,
+                        num: time_base.num,
+                        den: time_base.den,
+                    },
+                ));
             }
-            let extradata = extradata_bytes(codecpar)
-                .ok_or(PacketSinkError::MissingExtradata { stream_index })?;
+            let extradata = match extradata_bytes(codecpar) {
+                Some(bytes) => bytes,
+                None => {
+                    return Err((sink, PacketSinkError::MissingExtradata { stream_index }))
+                }
+            };
 
             let (codec, info, frame_rate) = match media_type {
                 AVMEDIA_TYPE_VIDEO => {
                     // The encoder whitelist was enforced at build time; this
                     // guards the codec id itself (h264 only in v1).
                     if (*codecpar).codec_id != ffmpeg_sys_next::AVCodecID::AV_CODEC_ID_H264 {
-                        return Err(PacketSinkError::UnsupportedStream {
-                            kind: "non-H.264 video",
-                        });
+                        return Err((
+                            sink,
+                            PacketSinkError::UnsupportedStream {
+                                kind: "non-H.264 video",
+                            },
+                        ));
                     }
                     let (runtime, delivered) =
-                        AvcRuntime::from_extradata(&extradata, stream_index)?;
+                        match AvcRuntime::from_extradata(&extradata, stream_index) {
+                            Ok(pair) => pair,
+                            Err(e) => return Err((sink, e)),
+                        };
                     let fr = (*st).avg_frame_rate;
                     let frame_rate = (fr.num > 0 && fr.den > 0).then_some(fr);
                     let sar = (*codecpar).sample_aspect_ratio;
@@ -208,9 +221,12 @@ impl PacketSinkWorker {
                 }
                 AVMEDIA_TYPE_AUDIO => {
                     if (*codecpar).codec_id != ffmpeg_sys_next::AVCodecID::AV_CODEC_ID_AAC {
-                        return Err(PacketSinkError::UnsupportedStream {
-                            kind: "non-AAC audio",
-                        });
+                        return Err((
+                            sink,
+                            PacketSinkError::UnsupportedStream {
+                                kind: "non-AAC audio",
+                            },
+                        ));
                     }
                     let runtime = AacRuntime::from_extradata(&extradata);
                     let info = PacketStreamInfo::Audio(AudioPacketConfig {
@@ -226,9 +242,12 @@ impl PacketSinkWorker {
                     (CodecRuntime::Aac(runtime), info, None)
                 }
                 _ => {
-                    return Err(PacketSinkError::UnsupportedStream {
-                        kind: "non-audio/video",
-                    })
+                    return Err((
+                        sink,
+                        PacketSinkError::UnsupportedStream {
+                            kind: "non-audio/video",
+                        },
+                    ))
                 }
             };
 
@@ -510,7 +529,7 @@ impl PacketSinkWorker {
         all_streams_terminal: bool,
         ret: i32,
         aborted: bool,
-        task_error: bool,
+        job_error: Option<String>,
     ) {
         if matches!(self.phase, Phase::Finished) {
             return;
@@ -523,7 +542,15 @@ impl PacketSinkWorker {
             self.sink.dispatch_delivery_error(&e);
             return;
         }
-        if ret >= 0 && all_streams_terminal && !task_error {
+        if let Some(message) = job_error {
+            // The sink itself drained cleanly, but the JOB failed (a sibling
+            // output, an upstream task): success must not be promised, and
+            // the consumer learns why. wait() keeps the original error.
+            self.sink
+                .dispatch_delivery_error(&PacketSinkError::JobFailed { message });
+            return;
+        }
+        if ret >= 0 && all_streams_terminal {
             self.sink.dispatch_end();
         }
     }
@@ -843,6 +870,7 @@ mod tests {
     fn collect(ctx: &TestCtx, sink: PacketSink) -> Result<PacketSinkWorker, PacketSinkError> {
         let status = Arc::new(AtomicUsize::new(0));
         unsafe { PacketSinkWorker::collect(ctx.ctx, ctx.stream_count(), sink, &status) }
+            .map_err(|(_sink, e)| e)
     }
 
     fn tb25() -> AVRational {
@@ -1226,9 +1254,9 @@ mod tests {
             other => panic!("expected the typed callback failure, got {other:?}"),
         }
 
-        // Terminal slot: the stashed error fires on_error, never on_end —
-        // even if every stream were terminal.
-        worker.finish(true, AVERROR_EXTERNAL, false, true);
+        // Terminal slot: the stashed error fires on_delivery_error, never
+        // on_end — even if every stream were terminal.
+        worker.finish(true, AVERROR_EXTERNAL, false, None);
         let events = events.lock().unwrap();
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0], PacketSinkEvent::Error(_)));
@@ -1413,20 +1441,32 @@ mod tests {
     #[test]
     fn finish_gate_matrix() {
         let ctx = video_ctx();
-        let run = |all_done: bool, ret: i32, aborted: bool, task_error: bool| {
+        let run = |all_done: bool, ret: i32, aborted: bool, job_error: Option<String>| {
             let (sink, events) = recording_sink();
             let mut worker = collect(&ctx, sink).unwrap();
-            worker.finish(all_done, ret, aborted, task_error);
+            worker.finish(all_done, ret, aborted, job_error);
+            // Finish is a one-way phase transition: a second call must be a
+            // no-op and can never fire a second terminal event.
+            worker.finish(true, 0, false, None);
             let events = events.lock().unwrap();
-            events
+            let ends = events
                 .iter()
                 .filter(|e| matches!(e, PacketSinkEvent::End))
-                .count()
+                .count();
+            let errors = events
+                .iter()
+                .filter(|e| matches!(e, PacketSinkEvent::Error(_)))
+                .count();
+            (ends, errors)
         };
-        assert_eq!(run(true, 0, false, false), 1, "healthy completion");
-        assert_eq!(run(false, 0, false, false), 0, "streams not terminal");
-        assert_eq!(run(true, -5, false, false), 0, "delivery error");
-        assert_eq!(run(true, 0, true, false), 0, "abort");
-        assert_eq!(run(true, 0, false, true), 0, "task error elsewhere");
+        assert_eq!(run(true, 0, false, None), (1, 0), "healthy completion");
+        assert_eq!(run(false, 0, false, None), (0, 0), "streams not terminal");
+        assert_eq!(run(true, -5, false, None), (0, 0), "delivery error");
+        assert_eq!(run(true, 0, true, None), (0, 0), "abort");
+        assert_eq!(
+            run(true, 0, false, Some("sibling failed".to_string())),
+            (0, 1),
+            "a job error after clean drain reports on_delivery_error, never on_end"
+        );
     }
 }

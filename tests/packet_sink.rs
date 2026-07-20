@@ -349,6 +349,139 @@ fn on_end_fires_after_recording_time_truncation() {
     );
 }
 
+/// The correctness review's two-output probe: a SIBLING output failing after
+/// this sink drained must never let the sink report success — on_end from a
+/// transiently clean snapshot followed by wait() == Err was the bug. The
+/// terminal coordinator waits for the job to settle; the sink then reports
+/// the job failure through on_delivery_error and wait() keeps the original
+/// error.
+#[test]
+fn sibling_failure_after_sink_drain_reports_delivery_error_not_end() {
+    if !have_encoder("libx264") {
+        eprintln!("skipping: libx264 not available in this FFmpeg build");
+        return;
+    }
+    let (sink, log) = recording_sink();
+    // Sibling container: a byte sink that fails hard after 64 KiB.
+    let mut written = 0usize;
+    let failing_sibling = Output::new_by_write_callback(move |buf: &[u8]| {
+        written += buf.len();
+        if written > 64 * 1024 {
+            ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO)
+        } else {
+            buf.len() as i32
+        }
+    })
+    .set_format("mpegts")
+    .set_video_codec("mpeg4");
+
+    let result = wait_with_watchdog(
+        FfmpegContext::builder()
+            .input(testsrc(3))
+            .output(
+                x264_output(sink)
+                    .add_stream_map("0:v")
+                    .set_recording_time_us(300_000),
+            )
+            .output(failing_sibling.add_stream_map("0:v"))
+            .build()
+            .unwrap()
+            .start()
+            .unwrap(),
+        120,
+        "sibling_failure",
+    );
+    // wait() keeps the sibling's original error.
+    let error = result.expect_err("the sibling write failure must fail the job");
+    assert!(
+        !matches!(error, ez_ffmpeg::error::Error::PacketSink(_)),
+        "the sink must not overwrite the sibling's error, got {error:?}"
+    );
+
+    let events = log.lock().unwrap().clone();
+    assert!(
+        !events.iter().any(|e| matches!(e, SinkEv::End { .. })),
+        "on_end must not fire when the job failed elsewhere"
+    );
+    assert!(
+        matches!(events.last(), Some(SinkEv::Error(message)) if !message.is_empty()),
+        "the settled job failure surfaces as on_delivery_error, got {:?}",
+        events.last()
+    );
+}
+
+/// The finalize-gating probe: a packet sink must never hold the
+/// scheduler-wide I/O finalize exemption. With a sink waiting in its terminal
+/// coordinator and a sibling container blocked on an unread TCP peer,
+/// stop() must still cut the sibling within the grace window and return —
+/// an (ungated) sink-held finalize guard would suppress the cut and hang.
+#[test]
+fn blocked_sibling_stays_interruptible_while_sink_finalizes() {
+    if !have_encoder("libx264") {
+        eprintln!("skipping: libx264 not available in this FFmpeg build");
+        return;
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accept_thread = std::thread::spawn(move || {
+        if let Ok((stream, _)) = listener.accept() {
+            // Hold the socket open without reading until the test ends.
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            drop(stream);
+        }
+    });
+
+    let (sink, log) = recording_sink();
+    let scheduler = FfmpegContext::builder()
+        // High-entropy source so the non-reading peer's buffers fill fast.
+        .input(Input::from("testsrc2=s=1280x720:r=30").set_format("lavfi"))
+        .output(
+            x264_output(sink)
+                .add_stream_map("0:v")
+                .set_recording_time_us(300_000),
+        )
+        .output(
+            Output::from(format!("tcp://{addr}?send_buffer_size=16384"))
+                .add_stream_map("0:v")
+                .set_format("mpegts")
+                .set_video_codec("mpeg4")
+                .set_video_codec_opt("qscale", "1"),
+        )
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+    // Let the sink drain (300 ms of media) and the sibling wedge on the
+    // unread socket.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(scheduler.stop());
+    });
+    let result = rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("stop() hung: the sink held the finalize exemption over a blocked sibling");
+    // The sibling was either cut mid-write (an error) or exited between
+    // writes (clean); both are acceptable — the property under test is that
+    // stop() RETURNS.
+    let _ = result;
+    let events = log.lock().unwrap();
+    let ends = events
+        .iter()
+        .filter(|e| matches!(e, SinkEv::End { .. }))
+        .count();
+    let errors = events
+        .iter()
+        .filter(|e| matches!(e, SinkEv::Error(_)))
+        .count();
+    assert!(
+        ends + errors <= 1,
+        "at most one terminal sink event may fire ({ends} end, {errors} error)"
+    );
+    drop(accept_thread);
+}
+
 #[test]
 fn channel_adapter_delivers_owned_events_in_order() {
     if !have_encoder("libx264") {
