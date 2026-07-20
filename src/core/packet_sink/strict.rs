@@ -86,6 +86,10 @@ enum Phase {
 enum ProcessFailure {
     Sink(PacketSinkError),
     Cancelled,
+    /// Delivery truncated by a job failure recorded elsewhere: stop
+    /// delivering, stash nothing — the terminal reads the recorded job
+    /// error and reports `JobFailed`.
+    JobStopped,
 }
 
 impl From<PacketSinkError> for ProcessFailure {
@@ -101,6 +105,7 @@ fn callback_failure(
 ) -> ProcessFailure {
     match error.kind {
         CallbackFailureKind::Cancelled => ProcessFailure::Cancelled,
+        CallbackFailureKind::JobStopped => ProcessFailure::JobStopped,
         CallbackFailureKind::Disconnected => {
             ProcessFailure::Sink(PacketSinkError::ChannelDisconnected)
         }
@@ -151,15 +156,20 @@ impl PacketSinkWorker {
         stream_count: usize,
         sink: PacketSink,
         scheduler_status: &Arc<AtomicUsize>,
+        scheduler_result: &Arc<std::sync::Mutex<Option<crate::error::Result<()>>>>,
     ) -> Result<Self, Box<(PacketSink, PacketSinkError)>> {
         // Tier dispatch: only Strict exists; new tiers add arms here.
         let super::PacketSinkTier::Strict = sink.tier;
 
-        // Wire the owned-channel cancellation observer: a blocked bounded
-        // send can now bail out when the job stops (nothing is wired for
-        // plain callback sinks).
+        // Wire the owned-channel job observer: a blocked bounded send can
+        // now bail out when the job stops AND classify whether it stopped
+        // by explicit cancellation or by a recorded failure (nothing is
+        // wired for plain callback sinks).
         if let Some(slot) = &sink.cancellation {
-            let _ = slot.set(scheduler_status.clone());
+            let _ = slot.set(super::JobStopObservables {
+                status: scheduler_status.clone(),
+                result: scheduler_result.clone(),
+            });
         }
 
         let mut infos = Vec::with_capacity(stream_count);
@@ -306,6 +316,7 @@ impl PacketSinkWorker {
         if let Err(cb) = self.sink.dispatch_stream_info(&self.infos) {
             match callback_failure(cb, None) {
                 ProcessFailure::Cancelled => self.cancelled = true,
+                ProcessFailure::JobStopped => {}
                 ProcessFailure::Sink(e) => {
                     if self.pending_error.is_none() {
                         self.pending_error = Some(e);
@@ -349,6 +360,9 @@ impl PacketSinkWorker {
                 self.cancelled = true;
                 AVERROR_EXTERNAL
             }
+            // Truncated by a failure elsewhere: neither cancelled nor a
+            // sink error — the terminal reads the recorded job error.
+            Err(ProcessFailure::JobStopped) => AVERROR_EXTERNAL,
             Err(ProcessFailure::Sink(e)) => {
                 if self.pending_error.is_none() {
                     self.pending_error = Some(e);
@@ -543,9 +557,10 @@ impl PacketSinkWorker {
     /// Terminal slot (where the muxer would write its trailer). One-way phase
     /// transition — a second call is a no-op, so no terminal event can ever
     /// fire twice. Fires `on_end` only through the strong gate; fires
-    /// `on_error` for a stashed delivery-path error; stays silent for
-    /// cancellation and failures elsewhere in the pipeline (the job result
-    /// carries those).
+    /// `on_error` for a stashed delivery-path error, or as
+    /// [`PacketSinkError::JobFailed`] when the job failed elsewhere (whether
+    /// or not that failure truncated this sink's delivery — `wait()` keeps
+    /// the original error); stays silent for aborts and clean cancellation.
     pub(crate) fn finish(
         &mut self,
         all_streams_terminal: bool,
@@ -898,7 +913,8 @@ mod tests {
 
     fn collect(ctx: &TestCtx, sink: PacketSink) -> Result<PacketSinkWorker, PacketSinkError> {
         let status = Arc::new(AtomicUsize::new(0));
-        unsafe { PacketSinkWorker::collect(ctx.ctx, ctx.stream_count(), sink, &status) }
+        let result = Arc::new(std::sync::Mutex::new(None));
+        unsafe { PacketSinkWorker::collect(ctx.ctx, ctx.stream_count(), sink, &status, &result) }
             .map_err(|boxed| (*boxed).1)
     }
 

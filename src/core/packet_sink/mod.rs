@@ -175,9 +175,14 @@ pub(crate) enum CallbackFailureKind {
     /// The owned-channel receiver is gone: the job stops with
     /// [`PacketSinkError::ChannelDisconnected`].
     Disconnected,
-    /// The job is already stopping and a blocking send bailed out
-    /// cooperatively: NOT an error (mirrors the worker's stop observation).
+    /// The job is already stopping WITHOUT a recorded error (explicit
+    /// `stop()`/`abort()`) and a blocking send bailed out cooperatively:
+    /// NOT an error (mirrors the worker's stop observation).
     Cancelled,
+    /// The job is stopping because some worker recorded a FAILURE while a
+    /// blocking send was parked: delivery is truncated by that job failure
+    /// (the terminal reports it as `JobFailed`), not cancelled.
+    JobStopped,
 }
 
 impl PacketCallbackError {
@@ -207,6 +212,14 @@ impl PacketCallbackError {
             message: "packet-sink channel receiver dropped".to_string(),
             source: None,
             kind: CallbackFailureKind::Disconnected,
+        }
+    }
+
+    pub(crate) fn job_stopped() -> Self {
+        Self {
+            message: "job failed elsewhere; blocking send abandoned".to_string(),
+            source: None,
+            kind: CallbackFailureKind::JobStopped,
         }
     }
 
@@ -640,10 +653,18 @@ enum SinkDispatch {
     Handler(Box<dyn PacketSinkHandler>),
 }
 
-/// Slot the owned-channel adapter uses to observe job cancellation: the
-/// worker publishes the scheduler-status handle here at collection time, so a
-/// blocked bounded send can bail out when the job stops.
-pub(crate) type CancellationSlot = Arc<OnceLock<Arc<AtomicUsize>>>;
+/// What the owned-channel adapter observes about the job while a bounded
+/// send is blocked: the scheduler status (has the job stopped?) and the
+/// scheduler result (did it stop because some worker FAILED?). Published by
+/// the worker at collection time.
+pub(crate) struct JobStopObservables {
+    pub(crate) status: Arc<AtomicUsize>,
+    pub(crate) result: Arc<std::sync::Mutex<Option<crate::error::Result<()>>>>,
+}
+
+/// Slot the owned-channel adapter uses to observe job cancellation: see
+/// [`JobStopObservables`].
+pub(crate) type CancellationSlot = Arc<OnceLock<JobStopObservables>>;
 
 /// The consumer bundle handed to `Output::from(sink)` /
 /// [`Output::new_by_packet_sink`](crate::Output::new_by_packet_sink).
@@ -829,9 +850,29 @@ fn send_with_cancellation(
             Ok(()) => return Ok(()),
             Err(crossbeam_channel::SendTimeoutError::Timeout(back)) => {
                 event = back;
-                if let Some(status) = cancellation.get() {
-                    if is_stopping(status.load(Ordering::Acquire)) {
-                        return Err(PacketCallbackError::cancelled());
+                if let Some(observables) = cancellation.get() {
+                    if is_stopping(observables.status.load(Ordering::Acquire)) {
+                        // Classify WHY the job is stopping. A natural
+                        // (all-muxers-done) STATUS_END cannot exist while
+                        // this sink is still delivering — the sink is itself
+                        // one of those muxers — so a stopping status here is
+                        // either explicit stop()/abort() (no error recorded:
+                        // stay silent as cancellation) or a failure-driven
+                        // shutdown. Failures record their error BEFORE
+                        // publishing the terminal status, so the recorded
+                        // result is already visible on this path and the
+                        // terminal can report the truncation as JobFailed.
+                        let failed = observables
+                            .result
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .as_ref()
+                            .is_some_and(|result| result.is_err());
+                        return Err(if failed {
+                            PacketCallbackError::job_stopped()
+                        } else {
+                            PacketCallbackError::cancelled()
+                        });
                     }
                 }
             }
@@ -1352,18 +1393,23 @@ mod tests {
     }
 
     /// The review probe: a blocked bounded send with a live, undrained
-    /// receiver must observe the job stopping and bail out promptly.
+    /// receiver must observe the job stopping and bail out promptly —
+    /// classified as clean cancellation when NO job error is recorded.
     #[test]
     fn blocked_channel_send_observes_cancellation() {
         let (mut sink, rx) = PacketSink::channel(NonZeroUsize::new(1).unwrap());
-        // Simulate the worker wiring: publish the scheduler-status handle.
+        // Simulate the worker wiring: publish the job observables.
         let status = Arc::new(AtomicUsize::new(
             crate::core::scheduler::ffmpeg_scheduler::STATUS_RUN,
         ));
+        let result = Arc::new(std::sync::Mutex::new(None));
         sink.cancellation
             .as_ref()
             .expect("channel sinks carry a cancellation slot")
-            .set(status.clone())
+            .set(JobStopObservables {
+                status: status.clone(),
+                result,
+            })
             .ok();
         // Fill the capacity-1 channel; the receiver never drains.
         let payload = [0u8, 0, 0, 1, 0x65];
@@ -1387,6 +1433,48 @@ mod tests {
             start.elapsed() < Duration::from_secs(5),
             "cancellation must be prompt"
         );
+        flipper.join().unwrap();
+        drop(rx);
+    }
+
+    /// A stopping status WITH a recorded job error is a failure-driven
+    /// shutdown, not cancellation: the blocked send must classify it as
+    /// `JobStopped` so the terminal reports `JobFailed` instead of staying
+    /// silent.
+    #[test]
+    fn blocked_channel_send_classifies_failure_driven_stop() {
+        let (mut sink, rx) = PacketSink::channel(NonZeroUsize::new(1).unwrap());
+        let status = Arc::new(AtomicUsize::new(
+            crate::core::scheduler::ffmpeg_scheduler::STATUS_RUN,
+        ));
+        let result: Arc<std::sync::Mutex<Option<crate::error::Result<()>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        sink.cancellation
+            .as_ref()
+            .expect("channel sinks carry a cancellation slot")
+            .set(JobStopObservables {
+                status: status.clone(),
+                result: result.clone(),
+            })
+            .ok();
+        let payload = [0u8, 0, 0, 1, 0x65];
+        assert!(sink.dispatch_packet(&test_view(&payload)).is_ok());
+        // Record the error BEFORE publishing the stopping status — the
+        // order every failure path guarantees.
+        let flipper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(120));
+            *result.lock().unwrap() = Some(Err(crate::error::Error::WorkerPanicked(
+                "muxer1:mpegts".to_string(),
+            )));
+            status.store(
+                crate::core::scheduler::ffmpeg_scheduler::STATUS_END,
+                Ordering::Release,
+            );
+        });
+        let err = sink
+            .dispatch_packet(&test_view(&payload))
+            .expect_err("blocked send must abandon on a failed job");
+        assert_eq!(err.kind, CallbackFailureKind::JobStopped);
         flipper.join().unwrap();
         drop(rx);
     }

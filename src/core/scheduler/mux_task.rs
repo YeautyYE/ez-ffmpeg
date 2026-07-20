@@ -686,6 +686,7 @@ fn _mux_init(
                 stream_count,
                 sink,
                 &scheduler_status,
+                &scheduler_result,
             )
         } {
             Ok(worker) => {
@@ -1424,7 +1425,7 @@ fn _mux_init(
 
         // ---- Packet-sink terminal path (returns; containers continue below).
         if let Some(mut sink) = sink_worker.take() {
-            debug!("Muxer finished.");
+            debug!("Packet sink muxer finished.");
             // Sequence EVERY crate-side failure source BEFORE the terminal
             // decision, so a delivered on_end implies wait() == Ok (the one
             // carve-out — user-capture Drop panics AFTER the terminal — is
