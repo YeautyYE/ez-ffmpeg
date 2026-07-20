@@ -523,6 +523,9 @@ pub mod recipes;
 
 pub mod frame_export;
 
+#[cfg(feature = "cli")]
+pub mod cli;
+
 static INIT_FFMPEG: std::sync::Once = std::sync::Once::new();
 
 extern "C" fn cleanup() {
