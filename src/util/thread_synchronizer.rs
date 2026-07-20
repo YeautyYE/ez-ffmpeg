@@ -138,19 +138,6 @@ impl ThreadSynchronizer {
         }
     }
 
-    /// Full-job settlement barrier for a scheduler-tracked thread: blocks
-    /// until every OTHER tracked thread — sibling muxers (whose context
-    /// frees precede their release), demuxers, decoders, filter graphs,
-    /// encoders, frame sources — has released its slot. The caller's own
-    /// slot stays held (its release still gates `wait()`/`stop()`), and the
-    /// condition is `live <= waiters`: every thread parked here counts
-    /// itself out, so concurrent callers (two packet sinks) proceed without
-    /// waiting on each other.
-    ///
-    /// Every worker records its panic/error BEFORE releasing its slot
-    /// (`ThreadDoneGuard`, `MuxPanicStatusGuard`), so once this returns the
-    /// scheduler result and status are settled up to the caller's own
-    /// remaining actions.
     /// Registers the calling thread's LIVE slot as settled, under the one
     /// counter lock: a registration can itself flip `live <= settled` to
     /// true for peers already parked in the barrier (slot releases are the
@@ -183,9 +170,21 @@ impl ThreadSynchronizer {
         self.inner.condvar.notify_all();
     }
 
-    /// Blocks until every live thread is a settled (registered) packet-sink
-    /// worker: `live <= settled`. The caller registered its own slot first,
-    /// so it is counted out of its own condition.
+    /// Full-job settlement barrier for a scheduler-tracked thread: blocks
+    /// until every live thread is a settled (registered) packet-sink worker
+    /// (`live <= settled`). Every OTHER tracked thread — sibling muxers
+    /// (whose context frees precede their release), demuxers, decoders,
+    /// filter graphs, encoders, frame sources — must have released its slot;
+    /// register-only peers are counted out the same way. The caller's own
+    /// slot stays held (its release still gates `wait()`/`stop()`), and it
+    /// registered its own slot first, so it is counted out of its own
+    /// condition and concurrent callers (two packet sinks) proceed without
+    /// waiting on each other.
+    ///
+    /// Every worker records its panic/error BEFORE releasing its slot
+    /// (`ThreadDoneGuard`, `MuxPanicStatusGuard`), so once this returns the
+    /// scheduler result and status are settled up to the caller's own
+    /// remaining actions.
     pub(crate) fn wait_peers_settled(&self) {
         let mut counts = self
             .inner
