@@ -471,6 +471,125 @@ fn sibling_custom_io_destruction_panic_prevents_on_end() {
     );
 }
 
+/// The multi-sink settlement rendezvous: two sinks on inputs of very
+/// different lengths both reach the barrier; the SECOND registration must
+/// itself wake the first, already-parked waiter (slot releases are the only
+/// other notifier, and neither sink has released yet). The on_end callbacks
+/// rendezvous with each other under a bounded timeout — a lost wakeup shows
+/// up as exactly one side timing out.
+#[test]
+fn two_sinks_settle_and_both_reach_their_terminals() {
+    let (tx_short, rx_short) = std::sync::mpsc::channel::<()>();
+    let (tx_long, rx_long) = std::sync::mpsc::channel::<()>();
+    let met_short = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let met_long = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let met = met_short.clone();
+    let sink_short = ez_ffmpeg::packet_sink::PacketSink::builder(move |_pkt| Ok(()))
+        .on_end(move || {
+            let _ = tx_short.send(());
+            met.store(
+                rx_long.recv_timeout(std::time::Duration::from_secs(15)).is_ok(),
+                std::sync::atomic::Ordering::Release,
+            );
+        })
+        .build();
+    let met = met_long.clone();
+    let sink_long = ez_ffmpeg::packet_sink::PacketSink::builder(move |_pkt| Ok(()))
+        .on_end(move || {
+            let _ = tx_long.send(());
+            met.store(
+                rx_short.recv_timeout(std::time::Duration::from_secs(15)).is_ok(),
+                std::sync::atomic::Ordering::Release,
+            );
+        })
+        .build();
+
+    let result = wait_with_watchdog(
+        FfmpegContext::builder()
+            .input(Input::from("sine=frequency=440:duration=0.1").set_format("lavfi"))
+            .input(Input::from("sine=frequency=330:duration=2").set_format("lavfi"))
+            .output(
+                Output::from(sink_short)
+                    .set_audio_codec("aac")
+                    .add_stream_map("0:a"),
+            )
+            .output(
+                Output::from(sink_long)
+                    .set_audio_codec("aac")
+                    .add_stream_map("1:a"),
+            )
+            .build()
+            .unwrap()
+            .start()
+            .unwrap(),
+        120,
+        "two_sink_settlement",
+    );
+    result.expect("the healthy two-sink job must succeed");
+    assert!(
+        met_short.load(std::sync::atomic::Ordering::Acquire)
+            && met_long.load(std::sync::atomic::Ordering::Acquire),
+        "both on_end callbacks must run concurrently-reachable (a lost \
+         settlement wakeup parks one sink past the other's rendezvous window)"
+    );
+}
+
+/// Multi-sink terminal containment: one sink's on_end panics AFTER the job
+/// settled; the panic is contained — the sibling sink's on_end still stands
+/// and wait() returns Ok. Without containment the panic re-arms the worker
+/// panic publisher and rewrites the settled result to WorkerPanicked.
+#[test]
+fn sibling_sink_terminal_panic_never_rewrites_the_settled_result() {
+    let started_short = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ended_long = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let started = started_short.clone();
+    let sink_short = ez_ffmpeg::packet_sink::PacketSink::builder(move |_pkt| Ok(()))
+        .on_end(move || {
+            started.store(true, std::sync::atomic::Ordering::Release);
+            panic!("injected terminal-callback panic");
+        })
+        .build();
+    let ended = ended_long.clone();
+    let sink_long = ez_ffmpeg::packet_sink::PacketSink::builder(move |_pkt| Ok(()))
+        .on_end(move || ended.store(true, std::sync::atomic::Ordering::Release))
+        .build();
+
+    let result = wait_with_watchdog(
+        FfmpegContext::builder()
+            .input(Input::from("sine=frequency=440:duration=0.1").set_format("lavfi"))
+            .input(Input::from("sine=frequency=330:duration=2").set_format("lavfi"))
+            .output(
+                Output::from(sink_short)
+                    .set_audio_codec("aac")
+                    .add_stream_map("0:a"),
+            )
+            .output(
+                Output::from(sink_long)
+                    .set_audio_codec("aac")
+                    .add_stream_map("1:a"),
+            )
+            .build()
+            .unwrap()
+            .start()
+            .unwrap(),
+        120,
+        "terminal_panic_containment",
+    );
+    assert!(
+        started_short.load(std::sync::atomic::Ordering::Acquire),
+        "the probe must actually reach the panicking on_end"
+    );
+    assert!(
+        ended_long.load(std::sync::atomic::Ordering::Acquire),
+        "the sibling sink's on_end must be delivered"
+    );
+    result.expect(
+        "a terminal-callback panic is contained and must not rewrite the settled job result",
+    );
+}
+
 /// The finalize-gating probe: a packet sink must never hold the
 /// scheduler-wide I/O finalize exemption. With a sink waiting in its terminal
 /// coordinator and a sibling container blocked on an unread TCP peer,
