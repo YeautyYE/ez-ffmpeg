@@ -1,22 +1,29 @@
-//! Strict-tier packet-sink runtime: configuration collection at the header
-//! slot, per-packet validation and delivery at the write slot, terminal
-//! events at the trailer slot.
+//! Strict-tier orchestrator: configuration collection at the header slot,
+//! per-packet validation and delivery at the write slot, terminal events at
+//! the trailer slot.
+//!
+//! This file owns control flow and phase state only; the mechanics live in
+//! sibling modules — [`super::timeline`] (shared origin + per-stream S7
+//! validation), [`super::codec`] (AVC/AAC configuration and payload
+//! normalization over the streaming walkers in [`super::nal_framing`]), and
+//! [`super::side_data`] (checked side-data iteration).
 //!
 //! The processing order at the write slot is fixed (progress accounting via
 //! `update_last_dts` already ran in the worker loop, on the original
 //! timeline, before this code sees the packet):
 //!
-//! 1. S8 configuration-change detection (side data vs. the seeded baseline);
-//! 2. S7 timestamp validation: reject missing timestamps, then shift onto the
+//! 1. packet/stream time-base equality (the anchor math depends on it);
+//! 2. S8 configuration-change detection (side data vs. the seeded baseline);
+//! 3. S7 timestamp validation: reject missing timestamps, then shift onto the
 //!    shared origin, then enforce `pts >= dts`, strictly monotonic dts, and
 //!    no duplicate pts;
-//! 3. payload normalization to a 4-byte length-prefixed access unit (Annex-B
+//! 4. payload normalization to a 4-byte length-prefixed access unit (Annex-B
 //!    packets are rewritten; already length-prefixed packets are validated in
 //!    place) and the in-band parameter-set policy;
-//! 4. `is_key` determination (IDR presence, not the raw key flag);
-//! 5. duration (encoder value passed through, derived when absent, error when
+//! 5. `is_key` determination (IDR presence, not the raw key flag);
+//! 6. duration (encoder value passed through, derived when absent, error when
 //!    underivable);
-//! 6. `on_packet` delivery; a negative return breaks the worker loop through
+//! 7. `on_packet` delivery; a negative return breaks the worker loop through
 //!    the same path a failed container write would take.
 //!
 //! Every violation is a typed [`PacketSinkError`], stashed here and published
@@ -24,57 +31,45 @@
 //! muxer's `i32` convention (a sentinel that is never `AVERROR_EOF`, so a
 //! failing callback can never masquerade as a healthy end of stream).
 
-use super::avcc;
+use super::codec::{aac::AacRuntime, avc::AvcRuntime, CodecRuntime};
+use super::side_data;
+use super::timeline::{StreamTimeline, Timeline};
 use super::{PacketSink, PacketStreamInfo, PacketView};
 use crate::core::context::PacketBox;
 use crate::error::PacketSinkError;
+use ffmpeg_next::packet::Ref;
 use ffmpeg_sys_next::AVMediaType::{AVMEDIA_TYPE_AUDIO, AVMEDIA_TYPE_VIDEO};
 use ffmpeg_sys_next::AVPacketSideDataType::{AV_PKT_DATA_NEW_EXTRADATA, AV_PKT_DATA_PARAM_CHANGE};
-use ffmpeg_next::packet::Ref;
 use ffmpeg_sys_next::{
-    av_get_audio_frame_duration2, av_rescale_q, av_rescale_q_rnd, avcodec_get_name,
-    AVCodecParameters, AVFormatContext, AVRational, AVRounding, AVERROR_EXTERNAL, AV_NOPTS_VALUE,
+    av_get_audio_frame_duration2, av_rescale_q, avcodec_get_name, AVCodecParameters,
+    AVFormatContext, AVRational, AVERROR_EXTERNAL, AV_NOPTS_VALUE,
 };
 use std::ffi::CStr;
 
-/// Codec-specific handling of one output stream.
-enum StreamKind {
-    /// H.264 in the strict tier. `annexb_packets` is decided once, from the
-    /// extradata form: Annex-B extradata means Annex-B packets (rewritten per
-    /// packet), avcC extradata means already length-prefixed packets
-    /// (validated in place). The forms never mix within one encoder.
-    H264 { annexb_packets: bool },
-    /// AAC raw frames; the AudioSpecificConfig travels in the stream info.
-    Aac,
-}
-
-/// S8 baseline: the canonical stream configuration seeded before delivery.
-struct ConfigBaseline {
-    /// Canonical parameter sets (video) — wrapper-independent fingerprint.
-    parameter_sets: Option<avcc::ParameterSets>,
-    /// Raw extradata bytes (audio ASC).
-    extradata: Vec<u8>,
-    /// Typed projections compared against `AV_PKT_DATA_PARAM_CHANGE`.
+/// Typed projections compared against `AV_PKT_DATA_PARAM_CHANGE` (which
+/// carries no parameter sets — only these fields).
+struct ParamProjection {
     width: i32,
     height: i32,
     sample_rate: i32,
 }
 
-/// Per-stream runtime state.
-struct StreamState {
-    kind: StreamKind,
+/// Per-stream runtime.
+struct StreamRuntime {
+    codec: CodecRuntime,
     time_base: AVRational,
     frame_rate: Option<AVRational>,
-    baseline: ConfigBaseline,
-    /// Origin shift for this stream, in its own time base; set for every
-    /// stream the moment the first packet of the job is delivered.
-    applied_offset: Option<i64>,
-    /// Last delivered dts (shifted timeline), for strict monotonicity.
-    last_dts: Option<i64>,
-    /// Shifted pts values still above the dts watermark. Since `pts >= dts`
-    /// holds and dts strictly increases, any pts at or below the current dts
-    /// can never repeat — pruning keeps this at the encoder's reorder depth.
-    pending_pts: Vec<i64>,
+    projection: ParamProjection,
+    timeline: StreamTimeline,
+}
+
+/// Delivery phase: explicit, one-way transitions instead of correlated flags.
+enum Phase {
+    /// Collected and (once `stream_info_delivered`) delivering.
+    Running,
+    /// Terminal callback dispatched (or deliberately suppressed); nothing may
+    /// fire twice.
+    Finished,
 }
 
 /// Strict-tier worker state. Built at the header slot (before any callback),
@@ -82,15 +77,19 @@ struct StreamState {
 pub(crate) struct PacketSinkWorker {
     sink: PacketSink,
     infos: Vec<PacketStreamInfo>,
-    streams: Vec<StreamState>,
-    /// Shared origin: `(dts, time_base)` of the first delivered packet.
-    origin: Option<(i64, AVRational)>,
+    streams: Vec<StreamRuntime>,
+    /// Stream time bases in index order (the anchor transition rescales into
+    /// every one of them at once).
+    stream_time_bases: Vec<AVRational>,
+    /// Shared origin state machine.
+    timeline: Timeline,
     /// First delivery-path error; cloned into the job result and handed to
     /// `on_error` at the terminal slot.
     pending_error: Option<PacketSinkError>,
-    /// Reused Annex-B -> AVCC conversion buffer.
+    /// Reused Annex-B -> AVCC conversion buffer (high-water sized).
     scratch: Vec<u8>,
     stream_info_delivered: bool,
+    phase: Phase,
 }
 
 impl PacketSinkWorker {
@@ -134,67 +133,30 @@ impl PacketSinkWorker {
             let extradata = extradata_bytes(codecpar)
                 .ok_or(PacketSinkError::MissingExtradata { stream_index })?;
 
-            let (kind, delivered_extradata, baseline, frame_rate) = match media_type {
+            let (codec, delivered_extradata, frame_rate) = match media_type {
                 AVMEDIA_TYPE_VIDEO => {
                     // The encoder whitelist was enforced at build time; this
                     // guards the codec id itself (h264 only in v1).
                     if (*codecpar).codec_id != ffmpeg_sys_next::AVCodecID::AV_CODEC_ID_H264 {
-                        return Err(PacketSinkError::UnsupportedStream { kind: "non-H.264 video" });
+                        return Err(PacketSinkError::UnsupportedStream {
+                            kind: "non-H.264 video",
+                        });
                     }
-                    let annexb_packets = extradata.first() != Some(&1);
-                    let ordered_sets = avcc::parse_parameter_sets(&extradata).map_err(|reason| {
-                        PacketSinkError::InvalidExtradata {
-                            stream_index,
-                            reason,
-                        }
-                    })?;
-                    // Deliver the configuration as avcC: pass a pre-existing
-                    // avcC through after validation (FFmpeg does not rewrite
-                    // one), synthesize it from Annex-B parameter sets
-                    // otherwise. The strict-tier structural checks (version 1,
-                    // >=1 SPS/PPS, 4-byte lengths) hold on both paths.
-                    let delivered = if annexb_packets {
-                        // Built from the ORIGINAL ordering (movenc preserves
-                        // wrapper order); only the S8 fingerprint below is
-                        // canonicalized.
-                        avcc::build_avcc(&ordered_sets).map_err(|reason| {
-                            PacketSinkError::InvalidExtradata {
-                                stream_index,
-                                reason,
-                            }
-                        })?
-                    } else {
-                        extradata.clone()
-                    };
+                    let (runtime, delivered) =
+                        AvcRuntime::from_extradata(&extradata, stream_index)?;
                     let fr = (*st).avg_frame_rate;
                     let frame_rate = (fr.num > 0 && fr.den > 0).then_some(fr);
-                    (
-                        StreamKind::H264 { annexb_packets },
-                        delivered,
-                        ConfigBaseline {
-                            parameter_sets: Some(ordered_sets.into_canonical()),
-                            extradata,
-                            width: (*codecpar).width,
-                            height: (*codecpar).height,
-                            sample_rate: 0,
-                        },
-                        frame_rate,
-                    )
+                    (CodecRuntime::Avc(runtime), delivered, frame_rate)
                 }
                 AVMEDIA_TYPE_AUDIO => {
                     if (*codecpar).codec_id != ffmpeg_sys_next::AVCodecID::AV_CODEC_ID_AAC {
-                        return Err(PacketSinkError::UnsupportedStream { kind: "non-AAC audio" });
+                        return Err(PacketSinkError::UnsupportedStream {
+                            kind: "non-AAC audio",
+                        });
                     }
                     (
-                        StreamKind::Aac,
+                        CodecRuntime::Aac(AacRuntime::from_extradata(&extradata)),
                         extradata.clone(),
-                        ConfigBaseline {
-                            parameter_sets: None,
-                            extradata,
-                            width: 0,
-                            height: 0,
-                            sample_rate: (*codecpar).sample_rate,
-                        },
                         None,
                     )
                 }
@@ -217,32 +179,41 @@ impl PacketSinkWorker {
                 sample_rate: (*codecpar).sample_rate,
                 channels: (*codecpar).ch_layout.nb_channels,
             });
-            streams.push(StreamState {
-                kind,
+            streams.push(StreamRuntime {
+                codec,
                 time_base,
                 frame_rate,
-                baseline,
-                applied_offset: None,
-                last_dts: None,
-                pending_pts: Vec::new(),
+                projection: ParamProjection {
+                    width: (*codecpar).width,
+                    height: (*codecpar).height,
+                    sample_rate: (*codecpar).sample_rate,
+                },
+                timeline: StreamTimeline::new(),
             });
         }
 
+        let stream_time_bases = streams.iter().map(|s| s.time_base).collect();
         Ok(Self {
             sink,
             infos,
             streams,
-            origin: None,
+            stream_time_bases,
+            timeline: Timeline::new(),
             pending_error: None,
             scratch: Vec::new(),
             stream_info_delivered: false,
+            phase: Phase::Running,
         })
     }
 
     /// Invokes `on_stream_info` exactly once, on the worker thread, before
-    /// any packet. Returns `0` or the sentinel error code.
+    /// any packet; a second call is a guarded no-op. Returns `0` or the
+    /// sentinel error code.
     pub(crate) fn deliver_stream_info(&mut self) -> i32 {
-        debug_assert!(!self.stream_info_delivered, "on_stream_info delivered twice");
+        if self.stream_info_delivered {
+            debug_assert!(false, "on_stream_info delivered twice");
+            return 0;
+        }
         self.stream_info_delivered = true;
         let code = (self.sink.on_stream_info)(&self.infos);
         if code < 0 {
@@ -289,16 +260,20 @@ impl PacketSinkWorker {
         out_fmt_ctx: *const AVFormatContext,
         packet_box: &mut PacketBox,
     ) -> Result<(), PacketSinkError> {
+        debug_assert!(
+            matches!(self.phase, Phase::Running),
+            "packet processed after the terminal slot"
+        );
         let stream_index = packet_box.packet_data.output_stream_index as usize;
         debug_assert!(stream_index < self.streams.len());
         let pkt = packet_box.packet.as_ptr();
 
-        // 0. The packet must be labeled in the stream's advertised time base:
+        // 1. The packet must be labeled in the stream's advertised time base:
         // the anchor is computed from packet values while delivery is labeled
         // with the stream time base, so a mismatch would silently corrupt the
         // shared-origin math and every delivered timestamp.
+        let stream_tb = self.streams[stream_index].time_base;
         {
-            let stream_tb = self.streams[stream_index].time_base;
             let pkt_tb = (*pkt).time_base;
             if pkt_tb.num != stream_tb.num || pkt_tb.den != stream_tb.den {
                 return Err(PacketSinkError::PacketTimeBaseMismatch {
@@ -311,10 +286,27 @@ impl PacketSinkWorker {
             }
         }
 
-        // 1. S8: mid-stream configuration change detection.
-        check_side_data(&self.streams[stream_index], stream_index, pkt)?;
+        // 2. S8: mid-stream configuration change detection over checked
+        // side-data iteration.
+        for entry in side_data::entries(pkt) {
+            let (sd_type, bytes) = entry.map_err(|reason| PacketSinkError::MalformedPacket {
+                stream_index,
+                reason,
+            })?;
+            if sd_type == AV_PKT_DATA_NEW_EXTRADATA {
+                self.streams[stream_index]
+                    .codec
+                    .check_new_extradata(bytes, stream_index)?;
+            } else if sd_type == AV_PKT_DATA_PARAM_CHANGE {
+                check_param_change(
+                    &self.streams[stream_index].projection,
+                    stream_index,
+                    bytes,
+                )?;
+            }
+        }
 
-        // 2. S7: timestamps. Missing values are rejected before anything else
+        // 3. S7: timestamps. Missing values are rejected before anything else
         // (the origin cannot anchor on AV_NOPTS_VALUE).
         let orig_pts = (*pkt).pts;
         let orig_dts = (*pkt).dts;
@@ -331,66 +323,23 @@ impl PacketSinkWorker {
             });
         }
 
-        // Anchor the shared origin on the first delivered packet and derive
-        // every stream's offset from it (delivery order == arrival order).
-        if self.origin.is_none() {
-            let tb0 = (*pkt).time_base;
-            self.origin = Some((orig_dts, tb0));
-            for (i, stream) in self.streams.iter_mut().enumerate() {
-                let offset = av_rescale_q_rnd(
-                    orig_dts,
-                    tb0,
-                    stream.time_base,
-                    AVRounding::AV_ROUND_NEAR_INF,
-                );
-                if offset == i64::MIN {
-                    return Err(PacketSinkError::TimestampOverflow { stream_index: i });
-                }
-                stream.applied_offset = Some(offset);
-            }
-        }
-        let state = &mut self.streams[stream_index];
-        let applied_offset = state
-            .applied_offset
-            .expect("origin anchored above for every stream");
+        // Anchor the shared origin on the first delivered packet (delivery
+        // order == arrival order); the transition derives every stream's
+        // offset at once, all-or-nothing.
+        self.timeline
+            .ensure_anchored(orig_dts, stream_tb, &self.stream_time_bases)?;
+        let applied_offset = self.timeline.offset(stream_index);
         let pts = orig_pts
             .checked_sub(applied_offset)
             .ok_or(PacketSinkError::TimestampOverflow { stream_index })?;
         let dts = orig_dts
             .checked_sub(applied_offset)
             .ok_or(PacketSinkError::TimestampOverflow { stream_index })?;
+        self.streams[stream_index]
+            .timeline
+            .observe(stream_index, pts, dts)?;
 
-        if pts < dts {
-            return Err(PacketSinkError::PtsBeforeDts {
-                stream_index,
-                pts,
-                dts,
-            });
-        }
-        if let Some(prev) = state.last_dts {
-            if dts <= prev {
-                return Err(PacketSinkError::NonMonotonicDts {
-                    stream_index,
-                    prev,
-                    current: dts,
-                });
-            }
-        }
-        // Duplicate-pts window. Membership is checked BEFORE pruning: a
-        // recorded pts equal to the NEW dts is exactly the boundary a
-        // duplicate can still collide with (e.g. (pts 3, dts 0) followed by
-        // (pts 3, dts 3)); pruning first forgot it. After the check, values
-        // at or below the new dts can never recur (`pts >= dts` plus strictly
-        // increasing dts) and are dropped, bounding the window to the
-        // encoder's reorder depth.
-        if state.pending_pts.contains(&pts) {
-            return Err(PacketSinkError::DuplicatePts { stream_index, pts });
-        }
-        state.pending_pts.retain(|&p| p > dts);
-        state.pending_pts.push(pts);
-        state.last_dts = Some(dts);
-
-        // 3.-4. Payload normalization + is_key.
+        // 4.-5. Payload normalization + is_key.
         let size = (*pkt).size;
         let data_ptr = (*pkt).data;
         if data_ptr.is_null() || size <= 0 {
@@ -400,51 +349,24 @@ impl PacketSinkWorker {
             });
         }
         let payload = std::slice::from_raw_parts(data_ptr, size as usize);
-        let malformed = |reason: String| PacketSinkError::MalformedPacket {
-            stream_index,
-            reason,
-        };
-        let (is_key, data): (bool, &[u8]) = match &state.kind {
-            StreamKind::H264 { annexb_packets } => {
-                let nals = if *annexb_packets {
-                    avcc::split_annexb(payload).map_err(malformed)?
-                } else {
-                    avcc::length_prefixed_nals(payload).map_err(malformed)?
-                };
-                let scan = avcc::au_scan(&nals);
-                if scan.has_parameter_set {
-                    check_inband_parameter_sets(state, stream_index, &nals)?;
-                    // Equal to the baseline is still not deliverable: the
-                    // strict tier keeps configuration out-of-band.
-                    return Err(PacketSinkError::InBandParameterSets { stream_index });
-                }
-                let data: &[u8] = if *annexb_packets {
-                    avcc::write_length_prefixed(&nals, &mut self.scratch)
-                        .map_err(|reason| PacketSinkError::MalformedPacket {
-                            stream_index,
-                            reason,
-                        })?;
-                    &self.scratch
-                } else {
-                    payload
-                };
-                (scan.has_idr, data)
-            }
+        let stream = &self.streams[stream_index];
+        let (is_key, data): (bool, &[u8]) = match &stream.codec {
+            CodecRuntime::Avc(avc) => avc.normalize_au(payload, &mut self.scratch, stream_index)?,
             // Every AAC frame is a random access point; the raw frame passes
             // through unchanged.
-            StreamKind::Aac => (true, payload),
+            CodecRuntime::Aac(_) => (true, payload),
         };
 
-        // 5. Duration: pass the encoder's through; derive when absent; a
+        // 6. Duration: pass the encoder's through; derive when absent; a
         // value that stays underivable is an error, never a silent zero.
-        let state = &self.streams[stream_index];
+        let stream = &self.streams[stream_index];
         let mut duration = (*pkt).duration;
         if duration < 0 {
             return Err(PacketSinkError::MissingDuration { stream_index });
         }
         if duration == 0 {
-            duration = match &state.kind {
-                StreamKind::H264 { .. } => match state.frame_rate {
+            duration = match &stream.codec {
+                CodecRuntime::Avc(_) => match stream.frame_rate {
                     // One CFR frame interval, in stream time-base ticks.
                     Some(fr) => av_rescale_q(
                         1,
@@ -452,11 +374,11 @@ impl PacketSinkWorker {
                             num: fr.den,
                             den: fr.num,
                         },
-                        state.time_base,
+                        stream.time_base,
                     ),
                     None => 0,
                 },
-                StreamKind::Aac => {
+                CodecRuntime::Aac(_) => {
                     let codecpar: *mut AVCodecParameters =
                         (**(*out_fmt_ctx).streams.add(stream_index)).codecpar;
                     let samples = av_get_audio_frame_duration2(codecpar, size);
@@ -468,7 +390,7 @@ impl PacketSinkWorker {
                                 num: 1,
                                 den: sample_rate,
                             },
-                            state.time_base,
+                            stream.time_base,
                         )
                     } else {
                         0
@@ -480,13 +402,13 @@ impl PacketSinkWorker {
             return Err(PacketSinkError::MissingDuration { stream_index });
         }
 
-        // 6. Deliver. The borrowed view (including `data`) dies with the call.
+        // 7. Deliver. The borrowed view (including `data`) dies with the call.
         let view = PacketView {
             stream_index,
             pts,
             dts,
             duration,
-            time_base: state.time_base,
+            time_base: stream_tb,
             is_key,
             applied_offset,
             data,
@@ -498,11 +420,23 @@ impl PacketSinkWorker {
         Ok(())
     }
 
-    /// Terminal slot (where the muxer would write its trailer). Fires
-    /// `on_end` only through the strong gate; fires `on_error` for a stashed
-    /// delivery-path error; stays silent for cancellation and failures
-    /// elsewhere in the pipeline (the job result carries those).
-    pub(crate) fn finish(&mut self, all_streams_terminal: bool, ret: i32, aborted: bool, task_error: bool) {
+    /// Terminal slot (where the muxer would write its trailer). One-way phase
+    /// transition — a second call is a no-op, so no terminal event can ever
+    /// fire twice. Fires `on_end` only through the strong gate; fires
+    /// `on_error` for a stashed delivery-path error; stays silent for
+    /// cancellation and failures elsewhere in the pipeline (the job result
+    /// carries those).
+    pub(crate) fn finish(
+        &mut self,
+        all_streams_terminal: bool,
+        ret: i32,
+        aborted: bool,
+        task_error: bool,
+    ) {
+        if matches!(self.phase, Phase::Finished) {
+            return;
+        }
+        self.phase = Phase::Finished;
         if aborted {
             return;
         }
@@ -531,70 +465,13 @@ unsafe fn extradata_bytes(codecpar: *const AVCodecParameters) -> Option<Vec<u8>>
     Some(std::slice::from_raw_parts(ptr, size as usize).to_vec())
 }
 
-/// S8: compare packet side data against the seeded baseline. Redundant
-/// (value-equal) announcements pass; any true change is a typed error.
-///
-/// # Safety
-/// - `pkt` must be a valid, non-null `AVPacket` whose
-///   `side_data`/`side_data_elems` array is consistent and alive for the
-///   call (each entry's `data`/`size` pair is read).
-unsafe fn check_side_data(
-    state: &StreamState,
-    stream_index: usize,
-    pkt: *const ffmpeg_sys_next::AVPacket,
-) -> Result<(), PacketSinkError> {
-    for i in 0..(*pkt).side_data_elems {
-        let sd = (*pkt).side_data.add(i as usize);
-        let sd_type = (*sd).type_;
-        if sd_type == AV_PKT_DATA_NEW_EXTRADATA {
-            let bytes = std::slice::from_raw_parts((*sd).data, (*sd).size);
-            match (&state.kind, &state.baseline.parameter_sets) {
-                (StreamKind::H264 { .. }, Some(baseline_sets)) => {
-                    // Normalize before comparing: the same parameter sets can
-                    // arrive as Annex-B, avcC or raw side data, and in any
-                    // order — both wrapper bytes and ordering would misreport
-                    // an unchanged configuration. The baseline is stored in
-                    // canonical (identity-sorted, deduplicated) form; the
-                    // announcement is canonicalized the same way.
-                    let sets = avcc::parse_parameter_sets(bytes)
-                        .map_err(|reason| PacketSinkError::ConfigChange {
-                            stream_index,
-                            what: format!("unparseable NEW_EXTRADATA ({reason})"),
-                        })?
-                        .into_canonical();
-                    if &sets != baseline_sets {
-                        return Err(PacketSinkError::ConfigChange {
-                            stream_index,
-                            what: "NEW_EXTRADATA carries different parameter sets".to_string(),
-                        });
-                    }
-                }
-                _ => {
-                    if bytes != state.baseline.extradata.as_slice() {
-                        return Err(PacketSinkError::ConfigChange {
-                            stream_index,
-                            what: "NEW_EXTRADATA differs from the stream configuration"
-                                .to_string(),
-                        });
-                    }
-                }
-            }
-        } else if sd_type == AV_PKT_DATA_PARAM_CHANGE {
-            check_param_change(
-                state,
-                stream_index,
-                std::slice::from_raw_parts((*sd).data, (*sd).size),
-            )?;
-        }
-    }
-    Ok(())
-}
-
 /// Layout check + typed-field projection compare for `AV_PKT_DATA_PARAM_CHANGE`
 /// (little-endian `u32 flags`, then the fields the flags select — the side
 /// data carries no parameter sets, so only its typed fields are compared).
+/// The payload must be EXACTLY as long as its flags require, and the fields
+/// must pass FFmpeg-style range checks.
 fn check_param_change(
-    state: &StreamState,
+    projection: &ParamProjection,
     stream_index: usize,
     data: &[u8],
 ) -> Result<(), PacketSinkError> {
@@ -648,12 +525,12 @@ fn check_param_change(
         if sample_rate <= 0 {
             return Err(malformed(&format!("sample rate {sample_rate} out of range")));
         }
-        if sample_rate != state.baseline.sample_rate {
+        if sample_rate != projection.sample_rate {
             return Err(PacketSinkError::ConfigChange {
                 stream_index,
                 what: format!(
                     "sample rate changed {} -> {sample_rate}",
-                    state.baseline.sample_rate
+                    projection.sample_rate
                 ),
             });
         }
@@ -667,42 +544,17 @@ fn check_param_change(
             && height > 0
             && (width as i64 + 128) * (height as i64 + 128) < (i32::MAX as i64) / 8;
         if !plausible {
-            return Err(malformed(&format!("dimensions {width}x{height} out of range")));
+            return Err(malformed(&format!(
+                "dimensions {width}x{height} out of range"
+            )));
         }
-        if width != state.baseline.width || height != state.baseline.height {
+        if width != projection.width || height != projection.height {
             return Err(PacketSinkError::ConfigChange {
                 stream_index,
                 what: format!(
                     "dimensions changed {}x{} -> {width}x{height}",
-                    state.baseline.width, state.baseline.height
+                    projection.width, projection.height
                 ),
-            });
-        }
-    }
-    Ok(())
-}
-
-/// In-band SPS/PPS: sets differing from the baseline are a configuration
-/// change; value-equal sets fall through to the strict-tier in-band rejection
-/// at the caller.
-fn check_inband_parameter_sets(
-    state: &StreamState,
-    stream_index: usize,
-    nals: &[&[u8]],
-) -> Result<(), PacketSinkError> {
-    let Some(baseline) = &state.baseline.parameter_sets else {
-        return Ok(());
-    };
-    for nal in nals {
-        let matches_baseline = match nal[0] & 0x1F {
-            avcc::NAL_SPS => baseline.sps.iter().any(|s| s.as_slice() == *nal),
-            avcc::NAL_PPS => baseline.pps.iter().any(|p| p.as_slice() == *nal),
-            _ => continue,
-        };
-        if !matches_baseline {
-            return Err(PacketSinkError::ConfigChange {
-                stream_index,
-                what: "in-band SPS/PPS differ from the stream configuration".to_string(),
             });
         }
     }

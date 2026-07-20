@@ -1,171 +1,18 @@
-//! H.264 Annex-B / AVCC normalization for the strict packet-sink tier.
+//! H.264/AVC strict-tier codec runtime: configuration (avcC) handling and
+//! per-packet access-unit normalization.
 //!
-//! The mp4 muxer performs this conversion at its write site
-//! (`ff_nal_parse_units` and `ff_isom_write_avcc` in libavformat); a packet
-//! sink bypasses the muxer, so the same responsibility lives here. Two
-//! invariants matter:
-//!
-//! * NAL boundary detection follows FFmpeg's convention exactly (a NAL ends at
-//!   the next `00 00 01` triple; both 3- and 4-byte start codes are accepted),
-//!   so a packet-sink AU is byte-identical to the sample the mp4 muxer would
-//!   have written for the same input.
-//! * avcC synthesis mirrors `ff_isom_write_avcc`, including the
-//!   chroma/bit-depth extension for profiles other than Baseline/Main/Extended,
-//!   with `lengthSizeMinusOne` fixed to 3 (4-byte length prefixes).
-//!
-//! Everything here is pure byte manipulation; errors are reported as plain
-//! `String` reasons and wrapped into typed [`crate::error::PacketSinkError`]
-//! variants by the caller.
+//! Splits into two layers:
+//! * record functions — parameter-set extraction from Annex-B or avcC
+//!   wrappers, avcC synthesis mirroring `ff_isom_write_avcc` (including the
+//!   chroma/bit-depth extension), the SPS bit reader;
+//! * [`AvcRuntime`] — the per-stream state machine the orchestrator drives:
+//!   one-traversal payload normalization via the streaming NAL walkers, IDR
+//!   classification, S8 parameter-set fingerprinting and the in-band policy.
 
-/// NAL unit types the strict tier cares about (H.264 table 7-1).
-pub(crate) const NAL_IDR: u8 = 5;
-pub(crate) const NAL_SPS: u8 = 7;
-pub(crate) const NAL_PPS: u8 = 8;
-
-/// Byte length of the AVCC length prefix the strict tier emits and accepts
-/// (`lengthSizeMinusOne == 3`). Both FFmpeg construction paths (libx264
-/// `set_avcc_extradata`, `ff_isom_write_avcc` for Annex-B input) hardcode it.
-pub(crate) const NAL_LENGTH_SIZE: usize = 4;
-
-/// What a NAL walk over one access unit observed.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct AuScan {
-    pub(crate) nal_count: usize,
-    pub(crate) has_idr: bool,
-    pub(crate) has_parameter_set: bool,
-}
-
-/// Splits an Annex-B byte stream into NAL unit slices.
-///
-/// Boundary convention is FFmpeg's (`ff_nal_find_startcode`): a NAL ends at the
-/// first following `00 00 01` triple. Leading bytes must form a start code
-/// (`00 00 01` with any number of leading zero bytes); anything else is
-/// malformed. Empty NAL units are rejected.
-pub(crate) fn split_annexb(data: &[u8]) -> Result<Vec<&[u8]>, String> {
-    if data.len() < 4 {
-        return Err(format!("Annex-B payload too short ({} bytes)", data.len()));
-    }
-    // Leading start code: (00)+ 01.
-    let mut pos = 0;
-    while pos < data.len() && data[pos] == 0 {
-        pos += 1;
-    }
-    if pos < 2 || pos >= data.len() || data[pos] != 1 {
-        return Err("payload does not begin with an Annex-B start code".to_string());
-    }
-    pos += 1;
-
-    let mut nals = Vec::new();
-    loop {
-        let mut end = find_startcode(data, pos).unwrap_or(data.len());
-        // FFmpeg's nal_parse_units trims trailing_zero_8bits from every NAL
-        // before length-prefixing (libavformat/nal.c); matching it keeps the
-        // AVCC output byte-identical to what the mp4 muxer would write.
-        while end > pos && data[end - 1] == 0 {
-            end -= 1;
-        }
-        if end == pos {
-            return Err("empty NAL unit".to_string());
-        }
-        nals.push(&data[pos..end]);
-        if !data[end..].iter().any(|&b| b != 0) {
-            // Only trailing zeros remain: the stream ends after this NAL.
-            break;
-        }
-        // Skip the separator start code ((00)+ 01; the trim above may have
-        // folded this NAL's trailing zeros into the run before the 1).
-        let mut next = end;
-        while next < data.len() && data[next] == 0 {
-            next += 1;
-        }
-        if next >= data.len() || data[next] != 1 {
-            return Err("malformed start code between NAL units".to_string());
-        }
-        pos = next + 1;
-        if pos >= data.len() {
-            return Err("trailing start code without a NAL unit".to_string());
-        }
-    }
-    Ok(nals)
-}
-
-/// First boundary at or after `from` where a start code begins. Mirrors
-/// `ff_nal_find_startcode`: locate the next `00 00 01` triple, then back up by
-/// exactly one byte when the preceding byte is zero (the leading zero of a
-/// 4-byte start code belongs to the start code, not to the previous NAL).
-fn find_startcode(data: &[u8], from: usize) -> Option<usize> {
-    if data.len() < 3 {
-        return None;
-    }
-    let i = (from..data.len() - 2)
-        .find(|&i| data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1)?;
-    if i > from && data[i - 1] == 0 {
-        Some(i - 1)
-    } else {
-        Some(i)
-    }
-}
-
-/// Splits an already length-prefixed (4-byte) AVCC access unit into NAL
-/// slices. Every NAL must be fully contained; zero-length NAL units and
-/// trailing garbage are rejected.
-pub(crate) fn length_prefixed_nals(data: &[u8]) -> Result<Vec<&[u8]>, String> {
-    let mut nals = Vec::new();
-    let mut pos = 0usize;
-    while pos < data.len() {
-        if data.len() - pos < NAL_LENGTH_SIZE {
-            return Err("truncated NAL length prefix".to_string());
-        }
-        let len = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
-            as usize;
-        pos += NAL_LENGTH_SIZE;
-        if len == 0 {
-            return Err("zero-length NAL unit".to_string());
-        }
-        if data.len() - pos < len {
-            return Err(format!(
-                "NAL length {len} overruns the packet ({} bytes remain)",
-                data.len() - pos
-            ));
-        }
-        nals.push(&data[pos..pos + len]);
-        pos += len;
-    }
-    if nals.is_empty() {
-        return Err("packet contains no NAL units".to_string());
-    }
-    Ok(nals)
-}
-
-/// Serializes NAL slices as a 4-byte length-prefixed AVCC access unit into
-/// `out` (cleared first).
-pub(crate) fn write_length_prefixed(nals: &[&[u8]], out: &mut Vec<u8>) -> Result<(), String> {
-    out.clear();
-    for nal in nals {
-        if nal.len() > u32::MAX as usize {
-            return Err("NAL unit exceeds the 4-byte length prefix range".to_string());
-        }
-        out.extend_from_slice(&(nal.len() as u32).to_be_bytes());
-        out.extend_from_slice(nal);
-    }
-    Ok(())
-}
-
-/// Summarizes the NAL composition of one access unit.
-pub(crate) fn au_scan(nals: &[&[u8]]) -> AuScan {
-    let mut scan = AuScan::default();
-    for nal in nals {
-        let nal_type = nal[0] & 0x1F;
-        scan.nal_count += 1;
-        if nal_type == NAL_IDR {
-            scan.has_idr = true;
-        }
-        if nal_type == NAL_SPS || nal_type == NAL_PPS {
-            scan.has_parameter_set = true;
-        }
-    }
-    scan
-}
+use super::super::nal_framing::{
+    push_length_prefixed, walk_annexb, walk_length_prefixed, NAL_LENGTH_SIZE, NAL_PPS, NAL_SPS,
+};
+use crate::error::PacketSinkError;
 
 /// Parsed parameter sets of one H.264 configuration, in original order.
 /// avcC synthesis consumes this form (movenc preserves wrapper order); the S8
@@ -202,16 +49,16 @@ pub(crate) fn parse_parameter_sets(extradata: &[u8]) -> Result<ParameterSets, St
             sps: Vec::new(),
             pps: Vec::new(),
         };
-        for nal in split_annexb(extradata)? {
-            match nal[0] & 0x1F {
-                NAL_SPS => sets.sps.push(nal.to_vec()),
-                NAL_PPS => sets.pps.push(nal.to_vec()),
-                other => {
-                    return Err(format!(
-                        "unexpected NAL type {other} in configuration data (expected SPS/PPS)"
-                    ))
-                }
-            }
+        let mut bad_type: Option<u8> = None;
+        walk_annexb(extradata, |nal| match nal[0] & 0x1F {
+            NAL_SPS => sets.sps.push(nal.to_vec()),
+            NAL_PPS => sets.pps.push(nal.to_vec()),
+            other => bad_type = bad_type.or(Some(other)),
+        })?;
+        if let Some(other) = bad_type {
+            return Err(format!(
+                "unexpected NAL type {other} in configuration data (expected SPS/PPS)"
+            ));
         }
         if sets.sps.is_empty() || sets.pps.is_empty() {
             return Err("configuration data lacks an SPS or a PPS".to_string());
@@ -327,6 +174,13 @@ pub(crate) fn build_avcc(sets: &ParameterSets) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// The RFC 6381 codec string for an avcC record: `avc1.PPCCLL` from the
+/// profile / constraint / level bytes.
+pub(crate) fn codec_string(avcc: &[u8]) -> String {
+    debug_assert!(avcc.len() >= 4);
+    format!("avc1.{:02X}{:02X}{:02X}", avcc[1], avcc[2], avcc[3])
+}
+
 /// Reads `chroma_format_idc` / bit depths from an SPS NAL (header byte
 /// included), defaulting to 4:2:0 / 8-bit when the profile does not carry the
 /// fields — the same subset `ff_avc_decode_sps` extracts for the avcC
@@ -367,7 +221,11 @@ fn sps_chroma_info(sps: &[u8]) -> Result<(u8, u8, u8), String> {
             if bit_depth_luma > 15 || bit_depth_chroma > 15 {
                 return Err("invalid SPS bit depth".to_string());
             }
-            Ok((chroma_format_idc as u8, bit_depth_luma as u8, bit_depth_chroma as u8))
+            Ok((
+                chroma_format_idc as u8,
+                bit_depth_luma as u8,
+                bit_depth_chroma as u8,
+            ))
         }
         _ => Ok((1, 8, 8)),
     }
@@ -415,8 +273,145 @@ impl<'a> BitReader<'a> {
     }
 }
 
+/// Per-stream H.264 runtime state.
+pub(crate) struct AvcRuntime {
+    /// Decided once, from the extradata form: Annex-B extradata means
+    /// Annex-B packets (rewritten per packet), avcC extradata means already
+    /// length-prefixed packets (validated in place). The forms never mix
+    /// within one encoder.
+    annexb_packets: bool,
+    /// Canonical parameter-set fingerprint (S8 baseline).
+    baseline: ParameterSets,
+}
+
+impl AvcRuntime {
+    /// Builds the runtime from finalized encoder extradata; returns the
+    /// runtime plus the avcC to deliver in the stream configuration (a
+    /// pre-existing avcC passes through after validation; Annex-B parameter
+    /// sets are synthesized into one, preserving wrapper order like movenc).
+    pub(crate) fn from_extradata(
+        extradata: &[u8],
+        stream_index: usize,
+    ) -> Result<(Self, Vec<u8>), PacketSinkError> {
+        let invalid = |reason: String| PacketSinkError::InvalidExtradata {
+            stream_index,
+            reason,
+        };
+        let annexb_packets = extradata.first() != Some(&1);
+        let ordered = parse_parameter_sets(extradata).map_err(invalid)?;
+        let delivered = if annexb_packets {
+            build_avcc(&ordered).map_err(|reason| PacketSinkError::InvalidExtradata {
+                stream_index,
+                reason,
+            })?
+        } else {
+            extradata.to_vec()
+        };
+        Ok((
+            Self {
+                annexb_packets,
+                baseline: ordered.into_canonical(),
+            },
+            delivered,
+        ))
+    }
+
+    /// S8: a `NEW_EXTRADATA` announcement — value-equal (canonicalized)
+    /// parameter sets are redundant and pass; anything else is a mid-stream
+    /// configuration change.
+    pub(crate) fn check_new_extradata(
+        &self,
+        bytes: &[u8],
+        stream_index: usize,
+    ) -> Result<(), PacketSinkError> {
+        let sets = parse_parameter_sets(bytes)
+            .map_err(|reason| PacketSinkError::ConfigChange {
+                stream_index,
+                what: format!("unparseable NEW_EXTRADATA ({reason})"),
+            })?
+            .into_canonical();
+        if sets != self.baseline {
+            return Err(PacketSinkError::ConfigChange {
+                stream_index,
+                what: "NEW_EXTRADATA carries different parameter sets".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// One-traversal payload normalization: validates NAL boundaries,
+    /// classifies types and (for Annex-B input) rewrites into `scratch` as a
+    /// 4-byte length-prefixed access unit — no per-packet allocation; the
+    /// already-length-prefixed path is validate-only and zero-copy.
+    ///
+    /// Returns `(is_key, payload)` where `is_key` is IDR presence and
+    /// `payload` borrows either `scratch` or the input.
+    pub(crate) fn normalize_au<'a>(
+        &self,
+        payload: &'a [u8],
+        scratch: &'a mut Vec<u8>,
+        stream_index: usize,
+    ) -> Result<(bool, &'a [u8]), PacketSinkError> {
+        let malformed = |reason: String| PacketSinkError::MalformedPacket {
+            stream_index,
+            reason,
+        };
+        let (scan, data): (_, &'a [u8]) = if self.annexb_packets {
+            scratch.clear();
+            // Exact output size is payload minus start codes plus 4 bytes per
+            // NAL; reserving input+16 covers every AU whose extra 3-byte
+            // start codes number at most 16 without a second sizing pass, and
+            // the buffer is reused across packets either way.
+            scratch.reserve(payload.len() + 16);
+            let scan = walk_annexb(payload, |nal| push_length_prefixed(nal, scratch))
+                .map_err(malformed)?;
+            (scan, scratch.as_slice())
+        } else {
+            let scan = walk_length_prefixed(payload, |_| {}).map_err(malformed)?;
+            (scan, payload)
+        };
+        if scan.has_parameter_set {
+            // Cold path: collect the in-band sets for the S8 comparison
+            // (differing sets are a config change; value-equal sets are still
+            // rejected — strict-tier configuration stays out-of-band).
+            self.check_inband_parameter_sets(data, stream_index)?;
+            return Err(PacketSinkError::InBandParameterSets { stream_index });
+        }
+        Ok((scan.has_idr, data))
+    }
+
+    /// In-band SPS/PPS: sets differing from the baseline are a configuration
+    /// change; value-equal sets fall through to the strict-tier in-band
+    /// rejection at the caller. `data` is length-prefixed (post-normalization).
+    fn check_inband_parameter_sets(
+        &self,
+        data: &[u8],
+        stream_index: usize,
+    ) -> Result<(), PacketSinkError> {
+        let mut mismatch = false;
+        let _ = walk_length_prefixed(data, |nal| {
+            let matches_baseline = match nal[0] & 0x1F {
+                NAL_SPS => self.baseline.sps.iter().any(|s| s.as_slice() == nal),
+                NAL_PPS => self.baseline.pps.iter().any(|p| p.as_slice() == nal),
+                _ => return,
+            };
+            if !matches_baseline {
+                mismatch = true;
+            }
+        });
+        if mismatch {
+            return Err(PacketSinkError::ConfigChange {
+                stream_index,
+                what: "in-band SPS/PPS differ from the stream configuration".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::super::nal_framing::collect_annexb;
     use super::*;
 
     // Minimal but structurally valid SPS/PPS payloads (header byte included).
@@ -433,60 +428,59 @@ mod tests {
     }
 
     #[test]
-    fn splits_three_and_four_byte_start_codes() {
-        let config = annexb_config();
-        let nals = split_annexb(&config).unwrap();
-        assert_eq!(nals, vec![SPS, PPS]);
+    fn builds_and_reparses_avcc() {
+        let sets = parse_parameter_sets(&annexb_config()).unwrap();
+        assert_eq!(sets.sps, vec![SPS.to_vec()]);
+        assert_eq!(sets.pps, vec![PPS.to_vec()]);
+        let avcc = build_avcc(&sets).unwrap();
+        assert_eq!(avcc[0], 1);
+        assert_eq!(avcc[1], 66);
+        assert_eq!(avcc[4] & 0x03, 3, "lengthSizeMinusOne must be 3");
+        assert_eq!(avcc[5] & 0x1F, 1);
+        let reparsed = parse_avcc_parameter_sets(&avcc).unwrap();
+        assert_eq!(reparsed, sets);
+        // Baseline profile: no extension bytes.
+        let sps_len = SPS.len();
+        let pps_len = PPS.len();
+        assert_eq!(avcc.len(), 6 + 2 + sps_len + 1 + 2 + pps_len);
+        assert_eq!(codec_string(&avcc), "avc1.42C01E");
     }
 
     #[test]
-    fn rejects_garbage_prefix_and_empty_nals() {
-        assert!(split_annexb(&[0x12, 0, 0, 1, 0x67]).is_err());
-        assert!(split_annexb(&[0, 0, 1]).is_err());
-        // Two adjacent start codes -> empty NAL.
-        assert!(split_annexb(&[0, 0, 1, 0, 0, 1, 0x41, 0x9A]).is_err());
+    fn high_profile_avcc_carries_the_extension() {
+        // High profile (100), chroma_format_idc=1, 8-bit depths. RBSP bits:
+        // profile 100, flags 0, level 30, sps_id ue(0)=1, chroma ue(1)=010,
+        // bit_depth_luma ue(0)=1, bit_depth_chroma ue(0)=1.
+        let mut sps = vec![0x67, 100, 0x00, 30];
+        // bits: 1 010 1 1 ... pad with stop bit pattern.
+        sps.push(0b1010_1110);
+        let sets = ParameterSets {
+            sps: vec![sps],
+            pps: vec![PPS.to_vec()],
+        };
+        let avcc = build_avcc(&sets).unwrap();
+        let tail = &avcc[avcc.len() - 4..];
+        assert_eq!(tail[0], 0xFC | 1, "chroma_format_idc");
+        assert_eq!(tail[1], 0xF8, "bit_depth_luma_minus8");
+        assert_eq!(tail[2], 0xF8, "bit_depth_chroma_minus8");
+        assert_eq!(tail[3], 0, "numOfSequenceParameterSetExt");
+        assert_eq!(codec_string(&avcc), "avc1.64001E");
     }
 
     #[test]
-    fn converts_annexb_au_to_length_prefixed() {
-        let mut au = vec![0, 0, 0, 1, 0x65, 0x88, 0x80];
-        au.extend_from_slice(&[0, 0, 1, 0x06, 0x05, 0xFF]);
-        let nals = split_annexb(&au).unwrap();
-        let scan = au_scan(&nals);
-        assert!(scan.has_idr);
-        assert!(!scan.has_parameter_set);
-        assert_eq!(scan.nal_count, 2);
-        let mut out = Vec::new();
-        write_length_prefixed(&nals, &mut out).unwrap();
-        assert_eq!(
-            out,
-            vec![0, 0, 0, 3, 0x65, 0x88, 0x80, 0, 0, 0, 3, 0x06, 0x05, 0xFF]
-        );
-        // Round-trip: the produced AU splits back into the same NALs.
-        let back = length_prefixed_nals(&out).unwrap();
-        assert_eq!(back, nals);
+    fn rejects_non_four_byte_avcc() {
+        let sets = parse_parameter_sets(&annexb_config()).unwrap();
+        let mut avcc = build_avcc(&sets).unwrap();
+        avcc[4] = 0xFC | 1; // lengthSizeMinusOne = 1 (2-byte prefixes)
+        assert!(parse_avcc_parameter_sets(&avcc).is_err());
     }
 
-    /// FFmpeg-equivalence fixture: trailing_zero_8bits after a NAL (before a
-    /// following start code and at stream end) are trimmed exactly like
-    /// libavformat/nal.c before length-prefixing.
     #[test]
-    fn trailing_zero_bytes_are_trimmed_like_ffmpeg() {
-        // NAL [65 AA] + two trailing zeros + 3-byte startcode + NAL [06 05].
-        let au = vec![0, 0, 0, 1, 0x65, 0xAA, 0, 0, 0, 0, 1, 0x06, 0x05];
-        let nals = split_annexb(&au).unwrap();
-        assert_eq!(nals, vec![&[0x65u8, 0xAA][..], &[0x06u8, 0x05][..]]);
-        let mut out = Vec::new();
-        write_length_prefixed(&nals, &mut out).unwrap();
-        assert_eq!(out, vec![0, 0, 0, 2, 0x65, 0xAA, 0, 0, 0, 2, 0x06, 0x05]);
-
-        // Trailing zeros at stream end are trimmed from the final NAL too.
-        let au = vec![0, 0, 0, 1, 0x65, 0xBB, 0, 0];
-        let nals = split_annexb(&au).unwrap();
-        assert_eq!(nals, vec![&[0x65u8, 0xBB][..]]);
-
-        // A NAL reduced to nothing by the trim is still an empty NAL.
-        assert!(split_annexb(&[0, 0, 0, 1, 0, 0]).is_err());
+    fn fingerprint_is_wrapper_independent() {
+        let from_annexb = parse_parameter_sets(&annexb_config()).unwrap();
+        let avcc = build_avcc(&from_annexb).unwrap();
+        let from_avcc = parse_parameter_sets(&avcc).unwrap();
+        assert_eq!(from_annexb, from_avcc);
     }
 
     #[test]
@@ -508,65 +502,30 @@ mod tests {
     }
 
     #[test]
-    fn length_prefixed_split_rejects_overruns() {
-        assert!(length_prefixed_nals(&[0, 0, 0, 9, 0x65]).is_err());
-        assert!(length_prefixed_nals(&[0, 0, 0, 0]).is_err());
-        assert!(length_prefixed_nals(&[]).is_err());
-        // Trailing partial prefix after a valid NAL.
-        assert!(length_prefixed_nals(&[0, 0, 0, 1, 0x65, 0xFF]).is_err());
+    fn runtime_normalizes_annexb_and_passes_through_avcc() {
+        let (runtime, delivered) = AvcRuntime::from_extradata(&annexb_config(), 0).unwrap();
+        assert_eq!(delivered[0], 1);
+        let mut scratch = Vec::new();
+        let au = vec![0, 0, 0, 1, 0x65, 0x88, 0x80];
+        let (is_key, data) = runtime.normalize_au(&au, &mut scratch, 0).unwrap();
+        assert!(is_key);
+        assert_eq!(data, &[0, 0, 0, 3, 0x65, 0x88, 0x80]);
+
+        // avcC-configured stream: packets are already length-prefixed and
+        // pass through unchanged (zero copy).
+        let avcc = build_avcc(&parse_parameter_sets(&annexb_config()).unwrap()).unwrap();
+        let (runtime, _) = AvcRuntime::from_extradata(&avcc, 0).unwrap();
+        let lp = vec![0, 0, 0, 2, 0x41, 0x9A];
+        let mut scratch = Vec::new();
+        let (is_key, data) = runtime.normalize_au(&lp, &mut scratch, 0).unwrap();
+        assert!(!is_key);
+        assert_eq!(data.as_ptr(), lp.as_ptr(), "pass-through must not copy");
     }
 
     #[test]
-    fn builds_and_reparses_avcc() {
-        let sets = parse_parameter_sets(&annexb_config()).unwrap();
-        assert_eq!(sets.sps, vec![SPS.to_vec()]);
-        assert_eq!(sets.pps, vec![PPS.to_vec()]);
-        let avcc = build_avcc(&sets).unwrap();
-        assert_eq!(avcc[0], 1);
-        assert_eq!(avcc[1], 66);
-        assert_eq!(avcc[4] & 0x03, 3, "lengthSizeMinusOne must be 3");
-        assert_eq!(avcc[5] & 0x1F, 1);
-        let reparsed = parse_avcc_parameter_sets(&avcc).unwrap();
-        assert_eq!(reparsed, sets);
-        // Baseline profile: no extension bytes.
-        let sps_len = SPS.len();
-        let pps_len = PPS.len();
-        assert_eq!(avcc.len(), 6 + 2 + sps_len + 1 + 2 + pps_len);
-    }
-
-    #[test]
-    fn high_profile_avcc_carries_the_extension() {
-        // High profile (100), chroma_format_idc=1, 8-bit depths. RBSP bits:
-        // profile 100, flags 0, level 30, sps_id ue(0)=1, chroma ue(1)=010,
-        // bit_depth_luma ue(0)=1, bit_depth_chroma ue(0)=1.
-        let mut sps = vec![0x67, 100, 0x00, 30];
-        // bits: 1 010 1 1 ... pad with stop bit pattern.
-        sps.push(0b1010_1110);
-        let sets = ParameterSets {
-            sps: vec![sps],
-            pps: vec![PPS.to_vec()],
-        };
-        let avcc = build_avcc(&sets).unwrap();
-        let tail = &avcc[avcc.len() - 4..];
-        assert_eq!(tail[0], 0xFC | 1, "chroma_format_idc");
-        assert_eq!(tail[1], 0xF8, "bit_depth_luma_minus8");
-        assert_eq!(tail[2], 0xF8, "bit_depth_chroma_minus8");
-        assert_eq!(tail[3], 0, "numOfSequenceParameterSetExt");
-    }
-
-    #[test]
-    fn rejects_non_four_byte_avcc() {
-        let sets = parse_parameter_sets(&annexb_config()).unwrap();
-        let mut avcc = build_avcc(&sets).unwrap();
-        avcc[4] = 0xFC | 1; // lengthSizeMinusOne = 1 (2-byte prefixes)
-        assert!(parse_avcc_parameter_sets(&avcc).is_err());
-    }
-
-    #[test]
-    fn fingerprint_is_wrapper_independent() {
-        let from_annexb = parse_parameter_sets(&annexb_config()).unwrap();
-        let avcc = build_avcc(&from_annexb).unwrap();
-        let from_avcc = parse_parameter_sets(&avcc).unwrap();
-        assert_eq!(from_annexb, from_avcc);
+    fn annexb_config_split_reuses_the_walker() {
+        let config = annexb_config();
+        let nals = collect_annexb(&config).unwrap();
+        assert_eq!(nals, vec![SPS, PPS]);
     }
 }

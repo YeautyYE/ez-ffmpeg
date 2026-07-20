@@ -868,10 +868,13 @@ fn _mux_init(
             st_last_dts: &mut st_last_dts,
             stream_eof: &mut stream_eof,
             nb_done: &mut nb_done,
-            sink: sink_worker.as_mut(),
         };
 
         if let Some(mut sq) = sq_mux {
+            // A packet sink can never reach this path: the sync-queue plan
+            // requires an interleaved non-encoded-A/V stream, which sink
+            // binding rejects; write sites below therefore stay container-only.
+            debug_assert!(sink_worker.is_none(), "packet sink with an sq_mux plan");
             // Reused scratch: released packets to write, and cascade-finished
             // sq-indices, both cleared inside `sq_mux_pump` each call.
             let mut released: Vec<PacketBox> = Vec::new();
@@ -893,7 +896,7 @@ fn _mux_init(
             for i in 0..stream_count {
                 if sq.sq_idx.get(i).copied().flatten().is_none() {
                     if let Err(e) = unsafe {
-                        sq_finish_output_stream(
+                        finish_output_stream(
                             i,
                             &cfg,
                             &mut state,
@@ -1097,34 +1100,15 @@ fn _mux_init(
             if raw_stream_index < 0 {
                 let eof_stream = packet_box.packet_data.output_stream_index;
                 if eof_stream >= 0 {
-                    let eof_idx = eof_stream as usize;
-                    if eof_idx < stream_count && !state.stream_eof[eof_idx] {
-                        // Flush trailing BSF packets before finishing this
-                        // stream. Skipped entirely when no mux stream has a BSF.
-                        if has_bsf {
-                            let fret = unsafe {
-                                flush_stream_bsf(
-                                    &cfg,
-                                    &mut state,
-                                    &mut stream_bsfs,
-                                    eof_idx,
-                                )
-                            };
-                            if fret < 0 {
-                                ret = fret;
-                                error!("Error flushing bitstream filter at EOF: stream={eof_idx}, ret={fret}");
-                                packet_pool.release(packet_box.packet);
-                                break;
-                            }
-                        }
-                        state.stream_eof[eof_idx] = true;
-                        *state.nb_done += 1;
-                        if eof_idx < mux_stream_nodes.len() {
-                            let node = mux_stream_nodes[eof_idx].as_ref();
-                            let SchNode::MuxStream { src: _, last_dts: _, source_finished } = node else { unreachable!() };
-                            source_finished.store(true, Ordering::Release);
-                            input_controller.update_locked(&scheduler_status);
-                        }
+                    // The completion authority is idempotent and flushes any
+                    // trailing BSF packets itself.
+                    if let Err(fret) = unsafe {
+                        finish_output_stream(eof_stream as usize, &cfg, &mut state, &mut stream_bsfs)
+                    } {
+                        ret = fret;
+                        error!("Error flushing bitstream filter at EOF: stream={eof_stream}, ret={fret}");
+                        packet_pool.release(packet_box.packet);
+                        break;
                     }
                 }
                 packet_pool.release(packet_box.packet);
@@ -1152,37 +1136,21 @@ fn _mux_init(
                         break;
                     }
 
-                    // Guard: skip if this stream already finished via recording_time EOF
-                    if state.stream_eof[stream_index] {
+                    // The completion authority is idempotent (a stream that
+                    // already finished via recording_time stays counted once)
+                    // and flushes any trailing BSF packets itself.
+                    if let Err(fret) = finish_output_stream(
+                        stream_index,
+                        &cfg,
+                        &mut state,
+                        &mut stream_bsfs,
+                    ) {
+                        ret = fret;
+                        error!("Error flushing bitstream filter at EOF: stream={stream_index}, ret={fret}");
                         packet_pool.release(packet_box.packet);
-                        continue;
+                        break;
                     }
-
-                    // Flush trailing BSF packets before finishing this stream.
-                    // Skipped entirely when no mux stream has a BSF. Already
-                    // inside `unsafe`.
-                    if has_bsf {
-                        let fret = flush_stream_bsf(
-                            &cfg,
-                            &mut state,
-                            &mut stream_bsfs,
-                            stream_index,
-                        );
-                        if fret < 0 {
-                            ret = fret;
-                            error!("Error flushing bitstream filter at EOF: stream={stream_index}, ret={fret}");
-                            packet_pool.release(packet_box.packet);
-                            break;
-                        }
-                    }
-
-                    *state.nb_done += 1;
                     packet_pool.release(packet_box.packet);
-
-                    let mux_stream_node = mux_stream_node.as_ref();
-                    let SchNode::MuxStream { src: _, last_dts: _, source_finished } = mux_stream_node else { unreachable!() };
-                    source_finished.store(true, Ordering::Release);
-                    input_controller.update_locked(&scheduler_status);
 
                     if *state.nb_done == stream_count {
                         trace!("All streams finished");
@@ -1225,31 +1193,20 @@ fn _mux_init(
                     ret = rret;
                     if ret == AVERROR_EOF {
                         // Per-stream EOF: mark this stream as finished, matching CLI's
-                        // sch_mux_receive_finish behavior in ffmpeg_mux.c:442.
-                        // Flush trailing BSF packets first. Skipped entirely when
-                        // no mux stream has a BSF.
-                        if has_bsf {
-                            let fret = flush_stream_bsf(
-                                &cfg,
-                                &mut state,
-                                &mut stream_bsfs,
-                                stream_index,
-                            );
-                            if fret < 0 {
-                                ret = fret;
-                                error!("Error flushing bitstream filter at EOF: stream={stream_index}, ret={fret}");
-                                packet_pool.release(packet_box.packet);
-                                break;
-                            }
+                        // sch_mux_receive_finish behavior in ffmpeg_mux.c:442. The
+                        // completion authority flushes trailing BSF packets itself.
+                        if let Err(fret) = finish_output_stream(
+                            stream_index,
+                            &cfg,
+                            &mut state,
+                            &mut stream_bsfs,
+                        ) {
+                            ret = fret;
+                            error!("Error flushing bitstream filter at EOF: stream={stream_index}, ret={fret}");
+                            packet_pool.release(packet_box.packet);
+                            break;
                         }
-                        state.stream_eof[stream_index] = true;
                         packet_pool.release(packet_box.packet);
-
-                        *state.nb_done += 1;
-                        let mux_stream_node = mux_stream_node.as_ref();
-                        let SchNode::MuxStream { src: _, last_dts: _, source_finished } = mux_stream_node else { unreachable!() };
-                        source_finished.store(true, Ordering::Release);
-                        input_controller.update_locked(&scheduler_status);
 
                         if *state.nb_done == stream_count {
                             trace!("All streams finished (recording_time)");
@@ -1259,12 +1216,26 @@ fn _mux_init(
                     }
                 }
 
-                // write. Without any BSF on this mux, take exactly the pre-BSF
-                // path (direct `write_packet`, no wrapper, no template).
+                // write. The sink/container dispatch reads a loop-invariant
+                // local (never behind &mut state), so the optimizer can
+                // unswitch the loop for plain container outputs; a packet
+                // sink diverts HERE, on the encoder timeline — deliberately
+                // before `mux_fixup_ts`, so time bases pass through verbatim
+                // and no muxer-side timestamp repair applies (the strict tier
+                // validates and rejects instead of repairing).
+                // `update_last_dts` already ran above, so progress accounting
+                // is unaffected. A negative sink return (never AVERROR_EOF)
+                // breaks this loop through the same path as a failed
+                // container write, with the typed error stashed in the sink.
                 if !packet_is_null(&packet_box.packet)
                     && (*packet_box.packet.as_ptr()).stream_index >= 0
                 {
-                    if has_bsf {
+                    if let Some(sink) = sink_worker.as_mut() {
+                        ret = sink.process_and_deliver(
+                            out_fmt_ctx.as_ptr(),
+                            &mut packet_box,
+                        );
+                    } else if has_bsf {
                         // Snapshot this stream's packet metadata so a later EOF
                         // flush can stamp the BSF's trailing packets correctly.
                         if stream_bsfs[stream_index].is_some() {
@@ -1980,9 +1951,6 @@ struct MuxWriteState<'a> {
     st_last_dts: &'a mut [i64],
     stream_eof: &'a mut [bool],
     nb_done: &'a mut usize,
-    /// Packet-sink delivery state; `Some` diverts `write_packet` from the
-    /// container write to callback delivery.
-    sink: Option<&'a mut crate::core::packet_sink::strict::PacketSinkWorker>,
 }
 
 /// # Safety
@@ -1998,18 +1966,6 @@ unsafe fn write_packet(
     state: &mut MuxWriteState,
     sq_packet_box: &mut PacketBox,
 ) -> i32 {
-    // Packet sink: divert to callback delivery ON THE ENCODER TIMELINE —
-    // deliberately before `mux_fixup_ts`, so the time base passes through
-    // verbatim and no muxer-side timestamp repair applies (the strict tier
-    // validates and rejects instead of repairing). `update_last_dts` already
-    // ran in the worker loop, so progress accounting is unaffected. Any
-    // negative return (never AVERROR_EOF) breaks the worker loop through the
-    // same path as a failed container write, with the typed error stashed in
-    // the sink state.
-    if let Some(sink) = state.sink.as_deref_mut() {
-        return sink.process_and_deliver(cfg.out_fmt_ctx.as_ptr(), sq_packet_box);
-    }
-
     mux_fixup_ts(cfg, state, sq_packet_box);
 
     (*sq_packet_box.packet.as_mut_ptr()).stream_index =
@@ -2047,18 +2003,20 @@ unsafe fn mux_write_released(
     }
 }
 
-/// Finish one output stream in the mux worker: flush its trailing BSF packets,
-/// mark it EOF, count it toward `nb_done`, and publish `source_finished` so the
-/// demux stops producing this follower (Architecture Y'). Mirrors the plain
-/// loop's per-stream EOF handling; the `sq_mux` cascade is the single place that
-/// counts each stream once. Returns `Err(ret)` on a BSF flush error.
+/// The single completion authority for one output stream: flush its trailing
+/// BSF packets, mark it EOF, count it toward `nb_done`, and publish
+/// `source_finished` so the demux stops producing this follower
+/// (Architecture Y'). Idempotent — a stream already at EOF is a no-op, so
+/// every terminal path (encoder EOF marker, demux recording_time signal,
+/// streamcopy truncation, the `sq_mux` cascade and its pre-finish) can call
+/// it without double counting. Returns `Err(ret)` on a BSF flush error.
 ///
 /// # Safety
 /// - `cfg.out_fmt_ctx` must reference the live output context, and the per-stream
 ///   slices in `state` and `stream_bsfs` must be sized to `cfg.stream_count`: the
 ///   BSF flush this may call dereferences the context and indexes those slices.
 ///   (`ost` is itself bounds-checked against `stream_count` inside the function.)
-unsafe fn sq_finish_output_stream(
+unsafe fn finish_output_stream(
     ost: usize,
     cfg: &MuxWriteCfg,
     state: &mut MuxWriteState,
@@ -2121,7 +2079,7 @@ fn sq_mux_pump(
     for &sq_j in nf.iter() {
         let ost = sq.ostream[sq_j];
         unsafe {
-            sq_finish_output_stream(ost, cfg, state, stream_bsfs)?;
+            finish_output_stream(ost, cfg, state, stream_bsfs)?;
         }
     }
 
