@@ -131,6 +131,14 @@ pub enum Error {
     #[error("Worker thread '{0}' panicked; output may be incomplete")]
     WorkerPanicked(String),
 
+    /// Recorded as the scheduler result when `start()` fails after some
+    /// worker threads were already launched. `start()` itself returns the
+    /// actual init error to its caller; this recorded value is what
+    /// concurrent observers (packet-sink terminal callbacks) report, so a
+    /// sink can never mistake a torn-down startup for a settled-Ok job.
+    #[error("Scheduler start failed; the job was torn down during startup")]
+    StartFailed,
+
     #[cfg(feature = "rtmp")]
     #[error("Rtmp stream already exists with key: {0}")]
     RtmpStreamAlreadyExists(String),

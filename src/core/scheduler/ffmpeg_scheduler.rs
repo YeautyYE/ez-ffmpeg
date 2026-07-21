@@ -63,11 +63,37 @@ impl Drop for SetEncRegisteredOnDrop {
 struct StartFailGuard {
     armed: bool,
     status: Arc<AtomicUsize>,
+    result: Arc<Mutex<Option<crate::error::Result<()>>>>,
     thread_sync: ThreadSynchronizer,
     // Cloned upfront: Drop cannot borrow ffmpeg_context (start() holds it
     // mutably), and the demuxer set is fixed before any worker spawns.
     demux_waiters: Vec<Arc<crate::util::sch_waiter::SchWaiter>>,
     mux_handed: Vec<bool>,
+    // Whether the settlement sentinel slot (claimed in start() before the
+    // muxer pre-count) is still held. True from construction until
+    // release_sentinel() runs — on the success path explicitly after the
+    // last registration loop, on the failure path inside Drop AFTER the
+    // failure is recorded.
+    sentinel_held: bool,
+}
+
+impl StartFailGuard {
+    /// Releases the settlement sentinel slot exactly once, reopening the
+    /// packet-sink settlement barrier (`live <= settled`). Like any worker
+    /// slot release, it must publish the terminal state when it turns out to
+    /// be the last live slot (a job whose muxers all finished inside
+    /// `mux_init`, e.g. every output streamless), or a woken `wait()` would
+    /// observe a non-terminal status.
+    fn release_sentinel(&mut self) {
+        if !self.sentinel_held {
+            return;
+        }
+        self.sentinel_held = false;
+        let status = self.status.clone();
+        self.thread_sync.thread_done_with(|| {
+            status.store(STATUS_END, Ordering::Release);
+        });
+    }
 }
 
 impl Drop for StartFailGuard {
@@ -75,6 +101,16 @@ impl Drop for StartFailGuard {
         if !self.armed {
             return;
         }
+        // Record the start failure BEFORE publishing the terminal status or
+        // releasing any slot (first-error-wins keeps a more specific error a
+        // worker recorded earlier). start() returns the actual init error to
+        // its caller; this recorded error exists for CONCURRENT observers: a
+        // fully-drained packet sink parked in the settlement barrier is
+        // admitted by the releases below and samples the scheduler result
+        // right after — with nothing recorded, it would deliver `on_end` for
+        // a job whose start() failed, and a truncated sink would stay silent
+        // instead of reporting the failure.
+        set_scheduler_error(&self.status, &self.result, crate::error::Error::StartFailed);
         self.status.store(STATUS_END, Ordering::Release);
         notify_pause_waiters();
         // Wake choked demuxers so they observe the terminal state and exit
@@ -87,6 +123,10 @@ impl Drop for StartFailGuard {
                 crate::core::scheduler::mux_task::release_mux_slot(&self.status, &self.thread_sync);
             }
         }
+        // Only after the failure is published: a settlement waiter this
+        // release admits must observe the recorded error, never a clean
+        // terminal state.
+        self.release_sentinel();
         self.thread_sync.wait_for_all_threads();
     }
 }
@@ -346,6 +386,18 @@ impl FfmpegScheduler<Initialization> {
         // still choked by the balancing pass (see MuxDoneGuard in mux_task.rs).
         let mux_done_remaining = Arc::new(AtomicUsize::new(self.ffmpeg_context.muxs.len()));
 
+        // Settlement sentinel: one extra tracked slot, claimed before the
+        // first registration below and held by this thread until the last
+        // init loop completed (released by `release_sentinel`; the failure
+        // path records the error FIRST — see StartFailGuard::drop). While it
+        // is live and never settled, the packet-sink settlement barrier
+        // (`live <= settled`, thread_synchronizer.rs) cannot pass, so no
+        // fully-drained sink can decide its terminal (on_end vs JobFailed)
+        // against a job that is still launching workers: the terminal
+        // decision always samples a job whose registration either completed
+        // or failed with the error already recorded.
+        thread_sync.thread_start();
+
         // Pre-count EVERY muxer's thread slot before any `mux_init` runs. A
         // streamless (AVFMT_NOSTREAMS) output releases its slot synchronously
         // inside `mux_init` (`release_mux_slot`); counted one-at-a-time, an
@@ -354,6 +406,25 @@ impl FfmpegScheduler<Initialization> {
         // which stops (truncates) those still-pending outputs. Counting all
         // muxers up front keeps the counter > 0 until every muxer — and every
         // later worker — is genuinely done.
+        //
+        // Muxers are the ONLY workers whose slots need pre-counting. Every
+        // other worker (encoder, filter graph, frame pipeline, decoder,
+        // demuxer, frame source) claims its slot on THIS thread inside its
+        // own init call, strictly before its worker thread spawns, and none
+        // of those inits releases a slot synchronously — so the counter never
+        // dips as registration proceeds. Their later registration is also
+        // invisible to every counter consumer: wait()/stop() cannot run yet
+        // (no Running handle exists before start() returns), and a packet
+        // sink cannot outrun the registration sequence to a premature on_end,
+        // twice over. First, a sink's completion requires a per-stream EOF
+        // marker for EVERY stream, and those originate only in producer
+        // workers (encoders, or a demuxer's recording-time EOF) — each stage's
+        // channel senders stay parked inside FfmpegContext until that stage's
+        // init (slot claimed first) moves them into its worker, so neither an
+        // EOF marker nor even a disconnect is observable before the whole
+        // producing chain, up to the sources spawned by the LAST init loops,
+        // has registered. Second, the settlement sentinel above holds the
+        // barrier shut for the whole window regardless.
         for _ in 0..self.ffmpeg_context.muxs.len() {
             thread_sync.thread_start();
         }
@@ -366,6 +437,7 @@ impl FfmpegScheduler<Initialization> {
         let mut start_fail_guard = StartFailGuard {
             armed: true,
             status: scheduler_status.clone(),
+            result: scheduler_result.clone(),
             thread_sync: thread_sync.clone(),
             demux_waiters: self
                 .ffmpeg_context
@@ -381,6 +453,7 @@ impl FfmpegScheduler<Initialization> {
                 })
                 .collect(),
             mux_handed: vec![false; self.ffmpeg_context.muxs.len()],
+            sentinel_held: true,
         };
 
         // Muxer
@@ -640,6 +713,10 @@ impl FfmpegScheduler<Initialization> {
                 scheduler_result.clone(),
             )?;
         }
+
+        // Registration is complete: every worker this job will ever track has
+        // claimed its slot above. Reopen the packet-sink settlement barrier.
+        start_fail_guard.release_sentinel();
 
         input_controller.as_ref().update_locked(&scheduler_status);
 
@@ -1230,6 +1307,122 @@ mod tests {
             unwind.load(Ordering::Acquire),
             "must publish enc_registered on unwind"
         );
+    }
+
+    /// The settlement sentinel must hold the packet-sink barrier shut for the
+    /// whole registration window, and a failing start() must record the
+    /// scheduler error BEFORE the sentinel release admits a parked waiter — a
+    /// fully-drained sink sampling the job right after admission must observe
+    /// the failure, never a clean terminal state it would report as on_end.
+    #[test]
+    fn start_fail_guard_publishes_the_failure_before_admitting_settlement_waiters() {
+        use super::{is_stopping, StartFailGuard};
+        use crate::util::thread_synchronizer::ThreadSynchronizer;
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+        let sync = ThreadSynchronizer::new();
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let result: Arc<Mutex<Option<crate::error::Result<()>>>> = Arc::new(Mutex::new(None));
+
+        // start(): the sentinel slot, then a packet-sink worker's slot.
+        sync.thread_start();
+        sync.thread_start();
+
+        // A locally-complete sink: registers settled, parks at the barrier,
+        // and samples the job state right after admission — the terminal
+        // decision's exact shape.
+        let observed_failure = Arc::new(AtomicBool::new(false));
+        let admitted = Arc::new(AtomicBool::new(false));
+        let (sink_sync, sink_status, sink_result) = (sync.clone(), status.clone(), result.clone());
+        let (observed_w, admitted_w) = (observed_failure.clone(), admitted.clone());
+        let sink = std::thread::spawn(move || {
+            sink_sync.register_settled();
+            sink_sync.wait_peers_settled();
+            admitted_w.store(true, Ordering::Release);
+            let recorded = sink_result
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let failure_visible = matches!(
+                &*recorded,
+                Some(Err(crate::error::Error::StartFailed))
+            ) && is_stopping(sink_status.load(Ordering::Acquire));
+            drop(recorded);
+            observed_w.store(failure_visible, Ordering::Release);
+            sink_sync.thread_done_with_settled(true, || {});
+        });
+
+        // Registration still in progress: the sentinel must keep the sink
+        // parked even though every OTHER live slot is settled.
+        sleep(Duration::from_millis(80));
+        assert!(
+            !admitted.load(Ordering::Acquire),
+            "the settlement barrier must hold while the sentinel slot is live"
+        );
+
+        // A later init fails: the armed guard drops. Its Drop records the
+        // error, publishes the terminal state, releases the sentinel and
+        // joins the sink worker.
+        drop(StartFailGuard {
+            armed: true,
+            status: status.clone(),
+            result: result.clone(),
+            thread_sync: sync.clone(),
+            demux_waiters: Vec::new(),
+            mux_handed: Vec::new(),
+            sentinel_held: true,
+        });
+
+        sink.join().unwrap();
+        assert!(admitted.load(Ordering::Acquire));
+        assert!(
+            observed_failure.load(Ordering::Acquire),
+            "an admitted settlement waiter must observe the recorded start failure"
+        );
+        // First-error-wins left the start failure as the recorded result.
+        assert!(matches!(
+            &*result.lock().unwrap(),
+            Some(Err(crate::error::Error::StartFailed))
+        ));
+    }
+
+    /// Success path: `release_sentinel` releases exactly once (idempotent),
+    /// publishes STATUS_END when the sentinel is the last live slot (a job
+    /// whose muxers all finished inside `mux_init`), and a disarmed guard
+    /// records nothing on drop.
+    #[test]
+    fn start_sentinel_success_release_publishes_end_and_records_no_error() {
+        use super::StartFailGuard;
+        use crate::util::thread_synchronizer::ThreadSynchronizer;
+        use std::sync::atomic::AtomicUsize;
+
+        let sync = ThreadSynchronizer::new();
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let result: Arc<Mutex<Option<crate::error::Result<()>>>> = Arc::new(Mutex::new(None));
+
+        sync.thread_start();
+        let mut guard = StartFailGuard {
+            armed: true,
+            status: status.clone(),
+            result: result.clone(),
+            thread_sync: sync.clone(),
+            demux_waiters: Vec::new(),
+            mux_handed: Vec::new(),
+            sentinel_held: true,
+        };
+
+        guard.release_sentinel();
+        // The sentinel was the last live slot: the release must publish the
+        // terminal state before any waiter wakes.
+        sync.wait_for_all_threads();
+        assert_eq!(status.load(Ordering::Acquire), super::STATUS_END);
+        // A second release must not touch the (now zero) counter.
+        guard.release_sentinel();
+        sync.wait_for_all_threads();
+
+        // The success path disarms; the drop must record nothing.
+        guard.armed = false;
+        drop(guard);
+        assert!(result.lock().unwrap().is_none());
     }
 
     // conc-06: workers parked in wait_until_not_paused must all wake and observe
