@@ -526,11 +526,14 @@ jobs:
       # the platform scheduler, device, socket, RTMP, subtitle, and async paths.
       # The cli suite is profile-aware: on linked 8.1 its execution tests
       # assert the typed UnverifiedRuntimeProfile refusal, on the vcpkg 7.1
-      # lanes the semantic goldens skip (no version-matched ffmpeg binary on
-      # PATH; the in-process gates accept EncoderUnavailable on the
-      # libx264-less link), and on the Homebrew 7.1 lane they run in full
-      # against the matching CLI. The emit-hardening tests type-check emitted
-      # programs with `rustc --emit=metadata`, needing no native linking.
+      # lanes the semantic goldens skip deterministically (today no
+      # version-matched ffmpeg binary is on PATH, and even if one ever lands
+      # there the goldens' lenient gate skips every shape whose canonical
+      # command names an encoder this libx264-less link lacks; the
+      # in-process gates accept EncoderUnavailable on that link), and on the
+      # Homebrew 7.1 lane they run in full against the matching CLI. The
+      # emit-hardening tests type-check emitted programs with
+      # `rustc --emit=metadata`, needing no native linking.
       - name: Run CPU-only library tests
         run: cargo test --lib --test build_probe --test builder_option_validation --test frame_export_test --test frame_export_uniform_test --test frame_export_audio_test --test hls_fmp4 --test video_writer --test rawvideo_seek_gating --test per_output_video_filter --test packet_sink --test packet_sink_negative --test packet_sink_teardown --test packet_sink_unwind --test cli_emit_hardening --features "${{ matrix.test_features }}" ${{ matrix.test_args }}
 
