@@ -184,8 +184,14 @@ pub(crate) fn collect_length_prefixed(data: &[u8]) -> Result<Vec<&[u8]>, String>
 mod tests {
     use super::*;
 
-    const SPS: &[u8] = &[0x67, 66, 0xC0, 0x1E, 0xAC, 0xD9, 0x40];
-    const PPS: &[u8] = &[0x68, 0xCE, 0x3C, 0x80];
+    // Encoder-produced SPS/PPS (x264 via the ffmpeg CLI, Constrained
+    // Baseline, 320x240): realistic payloads whose emulation-prevention
+    // (00 00 03) sequences the splitter must not mistake for start codes.
+    const SPS: &[u8] = &[
+        0x67, 0x42, 0xC0, 0x1E, 0xD9, 0x01, 0x41, 0xFB, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10,
+        0x00, 0x00, 0x03, 0x03, 0x20, 0xF1, 0x62, 0xE4, 0x80,
+    ];
+    const PPS: &[u8] = &[0x68, 0xCB, 0x83, 0xCB, 0x20];
 
     fn annexb_config() -> Vec<u8> {
         let mut v = vec![0, 0, 0, 1];

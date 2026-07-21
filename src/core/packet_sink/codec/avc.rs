@@ -533,10 +533,26 @@ mod tests {
     use super::super::super::nal_framing::collect_annexb;
     use super::*;
 
-    // Minimal but structurally valid SPS/PPS payloads (header byte included).
-    // The SPS declares Baseline (66) so no avcC extension applies.
-    const SPS: &[u8] = &[0x67, 66, 0xC0, 0x1E, 0xAC, 0xD9, 0x40];
-    const PPS: &[u8] = &[0x68, 0xCE, 0x3C, 0x80];
+    // Encoder-produced parameter sets (x264 via the ffmpeg CLI, header byte
+    // included): Constrained Baseline (profile_idc 66, constraint_set0+1 ->
+    // compatibility 0xC0), level_idc 30, coding 320x240 yuv420p (20x15
+    // macroblocks, frame_mbs_only, no cropping). Profile 66 means no avcC
+    // chroma/bit-depth extension applies. The payloads carry real emulation
+    // prevention (00 00 03) sequences.
+    const SPS: &[u8] = &[
+        0x67, 0x42, 0xC0, 0x1E, 0xD9, 0x01, 0x41, 0xFB, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10,
+        0x00, 0x00, 0x03, 0x03, 0x20, 0xF1, 0x62, 0xE4, 0x80,
+    ];
+    const PPS: &[u8] = &[0x68, 0xCB, 0x83, 0xCB, 0x20];
+
+    // Same encoder and coded shape (320x240 yuv420p 8-bit, level_idc 30) at
+    // High profile (profile_idc 100): chroma_format_idc 1 and 8-bit depths,
+    // the values the avcC extension must carry.
+    const HIGH_SPS: &[u8] = &[
+        0x67, 0x64, 0x00, 0x1E, 0xAC, 0xD9, 0x41, 0x41, 0xFB, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00,
+        0x10, 0x00, 0x00, 0x03, 0x03, 0x20, 0xF1, 0x62, 0xD9, 0x60,
+    ];
+    const HIGH_PPS: &[u8] = &[0x68, 0xEB, 0xE3, 0xCB, 0x22, 0xC0];
 
     fn annexb_config() -> Vec<u8> {
         let mut v = vec![0, 0, 0, 1];
@@ -572,15 +588,9 @@ mod tests {
 
     #[test]
     fn high_profile_avcc_carries_the_extension() {
-        // High profile (100), chroma_format_idc=1, 8-bit depths. RBSP bits:
-        // profile 100, flags 0, level 30, sps_id ue(0)=1, chroma ue(1)=010,
-        // bit_depth_luma ue(0)=1, bit_depth_chroma ue(0)=1.
-        let mut sps = vec![0x67, 100, 0x00, 30];
-        // bits: 1 010 1 1 ... pad with stop bit pattern.
-        sps.push(0b1010_1110);
         let sets = ParameterSets {
-            sps: vec![sps],
-            pps: vec![PPS.to_vec()],
+            sps: vec![HIGH_SPS.to_vec()],
+            pps: vec![HIGH_PPS.to_vec()],
         };
         let avcc = build_avcc(&sets).unwrap();
         let tail = &avcc[avcc.len() - 4..];
@@ -611,11 +621,11 @@ mod tests {
     #[test]
     fn canonical_form_is_order_insensitive_and_deduplicated() {
         let a = ParameterSets {
-            sps: vec![SPS.to_vec(), vec![0x67, 1, 2, 3]],
+            sps: vec![SPS.to_vec(), HIGH_SPS.to_vec()],
             pps: vec![PPS.to_vec(), PPS.to_vec()],
         };
         let b = ParameterSets {
-            sps: vec![vec![0x67, 1, 2, 3], SPS.to_vec()],
+            sps: vec![HIGH_SPS.to_vec(), SPS.to_vec()],
             pps: vec![PPS.to_vec()],
         };
         assert_ne!(a, b, "ordered forms differ");
