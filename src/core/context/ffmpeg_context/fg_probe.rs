@@ -52,21 +52,25 @@ pub(super) struct ProbedPad {
     /// Display name (`filter` or `filter:pad`), mirroring the naming the
     /// AVFilterInOut-based probe produced.
     pub(super) name: String,
-    /// (chain, filter) coordinates of the filter owning this pad, keyed like
-    /// [`ProbedTopology::edges`] endpoints — lets consumers run reachability
-    /// over the mirrored links.
-    pub(super) node: (usize, usize),
+    /// The pad itself, keyed like [`ProbedTopology::edges`] endpoints — lets
+    /// consumers run reachability over the mirrored data flow.
+    pub(super) pad_ref: PadRef,
 }
 
 pub(super) struct ProbedTopology {
     pub(super) inputs: Vec<ProbedPad>,
     pub(super) outputs: Vec<ProbedPad>,
-    /// The mirrored links, directed producer -> consumer, over the same
-    /// (chain, filter) coordinates as [`ProbedPad::node`]. Lets consumers
-    /// check directed reachability (can frames entering an open input pad
-    /// influence an open output pad?), which weak component counting cannot
-    /// answer.
-    pub(super) edges: Vec<NodeEdge>,
+    /// The mirrored data flow at PAD granularity, directed source ->
+    /// destination: output-pad -> input-pad edges are the would-be links
+    /// between filters, input-pad -> output-pad edges are in-filter routing
+    /// (which output pads a frame entering that input pad can influence).
+    /// Lets consumers check directed reachability (can frames entering an
+    /// open input pad influence an open output pad?), which weak component
+    /// counting cannot answer — and which filter-granular edges answered
+    /// wrongly for filters whose pads carry independent streams
+    /// (`streamselect`'s `map` relays one selected input per output and
+    /// drops the rest).
+    pub(super) edges: Vec<PadEdge>,
     /// Number of weakly-connected components over the created filters, where
     /// the edges are the links the mirror pass established (labeled and
     /// implicit alike). `1` for every ordinary chain; a `;`-separated
@@ -147,6 +151,66 @@ unsafe fn movie_spec_types(f: *mut AVFilterContext) -> Option<Vec<AVMediaType>> 
     Some(spec.split('+').map(spec_media_type).collect())
 }
 
+/// Which input pad feeds each output pad, for filters that RELAY one selected
+/// input per output instead of merging their inputs: `streamselect` /
+/// `astreamselect` declare this via `map` — output pad `j` carries frames
+/// from input pad `map[j]` only, and inputs no map entry selects are dropped
+/// entirely (f_streamselect.c `process_frame`). `None` for every other
+/// filter: the conservative default is that any input pad may influence any
+/// output pad (overlay composites its inputs, concat splices them, ...),
+/// which errs toward accepting graphs.
+///
+/// Both filters have dynamic pads and are not init-denied, so by the time
+/// this runs their init has executed and the pad counts in `n` are real; the
+/// applied `map` reads back from the same context. A read-back this mirror
+/// cannot represent (unset, exotic strtol spellings, entries that do not
+/// line up with the created pads) also returns `None` — falling back to the
+/// permissive default rather than inventing routing.
+fn selected_input_per_output(n: &NodeState) -> Option<Vec<usize>> {
+    if !matches!(n.filter_name.as_str(), "streamselect" | "astreamselect") {
+        return None;
+    }
+    let mut out: *mut u8 = null_mut();
+    // SAFETY: `n.ctx` is a created filter context with options applied, alive
+    // for the whole probe; av_opt_get hands out an owned copy freed below.
+    let map_str = unsafe {
+        let ret = av_opt_get(
+            n.ctx as *mut c_void,
+            c"map".as_ptr(),
+            AV_OPT_SEARCH_CHILDREN,
+            &mut out,
+        );
+        if ret < 0 || out.is_null() {
+            return None;
+        }
+        let map_str = CStr::from_ptr(out as *const c_char)
+            .to_str()
+            .ok()
+            .map(str::to_owned);
+        av_freep(&mut out as *mut *mut u8 as *mut c_void);
+        map_str?
+    };
+    let map = parse_streamselect_map(&map_str)?;
+    (map.len() == n.out_linked.len() && map.iter().all(|&pi| pi < n.in_linked.len()))
+        .then_some(map)
+}
+
+/// Parse a `streamselect` `map` string as whitespace-separated non-negative
+/// decimal input indexes, one per output pad. f_streamselect.c's
+/// `parse_mapping` reads the entries with a strtol loop, so sign/hex
+/// spellings and trailing junk are representable there but not here — for
+/// those this returns `None` and the caller keeps the permissive routing.
+fn parse_streamselect_map(s: &str) -> Option<Vec<usize>> {
+    s.split_whitespace()
+        .map(|tok| {
+            tok.chars()
+                .all(|c| c.is_ascii_digit())
+                .then(|| tok.parse::<usize>().ok())
+                .flatten()
+        })
+        .collect()
+}
+
 /// Initialize only the filters whose pad topology depends on init (dynamic
 /// pads), skipping the side-effectful ones. Options were already applied to
 /// the contexts, so `avfilter_init_dict(f, NULL)` sees them — the same call
@@ -181,10 +245,37 @@ pub(super) unsafe fn init_topology_filters(seg: *mut AVFilterGraphSegment) -> i3
     0
 }
 
-/// A would-be link between two created filters, in (chain, filter) node
-/// coordinates, DIRECTED as (producer, consumer): frames flow from the first
-/// node into the second.
-pub(super) type NodeEdge = ((usize, usize), (usize, usize));
+/// One pad endpoint of the mirrored data-flow graph: pad index `pad` on the
+/// input or output side of the filter at `node` (chain, filter) coordinates.
+/// The side matters — input pad 0 and output pad 0 of the same filter are
+/// distinct endpoints, connected only by that filter's in-filter routing.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(super) struct PadRef {
+    pub(super) node: (usize, usize),
+    pub(super) is_output: bool,
+    pub(super) pad: usize,
+}
+
+/// A directed data-flow edge between two pad endpoints: frames flow from the
+/// first pad into the second. See [`ProbedTopology::edges`] for the two edge
+/// kinds (between-filter links and in-filter routing).
+pub(super) type PadEdge = (PadRef, PadRef);
+
+fn in_pad(ci: usize, fi: usize, pad: usize) -> PadRef {
+    PadRef {
+        node: (ci, fi),
+        is_output: false,
+        pad,
+    }
+}
+
+fn out_pad(ci: usize, fi: usize, pad: usize) -> PadRef {
+    PadRef {
+        node: (ci, fi),
+        is_output: true,
+        pad,
+    }
+}
 
 /// Link-table mirror of one created filter.
 struct NodeState {
@@ -414,7 +505,11 @@ unsafe fn describe_pad(
         linklabel: label.unwrap_or_default(),
         media_type,
         name,
-        node,
+        pad_ref: PadRef {
+            node,
+            is_output,
+            pad: pad_idx,
+        },
     })
 }
 
@@ -423,7 +518,7 @@ fn link_inputs_mirror(
     ci: usize,
     fi: usize,
     open: &mut Vec<ProbedPad>,
-    edges: &mut Vec<NodeEdge>,
+    edges: &mut Vec<PadEdge>,
 ) -> Result<()> {
     let (eff, exact, nb_labels) = {
         let n = &nodes[ci][fi];
@@ -447,7 +542,7 @@ fn link_inputs_mirror(
                 unsafe { check_link_media_types(nodes, (cj, fj, pj), (ci, fi, pi)) }?;
                 nodes[cj][fj].out_linked[pj] = true;
                 nodes[ci][fi].in_linked[pi] = true;
-                edges.push(((cj, fj), (ci, fi)));
+                edges.push((out_pad(cj, fj, pj), in_pad(ci, fi, pi)));
                 continue;
             }
         }
@@ -461,7 +556,7 @@ fn link_outputs_mirror(
     ci: usize,
     fi: usize,
     open: &mut Vec<ProbedPad>,
-    edges: &mut Vec<NodeEdge>,
+    edges: &mut Vec<PadEdge>,
 ) -> Result<()> {
     let (eff, exact, nb_labels) = {
         let n = &nodes[ci][fi];
@@ -485,7 +580,7 @@ fn link_outputs_mirror(
                 unsafe { check_link_media_types(nodes, (ci, fi, pi), (cj, fj, pj)) }?;
                 nodes[cj][fj].in_linked[pj] = true;
                 nodes[ci][fi].out_linked[pi] = true;
-                edges.push(((ci, fi), (cj, fj)));
+                edges.push((out_pad(ci, fi, pi), in_pad(cj, fj, pj)));
                 continue 'pads;
             }
         } else {
@@ -509,7 +604,7 @@ fn link_outputs_mirror(
                     unsafe { check_link_media_types(nodes, (ci, fi, pi), (ci, nfi, pj)) }?;
                     nodes[ci][nfi].in_linked[pj] = true;
                     nodes[ci][fi].out_linked[pi] = true;
-                    edges.push(((ci, fi), (ci, nfi)));
+                    edges.push((out_pad(ci, fi, pi), in_pad(ci, nfi, pj)));
                     continue 'pads;
                 }
                 break;
@@ -542,6 +637,31 @@ pub(super) unsafe fn probe_open_pads(seg: *mut AVFilterGraphSegment) -> Result<P
             link_outputs_mirror(&mut nodes, ci, fi, &mut outputs, &mut edges)?;
         }
     }
+    // In-filter routing edges, added after the links so `edges` describes the
+    // complete pad-level data flow: which output pads can a frame entering
+    // each input pad influence? Every one of them by default — most
+    // multi-pad filters merge their inputs (overlay composites, concat
+    // splices) — but a relay filter selecting ONE input per output
+    // (streamselect's map) routes only the selected pairs, so an unselected
+    // input pad reaches no output at all.
+    for (ci, chain) in nodes.iter().enumerate() {
+        for (fi, n) in chain.iter().enumerate() {
+            if n.ctx.is_null() {
+                continue;
+            }
+            let selected = selected_input_per_output(n);
+            for pj in 0..n.out_linked.len() {
+                match &selected {
+                    Some(map) => edges.push((in_pad(ci, fi, map[pj]), out_pad(ci, fi, pj))),
+                    None => {
+                        for pi in 0..n.in_linked.len() {
+                            edges.push((in_pad(ci, fi, pi), out_pad(ci, fi, pj)));
+                        }
+                    }
+                }
+            }
+        }
+    }
     let filter_components = count_components(&nodes, &edges);
     Ok(ProbedTopology {
         inputs,
@@ -553,8 +673,10 @@ pub(super) unsafe fn probe_open_pads(seg: *mut AVFilterGraphSegment) -> Result<P
 
 /// Weakly-connected components of the created filters under the mirrored
 /// links, via a plain union-find over dense node ids. Skipped (null-ctx)
-/// entries are not nodes.
-fn count_components(nodes: &[Vec<NodeState>], edges: &[NodeEdge]) -> usize {
+/// entries are not nodes. In-filter routing edges connect two pads of the
+/// same node, so under the node-granular union they are no-ops and the count
+/// stays the pure link-connectivity the field documents.
+fn count_components(nodes: &[Vec<NodeState>], edges: &[PadEdge]) -> usize {
     // Dense id per created filter.
     let mut id = std::collections::HashMap::new();
     for (ci, chain) in nodes.iter().enumerate() {
@@ -574,7 +696,7 @@ fn count_components(nodes: &[Vec<NodeState>], edges: &[NodeEdge]) -> usize {
         x
     }
     for (a, b) in edges {
-        let (Some(&ia), Some(&ib)) = (id.get(a), id.get(b)) else {
+        let (Some(&ia), Some(&ib)) = (id.get(&a.node), id.get(&b.node)) else {
             continue;
         };
         let (ra, rb) = (find(&mut parent, ia), find(&mut parent, ib));
@@ -738,6 +860,19 @@ mod tests {
                 "probe accepted {desc:?} which upstream rejects at parse/link"
             );
         }
+    }
+
+    #[test]
+    fn streamselect_map_parses_decimal_entries_only() {
+        assert_eq!(parse_streamselect_map("0"), Some(vec![0]));
+        assert_eq!(parse_streamselect_map(" 1  0 "), Some(vec![1, 0]));
+        // Spellings only strtol reads (sign/hex) refuse to parse, so the
+        // caller keeps the permissive all-pads routing instead of guessing.
+        assert_eq!(parse_streamselect_map("+1"), None);
+        assert_eq!(parse_streamselect_map("0x1"), None);
+        // Unset map reads back as ""; zero entries never match a real output
+        // count, so this also ends in the permissive fallback.
+        assert_eq!(parse_streamselect_map(""), Some(vec![]));
     }
 
     #[test]

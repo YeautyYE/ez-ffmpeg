@@ -714,6 +714,98 @@ fn connected_but_unreachable_graph_is_rejected() {
 }
 
 #[test]
+fn streamselect_dropping_the_input_is_rejected() {
+    // Reachability must hold at PAD granularity, not filter granularity: the
+    // open input [in] and the open output sit on the SAME streamselect, yet
+    // map=0 relays only the color feed and drops [in] entirely — the encoded
+    // stream would be pure generator output.
+    let input = video_fixture("shape_sselect_drop_in.mp4");
+    let reason = shape_reason(
+        &input,
+        "color=c=red:s=64x64:r=1:d=1[bg];[bg][in]streamselect=inputs=2:map=0",
+    );
+    assert!(reason.contains("no directed path"), "reason: {reason}");
+}
+
+#[test]
+fn streamselect_relaying_the_input_is_accepted() {
+    // Positive control for the pad-granular walk: map=1 selects the open
+    // input pad, so the decoded stream IS the output. The unselected color
+    // feed is 64x64 while the input is 320x240 — the output dimensions prove
+    // which input pad the encoder consumed.
+    let input = video_fixture("sselect_relay_in.mp4");
+    let out = tmp_path("sselect_relay_out.mp4");
+    run(
+        FfmpegContext::builder()
+            .input(input.as_str())
+            .output(
+                Output::from(out.as_str())
+                    .set_video_codec("mpeg4")
+                    .set_video_filter(
+                        "color=c=red:s=64x64:r=30:d=0.5[alt];\
+                         [alt][in]streamselect=inputs=2:map=1",
+                    ),
+            )
+            .build()
+            .unwrap(),
+        "streamselect relaying the input",
+    )
+    .unwrap();
+    assert_eq!(video_dimensions(&out), (320, 240));
+}
+
+#[test]
+fn overlay_merging_the_input_is_accepted() {
+    // A multi-input filter that MERGES its inputs must keep passing when the
+    // open input is a secondary pad: frames entering overlay's pad 1 are
+    // composited into the output, so the input genuinely influences it.
+    let input = video_fixture("overlay_merge_in.mp4");
+    let out = tmp_path("overlay_merge_out.mp4");
+    run(
+        FfmpegContext::builder()
+            .input(input.as_str())
+            .output(
+                Output::from(out.as_str())
+                    .set_video_codec("mpeg4")
+                    .set_video_filter(
+                        "color=c=black:s=320x240:r=30:d=0.5[bg];\
+                         [bg][in]overlay=shortest=1",
+                    ),
+            )
+            .build()
+            .unwrap(),
+        "overlay merging the input",
+    )
+    .unwrap();
+    assert_eq!(video_dimensions(&out), (320, 240));
+}
+
+#[test]
+fn concat_appending_the_input_is_accepted() {
+    // concat splices every input into the output timeline, so the open input
+    // on pad 1 influences the output even though pad 0 is generator-fed.
+    let input = video_fixture("concat_append_in.mp4");
+    let out = tmp_path("concat_append_out.mp4");
+    run(
+        FfmpegContext::builder()
+            .input(input.as_str())
+            .output(
+                Output::from(out.as_str())
+                    .set_video_codec("mpeg4")
+                    .set_video_filter(
+                        "color=c=blue:s=320x240:r=30:d=0.2[pre];\
+                         [pre][in]concat=n=2:v=1:a=0",
+                    ),
+            )
+            .build()
+            .unwrap(),
+        "concat appending the input",
+    )
+    .unwrap();
+    assert_eq!(video_dimensions(&out), (320, 240));
+}
+
+#[test]
 fn zero_input_graph_is_rejected() {
     let input = video_fixture("shape_zero_in_in.mp4");
     let reason = shape_reason(&input, "color=c=red:s=64x64");
