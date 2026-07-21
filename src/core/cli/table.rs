@@ -604,6 +604,14 @@ pub(crate) fn validate_value(
         ValueRule::Path => {
             if value.is_empty() {
                 Err(fail("expected a non-empty path".to_string()))
+            } else if value.starts_with('-') {
+                // A `-`-leading value here almost always means the path was
+                // omitted and the next option was swallowed as the value.
+                Err(fail(
+                    "a `-`-leading value is rejected as a swallowed option; for a path that \
+                     genuinely starts with `-`, write it as `./-name`"
+                        .to_string(),
+                ))
             } else {
                 Ok(())
             }
@@ -828,6 +836,20 @@ mod tests {
         for bad in ["192q", "k", "", "1.5M", "192 k"] {
             assert!(
                 check(ValueRule::Bitrate, bad).is_err(),
+                "expected Err for {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_rejects_empty_and_dash_leading_values() {
+        assert!(check(ValueRule::Path, "seg_%03d.ts").is_ok());
+        // The documented escape hatch for a genuinely dash-leading name.
+        assert!(check(ValueRule::Path, "./-seg.ts").is_ok());
+        assert!(check(ValueRule::Path, "").is_err());
+        for bad in ["-hls_flags", "-y", "-"] {
+            assert!(
+                check(ValueRule::Path, bad).is_err(),
                 "expected Err for {bad:?}"
             );
         }
