@@ -593,6 +593,14 @@ impl EmbedRtmpServer<Running> {
                 return Err(RtmpCreateStream.into());
             }
         }
+        // The registration and its primed handshake ride a queue and a
+        // channel the poller cannot see. Wake the reactor once so it picks
+        // them up now instead of on the next 100ms poll fallback — the same
+        // wake create_rtmp_input performs after priming; RtmpStreamSender
+        // wakes per send, but nothing else announces this handshake.
+        if let Some(wake_handle) = &self.wake_handle {
+            wake_handle.wake();
+        }
         Ok(RtmpStreamSender {
             inner: sender,
             wake_handle: self.wake_handle.clone(),
