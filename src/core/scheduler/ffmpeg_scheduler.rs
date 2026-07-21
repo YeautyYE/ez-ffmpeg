@@ -762,6 +762,24 @@ impl FfmpegScheduler<Initialization> {
 }
 
 impl FfmpegScheduler<Running> {
+    /// Whether this scheduler's job contains the channel-adapter packet sink
+    /// identified by `token` (Arc pointer identity of its `CancellationSlot`).
+    /// Backs the [`PacketSinkReceiver::into_events`] pairing check; the
+    /// tokens live on the muxers (never taken by the worker handoff), so the
+    /// check is race-free against a running job.
+    ///
+    /// [`PacketSinkReceiver::into_events`]: crate::core::packet_sink::PacketSinkReceiver::into_events
+    pub(crate) fn runs_packet_sink(
+        &self,
+        token: &crate::core::packet_sink::CancellationSlot,
+    ) -> bool {
+        self.ffmpeg_context.muxs.iter().any(|mux| {
+            mux.packet_sink_token
+                .as_ref()
+                .is_some_and(|t| Arc::ptr_eq(t, token))
+        })
+    }
+
     /// Pauses a running FFmpeg job, transitioning from `Running` to `Paused`.
     ///
     /// Internally sets the FFmpeg pipeline threads to a paused state. Depending

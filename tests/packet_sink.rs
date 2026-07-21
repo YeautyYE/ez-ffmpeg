@@ -1086,7 +1086,10 @@ fn aac_only_delivery_streams_through_into_events() {
     let mut saw_end = false;
     let mut packets = 0usize;
     let mut prev_dts: Option<i64> = None;
-    for event in receiver.into_events(scheduler) {
+    let events = receiver
+        .into_events(scheduler)
+        .expect("receiver paired with the scheduler running its sink");
+    for event in events {
         match event.expect("job failed") {
             ez_ffmpeg::packet_sink::PacketSinkEvent::StreamInfo(streams) => {
                 assert!(!saw_info, "stream info must arrive exactly once");
@@ -1116,6 +1119,62 @@ fn aac_only_delivery_streams_through_into_events() {
     }
     assert!(saw_info && saw_end, "info and End must both arrive");
     assert!(packets > 50, "2 s of AAC is ~86 frames, got {packets}");
+}
+
+/// Run-token pairing: `into_events` must reject a scheduler that is not
+/// running this receiver's sink. Without the check, receiver A silently
+/// cross-wires with job B — streaming A's events while joining (and, on
+/// early drop, aborting) B. The typed error returns both handles unchanged,
+/// which the test proves by re-pairing each receiver with its own run and
+/// draining both to completion.
+#[test]
+fn into_events_rejects_a_cross_wired_scheduler() {
+    let capacity = std::num::NonZeroUsize::new(64).unwrap();
+    let (sink_a, receiver_a) = PacketSink::channel(capacity);
+    let scheduler_a = FfmpegContext::builder()
+        .input(Input::from("sine=frequency=440:duration=1").set_format("lavfi"))
+        .output(Output::from(sink_a).set_audio_codec("aac"))
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let (sink_b, receiver_b) = PacketSink::channel(capacity);
+    let scheduler_b = FfmpegContext::builder()
+        .input(Input::from("sine=frequency=220:duration=1").set_format("lavfi"))
+        .output(Output::from(sink_b).set_audio_codec("aac"))
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    // Cross-wiring receiver A with scheduler B must fail typed, before any
+    // event is consumed and without disturbing either running job.
+    let mismatch = receiver_a
+        .into_events(scheduler_b)
+        .expect_err("a scheduler not running this receiver's sink must be rejected");
+    assert_eq!(
+        mismatch.to_string(),
+        "packet-sink receiver paired with a scheduler that is not running its sink"
+    );
+
+    let receiver_a = mismatch.receiver;
+    let scheduler_b = mismatch.scheduler;
+    for (receiver, scheduler) in [(receiver_a, scheduler_a), (receiver_b, scheduler_b)] {
+        let mut saw_end = false;
+        let events = receiver
+            .into_events(scheduler)
+            .expect("the matching scheduler must be accepted");
+        for event in events {
+            if matches!(
+                event.expect("job failed"),
+                ez_ffmpeg::packet_sink::PacketSinkEvent::End
+            ) {
+                saw_end = true;
+            }
+        }
+        assert!(saw_end, "each run must settle through its own receiver");
+    }
 }
 
 #[test]

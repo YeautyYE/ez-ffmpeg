@@ -386,6 +386,11 @@ unsafe fn open_output_file(
         // projection are policy decisions, not container accidents.
         mux.oformat_flags =
             crate::core::packet_sink::PacketSinkPolicy::for_tier(sink.tier).oformat_flags();
+        // Keep the channel pair's identity token on the muxer: `packet_sink`
+        // itself is taken by the worker handoff, but pairing checks
+        // (`PacketSinkReceiver::into_events`) still need to know which
+        // scheduler runs this sink.
+        mux.packet_sink_token = sink.cancellation.clone();
         mux.packet_sink = Some(sink);
     }
 
