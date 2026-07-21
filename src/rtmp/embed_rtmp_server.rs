@@ -1670,6 +1670,110 @@ mod tests {
         );
     }
 
+    // The claim-release chain end to end, through the public lifecycle: a
+    // create claims the key and queues the registration, the running worker
+    // consumes it and moves the claim into the accepted publisher's state,
+    // and stop() must unwind that whole chain so the key is claimable again
+    // afterwards. The server is assembled exactly as start() builds it —
+    // same shared status, key set and handoff, and the same worker body
+    // start() spawns (handle_connections) — minus the TCP listener and
+    // accept thread, so no port is bound and every wait is a bounded poll
+    // against a deadline.
+    #[test]
+    fn stopped_server_releases_accepted_stream_keys() {
+        let registrations = Arc::new(RegistrationHandoff::new());
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let server = EmbedRtmpServer::<Running> {
+            address: String::new(),
+            bound_addr: None,
+            status: status.clone(),
+            stream_keys: Default::default(),
+            registrations: Some(registrations.clone()),
+            wake_handle: None,
+            gop_limit: 1,
+            max_connections: None,
+            state: PhantomData,
+        };
+
+        // The accept thread's side of the connection channel, kept open and
+        // idle for the worker's lifetime — a listener that never accepts.
+        let (_connection_sender, connection_receiver) =
+            crossbeam_channel::bounded::<TcpStream>(1);
+        let worker = {
+            let status = status.clone();
+            std::thread::Builder::new()
+                .name("rtmp-server-worker".to_string())
+                .spawn(move || {
+                    handle_connections(connection_receiver, registrations, 1, None, status, None)
+                })
+                .expect("spawn the worker thread")
+        };
+
+        // The create claims the key synchronously and queues the
+        // registration, primed with the connect / createStream / publish
+        // handshake, for the worker.
+        let sender = server
+            .create_stream_sender("app", "lifecycle-key")
+            .expect("create on the running server must succeed");
+
+        // Wait until the reactor drains that primed handshake (with no wake
+        // handle it picks the registration up on a ~100ms poll timeout). An
+        // empty channel means the worker consumed the registration, so the
+        // claim now lives in the reactor's publisher state — the ownership
+        // stop() must tear down.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !sender.inner.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the worker must drain the primed publish handshake within 5s"
+            );
+            sleep(Duration::from_millis(10));
+        }
+
+        // The accepted publisher holds the key: a duplicate create is
+        // refused with the typed already-exists error.
+        assert!(
+            matches!(
+                server.create_stream_sender("app", "lifecycle-key"),
+                Err(crate::error::Error::RtmpStreamAlreadyExists(ref key)) if key == "lifecycle-key"
+            ),
+            "the key must stay held while its publisher is accepted and live"
+        );
+
+        // Stop through the public seam; a surviving clone observes the
+        // aftermath, as any second owner of the server value would.
+        let observer = server.clone();
+        assert!(server.stop().is_stopped());
+
+        // The worker notices the stop flag on its next poll cycle and
+        // exits; joining it orders every teardown release before the
+        // assertions below.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !worker.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the worker must exit within 5s of stop()"
+            );
+            sleep(Duration::from_millis(10));
+        }
+        worker.join().expect("the worker must exit cleanly");
+
+        // The key is claimable again: the second create gets past the
+        // duplicate-key gate, and what refuses it is the stopped server's
+        // closed intake — not a lingering claim.
+        assert!(
+            matches!(
+                observer.create_stream_sender("app", "lifecycle-key"),
+                Err(crate::error::Error::RtmpCreateStream)
+            ),
+            "after stop the key must be free; only the closed intake may refuse the create"
+        );
+        assert!(
+            !observer.stream_keys.contains("lifecycle-key"),
+            "no claim may survive the worker's teardown"
+        );
+    }
+
     // A reactor panic must not leave the server half-dead: the unwind
     // boundary publishes STATUS_END so is_stopped() flips true and the accept
     // thread's per-iteration status check terminates its loop.
