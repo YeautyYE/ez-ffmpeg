@@ -652,8 +652,11 @@ mod tests {
     /// A4 golden fixture (trailing zeros): the FULL production path
     /// (`AvcRuntime::normalize_au` over an Annex-B AU that legally pads its
     /// NAL units with trailing_zero_8bits) must produce the byte-exact AVCC
-    /// sample the mp4 muxer's `nal_parse_units` would write — trims applied,
-    /// 4-byte length prefixes, no padding bytes carried into the payload.
+    /// sample FFmpeg master's (n8.2+) `nal_parse_units` writes — trims
+    /// applied, 4-byte length prefixes, no padding bytes carried into the
+    /// payload. FFmpeg 7.1/8.1 instead length-prefix the NAL unchanged,
+    /// carrying the padding into the sample; the divergence is fixture-only,
+    /// since real encoders emit no trailing_zero_8bits.
     /// (Placed at the runtime layer because the integration harness cannot
     /// inject a synthetic AU through a real encoder; this IS the delivery
     /// code path.)
@@ -669,7 +672,7 @@ mod tests {
         let mut scratch = Vec::new();
         let (is_key, data) = runtime.normalize_au(&au, &mut scratch, 0).unwrap();
         assert!(is_key);
-        // movenc-equivalent golden bytes: wb32(3) SEI, wb32(3) IDR — the
+        // Golden bytes in the trimmed form: wb32(3) SEI, wb32(3) IDR — the
         // padding is start-code framing, never sample payload.
         assert_eq!(
             data,

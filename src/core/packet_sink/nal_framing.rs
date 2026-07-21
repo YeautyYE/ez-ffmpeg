@@ -70,9 +70,11 @@ pub(crate) fn walk_annexb<'a>(
     let mut scan = AuScan::default();
     loop {
         let boundary = find_startcode(data, pos).unwrap_or(data.len());
-        // FFmpeg's nal_parse_units trims trailing_zero_8bits from every NAL
-        // before length-prefixing (libavformat/nal.c); matching it keeps the
-        // AVCC output byte-identical to what the mp4 muxer would write.
+        // FFmpeg master's (n8.2+) nal_parse_units (libavformat/nal.c) trims
+        // trailing_zero_8bits from every NAL before length-prefixing; this
+        // trim matches it. FFmpeg 7.1/8.1 length-prefix the NAL unchanged,
+        // carrying the padding into the sample. The divergence is
+        // fixture-only: real encoders emit no trailing_zero_8bits.
         let mut end = boundary;
         while end > pos && data[end - 1] == 0 {
             end -= 1;

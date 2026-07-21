@@ -1459,9 +1459,10 @@ fn _mux_init(
         if let Some(mut sink) = sink_worker.take() {
             debug!("Packet sink muxer finished.");
             // Sequence EVERY crate-side failure source BEFORE the terminal
-            // decision, so a delivered on_end implies wait() == Ok (the one
-            // carve-out — user-capture Drop panics AFTER the terminal — is
-            // contained below and cannot change the settled result):
+            // decision, so a delivered on_end implies wait() == Ok (the
+            // carve-outs — panics at or after the terminal, from the terminal
+            // callback itself or from user-capture Drops — are contained
+            // below and cannot change the settled result):
             // 1. close the live queue (wakes any sender);
             drop(pkt_receiver);
             // 2. stream bookkeeping, own-completion report and the input-
@@ -1895,7 +1896,6 @@ impl MuxDoneGuard {
             scheduler_status,
         }
     }
-
 }
 
 impl Drop for MuxDoneGuard {
@@ -1928,13 +1928,17 @@ impl Drop for MuxDoneGuard {
 
 /// Panic-only release net for the mux worker's pre-counted thread slot.
 ///
-/// The mux worker uses a MANUAL `thread_done_with` (not `ThreadDoneGuard`) so it
-/// can publish STATUS_END only AFTER writing the trailer and joining its
-/// encoders (the ordered terminal publish). That manual call is skipped if the
-/// worker unwinds (panics) partway through, leaking the slot — then
-/// `wait_for_all_threads` (`RunningGuard::Drop`) hangs forever. This guard
-/// releases the slot on unwind; the normal path calls `disarm()` immediately
-/// after its manual release so the slot is freed exactly once.
+/// The mux worker uses a MANUAL `thread_done_with` (not `ThreadDoneGuard`) so
+/// the slot is released only AFTER writing the trailer, joining its encoders
+/// and freeing the output context — wait()/stop() must not return while that
+/// teardown still runs. (Mux completion is published separately and EARLIER:
+/// the last muxer's `MuxDoneGuard` deliberately stores STATUS_END BEFORE the
+/// encoder join, so a parked encoder observes it and exits joinably.) That
+/// manual call is skipped if the worker unwinds (panics) partway through,
+/// leaking the slot — then `wait_for_all_threads` (`RunningGuard::Drop`) hangs
+/// forever. This guard releases the slot on unwind; the normal path goes
+/// through the consuming `release()` (disarm first, then the same release
+/// closure), so the slot is freed exactly once.
 struct MuxSlotGuard {
     armed: bool,
     thread_sync: ThreadSynchronizer,
@@ -2861,9 +2865,8 @@ mod tests {
 
     /// The delayed-mux failure paths (write_header error, worker spawn
     /// failure) must release the pre-counted mux thread slot AFTER recording
-    /// the error — otherwise wait()/stop() hangs forever on the leaked slot
-    /// (the thread-slot leak found by review), or wait() returns success
-    /// without the error.
+    /// the error — otherwise wait()/stop() hangs forever on the leaked slot,
+    /// or wait() returns success without the error.
     #[test]
     fn fail_mux_init_releases_slot_and_records_error() {
         let thread_sync = ThreadSynchronizer::new();
@@ -2952,8 +2955,7 @@ mod tests {
 
     /// The zero-stream (AVFMT_NOSTREAMS) early return must release the
     /// pre-counted slot WITHOUT recording an error — a streamless output is
-    /// legitimate, but leaving the slot counted hangs wait()/stop() (the
-    /// pre-existing leak surfaced by the slot-leak review).
+    /// legitimate, but leaving the slot counted hangs wait()/stop().
     #[test]
     fn release_mux_slot_unblocks_wait_without_error() {
         let thread_sync = ThreadSynchronizer::new();
@@ -2976,11 +2978,11 @@ mod tests {
         assert!(is_stopping(scheduler_status.load(Ordering::Acquire)));
     }
 
-    // Regression for the premature-STATUS_END truncation (found by the SHIP
-    // review): a streamless (AVFMT_NOSTREAMS) output releases its thread slot
-    // synchronously via `release_mux_slot`. The scheduler now pre-counts EVERY
-    // muxer's slot before any `mux_init`, so an early streamless release cannot
-    // drive the thread counter to zero and stop later, still-pending outputs.
+    // Regression for the premature-STATUS_END truncation: a streamless
+    // (AVFMT_NOSTREAMS) output releases its thread slot synchronously via
+    // `release_mux_slot`. The scheduler pre-counts EVERY muxer's slot before
+    // any `mux_init`, so an early streamless release cannot drive the thread
+    // counter to zero and stop later, still-pending outputs.
     // Here both slots are pre-counted (as the scheduler does): releasing the
     // first must NOT publish a terminal status.
     #[test]
@@ -3091,11 +3093,13 @@ mod tests {
             .expect("the choked demuxer must be released when the last muxer finishes");
     }
 
-    // BUG A regression: the mux worker releases its pre-counted thread slot via a
-    // MANUAL thread_done_with (not ThreadDoneGuard, so it can publish STATUS_END
-    // only after the trailer/join). A panic before that call would leak the slot
-    // and hang wait_for_all_threads. MuxSlotGuard is the panic-only net: an ARMED
-    // drop (the unwind path) must release the slot.
+    // Slot-leak regression: the mux worker releases its pre-counted thread slot
+    // via a MANUAL thread_done_with (not ThreadDoneGuard) so the release lands
+    // only after the trailer/join — mux completion itself (STATUS_END via
+    // MuxDoneGuard) is deliberately published BEFORE the encoder join. A panic
+    // before that manual call would leak the slot and hang wait_for_all_threads.
+    // MuxSlotGuard is the panic-only net: an ARMED drop (the unwind path) must
+    // release the slot.
     #[test]
     fn mux_slot_guard_releases_slot_on_armed_drop() {
         let thread_sync = ThreadSynchronizer::new();
