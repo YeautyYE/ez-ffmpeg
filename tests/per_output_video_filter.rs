@@ -461,7 +461,7 @@ fn audio_chain_on_video_stream_is_rejected() {
                 desc,
                 found,
                 expected,
-            }) if desc == "anull" && found == "audio" && expected == "video"
+            }) if desc == "anull" && *found == "audio" && *expected == "video"
         ),
         "unexpected error: {err:?}"
     );
