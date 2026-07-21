@@ -1604,6 +1604,10 @@ impl Reactor {
         // will ever announce.
         let mut publishers_pending = false;
 
+        // Event buffer reused across poll wakeups: poll clears and refills
+        // it instead of allocating a fresh Vec every iteration.
+        let mut events = Vec::new();
+
         loop {
             // 1. Check stop signal
             if self.status.load(Ordering::Acquire) == STATUS_END {
@@ -1654,13 +1658,10 @@ impl Reactor {
                 } else {
                     poll_timeout
                 };
-            let events = match self.poller.poll(Some(poll_wait)) {
-                Ok(events) => events,
-                Err(e) => {
-                    error!("Poller error: {:?}", e);
-                    continue;
-                }
-            };
+            if let Err(e) = self.poller.poll(Some(poll_wait), &mut events) {
+                error!("Poller error: {:?}", e);
+                continue;
+            }
 
             // 5-pre. Snapshot the cap-hit re-drain set BEFORE processing this
             // round's events: ids inserted during step 5 below belong to the
@@ -1678,7 +1679,7 @@ impl Reactor {
             let mut ids_to_close = Vec::new();
             let mut read_ids: Vec<usize> = Vec::new();
 
-            for event in events {
+            for event in &events {
                 let poller_token = event.token;
 
                 // Wakeup token: drain it and fall through to the channel-drain
