@@ -60,7 +60,7 @@
 //! # The manifest (generated; revision-pinned by an exact-equality test)
 //!
 //! <!-- manifest:begin -->
-//! Manifest revision 3; dialect: ffmpeg 7.1 command line.
+//! Manifest revision 4; dialect: ffmpeg 7.1 command line.
 //!
 //! | option | scope | selector | repeat | notes | maps to |
 //! |---|---|---|---|---|---|
