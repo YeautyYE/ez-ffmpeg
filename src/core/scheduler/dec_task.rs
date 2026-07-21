@@ -1956,8 +1956,8 @@ mod tests {
     // Known limitation: this counts the EXTERNAL refcount only. A revert
     // that reintroduces the callback's own from_raw/clone/into_raw dance
     // WITHOUT the stash is refcount-neutral and passes here; the lifecycle
-    // amplifier in tests/lifecycle.rs and review of the invariant at
-    // DecWorkerResources cover that variant.
+    // amplifier in tests/lifecycle.rs and the ownership invariant documented
+    // at DecWorkerResources cover that variant.
     #[test]
     fn dec_open_publishes_a_borrow_only_opaque_with_no_refcount() {
         // hw_device_setup_for_decode consults the process-global device
