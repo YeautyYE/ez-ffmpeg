@@ -750,9 +750,20 @@ mod tests {
     use std::ptr::{null, null_mut};
     use std::sync::{Arc, Mutex};
 
-    const SPS: &[u8] = &[0x67, 66, 0xC0, 0x1E, 0xAC, 0xD9, 0x40];
-    const PPS: &[u8] = &[0x68, 0xCE, 0x3C, 0x80];
-    const OTHER_SPS: &[u8] = &[0x67, 66, 0xC0, 0x28, 0xAC, 0xD9, 0x41];
+    // Encoder-produced parameter sets (x264 via the ffmpeg CLI): Constrained
+    // Baseline (profile_idc 66, compatibility 0xC0), level_idc 30, coding the
+    // same 320x240 yuv420p shape the test streams declare in codecpar.
+    const SPS: &[u8] = &[
+        0x67, 0x42, 0xC0, 0x1E, 0xD9, 0x01, 0x41, 0xFB, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10,
+        0x00, 0x00, 0x03, 0x03, 0x20, 0xF1, 0x62, 0xE4, 0x80,
+    ];
+    const PPS: &[u8] = &[0x68, 0xCB, 0x83, 0xCB, 0x20];
+    // Same encoder and coded shape at level 4.0: level_idc (SPS byte 3) is
+    // 0x28, so the derived codec projection differs from `SPS`.
+    const OTHER_SPS: &[u8] = &[
+        0x67, 0x42, 0xC0, 0x28, 0xD9, 0x01, 0x41, 0xFB, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10,
+        0x00, 0x00, 0x03, 0x03, 0x20, 0xF1, 0x83, 0x24, 0x80,
+    ];
 
     fn annexb_config() -> Vec<u8> {
         let mut v = vec![0, 0, 0, 1];
@@ -964,8 +975,8 @@ mod tests {
         let video = info.video().expect("typed video configuration");
         assert_eq!(video.codec_id(), AVCodecID::AV_CODEC_ID_H264);
         // The typed header fields mirror the fixture SPS: profile_idc 66
-        // (Baseline), constraint flags 0xC0, level_idc 30 (level 3.0) —
-        // and the RFC 6381 string is their hex projection.
+        // with constraint flags 0xC0 (Constrained Baseline), level_idc 30
+        // (level 3.0) — and the RFC 6381 string is their hex projection.
         assert_eq!(video.profile(), 66);
         assert_eq!(video.compatibility(), 0xC0);
         assert_eq!(video.level(), 30);
@@ -1471,8 +1482,12 @@ mod tests {
     #[test]
     fn reorder_is_config_change_only_when_the_projection_changes() {
         // Second SPS with an IDENTICAL projection (bytes 1..4) but a
-        // different tail: reorder must pass.
-        const SAME_PROJ_SPS: &[u8] = &[0x67, 66, 0xC0, 0x1E, 0xAA, 0x11, 0x22];
+        // different tail (same encoder, Constrained Baseline level 3.0,
+        // coding 640x480): reorder must pass.
+        const SAME_PROJ_SPS: &[u8] = &[
+            0x67, 0x42, 0xC0, 0x1E, 0xD9, 0x00, 0xA0, 0x3D, 0xB0, 0x11, 0x00, 0x00, 0x03, 0x00,
+            0x01, 0x00, 0x00, 0x03, 0x00, 0x32, 0x0F, 0x16, 0x2E, 0x48,
+        ];
         let mut config = vec![0, 0, 0, 1];
         config.extend_from_slice(SPS);
         config.extend_from_slice(&[0, 0, 1]);
