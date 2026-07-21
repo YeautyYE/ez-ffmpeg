@@ -1360,10 +1360,7 @@ fn _mux_init(
                     && (*packet_box.packet.as_ptr()).stream_index >= 0
                 {
                     if let Some(sink) = sink_worker.as_mut() {
-                        ret = sink.process_and_deliver(
-                            out_fmt_ctx.as_ptr(),
-                            &mut packet_box,
-                        );
+                        ret = sink.process_and_deliver(&mut packet_box);
                     } else if has_bsf {
                         // Snapshot this stream's packet metadata so a later EOF
                         // flush can stamp the BSF's trailing packets correctly.
