@@ -682,7 +682,7 @@ impl EmbedRtmpServer<Running> {
                 } else {
                     error!("Rtmp Server aborted. Can't create stream sender.");
                 }
-                Err(RtmpCreateStream.into())
+                Err(RtmpCreateStream)
             }
             Err(EnqueueRefused::Full(registration)) => {
                 // The worker is alive but the reactor has a full queue of
@@ -692,7 +692,7 @@ impl EmbedRtmpServer<Running> {
                 // backlog drains.
                 drop(registration);
                 warn!("Rtmp registration queue is full. Can't create stream sender.");
-                Err(RtmpRegistrationQueueFull.into())
+                Err(RtmpRegistrationQueueFull)
             }
         }
     }
