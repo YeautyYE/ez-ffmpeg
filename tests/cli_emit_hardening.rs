@@ -29,46 +29,154 @@ fn scratch_dir() -> std::path::PathBuf {
 /// `ez-ffmpeg` package builds a lib target named `ez_ffmpeg`).
 const LIB_DEP_NAME: &str = "ez_ffmpeg";
 
-/// Pulls the `ez_ffmpeg` dependency's fingerprint hash out of a unit
-/// fingerprint JSON. Entries in the `deps` array have the shape
-/// `[<pkg-id-hash>, "<dep name>", <bool>, <fingerprint-hash>]`, and the one
-/// named `ez_ffmpeg` is the lib this unit was built against. The scan is
-/// textual to keep the test dependency-free; any shape drift fails loudly
-/// instead of guessing — an entry that carries the dep-name marker but not a
-/// parsable trailing hash is a hard failure, never a skip, so the hash below
-/// is reported as unique only after every marker occurrence was decoded.
-fn lib_dep_fingerprint(json: &str, source: &Path) -> u64 {
-    let marker = format!("\"{LIB_DEP_NAME}\",");
-    let mut hashes: Vec<u64> = json
-        .match_indices(&marker)
-        .map(|(idx, _)| {
-            let tail = &json[idx + marker.len()..];
-            let end = tail.find(']').unwrap_or_else(|| {
-                panic!(
-                    "`{LIB_DEP_NAME}` dep entry at byte {idx} of {} has no closing `]`; \
-                     refusing to skip a record that cannot be decoded",
-                    source.display()
-                )
-            });
-            let entry = &tail[..end];
-            let field = entry.rfind(',').map_or(entry, |comma| &entry[comma + 1..]).trim();
-            field.parse::<u64>().unwrap_or_else(|err| {
-                panic!(
-                    "`{LIB_DEP_NAME}` dep entry at byte {idx} of {} ends in {field:?}, not a \
-                     u64 fingerprint hash ({err}); refusing to skip a record that cannot be \
-                     decoded",
-                    source.display()
-                )
-            })
+/// Byte cursor over the `deps` array of a unit fingerprint JSON. Every
+/// method either consumes exactly the expected token or panics naming the
+/// record and the byte offset; there is no recovery state, so a malformed
+/// record can never yield a value.
+struct DepsScan<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+    source: &'a Path,
+}
+
+impl<'a> DepsScan<'a> {
+    fn fail(&self, what: &str) -> ! {
+        panic!(
+            "malformed `deps` array in {} at byte {}: {what}; cargo's fingerprint JSON may \
+             have changed shape — refusing to decode the record by guesswork",
+            self.source.display(),
+            self.pos
+        )
+    }
+
+    fn peek(&self) -> u8 {
+        match self.bytes.get(self.pos) {
+            Some(byte) => *byte,
+            None => self.fail("record ends inside the array"),
+        }
+    }
+
+    fn expect(&mut self, byte: u8) {
+        let found = self.peek();
+        if found != byte {
+            self.fail(&format!("expected {:?}, found {:?}", byte as char, found as char));
+        }
+        self.pos += 1;
+    }
+
+    /// Consumes `byte` if it is next; reports whether it did.
+    fn eat(&mut self, byte: u8) -> bool {
+        let hit = self.bytes.get(self.pos) == Some(&byte);
+        self.pos += usize::from(hit);
+        hit
+    }
+
+    fn u64_field(&mut self) -> u64 {
+        let start = self.pos;
+        while self.bytes.get(self.pos).is_some_and(u8::is_ascii_digit) {
+            self.pos += 1;
+        }
+        if self.pos == start {
+            self.fail("expected an unsigned integer field");
+        }
+        let digits = std::str::from_utf8(&self.bytes[start..self.pos])
+            .expect("ASCII digits are valid UTF-8");
+        digits.parse::<u64>().unwrap_or_else(|err| {
+            self.fail(&format!("integer field {digits:?} is not a u64 ({err})"))
         })
-        .collect();
+    }
+
+    /// A string field. Escape sequences are a hard failure, not decoded:
+    /// dep names cargo records never need them, so one appearing means the
+    /// record does not have the shape this scanner understands.
+    fn str_field(&mut self) -> &'a str {
+        self.expect(b'"');
+        let start = self.pos;
+        loop {
+            match self.peek() {
+                b'"' => break,
+                b'\\' => self.fail("string field holds an escape sequence"),
+                _ => self.pos += 1,
+            }
+        }
+        // The delimiting quotes are ASCII bytes, so the enclosed byte range
+        // of this (already valid UTF-8) record is valid UTF-8 itself.
+        let text = std::str::from_utf8(&self.bytes[start..self.pos])
+            .expect("bytes between ASCII quote delimiters of a str are valid UTF-8");
+        self.pos += 1;
+        text
+    }
+
+    fn bool_field(&mut self) {
+        if self.bytes[self.pos..].starts_with(b"true") {
+            self.pos += 4;
+        } else if self.bytes[self.pos..].starts_with(b"false") {
+            self.pos += 5;
+        } else {
+            self.fail("expected `true` or `false`");
+        }
+    }
+}
+
+/// Pulls the `ez_ffmpeg` dependency's fingerprint hash out of a unit
+/// fingerprint JSON. Cargo writes the record as minified JSON whose sole
+/// top-level `deps` key holds an array of four-element entries
+/// `[<pkg-id-hash>, "<dep name>", <public flag>, <fingerprint-hash>]`, and
+/// the entry named `ez_ffmpeg` is the lib this unit was built against.
+/// The decoding is dependency-free, so instead of a JSON parser there is a
+/// scanner that anchors on the single `"deps":[` occurrence and accepts
+/// precisely the recorded entry shape. Dep-name text appearing anywhere
+/// else in the record (another field could embed `"ez_ffmpeg",77`) is
+/// never consulted, and every deviation — a missing or duplicated
+/// `"deps":[` key, an entry with the wrong element count or types, an
+/// unterminated string, a non-u64 number — is a hard failure naming the
+/// record, never a guess.
+fn lib_dep_fingerprint(json: &str, source: &Path) -> u64 {
+    const DEPS_KEY: &str = "\"deps\":[";
+    let mut occurrences = json.match_indices(DEPS_KEY).map(|(idx, _)| idx);
+    let anchor = occurrences.next().unwrap_or_else(|| {
+        panic!(
+            "no `\"deps\":[` key in {}; cargo's fingerprint JSON may have changed shape — \
+             the rlib this test binary links cannot be identified",
+            source.display()
+        )
+    });
+    if let Some(imposter) = occurrences.next() {
+        panic!(
+            "`\"deps\":[` occurs at byte {anchor} and again at byte {imposter} of {}; \
+             refusing to guess which one is the top-level deps array",
+            source.display()
+        );
+    }
+    let mut scan = DepsScan { bytes: json.as_bytes(), pos: anchor + DEPS_KEY.len(), source };
+    let mut hashes: Vec<u64> = Vec::new();
+    if !scan.eat(b']') {
+        loop {
+            scan.expect(b'[');
+            scan.u64_field(); // package-id hash: shape-checked, value unused
+            scan.expect(b',');
+            let name = scan.str_field();
+            scan.expect(b',');
+            scan.bool_field();
+            scan.expect(b',');
+            let fingerprint = scan.u64_field();
+            scan.expect(b']');
+            if name == LIB_DEP_NAME {
+                hashes.push(fingerprint);
+            }
+            if scan.eat(b']') {
+                break;
+            }
+            scan.expect(b',');
+        }
+    }
     hashes.sort_unstable();
     hashes.dedup();
     match hashes[..] {
         [fp] => fp,
         [] => panic!(
-            "no `{LIB_DEP_NAME}` dep entry with a fingerprint hash in {}; cargo's fingerprint \
-             JSON may have changed shape — the rlib this test binary links cannot be identified",
+            "no `{LIB_DEP_NAME}` dep entry in the `deps` array of {}; the rlib this test \
+             binary links cannot be identified",
             source.display()
         ),
         _ => panic!(
@@ -79,11 +187,43 @@ fn lib_dep_fingerprint(json: &str, source: &Path) -> u64 {
     }
 }
 
+/// A unit directory with no `lib-ez_ffmpeg` record is normally structural —
+/// a unit of this package that builds no lib (this test's own unit, a
+/// build-script unit) — and safe to skip. But cargo writes the artifact
+/// before the fingerprint record, so an interrupted build can leave
+/// `deps/libez_ffmpeg-<hash>.rlib` behind with the record missing, and such
+/// an orphan could be the very build this binary links: skipping its unit
+/// would let a stale sibling claim the unique match. Unit directory and
+/// artifact share the hash (`.fingerprint/<pkg>-<hash>` names
+/// `libez_ffmpeg-<hash>.rlib` — the same correspondence the selected
+/// unit's rlib path is built from after the scan), so the skip is allowed
+/// only once that artifact is proven absent.
+fn assert_no_orphan_rlib(deps: &Path, record: &Path, unit_hash: &str) {
+    let artifact = deps.join(format!("lib{LIB_DEP_NAME}-{unit_hash}.rlib"));
+    match artifact.symlink_metadata() {
+        Ok(_) => panic!(
+            "unit record {} does not exist, yet the unit's artifact {} does; an interrupted \
+             build can leave an rlib whose fingerprint was never written, and the linked \
+             rlib cannot be claimed unique while such a candidate exists (run `cargo clean`)",
+            record.display(),
+            artifact.display()
+        ),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => panic!(
+            "unit record {} does not exist and the probe for its artifact {} failed ({err}); \
+             refusing to skip a unit whose artifact state cannot be read",
+            record.display(),
+            artifact.display()
+        ),
+    }
+}
+
 /// Resolves the deps directory, the exact `libez_ffmpeg-<hash>.rlib` this
 /// test binary was linked against, and a listing of every other coexisting
 /// rlib (the listing feeds diagnostics only — those rlibs are never
-/// consulted, and deps-directory entries that cannot be read are annotated
-/// in it rather than dropped).
+/// consulted, and a deps-directory entry that cannot be read, or a deps
+/// directory that cannot be listed at all, is annotated in it rather than
+/// dropped).
 ///
 /// Identity, not recency: several `libez_ffmpeg-*.rlib` builds coexist in
 /// deps/ (feature variants, artifacts surviving interrupted builds), and any
@@ -103,11 +243,14 @@ fn lib_dep_fingerprint(json: &str, source: &Path) -> u64 {
 /// Any step that cannot be completed fails the test naming the searched
 /// path — including every record touched along the way: an unreadable
 /// directory entry, a non-UTF-8 file name, or an unreadable or malformed
-/// `lib-ez_ffmpeg` record aborts the scan instead of being skipped, because
-/// step 3 may claim a unique match only if every candidate record was
-/// actually read. There is deliberately no fallback: a broken chain means
-/// the linked rlib cannot be identified, and guessing would reopen the
-/// false-pass hole.
+/// `lib-ez_ffmpeg` record aborts the scan instead of being skipped, and a
+/// unit directory with no such record is skipped only once its same-hash
+/// rlib artifact is proven absent (cargo writes the artifact before the
+/// record, so an interrupted build strands an rlib no record accounts
+/// for), because step 3 may claim a unique match only if every candidate
+/// that could be the linked lib was actually read. There is deliberately
+/// no fallback: a broken chain means the linked rlib cannot be identified,
+/// and guessing would reopen the false-pass hole.
 fn linked_rlib() -> (PathBuf, PathBuf, Vec<String>) {
     let exe = std::env::current_exe().expect("cannot resolve the running test executable");
     let deps = exe
@@ -154,7 +297,8 @@ fn linked_rlib() -> (PathBuf, PathBuf, Vec<String>) {
     // very unit that was linked, letting a stale sibling pass as "unique".
     // Only two outcomes skip a directory — a foreign package prefix, or the
     // record file not existing (a unit of this package that is not the lib,
-    // e.g. this test's own unit).
+    // e.g. this test's own unit) once the unit is also proven to have left
+    // no orphan rlib artifact behind.
     let mut lib_hashes: Vec<String> = Vec::new();
     for entry in entries {
         let entry = entry.unwrap_or_else(|err| {
@@ -178,7 +322,10 @@ fn linked_rlib() -> (PathBuf, PathBuf, Vec<String>) {
         let record = entry.path().join(format!("lib-{LIB_DEP_NAME}"));
         let recorded = match std::fs::read_to_string(&record) {
             Ok(text) => text,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                assert_no_orphan_rlib(&deps, &record, hash);
+                continue;
+            }
             Err(err) => panic!(
                 "cannot read lib unit record {} ({err}); the linked rlib cannot be claimed \
                  unique while any candidate record is unreadable",
@@ -193,6 +340,13 @@ fn linked_rlib() -> (PathBuf, PathBuf, Vec<String>) {
              record is undecodable",
             record.display()
         );
+        // The equality is over lowercase hex on both sides: the needle by
+        // construction (`{:02x}`), the record by normalization here. The
+        // validation above admits either case, and two records holding one
+        // fingerprint in two cases must collide into the several-units
+        // panic below — a case difference must never manufacture a unique
+        // match.
+        let recorded = recorded.to_ascii_lowercase();
         if recorded == needle {
             lib_hashes.push(hash.to_owned());
         }
@@ -223,23 +377,28 @@ fn linked_rlib() -> (PathBuf, PathBuf, Vec<String>) {
     // Diagnostics only: list the coexisting rlibs so a stale-artifact puzzle
     // is recognizable. Entries this walk cannot decode are annotated in the
     // listing instead of silently dropped — hiding them would understate how
-    // crowded deps/ is exactly when the state is corrupt.
-    let others: Vec<String> = std::fs::read_dir(&deps)
-        .unwrap_or_else(|err| panic!("cannot read deps directory {} ({err})", deps.display()))
-        .filter_map(|entry| match entry {
-            Ok(entry) => {
-                let path = entry.path();
-                match path.file_name().and_then(|name| name.to_str()) {
-                    Some(name) => (name.starts_with("libez_ffmpeg-")
-                        && name.ends_with(".rlib")
-                        && path != rlib)
-                        .then(|| path.display().to_string()),
-                    None => Some(format!("{} (non-UTF-8 file name)", path.display())),
+    // crowded deps/ is exactly when the state is corrupt — and a deps
+    // directory that cannot be listed at all becomes a single annotated
+    // line: this listing exists to explain a primary failure, so it must
+    // never panic and preempt that failure's own message.
+    let others: Vec<String> = match std::fs::read_dir(&deps) {
+        Ok(entries) => entries
+            .filter_map(|entry| match entry {
+                Ok(entry) => {
+                    let path = entry.path();
+                    match path.file_name().and_then(|name| name.to_str()) {
+                        Some(name) => (name.starts_with("libez_ffmpeg-")
+                            && name.ends_with(".rlib")
+                            && path != rlib)
+                            .then(|| path.display().to_string()),
+                        None => Some(format!("{} (non-UTF-8 file name)", path.display())),
+                    }
                 }
-            }
-            Err(err) => Some(format!("<unreadable entry in {} ({err})>", deps.display())),
-        })
-        .collect();
+                Err(err) => Some(format!("<unreadable entry in {} ({err})>", deps.display())),
+            })
+            .collect(),
+        Err(err) => vec![format!("<cannot list deps dir {}: {err}>", deps.display())],
+    };
     (deps, rlib, others)
 }
 
