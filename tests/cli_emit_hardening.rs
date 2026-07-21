@@ -34,15 +34,32 @@ const LIB_DEP_NAME: &str = "ez_ffmpeg";
 /// `[<pkg-id-hash>, "<dep name>", <bool>, <fingerprint-hash>]`, and the one
 /// named `ez_ffmpeg` is the lib this unit was built against. The scan is
 /// textual to keep the test dependency-free; any shape drift fails loudly
-/// instead of guessing.
+/// instead of guessing — an entry that carries the dep-name marker but not a
+/// parsable trailing hash is a hard failure, never a skip, so the hash below
+/// is reported as unique only after every marker occurrence was decoded.
 fn lib_dep_fingerprint(json: &str, source: &Path) -> u64 {
     let marker = format!("\"{LIB_DEP_NAME}\",");
     let mut hashes: Vec<u64> = json
         .match_indices(&marker)
-        .filter_map(|(idx, _)| {
-            let entry = &json[idx + marker.len()..];
-            let entry = &entry[..entry.find(']')?];
-            entry.rsplit(',').next()?.trim().parse::<u64>().ok()
+        .map(|(idx, _)| {
+            let tail = &json[idx + marker.len()..];
+            let end = tail.find(']').unwrap_or_else(|| {
+                panic!(
+                    "`{LIB_DEP_NAME}` dep entry at byte {idx} of {} has no closing `]`; \
+                     refusing to skip a record that cannot be decoded",
+                    source.display()
+                )
+            });
+            let entry = &tail[..end];
+            let field = entry.rfind(',').map_or(entry, |comma| &entry[comma + 1..]).trim();
+            field.parse::<u64>().unwrap_or_else(|err| {
+                panic!(
+                    "`{LIB_DEP_NAME}` dep entry at byte {idx} of {} ends in {field:?}, not a \
+                     u64 fingerprint hash ({err}); refusing to skip a record that cannot be \
+                     decoded",
+                    source.display()
+                )
+            })
         })
         .collect();
     hashes.sort_unstable();
@@ -63,8 +80,10 @@ fn lib_dep_fingerprint(json: &str, source: &Path) -> u64 {
 }
 
 /// Resolves the deps directory, the exact `libez_ffmpeg-<hash>.rlib` this
-/// test binary was linked against, and every other coexisting rlib (those
-/// feed diagnostics only — they are never consulted).
+/// test binary was linked against, and a listing of every other coexisting
+/// rlib (the listing feeds diagnostics only — those rlibs are never
+/// consulted, and deps-directory entries that cannot be read are annotated
+/// in it rather than dropped).
 ///
 /// Identity, not recency: several `libez_ffmpeg-*.rlib` builds coexist in
 /// deps/ (feature variants, artifacts surviving interrupted builds), and any
@@ -82,9 +101,14 @@ fn lib_dep_fingerprint(json: &str, source: &Path) -> u64 {
 ///      rlib: `libez_ffmpeg-<lib-unit-hash>.rlib`.
 ///
 /// Any step that cannot be completed fails the test naming the searched
-/// path. There is deliberately no fallback: a broken chain means the linked
-/// rlib cannot be identified, and guessing would reopen the false-pass hole.
-fn linked_rlib() -> (PathBuf, PathBuf, Vec<PathBuf>) {
+/// path — including every record touched along the way: an unreadable
+/// directory entry, a non-UTF-8 file name, or an unreadable or malformed
+/// `lib-ez_ffmpeg` record aborts the scan instead of being skipped, because
+/// step 3 may claim a unique match only if every candidate record was
+/// actually read. There is deliberately no fallback: a broken chain means
+/// the linked rlib cannot be identified, and guessing would reopen the
+/// false-pass hole.
+fn linked_rlib() -> (PathBuf, PathBuf, Vec<String>) {
     let exe = std::env::current_exe().expect("cannot resolve the running test executable");
     let deps = exe
         .parent()
@@ -124,16 +148,55 @@ fn linked_rlib() -> (PathBuf, PathBuf, Vec<PathBuf>) {
     let entries = std::fs::read_dir(&fingerprint_root).unwrap_or_else(|err| {
         panic!("cannot read fingerprint root {} ({err})", fingerprint_root.display())
     });
-    let mut lib_hashes: Vec<String> = entries
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            let name = entry.file_name().to_str()?.to_owned();
-            let hash = name.strip_prefix(concat!(env!("CARGO_PKG_NAME"), "-"))?.to_owned();
-            let recorded =
-                std::fs::read_to_string(entry.path().join(format!("lib-{LIB_DEP_NAME}"))).ok()?;
-            (recorded.trim() == needle).then_some(hash)
-        })
-        .collect();
+    // Uniqueness below is a claim about ALL candidate records, so every
+    // record this walk touches must be decoded: an unreadable entry, a
+    // non-UTF-8 name, or an unreadable/malformed record file could hide the
+    // very unit that was linked, letting a stale sibling pass as "unique".
+    // Only two outcomes skip a directory — a foreign package prefix, or the
+    // record file not existing (a unit of this package that is not the lib,
+    // e.g. this test's own unit).
+    let mut lib_hashes: Vec<String> = Vec::new();
+    for entry in entries {
+        let entry = entry.unwrap_or_else(|err| {
+            panic!(
+                "unreadable directory entry under fingerprint root {} ({err}); the linked \
+                 rlib cannot be claimed unique without reading every unit record",
+                fingerprint_root.display()
+            )
+        });
+        let name = entry.file_name();
+        let name = name.to_str().unwrap_or_else(|| {
+            panic!(
+                "non-UTF-8 file name {name:?} under fingerprint root {}; the linked rlib \
+                 cannot be claimed unique without decoding every unit record",
+                fingerprint_root.display()
+            )
+        });
+        let Some(hash) = name.strip_prefix(concat!(env!("CARGO_PKG_NAME"), "-")) else {
+            continue;
+        };
+        let record = entry.path().join(format!("lib-{LIB_DEP_NAME}"));
+        let recorded = match std::fs::read_to_string(&record) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => panic!(
+                "cannot read lib unit record {} ({err}); the linked rlib cannot be claimed \
+                 unique while any candidate record is unreadable",
+                record.display()
+            ),
+        };
+        let recorded = recorded.trim();
+        assert!(
+            recorded.len() == 16 && recorded.bytes().all(|b| b.is_ascii_hexdigit()),
+            "malformed lib unit record {}: {recorded:?} is not the 16-hex-digit fingerprint \
+             hash cargo writes; the linked rlib cannot be claimed unique while any candidate \
+             record is undecodable",
+            record.display()
+        );
+        if recorded == needle {
+            lib_hashes.push(hash.to_owned());
+        }
+    }
     lib_hashes.sort_unstable();
     lib_hashes.dedup();
     let lib_hash = match &lib_hashes[..] {
@@ -157,13 +220,24 @@ fn linked_rlib() -> (PathBuf, PathBuf, Vec<PathBuf>) {
         "fingerprints name {} as the linked rlib, but it does not exist",
         rlib.display()
     );
-    let others: Vec<PathBuf> = std::fs::read_dir(&deps)
+    // Diagnostics only: list the coexisting rlibs so a stale-artifact puzzle
+    // is recognizable. Entries this walk cannot decode are annotated in the
+    // listing instead of silently dropped — hiding them would understate how
+    // crowded deps/ is exactly when the state is corrupt.
+    let others: Vec<String> = std::fs::read_dir(&deps)
         .unwrap_or_else(|err| panic!("cannot read deps directory {} ({err})", deps.display()))
-        .filter_map(|entry| {
-            let path = entry.ok()?.path();
-            let name = path.file_name()?.to_str()?;
-            (name.starts_with("libez_ffmpeg-") && name.ends_with(".rlib") && path != rlib)
-                .then_some(path)
+        .filter_map(|entry| match entry {
+            Ok(entry) => {
+                let path = entry.path();
+                match path.file_name().and_then(|name| name.to_str()) {
+                    Some(name) => (name.starts_with("libez_ffmpeg-")
+                        && name.ends_with(".rlib")
+                        && path != rlib)
+                        .then(|| path.display().to_string()),
+                    None => Some(format!("{} (non-UTF-8 file name)", path.display())),
+                }
+            }
+            Err(err) => Some(format!("<unreadable entry in {} ({err})>", deps.display())),
         })
         .collect();
     (deps, rlib, others)
@@ -204,7 +278,6 @@ fn assert_type_checks(code: &str, name: &str) {
         return;
     }
     let stderr = String::from_utf8_lossy(&out.stderr);
-    let others: Vec<String> = others.iter().map(|path| path.display().to_string()).collect();
     let others = if others.is_empty() {
         "none".to_string()
     } else {
