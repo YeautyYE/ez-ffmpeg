@@ -302,7 +302,9 @@ experimental and may be reshaped in a future minor release.
   same-build CLI run, in the same throughput class — and
   `conversion_precision(ConversionPrecision::High)` opts into accurate
   rounding + full chroma interpolation when the last bit of precision matters
-  more than speed.
+  more than speed. (v0.14.0 shipped the High-equivalent flags as the only
+  behavior; `High` reproduces v0.14.0 bytes exactly, while the current
+  default matches the CLI.)
 - **`SampleExtractor`** turns audio into owned, interleaved `f32` PCM;
   `for_whisper()` presets the 16 kHz mono shape ASR models consume.
 
