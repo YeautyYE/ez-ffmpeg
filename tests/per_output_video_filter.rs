@@ -487,9 +487,9 @@ fn unknown_filter_name_fails_build() {
 }
 
 // ---------------------------------------------------------------------------
-// Review probes: mapping spellings must not bypass the simple/complex
-// conflict (fftools binds unlabeled graph outputs before manual/automatic
-// mapping and then errors in ost_get_filters).
+// Mapping spellings must not bypass the simple/complex conflict (fftools
+// binds unlabeled graph outputs before manual/automatic mapping and then
+// errors in ost_get_filters).
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -570,8 +570,8 @@ fn multi_output_complex_conflict_hits_the_filtered_output() {
 }
 
 // ---------------------------------------------------------------------------
-// Review probes: a configured filter no video stream consumed is a typed
-// error, never a silent drop.
+// A configured filter with no video stream consumed is a typed error,
+// never a silent drop.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -670,7 +670,7 @@ fn filter_with_disable_video_is_rejected() {
 }
 
 // ---------------------------------------------------------------------------
-// Review probes: topology beyond pad counts — disconnected, unreachable and
+// Topology beyond pad counts — disconnected, unreachable and
 // zero/multi-pad descriptions are all the promised typed shape error.
 // ---------------------------------------------------------------------------
 
@@ -735,7 +735,7 @@ fn multi_input_graph_is_rejected() {
 }
 
 // ---------------------------------------------------------------------------
-// Review probes: VideoWriter honors the Output-level chain.
+// VideoWriter honors the Output-level chain.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -779,10 +779,10 @@ fn video_writer_rejects_conflicting_filter_descriptions() {
 }
 
 // ---------------------------------------------------------------------------
-// Review probes (round 2): per-output assignment semantics of the
-// simple/complex conflict — an output the unlabeled graph does NOT land on
-// keeps its simple filter, exactly like FFmpeg 7.1; the output that receives
-// the graph still conflicts. Both orders covered.
+// Per-output assignment semantics of the simple/complex conflict — an
+// output the unlabeled graph does NOT land on keeps its simple filter,
+// exactly like FFmpeg 7.1; the output that receives the graph still
+// conflicts. Both orders covered.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -856,10 +856,9 @@ fn filtered_output_receiving_the_graph_still_conflicts() {
 }
 
 // ---------------------------------------------------------------------------
-// Review probes (round 3): disable flags must not derail fftools-order
-// assignment — FFmpeg 7.1 puts an unlabeled graph on a -vn output and still
-// filters the next output. Legacy (no set_video_filter) ordering stays
-// pinned bit for bit.
+// Disable flags must not derail fftools-order assignment — FFmpeg 7.1 puts
+// an unlabeled graph on a -vn output and still filters the next output.
+// Legacy (no set_video_filter) ordering stays pinned bit for bit.
 // ---------------------------------------------------------------------------
 
 #[test]

@@ -1,12 +1,12 @@
 //! Emit injection hardening: user-controlled argv text must never break out
 //! of the generated program's comments or string literals.
 //!
-//! The review probe: a VERIFIED V6 command whose `-hls_segment_filename`
-//! value smuggles a quoted newline followed by `compile_error!(...)`. Before
-//! the fix the emitter copied raw argv into `//` comments, so the payload
-//! escaped the comment and the generated program failed to compile. Now
-//! every piece of user text placed in comments is control-escaped, and the
-//! probe must produce a program that type-checks.
+//! The regression case: a VERIFIED V6 command whose `-hls_segment_filename`
+//! value smuggles a quoted newline followed by `compile_error!(...)`. An
+//! emitter that copies raw argv into `//` comments lets the payload escape
+//! the comment, and the generated program fails to compile. Every piece of
+//! user text placed in comments is therefore control-escaped, and the
+//! command must produce a program that type-checks.
 //!
 //! Type-checking is real: the generated source is compiled with
 //! `rustc --emit=metadata` against this build's own `libez_ffmpeg` rlib (no
@@ -99,7 +99,7 @@ fn harness_compiles_a_benign_emission() {
 
 #[test]
 fn quoted_newline_payload_cannot_escape_generated_comments() {
-    // The review's probe: a quoted newline + compile_error! in a VERIFIED
+    // The payload: a quoted newline + compile_error! in a VERIFIED
     // V6 command's segment filename.
     let hostile = "ffmpeg -i in.mp4 -c:v libx264 -crf 23 -c:a aac -f hls -hls_time 6 \
                    -hls_playlist_type vod -hls_list_size 0 -hls_segment_filename \

@@ -838,8 +838,8 @@ fn oracle_hls(run: &GoldenRun) {
 }
 
 // ---------------------------------------------------------------------------
-// The V5 structural-uniqueness prerequisite (review probe): a two-video
-// input must be rejected, not silently filtered over a selected stream.
+// The V5 structural-uniqueness prerequisite: a two-video input must be
+// rejected, not silently filtered over a selected stream.
 // ---------------------------------------------------------------------------
 
 #[test]

@@ -1,7 +1,7 @@
 //! Positional scoper + option classifier: argv tokens -> [`CliIr`].
 //!
 //! The walk mirrors the fftools grammar ("options are applied to the next
-//! specified file") restricted to the Round-1 canonical layout:
+//! specified file") restricted to the supported canonical layout:
 //!
 //! ```text
 //! [globals|input options] -i INPUT [globals|output options] OUTPUT [globals]
@@ -113,8 +113,8 @@ impl Parser {
             return Err(CliError::UnsupportedLayout {
                 token: "-i".to_string(),
                 index,
-                reason: "the Round-1 subset is single-input; multi-input commands (overlay, \
-                         concat, …) are planned for Round 2"
+                reason: "the current supported subset is single-input; multi-input commands \
+                         (overlay, concat, …) are planned for a future release"
                     .to_string(),
             });
         }
@@ -147,7 +147,8 @@ impl Parser {
             return Err(CliError::UnsupportedLayout {
                 token: url.to_string(),
                 index,
-                reason: "the Round-1 subset is single-output; run one command per output"
+                reason: "the current supported subset is single-output; run one command per \
+                         output"
                     .to_string(),
             });
         }
@@ -489,8 +490,9 @@ fn check_combinations(ir: &CliIr) -> Result<(), CliError> {
             return conflict(
                 "-vf",
                 "-map",
-                "Round 1 accepts basic maps in filterless commands only; combining explicit \
-                 maps with filters needs labeled graphs (Round 2)",
+                "the current supported subset accepts basic maps in filterless commands only; \
+                 combining explicit maps with filters needs labeled graphs, which are planned \
+                 for a future release",
             );
         }
     }
@@ -534,24 +536,24 @@ fn check_combinations(ir: &CliIr) -> Result<(), CliError> {
         return conflict("-vn", "-an", "the output would have no streams at all");
     }
 
-    // -crf/-preset are whitelisted for the libx264 path only (Round 1): on
-    // any other encoder they would fall through to AVOption lookup with
+    // -crf/-preset are whitelisted for the libx264 path only: on any other
+    // encoder they would fall through to AVOption lookup with
     // build-dependent results.
     let x264 = out.video_codec.as_deref() == Some("libx264");
     if out.crf.is_some() && !x264 {
         return conflict(
             "-crf",
             "-c:v",
-            "Round 1 whitelists -crf for `-c:v libx264` only; on other encoders crf is an \
-             encoder-private AVOption with build-dependent meaning",
+            "the current supported subset whitelists -crf for `-c:v libx264` only; on other \
+             encoders crf is an encoder-private AVOption with build-dependent meaning",
         );
     }
     if out.preset.is_some() && !x264 {
         return conflict(
             "-preset",
             "-c:v",
-            "Round 1 whitelists -preset for `-c:v libx264` only; on other encoders preset is \
-             an encoder-private AVOption with build-dependent meaning",
+            "the current supported subset whitelists -preset for `-c:v libx264` only; on \
+             other encoders preset is an encoder-private AVOption with build-dependent meaning",
         );
     }
 

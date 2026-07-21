@@ -130,8 +130,8 @@ fn pins_v6(ir: &CliIr) -> bool {
         && ir.output.hls_segment_filename.is_some()
 }
 
-/// The R6 six: transcode, re-encoded clip, audio extract, thumbnail, scaled
-/// transcode, VOD HLS.
+/// The six verified shapes: transcode, re-encoded clip, audio extract,
+/// thumbnail, scaled transcode, VOD HLS.
 pub(crate) const VERIFIED_SHAPES: &[VerifiedShape] = &[
     VerifiedShape {
         id: "V1",
