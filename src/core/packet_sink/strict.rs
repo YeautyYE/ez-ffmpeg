@@ -137,7 +137,7 @@ pub(crate) struct PacketSinkWorker {
     /// Shared origin state machine.
     timeline: Timeline,
     /// First delivery-path error; cloned into the job result and handed to
-    /// `on_error` at the terminal slot.
+    /// `on_delivery_error` at the terminal slot.
     pending_error: Option<PacketSinkError>,
     /// Reused Annex-B -> AVCC conversion buffer (high-water sized).
     scratch: Vec<u8>,
@@ -558,7 +558,7 @@ impl PacketSinkWorker {
     /// Terminal slot (where the muxer would write its trailer). One-way phase
     /// transition — a second call is a no-op, so no terminal event can ever
     /// fire twice. Fires `on_end` only through the strong gate; fires
-    /// `on_error` for a stashed delivery-path error, or as
+    /// `on_delivery_error` for a stashed delivery-path error, or as
     /// [`PacketSinkError::JobFailed`] when the job failed elsewhere (whether
     /// or not that failure truncated this sink's delivery — `wait()` keeps
     /// the original error); stays silent for aborts and clean cancellation.
