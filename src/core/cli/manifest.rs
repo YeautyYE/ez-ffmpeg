@@ -20,7 +20,7 @@
 
 use super::ir::CliIr;
 #[cfg(test)]
-use super::table::{Arity, Repeat, ScopeRule, Selector, OPTION_TABLE};
+use super::table::{Repeat, ScopeRule, Selector, OPTION_TABLE};
 
 /// Manifest revision. Bump on ANY change to the accept surface, the shape
 /// tables, or a rejection reason. Emitted code headers carry this value.
@@ -509,12 +509,15 @@ pub(crate) fn manifest_docs_markdown() -> String {
             Repeat::Accumulate => "accumulates",
             Repeat::Free => "repeatable",
         };
-        let notes = if spec.selector == Selector::NoOp {
-            "accepted, no in-process effect"
-        } else if spec.arity == Arity::Flag {
-            "flag"
-        } else {
-            "takes a value"
+        // The notes column carries the REAL value grammar (from the same
+        // table row validation reads), never a generic "takes a value".
+        let notes = match (spec.selector, spec.value) {
+            (Selector::NoOp, Some(rule)) => {
+                format!("no in-process effect; value: {}", rule.grammar())
+            }
+            (Selector::NoOp, None) => "accepted, no in-process effect".to_string(),
+            (_, Some(rule)) => rule.grammar().to_string(),
+            (_, None) => "flag".to_string(),
         };
         let selector = match spec.selector {
             Selector::NoOp => "no-op",
@@ -529,6 +532,9 @@ pub(crate) fn manifest_docs_markdown() -> String {
             spec.name, scope, selector, repeat, notes, spec.sink
         ));
     }
+    out.push_str(
+        "\nCommand layout is fixed: exactly one `-i` input and exactly one output\npath, in the canonical `[global/input options] -i INPUT [output options]\nOUTPUT` order. The `-` stdin/stdout pseudo-paths are excluded — pipe I/O is\nprocess wiring, not part of the in-process subset.\n",
+    );
     out.push_str(
         "\nVerified shapes (may execute; each is backed by a semantic golden and a\ncompile-pinned emitted example):\n\n",
     );

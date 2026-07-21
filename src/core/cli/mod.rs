@@ -21,6 +21,14 @@
 //! # }
 //! ```
 //!
+//! The layer is optional; enable it in `Cargo.toml`:
+//!
+//! ```toml
+//! [dependencies.ez-ffmpeg]
+//! version = "*"
+//! features = ["cli"]
+//! ```
+//!
 //! # The contract: classify everything, approximate nothing
 //!
 //! **Broad CLI compatibility is a non-goal.** The ffmpeg CLI is ~14k lines
@@ -61,31 +69,36 @@
 //! | `-nostdin` | global | no-op | repeatable | accepted, no in-process effect | none (documented no-op) |
 //! | `-stats` | global | no-op | repeatable | accepted, no in-process effect | none (documented no-op) |
 //! | `-nostats` | global | no-op | repeatable | accepted, no in-process effect | none (documented no-op) |
-//! | `-loglevel` | global | no-op | repeatable | accepted, no in-process effect | none (documented no-op) |
-//! | `-v` | global | no-op | repeatable | accepted, no in-process effect | none (documented no-op) |
-//! | `-ss` | input or output (position-scoped) | container | once | takes a value | Input::set_start_time_us / Output::set_start_time_us |
-//! | `-t` | input or output (position-scoped) | container | once | takes a value | Input::set_recording_time_us / Output::set_recording_time_us |
-//! | `-to` | input or output (position-scoped) | container | once | takes a value | Input::set_stop_time_us / Output::set_stop_time_us |
-//! | `-f` | input or output (position-scoped) | container | once | takes a value | Input::set_format / Output::set_format |
+//! | `-loglevel` | global | no-op | repeatable | no in-process effect; value: `[repeat+][level+]LEVEL` | none (documented no-op) |
+//! | `-v` | global | no-op | repeatable | no in-process effect; value: `[repeat+][level+]LEVEL` | none (documented no-op) |
+//! | `-ss` | input or output (position-scoped) | container | once | decimal seconds only (`10`, `2.5`) | Input::set_start_time_us / Output::set_start_time_us |
+//! | `-t` | input or output (position-scoped) | container | once | decimal seconds only (`10`, `2.5`) | Input::set_recording_time_us / Output::set_recording_time_us |
+//! | `-to` | input or output (position-scoped) | container | once | decimal seconds only (`10`, `2.5`) | Input::set_stop_time_us / Output::set_stop_time_us |
+//! | `-f` | input or output (position-scoped) | container | once | container/demuxer name (`[a-z0-9_]+`) | Input::set_format / Output::set_format |
 //! | `-vn` | output | video | repeatable | flag | Output::disable_video |
 //! | `-an` | output | audio | repeatable | flag | Output::disable_audio |
-//! | `-c:v` | output | video | once | takes a value | Output::set_video_codec |
-//! | `-c:a` | output | audio | once | takes a value | Output::set_audio_codec |
-//! | `-b:v` | output | video | once | takes a value | Output::set_video_bitrate |
-//! | `-b:a` | output | audio | once | takes a value | Output::set_audio_bitrate |
-//! | `-crf` | output | video | once | takes a value | Output::set_video_codec_opt("crf", …), libx264 only |
-//! | `-preset` | output | video | once | takes a value | Output::set_video_codec_opt("preset", …), libx264 only |
-//! | `-pix_fmt` | output | video | once | takes a value | Output::set_pix_fmt |
-//! | `-ar` | output | audio | once | takes a value | Output::set_audio_sample_rate |
-//! | `-ac` | output | audio | once | takes a value | Output::set_audio_channels |
-//! | `-frames:v` | output | video | once | takes a value | Output::set_max_video_frames(1) |
-//! | `-vf` | output | video | once | takes a value | Output::set_video_filter |
-//! | `-map` | output | stream map | accumulates | takes a value | Output::add_stream_map / add_stream_map_with_copy |
-//! | `-movflags` | output | container | once | takes a value | Output::set_format_opt("movflags", "+faststart") |
-//! | `-hls_time` | output | container | once | takes a value | Output::set_format_opt("hls_time", …) |
-//! | `-hls_playlist_type` | output | container | once | takes a value | Output::set_format_opt("hls_playlist_type", "vod") |
-//! | `-hls_list_size` | output | container | once | takes a value | Output::set_format_opt("hls_list_size", "0") |
-//! | `-hls_segment_filename` | output | container | once | takes a value | Output::set_format_opt("hls_segment_filename", …) |
+//! | `-c:v` | output | video | once | codec name or `copy` (`[A-Za-z0-9_-]+`) | Output::set_video_codec |
+//! | `-c:a` | output | audio | once | codec name or `copy` (`[A-Za-z0-9_-]+`) | Output::set_audio_codec |
+//! | `-b:v` | output | video | once | `NNN` / `NNNk` / `NNNM` | Output::set_video_bitrate |
+//! | `-b:a` | output | audio | once | `NNN` / `NNNk` / `NNNM` | Output::set_audio_bitrate |
+//! | `-crf` | output | video | once | integer 0..=51 | Output::set_video_codec_opt("crf", …), libx264 only |
+//! | `-preset` | output | video | once | x264 preset name | Output::set_video_codec_opt("preset", …), libx264 only |
+//! | `-pix_fmt` | output | video | once | pixel format name (`[a-z0-9_]+`) | Output::set_pix_fmt |
+//! | `-ar` | output | audio | once | positive integer | Output::set_audio_sample_rate |
+//! | `-ac` | output | audio | once | positive integer | Output::set_audio_channels |
+//! | `-frames:v` | output | video | once | exactly `1` | Output::set_max_video_frames(1) |
+//! | `-vf` | output | video | once | single `scale=…` chain only | Output::set_video_filter |
+//! | `-map` | output | stream map | accumulates | basic index maps only (`0`, `0:v`, `0:a:1`, `0:1`, …) | Output::add_stream_map / add_stream_map_with_copy |
+//! | `-movflags` | output | container | once | exactly `+faststart` | Output::set_format_opt("movflags", "+faststart") |
+//! | `-hls_time` | output | container | once | decimal seconds > 0 | Output::set_format_opt("hls_time", …) |
+//! | `-hls_playlist_type` | output | container | once | exactly `vod` | Output::set_format_opt("hls_playlist_type", "vod") |
+//! | `-hls_list_size` | output | container | once | exactly `0` | Output::set_format_opt("hls_list_size", "0") |
+//! | `-hls_segment_filename` | output | container | once | non-empty path; `-`-leading values rejected | Output::set_format_opt("hls_segment_filename", …) |
+//!
+//! Command layout is fixed: exactly one `-i` input and exactly one output
+//! path, in the canonical `[global/input options] -i INPUT [output options]
+//! OUTPUT` order. The `-` stdin/stdout pseudo-paths are excluded — pipe I/O is
+//! process wiring, not part of the in-process subset.
 //!
 //! Verified shapes (may execute; each is backed by a semantic golden and a
 //! compile-pinned emitted example):
@@ -199,8 +212,24 @@ pub fn from_cli(command: &str) -> Result<FfmpegContext, CliError> {
 /// Emission works for verified shapes and for the manifest's enumerated
 /// unverified entries — including shapes that are
 /// not verified for execution, whose output is prominently labeled
-/// "unverified scaffolding". The generated code and [`from_cli_args`]
-/// consume the same lowered plan, so what you read is what would run.
+/// "unverified scaffolding".
+///
+/// The generated program and [`from_cli_args`] consume the same lowered
+/// plan — same builder calls, same values, same order — but they are not
+/// policy-identical. The runtime path layers three checks on top that the
+/// emitted program deliberately does not carry:
+///
+/// - **runtime-profile gate**: [`from_cli_args`] refuses to execute on a
+///   non-verified linked FFmpeg ([`CliError::UnverifiedRuntimeProfile`]);
+///   the emitted program runs against whatever FFmpeg it is built with;
+/// - **strict AVOption handling**: an in-process run fails on an option no
+///   component consumed (fftools `check_avoptions` parity, set through a
+///   crate-private flag); the emitted builder program only logs the
+///   default warning;
+/// - **unique-video-source prerequisite**: an in-process `-vf` run fails
+///   unless the opened input has exactly one video stream
+///   ([`CliError::AmbiguousFilterSource`]); the emitted program uses the
+///   builder default, which score-selects a stream like the ffmpeg CLI.
 pub fn emit_rust_code_from_args<S: AsRef<str>>(args: &[S]) -> Result<String, CliError> {
     let args: Vec<String> = args.iter().map(|s| s.as_ref().to_string()).collect();
     let args = tokenize::strip_program_token(args);

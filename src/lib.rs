@@ -113,6 +113,11 @@
 //! - **`async`**: Adds asynchronous functionality: [`FfmpegScheduler`] additionally implements
 //!   `Future`, so a running scheduler can be `.await`ed as a non-blocking alternative to the
 //!   always-available synchronous `wait()`.
+//! - **`cli`**: Strict ffmpeg command-line subset: run a supported command in-process with
+//!   `ez_ffmpeg::cli::from_cli_args`, or translate it into equivalent builder code with
+//!   `ez_ffmpeg::cli::emit_rust_code`. Every token must classify against a versioned
+//!   compatibility manifest; execution is additionally gated on verified (golden-tested)
+//!   command shapes and a verified linked-FFmpeg runtime profile — see the `cli` module docs.
 //! - **`static`**: Uses static linking for FFmpeg libraries (via `ffmpeg-next/static`).
 //!
 //! ## Relationship to the FFmpeg CLI
