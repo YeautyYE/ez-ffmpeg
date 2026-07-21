@@ -26,9 +26,13 @@
 //!
 //! Reference-binary resolution: `EZ_FFMPEG_CLI=<path>` is the STRICT lane
 //! (any failure, including a skip condition, fails the test); with the
-//! variable unset, `ffmpeg` from PATH is probed and exactly two conditions
-//! skip with a stderr note — no binary, or a libavcodec/libavformat
-//! major.minor mismatch with the linked build.
+//! variable unset, `ffmpeg` from PATH is probed and exactly three conditions
+//! skip with a stderr note — no binary, a libavcodec/libavformat
+//! major.minor mismatch with the linked build, or a linked build that lacks
+//! an encoder the shape's canonical command names. The last one is what
+//! keeps PATH discovery safe: an ambient version-matched binary must only
+//! ARM the comparison, never push a partially provisioned link (say a
+//! no-GPL build without libx264) into a guaranteed in-process failure.
 
 use std::process::Command;
 
@@ -136,6 +140,33 @@ fn cli_gate() -> CliGate {
 
 fn major_minor(v: u32) -> (u32, u32) {
     (v >> 16, (v >> 8) & 0xff)
+}
+
+/// The encoders a shape's canonical command names (`-c:v` / `-c:a` values,
+/// `copy` excluded — the fixtures themselves only use always-present native
+/// encoders).
+fn canonical_encoders(shape: &VerifiedShape) -> Vec<&'static str> {
+    shape
+        .canonical_argv
+        .iter()
+        .enumerate()
+        .filter(|(_, token)| **token == "-c:v" || **token == "-c:a")
+        .filter_map(|(i, _)| shape.canonical_argv.get(i + 1).copied())
+        .filter(|codec| *codec != "copy")
+        .collect()
+}
+
+/// The lenient lane's second gate: `cli_gate` proves a reference BINARY
+/// exists, this proves the LINKED build can execute the canonical command.
+/// Returns the first named encoder the linked build lacks. Only consulted
+/// when `EZ_FFMPEG_CLI` is unset — an explicit variable is the lane owner's
+/// promise that the environment is fully provisioned, and a missing encoder
+/// there must fail loudly downstream instead of skipping.
+fn missing_linked_encoder(shape: &VerifiedShape) -> Option<&'static str> {
+    let encoders = crate::core::codec::get_encoders();
+    canonical_encoders(shape)
+        .into_iter()
+        .find(|name| !encoders.iter().any(|e| e.codec_name == *name))
 }
 
 fn parse_lib_version(banner: &str, lib: &str) -> Option<(u32, u32)> {
@@ -452,6 +483,25 @@ fn run_shape(shape: &VerifiedShape) -> Option<GoldenRun> {
             return None;
         }
     };
+    // PATH discovery only ARMS the comparison; executing the canonical
+    // command additionally needs every encoder it names in the LINKED build.
+    // Without this, an ambient version-matched binary on a partially
+    // provisioned link (a no-GPL build without libx264) would walk the
+    // libx264 shapes straight into a guaranteed from_cli_args failure below.
+    // An explicit EZ_FFMPEG_CLI skips this check on purpose: the strict lane
+    // promises its environment and must fail loudly, never skip.
+    if std::env::var("EZ_FFMPEG_CLI").is_err() {
+        if let Some(missing) = missing_linked_encoder(shape) {
+            eprintln!(
+                "skipping {}: the linked FFmpeg lacks the `{missing}` encoder named by the \
+                 shape's canonical command; the PATH-discovered `{bin}` arms the semantic \
+                 goldens only on a fully provisioned build (set EZ_FFMPEG_CLI to make this \
+                 lane strict)",
+                shape.id
+            );
+            return None;
+        }
+    }
     let fixture = fixture_for(shape.id);
     let canonical_output = shape.canonical_argv.last().unwrap().to_string();
 
@@ -581,6 +631,28 @@ fn verified_shapes_pass_their_semantic_goldens() {
     }
 }
 
+/// The lenient encoder gate must read the canonical argv correctly: the
+/// libx264 shapes name it, the aac-only and mjpeg-only shapes do not — a
+/// drifted extraction would either skip too much (silent coverage loss on
+/// lenient lanes) or too little (a partially provisioned link walks into a
+/// guaranteed failure again). Runs ungated: pure argv inspection.
+#[test]
+fn canonical_encoder_extraction_matches_the_manifest() {
+    let by_id = |id: &str| {
+        canonical_encoders(VERIFIED_SHAPES.iter().find(|shape| shape.id == id).unwrap())
+    };
+    assert_eq!(by_id("V1"), vec!["libx264", "aac"]);
+    assert_eq!(by_id("V3"), vec!["aac"]);
+    assert_eq!(by_id("V4"), vec!["mjpeg"]);
+    for shape in VERIFIED_SHAPES {
+        assert!(
+            !canonical_encoders(shape).is_empty(),
+            "{}: every verified canonical command names its encoders explicitly",
+            shape.id
+        );
+    }
+}
+
 /// Structural evidence that V1's -crf/-preset survive the pipeline: the
 /// lowered plan carries both as encoder options and the emitted program
 /// makes both builder calls. The preset has no cheap deterministic runtime
@@ -691,16 +763,29 @@ fn oracle_audio_extract(run: &GoldenRun) {
         (1, 44100),
         "the DEFAULT-disposition bonus must select the mono track"
     );
-    // -b:a 192k observability: on this input (the fixture's already
-    // AAC-quantized mono sine) the encoder cannot spend the full request —
-    // the esds average lands near 92k — while the NO-OPTION default
-    // configuration lands near 69k. The lower bound is what matters: a
-    // vanished -b:a lowering reproduces the default figure and fails it.
+    // -b:a 192k observability, on ALL THREE lanes. On this input (the
+    // fixture's already AAC-quantized mono sine) the encoder cannot spend
+    // the full request — the esds average lands near 92k (measured: 91608
+    // on FFmpeg 7.1.3) — while the NO-OPTION default configuration lands
+    // near 69k (measured: 69118). The reference CLI's own figure is the
+    // anchor: it must clear the absolute window whose lower bound excludes
+    // the default figure, and every in-process lane must land within ±15%
+    // of it — a lane whose -b:a lowering vanished reproduces the default,
+    // ~25% below the anchor, and fails the tolerance.
+    let theirs = summarize(&run.theirs_output);
+    let emitted = summarize(&run.emitted_output);
+    let anchor = theirs[0].bit_rate;
     assert!(
-        (80_000..=210_000).contains(&ours[0].bit_rate),
-        "V3 audio bitrate {} outside the -b:a 192k window",
-        ours[0].bit_rate
+        (80_000..=210_000).contains(&anchor),
+        "V3 reference audio bitrate {anchor} outside the -b:a 192k window"
     );
+    for (lane, bit_rate) in [("ours", ours[0].bit_rate), ("emitted", emitted[0].bit_rate)] {
+        assert!(
+            (bit_rate - anchor).abs() * 100 <= anchor * 15,
+            "V3 {lane}: audio bitrate {bit_rate} deviates more than 15% from the reference \
+             CLI's {anchor} — the -b:a 192k lowering did not reach the encoder"
+        );
+    }
 
     // Fixture B (reference-CLI-built, forced dispositions): audio #0 STEREO
     // without DEFAULT, audio #1 MONO with DEFAULT. The correct selection is

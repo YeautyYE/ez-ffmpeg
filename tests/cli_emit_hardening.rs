@@ -9,8 +9,10 @@
 //! command must produce a program that type-checks.
 //!
 //! Type-checking is real: the generated source is compiled with
-//! `rustc --emit=metadata` against this build's own `libez_ffmpeg` rlib (no
-//! linking, so no native-library setup is needed).
+//! `rustc --emit=metadata` against the newest `libez_ffmpeg` rlib in this
+//! test binary's own deps directory — the single authority, required to
+//! accept; no other coexisting rlib is consulted (no linking, so no
+//! native-library setup is needed).
 
 #![cfg(feature = "cli")]
 
@@ -23,7 +25,7 @@ fn scratch_dir() -> std::path::PathBuf {
 }
 
 /// Locates this build's deps directory (where the test binary itself lives)
-/// and the newest `libez_ffmpeg-*.rlib` inside it.
+/// and every `libez_ffmpeg-*.rlib` inside it, newest modification first.
 fn deps_and_rlibs() -> (std::path::PathBuf, Vec<std::path::PathBuf>) {
     let exe = std::env::current_exe().unwrap();
     let deps = exe.parent().unwrap().to_path_buf();
@@ -47,52 +49,56 @@ fn deps_and_rlibs() -> (std::path::PathBuf, Vec<std::path::PathBuf>) {
     (deps, rlibs.into_iter().map(|(_, path)| path).collect())
 }
 
-/// Type-checks a generated program against the NEWEST `libez_ffmpeg` rlib.
-/// The newest rlib is the authority: a rejection from it fails the test —
-/// under an any-rlib-accepts rule a stale artifact from an earlier build
-/// could keep accepting a program the current crate rejects. Older rlibs
-/// (feature variants coexist in deps) are consulted only when rustc's
-/// stderr shows the rlib itself is unusable (metadata incompatibility:
-/// E0460/E0461/E0514), never on a genuine type error.
+/// Type-checks a generated program against the NEWEST `libez_ffmpeg` rlib —
+/// and ONLY that one. Multiple rlibs coexist in deps (feature variants,
+/// artifacts surviving toolchain updates), and any walk that keeps trying
+/// candidates until one accepts is a false-pass channel: a program the
+/// current crate rejects could still find one stale artifact that accepts
+/// it. So the newest rlib must accept outright; every failure — a genuine
+/// type error, but also an unusable artifact (metadata incompatibility
+/// after a toolchain change) — fails the test, and the message lists the
+/// coexisting rlibs so a stale-toolchain failure is recognizable and
+/// fixable (`cargo clean`) instead of silently routed around.
 fn assert_type_checks(code: &str, name: &str) {
     let dir = scratch_dir();
     let source = dir.join(format!("{name}.rs"));
     std::fs::write(&source, code).unwrap();
     let (deps, rlibs) = deps_and_rlibs();
-    let mut skipped = Vec::new();
-    for rlib in &rlibs {
-        let out = Command::new("rustc")
-            .arg("--edition")
-            .arg("2021")
-            .arg("--crate-type")
-            .arg("bin")
-            .arg("--emit=metadata")
-            .arg("--extern")
-            .arg(format!("ez_ffmpeg={}", rlib.display()))
-            .arg("-L")
-            .arg(format!("dependency={}", deps.display()))
-            .arg("--out-dir")
-            .arg(&dir)
-            .arg(&source)
-            .output()
-            .expect("failed to spawn rustc");
-        if out.status.success() {
-            return;
-        }
-        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-        let rlib_unusable = ["E0460", "E0461", "E0514", "incompatible version of rustc"]
-            .iter()
-            .any(|signature| stderr.contains(signature));
-        assert!(
-            rlib_unusable,
-            "generated program {name} failed to type-check against the newest usable rlib {}:\n{stderr}",
-            rlib.display()
-        );
-        skipped.push(format!("{}:\n{stderr}", rlib.display()));
+    let newest = &rlibs[0];
+    let out = Command::new("rustc")
+        .arg("--edition")
+        .arg("2021")
+        .arg("--crate-type")
+        .arg("bin")
+        .arg("--emit=metadata")
+        .arg("--extern")
+        .arg(format!("ez_ffmpeg={}", newest.display()))
+        .arg("-L")
+        .arg(format!("dependency={}", deps.display()))
+        .arg("--out-dir")
+        .arg(&dir)
+        .arg(&source)
+        .output()
+        .expect("failed to spawn rustc");
+    if out.status.success() {
+        return;
     }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let others: Vec<String> = rlibs[1..]
+        .iter()
+        .map(|rlib| rlib.display().to_string())
+        .collect();
+    let others = if others.is_empty() {
+        "none".to_string()
+    } else {
+        others.join(", ")
+    };
     panic!(
-        "no usable rlib: every candidate was metadata-incompatible:\n{}",
-        skipped.join("\n---\n")
+        "generated program {name} failed to type-check against the newest rlib {}:\n{stderr}\n\
+         older coexisting rlibs (deliberately not consulted — an accept from a stale artifact \
+         proves nothing; if the failure above is a metadata incompatibility from a toolchain \
+         change, run `cargo clean`): {others}",
+        newest.display()
     );
 }
 
