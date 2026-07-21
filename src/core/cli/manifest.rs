@@ -24,7 +24,7 @@ use super::table::{Repeat, ScopeRule, Selector, OPTION_TABLE};
 
 /// Manifest revision. Bump on ANY change to the accept surface, the shape
 /// tables, or a rejection reason. Emitted code headers carry this value.
-pub(crate) const MANIFEST_REVISION: u32 = 3;
+pub(crate) const MANIFEST_REVISION: u32 = 4;
 
 /// The CLI dialect this parser implements: the option grammar was written
 /// against the FFmpeg 7.1 command-line documentation and fftools sources.
