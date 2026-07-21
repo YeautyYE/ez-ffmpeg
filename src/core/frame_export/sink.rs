@@ -24,6 +24,8 @@ use ffmpeg_sys_next::{
     AVRational, AV_FRAME_FLAG_KEY, AV_NOPTS_VALUE,
 };
 use std::ffi::{CStr, CString};
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const US_PER_SEC: AVRational = AVRational {
     num: 1,
@@ -45,12 +47,25 @@ const US_PER_SEC: AVRational = AVRational {
 struct BufferPool {
     tx: Sender<Vec<u8>>,
     rx: Receiver<Vec<u8>>,
+    /// Test-only: `take` calls served by a previously-released buffer.
+    #[cfg(test)]
+    reuses: AtomicU64,
+    /// Test-only: `take` calls that fell through to a fresh allocation.
+    #[cfg(test)]
+    allocs: AtomicU64,
 }
 
 impl BufferPool {
     fn new(slots: usize) -> Self {
         let (tx, rx) = crossbeam_channel::bounded(slots.max(1));
-        Self { tx, rx }
+        Self {
+            tx,
+            rx,
+            #[cfg(test)]
+            reuses: AtomicU64::new(0),
+            #[cfg(test)]
+            allocs: AtomicU64::new(0),
+        }
     }
 
     /// The sender handed to each `VideoFrame` as its drop-time return path.
@@ -72,10 +87,29 @@ impl BufferPool {
         while let Ok(mut buf) = self.rx.try_recv() {
             if buf.capacity() >= total && buf.capacity() <= max_keep {
                 buf.clear();
+                #[cfg(test)]
+                self.reuses.fetch_add(1, Ordering::Relaxed);
                 return buf;
             }
         }
+        #[cfg(test)]
+        self.allocs.fetch_add(1, Ordering::Relaxed);
         Vec::with_capacity(total)
+    }
+
+    /// Test-only accounting: how many `take` calls a parked buffer served.
+    /// Reuse is not observable from outside the pool without leaning on
+    /// allocator behavior (the capacity or address of a freed block can
+    /// coincide with a fresh allocation), so the pool counts its own dequeues.
+    #[cfg(test)]
+    fn reuse_count(&self) -> u64 {
+        self.reuses.load(Ordering::Relaxed)
+    }
+
+    /// Test-only accounting: how many `take` calls allocated fresh.
+    #[cfg(test)]
+    fn alloc_count(&self) -> u64 {
+        self.allocs.load(Ordering::Relaxed)
     }
 }
 
@@ -411,21 +445,25 @@ mod tests {
         }
     }
 
-    /// A dropped `VideoFrame` hands its buffer back to the pool; the next
-    /// `take` reuses that very allocation instead of allocating fresh.
+    /// Pool accounting across a resolution-change scenario: the buffer a
+    /// dropped `VideoFrame` releases serves the next equal-size `take` (a
+    /// reuse, no fresh allocation), while a `take` grown past the parked
+    /// capacity falls through to a fresh allocation. The pool's own dequeue
+    /// counters make the proof exact — external signals such as the returned
+    /// buffer's capacity or address can coincide with a freed-then-reallocated
+    /// block, and inspecting spare capacity for surviving bytes reads memory
+    /// `Vec` no longer defines.
     #[test]
     fn dropped_frame_recycles_its_buffer() {
         let pool = BufferPool::new(2);
-        // Capacity 24 for a 12-byte payload: the surplus capacity and the
-        // sentinel bytes written into it are the identity marks that must
-        // survive the round trip through the pool.
-        let mut first = pool.take(24);
+        // First frame: nothing is parked yet, so the take allocates.
+        let mut first = pool.take(12);
         first.extend_from_slice(&[7u8; 12]);
-        for slot in first.spare_capacity_mut() {
-            slot.write(0xA5);
-        }
-        let capacity = first.capacity();
-        let ptr = first.as_ptr();
+        assert_eq!(
+            (pool.alloc_count(), pool.reuse_count()),
+            (1, 0),
+            "the first take has nothing to reuse"
+        );
         let vf = VideoFrame::new(
             2,
             2,
@@ -437,45 +475,42 @@ mod tests {
         );
         assert_eq!(pool.rx.len(), 0, "buffer still owned by the live frame");
         drop(vf);
-        // The drop parked exactly one buffer and the next take consumed it
-        // (parked count 1 -> 0).
         assert_eq!(pool.rx.len(), 1, "drop must park the buffer in the pool");
-        let reused = pool.take(12);
+        // Second frame at the same size: served by the parked buffer.
+        let mut second = pool.take(12);
         assert_eq!(pool.rx.len(), 0, "take must consume the parked buffer");
-        assert!(reused.is_empty(), "recycled buffers come back empty");
-        // REUSE proof, allocator-independent. The transitions above prove a
-        // dequeue, and address equality alone could pass by free-then-malloc
-        // coincidence (the allocator may hand the just-freed block back at
-        // the same address); neither proves the allocation was KEPT. Two
-        // marks a fresh allocation cannot carry do: `take(12)` allocating
-        // fresh yields capacity 12 exactly, never the parked 24; and `take`
-        // only clears the length, so a kept allocation still holds every
-        // byte written above, while a freed-and-reallocated block comes back
-        // uninitialized (glibc clobbers the head with free-list metadata).
+        assert!(second.is_empty(), "recycled buffers come back empty");
+        assert!(second.capacity() >= 12);
         assert_eq!(
-            reused.capacity(),
-            capacity,
-            "the recycled buffer must keep the parked allocation's capacity, \
-             not come back as a fresh request-sized one"
+            (pool.alloc_count(), pool.reuse_count()),
+            (1, 1),
+            "an equal-size take after a drop must be a reuse, not an allocation"
         );
-        // SAFETY: the capacity check above established this is the parked
-        // allocation, in which all `capacity` bytes were initialized before
-        // the drop and never released since.
-        let bytes = unsafe { std::slice::from_raw_parts(reused.as_ptr(), capacity) };
+        // Park the buffer again, then grow past its capacity (a mid-stream
+        // resolution increase): the parked buffer cannot serve the request,
+        // so the take must allocate fresh.
+        let parked_capacity = second.capacity();
+        second.extend_from_slice(&[7u8; 12]);
+        drop(VideoFrame::new(
+            2,
+            2,
+            PixelLayout::Rgb24,
+            None,
+            1,
+            second,
+            Some(pool.recycler()),
+        ));
         assert_eq!(
-            &bytes[..12],
-            &[7u8; 12],
-            "the payload bytes must survive the round trip"
+            pool.rx.len(),
+            1,
+            "the grown take starts with a buffer parked"
         );
-        assert!(
-            bytes[12..].iter().all(|b| *b == 0xA5),
-            "the spare-capacity sentinel must survive the round trip"
-        );
-        // Corroboration only — see above for why this alone proves nothing.
+        let grown = pool.take(parked_capacity + 1);
+        assert!(grown.capacity() > parked_capacity);
         assert_eq!(
-            reused.as_ptr(),
-            ptr,
-            "the same allocation must circulate through the pool"
+            (pool.alloc_count(), pool.reuse_count()),
+            (2, 1),
+            "a take grown past the parked capacity must allocate fresh"
         );
     }
 
@@ -540,6 +575,11 @@ mod tests {
         pool.recycler().try_send(big).unwrap();
         let buf = pool.take(4096); // 8192 <= 4 * 4096: within the keep bound
         assert_eq!(buf.as_ptr(), ptr, "a within-bound buffer must be reused");
+        assert_eq!(
+            (pool.alloc_count(), pool.reuse_count()),
+            (0, 1),
+            "the take must be served by the parked buffer, not an allocation"
+        );
     }
 
     /// With the pool full, a dropping frame frees its buffer quietly instead
@@ -593,6 +633,11 @@ mod tests {
             reused.as_ptr() as usize,
             ptr,
             "a cross-thread drop must land back in the pool"
+        );
+        assert_eq!(
+            (pool.alloc_count(), pool.reuse_count()),
+            (1, 1),
+            "the post-drop take must be a reuse"
         );
     }
 
