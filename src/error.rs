@@ -151,6 +151,10 @@ pub enum Error {
     #[error("Rtmp stream closed: the server is no longer consuming this stream")]
     RtmpStreamClosed,
 
+    #[cfg(feature = "rtmp")]
+    #[error("Rtmp server already started: clones of one server share a single lifecycle, which can be started only once")]
+    RtmpServerAlreadyStarted,
+
     #[cfg(feature = "subtitle")]
     #[error("Subtitle error: {0}")]
     Subtitle(#[from] crate::subtitle::SubtitleError),
@@ -292,7 +296,8 @@ impl PartialEq for Error {
             (RtmpCreateStream, RtmpCreateStream)
             | (RtmpRegistrationQueueFull, RtmpRegistrationQueueFull)
             | (RtmpThreadExited, RtmpThreadExited)
-            | (RtmpStreamClosed, RtmpStreamClosed) => true,
+            | (RtmpStreamClosed, RtmpStreamClosed)
+            | (RtmpServerAlreadyStarted, RtmpServerAlreadyStarted) => true,
             _ => false,
         }
     }
