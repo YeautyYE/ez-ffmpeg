@@ -1,3 +1,6 @@
+use crate::flv::flv_tag_body::{
+    is_audio_sequence_header, is_video_keyframe, is_video_sequence_header,
+};
 use crate::rtmp::gop::{FrameData, Gops};
 use crate::rtmp::write_queue::QUEUE_WARN_BYTES;
 use bytes::Bytes;
@@ -1645,16 +1648,6 @@ fn gop_contains_video_keyframe(frames: &[FrameData]) -> bool {
     })
 }
 
-fn is_video_sequence_header(data: &Bytes) -> bool {
-    // This is assuming h264.
-    data.len() >= 2 && data[0] == 0x17 && data[1] == 0x00
-}
-
-fn is_audio_sequence_header(data: &Bytes) -> bool {
-    // This is assuming aac.
-    data.len() >= 2 && data[0] == 0xaf && data[1] == 0x00
-}
-
 /// Whether `data` is a sequence header (of `data_type`) too large to cache.
 /// Only sequence headers are cached and replayed in the join burst, so only
 /// they carry the "poison the cache and disconnect every late joiner" risk; a
@@ -1690,14 +1683,6 @@ fn oversized_sequence_header_error(event: &ServerSessionEvent) -> Option<Schedul
     } else {
         None
     }
-}
-
-fn is_video_keyframe(data: &Bytes) -> bool {
-    // Assuming h264. 0x17 = keyframe frame-type + AVC codec; AVCPacketType 0x01
-    // is a NALU (the actual IDR). Require == 0x01 rather than != 0x00 so the
-    // sequence header (0x00) AND the AVC end-of-sequence marker (0x02) are both
-    // excluded — only a decodable IDR frame may flip the keyframe gate.
-    data.len() >= 2 && data[0] == 0x17 && data[1] == 0x01
 }
 
 #[cfg(test)]
