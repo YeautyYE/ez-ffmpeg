@@ -673,7 +673,11 @@ pub(crate) struct JobStopObservables {
 }
 
 /// Slot the owned-channel adapter uses to observe job cancellation: see
-/// [`JobStopObservables`].
+/// [`JobStopObservables`]. One slot is allocated per [`PacketSink::channel`]
+/// call and shared by the sink's callbacks and its receiver, so the Arc's
+/// pointer identity doubles as the pair's run token: the muxer keeps a clone
+/// and [`PacketSinkReceiver::into_events`] matches its own clone against the
+/// scheduler's job to reject a cross-wired scheduler.
 pub(crate) type CancellationSlot = Arc<OnceLock<JobStopObservables>>;
 
 /// The consumer bundle handed to `Output::from(sink)` /
@@ -803,8 +807,14 @@ impl PacketSink {
             let _ = err_tx.try_send(PacketSinkEvent::Error(e.clone()));
         })
         .build();
-        sink.cancellation = Some(cancellation);
-        (sink, PacketSinkReceiver { inner: rx })
+        sink.cancellation = Some(cancellation.clone());
+        (
+            sink,
+            PacketSinkReceiver {
+                inner: rx,
+                token: cancellation,
+            },
+        )
     }
 
     // ---- crate-internal dispatch (serial, delivery thread only) ----
@@ -1153,6 +1163,39 @@ impl std::fmt::Display for PacketRecvTimeoutError {
 
 impl std::error::Error for PacketRecvTimeoutError {}
 
+/// Error from [`PacketSinkReceiver::into_events`]: the scheduler passed in
+/// is not the one running this receiver's sink.
+///
+/// Each [`PacketSink::channel`] call shares an identity token between the
+/// sink and its receiver, and `into_events` requires the scheduler whose job
+/// contains that sink. Accepting an arbitrary scheduler would silently
+/// cross-wire two runs: iterate receiver A's events while joining — and, on
+/// early drop, aborting — job B. Both handles are returned unchanged so the
+/// caller can pair them correctly (the scheduler's job keeps running).
+pub struct PacketEventsPairingError {
+    /// The receiver, returned unchanged.
+    pub receiver: PacketSinkReceiver,
+    /// The scheduler, returned unchanged; its job is unaffected.
+    pub scheduler: FfmpegScheduler<Running>,
+}
+
+impl std::fmt::Debug for PacketEventsPairingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PacketEventsPairingError")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Display for PacketEventsPairingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "packet-sink receiver paired with a scheduler that is not running its sink",
+        )
+    }
+}
+
+impl std::error::Error for PacketEventsPairingError {}
+
 /// Receiving side of a [`PacketSink::channel`] adapter.
 ///
 /// Drain it concurrently with the running job (its own thread, or
@@ -1160,6 +1203,11 @@ impl std::error::Error for PacketRecvTimeoutError {}
 /// job — the next delivery fails typed instead of blocking forever.
 pub struct PacketSinkReceiver {
     inner: crossbeam_channel::Receiver<PacketSinkEvent>,
+    /// Identity of the `PacketSink::channel` call that produced this
+    /// receiver: the same `CancellationSlot` Arc the paired sink carries.
+    /// [`into_events`](Self::into_events) matches it by pointer identity
+    /// against the scheduler's job.
+    token: CancellationSlot,
 }
 
 impl PacketSinkReceiver {
@@ -1202,10 +1250,33 @@ impl PacketSinkReceiver {
     /// channel drains, and a job error surfaces as one terminal `Err`.
     /// Dropping the iterator mid-run releases the receiver FIRST (unblocking
     /// a worker parked in the channel send), then aborts the job.
-    pub fn into_events(self, scheduler: FfmpegScheduler<Running>) -> PacketEventIter {
-        PacketEventIter {
-            inner: OwnedRunIter::new(self.inner, scheduler, std::convert::identity),
+    ///
+    /// # Errors
+    ///
+    /// [`PacketEventsPairingError`] when `scheduler` is not the one running
+    /// this receiver's sink. The pairing is checked by identity — the token
+    /// shared by the sink/receiver pair from [`PacketSink::channel`] must
+    /// belong to the scheduler's job — because a cross-wired iterator would
+    /// silently stream one run's events while reporting (and, on drop,
+    /// aborting) another run's outcome. The error returns both handles
+    /// unchanged so they can be re-paired.
+    // The Err variant carries the scheduler back to the caller, so it is as
+    // large as the Ok variant (which owns the same scheduler inside the
+    // iterator); boxing it would not shrink the Result.
+    #[allow(clippy::result_large_err)]
+    pub fn into_events(
+        self,
+        scheduler: FfmpegScheduler<Running>,
+    ) -> Result<PacketEventIter, PacketEventsPairingError> {
+        if !scheduler.runs_packet_sink(&self.token) {
+            return Err(PacketEventsPairingError {
+                receiver: self,
+                scheduler,
+            });
         }
+        Ok(PacketEventIter {
+            inner: OwnedRunIter::new(self.inner, scheduler, std::convert::identity),
+        })
     }
 }
 
@@ -1213,6 +1284,12 @@ impl PacketSinkReceiver {
 /// [`PacketSinkReceiver::into_events`].
 pub struct PacketEventIter {
     inner: OwnedRunIter<PacketSinkEvent>,
+}
+
+impl std::fmt::Debug for PacketEventIter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PacketEventIter").finish_non_exhaustive()
+    }
 }
 
 impl Iterator for PacketEventIter {
