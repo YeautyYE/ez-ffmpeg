@@ -714,17 +714,69 @@ fn connected_but_unreachable_graph_is_rejected() {
 }
 
 #[test]
-fn streamselect_dropping_the_input_is_rejected() {
-    // Reachability must hold at PAD granularity, not filter granularity: the
-    // open input [in] and the open output sit on the SAME streamselect, yet
-    // map=0 relays only the color feed and drops [in] entirely — the encoded
-    // stream would be pure generator output.
-    let input = video_fixture("shape_sselect_drop_in.mp4");
-    let reason = shape_reason(
-        &input,
-        "color=c=red:s=64x64:r=1:d=1[bg];[bg][in]streamselect=inputs=2:map=0",
-    );
-    assert!(reason.contains("no directed path"), "reason: {reason}");
+fn streamselect_dropping_the_input_is_accepted_like_cli() {
+    // The applied map=0 relays only the color feed and currently drops [in],
+    // yet the graph must be ACCEPTED: streamselect's map is a runtime
+    // command (sendcmd / the send-command API can reroute [in] to the output
+    // mid-stream), so the applied selection proves nothing about where the
+    // input can flow — and ffmpeg (verified against 7.1.3) accepts and runs
+    // this exact description, encoding the generator feed. The reachability
+    // gate is structural (is [in] wired into the graph that feeds the
+    // output?), not a promise that filters keep the frames. The unselected
+    // input is 320x240 while the selected color feed is 64x64 — the output
+    // dimensions prove the encoder consumed the generator, like the CLI.
+    let input = video_fixture("sselect_drop_in.mp4");
+    let out = tmp_path("sselect_drop_out.mp4");
+    run(
+        FfmpegContext::builder()
+            .input(input.as_str())
+            .output(
+                Output::from(out.as_str())
+                    .set_video_codec("mpeg4")
+                    .set_video_filter(
+                        "color=c=red:s=64x64:r=30:d=0.5[bg];\
+                         [bg][in]streamselect=inputs=2:map=0",
+                    ),
+            )
+            .build()
+            .unwrap(),
+        "streamselect dropping the input",
+    )
+    .unwrap();
+    assert_eq!(video_dimensions(&out), (64, 64));
+}
+
+#[test]
+fn sendcmd_commanded_streamselect_is_accepted() {
+    // The runtime-commandable case the structural gate exists for: the graph
+    // starts on map=0 (the color feed) and a sendcmd entry rewrites the map
+    // to 1 mid-stream, after which streamselect relays the decoded input —
+    // ffmpeg 7.1.3 runs this with a "Success" command reply and switches the
+    // encoded content. A probe that pruned routing by the applied map=0
+    // would reject this description even though the input demonstrably
+    // reaches the encoder at runtime. Both feeds share one size: the output
+    // link's dimensions are negotiated once and a mid-stream switch must not
+    // change them.
+    let input = video_fixture("sselect_cmd_in.mp4");
+    let out = tmp_path("sselect_cmd_out.mp4");
+    run(
+        FfmpegContext::builder()
+            .input(input.as_str())
+            .output(
+                Output::from(out.as_str())
+                    .set_video_codec("mpeg4")
+                    .set_video_filter(
+                        "sendcmd=c='0.2 streamselect@sel map 1'[cmd];\
+                         color=c=red:s=320x240:r=30:d=0.5[bg];\
+                         [bg][cmd]streamselect@sel=inputs=2:map=0",
+                    ),
+            )
+            .build()
+            .unwrap(),
+        "sendcmd-commanded streamselect",
+    )
+    .unwrap();
+    assert_eq!(video_dimensions(&out), (320, 240));
 }
 
 #[test]
