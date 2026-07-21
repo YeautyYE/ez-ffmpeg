@@ -75,6 +75,18 @@ fn is_option_token(token: &str) -> bool {
     token.len() > 1 && token.starts_with('-')
 }
 
+/// Scope reported for a classified option. Rows the table marks
+/// [`ScopeRule::Global`] apply to the whole run wherever they appear, so
+/// they are reported as [`CliScope::Global`] — in particular at pre-input
+/// positions, which the positional walk alone would call [`CliScope::Input`].
+/// Every other row keeps the positional answer.
+fn effective_scope(positional: CliScope, rule: ScopeRule) -> CliScope {
+    match rule {
+        ScopeRule::Global => CliScope::Global,
+        _ => positional,
+    }
+}
+
 struct Parser {
     globals: GlobalsIr,
     input: Option<InputIr>,
@@ -86,6 +98,10 @@ struct Parser {
 }
 
 impl Parser {
+    /// Positional scope of the current token under the fftools walk
+    /// ("options are applied to the next specified file"). Position alone
+    /// cannot tell a global option from an input option before `-i`; use
+    /// [`effective_scope`] once the option's table row is known.
     fn scope(&self) -> CliScope {
         if self.output.is_some() {
             CliScope::AfterOutput
@@ -178,8 +194,9 @@ impl Parser {
         };
 
         // Scope admission first, so `-crf 23 -i in.mp4` is "output option in
-        // input position", not a mystery later.
-        let scope = self.scope();
+        // input position", not a mystery later. The table row refines the
+        // positional walk: global rows are global scope wherever they occur.
+        let scope = effective_scope(self.scope(), spec.scope);
         match spec.scope {
             ScopeRule::Global => {}
             _ if scope == CliScope::AfterOutput => {
@@ -248,7 +265,7 @@ impl Parser {
         }
 
         let value = value.map(|(text, _)| text).unwrap_or_default();
-        match self.scope() {
+        match scope {
             CliScope::Input => self.apply_input_option(name, value, index),
             _ => self.apply_output_option(name, value, index),
         }
@@ -731,4 +748,31 @@ fn dup_check(already: bool, name: &str, index: usize) -> Result<(), CliError> {
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn global_rows_report_global_scope_in_any_position() {
+        // A row the table marks Global applies to the whole run wherever it
+        // appears; the pre-input position in particular must not be
+        // misreported as input scope.
+        for positional in [CliScope::Input, CliScope::Output, CliScope::AfterOutput] {
+            assert_eq!(
+                effective_scope(positional, ScopeRule::Global),
+                CliScope::Global
+            );
+        }
+        // Positional rows keep the walk's answer.
+        assert_eq!(
+            effective_scope(CliScope::Input, ScopeRule::InputOrOutput),
+            CliScope::Input
+        );
+        assert_eq!(
+            effective_scope(CliScope::Output, ScopeRule::OutputOnly),
+            CliScope::Output
+        );
+    }
 }

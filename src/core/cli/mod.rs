@@ -284,34 +284,35 @@ fn emit_from_tokens(args: &[String]) -> Result<String, CliError> {
     Ok(emit::emit(&lower::lower(&ir), args, &status))
 }
 
-/// Runtime-profile gate: in-process execution is allowed only on linked
-/// FFmpeg builds whose libavcodec/libavformat major.minor pairs match a
-/// verified profile. Purely a version check — it runs before any I/O.
+/// Major.minor of the linked libavcodec and libavformat (in that order),
+/// extracted from FFmpeg's packed version words.
+fn linked_version_pairs() -> ((u32, u32), (u32, u32)) {
+    let pair = |v: u32| (v >> 16, (v >> 8) & 0xff);
+    (
+        pair(unsafe { ffmpeg_sys_next::avcodec_version() }),
+        pair(unsafe { ffmpeg_sys_next::avformat_version() }),
+    )
+}
+
 /// Whether the LINKED libavcodec/libavformat pair matches a verified runtime
 /// profile. Tests use this to stay honest on non-verified lanes: on a linked
 /// 8.x build the correct expectation is the typed `UnverifiedRuntimeProfile`
 /// failure, not runtime success.
 pub(crate) fn linked_profile_verified() -> bool {
-    let avcodec = unsafe { ffmpeg_sys_next::avcodec_version() };
-    let avformat = unsafe { ffmpeg_sys_next::avformat_version() };
-    let pair = |v: u32| (v >> 16, (v >> 8) & 0xff);
-    let (ac_major, ac_minor) = pair(avcodec);
-    let (af_major, af_minor) = pair(avformat);
-    VERIFIED_PROFILES.iter().any(|profile| {
-        (ac_major, ac_minor) == profile.avcodec && (af_major, af_minor) == profile.avformat
-    })
+    let (avcodec, avformat) = linked_version_pairs();
+    VERIFIED_PROFILES
+        .iter()
+        .any(|profile| avcodec == profile.avcodec && avformat == profile.avformat)
 }
 
+/// Runtime-profile gate: in-process execution is allowed only on linked
+/// FFmpeg builds whose libavcodec/libavformat major.minor pairs match a
+/// verified profile. Purely a version check — it runs before any I/O.
 fn check_runtime_profile() -> Result<(), CliError> {
-    let avcodec = unsafe { ffmpeg_sys_next::avcodec_version() };
-    let avformat = unsafe { ffmpeg_sys_next::avformat_version() };
-    let pair = |v: u32| (v >> 16, (v >> 8) & 0xff);
-    let (ac_major, ac_minor) = pair(avcodec);
-    let (af_major, af_minor) = pair(avformat);
-
     if linked_profile_verified() {
         return Ok(());
     }
+    let ((ac_major, ac_minor), (af_major, af_minor)) = linked_version_pairs();
     Err(CliError::UnverifiedRuntimeProfile {
         linked_avcodec: format!("{ac_major}.{ac_minor}"),
         linked_avformat: format!("{af_major}.{af_minor}"),
