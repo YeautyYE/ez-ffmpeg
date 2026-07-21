@@ -122,11 +122,17 @@ impl ThreadSynchronizer {
                         .take();
                 }
             }
-            // Every release notifies (not only the last): settlement waiters
-            // park on this condvar with a `live <= settled` condition that
-            // can become true on ANY peer's release. wait_for_all_threads
-            // re-checks its own condition, so the broader wakeup is safe.
-            self.inner.condvar.notify_all();
+            // Wake waiters only when a parked predicate can now hold.
+            // wait_for_all_threads parks on `live == 0` and
+            // wait_peers_settled on `live <= settled`; the former is
+            // subsumed by the latter (live == 0 satisfies `live <= settled`
+            // for any settled value). Waiters re-check their predicate under
+            // this same lock before every park, so while live still exceeds
+            // settled — both predicates false — a notification could wake no
+            // one past its re-check.
+            if counts.live <= counts.settled {
+                self.inner.condvar.notify_all();
+            }
         }
 
         // Fire outside the lock and CONTAIN a panicking waker: it must neither
@@ -141,11 +147,11 @@ impl ThreadSynchronizer {
     /// Registers the calling thread's LIVE slot as settled, under the one
     /// counter lock: a registration can itself flip `live <= settled` to
     /// true for peers already parked in the barrier (slot releases are the
-    /// only other notifier), so every registrant wakes the condvar. Without
-    /// this, sink A parks, sink B's registration satisfies the condition, B
-    /// proceeds into its (possibly blocking) terminal callbacks without
-    /// releasing its slot, and A sleeps forever — a lost wakeup, not a
-    /// cycle.
+    /// only other notifier), so a registration under which the predicate
+    /// holds wakes the condvar. Without that wake, sink A parks, sink B's
+    /// registration satisfies the condition, B proceeds into its (possibly
+    /// blocking) terminal callbacks without releasing its slot, and A sleeps
+    /// forever — a lost wakeup, not a cycle.
     ///
     /// The registration's lifetime is the SLOT's lifetime: the caller must
     /// release with `thread_done_with_settled(true, ..)`, which removes it
@@ -167,7 +173,12 @@ impl ThreadSynchronizer {
             counts.settled <= counts.live,
             "settled registrations must be a subset of live slots"
         );
-        self.inner.condvar.notify_all();
+        // A registration never changes `live`, so only the settlement
+        // barrier's `live <= settled` predicate can flip here; when it still
+        // fails, no parked waiter could pass its re-check — skip the wakeup.
+        if counts.live <= counts.settled {
+            self.inner.condvar.notify_all();
+        }
     }
 
     /// Full-job settlement barrier for a scheduler-tracked thread: blocks
