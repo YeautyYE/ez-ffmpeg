@@ -388,6 +388,35 @@ mod tests {
     }
 
     #[test]
+    fn capture_data_defaults_off_and_copies_payloads_when_enabled() {
+        // Default: scanning stays copy-free — no packet carries a payload.
+        let mut scanner = PacketScanner::open("test.mp4").unwrap();
+        let mut scanned = 0usize;
+        for packet in scanner.packets() {
+            assert!(
+                packet.unwrap().data().is_none(),
+                "a capture-off scan must not copy payloads"
+            );
+            scanned += 1;
+        }
+        assert!(scanned > 0, "expected packets in the fixture");
+
+        // Re-scan with capture enabled: every packet carries its bytes.
+        let mut scanner = PacketScanner::open("test.mp4").unwrap();
+        scanner.set_capture_data(true);
+        let mut captured = 0usize;
+        for packet in scanner.packets() {
+            let info = packet.unwrap();
+            let data = info
+                .data()
+                .expect("a capture-on scan must carry the payload");
+            assert!(!data.is_empty(), "captured payloads must not be empty");
+            captured += 1;
+        }
+        assert_eq!(captured, scanned, "both scans see the same packets");
+    }
+
+    #[test]
     fn test_seek_and_read() {
         let mut scanner = PacketScanner::open("test.mp4").unwrap();
         // Seek to 1 second (1_000_000 microseconds)
