@@ -69,7 +69,8 @@ pub(crate) fn parse_parameter_sets(extradata: &[u8]) -> Result<ParameterSets, St
 }
 
 /// Parses an AVCDecoderConfigurationRecord, enforcing the strict-tier checks:
-/// `configurationVersion == 1`, at least one SPS and one PPS, and
+/// `configurationVersion == 1`, at least one SPS and one PPS, every array
+/// entry carrying the NAL type its array declares (7 for SPS, 8 for PPS), and
 /// `lengthSizeMinusOne == 3` (FFmpeg passes pre-existing avcC through
 /// unchanged, so a non-4-byte configuration is possible in principle and the
 /// strict tier rejects it rather than rewriting every packet's prefixes).
@@ -95,6 +96,12 @@ pub(crate) fn parse_avcc_parameter_sets(avcc: &[u8]) -> Result<ParameterSets, St
     };
     for _ in 0..sps_count {
         let ps = read_u16_prefixed(avcc, &mut pos).map_err(|e| format!("SPS entry: {e}"))?;
+        let nal_type = ps[0] & 0x1F;
+        if nal_type != NAL_SPS {
+            return Err(format!(
+                "avcC SPS array entry carries NAL type {nal_type} (expected {NAL_SPS})"
+            ));
+        }
         sets.sps.push(ps);
     }
     if pos >= avcc.len() {
@@ -104,6 +111,12 @@ pub(crate) fn parse_avcc_parameter_sets(avcc: &[u8]) -> Result<ParameterSets, St
     pos += 1;
     for _ in 0..pps_count {
         let ps = read_u16_prefixed(avcc, &mut pos).map_err(|e| format!("PPS entry: {e}"))?;
+        let nal_type = ps[0] & 0x1F;
+        if nal_type != NAL_PPS {
+            return Err(format!(
+                "avcC PPS array entry carries NAL type {nal_type} (expected {NAL_PPS})"
+            ));
+        }
         sets.pps.push(ps);
     }
     // Trailing bytes (the profile extension) are legal and ignored here.
@@ -247,15 +260,22 @@ fn sps_chroma_info(sps: &[u8]) -> Result<(u8, u8, u8), String> {
             if chroma_format_idc == 3 {
                 r.bits(1)?; // separate_colour_plane_flag
             }
-            let bit_depth_luma = r.ue()? + 8;
-            let bit_depth_chroma = r.ue()? + 8;
-            if bit_depth_luma > 15 || bit_depth_chroma > 15 {
-                return Err("invalid SPS bit depth".to_string());
+            // Bound the raw ue(v) values before the +8 arithmetic: H.264
+            // 7.4.2.1.1 limits bit_depth_luma_minus8 / bit_depth_chroma_minus8
+            // to 0..=6, and an unbounded Exp-Golomb result (up to 2^32 - 2)
+            // would overflow the u32 addition.
+            let bit_depth_luma_minus8 = r.ue()?;
+            let bit_depth_chroma_minus8 = r.ue()?;
+            if bit_depth_luma_minus8 > 6 || bit_depth_chroma_minus8 > 6 {
+                return Err(format!(
+                    "invalid SPS bit depth (bit_depth_luma_minus8 {bit_depth_luma_minus8}, \
+                     bit_depth_chroma_minus8 {bit_depth_chroma_minus8}; both must be <= 6)"
+                ));
             }
             Ok((
                 chroma_format_idc as u8,
-                bit_depth_luma as u8,
-                bit_depth_chroma as u8,
+                bit_depth_luma_minus8 as u8 + 8,
+                bit_depth_chroma_minus8 as u8 + 8,
             ))
         }
         _ => Ok((1, 8, 8)),
@@ -350,6 +370,30 @@ impl AvcRuntime {
         } else {
             extradata.to_vec()
         };
+        // The avcC header (bytes 1..4) and the accessor projection must
+        // describe the same profile/compatibility/level: a synthesized avcC
+        // copies the first SPS's bytes, but a passed-through record keeps its
+        // original header, which can disagree with the SPS the projection
+        // (and the codec string) is derived from. Delivering such a record
+        // would hand consumers two conflicting descriptions of one stream.
+        if delivered[1] != projection.profile
+            || delivered[2] != projection.compatibility
+            || delivered[3] != projection.level
+        {
+            return Err(PacketSinkError::InvalidExtradata {
+                stream_index,
+                reason: format!(
+                    "avcC header declares profile/compatibility/level \
+                     {:02X}{:02X}{:02X} but the first SPS carries {:02X}{:02X}{:02X}",
+                    delivered[1],
+                    delivered[2],
+                    delivered[3],
+                    projection.profile,
+                    projection.compatibility,
+                    projection.level
+                ),
+            });
+        }
         Ok((
             Self {
                 annexb_packets,
@@ -642,5 +686,112 @@ mod tests {
         let config = annexb_config();
         let nals = collect_annexb(&config).unwrap();
         assert_eq!(nals, vec![SPS, PPS]);
+    }
+
+    /// Builds a raw avcC (lengthSizeMinusOne = 3) with the given header bytes
+    /// and exactly one entry per parameter-set array.
+    fn raw_avcc(profile: u8, compat: u8, level: u8, sps: &[u8], pps: &[u8]) -> Vec<u8> {
+        let mut v = vec![1, profile, compat, level, 0xFF, 0xE1];
+        v.extend_from_slice(&(sps.len() as u16).to_be_bytes());
+        v.extend_from_slice(sps);
+        v.push(1);
+        v.extend_from_slice(&(pps.len() as u16).to_be_bytes());
+        v.extend_from_slice(pps);
+        v
+    }
+
+    #[test]
+    fn rejects_avcc_with_swapped_sps_pps_nal_types() {
+        // SPS array carrying the PPS NAL (type 8) and vice versa: each array
+        // entry must actually be the parameter-set type its array declares.
+        let swapped = raw_avcc(66, 0xC0, 0x1E, PPS, SPS);
+        let err = parse_avcc_parameter_sets(&swapped).unwrap_err();
+        assert!(err.contains("NAL type"), "unexpected error: {err}");
+        assert!(matches!(
+            AvcRuntime::from_extradata(&swapped, 3),
+            Err(PacketSinkError::InvalidExtradata { stream_index: 3, .. })
+        ));
+        // An SPS smuggled into the PPS array alone must also be caught.
+        let bad_pps = raw_avcc(66, 0xC0, 0x1E, SPS, SPS);
+        let err = parse_avcc_parameter_sets(&bad_pps).unwrap_err();
+        assert!(err.contains("NAL type"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn rejects_sps_bit_depth_ue_overflow() {
+        // High-profile SPS whose bit_depth_luma_minus8 is ue(0xFFFF_FFFE):
+        // 31 leading zeros, the stop bit, then 31 one bits. The raw value
+        // must be bounded to <= 6 (H.264 7.4.2.1.1) before the +8
+        // conversion, which it would otherwise overflow.
+        let sps = [
+            0x67, 100, 0x00, 30, 0xA0, 0x00, 0x00, 0x00, 0x1F, 0xFF, 0xFF, 0xFF, 0xF0,
+        ];
+        let sets = ParameterSets {
+            sps: vec![sps.to_vec()],
+            pps: vec![PPS.to_vec()],
+        };
+        let err = build_avcc(&sets).unwrap_err();
+        assert!(err.contains("bit depth"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn rejects_chroma_format_idc_above_three() {
+        // chroma_format_idc is two bits wide in the avcC extension; an
+        // out-of-range SPS value (4..=7 and beyond) must be rejected, not
+        // silently masked into range. ue(7) = '0001000', ue(4) = '00101'.
+        for (payload, idc) in [(0x88u8, 7u32), (0x94, 4)] {
+            let sps = [0x67, 100, 0x00, 30, payload];
+            let sets = ParameterSets {
+                sps: vec![sps.to_vec()],
+                pps: vec![PPS.to_vec()],
+            };
+            let err = build_avcc(&sets).unwrap_err();
+            assert!(
+                err.contains(&format!("chroma_format_idc {idc}")),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_truncated_configuration_data() {
+        // Every strict prefix of a valid record is invalid: parsing must
+        // fail cleanly (no panic, no partial acceptance) at every cut.
+        let avcc = build_avcc(&parse_parameter_sets(&annexb_config()).unwrap()).unwrap();
+        for cut in 0..avcc.len() {
+            assert!(
+                parse_avcc_parameter_sets(&avcc[..cut]).is_err(),
+                "a {cut}-byte prefix must be rejected"
+            );
+        }
+        // A High-profile SPS that ends before the chroma fields must error
+        // out of the bit reader, not read past the payload.
+        let sets = ParameterSets {
+            sps: vec![vec![0x67, 100, 0x00, 30]],
+            pps: vec![PPS.to_vec()],
+        };
+        let err = build_avcc(&sets).unwrap_err();
+        assert!(err.contains("truncated"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn rejects_avcc_header_disagreeing_with_first_sps() {
+        // A passed-through record keeps its original header bytes while the
+        // profile/compatibility/level accessors derive from the first SPS.
+        // A record whose header disagrees would hand consumers two
+        // conflicting stream descriptions and must be rejected.
+        let good = build_avcc(&parse_parameter_sets(&annexb_config()).unwrap()).unwrap();
+        assert!(AvcRuntime::from_extradata(&good, 0).is_ok());
+        for byte in 1..4 {
+            let mut bad = good.clone();
+            bad[byte] ^= 0x01;
+            assert!(
+                matches!(
+                    AvcRuntime::from_extradata(&bad, 5),
+                    Err(PacketSinkError::InvalidExtradata { stream_index: 5, .. })
+                ),
+                "tampered header byte {byte} must be rejected"
+            );
+        }
     }
 }
