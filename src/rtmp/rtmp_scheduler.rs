@@ -98,7 +98,12 @@ const MAX_CACHEABLE_SEQUENCE_HEADER_BYTES: usize = 256 * 1024;
 
 enum ClientAction {
     Waiting,
-    Publishing(String), // Publishing to a stream key
+    // Publishing to a stream key. `Rc<str>` because the in-process media path
+    // clones the key once per audio/video tag (to end the borrow of `clients`
+    // before mutating `channels`); a refcount bump there beats a per-tag String
+    // allocation. The scheduler lives on the single reactor thread and already
+    // holds `Rc<StreamMetadata>`, so `Rc` adds no new threading constraint.
+    Publishing(Rc<str>),
     Watching { stream_key: String, stream_id: u32 },
 }
 
@@ -227,7 +232,7 @@ impl RtmpScheduler {
         let client = Client {
             session,
             connection_id: publisher_connection_id,
-            current_action: ClientAction::Publishing(stream_key.clone()),
+            current_action: ClientAction::Publishing(Rc::from(stream_key.as_str())),
             has_received_video_keyframe: false,
         };
 
@@ -438,7 +443,7 @@ impl RtmpScheduler {
         // needs no gate here (and, returning no Result, could not terminate the
         // feed anyway).
         self.handle_audio_video_data_received(
-            stream_key,
+            &stream_key,
             timestamp,
             data,
             data_type,
@@ -540,7 +545,7 @@ impl RtmpScheduler {
             Some(client_id) => {
                 let client = self.clients.remove(client_id);
                 match client.current_action {
-                    ClientAction::Publishing(stream_key) => self.publishing_ended(stream_key),
+                    ClientAction::Publishing(stream_key) => self.publishing_ended(&stream_key),
                     _ => {}
                 }
             }
@@ -572,7 +577,7 @@ impl RtmpScheduler {
             },
             None => return server_results,
         };
-        self.handle_publish_finished(String::new(), stream_key, &mut server_results);
+        self.handle_publish_finished(String::new(), &stream_key, &mut server_results);
         server_results
     }
 
@@ -662,7 +667,7 @@ impl RtmpScheduler {
                 app_name,
                 stream_key,
             } => {
-                self.handle_publish_finished(app_name, stream_key, server_results);
+                self.handle_publish_finished(app_name, &stream_key, server_results);
             }
 
             ServerSessionEvent::PlayStreamRequested {
@@ -710,7 +715,7 @@ impl RtmpScheduler {
                 // queue-critical threshold — is enforced at the top of this
                 // function via oversized_sequence_header_error.
                 self.handle_audio_video_data_received(
-                    stream_key,
+                    &stream_key,
                     timestamp,
                     data,
                     ReceivedDataType::Video,
@@ -727,7 +732,7 @@ impl RtmpScheduler {
                 // Same ingest bound for an oversized audio sequence header,
                 // enforced at the top via oversized_sequence_header_error.
                 self.handle_audio_video_data_received(
-                    stream_key,
+                    &stream_key,
                     timestamp,
                     data,
                     ReceivedDataType::Audio,
@@ -798,12 +803,12 @@ impl RtmpScheduler {
     fn handle_publish_finished(
         &mut self,
         app_name: String,
-        stream_key: String,
+        stream_key: &str,
         server_results: &mut Vec<ServerResult>,
     ) {
         debug!("Rtmp publish finished on app '{app_name}' and stream key '{stream_key}'");
 
-        let channel = match self.channels.get(&stream_key) {
+        let channel = match self.channels.get(stream_key) {
             Some(channel) => channel,
             None => return,
         };
@@ -1103,13 +1108,13 @@ impl RtmpScheduler {
 
     fn handle_audio_video_data_received(
         &mut self,
-        stream_key: String,
+        stream_key: &str,
         timestamp: RtmpTimestamp,
         data: Bytes,
         data_type: ReceivedDataType,
         server_results: &mut Vec<ServerResult>,
     ) {
-        let channel = match self.channels.get_mut(&stream_key) {
+        let channel = match self.channels.get_mut(stream_key) {
             Some(channel) => channel,
             None => return,
         };
@@ -1272,8 +1277,8 @@ impl RtmpScheduler {
         }
     }
 
-    fn publishing_ended(&mut self, stream_key: String) {
-        let should_remove = if let Some(channel) = self.channels.get_mut(&stream_key) {
+    fn publishing_ended(&mut self, stream_key: &str) {
+        let should_remove = if let Some(channel) = self.channels.get_mut(stream_key) {
             // Reset the FULL publisher-scoped state, not just metadata. During
             // the close linger the channel outlives its publisher (lingering
             // watchers keep it), yet `stream_keys` is released at once, so a NEW
@@ -1297,7 +1302,7 @@ impl RtmpScheduler {
             return;
         };
         if should_remove {
-            self.channels.remove(&stream_key);
+            self.channels.remove(stream_key);
         }
     }
 
@@ -1791,7 +1796,7 @@ mod tests {
         let mut server_results = Vec::new();
         let audio_data = Bytes::from(vec![0xAF, 0x01, 0xDD, 0xEE]);
         scheduler.handle_audio_video_data_received(
-            stream_key.clone(),
+            &stream_key,
             RtmpTimestamp { value: 50 },
             audio_data,
             ReceivedDataType::Audio,
@@ -2108,7 +2113,7 @@ mod tests {
         let data = Bytes::from(vec![0x17, 0x01, 0x00, 0x00, 0x00]); // Video data
 
         scheduler.handle_audio_video_data_received(
-            stream_key.clone(),
+            &stream_key,
             timestamp,
             data,
             ReceivedDataType::Video,
@@ -2154,7 +2159,7 @@ mod tests {
         let keyframe_data = Bytes::from(vec![0x17, 0x01, 0x00, 0x00, 0x00, 0xAA, 0xBB]);
         let timestamp = RtmpTimestamp { value: 1000 };
         scheduler.handle_audio_video_data_received(
-            stream_key.clone(),
+            &stream_key,
             timestamp,
             keyframe_data,
             ReceivedDataType::Video,
@@ -2181,7 +2186,7 @@ mod tests {
         server_results.clear();
         let non_keyframe_data = Bytes::from(vec![0x27, 0x01, 0x00, 0x00, 0x00, 0xCC]);
         scheduler.handle_audio_video_data_received(
-            stream_key.clone(),
+            &stream_key,
             RtmpTimestamp { value: 1033 },
             non_keyframe_data,
             ReceivedDataType::Video,
@@ -2210,7 +2215,7 @@ mod tests {
         server_results.clear();
         let audio_data = Bytes::from(vec![0xAF, 0x01, 0xDD, 0xEE]);
         scheduler.handle_audio_video_data_received(
-            stream_key.clone(),
+            &stream_key,
             RtmpTimestamp { value: 1040 },
             audio_data,
             ReceivedDataType::Audio,
@@ -2270,7 +2275,7 @@ mod tests {
         let mut server_results = Vec::new();
         let keyframe_data = Bytes::from(vec![0x17, 0x01, 0x00, 0x00, 0x00]);
         scheduler.handle_audio_video_data_received(
-            stream_key.clone(),
+            &stream_key,
             RtmpTimestamp { value: 0 },
             keyframe_data,
             ReceivedDataType::Video,
@@ -2327,7 +2332,7 @@ mod tests {
         let mut server_results = Vec::new();
         let sequence_header = Bytes::from(vec![0x17, 0x00, 0x00, 0x00, 0x00, 0x01, 0x64]);
         scheduler.handle_audio_video_data_received(
-            stream_key.clone(),
+            &stream_key,
             RtmpTimestamp { value: 0 },
             sequence_header.clone(),
             ReceivedDataType::Video,
@@ -2378,7 +2383,7 @@ mod tests {
         let mut server_results = Vec::new();
         let non_keyframe = Bytes::from(vec![0x27, 0x01, 0x00, 0x00, 0x00]);
         scheduler.handle_audio_video_data_received(
-            stream_key.clone(),
+            &stream_key,
             RtmpTimestamp { value: 100 },
             non_keyframe,
             ReceivedDataType::Video,
@@ -2394,7 +2399,7 @@ mod tests {
         // Now send keyframe
         let keyframe = Bytes::from(vec![0x17, 0x01, 0x00, 0x00, 0x00]);
         scheduler.handle_audio_video_data_received(
-            stream_key.clone(),
+            &stream_key,
             RtmpTimestamp { value: 200 },
             keyframe,
             ReceivedDataType::Video,
@@ -2429,7 +2434,7 @@ mod tests {
         let mut server_results = Vec::new();
         let audio_data = Bytes::from(vec![0xAF, 0x01, 0xDD, 0xEE]);
         scheduler.handle_audio_video_data_received(
-            stream_key.clone(),
+            &stream_key,
             RtmpTimestamp { value: 50 },
             audio_data.clone(),
             ReceivedDataType::Audio,
@@ -2445,7 +2450,7 @@ mod tests {
         // Send video keyframe
         let keyframe = Bytes::from(vec![0x17, 0x01, 0x00, 0x00, 0x00]);
         scheduler.handle_audio_video_data_received(
-            stream_key.clone(),
+            &stream_key,
             RtmpTimestamp { value: 100 },
             keyframe,
             ReceivedDataType::Video,
@@ -2455,7 +2460,7 @@ mod tests {
         // Now send audio again
         server_results.clear();
         scheduler.handle_audio_video_data_received(
-            stream_key.clone(),
+            &stream_key,
             RtmpTimestamp { value: 150 },
             audio_data,
             ReceivedDataType::Audio,
@@ -2494,7 +2499,7 @@ mod tests {
         let mut server_results = Vec::new();
         let audio_seq_header = Bytes::from(vec![0xAF, 0x00, 0x12, 0x10]);
         scheduler.handle_audio_video_data_received(
-            stream_key.clone(),
+            &stream_key,
             RtmpTimestamp { value: 0 },
             audio_seq_header.clone(),
             ReceivedDataType::Audio,
@@ -2564,7 +2569,7 @@ mod tests {
         let mut server_results = Vec::new();
         let keyframe = Bytes::from(vec![0x17, 0x01, 0x00, 0x00, 0x00]);
         scheduler.handle_audio_video_data_received(
-            stream_key.clone(),
+            &stream_key,
             RtmpTimestamp { value: 0 },
             keyframe,
             ReceivedDataType::Video,
@@ -2587,7 +2592,7 @@ mod tests {
         server_results.clear();
         let frame = Bytes::from(vec![0x27, 0x01, 0x00, 0x00, 0x00]);
         scheduler.handle_audio_video_data_received(
-            stream_key.clone(),
+            &stream_key,
             RtmpTimestamp { value: 33 },
             frame,
             ReceivedDataType::Video,
@@ -2685,7 +2690,7 @@ mod tests {
     ) -> Vec<ServerResult> {
         let mut results = Vec::new();
         scheduler.handle_audio_video_data_received(
-            stream_key.to_string(),
+            stream_key,
             RtmpTimestamp { value: timestamp },
             Bytes::from_static(data),
             ReceivedDataType::Video,
