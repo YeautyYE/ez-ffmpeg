@@ -109,8 +109,8 @@ pub enum ConversionPrecision {
     /// becomes the bottleneck). Opt in when the last bit of rounding and
     /// chroma reconstruction matters more than throughput — e.g. quality
     /// metrics or golden-reference pipelines. v0.14.0 applied exactly these
-    /// flags unconditionally, so `High` also reproduces v0.14.0 output
-    /// byte-for-byte.
+    /// flags unconditionally, so `High` also reproduces v0.14.0 output,
+    /// byte-identical when linked against the same libswscale build.
     High,
 }
 
