@@ -25,13 +25,14 @@ pub fn is_audio_sequence_header(data: &[u8]) -> bool {
     data.len() >= 2 && data[0] == 0xaf && data[1] == 0x00
 }
 
-/// Whether a video tag body is a decodable IDR keyframe.
+/// Whether a video tag body's first two bytes are `0x17 0x01`.
 ///
 /// Assumes h264: `0x17` = keyframe frame-type + AVC codec; AVCPacketType
-/// `0x01` is a NALU (the actual IDR). Require `== 0x01` rather than
-/// `!= 0x00` so the sequence header (`0x00`) AND the AVC end-of-sequence
-/// marker (`0x02`) are both excluded — only a decodable IDR frame may flip
-/// a watcher's keyframe gate.
+/// `0x01` marks a NALU packet. Only those two bytes are inspected — the NAL
+/// contents are not parsed. Require `== 0x01` rather than `!= 0x00` so the
+/// sequence header (`0x00`) AND the AVC end-of-sequence marker (`0x02`) are
+/// both excluded: both carry the keyframe frame type, but neither is
+/// picture data.
 pub fn is_video_keyframe(data: &[u8]) -> bool {
     data.len() >= 2 && data[0] == 0x17 && data[1] == 0x01
 }
