@@ -15,6 +15,7 @@ mod common;
 
 use common::{tmp_path_in, wait_with_watchdog};
 use ez_ffmpeg::error::{Error, OpenOutputError};
+use ez_ffmpeg::frame_export::{FrameExtractor, PixelLayout, VideoFrame};
 use ez_ffmpeg::stream_info::{find_audio_stream_info, find_video_stream_info, StreamInfo};
 use ez_ffmpeg::{FfmpegContext, Input, Output};
 
@@ -48,6 +49,26 @@ fn video_fixture(name: &str) -> String {
             .build()
             .unwrap(),
         "video fixture",
+    )
+    .unwrap();
+    path
+}
+
+/// 0.5s 320x240 solid-`color` video-only fixture, for tests that must tell
+/// WHICH feed produced the encoded frames by looking at their content.
+fn solid_video_fixture(name: &str, color: &str) -> String {
+    let path = tmp_path(name);
+    run(
+        FfmpegContext::builder()
+            .input(Input::from(format!("color=c={color}:s=320x240:r=30")).set_format("lavfi"))
+            .output(
+                Output::from(path.as_str())
+                    .set_video_codec("mpeg4")
+                    .set_recording_time_us(500_000),
+            )
+            .build()
+            .unwrap(),
+        "solid color fixture",
     )
     .unwrap();
     path
@@ -98,6 +119,20 @@ fn video_dimensions(path: &str) -> (i32, i32) {
         Some(StreamInfo::Video { width, height, .. }) => (width, height),
         other => panic!("expected a video stream in {path}, got {other:?}"),
     }
+}
+
+/// Mean red and blue channel values of a packed RGB24 frame, for telling a
+/// solid-red feed from a solid-blue one after a lossy encode round-trip.
+fn mean_red_blue(frame: &VideoFrame) -> (f64, f64) {
+    assert_eq!(frame.layout(), PixelLayout::Rgb24);
+    let bytes = frame.as_bytes();
+    let (mut red, mut blue) = (0u64, 0u64);
+    for px in bytes.chunks_exact(3) {
+        red += u64::from(px[0]);
+        blue += u64::from(px[2]);
+    }
+    let pixels = (bytes.len() / 3) as f64;
+    (red as f64 / pixels, blue as f64 / pixels)
 }
 
 // ---------------------------------------------------------------------------
@@ -747,17 +782,21 @@ fn streamselect_dropping_the_input_is_accepted_like_cli() {
 }
 
 #[test]
-fn sendcmd_commanded_streamselect_is_accepted() {
+fn sendcmd_commanded_streamselect_switches_content() {
     // The runtime-commandable case the structural gate exists for: the graph
-    // starts on map=0 (the color feed) and a sendcmd entry rewrites the map
-    // to 1 mid-stream, after which streamselect relays the decoded input —
-    // ffmpeg 7.1.3 runs this with a "Success" command reply and switches the
-    // encoded content. A probe that pruned routing by the applied map=0
-    // would reject this description even though the input demonstrably
-    // reaches the encoder at runtime. Both feeds share one size: the output
-    // link's dimensions are negotiated once and a mid-stream switch must not
-    // change them.
-    let input = video_fixture("sselect_cmd_in.mp4");
+    // starts on map=0 (the red generator feed) and a sendcmd entry rewrites
+    // the map to 1 at t=0.2s, after which streamselect relays the decoded
+    // input — ffmpeg 7.1.3 runs this with a "Success" command reply and
+    // switches the encoded content. A probe that pruned routing by the
+    // applied map=0 would reject this description even though the input
+    // demonstrably reaches the encoder at runtime. Both feeds share one size
+    // on purpose (the output link's dimensions are negotiated once and a
+    // mid-stream switch must not change them), so the feeds are told apart
+    // by content instead: the decoded input is solid blue, the generator
+    // solid red, and the decoded output must show red frames before the
+    // command and blue frames after it — a dropped or ignored command would
+    // leave every frame red.
+    let input = solid_video_fixture("sselect_cmd_in.mp4", "blue");
     let out = tmp_path("sselect_cmd_out.mp4");
     run(
         FfmpegContext::builder()
@@ -777,6 +816,44 @@ fn sendcmd_commanded_streamselect_is_accepted() {
     )
     .unwrap();
     assert_eq!(video_dimensions(&out), (320, 240));
+
+    // Decode the encoded output and classify frames on both sides of the
+    // command. sendcmd fires on the first frame with pts >= 0.2s and the
+    // remap takes effect on the following framesync event, so the exact
+    // boundary frame's side is scheduler detail — classify only frames
+    // safely clear of it (<= 0.1s and >= 0.3s at 30fps).
+    let frames = FrameExtractor::new(out.as_str())
+        .pixel(PixelLayout::Rgb24)
+        .collect_frames()
+        .unwrap();
+    let (mut red_before, mut blue_after) = (0usize, 0usize);
+    for frame in &frames {
+        let pts = frame.pts_us().expect("exported frame has a pts");
+        let (r, b) = mean_red_blue(frame);
+        if pts <= 100_000 {
+            assert!(
+                r > b + 64.0,
+                "frame at {pts}us predates the command and must come from \
+                 the red generator feed, got mean r={r:.0} b={b:.0}"
+            );
+            red_before += 1;
+        } else if pts >= 300_000 {
+            assert!(
+                b > r + 64.0,
+                "frame at {pts}us postdates the command and must come from \
+                 the blue decoded input, got mean r={r:.0} b={b:.0}"
+            );
+            blue_after += 1;
+        }
+    }
+    assert!(
+        red_before >= 2,
+        "output must cover frames before the 0.2s command, saw {red_before}"
+    );
+    assert!(
+        blue_after >= 2,
+        "output must extend past the 0.2s command, saw {blue_after}"
+    );
 }
 
 #[test]
