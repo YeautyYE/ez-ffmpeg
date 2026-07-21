@@ -844,7 +844,16 @@ fn send_with_cancellation(
     cancellation: &CancellationSlot,
     event: PacketSinkEvent,
 ) -> PacketCallbackResult {
-    let mut event = event;
+    // Fast path: `send_timeout` computes a wall-clock deadline up front on
+    // every call — pure overhead while the channel has capacity (the common
+    // case). Only a full channel proceeds to the deadline-based slices.
+    let mut event = match tx.try_send(event) {
+        Ok(()) => return Ok(()),
+        Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+            return Err(PacketCallbackError::disconnected());
+        }
+        Err(crossbeam_channel::TrySendError::Full(back)) => back,
+    };
     loop {
         match tx.send_timeout(event, Duration::from_millis(50)) {
             Ok(()) => return Ok(()),
