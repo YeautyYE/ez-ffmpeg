@@ -700,6 +700,16 @@ impl std::fmt::Debug for PacketSink {
 }
 
 impl PacketSink {
+    /// The delivery tier this sink was built for.
+    ///
+    /// Every v1 construction path produces [`PacketSinkTier::Strict`], so
+    /// today this always returns `Strict`; the accessor exists so consumers
+    /// that route or log sinks can branch on the tier once additional tiers
+    /// land, instead of inferring it from which constructor was used.
+    pub fn tier(&self) -> PacketSinkTier {
+        self.tier
+    }
+
     /// Starts building a strict-tier sink around the required packet
     /// consumer. `on_stream_info`, `on_end` and `on_delivery_error` are
     /// optional extras on the returned builder — but a sink cannot exist
@@ -1338,6 +1348,33 @@ mod tests {
 
         let mut discard = PacketSink::discard();
         assert!(discard.dispatch_packet(&test_view(&payload)).is_ok());
+    }
+
+    /// The public tier accessor is the only way consumers can observe a
+    /// sink's tier; every v1 construction path must report `Strict`, and the
+    /// enum default must agree so builders can rely on it.
+    #[test]
+    fn every_construction_path_reports_the_strict_tier() {
+        assert_eq!(PacketSinkTier::default(), PacketSinkTier::Strict);
+        assert_eq!(
+            PacketSink::builder(|_| Ok(())).build().tier(),
+            PacketSinkTier::Strict
+        );
+        assert_eq!(PacketSink::discard().tier(), PacketSinkTier::Strict);
+
+        struct Accepting;
+        impl PacketSinkHandler for Accepting {
+            fn on_packet(&mut self, _packet: &PacketView<'_>) -> PacketCallbackResult {
+                Ok(())
+            }
+        }
+        assert_eq!(
+            PacketSink::from_handler(Accepting).tier(),
+            PacketSinkTier::Strict
+        );
+
+        let (sink, _receiver) = PacketSink::channel(NonZeroUsize::new(1).unwrap());
+        assert_eq!(sink.tier(), PacketSinkTier::Strict);
     }
 
     #[test]
