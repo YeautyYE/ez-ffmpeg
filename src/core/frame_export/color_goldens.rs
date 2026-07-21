@@ -701,6 +701,32 @@ fn parse_swscale_version(banner: &str) -> Option<(u32, u32, u32)> {
 }
 
 #[test]
+fn parse_swscale_version_prefers_the_runtime_triple() {
+    // Header (left of `/`) and run-time (right) triples deliberately
+    // differ everywhere so a parser reading the wrong side cannot pass.
+    let banner = "ffmpeg version 7.1.3\nlibswscale      8.  1.100 /  9. 13.  2\n";
+    assert_eq!(parse_swscale_version(banner), Some((9, 13, 2)));
+}
+
+#[test]
+fn parse_swscale_version_falls_back_without_a_slash() {
+    let banner = "configuration: --enable-shared\nlibswscale 7.5.100\n";
+    assert_eq!(parse_swscale_version(banner), Some((7, 5, 100)));
+}
+
+#[test]
+fn parse_swscale_version_rejects_garbage() {
+    // No libswscale line at all.
+    assert_eq!(parse_swscale_version("ffmpeg version 7.1.3"), None);
+    // A line with no digits on either side of the slash.
+    assert_eq!(parse_swscale_version("libswscale garbage / nonsense"), None);
+    // Slash present but nothing after it.
+    assert_eq!(parse_swscale_version("libswscale 8.1.100 /"), None);
+    // Incomplete triple: major.minor only.
+    assert_eq!(parse_swscale_version("libswscale 8.1 / 8.1"), None);
+}
+
+#[test]
 fn default_tier_matches_cli_bytes() {
     // The strongest pin on the CLI-consistent default: over a moving,
     // gradient-heavy clip (testsrc2 — solid color would pass trivially), the

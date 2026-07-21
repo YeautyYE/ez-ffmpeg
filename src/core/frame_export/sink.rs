@@ -428,9 +428,22 @@ mod tests {
             first,
             Some(pool.recycler()),
         );
+        assert_eq!(pool.rx.len(), 0, "buffer still owned by the live frame");
         drop(vf);
+        // Primary, allocator-independent evidence: the drop parked exactly
+        // one buffer and the next take consumed it (parked count 1 -> 0)
+        // rather than allocating fresh.
+        assert_eq!(pool.rx.len(), 1, "drop must park the buffer in the pool");
         let reused = pool.take(12);
+        assert_eq!(pool.rx.len(), 0, "take must consume the parked buffer");
         assert!(reused.is_empty(), "recycled buffers come back empty");
+        assert!(
+            reused.capacity() >= 12,
+            "recycled capacity must still fit the request"
+        );
+        // Secondary corroboration only: address equality alone could pass
+        // by a free-then-malloc coincidence, so the channel-length
+        // transitions above carry the proof.
         assert_eq!(
             reused.as_ptr(),
             ptr,
