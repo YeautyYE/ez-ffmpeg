@@ -671,6 +671,18 @@ fn corpus_hls_pins() {
 }
 
 #[test]
+fn corpus_hls_segment_filename_swallows_next_option() {
+    // An omitted segment path makes the parser take the next token as the
+    // value; `-hls_flags` must fail path validation instead of being
+    // accepted as a filename on an otherwise verified HLS command.
+    rejected(
+        "ffmpeg -i in.mp4 -c:v libx264 -crf 23 -c:a aac -f hls -hls_time 6 -hls_playlist_type vod -hls_list_size 0 -hls_segment_filename -hls_flags -y out.m3u8",
+        "UnsupportedValue",
+        "./-name",
+    );
+}
+
+#[test]
 fn corpus_hls_options_without_f_hls() {
     rejected(
         "ffmpeg -i in.mp4 -c:v libx264 -crf 23 -c:a aac -hls_time 6 -y out.m3u8",
