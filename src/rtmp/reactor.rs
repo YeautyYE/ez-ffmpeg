@@ -688,8 +688,8 @@ pub struct Reactor {
     read_pending: HashSet<usize>,
     /// Connections whose poller interest may need updating (dirty tracking for O(m) instead of O(n))
     interest_dirty: HashSet<usize>,
-    /// Reusable buffer for connection IDs (to avoid Vec allocation in hot path)
-    #[allow(dead_code)]
+    /// Reusable scratch for the ids that enqueued fanout data in the current
+    /// `write_pending_packets` pass (avoids a Vec allocation per fanout)
     conn_ids_buffer: Vec<usize>,
     /// Reusable buffer for packets to write (avoids allocation in handle_readable)
     packets_buffer: Vec<(usize, Vec<u8>, bool, bool, bool)>,
@@ -1131,10 +1131,17 @@ impl Reactor {
         }
     }
 
-    /// Write pending packets to target connections
+    /// Write pending packets to target connections.
+    ///
+    /// Drains `packets_buffer`, enqueueing each packet to its target. Targets
+    /// that accepted data are marked for pending flush and interest update;
+    /// targets that refused (backpressure cap) are pushed into
+    /// `ids_to_close_buffer` — how those close is the caller's decision.
+    /// Shared by the readable-path fanout and `process_publishers`.
     fn write_pending_packets(&mut self) {
-        // Collect IDs that successfully enqueued data for dirty marking
-        let mut enqueued_ids = Vec::new();
+        // Collect the ids that successfully enqueued data for dirty marking
+        // (clear + reuse the scratch buffer; this runs per fanout round).
+        self.conn_ids_buffer.clear();
 
         for (target_id, data, is_keyframe, is_sequence_header, is_video) in
             self.packets_buffer.drain(..)
@@ -1157,7 +1164,7 @@ impl Reactor {
                     is_video,
                 );
                 if enqueued {
-                    enqueued_ids.push(target_id);
+                    self.conn_ids_buffer.push(target_id);
                 } else {
                     // Backpressure too high, cannot enqueue, close target connection
                     self.ids_to_close_buffer.push(target_id);
@@ -1166,7 +1173,7 @@ impl Reactor {
         }
 
         // Mark all connections that received data for pending flush and interest update
-        for id in enqueued_ids {
+        for &id in &self.conn_ids_buffer {
             self.pending_flush.insert(id);
             self.interest_dirty.insert(id);
         }
@@ -1374,36 +1381,18 @@ impl Reactor {
             }
         }
 
-        // Write pending packets and collect IDs that successfully enqueued
-        let mut enqueued_ids = Vec::new();
-        for (target_id, data, is_keyframe, is_sequence_header, is_video) in packets_to_write {
-            if let Some(target_conn) = self.connections.get_mut(target_id) {
-                // Same rule as the readable-path fanout: never append new live
-                // media to a condemned connection — its final tail must drain and
-                // close, not be reopened by a post-condemn packet.
-                if target_conn.is_condemned() {
-                    continue;
-                }
-                let enqueued = target_conn.enqueue_data(
-                    Bytes::from(data),
-                    is_keyframe,
-                    is_sequence_header,
-                    is_video,
-                );
-                if enqueued {
-                    enqueued_ids.push(target_id);
-                } else {
-                    // Backpressure too high, close target connection
-                    ids_to_close.push(target_id);
-                }
-            }
-        }
-
-        // Mark all connections that received data for pending flush and interest update
-        for id in enqueued_ids {
-            self.pending_flush.insert(id);
-            self.interest_dirty.insert(id);
-        }
+        // Fan out through the shared enqueue path: move this round's packets
+        // into `packets_buffer` (empty here — every user drains it fully) and
+        // let `write_pending_packets` apply the condemned-skip and
+        // backpressure rules identically to the readable-path fanout. The
+        // loop above must collect into locals instead of pushing straight
+        // into `packets_buffer`: `dispatch_publish_bytes` already borrows
+        // `self` mutably.
+        self.packets_buffer.append(&mut packets_to_write);
+        self.write_pending_packets();
+        // Backpressured targets are closed the same way as scheduler-driven
+        // ones, appended after them so the close order matches arrival order.
+        ids_to_close.append(&mut self.ids_to_close_buffer);
 
         // Close connections that need closing, flushing the status packet
         // (e.g. finish_playing) enqueued just above in the same round.

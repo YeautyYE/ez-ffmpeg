@@ -942,7 +942,7 @@ impl RtmpScheduler {
             let channel = self
                 .channels
                 .entry(stream_key.clone())
-                .or_insert(MediaChannel::new(self.gop_limit));
+                .or_insert_with(|| MediaChannel::new(self.gop_limit));
 
             channel.watching_client_ids.insert(*client_id);
             accept_result = client.session.accept_request(request_id);
