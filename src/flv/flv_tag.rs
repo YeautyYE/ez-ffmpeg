@@ -47,6 +47,14 @@ impl FlvTag {
         self.is_audio() && flv_tag_body::is_audio_sequence_header(&self.data)
     }
 
+    /// Whether this tag carries a decodable video keyframe: an AVC (h264)
+    /// NALU packet (`AVCPacketType` `0x01`) whose FLV frame type is keyframe,
+    /// i.e. an IDR picture a decoder can start from.
+    ///
+    /// This is deliberately narrower than the FLV keyframe frame-type nibble
+    /// alone: AVC sequence headers (`AVCPacketType` `0x00`) and end-of-sequence
+    /// markers (`AVCPacketType` `0x02`) also arrive with the keyframe frame
+    /// type, but neither is a decodable picture, so both return `false`.
     pub fn is_video_keyframe(&self) -> bool {
         self.is_video() && flv_tag_body::is_video_keyframe(&self.data)
     }
