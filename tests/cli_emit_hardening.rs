@@ -29,91 +29,272 @@ fn scratch_dir() -> std::path::PathBuf {
 /// `ez-ffmpeg` package builds a lib target named `ez_ffmpeg`).
 const LIB_DEP_NAME: &str = "ez_ffmpeg";
 
-/// Byte cursor over the `deps` array of a unit fingerprint JSON. Every
-/// method either consumes exactly the expected token or panics naming the
-/// record and the byte offset; there is no recovery state, so a malformed
-/// record can never yield a value.
-struct DepsScan<'a> {
+/// Nesting cap for [`JsonParser`]: fingerprint records are a few levels
+/// deep, so 64 is generous headroom while still bounding recursion on a
+/// corrupt or hostile record.
+const JSON_DEPTH_LIMIT: usize = 64;
+
+/// A parsed JSON value. Numbers keep their raw text: the only number this
+/// test interprets is the lib dep's fingerprint hash, converted to `u64`
+/// at its single point of use, so no other numeric field is ever coerced.
+enum Value {
+    Object(Vec<(String, Value)>),
+    Array(Vec<Value>),
+    Str(String),
+    Num(String),
+    Bool(bool),
+    Null,
+}
+
+impl Value {
+    /// One-line shape description for failure messages.
+    fn describe(&self) -> String {
+        match self {
+            Value::Object(members) => format!("an object with {} members", members.len()),
+            Value::Array(elements) => format!("an array of {} elements", elements.len()),
+            Value::Str(text) => format!("the string {text:?}"),
+            Value::Num(text) => format!("the number {text}"),
+            Value::Bool(value) => format!("the boolean {value}"),
+            Value::Null => "null".to_owned(),
+        }
+    }
+}
+
+/// Recursive-descent parser over a byte cursor for one complete JSON
+/// document. Dependency-free and deliberately unforgiving: the WHOLE
+/// document must parse and end cleanly before any value is handed out, so
+/// a truncated record, trailing garbage, or a malformed construct anywhere
+/// in it can never yield a partial value. Every failure panics naming the
+/// record and the byte offset; there is no recovery state.
+struct JsonParser<'a> {
     bytes: &'a [u8],
     pos: usize,
     source: &'a Path,
 }
 
-impl<'a> DepsScan<'a> {
+impl JsonParser<'_> {
     fn fail(&self, what: &str) -> ! {
         panic!(
-            "malformed `deps` array in {} at byte {}: {what}; cargo's fingerprint JSON may \
-             have changed shape — refusing to decode the record by guesswork",
+            "malformed JSON in {} at byte {}: {what}; cargo's fingerprint record may have \
+             changed shape — refusing to decode it by guesswork",
             self.source.display(),
             self.pos
         )
     }
 
-    fn peek(&self) -> u8 {
-        match self.bytes.get(self.pos) {
-            Some(byte) => *byte,
-            None => self.fail("record ends inside the array"),
-        }
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
     }
 
-    fn expect(&mut self, byte: u8) {
-        let found = self.peek();
-        if found != byte {
-            self.fail(&format!("expected {:?}, found {:?}", byte as char, found as char));
+    fn advance(&mut self) -> u8 {
+        match self.peek() {
+            Some(byte) => {
+                self.pos += 1;
+                byte
+            }
+            None => self.fail("unexpected end of document"),
         }
-        self.pos += 1;
     }
 
     /// Consumes `byte` if it is next; reports whether it did.
     fn eat(&mut self, byte: u8) -> bool {
-        let hit = self.bytes.get(self.pos) == Some(&byte);
+        let hit = self.peek() == Some(byte);
         self.pos += usize::from(hit);
         hit
     }
 
-    fn u64_field(&mut self) -> u64 {
+    fn expect(&mut self, byte: u8, ctx: &str) {
+        match self.peek() {
+            Some(found) if found == byte => self.pos += 1,
+            Some(found) => self.fail(&format!(
+                "expected {:?} {ctx}, found {:?}",
+                byte as char, found as char
+            )),
+            None => {
+                self.fail(&format!("expected {:?} {ctx}, found end of document", byte as char))
+            }
+        }
+    }
+
+    fn skip_whitespace(&mut self) {
+        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            self.pos += 1;
+        }
+    }
+
+    /// Parses the document: exactly one value, then nothing but trailing
+    /// ASCII whitespace. A second value or any other trailing byte is
+    /// fatal — a record with garbage after it is not the record cargo
+    /// wrote, whatever its prefix happens to parse as.
+    fn document(mut self) -> Value {
+        self.skip_whitespace();
+        let value = self.value(0);
+        self.skip_whitespace();
+        if self.pos != self.bytes.len() {
+            self.fail("trailing data after the JSON document");
+        }
+        value
+    }
+
+    fn value(&mut self, depth: usize) -> Value {
+        if depth >= JSON_DEPTH_LIMIT {
+            self.fail(&format!("nesting deeper than {JSON_DEPTH_LIMIT} levels"));
+        }
+        match self.peek() {
+            Some(b'{') => self.object(depth),
+            Some(b'[') => self.array(depth),
+            Some(b'"') => Value::Str(self.string()),
+            Some(b'-' | b'0'..=b'9') => self.number(),
+            Some(b't') => {
+                self.keyword("true");
+                Value::Bool(true)
+            }
+            Some(b'f') => {
+                self.keyword("false");
+                Value::Bool(false)
+            }
+            Some(b'n') => {
+                self.keyword("null");
+                Value::Null
+            }
+            Some(other) => self.fail(&format!("no JSON value starts with {:?}", other as char)),
+            None => self.fail("unexpected end of document where a value was expected"),
+        }
+    }
+
+    fn object(&mut self, depth: usize) -> Value {
+        self.expect(b'{', "to open an object");
+        self.skip_whitespace();
+        let mut members = Vec::new();
+        if self.eat(b'}') {
+            return Value::Object(members);
+        }
+        loop {
+            self.skip_whitespace();
+            let key = self.string();
+            self.skip_whitespace();
+            self.expect(b':', "after an object key");
+            self.skip_whitespace();
+            let value = self.value(depth + 1);
+            members.push((key, value));
+            self.skip_whitespace();
+            if self.eat(b'}') {
+                return Value::Object(members);
+            }
+            self.expect(b',', "between object members");
+        }
+    }
+
+    fn array(&mut self, depth: usize) -> Value {
+        self.expect(b'[', "to open an array");
+        self.skip_whitespace();
+        let mut elements = Vec::new();
+        if self.eat(b']') {
+            return Value::Array(elements);
+        }
+        loop {
+            self.skip_whitespace();
+            elements.push(self.value(depth + 1));
+            self.skip_whitespace();
+            if self.eat(b']') {
+                return Value::Array(elements);
+            }
+            self.expect(b',', "between array elements");
+        }
+    }
+
+    /// Parses a string literal with full escape handling. `\uXXXX` is
+    /// validated (exactly four hex digits) but kept verbatim rather than
+    /// decoded: no name this test compares against contains one, so
+    /// surrogate-pair decoding would be machinery without a consumer.
+    fn string(&mut self) -> String {
+        self.expect(b'"', "to open a string");
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            match self.advance() {
+                b'"' => break,
+                b'\\' => match self.advance() {
+                    b'"' => buf.push(b'"'),
+                    b'\\' => buf.push(b'\\'),
+                    b'/' => buf.push(b'/'),
+                    b'b' => buf.push(0x08),
+                    b'f' => buf.push(0x0C),
+                    b'n' => buf.push(b'\n'),
+                    b'r' => buf.push(b'\r'),
+                    b't' => buf.push(b'\t'),
+                    b'u' => {
+                        buf.extend_from_slice(b"\\u");
+                        for _ in 0..4 {
+                            let digit = self.advance();
+                            if !digit.is_ascii_hexdigit() {
+                                self.pos -= 1;
+                                self.fail("`\\u` escape without four hex digits");
+                            }
+                            buf.push(digit);
+                        }
+                    }
+                    other => {
+                        self.pos -= 1;
+                        self.fail(&format!("invalid escape `\\{}`", other as char));
+                    }
+                },
+                byte if byte < 0x20 => {
+                    self.pos -= 1;
+                    self.fail("raw control character inside a string");
+                }
+                byte => buf.push(byte),
+            }
+        }
+        String::from_utf8(buf).expect(
+            "unescaped bytes come from a valid UTF-8 record and every decoded escape is ASCII",
+        )
+    }
+
+    /// Parses a number per the JSON grammar and captures its raw text; the
+    /// caller decides if and how to interpret it (see [`Value::Num`]).
+    fn number(&mut self) -> Value {
         let start = self.pos;
-        while self.bytes.get(self.pos).is_some_and(u8::is_ascii_digit) {
+        self.eat(b'-');
+        match self.peek() {
+            Some(b'0') => {
+                self.pos += 1;
+                if self.peek().is_some_and(|byte| byte.is_ascii_digit()) {
+                    self.fail("a number cannot have a leading zero");
+                }
+            }
+            Some(b'1'..=b'9') => self.digit_run("a number needs at least one digit"),
+            _ => self.fail("a number needs at least one digit"),
+        }
+        if self.eat(b'.') {
+            self.digit_run("a decimal point needs at least one following digit");
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            self.pos += 1;
+            if !self.eat(b'+') {
+                self.eat(b'-');
+            }
+            self.digit_run("an exponent needs at least one digit");
+        }
+        let text =
+            std::str::from_utf8(&self.bytes[start..self.pos]).expect("JSON number text is ASCII");
+        Value::Num(text.to_owned())
+    }
+
+    fn digit_run(&mut self, what: &str) {
+        let start = self.pos;
+        while self.peek().is_some_and(|byte| byte.is_ascii_digit()) {
             self.pos += 1;
         }
         if self.pos == start {
-            self.fail("expected an unsigned integer field");
+            self.fail(what);
         }
-        let digits = std::str::from_utf8(&self.bytes[start..self.pos])
-            .expect("ASCII digits are valid UTF-8");
-        digits.parse::<u64>().unwrap_or_else(|err| {
-            self.fail(&format!("integer field {digits:?} is not a u64 ({err})"))
-        })
     }
 
-    /// A string field. Escape sequences are a hard failure, not decoded:
-    /// dep names cargo records never need them, so one appearing means the
-    /// record does not have the shape this scanner understands.
-    fn str_field(&mut self) -> &'a str {
-        self.expect(b'"');
-        let start = self.pos;
-        loop {
-            match self.peek() {
-                b'"' => break,
-                b'\\' => self.fail("string field holds an escape sequence"),
-                _ => self.pos += 1,
-            }
-        }
-        // The delimiting quotes are ASCII bytes, so the enclosed byte range
-        // of this (already valid UTF-8) record is valid UTF-8 itself.
-        let text = std::str::from_utf8(&self.bytes[start..self.pos])
-            .expect("bytes between ASCII quote delimiters of a str are valid UTF-8");
-        self.pos += 1;
-        text
-    }
-
-    fn bool_field(&mut self) {
-        if self.bytes[self.pos..].starts_with(b"true") {
-            self.pos += 4;
-        } else if self.bytes[self.pos..].starts_with(b"false") {
-            self.pos += 5;
+    fn keyword(&mut self, word: &str) {
+        if self.bytes[self.pos..].starts_with(word.as_bytes()) {
+            self.pos += word.len();
         } else {
-            self.fail("expected `true` or `false`");
+            self.fail(&format!("expected `{word}`"));
         }
     }
 }
@@ -123,65 +304,88 @@ impl<'a> DepsScan<'a> {
 /// top-level `deps` key holds an array of four-element entries
 /// `[<pkg-id-hash>, "<dep name>", <public flag>, <fingerprint-hash>]`, and
 /// the entry named `ez_ffmpeg` is the lib this unit was built against.
-/// The decoding is dependency-free, so instead of a JSON parser there is a
-/// scanner that anchors on the single `"deps":[` occurrence and accepts
-/// precisely the recorded entry shape. Dep-name text appearing anywhere
-/// else in the record (another field could embed `"ez_ffmpeg",77`) is
-/// never consulted, and every deviation — a missing or duplicated
-/// `"deps":[` key, an entry with the wrong element count or types, an
-/// unterminated string, a non-u64 number — is a hard failure naming the
-/// record, never a guess.
+/// The record is parsed as one complete JSON document and navigated
+/// structurally, so only the genuinely top-level `deps` key is consulted —
+/// a nested `deps` object member, a `"deps":[` sequence inside some other
+/// string, a truncated record, or garbage after the document can never
+/// satisfy the lookup. Every deviation — no top-level object, a missing or
+/// duplicated `deps` key, an entry with the wrong element count or types,
+/// any dep-entry count for `ez_ffmpeg` other than exactly one (duplicates
+/// are fatal even when their fingerprints agree: cargo writes each dep
+/// once, so a doubled entry is not cargo's record), a non-u64 fingerprint
+/// — is a hard failure naming the record, never a guess.
 fn lib_dep_fingerprint(json: &str, source: &Path) -> u64 {
-    const DEPS_KEY: &str = "\"deps\":[";
-    let mut occurrences = json.match_indices(DEPS_KEY).map(|(idx, _)| idx);
-    let anchor = occurrences.next().unwrap_or_else(|| {
+    let parser = JsonParser { bytes: json.as_bytes(), pos: 0, source };
+    let root = parser.document();
+    let Value::Object(members) = root else {
         panic!(
-            "no `\"deps\":[` key in {}; cargo's fingerprint JSON may have changed shape — \
+            "fingerprint record {} is not a JSON object but {}; cargo's fingerprint JSON may \
+             have changed shape — the rlib this test binary links cannot be identified",
+            source.display(),
+            root.describe()
+        );
+    };
+    let mut deps_values = members.iter().filter(|(key, _)| key == "deps").map(|(_, val)| val);
+    let deps = deps_values.next().unwrap_or_else(|| {
+        panic!(
+            "no top-level `deps` key in {}; cargo's fingerprint JSON may have changed shape — \
              the rlib this test binary links cannot be identified",
             source.display()
         )
     });
-    if let Some(imposter) = occurrences.next() {
+    assert!(
+        deps_values.next().is_none(),
+        "several top-level `deps` keys in {}; refusing to guess which one is authoritative",
+        source.display()
+    );
+    let Value::Array(entries) = deps else {
         panic!(
-            "`\"deps\":[` occurs at byte {anchor} and again at byte {imposter} of {}; \
-             refusing to guess which one is the top-level deps array",
-            source.display()
+            "top-level `deps` in {} is not an array but {}; cargo's fingerprint JSON may have \
+             changed shape — the rlib this test binary links cannot be identified",
+            source.display(),
+            deps.describe()
         );
-    }
-    let mut scan = DepsScan { bytes: json.as_bytes(), pos: anchor + DEPS_KEY.len(), source };
-    let mut hashes: Vec<u64> = Vec::new();
-    if !scan.eat(b']') {
-        loop {
-            scan.expect(b'[');
-            scan.u64_field(); // package-id hash: shape-checked, value unused
-            scan.expect(b',');
-            let name = scan.str_field();
-            scan.expect(b',');
-            scan.bool_field();
-            scan.expect(b',');
-            let fingerprint = scan.u64_field();
-            scan.expect(b']');
-            if name == LIB_DEP_NAME {
-                hashes.push(fingerprint);
-            }
-            if scan.eat(b']') {
-                break;
-            }
-            scan.expect(b',');
+    };
+    let mut fingerprints: Vec<&str> = Vec::new();
+    for (idx, entry) in entries.iter().enumerate() {
+        let Value::Array(fields) = entry else {
+            panic!(
+                "`deps[{idx}]` in {} is not an array but {}; cargo's fingerprint JSON may have \
+                 changed shape — refusing to decode the record by guesswork",
+                source.display(),
+                entry.describe()
+            );
+        };
+        let [Value::Num(_), Value::Str(name), Value::Bool(_), Value::Num(fingerprint)] =
+            &fields[..]
+        else {
+            panic!(
+                "`deps[{idx}]` in {} is not the four-element `[number, string, bool, number]` \
+                 entry cargo writes ({} elements); refusing to decode the record by guesswork",
+                source.display(),
+                fields.len()
+            );
+        };
+        if name == LIB_DEP_NAME {
+            fingerprints.push(fingerprint);
         }
     }
-    hashes.sort_unstable();
-    hashes.dedup();
-    match hashes[..] {
-        [fp] => fp,
+    match fingerprints[..] {
+        [fingerprint] => fingerprint.parse::<u64>().unwrap_or_else(|err| {
+            panic!(
+                "`{LIB_DEP_NAME}` dep fingerprint {fingerprint:?} in {} is not a u64 ({err})",
+                source.display()
+            )
+        }),
         [] => panic!(
             "no `{LIB_DEP_NAME}` dep entry in the `deps` array of {}; the rlib this test \
              binary links cannot be identified",
             source.display()
         ),
         _ => panic!(
-            "several distinct `{LIB_DEP_NAME}` dep fingerprints in {}: {hashes:?}; refusing to \
-             pick one",
+            "{} `{LIB_DEP_NAME}` dep entries in the `deps` array of {}: {fingerprints:?}; \
+             cargo records each dep once, so this is not cargo's record — refusing to pick one",
+            fingerprints.len(),
             source.display()
         ),
     }
