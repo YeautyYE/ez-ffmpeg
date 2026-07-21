@@ -23,7 +23,7 @@ use ffmpeg_sys_next::{
     av_dict_get, av_dict_set, av_rescale_q, AVFrame, AVMediaType, AVMediaType::AVMEDIA_TYPE_VIDEO,
     AVRational, AV_FRAME_FLAG_KEY, AV_NOPTS_VALUE,
 };
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 
 const US_PER_SEC: AVRational = AVRational {
     num: 1,
@@ -39,9 +39,9 @@ const US_PER_SEC: AVRational = AVRational {
 /// [`VideoFrame::into_vec`] detaches its buffer, which is simply a pool miss —
 /// the next frame allocates fresh.
 ///
-/// The channel is bounded, so a consumer that hoards frames (or clones made by
-/// the UniformN dup expansion) can never grow the pool past `slots` parked
-/// buffers; overflow and post-teardown returns degrade to a plain free.
+/// The channel is bounded, so a consumer that hoards frames (or duplicates
+/// made by the UniformN dup expansion) can never grow the pool past `slots`
+/// parked buffers; overflow and post-teardown returns degrade to a plain free.
 struct BufferPool {
     tx: Sender<Vec<u8>>,
     rx: Receiver<Vec<u8>>,
@@ -231,7 +231,8 @@ impl FrameFilter for ExportSink {
 
         if self.uniform {
             // The input-side sampler already selected this frame and stamped the
-            // number of copies to emit (1 when absent). Pack once, clone the rest.
+            // number of copies to emit (1 when absent). Pack once, copy the rest
+            // into pooled buffers.
             let count = unsafe { read_and_strip_emit_count(&mut frame) };
             // Defense in depth: even a corrupted or injected count can never
             // deliver more than the UniformN contract's n frames in total.
@@ -249,7 +250,13 @@ impl FrameFilter for ExportSink {
                 let data = if remaining == 0 {
                     std::mem::take(&mut bytes)
                 } else {
-                    bytes.clone()
+                    // Duplicates draw from the pool too: a plain clone would
+                    // allocate a fresh full-frame buffer per copy (UniformN(16)
+                    // on one 1080p RGB24 frame = 15 x 6.2 MB), while parked
+                    // buffers from already-dropped frames sit unused.
+                    let mut dup = self.pool.take(bytes.len());
+                    dup.extend_from_slice(&bytes);
+                    dup
                 };
                 if !self.deliver(w, h, pts_us, data) {
                     break;
@@ -283,7 +290,7 @@ impl FrameFilter for ExportSink {
 /// # Safety
 /// `frame` must be a valid owned frame whose metadata dict we may modify.
 unsafe fn read_and_strip_emit_count(frame: &mut Frame) -> u64 {
-    let key = CString::new(EMIT_COUNT_KEY).expect("literal has no NUL");
+    let key = EMIT_COUNT_KEY;
     let p = frame.as_mut_ptr();
     let entry = av_dict_get((*p).metadata, key.as_ptr(), std::ptr::null(), 0);
     let count = if entry.is_null() {
@@ -567,6 +574,59 @@ mod tests {
         (*p).data[0] = backing;
         (*p).linesize[0] = linesize;
         Frame::wrap(p)
+    }
+
+    /// Stamps the UniformN dup-count on a frame's metadata, as the input-side
+    /// sampler does before handing the frame down the graph.
+    unsafe fn stamp_count(frame: &mut Frame, count: u64) {
+        let val = std::ffi::CString::new(count.to_string()).expect("digits have no NUL");
+        let p = frame.as_mut_ptr();
+        assert!(av_dict_set(&mut (*p).metadata, EMIT_COUNT_KEY.as_ptr(), val.as_ptr(), 0) >= 0);
+    }
+
+    /// UniformN duplicate expansion must draw every copy from the pool: with
+    /// one parked buffer per delivery, the pack AND all duplicates consume
+    /// parked buffers instead of allocating fresh. The pool's parked count is
+    /// the observable — pointer identity could false-pass on a fresh
+    /// allocation landing on a recycled address.
+    #[test]
+    fn uniform_duplicates_draw_from_the_pool() {
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        let mut sink = ExportSink::new(tx, Sampling::UniformN(4), PixelLayout::Rgb24, None);
+        // One fitting parked buffer per delivery: 1 pack + 3 duplicates.
+        // (2x2 RGB24 = 12 bytes; ExportSink sized the pool at capacity + 2.)
+        for _ in 0..4 {
+            sink.pool
+                .recycler()
+                .try_send(Vec::with_capacity(12))
+                .expect("park a warm buffer");
+        }
+        let mut backing: Vec<u8> = (0u8..12).collect();
+        // SAFETY: `backing` outlives the frame; geometry matches (2x2, stride 6).
+        let mut frame = unsafe { synthetic_rgb24(backing.as_mut_ptr(), 2, 2, 6) };
+        unsafe { stamp_count(&mut frame, 4) };
+        let mut attrs: std::collections::HashMap<String, Box<dyn std::any::Any + Send>> =
+            std::collections::HashMap::new();
+        let mut ctx = FrameFilterContext::new("export_sink", &mut attrs);
+        let forwarded = sink.filter_frame(frame, &mut ctx).expect("filter_frame");
+        assert!(forwarded.is_some(), "uniform mode forwards the source frame");
+        // Hold every delivered frame alive so no buffer returns to the pool
+        // before the parked count is read.
+        let frames: Vec<VideoFrame> = rx.try_iter().collect();
+        assert_eq!(frames.len(), 4, "a dup-count of 4 must deliver 4 frames");
+        for (i, f) in frames.iter().enumerate() {
+            assert_eq!(f.index(), i as u64, "indices count every delivery");
+            assert_eq!(
+                f.as_bytes(),
+                &backing[..],
+                "every duplicate carries the packed payload"
+            );
+        }
+        assert!(
+            sink.pool.rx.try_recv().is_err(),
+            "all four parked buffers must be consumed: duplicates draw from \
+             the pool rather than allocating fresh"
+        );
     }
 
     /// Padded positive stride: packing must copy exactly `row_bytes` per row

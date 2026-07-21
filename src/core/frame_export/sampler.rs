@@ -6,8 +6,9 @@
 //! starve the encoder-side termination path (see the passthrough branch
 //! below). It never physically re-emits tail duplicates (which the EOS drain
 //! caps at 1024/filter): instead it stamps a *count* into one held frame's
-//! metadata (`EZ_FFMPEG_EMIT_COUNT`) and the output sink clones the packed
-//! bytes that many times — O(1) frames regardless of the count.
+//! metadata (`EZ_FFMPEG_EMIT_COUNT`) and the output sink copies the packed
+//! bytes that many times (into pooled buffers) — O(1) frames regardless of
+//! the count.
 //!
 //! Grid (C1, corrected): anchor at the first delivered frame AT/AFTER the trim
 //! boundary, `p0`; targets `t_i = p0 + (i + 0.5) * span / n` for `i in 0..n`;
@@ -31,12 +32,14 @@ use ffmpeg_sys_next::{
     av_dict_get, av_dict_set, av_rescale_q, AVFrame, AVMediaType, AVMediaType::AVMEDIA_TYPE_VIDEO,
     AVRational, AV_NOPTS_VALUE,
 };
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::sync::{Arc, OnceLock};
 
 /// Metadata key carrying the number of times the output sink should emit a
 /// held frame. Interpreted ONLY for `UniformN` (the sink ignores it otherwise).
-pub(crate) const EMIT_COUNT_KEY: &str = "EZ_FFMPEG_EMIT_COUNT";
+/// A `&CStr` so the per-frame dict lookups pass it straight to the FFmpeg dict
+/// API without allocating a `CString` per frame.
+pub(crate) const EMIT_COUNT_KEY: &CStr = c"EZ_FFMPEG_EMIT_COUNT";
 
 /// The uniform grid span in microseconds, resolved at open time (from
 /// `duration_hint_us` > selected-stream duration > container duration, or the
@@ -262,7 +265,7 @@ impl FrameFilter for ExportSampler {
 /// appends the new value at the END of the dict — a leftover entry would then
 /// win the sink's first-match read.
 fn stamp_emit_count(frame: &mut Frame, count: u64) -> Result<(), FrameFilterError> {
-    let key = CString::new(EMIT_COUNT_KEY).expect("literal has no NUL");
+    let key = EMIT_COUNT_KEY;
     let val = CString::new(count.to_string()).expect("digits have no NUL");
     // SAFETY: as_mut_ptr yields a valid owned frame; each av_dict_set(NULL)
     // removes one matching entry, so the loop strictly shrinks the dict.
