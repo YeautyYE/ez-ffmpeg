@@ -67,7 +67,13 @@ pub enum CliError {
     /// bare newlines, trailing backslash…). `offset` is the byte offset of
     /// the offending character in the original string.
     #[error("tokenize error at byte {offset}: {message}\n  the string form implements POSIX word splitting only — no variables, globs, tilde, pipes, redirects, comments or command lists; pass an argv slice to from_cli_args to sidestep shell quoting entirely\n  {CTA}")]
-    Tokenize { message: String, offset: usize },
+    Tokenize {
+        /// What is wrong at `offset` (e.g. `unterminated single quote`).
+        message: String,
+        /// Byte offset of the offending character in the original command
+        /// string.
+        offset: usize,
+    },
 
     /// A token in option position did not classify into the supported option
     /// table. `reason` explains the status (unknown, documented gap, alias,
@@ -75,19 +81,30 @@ pub enum CliError {
     /// spelling.
     #[error("unsupported option `{option}` (token #{index}, {scope})\n  {reason}{}\n  {CTA}", .hint.as_deref().map(|h| format!("\n  {h}")).unwrap_or_default())]
     UnsupportedOption {
+        /// The rejected option token, exactly as typed.
         option: String,
+        /// Zero-based index of the option token in the parsed argv.
         index: usize,
+        /// Where in the command the token was found.
         scope: CliScope,
+        /// Why the spelling is outside the subset (unknown, documented gap,
+        /// alias, per-stream indexed variant, …).
         reason: String,
+        /// Nearest supported spelling, when one is close enough to suggest.
         hint: Option<String>,
     },
 
     /// The option is supported but this value form is not.
     #[error("unsupported value `{value}` for `{option}` (token #{index})\n  {reason}\n  {CTA}")]
     UnsupportedValue {
+        /// The option whose value failed its grammar.
         option: String,
+        /// The rejected value token, verbatim.
         value: String,
+        /// Zero-based argv index of the VALUE token (not of the option that
+        /// introduced it).
         index: usize,
+        /// The value grammar the token violated.
         reason: String,
     },
 
@@ -96,8 +113,13 @@ pub enum CliError {
     /// limitation, not necessarily invalid ffmpeg syntax.
     #[error("unsupported command layout at token #{index} (`{token}`)\n  {reason}\n  {CTA}")]
     UnsupportedLayout {
+        /// Token at which the violation was detected; empty when the command
+        /// ended before a required token (missing input or output).
         token: String,
+        /// Zero-based argv index of `token`; the total token count when the
+        /// command ended early.
         index: usize,
+        /// The layout rule the command violated.
         reason: String,
     },
 
@@ -106,10 +128,19 @@ pub enum CliError {
     /// first occurrence in the argv when known.
     #[error("conflicting options `{first}`{} and `{second}`{}\n  {reason}\n  {CTA}", fmt_at(.first_index), fmt_at(.second_index))]
     ConflictingOptions {
+        /// Display name of the first participant; may carry a value
+        /// qualifier (`-c:v copy`) or be collective (`-hls_*`).
         first: String,
+        /// Display name of the second participant (same conventions as
+        /// `first`).
         second: String,
+        /// Argv index of `first`'s earliest participating occurrence, when
+        /// resolvable.
         first_index: Option<usize>,
+        /// Argv index of `second`'s earliest participating occurrence, when
+        /// resolvable.
         second_index: Option<usize>,
+        /// Why the pair cannot coexist in one command.
         reason: String,
     },
 
@@ -124,14 +155,22 @@ pub enum CliError {
     /// The emitters still accept this command and label their output as
     /// unverified scaffolding.
     #[error("command shape is not verified for execution\n  parsed options: [{}]\n  only shapes backed by a semantic golden may run; use emit_rust_code / emit_rust_code_from_args to generate unverified scaffolding code instead\n  {CTA}", .parsed_options.join(", "))]
-    NotVerified { parsed_options: Vec<String> },
+    NotVerified {
+        /// The command's manifest fingerprint: sorted, scope-qualified
+        /// canonical option keys (e.g. `in:-ss`, `out:-c:v`).
+        parsed_options: Vec<String>,
+    },
 
     /// Every token classified, but the command's option-set fingerprint
     /// matches neither a verified shape nor a documented emit-only entry.
     /// The manifest enumerates its emit surface explicitly — arbitrary
     /// combinations are rejected, not silently scaffolded.
     #[error("command shape is not in the compatibility manifest\n  parsed options: [{}]\n  neither a verified shape nor a documented emit-only entry; nothing is generated for unenumerated shapes\n  {CTA}", .parsed_options.join(", "))]
-    UnmatchedShape { parsed_options: Vec<String> },
+    UnmatchedShape {
+        /// The command's manifest fingerprint: sorted, scope-qualified
+        /// canonical option keys (e.g. `in:-ss`, `out:-c:v`).
+        parsed_options: Vec<String>,
+    },
 
     /// A `-vf` command's source stream is not structurally unique: the
     /// opened input carries more or fewer than exactly one video stream.
@@ -140,14 +179,21 @@ pub enum CliError {
     /// simple-filter prerequisite), so ambiguous inputs are rejected after
     /// probing instead of silently filtering a chosen stream.
     #[error("-vf requires an input with exactly one video stream; this input has {video_streams}\n  the ffmpeg CLI would score-select one stream to filter; the subset only executes filters over a structurally unique source\n  {CTA}")]
-    AmbiguousFilterSource { video_streams: usize },
+    AmbiguousFilterSource {
+        /// Video-stream count of the opened input (anything but exactly 1).
+        video_streams: usize,
+    },
 
     /// The linked FFmpeg libraries are not one of the verified runtime
     /// profiles. Raised before any I/O.
     #[error("linked FFmpeg is not a verified runtime profile\n  linked: libavcodec {linked_avcodec}, libavformat {linked_avformat}; verified profiles: {verified}\n  emit_rust_code still works — only in-process execution is gated\n  {CTA}")]
     UnverifiedRuntimeProfile {
+        /// `major.minor` of the linked libavcodec.
         linked_avcodec: String,
+        /// `major.minor` of the linked libavformat.
         linked_avformat: String,
+        /// Rendered list of the verified profiles (name plus the
+        /// libavcodec/libavformat pairs each one requires).
         verified: String,
     },
 
@@ -155,5 +201,9 @@ pub enum CliError {
     /// pipeline failed (I/O, codec availability, filter validation…). This
     /// wraps the crate's own typed error.
     #[error("building the pipeline failed: {0}")]
-    Build(#[from] crate::error::Error),
+    Build(
+        /// The crate's typed error from context building.
+        #[from]
+        crate::error::Error,
+    ),
 }

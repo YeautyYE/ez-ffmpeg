@@ -607,6 +607,7 @@ adopting one globally.
 - **subtitle:** Native ASS/SRT subtitle burn-in rendered by a pure-Rust engine inside the frame pipeline — independent of FFmpeg build flags (no `--enable-libass` needed, no system libass), with in-memory script input and explicit font-file control.
 - **flv:** Provides support for FLV container parsing and handling.
 - **async:** Adds asynchronous functionality (allowing you to `.await` operations).
+- **cli:** Strict ffmpeg command-line compatibility subset — run a supported command in-process with `cli::from_cli_args`, or translate it into equivalent builder code with `cli::emit_rust_code`. Every token must classify against a versioned compatibility manifest; execution additionally requires a verified (golden-tested) command shape and a verified linked-FFmpeg runtime profile, and anything outside the subset fails with a typed, token-anchored diagnostic instead of an approximation.
 - **static:** Enables static linking for FFmpeg libraries (via `ffmpeg-next/static`).
 
 ## Continuously Tested Platforms

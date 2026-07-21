@@ -69,6 +69,35 @@ pub(crate) enum ValueRule {
     LogLevel,
 }
 
+impl ValueRule {
+    /// One-line rendering of the accepted value grammar, written for the
+    /// generated support table (the docs must state the REAL rule per row,
+    /// not a generic "takes a value"). Must stay in sync with
+    /// [`validate_value`].
+    #[cfg(test)]
+    pub(crate) fn grammar(self) -> &'static str {
+        match self {
+            ValueRule::Seconds => "decimal seconds only (`10`, `2.5`)",
+            ValueRule::Codec => "codec name or `copy` (`[A-Za-z0-9_-]+`)",
+            ValueRule::Bitrate => "`NNN` / `NNNk` / `NNNM`",
+            ValueRule::Crf => "integer 0..=51",
+            ValueRule::Preset => "x264 preset name",
+            ValueRule::PositiveInt => "positive integer",
+            ValueRule::PixFmt => "pixel format name (`[a-z0-9_]+`)",
+            ValueRule::FramesOne => "exactly `1`",
+            ValueRule::ScaleFilter => "single `scale=…` chain only",
+            ValueRule::MapBasic => "basic index maps only (`0`, `0:v`, `0:a:1`, `0:1`, …)",
+            ValueRule::FormatName => "container/demuxer name (`[a-z0-9_]+`)",
+            ValueRule::MovflagsFaststart => "exactly `+faststart`",
+            ValueRule::HlsTime => "decimal seconds > 0",
+            ValueRule::HlsPlaylistVod => "exactly `vod`",
+            ValueRule::HlsListSizeZero => "exactly `0`",
+            ValueRule::Path => "non-empty path; `-`-leading values rejected",
+            ValueRule::LogLevel => "`[repeat+][level+]LEVEL`",
+        }
+    }
+}
+
 /// What an option addresses — the seven-tuple's media/stream selector,
 /// typed. The parser's no-op routing reads this (a `NoOp` row never reaches
 /// a lowering sink), and the docs render it.
