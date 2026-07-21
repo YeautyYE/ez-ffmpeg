@@ -394,29 +394,42 @@ the `AudioSpecificConfig`. Feed a `VideoDecoder`/`AudioDecoder` in a WebView,
 packetize for RTP/SRT, forward over a WebSocket, or build fMP4 segments —
 without parsing container bytes first.
 
-```rust,ignore
+```rust
 use ez_ffmpeg::packet_sink::PacketSink;
 use ez_ffmpeg::{FfmpegContext, Output};
 
-let sink = PacketSink::builder(|packet| {
-    // One H.264 access unit (AVCC layout), timestamps in stream ticks
-    // plus *_us conveniences, IDR-accurate keyframe flag.
-    send_chunk(packet.pts_us(), packet.is_key(), packet.data());
-    Ok(())
-})
-.on_stream_info(|streams| {
-    let video = streams[0].video().unwrap();
-    configure_decoder(video.codec_string(), video.codec_config());
-    Ok(())
-})
-.build();
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let sink = PacketSink::builder(|packet| {
+        // One H.264 access unit (AVCC layout), timestamps in stream ticks
+        // plus *_us conveniences, IDR-accurate keyframe flag.
+        println!(
+            "pts {} us, key {}, {} bytes",
+            packet.pts_us(),
+            packet.is_key(),
+            packet.data().len()
+        );
+        Ok(())
+    })
+    .on_stream_info(|streams| {
+        // Ready-made WebCodecs config: codec string + avcC description.
+        let video = streams[0].video().expect("video stream");
+        println!(
+            "codec \"{}\", avcC {} bytes",
+            video.codec_string(),
+            video.codec_config().len()
+        );
+        Ok(())
+    })
+    .build();
 
-FfmpegContext::builder()
-    .input("input.mp4")
-    .output(Output::from(sink).set_video_codec("libx264"))
-    .build()?
-    .start()?
-    .wait()?;
+    FfmpegContext::builder()
+        .input("input.mp4")
+        .output(Output::from(sink).set_video_codec("libx264"))
+        .build()?
+        .start()?
+        .wait()?;
+    Ok(())
+}
 ```
 
 Callbacks run on the delivery thread and block the pipeline while they run
