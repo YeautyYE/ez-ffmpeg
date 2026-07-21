@@ -1082,14 +1082,22 @@ pub enum OpenOutputError {
     /// type (fftools fg_create_simple: "Filtergraph has a %s output, cannot
     /// connect it to %s output stream") — e.g. an audio chain like `anull`
     /// cannot be attached as a video filter.
+    ///
+    /// The media-type labels are static (`"video"`, `"audio"`, ... — the
+    /// strings fftools prints), which keeps this variant inside `Error`'s
+    /// 64-byte layout; three owned `String`s would grow every hot-path
+    /// `Result` in the crate.
     #[error(
         "Simple filtergraph '{desc}' has a {found} pad, cannot connect it to \
          the {expected} stream of this output"
     )]
     SimpleFilterMediaTypeMismatch {
+        /// The offending filtergraph description, as configured.
         desc: String,
-        found: String,
-        expected: String,
+        /// The media type of the mismatched pad.
+        found: &'static str,
+        /// The media type the output stream requires.
+        expected: &'static str,
     },
 }
 
@@ -1703,6 +1711,22 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "Frame writable error: Memory allocation error while copying frame data"
+        );
+    }
+
+    // `Error` rides in every hot-path `Result` — the per-frame encoder and
+    // filter calls return `Result<(), Error>` / `Result<bool, Error>` — so its
+    // size is a layout contract, not an implementation detail: one oversized
+    // payload grows every such `Result` crate-wide. 64 bytes is the
+    // long-standing layout; keep new payloads inside it (use static labels
+    // for fixed vocabulary, or box a genuinely large variant).
+    #[test]
+    fn error_stays_within_its_64_byte_layout() {
+        let size = std::mem::size_of::<super::Error>();
+        assert!(
+            size <= 64,
+            "Error grew to {size} bytes (> 64): shrink the new payload \
+             (static labels) or box the variant"
         );
     }
 
