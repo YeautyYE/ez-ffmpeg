@@ -116,8 +116,12 @@ pub(crate) fn tokenize(command: &str) -> Result<Vec<String>, CliError> {
                     "bare newline; join lines with a trailing backslash (POSIX) or caret (cmd)",
                 ))
             }
-            c if c.is_whitespace() => {
-                // Includes '\r' and '\t'. Token boundary.
+            // Token boundary: ASCII space and tab (the POSIX default IFS
+            // blanks; `\n` is rejected above), plus `\r` for tolerance of
+            // pasted Windows text. Other Unicode whitespace (U+3000
+            // IDEOGRAPHIC SPACE, U+00A0 NBSP…) is not a separator to a
+            // POSIX shell, so it stays ordinary word data here too.
+            ' ' | '\t' | '\r' => {
                 if started {
                     tokens.push(std::mem::take(&mut current));
                     started = false;
@@ -171,10 +175,12 @@ pub(crate) fn tokenize(command: &str) -> Result<Vec<String>, CliError> {
 }
 
 /// `$` handling shared by the unquoted and double-quoted contexts: a `$`
-/// introducing an expansion (`$VAR`, `${VAR}`, `$1`, `$@`…) is rejected —
-/// the shell would substitute it and this layer must not silently pass the
-/// literal through. A `$` no shell would expand (end of word, `$.` etc.)
-/// stays literal.
+/// introducing an expansion (`$VAR`, `${VAR}`, `$1`, `$@`, `$(cmd)`,
+/// `$((expr))`…) is rejected — the shell would substitute it and this layer
+/// must not silently pass the literal through. `(` matters most inside
+/// double quotes, where it is not caught by the unquoted shell-operator
+/// check. A `$` no shell would expand (end of word, `$.` etc.) stays
+/// literal.
 fn check_dollar(
     chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
     offset: usize,
@@ -183,12 +189,12 @@ fn check_dollar(
     let expands = matches!(
         chars.peek(),
         Some((_, c)) if c.is_ascii_alphanumeric()
-            || matches!(c, '_' | '{' | '@' | '*' | '#' | '?' | '$' | '!' | '-')
+            || matches!(c, '_' | '{' | '@' | '*' | '#' | '?' | '$' | '!' | '-' | '(')
     );
     if expands {
         return Err(CliError::Tokenize {
-            message: "shell variable/parameter expansion is not performed; expand the value \
-                      yourself or pass an argv slice"
+            message: "shell expansion ($VAR, ${VAR}, $(cmd), $((expr))) is not performed; \
+                      expand the value yourself or pass an argv slice"
                 .to_string(),
             offset,
         });
@@ -303,6 +309,14 @@ mod tests {
     }
 
     #[test]
+    fn non_ascii_whitespace_is_word_data_not_a_separator() {
+        // POSIX shells split words on IFS blanks only; U+3000 IDEOGRAPHIC
+        // SPACE and U+00A0 NBSP are ordinary characters in an unquoted word.
+        assert_eq!(ok("-i a\u{3000}b.mp4"), ["-i", "a\u{3000}b.mp4"]);
+        assert_eq!(ok("-i a\u{a0}b.mp4"), ["-i", "a\u{a0}b.mp4"]);
+    }
+
+    #[test]
     fn unicode_inside_quotes_survives() {
         assert_eq!(
             ok("-i '目录 一/クリップ.mov'"),
@@ -396,6 +410,15 @@ mod tests {
         reject_msg("-i ${SRC} -y out.mp4", "expansion");
         reject_msg(r#"-i "$SRC" -y out.mp4"#, "expansion");
         reject_msg("-i $1", "expansion");
+    }
+
+    #[test]
+    fn dollar_command_and_arithmetic_substitution_rejected() {
+        // `(` after `$` inside double quotes is not caught by the unquoted
+        // shell-operator arm, so check_dollar itself must reject it.
+        reject_msg(r#"-i "$(ls).mp4""#, "expansion");
+        reject_msg(r#"-t "$((1+2))""#, "expansion");
+        reject_msg("-i $(ls)", "expansion");
     }
 
     #[test]
