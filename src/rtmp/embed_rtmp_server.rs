@@ -670,6 +670,38 @@ fn is_fd_exhaustion(e: &std::io::Error) -> bool {
     }
 }
 
+/// The single unwind boundary of the rtmp-server-worker thread.
+///
+/// The reactor is the only consumer of the connection/publisher channels. An
+/// uncontained panic in its loop would kill the worker thread without ever
+/// publishing `STATUS_END`: `is_stopped()` would stay `false` forever and the
+/// accept thread — whose loop exits only on the status flag or a disconnected
+/// channel send — would keep feeding connections nobody drains. Containing
+/// the unwind here publishes the terminal status so the accept thread exits
+/// on its next ~100ms cycle, and returns normally so the caller's `Reactor`
+/// drop still runs, closing every accepted connection.
+///
+/// The store is idempotent: a clean return only reaches `STATUS_END` through
+/// `signal_stop` (or the reactor's own fatal paths), and this function leaves
+/// the status untouched unless it actually caught an unwind.
+fn contain_reactor_panic(status: &AtomicUsize, run_reactor: impl FnOnce()) {
+    // AssertUnwindSafe: the closure borrows the reactor mutably, and `&mut T`
+    // is not `UnwindSafe`. That is acceptable here because after an unwind the
+    // reactor is never used again — the caller only drops it.
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run_reactor)) {
+        // Publish the terminal status BEFORE logging: `error!` can run a
+        // user-installed logger that itself panics, and that unwind must not
+        // skip the store and leave the server half-dead after all.
+        status.store(STATUS_END, Ordering::Release);
+        let msg = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("non-string panic payload");
+        error!("Rtmp reactor panicked ({msg}); the server is stopped and all connections will be closed.");
+    }
+}
+
 fn handle_connections(
     connection_receiver: crossbeam_channel::Receiver<TcpStream>,
     publisher_receiver: crossbeam_channel::Receiver<(String, PublisherSource)>,
@@ -689,8 +721,12 @@ fn handle_connections(
         }
     };
 
-    // Run Reactor main loop
-    reactor.run(connection_receiver, publisher_receiver, waker);
+    // Run the Reactor main loop behind the thread's unwind boundary. The
+    // closure borrows `reactor` rather than owning it so that on a contained
+    // panic it is dropped HERE, after the terminal status is published.
+    contain_reactor_panic(&status, || {
+        reactor.run(connection_receiver, publisher_receiver, waker)
+    });
 
     if status.load(Ordering::Acquire) != STATUS_END {
         error!("Rtmp Server aborted.");
@@ -1466,6 +1502,26 @@ mod tests {
         let ended = server.stop();
         assert!(ended.is_stopped());
         assert!(wait_for_port_release(addr));
+    }
+
+    // A reactor panic must not leave the server half-dead: the unwind
+    // boundary publishes STATUS_END so is_stopped() flips true and the accept
+    // thread's per-iteration status check terminates its loop.
+    #[test]
+    fn reactor_panic_publishes_terminal_status() {
+        let status = AtomicUsize::new(STATUS_RUN);
+        contain_reactor_panic(&status, || panic!("injected reactor panic"));
+        assert_eq!(status.load(Ordering::Acquire), STATUS_END);
+    }
+
+    // The clean path owns no status transition: a normally-returning reactor
+    // reaches STATUS_END only through signal_stop (or its own fatal paths),
+    // and the containment must not force STATUS_END onto a live status.
+    #[test]
+    fn reactor_clean_return_leaves_status_untouched() {
+        let status = AtomicUsize::new(STATUS_RUN);
+        contain_reactor_panic(&status, || {});
+        assert_eq!(status.load(Ordering::Acquire), STATUS_RUN);
     }
 
     #[test]
