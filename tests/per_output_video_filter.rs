@@ -856,6 +856,72 @@ fn filtered_output_receiving_the_graph_still_conflicts() {
 }
 
 // ---------------------------------------------------------------------------
+// Streamcopy on the fftools-order candidate output: FFmpeg 7.1 fails at the
+// FIRST output the unlabeled graph binds to (ffmpeg_mux_init.c ost_add,
+// "Filtering and streamcopy cannot be used together") — the graph must never
+// slide past a copy output onto a later encoding output.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn copy_first_output_cannot_defer_the_graph_to_a_later_encoder() {
+    // Output #0 is -c:v copy, so binding the unlabeled graph there is the
+    // CLI's fatal filtering/streamcopy conflict. Skipping the copy output
+    // and binding the graph to output #1 instead would build a job the CLI
+    // rejects (and hand output #2 its simple filter as if the layout were
+    // legal).
+    let input = video_fixture("copy_candidate_in.mp4");
+    let err = build_err(
+        FfmpegContext::builder()
+            .input(input.as_str())
+            .filter_desc("hue=s=0")
+            .output(
+                Output::from(tmp_path("copy_candidate_a.mp4").as_str()).set_video_codec("copy"),
+            )
+            .output(
+                Output::from(tmp_path("copy_candidate_b.mp4").as_str()).set_video_codec("mpeg4"),
+            )
+            .output(
+                Output::from(tmp_path("copy_candidate_c.mp4").as_str())
+                    .set_video_codec("mpeg4")
+                    .set_video_filter("scale=160:120"),
+            )
+            .build(),
+    );
+    assert!(
+        matches!(&err, Error::OpenOutput(OpenOutputError::InvalidArgument)),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn copy_candidate_error_precedes_the_filtered_output_conflict() {
+    // With -c:v copy on output #0 and the simple filter on output #1, the
+    // CLI still dies at output #0 (create_streams handles output files in
+    // order): the streamcopy conflict wins, not the simple/complex conflict
+    // the graph would hit on the later filtered output.
+    let input = video_fixture("copy_candidate_order_in.mp4");
+    let err = build_err(
+        FfmpegContext::builder()
+            .input(input.as_str())
+            .filter_desc("hue=s=0")
+            .output(
+                Output::from(tmp_path("copy_candidate_order_a.mp4").as_str())
+                    .set_video_codec("copy"),
+            )
+            .output(
+                Output::from(tmp_path("copy_candidate_order_b.mp4").as_str())
+                    .set_video_codec("mpeg4")
+                    .set_video_filter("scale=160:120"),
+            )
+            .build(),
+    );
+    assert!(
+        matches!(&err, Error::OpenOutput(OpenOutputError::InvalidArgument)),
+        "unexpected error: {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Disable flags must not derail fftools-order assignment — FFmpeg 7.1 puts
 // an unlabeled graph on a -vn output and still filters the next output.
 // Legacy (no set_video_filter) ordering stays pinned bit for bit.
