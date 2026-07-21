@@ -607,6 +607,101 @@ pub enum PublisherSource {
     Feed(crossbeam_channel::Receiver<PublisherFeed>),
 }
 
+/// RAII claim on a stream key in the shared `stream_keys` set.
+///
+/// [`claim`](Self::claim) inserts the key (insert-or-fail, so two concurrent
+/// claims cannot both win) and the guard releases it **exactly once**, on
+/// drop, wherever the value dies: a failed channel send, a scheduler refusal
+/// in [`Reactor::add_publisher`], or a queued registration nobody ever
+/// received. [`into_key`](Self::into_key) disarms the guard instead —
+/// the key stays claimed and releasing it becomes the job of whoever now
+/// stores it (the accepted publisher's state, released by
+/// [`Reactor::remove_publisher`]). Exactly one of `Drop`/`into_key` ever
+/// consumes the key, so a release can never fire twice and free a claim
+/// another create has re-won in the meantime.
+pub(crate) struct StreamKeyClaim {
+    stream_keys: Arc<dashmap::DashSet<String>>,
+    /// `Some` while the guard is armed; taken by `into_key` (ownership moves
+    /// to the publisher state) or by `drop` (release).
+    stream_key: Option<String>,
+}
+
+impl StreamKeyClaim {
+    /// Atomically claim `stream_key`; gives the key back if already claimed.
+    pub(crate) fn claim(
+        stream_keys: Arc<dashmap::DashSet<String>>,
+        stream_key: String,
+    ) -> Result<Self, String> {
+        if stream_keys.insert(stream_key.clone()) {
+            Ok(Self {
+                stream_keys,
+                stream_key: Some(stream_key),
+            })
+        } else {
+            Err(stream_key)
+        }
+    }
+
+    pub(crate) fn key(&self) -> &str {
+        self.stream_key
+            .as_deref()
+            .expect("an armed claim always holds its key")
+    }
+
+    /// Disarm the guard and hand the key over: the key STAYS claimed, and
+    /// releasing it (removing it from `stream_keys`) becomes the caller's
+    /// responsibility.
+    fn into_key(mut self) -> String {
+        self.stream_key
+            .take()
+            .expect("an armed claim always holds its key")
+    }
+}
+
+impl Drop for StreamKeyClaim {
+    fn drop(&mut self) {
+        if let Some(stream_key) = self.stream_key.take() {
+            self.stream_keys.remove(&stream_key);
+        }
+    }
+}
+
+/// A publisher registration in flight from the server's `register_publisher`
+/// to the reactor. It carries the key claim so a registration dropped
+/// anywhere short of [`Reactor::add_publisher`] taking ownership — a failed
+/// send, a reactor that stopped or panicked before draining the channel, the
+/// channel itself being torn down — releases the key automatically.
+pub(crate) struct PublisherRegistration {
+    pub(crate) claim: StreamKeyClaim,
+    pub(crate) source: PublisherSource,
+}
+
+/// Owns the reactor-side registration receiver and drains still-queued
+/// registrations when dropped, releasing their key claims.
+///
+/// Two reasons the explicit drain must exist even though each claim already
+/// releases itself on drop:
+/// - `run` checks the stop signal BEFORE draining registrations, so a
+///   registration racing a stop is enqueued but never consumed;
+/// - a bounded crossbeam channel frees its queued messages only when the
+///   LAST endpoint drops, and the server handle keeps a `Sender` alive
+///   arbitrarily long after the reactor thread is gone.
+///
+/// Draining in `Drop` (not at the end of `run`) also covers a panicking
+/// reactor: the unwind out of `run` drops this guard and the leftover claims
+/// release with the reactor, not with the last server handle.
+///
+/// A send racing this drain can still slip a registration in after the last
+/// `try_recv` saw the channel empty. That claim is not lost — it releases
+/// with the queued message when the channel's last endpoint drops.
+struct RegistrationDrain(crossbeam_channel::Receiver<PublisherRegistration>);
+
+impl Drop for RegistrationDrain {
+    fn drop(&mut self) {
+        while self.0.try_recv().is_ok() {}
+    }
+}
+
 /// Publisher state
 pub struct PublisherState {
     pub stream_key: String,
@@ -867,20 +962,25 @@ impl Reactor {
     /// Add publishers.
     ///
     /// In-process publishers claim their key in `stream_keys` at create time
-    /// (insert-or-fail), so success does not insert here. A refused
-    /// registration releases the claim — `new_channel` can refuse a key a
-    /// network session is already publishing to, and leaving the claim in
-    /// place would block that key for in-process creates forever.
-    pub fn add_publisher(&mut self, stream_key: String, source: PublisherSource) -> Option<usize> {
+    /// (insert-or-fail) and the registration carries that claim here, so
+    /// success does not insert. Acceptance disarms the claim and moves the
+    /// key into the publisher's state — from then on `remove_publisher` owns
+    /// the release, at publisher end-of-life. Refusal drops the claim, which
+    /// releases the key — `new_channel` can refuse a key a network session
+    /// is already publishing to, and leaving the claim in place would block
+    /// that key for in-process creates forever.
+    pub fn add_publisher(&mut self, registration: PublisherRegistration) -> Option<usize> {
+        let PublisherRegistration { claim, source } = registration;
         let entry = self.publishers.vacant_entry();
         let id = entry.key();
 
-        if self.scheduler.new_channel(stream_key.clone(), id) {
+        if self.scheduler.new_channel(claim.key().to_string(), id) {
+            let stream_key = claim.into_key();
+            debug!("Publisher {} added for stream: {}", id, stream_key);
             entry.insert(PublisherState { stream_key, source });
-            debug!("Publisher {} added", id);
             Some(id)
         } else {
-            self.stream_keys.remove(&stream_key);
+            // Dropping `claim` releases the key.
             None
         }
     }
@@ -1577,10 +1677,18 @@ impl Reactor {
     pub fn run(
         &mut self,
         connection_receiver: crossbeam_channel::Receiver<TcpStream>,
-        publisher_receiver: crossbeam_channel::Receiver<(String, PublisherSource)>,
+        publisher_receiver: crossbeam_channel::Receiver<PublisherRegistration>,
         waker: Option<Waker>,
     ) {
         info!("Reactor started");
+
+        // Hold the registration receiver in a drop-guard that drains
+        // leftovers when run() exits — by stop signal or by unwind. The stop
+        // check below runs BEFORE the registration drain, so a registration
+        // enqueued while the reactor is going down is never consumed; its
+        // queued claim would otherwise stay held until the last server
+        // handle drops its Sender (see RegistrationDrain).
+        let publisher_receiver = RegistrationDrain(publisher_receiver);
 
         // Register the wakeup handle. If it is absent (waker_pair() failed) or
         // registration fails, the reactor still works via the POLL_TIMEOUT_MS
@@ -1629,9 +1737,8 @@ impl Reactor {
 
             // 3. Non-blocking receive new publishers
             let mut new_publisher_added = false;
-            while let Ok((stream_key, source)) = publisher_receiver.try_recv() {
-                if self.add_publisher(stream_key.clone(), source).is_some() {
-                    debug!("New publisher added for stream: {}", stream_key);
+            while let Ok(registration) = publisher_receiver.0.try_recv() {
+                if self.add_publisher(registration).is_some() {
                     new_publisher_added = true;
                 }
             }
@@ -2634,12 +2741,16 @@ mod tests {
 
         let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
-        let mut reactor = Reactor::new(3, None, stream_keys, status).expect("reactor");
+        let mut reactor = Reactor::new(3, None, stream_keys.clone(), status).expect("reactor");
 
         // Register an in-process (create_rtmp_input-style) Feed publisher.
         let (feed_tx, feed_rx) = crossbeam_channel::bounded(64);
+        let claim = StreamKeyClaim::claim(stream_keys, "live".to_string()).expect("claim");
         let pub_id = reactor
-            .add_publisher("live".to_string(), PublisherSource::Feed(feed_rx))
+            .add_publisher(PublisherRegistration {
+                claim,
+                source: PublisherSource::Feed(feed_rx),
+            })
             .expect("publisher registered");
 
         // Realistic mixed sequence on ONE FIFO feed: connect/createStream/publish
@@ -2718,6 +2829,124 @@ mod tests {
             removed.contains(&pub_id),
             "a disconnected publisher must be scheduled for removal"
         );
+    }
+
+    // The claim guard's two exits are exclusive: drop releases the key,
+    // into_key hands it over still-claimed (releasing then belongs to
+    // whoever stores it — remove_publisher for an accepted publisher).
+    #[test]
+    fn stream_key_claim_releases_on_drop_and_disarms_on_into_key() {
+        let stream_keys: Arc<dashmap::DashSet<String>> = Arc::new(dashmap::DashSet::new());
+
+        let claim = StreamKeyClaim::claim(stream_keys.clone(), "k".to_string()).expect("claim");
+        assert!(
+            StreamKeyClaim::claim(stream_keys.clone(), "k".to_string()).is_err(),
+            "a second claim for a held key must lose"
+        );
+        drop(claim);
+        assert!(!stream_keys.contains("k"), "drop must release the claim");
+
+        let claim =
+            StreamKeyClaim::claim(stream_keys.clone(), "k".to_string()).expect("re-claim");
+        let key = claim.into_key();
+        assert!(
+            stream_keys.contains("k"),
+            "into_key must keep the key claimed"
+        );
+        // The disarmed key's owner releases it, as remove_publisher does.
+        stream_keys.remove(&key);
+        assert!(!stream_keys.contains("k"));
+    }
+
+    // add_publisher owns the claim it is handed: acceptance moves the key
+    // into the publisher's state and only remove_publisher releases it;
+    // refusal (a network session already publishes the key, which never
+    // touches stream_keys) drops the claim and frees the key immediately.
+    #[test]
+    fn add_publisher_acceptance_defers_release_refusal_frees_the_key() {
+        let stream_keys = Arc::new(dashmap::DashSet::new());
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let mut reactor = Reactor::new(3, None, stream_keys.clone(), status).expect("reactor");
+
+        let (_feed_tx, feed_rx) = crossbeam_channel::bounded::<PublisherFeed>(1);
+        let claim =
+            StreamKeyClaim::claim(stream_keys.clone(), "live".to_string()).expect("claim");
+        let id = reactor
+            .add_publisher(PublisherRegistration {
+                claim,
+                source: PublisherSource::Feed(feed_rx),
+            })
+            .expect("accepted");
+        assert!(
+            stream_keys.contains("live"),
+            "acceptance must keep the key claimed"
+        );
+        reactor.remove_publisher(id);
+        assert!(
+            !stream_keys.contains("live"),
+            "removing the publisher must release its key"
+        );
+
+        // Simulate a network publisher owning "net" inside the scheduler.
+        assert!(reactor.scheduler.new_channel("net".to_string(), 777));
+        let (_feed_tx2, feed_rx2) = crossbeam_channel::bounded::<PublisherFeed>(1);
+        let claim = StreamKeyClaim::claim(stream_keys.clone(), "net".to_string()).expect("claim");
+        assert!(
+            reactor
+                .add_publisher(PublisherRegistration {
+                    claim,
+                    source: PublisherSource::Feed(feed_rx2),
+                })
+                .is_none(),
+            "a key already being published must be refused"
+        );
+        assert!(
+            !stream_keys.contains("net"),
+            "a refused registration must release its key claim"
+        );
+    }
+
+    // A registration enqueued while the reactor is stopping is never
+    // consumed — run() checks the stop flag before draining registrations.
+    // Its queued claim must not outlive the reactor: the key must be
+    // claimable again even though the server side still holds the Sender.
+    #[test]
+    fn reactor_stop_releases_enqueued_but_unconsumed_key_claims() {
+        let stream_keys = Arc::new(dashmap::DashSet::new());
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let mut reactor =
+            Reactor::new(3, None, stream_keys.clone(), status.clone()).expect("reactor");
+
+        let (_connection_sender, connection_receiver) =
+            crossbeam_channel::bounded::<TcpStream>(1);
+        let (publisher_sender, publisher_receiver) = crossbeam_channel::bounded(4);
+
+        // Enqueue a registration, then signal stop so run() exits on its
+        // first stop-flag check without ever draining the channel.
+        let (_feed_tx, feed_rx) = crossbeam_channel::bounded::<PublisherFeed>(1);
+        let claim = StreamKeyClaim::claim(stream_keys.clone(), "orphan".to_string())
+            .expect("first claim must win");
+        publisher_sender
+            .send(PublisherRegistration {
+                claim,
+                source: PublisherSource::Feed(feed_rx),
+            })
+            .expect("send on a live channel");
+        status.store(STATUS_END, Ordering::Release);
+
+        reactor.run(connection_receiver, publisher_receiver, None);
+
+        // The Sender is still alive, so only run()'s exit drain can have
+        // released the claim — channel teardown never happened.
+        assert!(
+            !stream_keys.contains("orphan"),
+            "a stopped reactor must release queued, never-consumed key claims"
+        );
+        assert!(
+            StreamKeyClaim::claim(stream_keys.clone(), "orphan".to_string()).is_ok(),
+            "the key must be claimable again after the reactor stopped"
+        );
+        drop(publisher_sender);
     }
 
     // H8.c: a server-initiated close must first try to flush what was queued
@@ -3023,12 +3252,16 @@ mod tests {
     fn publisher_drain_item_budget_bounds_one_round() {
         let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
-        let mut reactor = Reactor::new(3, None, stream_keys, status).expect("reactor");
+        let mut reactor = Reactor::new(3, None, stream_keys.clone(), status).expect("reactor");
 
         // Channel larger than the budget so the backlog fits in one send burst.
         let (feed_tx, feed_rx) = crossbeam_channel::bounded(MAX_PUBLISH_ITEMS_PER_POLL + 64);
+        let claim = StreamKeyClaim::claim(stream_keys, "live".to_string()).expect("claim");
         reactor
-            .add_publisher("live".to_string(), PublisherSource::Feed(feed_rx))
+            .add_publisher(PublisherRegistration {
+                claim,
+                source: PublisherSource::Feed(feed_rx),
+            })
             .expect("publisher registered");
 
         // Budget + 6 tiny audio tags queued ahead of a single drain.
@@ -3065,11 +3298,15 @@ mod tests {
     fn publisher_drain_byte_budget_bounds_one_round() {
         let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
-        let mut reactor = Reactor::new(3, None, stream_keys, status).expect("reactor");
+        let mut reactor = Reactor::new(3, None, stream_keys.clone(), status).expect("reactor");
 
         let (feed_tx, feed_rx) = crossbeam_channel::bounded(16);
+        let claim = StreamKeyClaim::claim(stream_keys, "live".to_string()).expect("claim");
         reactor
-            .add_publisher("live".to_string(), PublisherSource::Feed(feed_rx))
+            .add_publisher(PublisherRegistration {
+                claim,
+                source: PublisherSource::Feed(feed_rx),
+            })
             .expect("publisher registered");
 
         // 3 x 200KiB crosses the 512KiB byte budget on the third item
@@ -3114,11 +3351,15 @@ mod tests {
     fn publisher_drain_oversized_item_is_consumed_not_dropped() {
         let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
-        let mut reactor = Reactor::new(3, None, stream_keys, status).expect("reactor");
+        let mut reactor = Reactor::new(3, None, stream_keys.clone(), status).expect("reactor");
 
         let (feed_tx, feed_rx) = crossbeam_channel::bounded(4);
+        let claim = StreamKeyClaim::claim(stream_keys, "live".to_string()).expect("claim");
         reactor
-            .add_publisher("live".to_string(), PublisherSource::Feed(feed_rx))
+            .add_publisher(PublisherRegistration {
+                claim,
+                source: PublisherSource::Feed(feed_rx),
+            })
             .expect("publisher registered");
 
         // A single 600KiB audio sequence header (> byte budget), then a small

@@ -4,8 +4,8 @@ use crate::flv::flv_buffer::FlvBuffer;
 use crate::flv::flv_tag::FlvTag;
 use crate::rtmp::poller::{waker_pair, WakeHandle, Waker};
 use crate::rtmp::reactor::{
-    effective_max_connections, PublisherFeed, PublisherSource, Reactor, CHANNEL_HEADROOM,
-    PUBLISHER_CHANNEL_CAPACITY,
+    effective_max_connections, PublisherFeed, PublisherRegistration, PublisherSource, Reactor,
+    StreamKeyClaim, CHANNEL_HEADROOM, PUBLISHER_CHANNEL_CAPACITY,
 };
 use bytes::{BufMut, Bytes};
 use log::{debug, error, info, warn};
@@ -31,15 +31,18 @@ pub struct EmbedRtmpServer<S> {
     address: String,
     bound_addr: Option<std::net::SocketAddr>,
     status: Arc<AtomicUsize>,
-    // Arc-shared with the reactor. create_* claims a key by inserting it
-    // (insert-or-fail, so concurrent creates cannot both win); the reactor
-    // releases it when the publisher is removed or its registration is
-    // refused. DashSet's Clone is a deep copy, so a non-Arc field cloned
-    // into the worker thread would split server and reactor onto two
-    // disjoint sets and disable the duplicate-key check entirely.
+    // Arc-shared with the reactor. create_* claims a key by wrapping it in a
+    // StreamKeyClaim (insert-or-fail, so concurrent creates cannot both win);
+    // the claim rides inside the queued registration and releases itself on
+    // drop unless the reactor accepts the publisher — from then on removal
+    // of the publisher releases the key. DashSet's Clone is a deep copy, so
+    // a non-Arc field cloned into the worker thread would split server and
+    // reactor onto two disjoint sets and disable the duplicate-key check
+    // entirely.
     stream_keys: Arc<dashmap::DashSet<String>>,
-    // stream_key -> publisher source (raw byte path or media-bypass feed)
-    publisher_sender: Option<crossbeam_channel::Sender<(String, PublisherSource)>>,
+    // Registrations for the reactor: key claim + publisher source (raw byte
+    // path or media-bypass feed)
+    publisher_sender: Option<crossbeam_channel::Sender<PublisherRegistration>>,
     /// Producer-side wakeup for the reactor (PERF-3), set in `start()`.
     wake_handle: Option<WakeHandle>,
     gop_limit: usize,
@@ -553,17 +556,17 @@ impl EmbedRtmpServer<Running> {
         stream_key: impl Into<String>,
     ) -> crate::error::Result<RtmpStreamSender> {
         let stream_key = stream_key.into();
-        // Claim the key atomically: `insert` returns false when the key is
-        // already present. A separate contains() check would let two
-        // concurrent creates for the same key both pass before either
-        // registration reached the reactor; both would return Ok and the
-        // loser would only fail later with an opaque send error.
-        if !self.stream_keys.insert(stream_key.clone()) {
+        // Claim the key atomically: `claim` inserts-or-fails, so two
+        // concurrent creates for the same key cannot both pass. A separate
+        // contains() check would let both pass before either registration
+        // reached the reactor; both would return Ok and the loser would only
+        // fail later with an opaque send error.
+        let Ok(claim) = StreamKeyClaim::claim(self.stream_keys.clone(), stream_key.clone()) else {
             return Err(RtmpStreamAlreadyExists(stream_key));
-        }
+        };
 
         let (sender, receiver) = crossbeam_channel::bounded(PUBLISHER_CHANNEL_CAPACITY);
-        self.register_publisher(stream_key.clone(), PublisherSource::Raw(receiver))?;
+        self.register_publisher(claim, PublisherSource::Raw(receiver))?;
 
         // Prime the raw byte channel with the connect / createStream / publish
         // handshake the server session expects before any media.
@@ -592,12 +595,12 @@ impl EmbedRtmpServer<Running> {
     ) -> crate::error::Result<crossbeam_channel::Sender<PublisherFeed>> {
         let stream_key = stream_key.into();
         // Claim the key atomically (insert-or-fail); see create_stream_sender.
-        if !self.stream_keys.insert(stream_key.clone()) {
+        let Ok(claim) = StreamKeyClaim::claim(self.stream_keys.clone(), stream_key.clone()) else {
             return Err(RtmpStreamAlreadyExists(stream_key));
-        }
+        };
 
         let (sender, receiver) = crossbeam_channel::bounded(PUBLISHER_CHANNEL_CAPACITY);
-        self.register_publisher(stream_key.clone(), PublisherSource::Feed(receiver))?;
+        self.register_publisher(claim, PublisherSource::Feed(receiver))?;
 
         // Prime the feed with the same connect / createStream / publish bytes
         // the raw path would send, wrapped as PublisherFeed::Raw.
@@ -612,35 +615,38 @@ impl EmbedRtmpServer<Running> {
 
     /// Hands a newly registered publisher's receiving end to the reactor.
     ///
-    /// The caller holds the `stream_keys` claim for `stream_key`. On failure
-    /// the claim is released here — the reactor never saw the registration,
-    /// so nobody else would. Once the send succeeds, releasing becomes the
-    /// reactor's job (`remove_publisher`, or a refused `add_publisher`);
-    /// callers must NOT remove the key on later failures, or they could
-    /// free a claim the reactor already released and another create re-won.
+    /// The registration carries the caller's `stream_keys` claim, and the
+    /// claim is a drop-releasing guard: whichever side ends up holding the
+    /// registration when it dies releases the key, with no path releasing
+    /// twice. Concretely:
+    /// - no publisher channel, or the send fails: the registration (returned
+    ///   inside the `SendError`) drops here, releasing the claim — the
+    ///   reactor never saw it, so nobody else could;
+    /// - the reactor consumes the registration: `add_publisher` either
+    ///   disarms the claim into the accepted publisher's state (released
+    ///   later by `remove_publisher`) or drops a refused one;
+    /// - the reactor stops, panics, or never drains the queue: the queued
+    ///   registration drops with the channel, releasing the claim.
     fn register_publisher(
         &self,
-        stream_key: String,
+        claim: StreamKeyClaim,
         source: PublisherSource,
     ) -> crate::error::Result<()> {
+        let registration = PublisherRegistration { claim, source };
         let publisher_sender = match self.publisher_sender.as_ref() {
             Some(sender) => sender,
             None => {
                 error!("Publisher sender not initialized");
-                self.stream_keys.remove(&stream_key);
                 return Err(RtmpCreateStream.into());
             }
         };
 
-        if let Err(crossbeam_channel::SendError((stream_key, _))) =
-            publisher_sender.send((stream_key, source))
-        {
+        if publisher_sender.send(registration).is_err() {
             if self.status.load(Ordering::Acquire) != STATUS_END {
                 warn!("Rtmp server worker already exited. Can't create stream sender.");
             } else {
                 error!("Rtmp Server aborted. Can't create stream sender.");
             }
-            self.stream_keys.remove(&stream_key);
             return Err(RtmpCreateStream.into());
         }
         Ok(())
@@ -692,21 +698,23 @@ fn is_fd_exhaustion(e: &std::io::Error) -> bool {
 /// The single unwind boundary of the rtmp-server-worker thread.
 ///
 /// The reactor is the only consumer of the connection/publisher channels. An
-/// uncontained panic in its loop would kill the worker thread without ever
-/// publishing `STATUS_END`: `is_stopped()` would stay `false` forever and the
-/// accept thread — whose loop exits only on the status flag or a disconnected
-/// channel send — would keep feeding connections nobody drains. Containing
-/// the unwind here publishes the terminal status so the accept thread exits
-/// on its next ~100ms cycle, and returns normally so the caller's `Reactor`
-/// drop still runs, closing every accepted connection.
+/// uncontained panic — in the reactor's construction just as much as in its
+/// loop — would kill the worker thread without ever publishing `STATUS_END`:
+/// `is_stopped()` would stay `false` forever and the accept thread — whose
+/// loop exits only on the status flag or a disconnected channel send — would
+/// keep feeding connections nobody drains. Containing the unwind here
+/// publishes the terminal status so the accept thread exits on its next
+/// ~100ms cycle, and returns normally so the caller's `Reactor` drop still
+/// runs, closing every accepted connection.
 ///
 /// The store is idempotent: a clean return only reaches `STATUS_END` through
 /// `signal_stop` (or the reactor's own fatal paths), and this function leaves
 /// the status untouched unless it actually caught an unwind.
 fn contain_reactor_panic(status: &AtomicUsize, run_reactor: impl FnOnce()) {
-    // AssertUnwindSafe: the closure borrows the reactor mutably, and `&mut T`
-    // is not `UnwindSafe`. That is acceptable here because after an unwind the
-    // reactor is never used again — the caller only drops it.
+    // AssertUnwindSafe: the closure borrows the caller's reactor slot mutably,
+    // and `&mut T` is not `UnwindSafe`. That is acceptable here because after
+    // an unwind the slot's reactor is never used again — the caller only
+    // drops it.
     if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run_reactor)) {
         // Publish the terminal status BEFORE logging: `error!` can run a
         // user-installed logger that itself panics, and that unwind must not
@@ -723,28 +731,36 @@ fn contain_reactor_panic(status: &AtomicUsize, run_reactor: impl FnOnce()) {
 
 fn handle_connections(
     connection_receiver: crossbeam_channel::Receiver<TcpStream>,
-    publisher_receiver: crossbeam_channel::Receiver<(String, PublisherSource)>,
+    publisher_receiver: crossbeam_channel::Receiver<PublisherRegistration>,
     stream_keys: Arc<dashmap::DashSet<String>>,
     gop_limit: usize,
     max_connections: Option<usize>,
     status: Arc<AtomicUsize>,
     waker: Option<Waker>,
 ) {
-    // Create Reactor
-    let mut reactor = match Reactor::new(gop_limit, max_connections, stream_keys, status.clone()) {
-        Ok(r) => r,
-        Err(e) => {
-            error!("Failed to create Reactor: {:?}", e);
-            status.store(STATUS_END, Ordering::Release);
-            return;
-        }
-    };
-
-    // Run the Reactor main loop behind the thread's unwind boundary. The
-    // closure borrows `reactor` rather than owning it so that on a contained
-    // panic it is dropped HERE, after the terminal status is published.
+    // The reactor is CREATED inside the contained closure so that a panicking
+    // constructor also publishes `STATUS_END`, but STORED in this outer slot
+    // so that on a contained panic it is dropped HERE, after the terminal
+    // status is published — a `Drop` panicking mid-unwind would abort the
+    // process instead.
+    let mut reactor_slot: Option<Reactor> = None;
     contain_reactor_panic(&status, || {
-        reactor.run(connection_receiver, publisher_receiver, waker)
+        let reactor = match Reactor::new(gop_limit, max_connections, stream_keys, status.clone()) {
+            Ok(r) => r,
+            Err(e) => {
+                // Publish the terminal status BEFORE logging, mirroring the
+                // panic arm above: `error!` can run a user-installed logger
+                // that itself panics, and that unwind must not leave the
+                // worker dead with the status still running and the accept
+                // loop parked forever.
+                status.store(STATUS_END, Ordering::Release);
+                error!("Failed to create Reactor: {:?}", e);
+                return;
+            }
+        };
+        reactor_slot
+            .insert(reactor)
+            .run(connection_receiver, publisher_receiver, waker)
     });
 
     if status.load(Ordering::Acquire) != STATUS_END {
