@@ -22,7 +22,9 @@ fn fmt_at(index: &Option<usize>) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CliScope {
-    /// Before any file: applies to the whole run (e.g. `-y`).
+    /// An option the support table classifies as global: it applies to the
+    /// whole run wherever it appears (e.g. `-y`), so no file position is
+    /// reported for it.
     Global,
     /// Before `-i`: applies to the input file.
     Input,
