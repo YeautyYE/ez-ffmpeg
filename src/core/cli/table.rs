@@ -1078,8 +1078,11 @@ mod tests {
                     .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_')
                     .collect();
                 if !method.is_empty() {
+                    // The `(` closes the identifier: a bare `fn {method}`
+                    // prefix-matches a surviving sibling (`set_video_codec`
+                    // matching `set_video_codec_opt`) and misses the rename.
                     assert!(
-                        haystack.contains(&format!("fn {method}")),
+                        haystack.contains(&format!("fn {method}(")),
                         "{}: sink cites `{method}`, which is not a builder method",
                         spec.name
                     );

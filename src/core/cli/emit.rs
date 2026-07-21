@@ -370,11 +370,15 @@ fn lit(s: &str) -> String {
 /// User text rendered inside a generated `//` comment. Control characters
 /// (newlines above all) are escape-rendered so no token can break out of the
 /// comment and inject source — a quoted newline in an argv token must never
-/// become a real newline in generated code.
+/// become a real newline in generated code. U+2028/U+2029 (LINE/PARAGRAPH
+/// SEPARATOR) are not Unicode controls and rustc itself only ends `//`
+/// comments at `\n`, but JavaScript-family tooling and some editors treat
+/// them as line terminators — they are escaped on the same principle,
+/// matching the `{:?}` treatment string literals already get.
 fn comment_text(s: &str) -> String {
     s.chars()
         .flat_map(|c| {
-            if c.is_control() {
+            if c.is_control() || c == '\u{2028}' || c == '\u{2029}' {
                 c.escape_debug().collect::<Vec<_>>()
             } else {
                 vec![c]
@@ -447,6 +451,16 @@ mod tests {
     fn lit_escapes_quotes_and_keeps_unicode() {
         assert_eq!(lit(r#"a"b"#), r#""a\"b""#);
         assert_eq!(lit("视频.mp4"), "\"视频.mp4\"");
+    }
+
+    #[test]
+    fn comment_text_escapes_controls_and_unicode_line_separators() {
+        assert_eq!(comment_text("a\nb\0c"), r"a\nb\0c");
+        // U+2028/U+2029 are category Zl/Zp, not controls, and must still be
+        // escape-rendered: some tooling treats them as line terminators.
+        assert_eq!(comment_text("a\u{2028}b\u{2029}c"), r"a\u{2028}b\u{2029}c");
+        // Ordinary unicode passes through untouched.
+        assert_eq!(comment_text("视频 ok"), "视频 ok");
     }
 
     #[test]

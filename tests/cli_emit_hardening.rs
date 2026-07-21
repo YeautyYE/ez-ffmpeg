@@ -47,14 +47,19 @@ fn deps_and_rlibs() -> (std::path::PathBuf, Vec<std::path::PathBuf>) {
     (deps, rlibs.into_iter().map(|(_, path)| path).collect())
 }
 
-/// Type-checks a generated program against the crate. Tries each candidate
-/// rlib (feature variants may coexist in deps) and passes when any accepts.
+/// Type-checks a generated program against the NEWEST `libez_ffmpeg` rlib.
+/// The newest rlib is the authority: a rejection from it fails the test —
+/// under an any-rlib-accepts rule a stale artifact from an earlier build
+/// could keep accepting a program the current crate rejects. Older rlibs
+/// (feature variants coexist in deps) are consulted only when rustc's
+/// stderr shows the rlib itself is unusable (metadata incompatibility:
+/// E0460/E0461/E0514), never on a genuine type error.
 fn assert_type_checks(code: &str, name: &str) {
     let dir = scratch_dir();
     let source = dir.join(format!("{name}.rs"));
     std::fs::write(&source, code).unwrap();
     let (deps, rlibs) = deps_and_rlibs();
-    let mut failures = Vec::new();
+    let mut skipped = Vec::new();
     for rlib in &rlibs {
         let out = Command::new("rustc")
             .arg("--edition")
@@ -74,15 +79,20 @@ fn assert_type_checks(code: &str, name: &str) {
         if out.status.success() {
             return;
         }
-        failures.push(format!(
-            "{}:\n{}",
-            rlib.display(),
-            String::from_utf8_lossy(&out.stderr)
-        ));
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let rlib_unusable = ["E0460", "E0461", "E0514", "incompatible version of rustc"]
+            .iter()
+            .any(|signature| stderr.contains(signature));
+        assert!(
+            rlib_unusable,
+            "generated program {name} failed to type-check against the newest usable rlib {}:\n{stderr}",
+            rlib.display()
+        );
+        skipped.push(format!("{}:\n{stderr}", rlib.display()));
     }
     panic!(
-        "generated program {name} failed to type-check against every candidate rlib:\n{}",
-        failures.join("\n---\n")
+        "no usable rlib: every candidate was metadata-incompatible:\n{}",
+        skipped.join("\n---\n")
     );
 }
 
@@ -134,4 +144,80 @@ fn hostile_noop_values_and_paths_stay_in_comments() {
         );
     }
     assert_type_checks(&code, "hostile_paths");
+}
+
+/// `*/` in a token must stay data. It is inert in `//` line comments and in
+/// string literals; if the emitter ever moved user text into a `/* */` block
+/// comment, this payload would terminate it early and the trailing
+/// `compile_error!` would become live code — the type-check is the trap.
+#[test]
+fn block_comment_terminator_token_stays_data() {
+    let args = [
+        "-i",
+        "in.mp4",
+        "-c:v",
+        "mpeg4",
+        "-y",
+        "out*/compile_error!(\"boom\")/*.mp4",
+    ];
+    let code = ez_ffmpeg::cli::emit_rust_code_from_args(&args).unwrap();
+    for line in code.lines() {
+        assert!(
+            !line.trim_start().starts_with("compile_error!"),
+            "payload escaped onto its own line:\n{code}"
+        );
+    }
+    assert_type_checks(&code, "hostile_block_comment");
+}
+
+/// A quoted newline followed by `//!` aims at rustc's inner doc comments:
+/// mid-file, a line starting `//!` is a hard compile error (E0753) even
+/// though it looks like "just another comment". The escaped newline must
+/// keep it from ever reaching line-start.
+#[test]
+fn inner_doc_comment_payload_cannot_reach_line_start() {
+    let args = ["-i", "in\n//! boom.mp4", "-c:v", "mpeg4", "-y", "out.avi"];
+    let code = ez_ffmpeg::cli::emit_rust_code_from_args(&args).unwrap();
+    for line in code.lines() {
+        assert!(
+            !line.trim_start().starts_with("//!"),
+            "inner doc comment reached line start:\n{code}"
+        );
+    }
+    assert_type_checks(&code, "hostile_inner_doc");
+}
+
+/// An embedded NUL is a control character and must be escape-rendered
+/// everywhere — no raw 0x00 byte may survive into generated source.
+#[test]
+fn nul_byte_token_is_escape_rendered() {
+    let args = ["-i", "in\0nul.mp4", "-c:v", "mpeg4", "-y", "out.avi"];
+    let code = ez_ffmpeg::cli::emit_rust_code_from_args(&args).unwrap();
+    assert!(
+        !code.contains('\0'),
+        "raw NUL leaked into generated source:\n{code:?}"
+    );
+    assert_type_checks(&code, "hostile_nul");
+}
+
+/// U+2028/U+2029 are line terminators in JavaScript-family tooling and some
+/// editors, but NOT Unicode controls — a controls-only escape passes them
+/// raw into `//` comments, where tooling that breaks lines at them would
+/// see the smuggled `//!` at line start. No raw separator may survive.
+#[test]
+fn unicode_line_separators_are_escape_rendered() {
+    let args = [
+        "-i",
+        "in\u{2028}//! zl.mp4",
+        "-c:v",
+        "mpeg4",
+        "-y",
+        "out\u{2029}//! zp.avi",
+    ];
+    let code = ez_ffmpeg::cli::emit_rust_code_from_args(&args).unwrap();
+    assert!(
+        !code.contains('\u{2028}') && !code.contains('\u{2029}'),
+        "raw U+2028/U+2029 leaked into generated source:\n{code:?}"
+    );
+    assert_type_checks(&code, "hostile_line_separators");
 }
