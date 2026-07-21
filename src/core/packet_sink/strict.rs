@@ -274,6 +274,31 @@ impl PacketSinkWorker {
                         Ok(runtime) => runtime,
                         Err(e) => return Err(Box::new((sink, e))),
                     };
+                    let channels = (*codecpar).ch_layout.nb_channels;
+                    // With channelConfiguration 0 the ASC's embedded
+                    // program_config_element is the configuration's only
+                    // channel declaration; the advertised count must agree
+                    // with it, or the delivered metadata (`channels`) and
+                    // the delivered codec_config (the ASC consumers hand to
+                    // decoders) would contradict each other. Table-signaled
+                    // layouts are exempt: SBR/PS decoding legitimately
+                    // doubles a mono channelConfiguration (HE-AAC v2), so
+                    // table count and advertised count may differ.
+                    if let Some(pce_channels) = runtime.pce_channel_count() {
+                        if i64::from(pce_channels) != i64::from(channels) {
+                            return Err(Box::new((
+                                sink,
+                                PacketSinkError::InvalidExtradata {
+                                    stream_index,
+                                    reason: format!(
+                                        "AudioSpecificConfig program_config_element declares \
+                                         {pce_channels} channels but the stream advertises \
+                                         {channels}"
+                                    ),
+                                },
+                            )));
+                        }
+                    }
                     let info = PacketStreamInfo::Audio(AudioPacketConfig {
                         stream_index,
                         codec_id: (*codecpar).codec_id,
@@ -281,7 +306,7 @@ impl PacketSinkWorker {
                         codec_config: extradata.clone(),
                         time_base,
                         sample_rate: (*codecpar).sample_rate,
-                        channels: (*codecpar).ch_layout.nb_channels,
+                        channels,
                         channel_layout: describe_channel_layout(codecpar),
                     });
                     // The AAC frame duration is stream-invariant:
@@ -1307,6 +1332,71 @@ mod tests {
         assert!(packets[1].is_key(), "audio packets are always key");
         // AAC duration was derived from the codec frame size (1024 samples).
         assert_eq!(packets[1].duration(), 1024);
+    }
+
+    /// AudioSpecificConfig produced by FFmpeg's native AAC encoder with
+    /// forced PCE signaling (channelConfiguration 0, quad layout: one
+    /// front CPE + one back CPE = 4 channels):
+    ///   ffmpeg -f lavfi -i anullsrc=channel_layout=quad:sample_rate=48000 \
+    ///          -c:a aac -aac_pce 1 -bitexact -frames:a 3 out.mp4
+    const PCE_QUAD_ASC: [u8; 16] = [
+        0x11, 0x80, 0x04, 0xC4, 0x04, 0x00, 0x21, 0x10, 0x04, 0x4C, 0x61, 0x76, 0x63, 0x56, 0xE5,
+        0x00,
+    ];
+
+    #[test]
+    fn pce_channel_count_must_match_the_advertised_metadata() {
+        // The default test stream advertises 2 channels; the PCE declares
+        // 4 — contradictory metadata must fail before any callback.
+        let ctx = TestCtx::new();
+        unsafe {
+            ctx.add_stream(
+                AVMediaType::AVMEDIA_TYPE_AUDIO,
+                AVCodecID::AV_CODEC_ID_AAC,
+                Some(&PCE_QUAD_ASC),
+                AVRational { num: 1, den: 48000 },
+            );
+        }
+        let (sink, events) = recording_sink();
+        match collect(&ctx, sink) {
+            Err(PacketSinkError::InvalidExtradata {
+                stream_index: 0,
+                reason,
+            }) => {
+                assert!(
+                    reason.contains("program_config_element")
+                        && reason.contains('4')
+                        && reason.contains('2'),
+                    "got {reason:?}"
+                );
+            }
+            Err(other) => panic!("expected InvalidExtradata, got {other:?}"),
+            Ok(_) => panic!("collect must reject a PCE/metadata channel mismatch"),
+        }
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "a configuration failure must precede every callback"
+        );
+    }
+
+    #[test]
+    fn pce_channel_count_agreeing_with_the_metadata_collects() {
+        let ctx = TestCtx::new();
+        unsafe {
+            let idx = ctx.add_stream(
+                AVMediaType::AVMEDIA_TYPE_AUDIO,
+                AVCodecID::AV_CODEC_ID_AAC,
+                Some(&PCE_QUAD_ASC),
+                AVRational { num: 1, den: 48000 },
+            );
+            let st = *(*ctx.ctx).streams.add(idx);
+            (*(*st).codecpar).ch_layout.nb_channels = 4;
+        }
+        let (sink, _events) = recording_sink();
+        let worker = collect(&ctx, sink).unwrap();
+        let audio = worker.infos[0].audio().expect("typed audio configuration");
+        assert_eq!(audio.channels(), 4);
+        assert_eq!(audio.codec_string(), "mp4a.40.2");
     }
 
     #[test]
