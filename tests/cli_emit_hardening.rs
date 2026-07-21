@@ -31,7 +31,11 @@ const LIB_DEP_NAME: &str = "ez_ffmpeg";
 
 /// Nesting cap for [`JsonParser`]: fingerprint records are a few levels
 /// deep, so 64 is generous headroom while still bounding recursion on a
-/// corrupt or hostile record.
+/// corrupt or hostile record. Depth counts every value uniformly — each
+/// value, container or primitive alike, occupies one level, the root
+/// being level 1 — so the boundary is a single rule for all kinds:
+/// values at levels 1..=64 are admitted, and a value that would sit at
+/// level 65 is fatal whether it is a container or a bare scalar.
 const JSON_DEPTH_LIMIT: usize = 64;
 
 /// A parsed JSON value. Numbers keep their raw text: the only number this
@@ -69,6 +73,8 @@ impl Value {
 struct JsonParser<'a> {
     bytes: &'a [u8],
     pos: usize,
+    /// Current value-nesting level; maintained exclusively by [`Self::value`].
+    depth: usize,
     source: &'a Path,
 }
 
@@ -128,7 +134,7 @@ impl JsonParser<'_> {
     /// wrote, whatever its prefix happens to parse as.
     fn document(mut self) -> Value {
         self.skip_whitespace();
-        let value = self.value(0);
+        let value = self.value();
         self.skip_whitespace();
         if self.pos != self.bytes.len() {
             self.fail("trailing data after the JSON document");
@@ -136,13 +142,21 @@ impl JsonParser<'_> {
         value
     }
 
-    fn value(&mut self, depth: usize) -> Value {
-        if depth >= JSON_DEPTH_LIMIT {
+    /// Parses one value of any kind. The depth limit is enforced here and
+    /// only here, so it is uniform across kinds: EVERY value costs one
+    /// level for exactly the span of its own parse (increment on entry,
+    /// decrement on exit), the root sitting at level 1. A value that would
+    /// occupy level `JSON_DEPTH_LIMIT + 1` is fatal whether it is an
+    /// object, an array, or a bare primitive — the boundary does not care
+    /// what kind of value lies beyond it.
+    fn value(&mut self) -> Value {
+        self.depth += 1;
+        if self.depth > JSON_DEPTH_LIMIT {
             self.fail(&format!("nesting deeper than {JSON_DEPTH_LIMIT} levels"));
         }
-        match self.peek() {
-            Some(b'{') => self.object(depth),
-            Some(b'[') => self.array(depth),
+        let value = match self.peek() {
+            Some(b'{') => self.object(),
+            Some(b'[') => self.array(),
             Some(b'"') => Value::Str(self.string()),
             Some(b'-' | b'0'..=b'9') => self.number(),
             Some(b't') => {
@@ -159,10 +173,12 @@ impl JsonParser<'_> {
             }
             Some(other) => self.fail(&format!("no JSON value starts with {:?}", other as char)),
             None => self.fail("unexpected end of document where a value was expected"),
-        }
+        };
+        self.depth -= 1;
+        value
     }
 
-    fn object(&mut self, depth: usize) -> Value {
+    fn object(&mut self) -> Value {
         self.expect(b'{', "to open an object");
         self.skip_whitespace();
         let mut members = Vec::new();
@@ -175,7 +191,7 @@ impl JsonParser<'_> {
             self.skip_whitespace();
             self.expect(b':', "after an object key");
             self.skip_whitespace();
-            let value = self.value(depth + 1);
+            let value = self.value();
             members.push((key, value));
             self.skip_whitespace();
             if self.eat(b'}') {
@@ -185,7 +201,7 @@ impl JsonParser<'_> {
         }
     }
 
-    fn array(&mut self, depth: usize) -> Value {
+    fn array(&mut self) -> Value {
         self.expect(b'[', "to open an array");
         self.skip_whitespace();
         let mut elements = Vec::new();
@@ -194,7 +210,7 @@ impl JsonParser<'_> {
         }
         loop {
             self.skip_whitespace();
-            elements.push(self.value(depth + 1));
+            elements.push(self.value());
             self.skip_whitespace();
             if self.eat(b']') {
                 return Value::Array(elements);
@@ -203,10 +219,14 @@ impl JsonParser<'_> {
         }
     }
 
-    /// Parses a string literal with full escape handling. `\uXXXX` is
-    /// validated (exactly four hex digits) but kept verbatim rather than
-    /// decoded: no name this test compares against contains one, so
-    /// surrogate-pair decoding would be machinery without a consumer.
+    /// Parses a string literal and decodes EVERY escape into the produced
+    /// string — the simple escapes to their characters and `\uXXXX` to its
+    /// code point, surrogate pairs combined per UTF-16 (a lone or
+    /// malformed surrogate half is fatal at its byte offset). Full
+    /// decoding is what makes every string comparison escape-proof: the
+    /// literals `"deps"` and `"\u0064eps"` denote the same JSON string,
+    /// so duplicate-key detection and the dep-name match see one spelling
+    /// and cannot be evaded by escaped variants of the same text.
     fn string(&mut self) -> String {
         self.expect(b'"', "to open a string");
         let mut buf: Vec<u8> = Vec::new();
@@ -223,15 +243,9 @@ impl JsonParser<'_> {
                     b'r' => buf.push(b'\r'),
                     b't' => buf.push(b'\t'),
                     b'u' => {
-                        buf.extend_from_slice(b"\\u");
-                        for _ in 0..4 {
-                            let digit = self.advance();
-                            if !digit.is_ascii_hexdigit() {
-                                self.pos -= 1;
-                                self.fail("`\\u` escape without four hex digits");
-                            }
-                            buf.push(digit);
-                        }
+                        let decoded = self.unicode_escape();
+                        let mut utf8 = [0u8; 4];
+                        buf.extend_from_slice(decoded.encode_utf8(&mut utf8).as_bytes());
                     }
                     other => {
                         self.pos -= 1;
@@ -246,8 +260,65 @@ impl JsonParser<'_> {
             }
         }
         String::from_utf8(buf).expect(
-            "unescaped bytes come from a valid UTF-8 record and every decoded escape is ASCII",
+            "unescaped bytes come from a valid UTF-8 record and every escape decodes to \
+             well-formed UTF-8",
         )
+    }
+
+    /// Decodes one `\uXXXX` escape with the cursor just past the `u`,
+    /// returning its scalar value. A high surrogate (U+D800..=U+DBFF)
+    /// must be immediately followed by a `\uXXXX` low surrogate
+    /// (U+DC00..=U+DFFF) and the two combine per UTF-16; a lone low
+    /// surrogate, an unpaired high surrogate, or a high surrogate paired
+    /// with a non-low unit is fatal.
+    fn unicode_escape(&mut self) -> char {
+        let unit = self.hex4();
+        match unit {
+            0xD800..=0xDBFF => {
+                let pair_start = self.pos;
+                if !(self.eat(b'\\') && self.eat(b'u')) {
+                    self.pos = pair_start;
+                    self.fail(&format!(
+                        "high surrogate `\\u{unit:04X}` not followed by a `\\u` low surrogate"
+                    ));
+                }
+                let low = self.hex4();
+                if !(0xDC00..=0xDFFF).contains(&low) {
+                    self.pos = pair_start;
+                    self.fail(&format!(
+                        "high surrogate `\\u{unit:04X}` paired with `\\u{low:04X}`, which is \
+                         not a low surrogate"
+                    ));
+                }
+                let code = 0x10000 + ((u32::from(unit) - 0xD800) << 10) + (u32::from(low) - 0xDC00);
+                char::from_u32(code).expect("a surrogate pair always combines to a scalar value")
+            }
+            0xDC00..=0xDFFF => {
+                self.pos -= 6;
+                self.fail(&format!("lone low surrogate `\\u{unit:04X}`"));
+            }
+            scalar => char::from_u32(u32::from(scalar))
+                .expect("a u16 outside the surrogate range is always a scalar value"),
+        }
+    }
+
+    /// Consumes exactly four hex digits and returns their value.
+    fn hex4(&mut self) -> u16 {
+        let mut value: u16 = 0;
+        for _ in 0..4 {
+            let digit = self.advance();
+            let nibble = match digit {
+                b'0'..=b'9' => digit - b'0',
+                b'a'..=b'f' => digit - b'a' + 10,
+                b'A'..=b'F' => digit - b'A' + 10,
+                _ => {
+                    self.pos -= 1;
+                    self.fail("`\\u` escape without four hex digits");
+                }
+            };
+            value = (value << 4) | u16::from(nibble);
+        }
+        value
     }
 
     /// Parses a number per the JSON grammar and captures its raw text; the
@@ -315,7 +386,7 @@ impl JsonParser<'_> {
 /// once, so a doubled entry is not cargo's record), a non-u64 fingerprint
 /// — is a hard failure naming the record, never a guess.
 fn lib_dep_fingerprint(json: &str, source: &Path) -> u64 {
-    let parser = JsonParser { bytes: json.as_bytes(), pos: 0, source };
+    let parser = JsonParser { bytes: json.as_bytes(), pos: 0, depth: 0, source };
     let root = parser.document();
     let Value::Object(members) = root else {
         panic!(
