@@ -204,8 +204,8 @@ impl Gops {
 
     /// Frames of the currently-writing (open) GOP. Replayed to joining
     /// watchers as the final segment of the join burst: live delta frames a
-    /// joiner receives afterwards reference this GOP's IDR, so omitting it
-    /// leaves the picture smeared until the next keyframe.
+    /// joiner receives afterwards reference this GOP's opening keyframe, so
+    /// omitting it leaves the picture smeared until the next keyframe.
     pub(crate) fn current_frames(&self) -> &[FrameData] {
         &self.current
     }

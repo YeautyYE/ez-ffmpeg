@@ -1366,7 +1366,7 @@ mod bypass_parity_tests {
     }
 
     #[test]
-    fn large_idr_spanning_multiple_chunks_round_trips_identically() {
+    fn large_keyframe_spanning_multiple_chunks_round_trips_identically() {
         // A keyframe larger than the default 128-byte chunk size forces the
         // serializer to split it into continuation chunks; the deserializer
         // must reassemble the exact same bytes.

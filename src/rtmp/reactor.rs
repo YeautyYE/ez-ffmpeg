@@ -2918,7 +2918,7 @@ mod tests {
                 data: Bytes::from_static(&[0x17, 0x01, 0xAA, 0xBB]),
             })
             .unwrap();
-        // A second IDR freezes the first GOP into the replay cache.
+        // A second keyframe freezes the first GOP into the replay cache.
         feed_tx
             .send(PublisherFeed::Media {
                 tag_type: 0x09,

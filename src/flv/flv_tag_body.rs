@@ -58,7 +58,7 @@ mod tests {
     }
 
     #[test]
-    fn video_keyframe_is_idr_nalu_only() {
+    fn video_keyframe_requires_keyframe_flag_and_nalu_packet_type() {
         assert!(is_video_keyframe(&[0x17, 0x01, 0xAA]));
         assert!(!is_video_keyframe(&[0x17, 0x00])); // sequence header
         assert!(!is_video_keyframe(&[0x17, 0x02])); // end-of-sequence marker
