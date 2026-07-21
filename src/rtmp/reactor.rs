@@ -864,17 +864,23 @@ impl Reactor {
         }
     }
 
-    /// Add publishers
+    /// Add publishers.
+    ///
+    /// In-process publishers claim their key in `stream_keys` at create time
+    /// (insert-or-fail), so success does not insert here. A refused
+    /// registration releases the claim — `new_channel` can refuse a key a
+    /// network session is already publishing to, and leaving the claim in
+    /// place would block that key for in-process creates forever.
     pub fn add_publisher(&mut self, stream_key: String, source: PublisherSource) -> Option<usize> {
         let entry = self.publishers.vacant_entry();
         let id = entry.key();
 
         if self.scheduler.new_channel(stream_key.clone(), id) {
-            self.stream_keys.insert(stream_key.clone());
             entry.insert(PublisherState { stream_key, source });
             debug!("Publisher {} added", id);
             Some(id)
         } else {
+            self.stream_keys.remove(&stream_key);
             None
         }
     }

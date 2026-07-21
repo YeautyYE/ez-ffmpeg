@@ -31,10 +31,12 @@ pub struct EmbedRtmpServer<S> {
     address: String,
     bound_addr: Option<std::net::SocketAddr>,
     status: Arc<AtomicUsize>,
-    // Arc-shared with the reactor: the duplicate-key check in create_* reads
-    // the keys the reactor inserts. DashSet's Clone is a deep copy, so a
-    // non-Arc field cloned into the worker thread would split server and
-    // reactor onto two disjoint sets and disable the check entirely.
+    // Arc-shared with the reactor. create_* claims a key by inserting it
+    // (insert-or-fail, so concurrent creates cannot both win); the reactor
+    // releases it when the publisher is removed or its registration is
+    // refused. DashSet's Clone is a deep copy, so a non-Arc field cloned
+    // into the worker thread would split server and reactor onto two
+    // disjoint sets and disable the duplicate-key check entirely.
     stream_keys: Arc<dashmap::DashSet<String>>,
     // stream_key -> publisher source (raw byte path or media-bypass feed)
     publisher_sender: Option<crossbeam_channel::Sender<(String, PublisherSource)>>,
@@ -551,7 +553,12 @@ impl EmbedRtmpServer<Running> {
         stream_key: impl Into<String>,
     ) -> crate::error::Result<RtmpStreamSender> {
         let stream_key = stream_key.into();
-        if self.stream_keys.contains(&stream_key) {
+        // Claim the key atomically: `insert` returns false when the key is
+        // already present. A separate contains() check would let two
+        // concurrent creates for the same key both pass before either
+        // registration reached the reactor; both would return Ok and the
+        // loser would only fail later with an opaque send error.
+        if !self.stream_keys.insert(stream_key.clone()) {
             return Err(RtmpStreamAlreadyExists(stream_key));
         }
 
@@ -584,7 +591,8 @@ impl EmbedRtmpServer<Running> {
         stream_key: impl Into<String>,
     ) -> crate::error::Result<crossbeam_channel::Sender<PublisherFeed>> {
         let stream_key = stream_key.into();
-        if self.stream_keys.contains(&stream_key) {
+        // Claim the key atomically (insert-or-fail); see create_stream_sender.
+        if !self.stream_keys.insert(stream_key.clone()) {
             return Err(RtmpStreamAlreadyExists(stream_key));
         }
 
@@ -603,6 +611,13 @@ impl EmbedRtmpServer<Running> {
     }
 
     /// Hands a newly registered publisher's receiving end to the reactor.
+    ///
+    /// The caller holds the `stream_keys` claim for `stream_key`. On failure
+    /// the claim is released here — the reactor never saw the registration,
+    /// so nobody else would. Once the send succeeds, releasing becomes the
+    /// reactor's job (`remove_publisher`, or a refused `add_publisher`);
+    /// callers must NOT remove the key on later failures, or they could
+    /// free a claim the reactor already released and another create re-won.
     fn register_publisher(
         &self,
         stream_key: String,
@@ -612,16 +627,20 @@ impl EmbedRtmpServer<Running> {
             Some(sender) => sender,
             None => {
                 error!("Publisher sender not initialized");
+                self.stream_keys.remove(&stream_key);
                 return Err(RtmpCreateStream.into());
             }
         };
 
-        if publisher_sender.send((stream_key, source)).is_err() {
+        if let Err(crossbeam_channel::SendError((stream_key, _))) =
+            publisher_sender.send((stream_key, source))
+        {
             if self.status.load(Ordering::Acquire) != STATUS_END {
                 warn!("Rtmp server worker already exited. Can't create stream sender.");
             } else {
                 error!("Rtmp Server aborted. Can't create stream sender.");
             }
+            self.stream_keys.remove(&stream_key);
             return Err(RtmpCreateStream.into());
         }
         Ok(())
@@ -1464,16 +1483,12 @@ mod tests {
             .create_rtmp_input("app", "dup-key")
             .expect("first create must succeed");
 
-        // Registration travels over a channel to the reactor thread; poll
-        // until the shared key set reflects it.
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while !server.stream_keys.contains("dup-key") {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the stream key must appear in the shared set within 1s"
-            );
-            sleep(Duration::from_millis(10));
-        }
+        // The key is claimed synchronously inside create_*, before the
+        // registration ever reaches the reactor thread.
+        assert!(
+            server.stream_keys.contains("dup-key"),
+            "the stream key must be claimed by the time create returns"
+        );
 
         let second = server.create_rtmp_input("app", "dup-key");
         assert!(
@@ -1483,6 +1498,47 @@ mod tests {
             ),
             "a second create for a registered key must fail with RtmpStreamAlreadyExists"
         );
+
+        server.stop();
+    }
+
+    // Claiming a stream key must be atomic with the duplicate check: when two
+    // threads race create with the same key, exactly one may get Ok and the
+    // other must fail immediately with the typed RtmpStreamAlreadyExists
+    // error, not with a later opaque send failure.
+    #[test]
+    fn racing_creates_for_same_key_yield_exactly_one_winner() {
+        let server = EmbedRtmpServer::new("127.0.0.1:0").start().expect("start");
+
+        for round in 0..8 {
+            let key = format!("race-key-{round}");
+            let barrier = std::sync::Barrier::new(2);
+            let (a, b) = std::thread::scope(|s| {
+                let ta = s.spawn(|| {
+                    barrier.wait();
+                    server.create_rtmp_input("app", key.as_str())
+                });
+                let tb = s.spawn(|| {
+                    barrier.wait();
+                    server.create_rtmp_input("app", key.as_str())
+                });
+                (ta.join().expect("thread a"), tb.join().expect("thread b"))
+            });
+
+            let oks = a.is_ok() as usize + b.is_ok() as usize;
+            assert_eq!(
+                oks, 1,
+                "round {round}: exactly one racing create may claim the key, got {oks} Ok"
+            );
+            let loser = if a.is_ok() { b } else { a };
+            assert!(
+                matches!(
+                    loser,
+                    Err(crate::error::Error::RtmpStreamAlreadyExists(ref k)) if k == &key
+                ),
+                "round {round}: the losing create must fail with RtmpStreamAlreadyExists"
+            );
+        }
 
         server.stop();
     }
