@@ -1392,9 +1392,9 @@ mod tests {
         assert_eq!(err.kind, CallbackFailureKind::Disconnected);
     }
 
-    /// The review probe: a blocked bounded send with a live, undrained
-    /// receiver must observe the job stopping and bail out promptly —
-    /// classified as clean cancellation when NO job error is recorded.
+    /// A blocked bounded send with a live, undrained receiver must observe
+    /// the job stopping and bail out promptly — classified as clean
+    /// cancellation when NO job error is recorded.
     #[test]
     fn blocked_channel_send_observes_cancellation() {
         let (mut sink, rx) = PacketSink::channel(NonZeroUsize::new(1).unwrap());
