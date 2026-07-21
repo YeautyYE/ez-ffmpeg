@@ -63,7 +63,13 @@ struct ParamProjection {
 struct StreamRuntime {
     codec: CodecRuntime,
     time_base: AVRational,
-    frame_rate: Option<AVRational>,
+    /// Duration substituted for durationless packets, in stream time-base
+    /// ticks; 0 when underivable (such a packet then fails typed). Both
+    /// derivations are stream-invariant — one CFR frame interval over the
+    /// fixed frame rate for video, the fixed codec frame size over the
+    /// sample rate for audio — so they are computed once at collection
+    /// instead of per packet.
+    derived_duration: i64,
     projection: ParamProjection,
     timeline: StreamTimeline,
 }
@@ -202,7 +208,7 @@ impl PacketSinkWorker {
                 }
             };
 
-            let (codec, info, frame_rate) = match media_type {
+            let (codec, info, derived_duration) = match media_type {
                 AVMEDIA_TYPE_VIDEO => {
                     // The encoder whitelist was enforced at build time; this
                     // guards the codec id itself (h264 only in v1).
@@ -239,7 +245,21 @@ impl PacketSinkWorker {
                         sample_aspect_ratio: (sar.num > 0 && sar.den > 0).then_some(sar),
                         frame_rate,
                     });
-                    (CodecRuntime::Avc(runtime), info, frame_rate)
+                    // One CFR frame interval in stream time-base ticks; 0
+                    // when no frame rate is advertised (a durationless
+                    // packet then fails typed).
+                    let derived_duration = match frame_rate {
+                        Some(fr) => av_rescale_q(
+                            1,
+                            AVRational {
+                                num: fr.den,
+                                den: fr.num,
+                            },
+                            time_base,
+                        ),
+                        None => 0,
+                    };
+                    (CodecRuntime::Avc(runtime), info, derived_duration)
                 }
                 AVMEDIA_TYPE_AUDIO => {
                     if (*codecpar).codec_id != ffmpeg_sys_next::AVCodecID::AV_CODEC_ID_AAC {
@@ -264,7 +284,27 @@ impl PacketSinkWorker {
                         channels: (*codecpar).ch_layout.nb_channels,
                         channel_layout: describe_channel_layout(codecpar),
                     });
-                    (CodecRuntime::Aac(runtime), info, None)
+                    // The AAC frame duration is stream-invariant:
+                    // av_get_audio_frame_duration2 reads only codecpar (the
+                    // fixed codec frame size) for AAC and treats the byte
+                    // count purely as a nonzero gate, so a unit stand-in
+                    // derives the same value as any real payload (empty
+                    // payloads are rejected before duration handling).
+                    let samples = av_get_audio_frame_duration2(codecpar, 1);
+                    let sample_rate = (*codecpar).sample_rate;
+                    let derived_duration = if samples > 0 && sample_rate > 0 {
+                        av_rescale_q(
+                            samples as i64,
+                            AVRational {
+                                num: 1,
+                                den: sample_rate,
+                            },
+                            time_base,
+                        )
+                    } else {
+                        0
+                    };
+                    (CodecRuntime::Aac(runtime), info, derived_duration)
                 }
                 _ => {
                     return Err(Box::new((
@@ -280,7 +320,7 @@ impl PacketSinkWorker {
             streams.push(StreamRuntime {
                 codec,
                 time_base,
-                frame_rate,
+                derived_duration,
                 projection: ParamProjection {
                     width: (*codecpar).width,
                     height: (*codecpar).height,
@@ -345,16 +385,12 @@ impl PacketSinkWorker {
     /// error stashed.
     ///
     /// # Safety
-    /// - `out_fmt_ctx` must be the live output context this worker was
-    ///   collected from, and `packet_box.packet_data.output_stream_index`
-    ///   must be a valid stream index of it (same contract as `write_packet`).
-    /// - `packet_box.packet` must wrap a live packet.
-    pub(crate) unsafe fn process_and_deliver(
-        &mut self,
-        out_fmt_ctx: *const AVFormatContext,
-        packet_box: &mut PacketBox,
-    ) -> i32 {
-        match self.process(out_fmt_ctx, packet_box) {
+    /// - `packet_box.packet` must wrap a live packet, and
+    ///   `packet_box.packet_data.output_stream_index` must be a valid stream
+    ///   index of the output this worker was collected from (same contract
+    ///   as `write_packet`).
+    pub(crate) unsafe fn process_and_deliver(&mut self, packet_box: &mut PacketBox) -> i32 {
+        match self.process(packet_box) {
             Ok(()) => 0,
             Err(ProcessFailure::Cancelled) => {
                 self.cancelled = true;
@@ -374,11 +410,7 @@ impl PacketSinkWorker {
 
     /// # Safety
     /// - Same contract as [`Self::process_and_deliver`] (its only caller).
-    unsafe fn process(
-        &mut self,
-        out_fmt_ctx: *const AVFormatContext,
-        packet_box: &mut PacketBox,
-    ) -> Result<(), ProcessFailure> {
+    unsafe fn process(&mut self, packet_box: &mut PacketBox) -> Result<(), ProcessFailure> {
         let stream_index = packet_box.packet_data.output_stream_index as usize;
         debug_assert!(stream_index < self.streams.len());
         // Real phase guard (not debug-only): a packet may only be processed
@@ -488,9 +520,9 @@ impl PacketSinkWorker {
             CodecRuntime::Aac(_) => (true, payload),
         };
 
-        // 6. Duration: pass the encoder's through; derive when absent; a
-        // value that stays underivable is an error, never a silent zero.
-        let stream = &self.streams[stream_index];
+        // 6. Duration: pass the encoder's through; substitute this stream's
+        // collection-derived interval when absent; a value that stays
+        // underivable is an error, never a silent zero.
         let mut duration = (*pkt).duration;
         if duration < 0 {
             return Err(ProcessFailure::from(PacketSinkError::MissingDuration {
@@ -498,38 +530,7 @@ impl PacketSinkWorker {
             }));
         }
         if duration == 0 {
-            duration = match &stream.codec {
-                CodecRuntime::Avc(_) => match stream.frame_rate {
-                    // One CFR frame interval, in stream time-base ticks.
-                    Some(fr) => av_rescale_q(
-                        1,
-                        AVRational {
-                            num: fr.den,
-                            den: fr.num,
-                        },
-                        stream.time_base,
-                    ),
-                    None => 0,
-                },
-                CodecRuntime::Aac(_) => {
-                    let codecpar: *mut AVCodecParameters =
-                        (**(*out_fmt_ctx).streams.add(stream_index)).codecpar;
-                    let samples = av_get_audio_frame_duration2(codecpar, size);
-                    let sample_rate = (*codecpar).sample_rate;
-                    if samples > 0 && sample_rate > 0 {
-                        av_rescale_q(
-                            samples as i64,
-                            AVRational {
-                                num: 1,
-                                den: sample_rate,
-                            },
-                            stream.time_base,
-                        )
-                    } else {
-                        0
-                    }
-                }
-            };
+            duration = stream.derived_duration;
         }
         if duration <= 0 {
             return Err(ProcessFailure::from(PacketSinkError::MissingDuration {
@@ -984,7 +985,7 @@ mod tests {
         assert_eq!(worker.deliver_stream_info(), 0);
         let mut pb = packet(&idr_au(), 4, 4, tb25(), 0);
         assert_eq!(
-            unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) },
+            unsafe { worker.process_and_deliver(&mut pb) },
             0
         );
         let events = events.lock().unwrap();
@@ -1011,7 +1012,7 @@ mod tests {
         let mut worker = collect(&ctx, sink).unwrap();
         assert_eq!(worker.deliver_stream_info(), 0);
         let mut pb = packet(&p_au(), 0, 0, tb25(), 0);
-        assert_eq!(unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) }, 0);
+        assert_eq!(unsafe { worker.process_and_deliver(&mut pb) }, 0);
         let events = events.lock().unwrap();
         let PacketSinkEvent::Packet(p) = &events[1] else {
             panic!("expected a packet event after the stream info");
@@ -1028,7 +1029,7 @@ mod tests {
 
         let mut nopts = packet(&idr_au(), ffmpeg_sys_next::AV_NOPTS_VALUE, 0, tb25(), 0);
         assert_eq!(
-            unsafe { worker.process_and_deliver(ctx.ctx, &mut nopts) },
+            unsafe { worker.process_and_deliver(&mut nopts) },
             AVERROR_EXTERNAL
         );
         assert!(matches!(
@@ -1042,7 +1043,7 @@ mod tests {
         assert_eq!(worker.deliver_stream_info(), 0);
         let mut bad = packet(&idr_au(), 1, 2, tb25(), 0);
         assert_eq!(
-            unsafe { worker.process_and_deliver(ctx.ctx, &mut bad) },
+            unsafe { worker.process_and_deliver(&mut bad) },
             AVERROR_EXTERNAL
         );
         assert!(matches!(
@@ -1055,10 +1056,10 @@ mod tests {
         let mut worker = collect(&ctx, sink).unwrap();
         assert_eq!(worker.deliver_stream_info(), 0);
         let mut first = packet(&idr_au(), 0, 0, tb25(), 0);
-        assert_eq!(unsafe { worker.process_and_deliver(ctx.ctx, &mut first) }, 0);
+        assert_eq!(unsafe { worker.process_and_deliver(&mut first) }, 0);
         let mut stale = packet(&p_au(), 5, 0, tb25(), 0);
         assert_eq!(
-            unsafe { worker.process_and_deliver(ctx.ctx, &mut stale) },
+            unsafe { worker.process_and_deliver(&mut stale) },
             AVERROR_EXTERNAL
         );
         assert!(matches!(
@@ -1071,10 +1072,10 @@ mod tests {
         let mut worker = collect(&ctx, sink).unwrap();
         assert_eq!(worker.deliver_stream_info(), 0);
         let mut a = packet(&idr_au(), 3, 0, tb25(), 0);
-        assert_eq!(unsafe { worker.process_and_deliver(ctx.ctx, &mut a) }, 0);
+        assert_eq!(unsafe { worker.process_and_deliver(&mut a) }, 0);
         let mut b = packet(&p_au(), 3, 1, tb25(), 0);
         assert_eq!(
-            unsafe { worker.process_and_deliver(ctx.ctx, &mut b) },
+            unsafe { worker.process_and_deliver(&mut b) },
             AVERROR_EXTERNAL
         );
         assert!(matches!(
@@ -1101,7 +1102,7 @@ mod tests {
         assert_eq!(worker.deliver_stream_info(), 0);
         let mut pb = packet(&idr_au(), 0, 0, tb25(), 0);
         assert_eq!(
-            unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) },
+            unsafe { worker.process_and_deliver(&mut pb) },
             AVERROR_EXTERNAL
         );
         assert!(matches!(
@@ -1129,7 +1130,7 @@ mod tests {
             assert!(!sd.is_null());
             std::ptr::copy_nonoverlapping(config.as_ptr(), sd, config.len());
         }
-        assert_eq!(unsafe { worker.process_and_deliver(ctx.ctx, &mut same) }, 0);
+        assert_eq!(unsafe { worker.process_and_deliver(&mut same) }, 0);
 
         // A different SPS is a mid-stream configuration change.
         let mut changed = packet(&p_au(), 1, 1, tb25(), 0);
@@ -1147,7 +1148,7 @@ mod tests {
             std::ptr::copy_nonoverlapping(config.as_ptr(), sd, config.len());
         }
         assert_eq!(
-            unsafe { worker.process_and_deliver(ctx.ctx, &mut changed) },
+            unsafe { worker.process_and_deliver(&mut changed) },
             AVERROR_EXTERNAL
         );
         assert!(matches!(
@@ -1177,7 +1178,7 @@ mod tests {
             assert!(!sd.is_null());
             std::ptr::copy_nonoverlapping(payload.as_ptr(), sd, payload.len());
         }
-        assert_eq!(unsafe { worker.process_and_deliver(ctx.ctx, &mut same) }, 0);
+        assert_eq!(unsafe { worker.process_and_deliver(&mut same) }, 0);
 
         // A resolution change is rejected typed.
         let (sink, _events) = recording_sink();
@@ -1197,7 +1198,7 @@ mod tests {
             std::ptr::copy_nonoverlapping(payload.as_ptr(), sd, payload.len());
         }
         assert_eq!(
-            unsafe { worker.process_and_deliver(ctx.ctx, &mut changed) },
+            unsafe { worker.process_and_deliver(&mut changed) },
             AVERROR_EXTERNAL
         );
         assert!(matches!(
@@ -1218,7 +1219,7 @@ mod tests {
         au.extend_from_slice(&[0, 0, 1, 0x65, 0x88, 0x84]);
         let mut pb = packet(&au, 0, 0, tb25(), 0);
         assert_eq!(
-            unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) },
+            unsafe { worker.process_and_deliver(&mut pb) },
             AVERROR_EXTERNAL
         );
         assert!(matches!(
@@ -1235,7 +1236,7 @@ mod tests {
         au.extend_from_slice(&[0, 0, 1, 0x65, 0x88, 0x84]);
         let mut pb = packet(&au, 0, 0, tb25(), 0);
         assert_eq!(
-            unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) },
+            unsafe { worker.process_and_deliver(&mut pb) },
             AVERROR_EXTERNAL
         );
         assert!(matches!(
@@ -1267,11 +1268,11 @@ mod tests {
 
         // First delivered packet: video dts 5 (at 1/25) anchors the origin.
         let mut v = packet(&idr_au(), 5, 5, tb25(), 0);
-        assert_eq!(unsafe { worker.process_and_deliver(ctx.ctx, &mut v) }, 0);
+        assert_eq!(unsafe { worker.process_and_deliver(&mut v) }, 0);
         // Audio at original dts 0 keeps its true relative offset: negative.
         let mut a = packet(&[0x21, 0x10, 0x04], 0, 0, AVRational { num: 1, den: 44100 }, 1);
         a.packet_data.codec_type = AVMediaType::AVMEDIA_TYPE_AUDIO;
-        assert_eq!(unsafe { worker.process_and_deliver(ctx.ctx, &mut a) }, 0);
+        assert_eq!(unsafe { worker.process_and_deliver(&mut a) }, 0);
 
         let events = events.lock().unwrap();
         let packets: Vec<_> = events
@@ -1312,7 +1313,7 @@ mod tests {
         let mut worker = collect(&ctx, sink).unwrap();
         assert_eq!(worker.deliver_stream_info(), 0);
         let mut pb = packet(&idr_au(), 0, 0, tb25(), 0);
-        let ret = unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) };
+        let ret = unsafe { worker.process_and_deliver(&mut pb) };
         assert_eq!(ret, AVERROR_EXTERNAL);
         assert_ne!(ret, ffmpeg_sys_next::AVERROR_EOF);
         match worker.pending_error_cloned() {
@@ -1342,10 +1343,10 @@ mod tests {
             let mut worker = collect(&ctx, sink).unwrap();
         assert_eq!(worker.deliver_stream_info(), 0);
             let mut a = packet(&idr_au(), first.0, first.1, tb25(), 0);
-            assert_eq!(unsafe { worker.process_and_deliver(ctx.ctx, &mut a) }, 0);
+            assert_eq!(unsafe { worker.process_and_deliver(&mut a) }, 0);
             let mut b = packet(&p_au(), second.0, second.1, tb25(), 0);
             assert_eq!(
-                unsafe { worker.process_and_deliver(ctx.ctx, &mut b) },
+                unsafe { worker.process_and_deliver(&mut b) },
                 AVERROR_EXTERNAL,
                 "({},{}) then ({},{}) must be rejected",
                 first.0,
@@ -1395,7 +1396,7 @@ mod tests {
         assert_eq!(worker.deliver_stream_info(), 0);
         let mut pb = packet(&idr_au(), 0, 0, AVRational { num: 1, den: 30 }, 0);
         assert_eq!(
-            unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) },
+            unsafe { worker.process_and_deliver(&mut pb) },
             AVERROR_EXTERNAL
         );
         assert!(matches!(
@@ -1452,7 +1453,7 @@ mod tests {
                 std::ptr::copy_nonoverlapping(payload.as_ptr(), sd, payload.len());
             }
             assert_eq!(
-                unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) },
+                unsafe { worker.process_and_deliver(&mut pb) },
                 AVERROR_EXTERNAL,
                 "{what} must be rejected"
             );
@@ -1507,7 +1508,7 @@ mod tests {
             std::ptr::copy_nonoverlapping(swapped.as_ptr(), sd, swapped.len());
         }
         assert_eq!(
-            unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) },
+            unsafe { worker.process_and_deliver(&mut pb) },
             0,
             "reordered identical sets with an unchanged projection must pass"
         );
@@ -1550,7 +1551,7 @@ mod tests {
             std::ptr::copy_nonoverlapping(swapped.as_ptr(), sd, swapped.len());
         }
         assert_eq!(
-            unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) },
+            unsafe { worker.process_and_deliver(&mut pb) },
             AVERROR_EXTERNAL,
             "a reorder that changes the derived projection must be rejected"
         );
@@ -1569,7 +1570,7 @@ mod tests {
         let mut worker = collect(&ctx, sink).unwrap();
         let mut pb = packet(&idr_au(), 0, 0, tb25(), 0);
         assert_eq!(
-            unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) },
+            unsafe { worker.process_and_deliver(&mut pb) },
             AVERROR_EXTERNAL
         );
         assert!(matches!(
