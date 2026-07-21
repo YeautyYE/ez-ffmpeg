@@ -306,7 +306,10 @@ pub(super) fn outputs_bind(
     //                     (ffmpeg_mux_init.c create_streams) — so explicit
     //                     maps cannot reroute the graph past the conflict,
     //                     while an output the graph does NOT land on keeps
-    //                     its own simple filter, exactly like FFmpeg.
+    //                     its own simple filter, exactly like FFmpeg. A
+    //                     stream-copy candidate output fails right there
+    //                     with the CLI's filtering/streamcopy error instead
+    //                     of deferring the graph to a later encoding output.
     //   video copy     -> FilterWithStreamCopy (open_output_file for
     //                     -c:v copy, map_manual for copy maps);
     //   direct encode  -> the filter binds in init_simple_filtergraph,
@@ -1749,7 +1752,7 @@ fn output_bind_by_unlabeled_filter(
     mux: &mut Muxer,
     filter_graphs: &mut Vec<FilterGraph>,
     auto_disable: &mut i32,
-    assign_despite_disable: bool,
+    fftools_order: bool,
 ) -> Result<()> {
     let fg_len = filter_graphs.len();
 
@@ -1786,7 +1789,7 @@ fn output_bind_by_unlabeled_filter(
             // has no disable gate; ffmpeg 7.1 puts the graph on a -vn output
             // and happily filters the next one), so the pre-pass must not
             // skip here either.
-            if !assign_despite_disable && *auto_disable & (1 << media_type as i32) != 0 {
+            if !fftools_order && *auto_disable & (1 << media_type as i32) != 0 {
                 continue;
             }
 
@@ -1803,6 +1806,20 @@ fn output_bind_by_unlabeled_filter(
 
             match option {
                 None => {
+                    // FFmpeg reference: ffmpeg_mux_init.c:1237-1242 — a
+                    // stream fed from a complex filtergraph that resolves to
+                    // streamcopy is fatal in ost_add. In fftools order the
+                    // unlabeled graph output belongs to THIS output file, so
+                    // a copy codec here must fail like the CLI instead of
+                    // leaving the graph to slide to a later encoding output.
+                    if fftools_order {
+                        error!(target: LOG_TARGET,
+                            "Filtering and streamcopy cannot be used together. \
+                             No encoder available for filter output type {:?}.",
+                            media_type
+                        );
+                        return Err(OpenOutputError::InvalidArgument.into());
+                    }
                     warn!(target: LOG_TARGET,
                         "An unexpected media_type {:?} appears in output_filter",
                         media_type
