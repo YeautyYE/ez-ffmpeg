@@ -40,11 +40,15 @@ fn run(input: Input, output: Output, scenario: &str) -> ez_ffmpeg::error::Result
     )
 }
 
-/// Validates the strict-tier avcC structural contract (v1.2 three checks).
+/// Validates the strict-tier avcC structural contract.
 fn assert_valid_avcc(avcc: &[u8]) {
     assert!(avcc.len() >= 7, "avcC too short: {} bytes", avcc.len());
     assert_eq!(avcc[0], 1, "configurationVersion");
-    assert_eq!(avcc[4] & 0x03, 3, "lengthSizeMinusOne must be 3 (4-byte)");
+    // Full bytes, not masked views: the reserved bits around the length
+    // size and the SPS count are all ones in every conforming record
+    // (ff_isom_write_avcc emits 0xFF and 0xE0 | count).
+    assert_eq!(avcc[4], 0xFF, "reserved ones + lengthSizeMinusOne 3 (4-byte)");
+    assert_eq!(avcc[5] & 0xE0, 0xE0, "byte 5 reserved bits must be ones");
     assert!(avcc[5] & 0x1F >= 1, "at least one SPS");
 }
 

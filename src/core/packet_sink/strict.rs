@@ -970,7 +970,11 @@ mod tests {
         assert_eq!(avcc[0], 1);
         // avcC bytes 1..4 are SPS bytes 1..4 verbatim.
         assert_eq!(&avcc[1..4], &SPS[1..4]);
-        assert_eq!(avcc[4] & 0x03, 3, "4-byte NAL length prefixes");
+        // Bytes 4 and 5 carry all-ones reserved bits around the length size
+        // and the SPS count (ff_isom_write_avcc emits 0xFF and 0xE0 | count);
+        // the assertions pin the full bytes, not a masked view.
+        assert_eq!(avcc[4], 0xFF, "reserved ones + 4-byte NAL length prefixes");
+        assert_eq!(avcc[5] & 0xE0, 0xE0, "byte 5 reserved bits must be ones");
         assert!(avcc[5] & 0x1F >= 1, "at least one SPS");
         let video = info.video().expect("typed video configuration");
         assert_eq!(video.codec_id(), AVCodecID::AV_CODEC_ID_H264);

@@ -3,8 +3,10 @@
 //!
 //! Splits into two layers:
 //! * record functions — parameter-set extraction from Annex-B or avcC
-//!   wrappers, avcC synthesis mirroring `ff_isom_write_avcc` (including the
-//!   chroma/bit-depth extension), the SPS bit reader;
+//!   wrappers (full structural validation of the record: reserved bits, NAL
+//!   headers, the profile extension, trailing data and header/SPS
+//!   consistency), avcC synthesis mirroring `ff_isom_write_avcc` (including
+//!   the chroma/bit-depth extension), the SPS bit reader;
 //! * [`AvcRuntime`] — the per-stream state machine the orchestrator drives:
 //!   payload normalization via the streaming NAL walkers (a census walk
 //!   then a write walk for Annex-B input), IDR classification, S8
@@ -14,6 +16,11 @@ use super::super::nal_framing::{
     push_length_prefixed, walk_annexb, walk_length_prefixed, NAL_LENGTH_SIZE, NAL_PPS, NAL_SPS,
 };
 use crate::error::PacketSinkError;
+
+/// Sequence parameter set extension NAL (H.264 Table 7-1, type 13) — the
+/// only type `ff_isom_write_avcc` (libavformat/avc.c) stores in the avcC
+/// `sequenceParameterSetExtNALUnit` array.
+const NAL_SPS_EXT: u8 = 13;
 
 /// Parsed parameter sets of one H.264 configuration, in original order.
 /// avcC synthesis consumes this form (movenc preserves wrapper order); the S8
@@ -51,11 +58,27 @@ pub(crate) fn parse_parameter_sets(extradata: &[u8]) -> Result<ParameterSets, St
             pps: Vec::new(),
         };
         let mut bad_type: Option<u8> = None;
-        walk_annexb(extradata, |nal| match nal[0] & 0x1F {
-            NAL_SPS => sets.sps.push(nal.to_vec()),
-            NAL_PPS => sets.pps.push(nal.to_vec()),
-            other => bad_type = bad_type.or(Some(other)),
+        let mut bad_header: Option<u8> = None;
+        walk_annexb(extradata, |nal| {
+            // Full NAL header validation, not a type mask: FFmpeg's NAL
+            // reader rejects a set forbidden_zero_bit the same way
+            // (`h264_parse_nal_header`, libavcodec/h2645_parse.c) while
+            // accepting any nal_ref_idc.
+            if nal[0] & 0x80 != 0 {
+                bad_header = bad_header.or(Some(nal[0]));
+                return;
+            }
+            match nal[0] & 0x1F {
+                NAL_SPS => sets.sps.push(nal.to_vec()),
+                NAL_PPS => sets.pps.push(nal.to_vec()),
+                other => bad_type = bad_type.or(Some(other)),
+            }
         })?;
+        if let Some(header) = bad_header {
+            return Err(format!(
+                "configuration NAL header 0x{header:02X} has forbidden_zero_bit set"
+            ));
+        }
         if let Some(other) = bad_type {
             return Err(format!(
                 "unexpected NAL type {other} in configuration data (expected SPS/PPS)"
@@ -68,18 +91,57 @@ pub(crate) fn parse_parameter_sets(extradata: &[u8]) -> Result<ParameterSets, St
     }
 }
 
-/// Parses an AVCDecoderConfigurationRecord, enforcing the strict-tier checks:
-/// `configurationVersion == 1`, at least one SPS and one PPS, every array
-/// entry carrying the NAL type its array declares (7 for SPS, 8 for PPS), and
-/// `lengthSizeMinusOne == 3` (FFmpeg passes pre-existing avcC through
-/// unchanged, so a non-4-byte configuration is possible in principle and the
-/// strict tier rejects it rather than rewriting every packet's prefixes).
+/// Parses an AVCDecoderConfigurationRecord, enforcing the strict-tier
+/// checks; the thin wrapper over [`parse_avcc_record`] that drops the
+/// structural fields once validation passed.
 pub(crate) fn parse_avcc_parameter_sets(avcc: &[u8]) -> Result<ParameterSets, String> {
+    parse_avcc_record(avcc).map(|record| record.sets)
+}
+
+/// One fully validated AVCDecoderConfigurationRecord: the header's declared
+/// projection, the optional profile-extension fields and the parameter sets.
+#[derive(Debug)]
+struct AvccRecord {
+    header: CodecProjection,
+    /// `(chroma_format_idc, bit_depth_luma, bit_depth_chroma)` declared by
+    /// the profile extension, when the record carries one.
+    extension: Option<(u8, u8, u8)>,
+    sets: ParameterSets,
+}
+
+/// Parses an AVCDecoderConfigurationRecord, enforcing the strict-tier
+/// checks: `configurationVersion == 1`, all-ones reserved bits in bytes 4
+/// and 5, `lengthSizeMinusOne == 3` (FFmpeg passes pre-existing avcC
+/// through unchanged, so a non-4-byte configuration is possible in
+/// principle and the strict tier rejects it rather than rewriting every
+/// packet's prefixes), at least one SPS and one PPS, every array entry
+/// carrying a valid NAL header of the type its array declares, a
+/// complete-or-absent profile extension with nothing after it
+/// ([`parse_avcc_extension`]), and a header that agrees with the record's
+/// own first SPS ([`check_avcc_consistency`]).
+fn parse_avcc_record(avcc: &[u8]) -> Result<AvccRecord, String> {
     if avcc.len() < 7 {
         return Err(format!("avcC too short ({} bytes)", avcc.len()));
     }
     if avcc[0] != 1 {
         return Err(format!("avcC configurationVersion is {} (expected 1)", avcc[0]));
+    }
+    let header = CodecProjection {
+        profile: avcc[1],
+        compatibility: avcc[2],
+        level: avcc[3],
+    };
+    // Byte 4 is reserved '111111' + lengthSizeMinusOne and byte 5 reserved
+    // '111' + numOfSequenceParameterSets (ISO/IEC 14496-15, 5.3.3.1.2);
+    // `ff_isom_write_avcc` (libavformat/avc.c) emits 0xFF and 0xE0 | count.
+    // The strict tier requires the ones instead of masking them away:
+    // cleared reserved bits mean the bytes are not an avcC field layout
+    // any conforming writer produces.
+    if avcc[4] & 0xFC != 0xFC {
+        return Err(format!(
+            "avcC byte 4 reserved bits are cleared (0x{:02X}, expected 0xFC | lengthSizeMinusOne)",
+            avcc[4]
+        ));
     }
     let length_size = (avcc[4] & 0x03) as usize + 1;
     if length_size != NAL_LENGTH_SIZE {
@@ -87,21 +149,21 @@ pub(crate) fn parse_avcc_parameter_sets(avcc: &[u8]) -> Result<ParameterSets, St
             "avcC NAL length size is {length_size} (the strict tier requires 4)"
         ));
     }
-    let mut pos = 5usize;
-    let sps_count = (avcc[pos] & 0x1F) as usize;
-    pos += 1;
+    if avcc[5] & 0xE0 != 0xE0 {
+        return Err(format!(
+            "avcC byte 5 reserved bits are cleared (0x{:02X}, expected 0xE0 | numOfSequenceParameterSets)",
+            avcc[5]
+        ));
+    }
+    let sps_count = (avcc[5] & 0x1F) as usize;
+    let mut pos = 6usize;
     let mut sets = ParameterSets {
         sps: Vec::with_capacity(sps_count),
         pps: Vec::new(),
     };
     for _ in 0..sps_count {
         let ps = read_u16_prefixed(avcc, &mut pos).map_err(|e| format!("SPS entry: {e}"))?;
-        let nal_type = ps[0] & 0x1F;
-        if nal_type != NAL_SPS {
-            return Err(format!(
-                "avcC SPS array entry carries NAL type {nal_type} (expected {NAL_SPS})"
-            ));
-        }
+        check_ps_nal_header(ps[0], NAL_SPS, "SPS")?;
         sets.sps.push(ps);
     }
     if pos >= avcc.len() {
@@ -111,19 +173,140 @@ pub(crate) fn parse_avcc_parameter_sets(avcc: &[u8]) -> Result<ParameterSets, St
     pos += 1;
     for _ in 0..pps_count {
         let ps = read_u16_prefixed(avcc, &mut pos).map_err(|e| format!("PPS entry: {e}"))?;
-        let nal_type = ps[0] & 0x1F;
-        if nal_type != NAL_PPS {
-            return Err(format!(
-                "avcC PPS array entry carries NAL type {nal_type} (expected {NAL_PPS})"
-            ));
-        }
+        check_ps_nal_header(ps[0], NAL_PPS, "PPS")?;
         sets.pps.push(ps);
     }
-    // Trailing bytes (the profile extension) are legal and ignored here.
     if sets.sps.is_empty() || sets.pps.is_empty() {
         return Err("avcC lacks an SPS or a PPS".to_string());
     }
-    Ok(sets)
+    let extension = parse_avcc_extension(avcc, pos, header.profile)?;
+    let record = AvccRecord {
+        header,
+        extension,
+        sets,
+    };
+    check_avcc_consistency(&record)?;
+    Ok(record)
+}
+
+/// Full NAL header validation for configuration parameter sets:
+/// `forbidden_zero_bit` must be 0 and `nal_unit_type` must be the one the
+/// array declares. FFmpeg's NAL reader rejects a set forbidden bit the
+/// same way (`h264_parse_nal_header`, libavcodec/h2645_parse.c) while
+/// accepting any `nal_ref_idc`, so the two middle bits stay unconstrained.
+fn check_ps_nal_header(header: u8, expected_type: u8, what: &str) -> Result<(), String> {
+    if header & 0x80 != 0 {
+        return Err(format!(
+            "avcC {what} entry NAL header 0x{header:02X} has forbidden_zero_bit set"
+        ));
+    }
+    let nal_type = header & 0x1F;
+    if nal_type != expected_type {
+        return Err(format!(
+            "avcC {what} array entry carries NAL type {nal_type} (expected {expected_type})"
+        ));
+    }
+    Ok(())
+}
+
+/// Parses the trailing profile extension at `pos`, or verifies its legal
+/// absence — the record-level trailing-data policy.
+///
+/// `ff_isom_write_avcc` (libavformat/avc.c) appends the chroma-format /
+/// bit-depth block plus the SPS-EXT array only for profiles other than
+/// Baseline (66), Main (77) and Extended (88), so for those profiles any
+/// trailing byte is foreign data. For all other profiles ISO/IEC 14496-15
+/// requires the block, but real muxers predating its introduction end the
+/// record at the PPS array, and FFmpeg's own reader
+/// (`ff_h264_decode_extradata`, libavcodec/h264_parse.c) stops there
+/// without ever requiring it — a record that ends there is accepted. When
+/// the block IS present it must be complete, carry all-ones reserved bits,
+/// hold SPS-EXT NALs only, and end the record.
+fn parse_avcc_extension(
+    avcc: &[u8],
+    mut pos: usize,
+    profile: u8,
+) -> Result<Option<(u8, u8, u8)>, String> {
+    if pos == avcc.len() {
+        return Ok(None);
+    }
+    let trailing = avcc.len() - pos;
+    if profile == 66 || profile == 77 || profile == 88 {
+        return Err(format!(
+            "avcC for profile {profile} carries {trailing} trailing byte(s) \
+             (no extension is defined)"
+        ));
+    }
+    if trailing < 4 {
+        return Err(format!(
+            "avcC profile extension truncated ({trailing} byte(s); need the chroma \
+             format, two bit depths and the SPS-EXT count)"
+        ));
+    }
+    if avcc[pos] & 0xFC != 0xFC {
+        return Err(format!(
+            "avcC extension chroma byte reserved bits are cleared (0x{:02X})",
+            avcc[pos]
+        ));
+    }
+    let chroma_format_idc = avcc[pos] & 0x03;
+    if avcc[pos + 1] & 0xF8 != 0xF8 || avcc[pos + 2] & 0xF8 != 0xF8 {
+        return Err(format!(
+            "avcC extension bit-depth reserved bits are cleared (0x{:02X} 0x{:02X})",
+            avcc[pos + 1],
+            avcc[pos + 2]
+        ));
+    }
+    let bit_depth_luma = (avcc[pos + 1] & 0x07) + 8;
+    let bit_depth_chroma = (avcc[pos + 2] & 0x07) + 8;
+    let sps_ext_count = avcc[pos + 3] as usize;
+    pos += 4;
+    for _ in 0..sps_ext_count {
+        let ps = read_u16_prefixed(avcc, &mut pos).map_err(|e| format!("SPS-EXT entry: {e}"))?;
+        check_ps_nal_header(ps[0], NAL_SPS_EXT, "SPS-EXT")?;
+    }
+    if pos != avcc.len() {
+        return Err(format!(
+            "avcC carries {} trailing byte(s) after the profile extension",
+            avcc.len() - pos
+        ));
+    }
+    Ok(Some((chroma_format_idc, bit_depth_luma, bit_depth_chroma)))
+}
+
+/// The avcC header and the record's own first SPS must describe one
+/// stream: `ff_isom_write_avcc` derives bytes 1..4 (profile /
+/// compatibility / level) and the profile-extension fields all from the
+/// first SPS, so a record that disagrees with its SPS hands consumers two
+/// conflicting descriptions and is rejected — at initial construction and,
+/// via the shared parse, for every `NEW_EXTRADATA` announcement.
+fn check_avcc_consistency(record: &AvccRecord) -> Result<(), String> {
+    let derived = CodecProjection::from_ordered_sets(&record.sets)?;
+    if record.header != derived {
+        return Err(format!(
+            "avcC header declares profile/compatibility/level \
+             {:02X}{:02X}{:02X} but the first SPS carries {:02X}{:02X}{:02X}",
+            record.header.profile,
+            record.header.compatibility,
+            record.header.level,
+            derived.profile,
+            derived.compatibility,
+            derived.level
+        ));
+    }
+    if let Some((chroma, luma, chroma_depth)) = record.extension {
+        let first_sps = record.sets.sps.first().ok_or("no SPS")?;
+        let sps_fields = sps_chroma_info(first_sps)?;
+        if (chroma, luma, chroma_depth) != sps_fields {
+            let (sps_chroma, sps_luma, sps_chroma_depth) = sps_fields;
+            return Err(format!(
+                "avcC extension declares chroma_format_idc {chroma} and bit depths \
+                 {luma}/{chroma_depth} but the first SPS carries {sps_chroma} and \
+                 {sps_luma}/{sps_chroma_depth}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn read_u16_prefixed(data: &[u8], pos: &mut usize) -> Result<Vec<u8>, String> {
@@ -356,44 +539,18 @@ impl AvcRuntime {
             reason,
         };
         let annexb_packets = extradata.first() != Some(&1);
-        let ordered = parse_parameter_sets(extradata).map_err(invalid)?;
-        let projection = CodecProjection::from_ordered_sets(&ordered)
-            .map_err(|reason| PacketSinkError::InvalidExtradata {
-                stream_index,
-                reason,
-            })?;
+        let ordered = parse_parameter_sets(extradata).map_err(&invalid)?;
+        let projection = CodecProjection::from_ordered_sets(&ordered).map_err(&invalid)?;
+        // Header/SPS agreement needs no separate step here: a pass-through
+        // record was already held against its own first SPS by
+        // `check_avcc_consistency` inside the parse (bytes 1..4 plus the
+        // profile-extension fields), and a synthesized record copies those
+        // bytes from that same first SPS.
         let delivered = if annexb_packets {
-            build_avcc(&ordered).map_err(|reason| PacketSinkError::InvalidExtradata {
-                stream_index,
-                reason,
-            })?
+            build_avcc(&ordered).map_err(&invalid)?
         } else {
             extradata.to_vec()
         };
-        // The avcC header (bytes 1..4) and the accessor projection must
-        // describe the same profile/compatibility/level: a synthesized avcC
-        // copies the first SPS's bytes, but a passed-through record keeps its
-        // original header, which can disagree with the SPS the projection
-        // (and the codec string) is derived from. Delivering such a record
-        // would hand consumers two conflicting descriptions of one stream.
-        if delivered[1] != projection.profile
-            || delivered[2] != projection.compatibility
-            || delivered[3] != projection.level
-        {
-            return Err(PacketSinkError::InvalidExtradata {
-                stream_index,
-                reason: format!(
-                    "avcC header declares profile/compatibility/level \
-                     {:02X}{:02X}{:02X} but the first SPS carries {:02X}{:02X}{:02X}",
-                    delivered[1],
-                    delivered[2],
-                    delivered[3],
-                    projection.profile,
-                    projection.compatibility,
-                    projection.level
-                ),
-            });
-        }
         Ok((
             Self {
                 annexb_packets,
@@ -408,6 +565,12 @@ impl AvcRuntime {
     /// S8: a `NEW_EXTRADATA` announcement — value-equal (canonicalized)
     /// parameter sets are redundant and pass; anything else is a mid-stream
     /// configuration change.
+    ///
+    /// An avcC-form announcement passes through the same full record
+    /// validation as initial construction (`parse_avcc_record` via
+    /// [`parse_parameter_sets`]), including the header-vs-first-SPS
+    /// consistency check — so tampered header bytes over unchanged SPS/PPS
+    /// fail here rather than slipping past the set-identity comparison.
     pub(crate) fn check_new_extradata(
         &self,
         bytes: &[u8],
@@ -416,7 +579,7 @@ impl AvcRuntime {
         let ordered = parse_parameter_sets(bytes).map_err(|reason| {
             PacketSinkError::ConfigChange {
                 stream_index,
-                what: format!("unparseable NEW_EXTRADATA ({reason})"),
+                what: format!("invalid NEW_EXTRADATA ({reason})"),
             }
         })?;
         // Composite baseline, part 2: the derived projection consumers were
@@ -427,7 +590,7 @@ impl AvcRuntime {
         let projection = CodecProjection::from_ordered_sets(&ordered).map_err(|reason| {
             PacketSinkError::ConfigChange {
                 stream_index,
-                what: format!("unparseable NEW_EXTRADATA SPS ({reason})"),
+                what: format!("invalid NEW_EXTRADATA SPS ({reason})"),
             }
         })?;
         if projection != self.projection {
@@ -806,5 +969,200 @@ mod tests {
                 "tampered header byte {byte} must be rejected"
             );
         }
+    }
+
+    fn high_sets() -> ParameterSets {
+        ParameterSets {
+            sps: vec![HIGH_SPS.to_vec()],
+            pps: vec![HIGH_PPS.to_vec()],
+        }
+    }
+
+    #[test]
+    fn rejects_avcc_reserved_bits_cleared() {
+        let good = build_avcc(&parse_parameter_sets(&annexb_config()).unwrap()).unwrap();
+        // Byte 4 keeps lengthSizeMinusOne = 3 but clears the six reserved
+        // ones a conforming writer emits; masking would accept it.
+        let mut bad = good.clone();
+        bad[4] = 0x03;
+        let err = parse_avcc_parameter_sets(&bad).unwrap_err();
+        assert!(err.contains("byte 4 reserved"), "unexpected error: {err}");
+        // Byte 5 keeps numOfSequenceParameterSets = 1 but clears the three
+        // reserved ones.
+        let mut bad = good.clone();
+        bad[5] = 0x01;
+        let err = parse_avcc_parameter_sets(&bad).unwrap_err();
+        assert!(err.contains("byte 5 reserved"), "unexpected error: {err}");
+        assert!(matches!(
+            AvcRuntime::from_extradata(&bad, 2),
+            Err(PacketSinkError::InvalidExtradata { stream_index: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_parameter_set_with_forbidden_zero_bit() {
+        // 0xE7 keeps nal_unit_type 7 (SPS) while setting forbidden_zero_bit;
+        // a type-only mask would accept it. The full header must be checked.
+        let mut sps = SPS.to_vec();
+        sps[0] = 0xE7;
+        let err = parse_avcc_parameter_sets(&raw_avcc(66, 0xC0, 0x1E, &sps, PPS)).unwrap_err();
+        assert!(err.contains("forbidden_zero_bit"), "unexpected error: {err}");
+        // The same header through the Annex-B configuration path.
+        let mut config = vec![0, 0, 0, 1];
+        config.extend_from_slice(&sps);
+        config.extend_from_slice(&[0, 0, 1]);
+        config.extend_from_slice(PPS);
+        let err = parse_parameter_sets(&config).unwrap_err();
+        assert!(err.contains("forbidden_zero_bit"), "unexpected error: {err}");
+        // A PPS entry with the bit set must fail identically.
+        let mut pps = PPS.to_vec();
+        pps[0] = 0xE8;
+        let err = parse_avcc_parameter_sets(&raw_avcc(66, 0xC0, 0x1E, SPS, &pps)).unwrap_err();
+        assert!(err.contains("forbidden_zero_bit"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn accepts_high_profile_avcc_without_the_extension() {
+        // Muxers predating the ISO/IEC 14496-15 profile extension end the
+        // record at the PPS array even for High profile, and FFmpeg's own
+        // reader (ff_h264_decode_extradata, libavcodec/h264_parse.c) never
+        // requires the block — such a record must parse.
+        let bare = raw_avcc(0x64, 0x00, 0x1E, HIGH_SPS, HIGH_PPS);
+        let record = parse_avcc_record(&bare).unwrap();
+        assert_eq!(record.extension, None);
+        assert_eq!(record.sets, high_sets());
+        assert!(AvcRuntime::from_extradata(&bare, 0).is_ok());
+    }
+
+    #[test]
+    fn round_trips_the_high_profile_extension() {
+        let avcc = build_avcc(&high_sets()).unwrap();
+        let record = parse_avcc_record(&avcc).unwrap();
+        assert_eq!(record.extension, Some((1, 8, 8)));
+        assert_eq!(record.sets, high_sets());
+        assert!(AvcRuntime::from_extradata(&avcc, 0).is_ok());
+    }
+
+    #[test]
+    fn rejects_extension_reserved_bits_cleared() {
+        let good = build_avcc(&high_sets()).unwrap();
+        let ext = good.len() - 4;
+        // Each write keeps the field value and clears only the reserved
+        // ones: chroma byte 0xFD -> 0x01, bit-depth bytes 0xF8 -> 0x00.
+        for (offset, cleared) in [(0usize, 0x01u8), (1, 0x00), (2, 0x00)] {
+            let mut bad = good.clone();
+            bad[ext + offset] = cleared;
+            let err = parse_avcc_parameter_sets(&bad).unwrap_err();
+            assert!(err.contains("reserved"), "unexpected error: {err}");
+        }
+    }
+
+    #[test]
+    fn rejects_partial_or_padded_extension() {
+        let good = build_avcc(&high_sets()).unwrap();
+        // A cut inside the extension leaves the chroma byte without its bit
+        // depths: the block must be complete or absent, never partial.
+        let err = parse_avcc_parameter_sets(&good[..good.len() - 2]).unwrap_err();
+        assert!(err.contains("extension truncated"), "unexpected error: {err}");
+        // A byte beyond the complete extension is foreign data.
+        let mut padded = good.clone();
+        padded.push(0);
+        let err = parse_avcc_parameter_sets(&padded).unwrap_err();
+        assert!(
+            err.contains("after the profile extension"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_trailing_bytes_on_baseline_profile() {
+        // No extension is defined for Baseline/Main/Extended
+        // (ff_isom_write_avcc appends it only for other profiles), so any
+        // trailing byte on a profile-66 record is foreign data.
+        let mut avcc = build_avcc(&parse_parameter_sets(&annexb_config()).unwrap()).unwrap();
+        avcc.push(0);
+        let err = parse_avcc_parameter_sets(&avcc).unwrap_err();
+        assert!(err.contains("no extension is defined"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn validates_sequence_parameter_set_ext_entries() {
+        // numOfSequenceParameterSetExt = 1 with one SPS-EXT NAL (type 13,
+        // header 0x6D): the entry parses and ends the record.
+        let mut avcc = build_avcc(&high_sets()).unwrap();
+        let count = avcc.len() - 1;
+        avcc[count] = 1;
+        avcc.extend_from_slice(&[0, 2, 0x6D, 0x40]);
+        let record = parse_avcc_record(&avcc).unwrap();
+        assert_eq!(record.extension, Some((1, 8, 8)));
+        // The array holds SPS-EXT NALs only: an SPS header there is wrong.
+        let header = avcc.len() - 2;
+        avcc[header] = 0x67;
+        let err = parse_avcc_record(&avcc).unwrap_err();
+        assert!(err.contains("SPS-EXT"), "unexpected error: {err}");
+        // forbidden_zero_bit applies to SPS-EXT entries too.
+        avcc[header] = 0xED;
+        let err = parse_avcc_record(&avcc).unwrap_err();
+        assert!(err.contains("forbidden_zero_bit"), "unexpected error: {err}");
+        // A declared entry with no bytes must fail, not read past the end.
+        let mut short = build_avcc(&high_sets()).unwrap();
+        let count = short.len() - 1;
+        short[count] = 1;
+        let err = parse_avcc_parameter_sets(&short).unwrap_err();
+        assert!(err.contains("SPS-EXT"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn rejects_extension_disagreeing_with_the_sps() {
+        // bit_depth_luma_minus8 = 2 in the record while the SPS codes 0:
+        // the extension fields derive from the first SPS
+        // (ff_isom_write_avcc), so a disagreement is two conflicting
+        // stream descriptions.
+        let mut avcc = build_avcc(&high_sets()).unwrap();
+        let ext = avcc.len() - 4;
+        avcc[ext + 1] = 0xF8 | 2;
+        let err = parse_avcc_parameter_sets(&avcc).unwrap_err();
+        assert!(err.contains("bit depths"), "unexpected error: {err}");
+        assert!(matches!(
+            AvcRuntime::from_extradata(&avcc, 6),
+            Err(PacketSinkError::InvalidExtradata { stream_index: 6, .. })
+        ));
+    }
+
+    #[test]
+    fn s8_rejects_tampered_avcc_header_with_unchanged_sets() {
+        let (runtime, delivered, _) = AvcRuntime::from_extradata(&annexb_config(), 0).unwrap();
+        // The identical record is redundant and passes.
+        runtime.check_new_extradata(&delivered, 0).unwrap();
+        // Each header byte flipped with SPS/PPS untouched: the announcement
+        // contradicts its own SPS and must fail S8 instead of slipping
+        // through the set-identity comparison.
+        for byte in 1..4 {
+            let mut tampered = delivered.clone();
+            tampered[byte] ^= 0x01;
+            assert!(
+                matches!(
+                    runtime.check_new_extradata(&tampered, 7),
+                    Err(PacketSinkError::ConfigChange { stream_index: 7, .. })
+                ),
+                "tampered avcC header byte {byte} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn s8_rejects_tampered_extension_fields_with_unchanged_sets() {
+        let config = build_avcc(&high_sets()).unwrap();
+        let (runtime, delivered, _) = AvcRuntime::from_extradata(&config, 0).unwrap();
+        runtime.check_new_extradata(&delivered, 0).unwrap();
+        // chroma_format_idc 2 in the announcement while the unchanged SPS
+        // codes 1: rejected through the same header consistency check.
+        let mut tampered = delivered;
+        let ext = tampered.len() - 4;
+        tampered[ext] = 0xFC | 2;
+        assert!(matches!(
+            runtime.check_new_extradata(&tampered, 4),
+            Err(PacketSinkError::ConfigChange { stream_index: 4, .. })
+        ));
     }
 }
