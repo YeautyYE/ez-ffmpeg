@@ -533,7 +533,7 @@ pub(crate) fn manifest_docs_markdown() -> String {
         ));
     }
     out.push_str(
-        "\nCommand layout is fixed: exactly one `-i` input and exactly one output\npath, in the canonical `[global/input options] -i INPUT [output options]\nOUTPUT` order. The `-` stdin/stdout pseudo-paths are excluded — pipe I/O is\nprocess wiring, not part of the in-process subset.\n",
+        "\nCommand layout is fixed: exactly one `-i` input and exactly one output\npath, in the canonical `[global/input options] -i INPUT [output options]\nOUTPUT [global options]` order — after the output path only GLOBAL options\nare accepted (e.g. a trailing `-y`). The `-` stdin/stdout pseudo-paths are\nexcluded — pipe I/O is process wiring, not part of the in-process subset.\n",
     );
     out.push_str(
         "\nVerified shapes (may execute; each is backed by a semantic golden and a\ncompile-pinned emitted example):\n\n",

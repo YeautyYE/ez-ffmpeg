@@ -79,8 +79,8 @@
 //! | `-an` | output | audio | repeatable | flag | Output::disable_audio |
 //! | `-c:v` | output | video | once | codec name or `copy` (`[A-Za-z0-9_-]+`) | Output::set_video_codec |
 //! | `-c:a` | output | audio | once | codec name or `copy` (`[A-Za-z0-9_-]+`) | Output::set_audio_codec |
-//! | `-b:v` | output | video | once | `NNN` / `NNNk` / `NNNM` | Output::set_video_bitrate |
-//! | `-b:a` | output | audio | once | `NNN` / `NNNk` / `NNNM` | Output::set_audio_bitrate |
+//! | `-b:v` | output | video | once | `NNN` with optional `k`/`K`/`m`/`M` suffix | Output::set_video_bitrate |
+//! | `-b:a` | output | audio | once | `NNN` with optional `k`/`K`/`m`/`M` suffix | Output::set_audio_bitrate |
 //! | `-crf` | output | video | once | integer 0..=51 | Output::set_video_codec_opt("crf", …), libx264 only |
 //! | `-preset` | output | video | once | x264 preset name | Output::set_video_codec_opt("preset", …), libx264 only |
 //! | `-pix_fmt` | output | video | once | pixel format name (`[a-z0-9_]+`) | Output::set_pix_fmt |
@@ -97,8 +97,9 @@
 //!
 //! Command layout is fixed: exactly one `-i` input and exactly one output
 //! path, in the canonical `[global/input options] -i INPUT [output options]
-//! OUTPUT` order. The `-` stdin/stdout pseudo-paths are excluded — pipe I/O is
-//! process wiring, not part of the in-process subset.
+//! OUTPUT [global options]` order — after the output path only GLOBAL options
+//! are accepted (e.g. a trailing `-y`). The `-` stdin/stdout pseudo-paths are
+//! excluded — pipe I/O is process wiring, not part of the in-process subset.
 //!
 //! Verified shapes (may execute; each is backed by a semantic golden and a
 //! compile-pinned emitted example):

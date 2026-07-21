@@ -35,7 +35,8 @@ pub(crate) enum ValueRule {
     Seconds,
     /// Codec name or `copy` (`[A-Za-z0-9_-]+`).
     Codec,
-    /// `NNN`, `NNNk`, `NNNM` bitrate spellings.
+    /// Bitrate spellings: digits with an optional `k`/`K`/`m`/`M` suffix,
+    /// passed to FFmpeg verbatim.
     Bitrate,
     /// Integer 0..=51.
     Crf,
@@ -79,7 +80,7 @@ impl ValueRule {
         match self {
             ValueRule::Seconds => "decimal seconds only (`10`, `2.5`)",
             ValueRule::Codec => "codec name or `copy` (`[A-Za-z0-9_-]+`)",
-            ValueRule::Bitrate => "`NNN` / `NNNk` / `NNNM`",
+            ValueRule::Bitrate => "`NNN` with optional `k`/`K`/`m`/`M` suffix",
             ValueRule::Crf => "integer 0..=51",
             ValueRule::Preset => "x264 preset name",
             ValueRule::PositiveInt => "positive integer",
@@ -531,7 +532,8 @@ pub(crate) fn validate_value(
                 Ok(())
             } else {
                 Err(fail(
-                    "bitrates use the NNN / NNNk / NNNM spellings in this subset".to_string(),
+                    "bitrates are digits with an optional k/K/m/M suffix in this subset"
+                        .to_string(),
                 ))
             }
         }

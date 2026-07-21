@@ -13,10 +13,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .output(
             Output::from("clip.mp4")
+                .set_recording_time_us(4_000_000) // -t
                 .set_video_codec("libx264") // -c:v libx264
                 .set_audio_codec("aac") // -c:a aac
                 .set_video_codec_opt("crf", "23") // -crf 23
-                .set_recording_time_us(4_000_000) // -t
         )
         .build()?
         .start()?
