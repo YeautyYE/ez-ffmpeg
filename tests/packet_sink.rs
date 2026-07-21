@@ -408,7 +408,7 @@ fn sibling_failure_after_sink_drain_reports_delivery_error_not_end() {
         "on_end must not fire when the job failed elsewhere"
     );
     assert!(
-        matches!(events.last(), Some(SinkEv::Error(message)) if !message.is_empty()),
+        matches!(events.last(), Some(SinkEv::Error { message, .. }) if !message.is_empty()),
         "the settled job failure surfaces as on_delivery_error, got {:?}",
         events.last()
     );
@@ -474,7 +474,7 @@ fn sibling_custom_io_destruction_panic_prevents_on_end() {
         "on_end must not fire when a sibling's teardown panicked: {events:?}"
     );
     assert!(
-        events.iter().any(|e| matches!(e, SinkEv::Error(_))),
+        events.iter().any(|e| matches!(e, SinkEv::Error { .. })),
         "the sibling teardown failure surfaces as on_delivery_error: {events:?}"
     );
 }
@@ -781,8 +781,17 @@ fn on_end_waits_for_live_peers_after_a_register_only_sink_departs() {
     // opens the capture gate before anything waits on the parked sibling.
     let _open_gate_on_unwind = GateOnDrop(capture_gate.clone());
 
-    // 1. A drains and sits at the settlement barrier.
+    // 1. A drains and sits at the settlement barrier. First wait for the
+    // FIRST delivery (the stability window alone could declare quiescence
+    // before anything was delivered), then require the count to hold still.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while delivered_a.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "sink A never delivered a packet"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     let mut last = delivered_a.load(std::sync::atomic::Ordering::Acquire);
     let mut stable_since = std::time::Instant::now();
     loop {
@@ -799,7 +808,6 @@ fn on_end_waits_for_live_peers_after_a_register_only_sink_departs() {
             break;
         }
     }
-    assert!(last > 0, "sink A must have delivered packets");
 
     // 2. Clean stop(): B truncates mid-delivery (register-only, silent per
     // the stop contract, releases its slot); the sibling's teardown parks
@@ -919,11 +927,12 @@ fn blocked_sibling_stays_interruptible_while_sink_finalizes() {
     }
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
+    // Hand the accepted socket back to the test thread, which holds it open
+    // without reading until the test ends and probes it for wedge evidence.
+    let (stream_tx, stream_rx) = std::sync::mpsc::channel();
     let accept_thread = std::thread::spawn(move || {
         if let Ok((stream, _)) = listener.accept() {
-            // Hold the socket open without reading until the test ends.
-            std::thread::sleep(std::time::Duration::from_secs(30));
-            drop(stream);
+            let _ = stream_tx.send(stream);
         }
     });
 
@@ -947,9 +956,41 @@ fn blocked_sibling_stays_interruptible_while_sink_finalizes() {
         .unwrap()
         .start()
         .unwrap();
-    // Let the sink drain (300 ms of media) and the sibling wedge on the
-    // unread socket.
-    std::thread::sleep(std::time::Duration::from_millis(1500));
+    // Wedge proof, deadline-bounded, instead of an open-loop sleep: peek()
+    // (non-draining) watches the unread peer's receive queue fill and then
+    // STOP growing — kernel backpressure with the sender's own send buffer
+    // (16 KiB, set on the URL) full behind it — while the infinite testsrc2
+    // input still has frames to give. After a held plateau the sibling's
+    // next write can only block, which is the state stop() must cut.
+    let stream = stream_rx
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("the sibling never connected to the TCP peer");
+    stream.set_nonblocking(true).unwrap();
+    let mut peek_buf = vec![0u8; 4 * 1024 * 1024];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut queued_prev = 0usize;
+    let mut stable_polls = 0u32;
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the sibling never wedged on the unread peer"
+        );
+        let queued = match stream.peek(&mut peek_buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
+            Err(e) => panic!("peek on the unread peer failed: {e}"),
+        };
+        if queued > 0 && queued == queued_prev {
+            stable_polls += 1;
+            if stable_polls >= 6 {
+                break;
+            }
+        } else {
+            stable_polls = 0;
+            queued_prev = queued;
+        }
+    }
 
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -969,13 +1010,16 @@ fn blocked_sibling_stays_interruptible_while_sink_finalizes() {
         .count();
     let errors = events
         .iter()
-        .filter(|e| matches!(e, SinkEv::Error(_)))
+        .filter(|e| matches!(e, SinkEv::Error { .. }))
         .count();
     assert!(
         ends + errors <= 1,
         "at most one terminal sink event may fire ({ends} end, {errors} error)"
     );
-    drop(accept_thread);
+    // The peer socket stayed open (unread) across the whole stop; the accept
+    // thread already exited after handing it over.
+    drop(stream);
+    let _ = accept_thread.join();
 }
 
 /// The round-7 correctness probe: a delivered on_end must imply wait() ==

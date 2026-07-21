@@ -146,7 +146,10 @@ pub enum SinkEv {
     End {
         thread: std::thread::ThreadId,
     },
-    Error(String),
+    Error {
+        message: String,
+        thread: std::thread::ThreadId,
+    },
 }
 
 pub type SinkLog = Arc<Mutex<Vec<SinkEv>>>;
@@ -172,7 +175,12 @@ pub fn recording_sink() -> (PacketSink, SinkLog) {
             thread: std::thread::current().id(),
         })
     })
-    .on_delivery_error(move |e| err_log.lock().unwrap().push(SinkEv::Error(e.to_string())))
+    .on_delivery_error(move |e| {
+        err_log.lock().unwrap().push(SinkEv::Error {
+            message: e.to_string(),
+            thread: std::thread::current().id(),
+        })
+    })
     .build();
     (sink, log)
 }

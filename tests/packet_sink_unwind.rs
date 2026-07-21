@@ -41,6 +41,19 @@ static HOLD: Mutex<Option<&'static str>> = Mutex::new(None);
 static HELD: AtomicBool = AtomicBool::new(false);
 static RELEASE: AtomicBool = AtomicBool::new(false);
 
+/// Abort-store observation latch. While `WATCH_ARMED`, a container muxer's
+/// abort-specific records set `ABORT_OBSERVED`: "Muxer detected abort" and
+/// "Muxer skipping trailer due to abort" are each logged strictly after an
+/// acquire load of the scheduler status returned the ABORT value on that
+/// worker's thread (the trailer gate logs the latter on every abort-path
+/// container-mux teardown, and abort is never downgraded). The store being
+/// waited for therefore happens-before the latch, so `RELEASE` chained
+/// through it is ordered after the store — an observed handshake, not a
+/// timing guess. A packet sink's terminal path returns before the trailer
+/// gate, so only a container output can emit the records.
+static WATCH_ARMED: AtomicBool = AtomicBool::new(false);
+static ABORT_OBSERVED: AtomicBool = AtomicBool::new(false);
+
 /// The injecting logger is process-global: scenarios must not interleave.
 static PROCESS_LOCK: Mutex<()> = Mutex::new(());
 
@@ -52,6 +65,14 @@ impl log::Log for InjectingLogger {
     }
 
     fn log(&self, record: &log::Record) {
+        if WATCH_ARMED.load(Ordering::Acquire) {
+            let msg = record.args().to_string();
+            if msg.contains("Muxer detected abort")
+                || msg.contains("Muxer skipping trailer due to abort")
+            {
+                ABORT_OBSERVED.store(true, Ordering::Release);
+            }
+        }
         let hold = *HOLD.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(needle) = hold {
             if record.args().to_string().contains(needle) {
@@ -90,6 +111,8 @@ fn disarm_all() {
     *HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
     HELD.store(false, Ordering::Release);
     RELEASE.store(false, Ordering::Release);
+    WATCH_ARMED.store(false, Ordering::Release);
+    ABORT_OBSERVED.store(false, Ordering::Release);
 }
 
 /// Arms with a HOLD scenario and guarantees the parked worker is released
@@ -419,9 +442,18 @@ fn late_filter_worker_panic_prevents_on_end() {
         std::thread::sleep(Duration::from_millis(2));
     }
     // 2. The sink drains everything the (already exited) encoder queued:
-    // wait for delivery quiescence, after which the sink sits in the
-    // settlement barrier waiting for the parked filter's slot.
+    // wait for the FIRST delivery (the stability window alone could declare
+    // quiescence before anything was delivered), then for delivery
+    // quiescence, after which the sink sits in the settlement barrier
+    // waiting for the parked filter's slot.
     let deadline = Instant::now() + Duration::from_secs(30);
+    while delivered.load(Ordering::Acquire) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the sink never delivered a packet"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let mut last = delivered.load(Ordering::Acquire);
     let mut stable_since = Instant::now();
     loop {
@@ -435,7 +467,6 @@ fn late_filter_worker_panic_prevents_on_end() {
             break;
         }
     }
-    assert!(last > 0, "the sink must have delivered packets before the probe");
     // 3. Release the filter into the armed panic: it is recorded BEFORE the
     // filter's slot releases, which is exactly what the sink's barrier
     // waits behind.
@@ -472,8 +503,10 @@ fn late_filter_worker_panic_prevents_on_end() {
 /// pins the CURRENT contract (the fresh pre-dispatch load); it does not
 /// discriminate the older implementation, whose load also sat after this
 /// hold point — the settlement family's discriminating evidence is the
-/// parked-filter probe. The 500 ms grace below is a scheduling heuristic
-/// for the helper's ABORT store, not a happens-before acknowledgement.
+/// parked-filter probe. The worker is released only after a sibling
+/// container muxer (fed by a second, infinite input) OBSERVES the abort
+/// store — its abort-specific teardown record latches `ABORT_OBSERVED` —
+/// so the store happens-before the release: an acknowledged handshake.
 #[test]
 fn abort_at_the_linearization_point_suppresses_the_terminal() {
     let _lock = PROCESS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -493,9 +526,29 @@ fn abort_at_the_linearization_point_suppresses_the_terminal() {
     .build();
 
     *HOLD.lock().unwrap_or_else(|e| e.into_inner()) = Some("All streams finished");
+    // The second chain is INFINITE and realtime-paced: its container muxer
+    // is guaranteed alive whenever the abort lands, and its teardown always
+    // crosses the trailer gate, whose abort branch acknowledges the store.
+    // The sink's own chain (input 0) still finishes naturally and parks its
+    // worker at the hold needle.
     let scheduler = FfmpegContext::builder()
         .input(Input::from("sine=frequency=440:duration=1").set_format("lavfi"))
-        .output(Output::from(sink).set_audio_codec("aac"))
+        .input(
+            Input::from("sine=frequency=330")
+                .set_format("lavfi")
+                .set_readrate(1.0),
+        )
+        .output(
+            Output::from(sink)
+                .set_audio_codec("aac")
+                .add_stream_map("0:a"),
+        )
+        .output(
+            Output::from("abort-probe.null")
+                .set_format("null")
+                .set_audio_codec("pcm_s16le")
+                .add_stream_map("1:a"),
+        )
         .build()
         .unwrap()
         .start()
@@ -517,10 +570,19 @@ fn abort_at_the_linearization_point_suppresses_the_terminal() {
     // abort() consumes the scheduler and BLOCKS until every worker exits
     // (RunningGuard's drop) — the worker is parked in the logger, so abort
     // runs on a helper thread. Its ABORT store is its first action; the
-    // grace below dwarfs the helper's spawn+store latency, so the store has
-    // landed before the worker is released into the terminal region.
+    // worker is released into the terminal region only after the sibling
+    // muxer's abort record proves that store is published (see the latch's
+    // doc comment), so the post-settlement load is ordered after it.
+    WATCH_ARMED.store(true, Ordering::Release);
     let abort_thread = std::thread::spawn(move || scheduler.abort());
-    std::thread::sleep(Duration::from_millis(500));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !ABORT_OBSERVED.load(Ordering::Acquire) {
+        assert!(
+            Instant::now() < deadline,
+            "no worker ever observed the abort store"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
     RELEASE.store(true, Ordering::Release);
     abort_thread
         .join()
