@@ -416,8 +416,15 @@ mod tests {
     #[test]
     fn dropped_frame_recycles_its_buffer() {
         let pool = BufferPool::new(2);
-        let mut first = pool.take(12);
+        // Capacity 24 for a 12-byte payload: the surplus capacity and the
+        // sentinel bytes written into it are the identity marks that must
+        // survive the round trip through the pool.
+        let mut first = pool.take(24);
         first.extend_from_slice(&[7u8; 12]);
+        for slot in first.spare_capacity_mut() {
+            slot.write(0xA5);
+        }
+        let capacity = first.capacity();
         let ptr = first.as_ptr();
         let vf = VideoFrame::new(
             2,
@@ -430,20 +437,41 @@ mod tests {
         );
         assert_eq!(pool.rx.len(), 0, "buffer still owned by the live frame");
         drop(vf);
-        // Primary, allocator-independent evidence: the drop parked exactly
-        // one buffer and the next take consumed it (parked count 1 -> 0)
-        // rather than allocating fresh.
+        // The drop parked exactly one buffer and the next take consumed it
+        // (parked count 1 -> 0).
         assert_eq!(pool.rx.len(), 1, "drop must park the buffer in the pool");
         let reused = pool.take(12);
         assert_eq!(pool.rx.len(), 0, "take must consume the parked buffer");
         assert!(reused.is_empty(), "recycled buffers come back empty");
-        assert!(
-            reused.capacity() >= 12,
-            "recycled capacity must still fit the request"
+        // REUSE proof, allocator-independent. The transitions above prove a
+        // dequeue, and address equality alone could pass by free-then-malloc
+        // coincidence (the allocator may hand the just-freed block back at
+        // the same address); neither proves the allocation was KEPT. Two
+        // marks a fresh allocation cannot carry do: `take(12)` allocating
+        // fresh yields capacity 12 exactly, never the parked 24; and `take`
+        // only clears the length, so a kept allocation still holds every
+        // byte written above, while a freed-and-reallocated block comes back
+        // uninitialized (glibc clobbers the head with free-list metadata).
+        assert_eq!(
+            reused.capacity(),
+            capacity,
+            "the recycled buffer must keep the parked allocation's capacity, \
+             not come back as a fresh request-sized one"
         );
-        // Secondary corroboration only: address equality alone could pass
-        // by a free-then-malloc coincidence, so the channel-length
-        // transitions above carry the proof.
+        // SAFETY: the capacity check above established this is the parked
+        // allocation, in which all `capacity` bytes were initialized before
+        // the drop and never released since.
+        let bytes = unsafe { std::slice::from_raw_parts(reused.as_ptr(), capacity) };
+        assert_eq!(
+            &bytes[..12],
+            &[7u8; 12],
+            "the payload bytes must survive the round trip"
+        );
+        assert!(
+            bytes[12..].iter().all(|b| *b == 0xA5),
+            "the spare-capacity sentinel must survive the round trip"
+        );
+        // Corroboration only — see above for why this alone proves nothing.
         assert_eq!(
             reused.as_ptr(),
             ptr,
