@@ -3172,6 +3172,104 @@ mod tests {
         );
     }
 
+    // A worker can construct the reactor and still die before consuming a
+    // queued registration — run() may never be reached, or exit on the stop
+    // flag ahead of its first drain. The registration's claim lives in the
+    // handoff queue, not in the reactor, so worker teardown (reactor drop,
+    // then kill-switch drop) must release it and reopen the key even though
+    // the server side keeps its handle to the handoff alive.
+    #[test]
+    fn worker_exit_without_consuming_registration_reopens_the_key() {
+        let stream_keys: Arc<dashmap::DashSet<String>> = Arc::new(dashmap::DashSet::new());
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let reactor = Reactor::new(3, None, status).expect("reactor");
+
+        let registrations = Arc::new(RegistrationHandoff::new());
+        let kill_switch = RegistrationKillSwitch::arm(registrations.clone());
+
+        let (_feed_tx, feed_rx) = crossbeam_channel::bounded::<PublisherFeed>(1);
+        let claim = StreamKeyClaim::claim(stream_keys.clone(), "held".to_string())
+            .expect("first claim must win");
+        registrations
+            .enqueue(PublisherRegistration {
+                claim,
+                source: PublisherSource::Feed(feed_rx),
+            })
+            .unwrap_or_else(|_| panic!("enqueue while the worker lives"));
+        assert!(
+            stream_keys.contains("held"),
+            "a queued registration keeps its key claimed"
+        );
+
+        // Worker teardown in its real order, the registration never
+        // consumed: the reactor goes first, then the kill switch fires the
+        // terminal drain.
+        drop(reactor);
+        drop(kill_switch);
+
+        assert!(
+            !stream_keys.contains("held"),
+            "worker exit must release a never-consumed registration's key claim"
+        );
+        assert!(
+            StreamKeyClaim::claim(stream_keys.clone(), "held".to_string()).is_ok(),
+            "a create for the same key must win again after the worker died"
+        );
+    }
+
+    // An accepted publisher's claim rides the full chain — enqueued into the
+    // handoff, drained by the consume side, moved into PublisherState by
+    // add_publisher — and its last owner is the reactor's publisher slab.
+    // Dropping the reactor with the publisher still live (exactly what a
+    // run() exit leaves behind: nothing calls remove_publisher on shutdown)
+    // must release the key and make it claimable again.
+    #[test]
+    fn reactor_drop_with_live_consumed_publisher_reopens_the_key() {
+        let stream_keys: Arc<dashmap::DashSet<String>> = Arc::new(dashmap::DashSet::new());
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let mut reactor = Reactor::new(3, None, status).expect("reactor");
+
+        let registrations = Arc::new(RegistrationHandoff::new());
+        let kill_switch = RegistrationKillSwitch::arm(registrations.clone());
+
+        let (_feed_tx, feed_rx) = crossbeam_channel::bounded::<PublisherFeed>(1);
+        let claim = StreamKeyClaim::claim(stream_keys.clone(), "live".to_string())
+            .expect("first claim must win");
+        registrations
+            .enqueue(PublisherRegistration {
+                claim,
+                source: PublisherSource::Feed(feed_rx),
+            })
+            .unwrap_or_else(|_| panic!("enqueue while the worker lives"));
+
+        // The reactor's consume side: one drain, then acceptance moves the
+        // still-armed claim into PublisherState.
+        let mut batch = Vec::new();
+        kill_switch.handoff().drain_into(&mut batch);
+        assert_eq!(batch.len(), 1, "the queued registration must be drained");
+        for registration in batch.drain(..) {
+            reactor.add_publisher(registration).expect("accepted");
+        }
+        assert!(
+            stream_keys.contains("live"),
+            "an accepted publisher keeps its key claimed while the reactor lives"
+        );
+
+        // run() exits with the publisher still in the slab; the reactor drop
+        // is the worker's last word on it. The kill switch is still armed, so
+        // the release below can only come from the publisher slab dropping.
+        drop(reactor);
+        assert!(
+            !stream_keys.contains("live"),
+            "dropping the reactor must release live publishers' key claims"
+        );
+        assert!(
+            StreamKeyClaim::claim(stream_keys.clone(), "live".to_string()).is_ok(),
+            "a create for the same key must win again after the reactor died"
+        );
+        drop(kill_switch);
+    }
+
     // H8.c: a server-initiated close must first try to flush what was queued
     // in the same round — most visibly the finish_playing status a watcher
     // gets when the publisher ends. A raw remove_connection dropped it: the
