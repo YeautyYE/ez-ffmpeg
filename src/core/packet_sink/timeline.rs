@@ -12,15 +12,19 @@ use ffmpeg_sys_next::{av_rescale_q_rnd, AVRational, AVRounding};
 
 /// Job-wide shared origin.
 pub(crate) enum Timeline {
-    /// No packet delivered yet.
-    Unanchored,
+    /// No packet delivered yet. Carries the offset storage, sized for the
+    /// job's stream count at collection, so the anchor transition on the
+    /// first delivered packet allocates nothing.
+    Unanchored { storage: Vec<i64> },
     /// Origin committed: one shift per stream, in that stream's time base.
     Anchored { offsets: Vec<i64> },
 }
 
 impl Timeline {
-    pub(crate) fn new() -> Self {
-        Timeline::Unanchored
+    pub(crate) fn new(stream_count: usize) -> Self {
+        Timeline::Unanchored {
+            storage: Vec::with_capacity(stream_count),
+        }
     }
 
     /// Anchors on the first delivered packet's `(dts0, tb0)` if not anchored
@@ -34,20 +38,25 @@ impl Timeline {
         tb0: AVRational,
         stream_time_bases: &[AVRational],
     ) -> Result<(), PacketSinkError> {
-        if matches!(self, Timeline::Anchored { .. }) {
-            return Ok(());
-        }
-        let mut offsets = Vec::with_capacity(stream_time_bases.len());
+        let storage = match self {
+            Timeline::Anchored { .. } => return Ok(()),
+            Timeline::Unanchored { storage } => storage,
+        };
+        // Empty on entry: preallocated empty at collection, and the error
+        // path below clears whatever it partially filled.
+        debug_assert!(storage.is_empty());
         for (stream_index, tb) in stream_time_bases.iter().enumerate() {
             // SAFETY: pure integer arithmetic over validated rationals (every
             // stream time base was checked positive at collection).
             let offset =
                 unsafe { av_rescale_q_rnd(dts0, tb0, *tb, AVRounding::AV_ROUND_NEAR_INF) };
             if offset == i64::MIN {
+                storage.clear();
                 return Err(PacketSinkError::TimestampOverflow { stream_index });
             }
-            offsets.push(offset);
+            storage.push(offset);
         }
+        let offsets = std::mem::take(storage);
         *self = Timeline::Anchored { offsets };
         Ok(())
     }
@@ -57,7 +66,7 @@ impl Timeline {
     pub(crate) fn offset(&self, stream_index: usize) -> i64 {
         match self {
             Timeline::Anchored { offsets } => offsets[stream_index],
-            Timeline::Unanchored => unreachable!("timeline queried before anchoring"),
+            Timeline::Unanchored { .. } => unreachable!("timeline queried before anchoring"),
         }
     }
 }
@@ -72,19 +81,26 @@ pub(crate) struct StreamTimeline {
     pending_pts: Vec<i64>,
 }
 
+/// Preallocation hint for the pending-pts window. H.264 caps the decoded
+/// picture buffer at 16 frames, so a compliant encoder's reorder window
+/// never exceeds 16 entries (audio never reorders: the window stays at 1).
+/// A deeper window merely grows the `Vec` past the hint.
+const PENDING_PTS_CAPACITY: usize = 16;
+
 impl StreamTimeline {
     pub(crate) fn new() -> Self {
         Self {
             last_dts: None,
-            pending_pts: Vec::new(),
+            pending_pts: Vec::with_capacity(PENDING_PTS_CAPACITY),
         }
     }
 
     /// Validates one shifted `(pts, dts)` pair and records it: `pts >= dts`,
-    /// strictly increasing dts, and no duplicate pts. Duplicate membership is
-    /// checked BEFORE pruning — a recorded pts equal to the NEW dts is
-    /// exactly the boundary a duplicate can still collide with (e.g.
-    /// (pts 3, dts 0) followed by (pts 3, dts 3)); pruning first forgot it.
+    /// strictly increasing dts, and no duplicate pts. The duplicate probe
+    /// covers every recorded value, including those pruned in the same pass —
+    /// a recorded pts equal to the NEW dts is exactly the boundary a
+    /// duplicate can still collide with (e.g. (pts 3, dts 0) followed by
+    /// (pts 3, dts 3)); pruning without probing would forget it.
     pub(crate) fn observe(
         &mut self,
         stream_index: usize,
@@ -107,10 +123,20 @@ impl StreamTimeline {
                 });
             }
         }
-        if self.pending_pts.contains(&pts) {
+        // One pass serves both the duplicate probe and the prune: `retain`
+        // visits every recorded value exactly once, so the probe still sees
+        // the full pre-prune set. On the duplicate error the prune is
+        // already committed while `last_dts` and the push are not; that
+        // mixed state is never repaired because a delivery error stops the
+        // job's packet flow — nothing observes this timeline again.
+        let mut duplicate = false;
+        self.pending_pts.retain(|&p| {
+            duplicate |= p == pts;
+            p > dts
+        });
+        if duplicate {
             return Err(PacketSinkError::DuplicatePts { stream_index, pts });
         }
-        self.pending_pts.retain(|&p| p > dts);
         self.pending_pts.push(pts);
         self.last_dts = Some(dts);
         Ok(())
@@ -125,13 +151,32 @@ mod tests {
     fn anchor_is_all_or_nothing_and_idempotent() {
         let tb25 = AVRational { num: 1, den: 25 };
         let tb_audio = AVRational { num: 1, den: 44100 };
-        let mut tl = Timeline::new();
+        let mut tl = Timeline::new(2);
         tl.ensure_anchored(5, tb25, &[tb25, tb_audio]).unwrap();
         assert_eq!(tl.offset(0), 5);
         assert_eq!(tl.offset(1), 8820);
         // Second anchor attempt is a no-op (offsets unchanged).
         tl.ensure_anchored(100, tb25, &[tb25, tb_audio]).unwrap();
         assert_eq!(tl.offset(0), 5);
+    }
+
+    #[test]
+    fn anchor_overflow_leaves_the_timeline_unanchored_and_reusable() {
+        let tb1 = AVRational { num: 1, den: 1 };
+        let tb90k = AVRational { num: 1, den: 90000 };
+        let mut tl = Timeline::new(2);
+        // The second stream's rescale overflows: the transition must commit
+        // nothing (all-or-nothing) and report the offending stream.
+        assert!(matches!(
+            tl.ensure_anchored(i64::MAX / 2, tb1, &[tb1, tb90k]),
+            Err(PacketSinkError::TimestampOverflow { stream_index: 1 })
+        ));
+        assert!(matches!(tl, Timeline::Unanchored { .. }));
+        // A later anchor starts from scratch: nothing partially filled ahead
+        // of the overflow leaks into the committed offsets.
+        tl.ensure_anchored(5, tb1, &[tb1, tb90k]).unwrap();
+        assert_eq!(tl.offset(0), 5);
+        assert_eq!(tl.offset(1), 450_000);
     }
 
     #[test]
