@@ -41,15 +41,20 @@
 //!      terminal state (natural encoder EOF, or configured truncation such as
 //!      `set_recording_time_us` / `set_shortest`), everything was delivered,
 //!      and the whole job settled without an error: the delivery thread
-//!      first waits for every other job worker to finish (including sibling
-//!      outputs' teardown), then decides on one fresh status/result read —
-//!      the linearization point. An `abort()` that lands after that read is
-//!      indistinguishable from one after the callback.
+//!      first waits for every other job worker to finish (including
+//!      container outputs' teardown), then decides on one fresh
+//!      status/result read — the linearization point. Sibling packet-sink
+//!      workers are the one exception to that wait: they are only
+//!      guaranteed settled by then (errors recorded, encoders joined,
+//!      contexts freed) — their terminal callbacks and capture drops may
+//!      still be running concurrently. An `abort()` that lands after the
+//!      status read is indistinguishable from one after the callback.
 //!    * `on_delivery_error` fires when delivery stopped because of a
 //!      strict-tier violation or a failing callback, or when the job failed
 //!      elsewhere — whether that failure landed after this sink delivered
-//!      everything or truncated its delivery. Clean cancellation stays
-//!      silent.
+//!      everything or truncated its delivery. Cancellation is silent only
+//!      when it interrupts delivery: a `stop()` that lands after this sink
+//!      fully drained still delivers `on_end`.
 //!
 //! # Timestamp and ordering
 //!
@@ -435,7 +440,11 @@ impl AudioPacketConfig {
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum PacketStreamInfo {
+    /// H.264 stream configuration: avcC record, RFC 6381 codec string,
+    /// profile/level, dimensions, time base, frame rate.
     Video(VideoPacketConfig),
+    /// AAC stream configuration: AudioSpecificConfig, RFC 6381 codec string,
+    /// time base, sample rate, channel layout.
     Audio(AudioPacketConfig),
 }
 
@@ -915,7 +924,9 @@ impl PacketSinkBuilder {
     }
 
     /// Terminal success callback; see the [module docs](self) for the exact
-    /// gate. Never invoked after an error, a cancelled job, or lost packets.
+    /// gate. Never invoked after an error or lost packets. Cancellation
+    /// suppresses it only when it interrupts delivery: a `stop()` that lands
+    /// after this sink fully drained still delivers `on_end`.
     pub fn on_end<F>(mut self, f: F) -> Self
     where
         F: FnMut() + Send + 'static,
@@ -1056,13 +1067,15 @@ impl EncodedPacket {
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum PacketSinkEvent {
-    /// The one-time stream configuration.
+    /// The one-time stream configuration, one entry per output stream.
     StreamInfo(Vec<PacketStreamInfo>),
-    /// One delivered packet.
+    /// One delivered packet, copied into an owned payload.
     Packet(EncodedPacket),
-    /// Terminal success.
+    /// Terminal success (best-effort; see the enum docs).
     End,
-    /// Terminal delivery-path failure.
+    /// A delivery-path error, or [`PacketSinkError::JobFailed`] when the job
+    /// failed elsewhere (`wait()` keeps the original error). Best-effort like
+    /// [`End`](Self::End).
     Error(PacketSinkError),
 }
 
