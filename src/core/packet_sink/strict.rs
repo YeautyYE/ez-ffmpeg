@@ -296,7 +296,7 @@ impl PacketSinkWorker {
             infos,
             streams,
             stream_time_bases,
-            timeline: Timeline::new(),
+            timeline: Timeline::new(stream_count),
             pending_error: None,
             scratch: Vec::new(),
             phase: Phase::Collected,
