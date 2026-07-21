@@ -1021,6 +1021,9 @@ fn vf_uniqueness_gate_opens_the_input_exactly_once() {
     .iter()
     .map(|s| s.to_string())
     .collect();
+    let have_libx264 = crate::core::codec::get_encoders()
+        .iter()
+        .any(|e| e.codec_name == "libx264");
     match from_cli_args(&args) {
         Ok(context) => {
             drop(context);
@@ -1034,6 +1037,27 @@ fn vf_uniqueness_gate_opens_the_input_exactly_once() {
         Err(CliError::UnverifiedRuntimeProfile { .. }) if !linked_profile_verified() => {
             // The profile gate fires before any I/O: zero openings.
             assert_eq!(opens_of(&fixture) - before, 0);
+        }
+        Err(CliError::Build(err)) if linked_profile_verified() && !have_libx264 => {
+            // A verified profile whose linked build lacks libx264 (e.g. a
+            // no-GPL FFmpeg): the pipeline opens its input first — encoder
+            // resolution runs in output binding, strictly after
+            // open_input_files — so the typed encoder failure must still
+            // leave exactly one recorded opening.
+            assert!(
+                matches!(
+                    &err,
+                    crate::error::Error::OpenOutput(
+                        crate::error::OpenOutputError::EncoderUnavailable { name }
+                    ) if name == "libx264"
+                ),
+                "expected EncoderUnavailable(libx264) on this build, got: {err}"
+            );
+            assert_eq!(
+                opens_of(&fixture) - before,
+                1,
+                "encoder resolution happens after the single opening"
+            );
         }
         Err(other) => panic!("single-video -vf build failed unexpectedly: {other}"),
     }
