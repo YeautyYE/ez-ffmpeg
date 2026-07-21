@@ -1544,18 +1544,10 @@ fn _mux_init(
             // status caused by a failure always has the error visible here),
             // while a clean stop() records nothing and stays silent.
             let aborted = scheduler_status.load(Ordering::Acquire) == STATUS_ABORT;
-            let job_error = if !aborted {
-                scheduler_result
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .as_ref()
-                    .and_then(|result| result.as_ref().err())
-                    .map(|e| e.to_string())
-            } else {
-                None
-            };
             // 6. POST-SETTLEMENT REGION, all of it under ONE panic
-            // containment boundary: the terminal dispatch (finish() runs the
+            // containment boundary: the job-error formatting (Display of a
+            // recorded error can run user code — frame-filter variants wrap
+            // user error types), the terminal dispatch (finish() runs the
             // user's on_end/on_delivery_error), the capture drops AND the
             // failure logging (a user-installed logger can itself panic).
             // After the barrier the only code left on this thread is user
@@ -1566,18 +1558,50 @@ fn _mux_init(
             // (S9); before the slot release, so stop() cannot return while a
             // blocking terminal callback or destructor runs.
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Formatting sits in its own inner catch so a panicking
+                // Display cannot skip the terminal dispatch. Only the
+                // `e.to_string()` call can panic here (the lock handles
+                // poison, the Option/Result adapters cannot), so a caught
+                // panic proves an error IS recorded: substitute a fixed
+                // message rather than repaint the failed job as success.
+                let job_error = if !aborted {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        scheduler_result
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .as_ref()
+                            .and_then(|result| result.as_ref().err())
+                            .map(|e| e.to_string())
+                    }))
+                    .unwrap_or_else(|_| {
+                        Some(String::from(
+                            "job error message unavailable: formatting the recorded error panicked",
+                        ))
+                    })
+                } else {
+                    None
+                };
+                let finish_panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     sink.finish(nb_done == stream_count, ret, aborted, job_error)
                 }))
-                .is_err()
-                {
+                .is_err();
+                // Consume the sink BEFORE any failure logging: a log call
+                // that panics unwinds to the outer boundary, and if the sink
+                // were still owned that unwind would run the capture
+                // destructors — a destructor panic at that point would be a
+                // panic-during-unwind abort. With the sink already consumed,
+                // the log calls below are the last code on this path and
+                // their unwind crosses only plain locals.
+                let teardown_panicked =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(sink))).is_err();
+                if finish_panicked {
                     // Best-effort: a panic from this log call is swallowed by
-                    // the outer boundary.
+                    // the outer boundary (possibly skipping the next log).
                     error!(
                         "packet sink terminal callback panicked; the settled job result is preserved"
                     );
                 }
-                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(sink))).is_err() {
+                if teardown_panicked {
                     error!(
                         "packet sink consumer state panicked during teardown; the settled job result is preserved"
                     );

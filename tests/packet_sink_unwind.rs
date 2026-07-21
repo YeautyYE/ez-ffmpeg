@@ -8,9 +8,10 @@
 //!   with a Drop-side observable proving the panic is PUBLISHED before the
 //!   callback captures are destroyed;
 //! - terminal settlement: a late filter-worker panic (its final log fires
-//!   after the sink drained) must prevent `on_end`, and a capture-`Drop`
-//!   panic composed with a panicking logger must not un-settle a delivered
-//!   `on_end`;
+//!   after the sink drained) must prevent `on_end`, and the terminal
+//!   region's panic compositions (capture-`Drop` + logger; terminal
+//!   callback + logger + unconditional capture-`Drop`) must neither
+//!   un-settle the delivered result nor abort the process;
 //! - the linearization window: an abort landing while the worker is held
 //!   between its last packet completion and the terminal region suppresses
 //!   both terminal callbacks.
@@ -275,6 +276,90 @@ fn on_end_survives_capture_drop_panic_composed_with_logger_panic() {
         evs,
         vec!["end".to_string()],
         "exactly one on_end and no error callback"
+    );
+}
+
+/// Panics from `Drop` unconditionally — even on a thread that is already
+/// unwinding, where the second panic aborts the process. This is the
+/// hostile-destructor case the terminal teardown order must make safe: the
+/// sink may only be dropped inside its own catch on a non-unwinding thread,
+/// never as a closure capture while a logger panic unwinds past it.
+struct AlwaysPanicOnDrop(Arc<AtomicBool>);
+
+impl Drop for AlwaysPanicOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+        panic!("injected unconditional capture-destructor panic");
+    }
+}
+
+/// The full terminal-region composition: the terminal callback (`on_end`)
+/// panics, its failure log hits a panicking logger, AND a capture
+/// destructor panics unconditionally. The teardown order must keep every
+/// unwind single — finish caught first, the sink consumed under its own
+/// catch BEFORE any failure logging, logs last — because a sink still owned
+/// when the logger panic unwinds would run the capture destructor
+/// mid-unwind: a panic-during-unwind process abort. The test completing at
+/// all proves no abort; the Ok result and the single delivered `on_end`
+/// prove the settled job result survived the composition.
+#[test]
+fn settled_result_survives_finish_panic_logger_panic_and_drop_panic() {
+    let _lock = PROCESS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    install_logger_once();
+    disarm_all();
+
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let destroyed = Arc::new(AtomicBool::new(false));
+    let bomb = AlwaysPanicOnDrop(destroyed.clone());
+    let (ev_end, ev_err) = (events.clone(), events.clone());
+    let sink = PacketSink::builder(move |_pkt| {
+        let _hold = &bomb;
+        Ok(())
+    })
+    .on_end(move || {
+        ev_end.lock().unwrap().push("end".to_string());
+        panic!("injected terminal-callback panic");
+    })
+    .on_delivery_error(move |e| ev_err.lock().unwrap().push(format!("error: {e}")))
+    .build();
+
+    // Arm the logger on the terminal-callback failure log: the logger panic
+    // then unwinds from inside the containment's logging tail, after the
+    // sink must already have been consumed.
+    *TRIGGER.lock().unwrap_or_else(|e| e.into_inner()) = Some("terminal callback panicked");
+    let scheduler = FfmpegContext::builder()
+        .input(Input::from("sine=frequency=440:duration=1").set_format("lavfi"))
+        .output(Output::from(sink).set_audio_codec("aac"))
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+    let result = wait_with_watchdog(scheduler, 60, "finish_logger_drop_panic_composition");
+
+    // The terminal-callback failure log fired (and panicked): the needle
+    // was consumed.
+    assert!(
+        TRIGGER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none(),
+        "the terminal-callback failure log must have fired and hit the armed logger"
+    );
+    disarm_all();
+    assert!(
+        result.is_ok(),
+        "a terminal-callback panic composed with a logger panic and a capture-destructor \
+         panic must not fail the settled job: {result:?}"
+    );
+    assert!(
+        destroyed.load(Ordering::Acquire),
+        "the sink captures must be destroyed before wait() returns"
+    );
+    let evs = events.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert_eq!(
+        evs,
+        vec!["end".to_string()],
+        "exactly one on_end (delivered before its panic) and no error callback"
     );
 }
 
