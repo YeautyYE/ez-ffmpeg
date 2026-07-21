@@ -612,17 +612,17 @@ pub enum PublisherSource {
 /// [`claim`](Self::claim) inserts the key (insert-or-fail, so two concurrent
 /// claims cannot both win) and the guard releases it **exactly once**, on
 /// drop, wherever the value dies: a refused enqueue, a scheduler refusal
-/// in [`Reactor::add_publisher`], or a queued registration nobody ever
-/// consumed. [`into_key`](Self::into_key) disarms the guard instead —
-/// the key stays claimed and releasing it becomes the job of whoever now
-/// stores it (the accepted publisher's state, released by
-/// [`Reactor::remove_publisher`]). Exactly one of `Drop`/`into_key` ever
-/// consumes the key, so a release can never fire twice and free a claim
-/// another create has re-won in the meantime.
+/// in [`Reactor::add_publisher`], a queued registration nobody ever
+/// consumed, or an accepted publisher's [`PublisherState`] reaching its end
+/// of life ([`Reactor::remove_publisher`], or the reactor being torn down
+/// with publishers still live). The guard is never disarmed — ownership
+/// only ever moves, registration to state — so there is no instant at
+/// which the key is claimed but no guard would release it, and a release
+/// can never fire twice and free a claim another create has re-won in the
+/// meantime.
 pub(crate) struct StreamKeyClaim {
     stream_keys: Arc<dashmap::DashSet<String>>,
-    /// `Some` while the guard is armed; taken by `into_key` (ownership moves
-    /// to the publisher state) or by `drop` (release).
+    /// `Some` while the guard is armed; taken by `drop` (release).
     stream_key: Option<String>,
 }
 
@@ -642,18 +642,10 @@ impl StreamKeyClaim {
         }
     }
 
+    /// Borrow the claimed key, for scheduler lookups and logging.
     pub(crate) fn key(&self) -> &str {
         self.stream_key
             .as_deref()
-            .expect("an armed claim always holds its key")
-    }
-
-    /// Disarm the guard and hand the key over: the key STAYS claimed, and
-    /// releasing it (removing it from `stream_keys`) becomes the caller's
-    /// responsibility.
-    fn into_key(mut self) -> String {
-        self.stream_key
-            .take()
             .expect("an armed claim always holds its key")
     }
 }
@@ -805,8 +797,13 @@ impl Drop for RegistrationKillSwitch {
 }
 
 /// Publisher state
+///
+/// Owns the stream-key claim for as long as the publisher is accepted.
+/// Dropping the state — [`Reactor::remove_publisher`], or the reactor's
+/// `publishers` slab being dropped on teardown, clean exit and unwind
+/// alike — releases the key.
 pub struct PublisherState {
-    pub stream_key: String,
+    pub(crate) claim: StreamKeyClaim,
     pub source: PublisherSource,
 }
 
@@ -862,13 +859,10 @@ pub struct Reactor {
     generations: HashMap<usize, u32>,
     /// Business scheduler
     scheduler: RtmpScheduler,
-    /// Publishers
+    /// Publishers. Each state owns its stream-key claim, so dropping this
+    /// slab (reactor teardown with publishers still live) releases every
+    /// accepted key back to the server's shared set.
     publishers: slab::Slab<PublisherState>,
-    /// stream_key set, shared with the owning `EmbedRtmpServer`. Must be the
-    /// `Arc` the server also reads: `DashSet`'s `Clone` is a deep copy, so a
-    /// by-value set here would leave the server's duplicate-key check reading
-    /// a set nobody writes to and `RtmpStreamAlreadyExists` dead code.
-    stream_keys: Arc<dashmap::DashSet<String>>,
     /// Stop flag
     status: Arc<AtomicUsize>,
     /// Maximum allowed connections (auto-adjusted by system FD limit)
@@ -909,15 +903,18 @@ impl Reactor {
     /// # Arguments
     /// * `gop_limit` - Maximum number of GOPs to cache per stream
     /// * `max_connections` - Maximum connections limit (None = auto-detect based on system FD limit)
-    /// * `stream_keys` - Shared set of active stream keys
     /// * `status` - Shared status flag for graceful shutdown
+    ///
+    /// The reactor holds no handle to the server's shared stream-key set:
+    /// every key it ever releases arrives inside a [`StreamKeyClaim`] guard
+    /// (carrying its own reference to that set) and is released by dropping
+    /// the guard.
     ///
     /// The effective max_connections is calculated as:
     /// `min(config_value, 0.8 * system_fd_limit)` to leave headroom for other FDs.
     pub fn new(
         gop_limit: usize,
         max_connections: Option<usize>,
-        stream_keys: Arc<dashmap::DashSet<String>>,
         status: Arc<AtomicUsize>,
     ) -> io::Result<Self> {
         let poller = Poller::new()?;
@@ -931,7 +928,6 @@ impl Reactor {
             generations: HashMap::new(),
             scheduler: RtmpScheduler::new(gop_limit),
             publishers: slab::Slab::with_capacity(64),
-            stream_keys,
             status,
             max_connections: effective_max,
             pending_flush: HashSet::with_capacity(256),
@@ -1063,23 +1059,24 @@ impl Reactor {
 
     /// Add publishers.
     ///
-    /// In-process publishers claim their key in `stream_keys` at create time
-    /// (insert-or-fail) and the registration carries that claim here, so
-    /// success does not insert. Acceptance disarms the claim and moves the
-    /// key into the publisher's state — from then on `remove_publisher` owns
-    /// the release, at publisher end-of-life. Refusal drops the claim, which
-    /// releases the key — `new_channel` can refuse a key a network session
-    /// is already publishing to, and leaving the claim in place would block
-    /// that key for in-process creates forever.
+    /// In-process publishers claim their key in the server's shared set at
+    /// create time (insert-or-fail) and the registration carries that claim
+    /// here, so success does not insert. Acceptance moves the still-armed
+    /// claim into the publisher's state, which owns it until the state drops
+    /// at publisher end-of-life. The move happens before the log call, so
+    /// even a panicking log handler cannot unwind past a key that is claimed
+    /// yet owned by no guard. Refusal drops the claim, which releases the
+    /// key — `new_channel` can refuse a key a network session is already
+    /// publishing to, and leaving the claim in place would block that key
+    /// for in-process creates forever.
     pub fn add_publisher(&mut self, registration: PublisherRegistration) -> Option<usize> {
         let PublisherRegistration { claim, source } = registration;
         let entry = self.publishers.vacant_entry();
         let id = entry.key();
 
         if self.scheduler.new_channel(claim.key().to_string(), id) {
-            let stream_key = claim.into_key();
-            debug!("Publisher {} added for stream: {}", id, stream_key);
-            entry.insert(PublisherState { stream_key, source });
+            let state = entry.insert(PublisherState { claim, source });
+            debug!("Publisher {} added for stream: {}", id, state.claim.key());
             Some(id)
         } else {
             // Dropping `claim` releases the key.
@@ -1087,12 +1084,15 @@ impl Reactor {
         }
     }
 
-    /// Remove publishers
+    /// Remove publishers.
+    ///
+    /// Dropping the removed state releases its stream-key claim, so the key
+    /// is claimable again the moment the publisher dies here.
     pub fn remove_publisher(&mut self, id: usize) {
         if let Some(pub_state) = self.publishers.try_remove(id) {
             self.scheduler.notify_publisher_closed(id);
-            self.stream_keys.remove(&pub_state.stream_key);
             debug!("Publisher {} removed", id);
+            drop(pub_state);
         }
     }
 
@@ -2200,10 +2200,8 @@ mod tests {
 
     #[test]
     fn test_check_timeouts_throttle_and_detection() {
-        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
-        let mut reactor =
-            Reactor::new(3, None, stream_keys, status).expect("Failed to create reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("Failed to create reactor");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
         let addr = listener.local_addr().expect("Failed to get address");
@@ -2249,20 +2247,17 @@ mod tests {
 
     #[test]
     fn test_reactor_creation() {
-        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
 
-        let reactor = Reactor::new(3, None, stream_keys, status);
+        let reactor = Reactor::new(3, None, status);
         assert!(reactor.is_ok());
     }
 
     #[test]
     fn test_connection_generation_increments() {
-        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
 
-        let mut reactor =
-            Reactor::new(3, None, stream_keys, status).expect("Failed to create reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("Failed to create reactor");
 
         // Create a listener and accept multiple connections
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
@@ -2296,11 +2291,9 @@ mod tests {
 
     #[test]
     fn test_token_validation() {
-        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
 
-        let mut reactor =
-            Reactor::new(3, None, stream_keys, status).expect("Failed to create reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("Failed to create reactor");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
         let addr = listener.local_addr().expect("Failed to get address");
@@ -2333,11 +2326,9 @@ mod tests {
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn test_generation_prevents_aba_problem() {
-        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
 
-        let mut reactor =
-            Reactor::new(3, None, stream_keys, status).expect("Failed to create reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("Failed to create reactor");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
         let addr = listener.local_addr().expect("Failed to get address");
@@ -2382,11 +2373,9 @@ mod tests {
     /// Note: This test creates connections but doesn't run the full RTMP handshake
     #[test]
     fn test_many_connections_creation() {
-        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
 
-        let mut reactor =
-            Reactor::new(3, None, stream_keys, status).expect("Failed to create reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("Failed to create reactor");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
         let addr = listener.local_addr().expect("Failed to get address");
@@ -2429,11 +2418,9 @@ mod tests {
     fn perf_connection_scaling() {
         use std::time::Instant;
 
-        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
 
-        let mut reactor =
-            Reactor::new(3, None, stream_keys, status).expect("Failed to create reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("Failed to create reactor");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
         let addr = listener.local_addr().expect("Failed to get address");
@@ -2505,11 +2492,9 @@ mod tests {
         use std::io::Write;
         use std::time::Instant;
 
-        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
 
-        let mut reactor =
-            Reactor::new(3, None, stream_keys, status).expect("Failed to create reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("Failed to create reactor");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
         let addr = listener.local_addr().expect("Failed to get address");
@@ -2577,11 +2562,9 @@ mod tests {
     fn test_handle_writable_marks_interest_dirty_on_queue_drain() {
         use std::io::Read;
 
-        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
 
-        let mut reactor =
-            Reactor::new(3, None, stream_keys, status).expect("Failed to create reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("Failed to create reactor");
 
         // Create a listener and connection pair
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
@@ -2642,11 +2625,9 @@ mod tests {
     fn test_flush_pending_marks_interest_dirty_on_queue_drain() {
         use std::io::Read;
 
-        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
 
-        let mut reactor =
-            Reactor::new(3, None, stream_keys, status).expect("Failed to create reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("Failed to create reactor");
 
         // Create a listener and connection pair
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
@@ -2727,10 +2708,8 @@ mod tests {
     fn test_flush_pending_wouldblock_registers_writable_not_pending_flush() {
         use std::os::unix::io::AsRawFd;
 
-        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
-        let mut reactor =
-            Reactor::new(3, None, stream_keys, status).expect("Failed to create reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("Failed to create reactor");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
         let addr = listener.local_addr().expect("Failed to get address");
@@ -2786,11 +2765,9 @@ mod tests {
     /// Test that flush_pending marks interest_dirty when connection has no pending writes
     #[test]
     fn test_flush_pending_marks_interest_dirty_when_no_pending_writes() {
-        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
 
-        let mut reactor =
-            Reactor::new(3, None, stream_keys, status).expect("Failed to create reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("Failed to create reactor");
 
         // Create a listener and connection pair
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
@@ -2844,7 +2821,7 @@ mod tests {
 
         let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
-        let mut reactor = Reactor::new(3, None, stream_keys.clone(), status).expect("reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("reactor");
 
         // Register an in-process (create_rtmp_input-style) Feed publisher.
         let (feed_tx, feed_rx) = crossbeam_channel::bounded(64);
@@ -2934,11 +2911,11 @@ mod tests {
         );
     }
 
-    // The claim guard's two exits are exclusive: drop releases the key,
-    // into_key hands it over still-claimed (releasing then belongs to
-    // whoever stores it — remove_publisher for an accepted publisher).
+    // The claim guard has exactly one exit: drop releases the key. Moving
+    // the guard (into a registration, into the accepted publisher's state)
+    // neither releases nor re-inserts anything.
     #[test]
-    fn stream_key_claim_releases_on_drop_and_disarms_on_into_key() {
+    fn stream_key_claim_releases_on_drop_but_not_on_move() {
         let stream_keys: Arc<dashmap::DashSet<String>> = Arc::new(dashmap::DashSet::new());
 
         let claim = StreamKeyClaim::claim(stream_keys.clone(), "k".to_string()).expect("claim");
@@ -2946,30 +2923,28 @@ mod tests {
             StreamKeyClaim::claim(stream_keys.clone(), "k".to_string()).is_err(),
             "a second claim for a held key must lose"
         );
-        drop(claim);
-        assert!(!stream_keys.contains("k"), "drop must release the claim");
 
-        let claim =
-            StreamKeyClaim::claim(stream_keys.clone(), "k".to_string()).expect("re-claim");
-        let key = claim.into_key();
+        // A move is not an exit: the moved-from binding runs no Drop.
+        let moved = claim;
         assert!(
             stream_keys.contains("k"),
-            "into_key must keep the key claimed"
+            "moving the guard must keep the key claimed"
         );
-        // The disarmed key's owner releases it, as remove_publisher does.
-        stream_keys.remove(&key);
-        assert!(!stream_keys.contains("k"));
+
+        drop(moved);
+        assert!(!stream_keys.contains("k"), "drop must release the claim");
     }
 
-    // add_publisher owns the claim it is handed: acceptance moves the key
-    // into the publisher's state and only remove_publisher releases it;
-    // refusal (a network session already publishes the key, which never
-    // touches stream_keys) drops the claim and frees the key immediately.
+    // add_publisher owns the claim it is handed: acceptance moves the
+    // still-armed claim into the publisher's state, released when that
+    // state drops (here via remove_publisher); refusal (a network session
+    // already publishes the key, which never touches stream_keys) drops
+    // the claim and frees the key immediately.
     #[test]
     fn add_publisher_acceptance_defers_release_refusal_frees_the_key() {
         let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
-        let mut reactor = Reactor::new(3, None, stream_keys.clone(), status).expect("reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("reactor");
 
         let (_feed_tx, feed_rx) = crossbeam_channel::bounded::<PublisherFeed>(1);
         let claim =
@@ -3017,8 +2992,7 @@ mod tests {
     fn reactor_stop_releases_enqueued_but_unconsumed_key_claims() {
         let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
-        let mut reactor =
-            Reactor::new(3, None, stream_keys.clone(), status.clone()).expect("reactor");
+        let mut reactor = Reactor::new(3, None, status.clone()).expect("reactor");
 
         let (_connection_sender, connection_receiver) =
             crossbeam_channel::bounded::<TcpStream>(1);
@@ -3056,6 +3030,49 @@ mod tests {
             "the key must be claimable again after the reactor stopped"
         );
         drop(registrations);
+    }
+
+    // Reactor teardown must release accepted publishers' key claims: run()
+    // can exit — stop signal or unwind — with publishers still in the slab,
+    // and dropping the reactor is the worker's last word on them, so the
+    // keys must be claimable again afterwards.
+    #[test]
+    fn reactor_teardown_releases_accepted_publisher_key_claims() {
+        let stream_keys = Arc::new(dashmap::DashSet::new());
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let mut reactor = Reactor::new(3, None, status.clone()).expect("reactor");
+
+        let (_feed_tx, feed_rx) = crossbeam_channel::bounded::<PublisherFeed>(1);
+        let claim =
+            StreamKeyClaim::claim(stream_keys.clone(), "live".to_string()).expect("claim");
+        reactor
+            .add_publisher(PublisherRegistration {
+                claim,
+                source: PublisherSource::Feed(feed_rx),
+            })
+            .expect("accepted");
+        assert!(
+            stream_keys.contains("live"),
+            "an accepted publisher's key stays claimed while the reactor lives"
+        );
+
+        // run() exits on the stop flag with the publisher still in the slab.
+        let (_connection_sender, connection_receiver) =
+            crossbeam_channel::bounded::<TcpStream>(1);
+        let registrations = Arc::new(RegistrationHandoff::new());
+        let kill_switch = RegistrationKillSwitch::arm(registrations);
+        status.store(STATUS_END, Ordering::Release);
+        reactor.run(connection_receiver, kill_switch.handoff(), None);
+
+        drop(reactor);
+        assert!(
+            !stream_keys.contains("live"),
+            "tearing the reactor down must release accepted publishers' keys"
+        );
+        assert!(
+            StreamKeyClaim::claim(stream_keys.clone(), "live".to_string()).is_ok(),
+            "the key must be claimable again after teardown"
+        );
     }
 
     // The worker can die BEFORE run() ever executes — Reactor::new failing
@@ -3163,9 +3180,8 @@ mod tests {
     fn close_connection_after_flush_delivers_the_queued_tail() {
         use std::io::Read;
 
-        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
-        let mut reactor = Reactor::new(3, None, stream_keys, status).expect("reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("reactor");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
         let addr = listener.local_addr().expect("Failed to get address");
@@ -3216,9 +3232,8 @@ mod tests {
         use std::io::Read;
         use std::os::unix::io::AsRawFd;
 
-        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
-        let mut reactor = Reactor::new(3, None, stream_keys, status).expect("reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("reactor");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
         let addr = listener.local_addr().expect("Failed to get address");
@@ -3300,9 +3315,8 @@ mod tests {
     fn condemn_deadline_backstops_a_peer_that_never_reads() {
         use std::os::unix::io::AsRawFd;
 
-        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
-        let mut reactor = Reactor::new(3, None, stream_keys, status).expect("reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("reactor");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
         let addr = listener.local_addr().expect("Failed to get address");
@@ -3366,9 +3380,8 @@ mod tests {
     fn condemned_connection_is_skipped_by_live_fanout_and_closes_on_drain() {
         use std::io::Read;
 
-        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
-        let mut reactor = Reactor::new(3, None, stream_keys, status).expect("reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("reactor");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
         let addr = listener.local_addr().expect("Failed to get address");
@@ -3458,7 +3471,7 @@ mod tests {
     fn publisher_drain_item_budget_bounds_one_round() {
         let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
-        let mut reactor = Reactor::new(3, None, stream_keys.clone(), status).expect("reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("reactor");
 
         // Channel larger than the budget so the backlog fits in one send burst.
         let (feed_tx, feed_rx) = crossbeam_channel::bounded(MAX_PUBLISH_ITEMS_PER_POLL + 64);
@@ -3504,7 +3517,7 @@ mod tests {
     fn publisher_drain_byte_budget_bounds_one_round() {
         let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
-        let mut reactor = Reactor::new(3, None, stream_keys.clone(), status).expect("reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("reactor");
 
         let (feed_tx, feed_rx) = crossbeam_channel::bounded(16);
         let claim = StreamKeyClaim::claim(stream_keys, "live".to_string()).expect("claim");
@@ -3557,7 +3570,7 @@ mod tests {
     fn publisher_drain_oversized_item_is_consumed_not_dropped() {
         let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
-        let mut reactor = Reactor::new(3, None, stream_keys.clone(), status).expect("reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("reactor");
 
         let (feed_tx, feed_rx) = crossbeam_channel::bounded(4);
         let claim = StreamKeyClaim::claim(stream_keys, "live".to_string()).expect("claim");
@@ -3625,10 +3638,8 @@ mod tests {
     fn reactor_with_handshake_bytes_pending() -> (Reactor, ConnectionToken, TcpStream) {
         use std::io::Write;
 
-        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
-        let mut reactor =
-            Reactor::new(3, None, stream_keys, status).expect("Failed to create reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("Failed to create reactor");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
         let addr = listener.local_addr().expect("Failed to get address");
@@ -3710,10 +3721,8 @@ mod tests {
     /// connection that reused the id. Removal must scrub the set.
     #[test]
     fn remove_connection_scrubs_read_pending() {
-        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
-        let mut reactor =
-            Reactor::new(3, None, stream_keys, status).expect("Failed to create reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("Failed to create reactor");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
         let addr = listener.local_addr().expect("Failed to get address");

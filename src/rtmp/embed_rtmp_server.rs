@@ -231,7 +231,6 @@ impl EmbedRtmpServer<Initialization> {
         };
         self.wake_handle = wake_handle;
 
-        let stream_keys = self.stream_keys.clone();
         let status = self.status.clone();
         let max_connections = self.max_connections;
         let result = std::thread::Builder::new()
@@ -240,7 +239,6 @@ impl EmbedRtmpServer<Initialization> {
                 handle_connections(
                     stream_receiver,
                     registrations,
-                    stream_keys,
                     self.gop_limit,
                     max_connections,
                     status,
@@ -632,8 +630,9 @@ impl EmbedRtmpServer<Running> {
     ///   refusal and a successful enqueue are the same critical section, so
     ///   the reactor side can never have seen it;
     /// - the reactor consumes the registration: `add_publisher` either
-    ///   disarms the claim into the accepted publisher's state (released
-    ///   later by `remove_publisher`) or drops a refused one;
+    ///   moves the still-armed claim into the accepted publisher's state
+    ///   (released when that state drops — `remove_publisher`, or reactor
+    ///   teardown) or drops a refused one;
     /// - the worker dies — cleanly, by panic, or before the reactor even
     ///   existed — with the registration still queued: the worker's
     ///   `RegistrationKillSwitch` drains it, releasing the claim.
@@ -745,7 +744,6 @@ fn contain_reactor_panic(status: &AtomicUsize, run_reactor: impl FnOnce()) {
 fn handle_connections(
     connection_receiver: crossbeam_channel::Receiver<TcpStream>,
     registrations: Arc<RegistrationHandoff>,
-    stream_keys: Arc<dashmap::DashSet<String>>,
     gop_limit: usize,
     max_connections: Option<usize>,
     status: Arc<AtomicUsize>,
@@ -764,10 +762,12 @@ fn handle_connections(
     // constructor also publishes `STATUS_END`, but STORED in this outer slot
     // so that on a contained panic it is dropped HERE, after the terminal
     // status is published — a `Drop` panicking mid-unwind would abort the
-    // process instead.
+    // process instead. This drop is also what releases the key claims of
+    // publishers still accepted when the worker dies: each claim lives in
+    // its `PublisherState`, torn down with the reactor's publisher slab.
     let mut reactor_slot: Option<Reactor> = None;
     contain_reactor_panic(&status, || {
-        let reactor = match Reactor::new(gop_limit, max_connections, stream_keys, status.clone()) {
+        let reactor = match Reactor::new(gop_limit, max_connections, status.clone()) {
             Ok(r) => r,
             Err(e) => {
                 // Publish the terminal status BEFORE logging, mirroring the
