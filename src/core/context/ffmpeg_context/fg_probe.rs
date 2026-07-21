@@ -63,13 +63,13 @@ pub(super) struct ProbedTopology {
     /// The mirrored data flow at PAD granularity, directed source ->
     /// destination: output-pad -> input-pad edges are the would-be links
     /// between filters, input-pad -> output-pad edges are in-filter routing
-    /// (which output pads a frame entering that input pad can influence).
-    /// Lets consumers check directed reachability (can frames entering an
-    /// open input pad influence an open output pad?), which weak component
-    /// counting cannot answer — and which filter-granular edges answered
-    /// wrongly for filters whose pads carry independent streams
-    /// (`streamselect`'s `map` relays one selected input per output and
-    /// drops the rest).
+    /// (a full crossbar: every input pad of a filter counts as influencing
+    /// every output pad, because libavfilter routing is not static — a
+    /// selector's `map` can be rewritten mid-stream by `sendcmd`, so no
+    /// applied option proves an input can never reach an output). Lets
+    /// consumers check directed STRUCTURAL reachability (is an open input
+    /// pad wired into the flow that feeds an open output pad?), which weak
+    /// component counting cannot answer.
     pub(super) edges: Vec<PadEdge>,
     /// Number of weakly-connected components over the created filters, where
     /// the edges are the links the mirror pass established (labeled and
@@ -149,66 +149,6 @@ unsafe fn movie_spec_types(f: *mut AVFilterContext) -> Option<Vec<AVMediaType>> 
         return None;
     }
     Some(spec.split('+').map(spec_media_type).collect())
-}
-
-/// Which input pad feeds each output pad, for filters that RELAY one selected
-/// input per output instead of merging their inputs: `streamselect` /
-/// `astreamselect` declare this via `map` — output pad `j` carries frames
-/// from input pad `map[j]` only, and inputs no map entry selects are dropped
-/// entirely (f_streamselect.c `process_frame`). `None` for every other
-/// filter: the conservative default is that any input pad may influence any
-/// output pad (overlay composites its inputs, concat splices them, ...),
-/// which errs toward accepting graphs.
-///
-/// Both filters have dynamic pads and are not init-denied, so by the time
-/// this runs their init has executed and the pad counts in `n` are real; the
-/// applied `map` reads back from the same context. A read-back this mirror
-/// cannot represent (unset, exotic strtol spellings, entries that do not
-/// line up with the created pads) also returns `None` — falling back to the
-/// permissive default rather than inventing routing.
-fn selected_input_per_output(n: &NodeState) -> Option<Vec<usize>> {
-    if !matches!(n.filter_name.as_str(), "streamselect" | "astreamselect") {
-        return None;
-    }
-    let mut out: *mut u8 = null_mut();
-    // SAFETY: `n.ctx` is a created filter context with options applied, alive
-    // for the whole probe; av_opt_get hands out an owned copy freed below.
-    let map_str = unsafe {
-        let ret = av_opt_get(
-            n.ctx as *mut c_void,
-            c"map".as_ptr(),
-            AV_OPT_SEARCH_CHILDREN,
-            &mut out,
-        );
-        if ret < 0 || out.is_null() {
-            return None;
-        }
-        let map_str = CStr::from_ptr(out as *const c_char)
-            .to_str()
-            .ok()
-            .map(str::to_owned);
-        av_freep(&mut out as *mut *mut u8 as *mut c_void);
-        map_str?
-    };
-    let map = parse_streamselect_map(&map_str)?;
-    (map.len() == n.out_linked.len() && map.iter().all(|&pi| pi < n.in_linked.len()))
-        .then_some(map)
-}
-
-/// Parse a `streamselect` `map` string as whitespace-separated non-negative
-/// decimal input indexes, one per output pad. f_streamselect.c's
-/// `parse_mapping` reads the entries with a strtol loop, so sign/hex
-/// spellings and trailing junk are representable there but not here — for
-/// those this returns `None` and the caller keeps the permissive routing.
-fn parse_streamselect_map(s: &str) -> Option<Vec<usize>> {
-    s.split_whitespace()
-        .map(|tok| {
-            tok.chars()
-                .all(|c| c.is_ascii_digit())
-                .then(|| tok.parse::<usize>().ok())
-                .flatten()
-        })
-        .collect()
 }
 
 /// Initialize only the filters whose pad topology depends on init (dynamic
@@ -638,26 +578,27 @@ pub(super) unsafe fn probe_open_pads(seg: *mut AVFilterGraphSegment) -> Result<P
         }
     }
     // In-filter routing edges, added after the links so `edges` describes the
-    // complete pad-level data flow: which output pads can a frame entering
-    // each input pad influence? Every one of them by default — most
-    // multi-pad filters merge their inputs (overlay composites, concat
-    // splices) — but a relay filter selecting ONE input per output
-    // (streamselect's map) routes only the selected pairs, so an unselected
-    // input pad reaches no output at all.
+    // complete pad-level data flow: every input pad of a filter is treated as
+    // influencing every output pad (a full crossbar). This deliberately
+    // includes filters whose CURRENT options would drop an input: a
+    // `streamselect=map=0` graph relays only pad 0 today, but `map` is a
+    // runtime command (`sendcmd`/`avfilter_graph_send_command` rewrite it
+    // mid-stream, after which the other pad feeds the output) and ffmpeg
+    // accepts such descriptions as-is — verified against ffmpeg 7.1.3, which
+    // encodes "color[bg];[bg][in]streamselect=inputs=2:map=0" without
+    // complaint and honors a later `map 1` command. Pruning by the applied
+    // map would therefore reject valid graphs whose dropped input can still
+    // reach the output at runtime. The crossbar keeps the walk structural: it
+    // answers "is the pad wired into the flow that feeds the output?", never
+    // "will frames survive the trip?".
     for (ci, chain) in nodes.iter().enumerate() {
         for (fi, n) in chain.iter().enumerate() {
             if n.ctx.is_null() {
                 continue;
             }
-            let selected = selected_input_per_output(n);
             for pj in 0..n.out_linked.len() {
-                match &selected {
-                    Some(map) => edges.push((in_pad(ci, fi, map[pj]), out_pad(ci, fi, pj))),
-                    None => {
-                        for pi in 0..n.in_linked.len() {
-                            edges.push((in_pad(ci, fi, pi), out_pad(ci, fi, pj)));
-                        }
-                    }
+                for pi in 0..n.in_linked.len() {
+                    edges.push((in_pad(ci, fi, pi), out_pad(ci, fi, pj)));
                 }
             }
         }
@@ -860,19 +801,6 @@ mod tests {
                 "probe accepted {desc:?} which upstream rejects at parse/link"
             );
         }
-    }
-
-    #[test]
-    fn streamselect_map_parses_decimal_entries_only() {
-        assert_eq!(parse_streamselect_map("0"), Some(vec![0]));
-        assert_eq!(parse_streamselect_map(" 1  0 "), Some(vec![1, 0]));
-        // Spellings only strtol reads (sign/hex) refuse to parse, so the
-        // caller keeps the permissive all-pads routing instead of guessing.
-        assert_eq!(parse_streamselect_map("+1"), None);
-        assert_eq!(parse_streamselect_map("0x1"), None);
-        // Unset map reads back as ""; zero entries never match a real output
-        // count, so this also ends in the permissive fallback.
-        assert_eq!(parse_streamselect_map(""), Some(vec![]));
     }
 
     #[test]

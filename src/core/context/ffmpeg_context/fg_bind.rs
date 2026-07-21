@@ -597,18 +597,24 @@ pub(super) struct WriterFilterShape {
     pub(super) output_pad_types: Vec<AVMediaType>,
     /// Whether the open OUTPUT pad is reachable from the open INPUT pad
     /// following the DIRECTED pad-level data flow: the (producer -> consumer)
-    /// links between filters plus each filter's in-filter routing.
-    /// Weak connectivity is not enough: in
+    /// links between filters plus each filter's in-filter routing (a full
+    /// crossbar — see [`fg_probe::ProbedTopology::edges`]). Weak connectivity
+    /// is not enough: in
     /// `"color,split[out][aux];[aux][in]overlay,nullsink"` everything is one
     /// weak component with one open input and one open output, yet frames
     /// entering `[in]` flow only into the sink while an independent source
-    /// feeds `[out]`. Filter-level reachability is not enough either: in
-    /// `"color[bg];[bg][in]streamselect=inputs=2:map=0"` the open input and
-    /// the open output sit on the SAME filter, yet `map=0` relays only the
-    /// color feed and drops `[in]` entirely. In both cases the pushed frames
-    /// cannot influence the encoded output, and an unbounded side source
-    /// keeps the job from finishing. Meaningful only when there is exactly
-    /// one input pad and one output pad; `false` otherwise.
+    /// feeds `[out]` — the pushed frames cannot influence the encoded output,
+    /// and the unbounded side source keeps the job from finishing.
+    ///
+    /// The check is STRUCTURAL, not semantic: a filter whose applied options
+    /// would currently discard the input still counts as forwarding it. In
+    /// `"color[bg];[bg][in]streamselect=inputs=2:map=0"` the applied map
+    /// relays only the color feed, yet the graph is accepted — `map` is a
+    /// runtime command (`sendcmd` can reroute `[in]` to the output
+    /// mid-stream) and ffmpeg accepts and runs the same description, so
+    /// pruning by the applied selection would reject valid graphs.
+    /// Meaningful only when there is exactly one input pad and one output
+    /// pad; `false` otherwise.
     pub(super) output_reachable: bool,
 }
 
@@ -678,12 +684,15 @@ pub(super) fn probe_writer_filter_shape(filter_desc: &str) -> Result<WriterFilte
 }
 
 /// Directed reachability over the probe's pad-level data-flow edges (links
-/// between filters plus in-filter routing): can frames entering the `from`
-/// input pad influence the `to` output pad? Pad granularity is what makes a
-/// selective relay honest: for a single-filter graph like `"null"` the input
-/// pad still reaches the output pad through the filter's own routing edge,
-/// while `streamselect=map=0`'s unselected input pad has no routing edge and
-/// reaches nothing.
+/// between filters plus each filter's crossbar routing): is the `from` input
+/// pad wired into the flow that feeds the `to` output pad? For a
+/// single-filter graph like `"null"` the input pad reaches the output pad
+/// through the filter's own routing edge; for
+/// `"color,split[out][aux];[aux][in]overlay,nullsink"` the walk from `[in]`
+/// dead-ends in the sink and never reaches `[out]`. Structural only: a
+/// filter that may drop the frames at runtime (`streamselect` whose current
+/// `map` selects another input) still forwards in this walk, because such
+/// routing is commandable mid-stream and ffmpeg accepts those descriptions.
 #[cfg(not(docsrs))]
 fn pad_reaches(from: fg_probe::PadRef, to: fg_probe::PadRef, edges: &[fg_probe::PadEdge]) -> bool {
     let mut visited = std::collections::HashSet::new();
