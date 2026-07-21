@@ -59,6 +59,18 @@ const MAX_PUBLISH_BYTES_PER_POLL: usize = MAX_READ_PER_POLL;
 /// for streams of tiny packets whose byte total stays low. Equal to the
 /// channel capacity: one round can at most clear a full backlog.
 const MAX_PUBLISH_ITEMS_PER_POLL: usize = PUBLISHER_CHANNEL_CAPACITY;
+/// Capacity of the registration handoff between the create paths and the
+/// reactor — the same bound the crossbeam channel it replaced had. Every
+/// queued registration parks a stream-key claim, so an uncapped queue lets a
+/// stalled reactor accumulate claims without limit; at the bound the enqueue
+/// refuses instead, and the caller surfaces a typed error.
+const REGISTRATION_QUEUE_CAPACITY: usize = 1024;
+/// Per-round budget for registrations drained out of the handoff. Without
+/// it, one round transfers the entire backlog and `add_publisher` runs for
+/// all of it before the next poll or stop check, starving sockets; a
+/// remainder instead forces a zero-timeout poll, so the next batch runs
+/// promptly rather than after the poll fallback.
+const MAX_REGISTRATIONS_PER_POLL: usize = 128;
 const DEFAULT_MAX_CONNECTIONS: usize = 10000; // Default max connections (auto-adjusted by system FD limit)
 #[cfg(windows)]
 const DEFAULT_MAX_CONNECTIONS_WINDOWS: usize = 8000; // Conservative default for Windows (no direct FD limit API)
@@ -661,8 +673,8 @@ impl Drop for StreamKeyClaim {
 /// A publisher registration in flight from the server's `register_publisher`
 /// to the reactor. It carries the key claim so a registration dropped
 /// anywhere short of [`Reactor::add_publisher`] taking ownership — refused
-/// at enqueue because the worker is gone, or still queued when the worker's
-/// [`RegistrationKillSwitch`] fires — releases the key automatically.
+/// at enqueue because the intake is closed or full, or still queued when the
+/// worker's [`RegistrationKillSwitch`] fires — releases the key automatically.
 pub(crate) struct PublisherRegistration {
     pub(crate) claim: StreamKeyClaim,
     pub(crate) source: PublisherSource,
@@ -671,11 +683,13 @@ pub(crate) struct PublisherRegistration {
 /// The registration queue proper: the worker-liveness flag and the payload
 /// live behind ONE lock so no observer can see them disagree.
 pub(crate) struct RegistrationQueue {
-    /// `false` once the reactor worker has died. Flipped by
-    /// [`RegistrationKillSwitch`]'s drop under the same lock that guards
-    /// `queue`, so an enqueue either happens before the flip (and is drained
-    /// by the same critical section that flips it) or observes `false` and
-    /// is refused. There is no in-between.
+    /// `false` once the worker has died ([`RegistrationKillSwitch`]'s drop,
+    /// which also drains the queue in the same critical section) or the
+    /// server was signaled to stop ([`RegistrationHandoff::close`], which
+    /// leaves queued entries to the reactor's remaining rounds, backstopped
+    /// by the kill switch's terminal drain). Either flip shares the lock
+    /// with every enqueue: an enqueue happens entirely before it, or
+    /// observes `false` and is refused. There is no in-between.
     alive: bool,
     queue: VecDeque<PublisherRegistration>,
 }
@@ -694,14 +708,29 @@ pub(crate) struct RegistrationQueue {
 /// - a drain loop that stops at `Empty` can be kept spinning by a steady
 ///   producer, because nothing tells producers to stop.
 ///
-/// Here [`enqueue`](Self::enqueue) checks liveness and pushes in one
-/// critical section, and the kill switch flips liveness and drains in one
-/// critical section, so every registration ends in exactly one of three
+/// Here [`enqueue`](Self::enqueue) checks liveness and capacity and pushes
+/// in one critical section, and the kill switch flips liveness and drains in
+/// one critical section, so every registration ends in exactly one of three
 /// hands — the reactor (via [`drain_into`](Self::drain_into)), the terminal
 /// kill-switch drain, or the refused caller — each of which releases the
 /// key claim by dropping the registration.
 pub(crate) struct RegistrationHandoff {
     queue: Mutex<RegistrationQueue>,
+}
+
+/// Why [`RegistrationHandoff::enqueue`] refused a registration. Both arms
+/// hand the registration back, and dropping it releases the key claim; the
+/// split exists so the create paths can surface distinct errors for "the
+/// server is gone" and "the server is backlogged".
+pub(crate) enum EnqueueRefused {
+    /// The intake is closed: the worker died, or the server was signaled to
+    /// stop. No reactor round will consume the queue again, so accepting
+    /// the registration would report a success that cannot happen.
+    Closed(PublisherRegistration),
+    /// The queue already holds [`REGISTRATION_QUEUE_CAPACITY`] registrations
+    /// the reactor has not picked up. The worker is alive; the caller may
+    /// retry once the backlog drains.
+    Full(PublisherRegistration),
 }
 
 impl RegistrationHandoff {
@@ -726,29 +755,49 @@ impl RegistrationHandoff {
     }
 
     /// Enqueue a registration for the reactor, or hand it back if the worker
-    /// is gone. The liveness check and the push share one critical section,
-    /// so a registration accepted here is guaranteed visible to the drain
-    /// that runs when the worker dies — there is no window in which it can
-    /// be queued yet seen by nobody. The caller drops a refused
-    /// registration, releasing its key claim.
+    /// is gone or the queue is at capacity. The liveness check, the capacity
+    /// check and the push share one critical section, so a registration
+    /// accepted here is guaranteed visible to the drain that runs when the
+    /// worker dies — there is no window in which it can be queued yet seen
+    /// by nobody — and the queue can never exceed its bound. The caller
+    /// drops a refused registration, releasing its key claim.
     pub(crate) fn enqueue(
         &self,
         registration: PublisherRegistration,
-    ) -> Result<(), PublisherRegistration> {
+    ) -> Result<(), EnqueueRefused> {
         let mut queue = self.lock();
-        if queue.alive {
+        if !queue.alive {
+            Err(EnqueueRefused::Closed(registration))
+        } else if queue.queue.len() >= REGISTRATION_QUEUE_CAPACITY {
+            Err(EnqueueRefused::Full(registration))
+        } else {
             queue.queue.push_back(registration);
             Ok(())
-        } else {
-            Err(registration)
         }
     }
 
-    /// Move everything currently queued into `batch` under one lock. The
-    /// caller processes after this returns, off the lock, so enqueuers are
-    /// never blocked behind scheduler work.
-    fn drain_into(&self, batch: &mut Vec<PublisherRegistration>) {
-        batch.extend(self.lock().queue.drain(..));
+    /// Close the intake without draining: every enqueue from this point on
+    /// is refused as [`EnqueueRefused::Closed`]. The stop signal calls this
+    /// so a caller that observes the server as stopped can no longer be
+    /// told Ok for a registration no reactor round will consume. Whatever
+    /// is already queued keeps its owner — the reactor's remaining rounds,
+    /// with the kill switch's terminal drain as the claims backstop.
+    pub(crate) fn close(&self) {
+        self.lock().alive = false;
+    }
+
+    /// Move up to [`MAX_REGISTRATIONS_PER_POLL`] queued registrations into
+    /// `batch` under one lock, front first, and report whether any remain.
+    /// The caller processes after this returns, off the lock, so enqueuers
+    /// are never blocked behind scheduler work; the budget keeps a large
+    /// backlog from monopolizing one reactor round, and a `true` return
+    /// tells the caller to come back promptly for the remainder instead of
+    /// sleeping out a full poll timeout on it.
+    fn drain_into(&self, batch: &mut Vec<PublisherRegistration>) -> bool {
+        let mut queue = self.lock();
+        let take = queue.queue.len().min(MAX_REGISTRATIONS_PER_POLL);
+        batch.extend(queue.queue.drain(..take));
+        !queue.queue.is_empty()
     }
 
     /// Close the intake and take whatever is still queued, in one critical
@@ -1836,10 +1885,12 @@ impl Reactor {
                 }
             }
 
-            // 3. Take the queued publisher registrations (one lock), then
-            // process them off the lock.
+            // 3. Take up to a budget of queued publisher registrations (one
+            // lock), then process them off the lock. The budget bounds how
+            // long this step can keep sockets waiting; a remainder makes the
+            // poll below non-blocking so the next round picks it up promptly.
             let mut new_publisher_added = false;
-            registrations.drain_into(&mut registration_batch);
+            let registrations_pending = registrations.drain_into(&mut registration_batch);
             for registration in registration_batch.drain(..) {
                 if self.add_publisher(registration).is_some() {
                     new_publisher_added = true;
@@ -1857,17 +1908,21 @@ impl Reactor {
             // immediately instead of stalling on the poll timeout (PERF-5a).
             //
             // The same applies when the previous round's publisher drain hit
-            // its budget: the leftover items sit on a channel the poller
-            // cannot see, so a blocking poll would add up to POLL_TIMEOUT_MS
-            // of latency per excess batch. Poll non-blocking and let steps
-            // 5-10 run in between, which is exactly what the budget exists
-            // to guarantee.
-            let poll_wait =
-                if new_publisher_added || publishers_pending || !self.read_pending.is_empty() {
-                    Duration::ZERO
-                } else {
-                    poll_timeout
-                };
+            // its budget, and when this round's registration drain left a
+            // remainder: the leftover items sit on a channel or queue the
+            // poller cannot see, so a blocking poll would add up to
+            // POLL_TIMEOUT_MS of latency per excess batch. Poll non-blocking
+            // and let steps 5-10 run in between, which is exactly what the
+            // budgets exist to guarantee.
+            let poll_wait = if new_publisher_added
+                || publishers_pending
+                || registrations_pending
+                || !self.read_pending.is_empty()
+            {
+                Duration::ZERO
+            } else {
+                poll_timeout
+            };
             if let Err(e) = self.poller.poll(Some(poll_wait), &mut events) {
                 error!("Poller error: {:?}", e);
                 continue;
@@ -3169,6 +3224,132 @@ mod tests {
         assert!(
             !stream_keys.contains("a") && !stream_keys.contains("b"),
             "dropping the batch must release the claims exactly once"
+        );
+    }
+
+    // The intake is bounded at REGISTRATION_QUEUE_CAPACITY — the bound the
+    // crossbeam channel this queue replaced enforced. The capacity check
+    // shares the enqueue's critical section, so the entry past the bound is
+    // refused as Full with the queue still exactly at capacity; dropping
+    // the refusal reopens its key immediately. A stalled reactor thus costs
+    // callers a typed error, not an unbounded backlog of parked claims.
+    #[test]
+    fn full_registration_queue_refuses_enqueue_and_reopens_the_key() {
+        let stream_keys: Arc<dashmap::DashSet<String>> = Arc::new(dashmap::DashSet::new());
+        let registrations = RegistrationHandoff::new();
+
+        for i in 0..REGISTRATION_QUEUE_CAPACITY {
+            let (_feed_tx, feed_rx) = crossbeam_channel::bounded::<PublisherFeed>(1);
+            let claim = StreamKeyClaim::claim(stream_keys.clone(), format!("k-{i}"))
+                .expect("first claim must win");
+            registrations
+                .enqueue(PublisherRegistration {
+                    claim,
+                    source: PublisherSource::Feed(feed_rx),
+                })
+                .unwrap_or_else(|_| panic!("enqueue {i} within the bound must be accepted"));
+        }
+
+        let (_feed_tx, feed_rx) = crossbeam_channel::bounded::<PublisherFeed>(1);
+        let claim = StreamKeyClaim::claim(stream_keys.clone(), "overflow".to_string())
+            .expect("first claim must win");
+        let refused = registrations.enqueue(PublisherRegistration {
+            claim,
+            source: PublisherSource::Feed(feed_rx),
+        });
+        assert!(
+            matches!(refused, Err(EnqueueRefused::Full(_))),
+            "the enqueue past the bound must be refused as Full"
+        );
+
+        drop(refused);
+        assert!(
+            !stream_keys.contains("overflow"),
+            "a refused registration must release its key claim"
+        );
+        assert!(
+            StreamKeyClaim::claim(stream_keys.clone(), "overflow".to_string()).is_ok(),
+            "the key must be claimable again right after the refusal"
+        );
+
+        // The refusal is backpressure, not closure: draining the backlog
+        // makes the same intake accept again, and no queued entry was lost
+        // to the refused push.
+        let mut batch = Vec::new();
+        while registrations.drain_into(&mut batch) {}
+        assert_eq!(
+            batch.len(),
+            REGISTRATION_QUEUE_CAPACITY,
+            "the refusal must leave the queued entries intact"
+        );
+        let (_feed_tx, feed_rx) = crossbeam_channel::bounded::<PublisherFeed>(1);
+        let claim = StreamKeyClaim::claim(stream_keys.clone(), "after-drain".to_string())
+            .expect("claim after the drain");
+        assert!(
+            registrations
+                .enqueue(PublisherRegistration {
+                    claim,
+                    source: PublisherSource::Feed(feed_rx),
+                })
+                .is_ok(),
+            "a drained intake must accept registrations again"
+        );
+    }
+
+    // drain_into is budgeted: one call takes at most
+    // MAX_REGISTRATIONS_PER_POLL entries — front first — and reports
+    // whether a remainder is left, which the run loop turns into a
+    // zero-timeout poll. A backlog larger than the budget therefore spreads
+    // across rounds without losing entries or reordering them, instead of
+    // monopolizing a single round while sockets wait.
+    #[test]
+    fn drain_into_budgets_each_round_without_losing_or_reordering_entries() {
+        let stream_keys: Arc<dashmap::DashSet<String>> = Arc::new(dashmap::DashSet::new());
+        let registrations = RegistrationHandoff::new();
+
+        let total = MAX_REGISTRATIONS_PER_POLL * 2 + 3;
+        for i in 0..total {
+            let (_feed_tx, feed_rx) = crossbeam_channel::bounded::<PublisherFeed>(1);
+            let claim = StreamKeyClaim::claim(stream_keys.clone(), format!("k-{i:04}"))
+                .expect("first claim must win");
+            registrations
+                .enqueue(PublisherRegistration {
+                    claim,
+                    source: PublisherSource::Feed(feed_rx),
+                })
+                .unwrap_or_else(|_| panic!("enqueue {i} within the bound"));
+        }
+
+        // One budgeted batch per simulated reactor round.
+        let mut drained_keys = Vec::new();
+        let mut rounds = 0;
+        loop {
+            let mut batch = Vec::new();
+            let more = registrations.drain_into(&mut batch);
+            assert!(
+                batch.len() <= MAX_REGISTRATIONS_PER_POLL,
+                "one round must not exceed the drain budget"
+            );
+            drained_keys.extend(batch.iter().map(|r| r.claim.key().to_string()));
+            rounds += 1;
+            if !more {
+                break;
+            }
+            assert_eq!(
+                batch.len(),
+                MAX_REGISTRATIONS_PER_POLL,
+                "a round that reports a remainder must have used its whole budget"
+            );
+        }
+
+        assert_eq!(
+            rounds, 3,
+            "the backlog must spread across ceil(total / budget) rounds"
+        );
+        let expected: Vec<String> = (0..total).map(|i| format!("k-{i:04}")).collect();
+        assert_eq!(
+            drained_keys, expected,
+            "every entry must arrive exactly once, in enqueue order"
         );
     }
 

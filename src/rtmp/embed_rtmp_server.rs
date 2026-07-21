@@ -1,12 +1,12 @@
 use crate::core::context::output::Output;
-use crate::error::Error::{RtmpCreateStream, RtmpStreamAlreadyExists};
+use crate::error::Error::{RtmpCreateStream, RtmpRegistrationQueueFull, RtmpStreamAlreadyExists};
 use crate::flv::flv_buffer::FlvBuffer;
 use crate::flv::flv_tag::FlvTag;
 use crate::rtmp::poller::{waker_pair, WakeHandle, Waker};
 use crate::rtmp::reactor::{
-    effective_max_connections, PublisherFeed, PublisherRegistration, PublisherSource, Reactor,
-    RegistrationHandoff, RegistrationKillSwitch, StreamKeyClaim, CHANNEL_HEADROOM,
-    PUBLISHER_CHANNEL_CAPACITY,
+    effective_max_connections, EnqueueRefused, PublisherFeed, PublisherRegistration,
+    PublisherSource, Reactor, RegistrationHandoff, RegistrationKillSwitch, StreamKeyClaim,
+    CHANNEL_HEADROOM, PUBLISHER_CHANNEL_CAPACITY,
 };
 use bytes::{BufMut, Bytes};
 use log::{debug, error, info, warn};
@@ -90,18 +90,29 @@ impl<S: 'static> EmbedRtmpServer<S> {
 
     /// Signal the server threads to stop without consuming the server.
     ///
-    /// Idempotent: storing `STATUS_END` again and re-waking an already-woken
-    /// reactor are both no-ops. The wake matters — without it the reactor
-    /// notices the flag only on its next poll timeout, and a reactor parked
-    /// in `poll()` would otherwise hold the shutdown for up to 100ms. When no
-    /// wake handle exists (waker_pair creation failed at start), that 100ms
-    /// poll fallback is exactly the degraded path the reactor already runs on.
+    /// Idempotent: re-closing a closed intake, storing `STATUS_END` again and
+    /// re-waking an already-woken reactor are all no-ops. The wake matters —
+    /// without it the reactor notices the flag only on its next poll timeout,
+    /// and a reactor parked in `poll()` would otherwise hold the shutdown for
+    /// up to 100ms. When no wake handle exists (waker_pair creation failed at
+    /// start), that 100ms poll fallback is exactly the degraded path the
+    /// reactor already runs on.
     ///
     /// This exists because `EmbedRtmpServer` cannot implement `Drop` itself:
     /// `into_state()` moves fields out of `self`, which the compiler forbids
     /// for types with a `Drop` impl (E0509). Shared owners that only hold a
     /// reference (e.g. [`StreamHandle`]) stop the server through this instead.
     fn signal_stop(&self) {
+        // Close the registration intake BEFORE publishing the stopped
+        // status: the release-store below then orders the close ahead of
+        // any observer's acquire-load, so a caller that saw
+        // `is_stopped() == true` can no longer enqueue a registration and
+        // be told Ok when no reactor round will consume it. Registrations
+        // already queued keep their owners — the reactor's remaining
+        // rounds, with the worker's kill-switch drain as the backstop.
+        if let Some(registrations) = &self.registrations {
+            registrations.close();
+        }
         self.status.store(STATUS_END, Ordering::Release);
         if let Some(wake_handle) = &self.wake_handle {
             wake_handle.wake();
@@ -625,10 +636,11 @@ impl EmbedRtmpServer<Running> {
     /// claim is a drop-releasing guard: whichever side ends up holding the
     /// registration when it dies releases the key, with no path releasing
     /// twice. Concretely:
-    /// - no registration queue, or the enqueue is refused because the worker
-    ///   is gone: the registration drops here, releasing the claim — the
-    ///   refusal and a successful enqueue are the same critical section, so
-    ///   the reactor side can never have seen it;
+    /// - no registration queue, or the enqueue is refused because the intake
+    ///   is closed (worker gone, server stopped) or at capacity: the
+    ///   registration drops here, releasing the claim — the refusal and a
+    ///   successful enqueue are the same critical section, so the reactor
+    ///   side can never have seen it;
     /// - the reactor consumes the registration: `add_publisher` either
     ///   moves the still-armed claim into the accepted publisher's state
     ///   (released when that state drops — `remove_publisher`, or reactor
@@ -650,18 +662,31 @@ impl EmbedRtmpServer<Running> {
             }
         };
 
-        if let Err(registration) = registrations.enqueue(registration) {
-            // The worker is gone and can never consume this registration:
-            // dropping it here releases its stream-key claim immediately.
-            drop(registration);
-            if self.status.load(Ordering::Acquire) != STATUS_END {
-                warn!("Rtmp server worker already exited. Can't create stream sender.");
-            } else {
-                error!("Rtmp Server aborted. Can't create stream sender.");
+        match registrations.enqueue(registration) {
+            Ok(()) => Ok(()),
+            Err(EnqueueRefused::Closed(registration)) => {
+                // The worker is gone, or the server was signaled to stop:
+                // nothing will ever consume this registration. Dropping it
+                // here releases its stream-key claim immediately.
+                drop(registration);
+                if self.status.load(Ordering::Acquire) != STATUS_END {
+                    warn!("Rtmp server worker already exited. Can't create stream sender.");
+                } else {
+                    error!("Rtmp Server aborted. Can't create stream sender.");
+                }
+                Err(RtmpCreateStream.into())
             }
-            return Err(RtmpCreateStream.into());
+            Err(EnqueueRefused::Full(registration)) => {
+                // The worker is alive but the reactor has a full queue of
+                // earlier registrations to pick up. Refusing keeps the
+                // parked key claims bounded; dropping the refusal reopens
+                // this key immediately, so the caller may retry once the
+                // backlog drains.
+                drop(registration);
+                warn!("Rtmp registration queue is full. Can't create stream sender.");
+                Err(RtmpRegistrationQueueFull.into())
+            }
         }
-        Ok(())
     }
 
     /// Stops the RTMP server by signaling the listening and connection-handling threads
@@ -1596,6 +1621,45 @@ mod tests {
         let ended = server.stop();
         assert!(ended.is_stopped());
         assert!(wait_for_port_release(addr));
+    }
+
+    // signal_stop must close the registration intake in the same breath as
+    // publishing the stopped status. Without that, a server clone could
+    // observe is_stopped() == true, still enqueue a registration, and be
+    // told Ok even though no reactor round would ever consume it — the kill
+    // switch would eventually release the claim, but the Ok reported a
+    // stream that could never exist. No socket is bound here: the create
+    // path touches only the handoff, the key set and the status flag.
+    #[test]
+    fn stop_signal_closes_the_registration_intake() {
+        let server = EmbedRtmpServer::<Running> {
+            address: String::new(),
+            bound_addr: None,
+            status: Arc::new(AtomicUsize::new(STATUS_RUN)),
+            stream_keys: Default::default(),
+            registrations: Some(Arc::new(RegistrationHandoff::new())),
+            wake_handle: None,
+            gop_limit: 1,
+            max_connections: None,
+            state: PhantomData,
+        };
+
+        let _live = server
+            .create_rtmp_input("app", "before")
+            .expect("create while running must succeed");
+
+        server.signal_stop();
+        assert!(server.is_stopped());
+
+        let after = server.create_rtmp_input("app", "after");
+        assert!(
+            matches!(after, Err(crate::error::Error::RtmpCreateStream)),
+            "a create issued after the stop signal must fail with the stopped error"
+        );
+        assert!(
+            !server.stream_keys.contains("after"),
+            "the refused create must release its key claim immediately"
+        );
     }
 
     // A reactor panic must not leave the server half-dead: the unwind

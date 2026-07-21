@@ -140,6 +140,10 @@ pub enum Error {
     RtmpCreateStream,
 
     #[cfg(feature = "rtmp")]
+    #[error("Rtmp registration queue is full: too many streams are waiting to be registered")]
+    RtmpRegistrationQueueFull,
+
+    #[cfg(feature = "rtmp")]
     #[error("Rtmp server thread exited")]
     RtmpThreadExited,
 
@@ -286,6 +290,7 @@ impl PartialEq for Error {
             | (Bug, Bug) => true,
             #[cfg(feature = "rtmp")]
             (RtmpCreateStream, RtmpCreateStream)
+            | (RtmpRegistrationQueueFull, RtmpRegistrationQueueFull)
             | (RtmpThreadExited, RtmpThreadExited)
             | (RtmpStreamClosed, RtmpStreamClosed) => true,
             _ => false,
