@@ -263,14 +263,18 @@ pub fn captured_warnings() -> Vec<(Level, String)> {
     CAPTURE.entries.lock().unwrap().clone()
 }
 
-/// Asserts that some recorded WARN/ERROR message contains `needle`.
+/// Asserts that some message recorded at exactly WARN level contains
+/// `needle` — an ERROR entry with the same text does not satisfy it, so a
+/// documented warning silently escalating to an error still fails here.
 /// Tests sharing the process should assert on unique substrings, so
 /// parallel scenarios cannot satisfy each other's expectations.
 pub fn assert_warning_containing(needle: &str) {
     let entries = captured_warnings();
     assert!(
-        entries.iter().any(|(_, msg)| msg.contains(needle)),
-        "no captured WARN/ERROR contains {needle:?}; captured {} entr(ies):\n{}",
+        entries
+            .iter()
+            .any(|(lvl, msg)| *lvl == Level::Warn && msg.contains(needle)),
+        "no captured WARN contains {needle:?}; captured {} entr(ies):\n{}",
         entries.len(),
         entries
             .iter()
