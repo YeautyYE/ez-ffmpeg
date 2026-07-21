@@ -536,9 +536,12 @@ fn run_shape(shape: &VerifiedShape) -> Option<GoldenRun> {
 /// `cargo test --lib` alone does not build examples).
 fn example_binary(name: &str) -> std::path::PathBuf {
     let deps_dir = std::env::current_exe().unwrap();
-    // target/debug/deps/<test-bin> -> target/debug/examples/<name>
+    // target/debug/deps/<test-bin> -> target/debug/examples/<name>, carrying
+    // the platform executable suffix (`.exe` on Windows, empty elsewhere).
     let debug_dir = deps_dir.parent().unwrap().parent().unwrap();
-    let path = debug_dir.join("examples").join(name);
+    let path = debug_dir
+        .join("examples")
+        .join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
     if path.exists() {
         return path;
     }
