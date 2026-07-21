@@ -361,10 +361,11 @@ mod facade_tests {
 
     #[test]
     fn loglevel_grammar_is_wired_to_the_facade() {
-        // End-to-end pin of the R7-5 probe: the flag-prefix grammar must be
-        // reachable through from_cli itself, anchored at the VALUE token —
-        // disconnecting -loglevel from its rule would fail here even if the
-        // rule's own unit tests stayed green.
+        // End-to-end pin of the -loglevel value-grammar wiring: the
+        // flag-prefix grammar must be reachable through from_cli itself,
+        // anchored at the VALUE token — disconnecting -loglevel from its
+        // rule would fail here even if the rule's own unit tests stayed
+        // green.
         let err = from_cli(
             "ffmpeg -hide_banner -loglevel banana+error -i in.mkv -c:v libx264 -crf 23 -preset fast -c:a aac -y out.mp4",
         )
