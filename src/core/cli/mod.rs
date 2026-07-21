@@ -325,6 +325,49 @@ mod facade_tests {
         }
     }
 
+    /// Fail-closed pin with LITERAL version pairs. `VERIFIED_PROFILES` is
+    /// deliberately not consulted: the test above derives its expectation
+    /// from the same table the gate reads, so a table edit that silently
+    /// widened the gate (say, adding an unproven 8.x row) would satisfy
+    /// both sides. FFmpeg 7.1 is the only verified line — libavcodec 61.19
+    /// / libavformat 61.7 — and those numbers are hardcoded here: on any
+    /// other linked pair, `from_cli_args` on a verified-shape command must
+    /// return the typed profile refusal before any I/O.
+    #[test]
+    fn non_71_linked_pair_fails_closed_by_literal_version() {
+        let pair = |v: u32| (v >> 16, (v >> 8) & 0xff);
+        let linked_is_71 = pair(unsafe { ffmpeg_sys_next::avcodec_version() }) == (61, 19)
+            && pair(unsafe { ffmpeg_sys_next::avformat_version() }) == (61, 7);
+        let args = [
+            "-i",
+            "no_such_fixture.mkv",
+            "-c:v",
+            "libx264",
+            "-crf",
+            "23",
+            "-preset",
+            "fast",
+            "-c:a",
+            "aac",
+            "-y",
+            "out.mp4",
+        ];
+        match from_cli_args(&args) {
+            Err(CliError::UnverifiedRuntimeProfile { .. }) => assert!(
+                !linked_is_71,
+                "profile refusal on the literal 7.1 pair (61.19/61.7)"
+            ),
+            Ok(_) => assert!(
+                linked_is_71,
+                "a non-7.1 linked pair must fail closed with UnverifiedRuntimeProfile"
+            ),
+            Err(other) => assert!(
+                linked_is_71,
+                "a non-7.1 linked pair must fail closed with UnverifiedRuntimeProfile, got: {other}"
+            ),
+        }
+    }
+
     #[test]
     fn unverified_shape_is_refused_at_run_but_emitted() {
         let args = ["-i", "in.mp4", "-c:v", "mpeg4", "-y", "out.avi"];

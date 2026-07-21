@@ -281,6 +281,10 @@ struct StreamSummary {
     height: i32,
     sample_rate: i32,
     channels: i32,
+    /// Container-declared stream bitrate (mp4: the esds average), 0 when
+    /// the demuxer does not know one. Only oracles with a bitrate-shaped
+    /// option under test read it.
+    bit_rate: i64,
 }
 
 fn summarize(path: &str) -> Vec<StreamSummary> {
@@ -300,11 +304,13 @@ fn summarize(path: &str) -> Vec<StreamSummary> {
                 height,
                 sample_rate: 0,
                 channels: 0,
+                bit_rate: 0,
             },
             StreamInfo::Audio {
                 codec_name,
                 sample_rate,
                 nb_channels,
+                bit_rate,
                 ..
             } => StreamSummary {
                 kind: "audio",
@@ -313,6 +319,7 @@ fn summarize(path: &str) -> Vec<StreamSummary> {
                 height: 0,
                 sample_rate,
                 channels: nb_channels,
+                bit_rate,
             },
             other => StreamSummary {
                 kind: "other",
@@ -321,6 +328,7 @@ fn summarize(path: &str) -> Vec<StreamSummary> {
                 height: 0,
                 sample_rate: 0,
                 channels: 0,
+                bit_rate: 0,
             },
         })
         .collect()
@@ -570,6 +578,41 @@ fn verified_shapes_pass_their_semantic_goldens() {
     }
 }
 
+/// Structural evidence that V1's -crf/-preset survive the pipeline: the
+/// lowered plan carries both as encoder options and the emitted program
+/// makes both builder calls. The preset has no cheap deterministic runtime
+/// observable (the x264 SEI encodes it only through version-dependent
+/// derived settings), so this pin is its coverage; crf additionally gets a
+/// discriminating runtime probe inside `oracle_transcode`. Runs ungated —
+/// parse, lower and emit are pure.
+#[test]
+fn v1_crf_preset_ride_the_lowered_plan_and_emission() {
+    let shape = VERIFIED_SHAPES
+        .iter()
+        .find(|shape| shape.id == "V1")
+        .unwrap();
+    let args: Vec<String> = shape.canonical_argv.iter().map(|s| s.to_string()).collect();
+    let ir = super::parse::parse(&args).unwrap();
+    let lowered = super::lower::lower(&ir);
+    assert_eq!(
+        lowered.output.video_codec_opts,
+        vec![
+            ("crf".to_string(), "23".to_string()),
+            ("preset".to_string(), "fast".to_string()),
+        ],
+        "the lowered plan must carry -crf and -preset as encoder options"
+    );
+    let code = super::emit_rust_code_from_args(shape.canonical_argv).unwrap();
+    assert!(
+        code.contains(".set_video_codec_opt(\"crf\", \"23\")"),
+        "emitted program lost the -crf call:\n{code}"
+    );
+    assert!(
+        code.contains(".set_video_codec_opt(\"preset\", \"fast\")"),
+        "emitted program lost the -preset call:\n{code}"
+    );
+}
+
 fn oracle_transcode(run: &GoldenRun) {
     let ours = summarize(&run.ours_output);
     assert_eq!(ours.len(), 2);
@@ -580,15 +623,57 @@ fn oracle_transcode(run: &GoldenRun) {
         Some(FIXTURE_TITLE),
         "the fixture title must be implicitly copied"
     );
+    // -crf runtime observability. libx264 stamps its resolved option string
+    // into an SEI of the first access unit, so `crf=NN.N` is readable off
+    // the output bytes. The canonical command's crf 23 equals the x264
+    // DEFAULT, so its marker alone proves only that the SEI methodology
+    // works on this build (asserted across all three lanes); the
+    // discriminating evidence is a second in-process run with the
+    // non-default crf 30 — had the -crf lowering vanished, x264 would fall
+    // back to its default and stamp crf=23.0 instead.
+    let sei_carries = |path: &str, marker: &[u8]| {
+        let bytes = std::fs::read(path).unwrap();
+        bytes.windows(marker.len()).any(|w| w == marker)
+    };
+    for (lane, path) in [
+        ("theirs", &run.theirs_output),
+        ("ours", &run.ours_output),
+        ("emitted", &run.emitted_output),
+    ] {
+        assert!(
+            sei_carries(path, b"crf=23.0"),
+            "V1 {lane}: x264 SEI does not carry the crf marker"
+        );
+    }
+    let probe_dir = tmp_dir("V1_crf_probe");
+    let probe_out = probe_dir.join("crf30.mp4").to_string_lossy().into_owned();
+    let fixture = fixture_for("V1");
+    let probe_args = [
+        "-i", &fixture, "-c:v", "libx264", "-crf", "30", "-preset", "fast", "-c:a", "aac",
+        "-y", &probe_out,
+    ];
+    let context = from_cli_args(&probe_args).expect("V1 crf probe must pass the gates");
+    run_context(context, "V1 crf probe");
+    assert!(
+        sei_carries(&probe_out, b"crf=30.0"),
+        "V1 crf probe: -crf 30 never reached the encoder"
+    );
+    assert!(
+        !sei_carries(&probe_out, b"crf=23.0"),
+        "V1 crf probe: encoder ran at the crf default despite -crf 30"
+    );
 }
 
 fn oracle_clip(run: &GoldenRun) {
-    // -ss 10 on a 16s fixture with -t 20: ~6s remain; both engines agreed
-    // (three-lane oracle), pin the absolute window too.
+    // -ss 10 on the 16s fixture leaves ~6s of tail; -t 4 must cut it to
+    // ~4s. The upper bound is the load-bearing edge: a command whose -t
+    // lowering silently vanished still yields a valid ~6s clip, and only
+    // this window catches that. Both engines agreed (three-lane oracle);
+    // pin the absolute window too.
     let duration = get_duration_us(&run.ours_output).unwrap();
     assert!(
-        (5_500_000..=6_500_000).contains(&duration),
-        "clip duration {duration}us outside the expected ~6s window"
+        (3_500_000..=4_500_000).contains(&duration),
+        "clip duration {duration}us outside the expected ~4s window"
     );
 }
 
@@ -602,6 +687,16 @@ fn oracle_audio_extract(run: &GoldenRun) {
         (ours[0].channels, ours[0].sample_rate),
         (1, 44100),
         "the DEFAULT-disposition bonus must select the mono track"
+    );
+    // -b:a 192k observability: on this input (the fixture's already
+    // AAC-quantized mono sine) the encoder cannot spend the full request —
+    // the esds average lands near 92k — while the NO-OPTION default
+    // configuration lands near 69k. The lower bound is what matters: a
+    // vanished -b:a lowering reproduces the default figure and fails it.
+    assert!(
+        (80_000..=210_000).contains(&ours[0].bit_rate),
+        "V3 audio bitrate {} outside the -b:a 192k window",
+        ours[0].bit_rate
     );
 
     // Fixture B (reference-CLI-built, forced dispositions): audio #0 STEREO

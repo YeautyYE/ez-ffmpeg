@@ -153,8 +153,12 @@ pub(crate) const VERIFIED_SHAPES: &[VerifiedShape] = &[
         oracle: GoldenOracle::Clip,
         pins: pins_v2,
         output_ext: "mp4",
+        // -t 4 is deliberately SHORTER than the golden fixture's remaining
+        // tail after -ss 10 (16s fixture -> ~6s left), so the duration
+        // oracle observes the -t lowering doing real work: dropping it
+        // yields a ~6s clip and fails the window.
         canonical_argv: &[
-            "-ss", "10", "-i", "in.mp4", "-t", "20", "-c:v", "libx264", "-crf", "23", "-c:a",
+            "-ss", "10", "-i", "in.mp4", "-t", "4", "-c:v", "libx264", "-crf", "23", "-c:a",
             "aac", "-y", "clip.mp4",
         ],
         emitted_example: "cli_emitted_clip",
