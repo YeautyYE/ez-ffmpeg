@@ -418,23 +418,15 @@ fn mux_task_start(
     mux_done: MuxDoneGuard,
 ) -> crate::error::Result<()> {
     let Some(queue_sender) = queue_sender else {
-        // A packet sink with zero streams has nothing to deliver and no
-        // file to create: fail typed (before the callbacks could ever fire)
-        // instead of running the streamless open below against a context
-        // that has no URL.
-        if packet_sink.is_some() {
-            let error = crate::error::Error::PacketSink(crate::error::PacketSinkError::NoStreams);
-            fail_mux_init(
-                &scheduler_status,
-                &scheduler_result,
-                MuxInitQueues::NONE,
-                guard,
-                slot_guard,
-                crate::error::Error::PacketSink(crate::error::PacketSinkError::NoStreams),
-                packet_sink,
-            );
-            return Err(error);
-        }
+        // No queue means no mapped stream (`Muxer::new_stream` creates the
+        // queue with the first stream). A packet sink cannot reach this task
+        // stream-less: build()'s `check_output_streams` already rejected it
+        // with the typed `PacketSinkError::NoStreams` before any scheduler
+        // thread spawned, so the streamless-open path below is container-only.
+        debug_assert!(
+            packet_sink.is_none(),
+            "zero-stream packet sink must fail typed at build()"
+        );
         // Zero-stream output (e.g. an AVFMT_NOSTREAMS muxer like ffmetadata): no mux
         // worker thread is spawned, so this branch — not `_mux_init` — is the only
         // place a file-backed streamless output gets opened. Open it here (deferred
@@ -552,7 +544,6 @@ fn mux_task_start(
     Ok(())
 }
 
-#[cfg_attr(not(feature = "cli"), allow(unused_variables))]
 fn _mux_init(
     mux_idx: usize,
     guard: MuxTeardownGuard,
@@ -561,7 +552,8 @@ fn _mux_init(
     recording_time_us: Option<i64>,
     stream_count: usize,
     format_opts: Option<HashMap<CString, CString>>,
-    strict_avoptions: bool,
+    // Consumed only by the cli-gated unconsumed-option check below.
+    #[cfg_attr(not(feature = "cli"), allow(unused_variables))] strict_avoptions: bool,
     bsf_chains: StreamBsfChains,
     packet_sink: Option<crate::core::packet_sink::PacketSink>,
     interrupt_state: Arc<crate::core::context::InterruptState>,
@@ -1398,7 +1390,18 @@ fn _mux_init(
                         trace!("Muxer returned EOF");
                         break;
                     } else if ret < 0 {
-                        error!("Error muxing a packet: stream_index={stream_index}, ret={ret}");
+                        // A sink delivery that bailed out because its channel
+                        // observed the job stopping records nothing and is
+                        // settled below as a clean stop, not a failure; keep
+                        // that exit quiet and every real error loud.
+                        if sink_worker
+                            .as_ref()
+                            .is_some_and(|sink| sink.cancelled_cleanly())
+                        {
+                            trace!("Sink delivery stopped cooperatively: stream_index={stream_index}");
+                        } else {
+                            error!("Error muxing a packet: stream_index={stream_index}, ret={ret}");
+                        }
                         break;
                     }
                 }

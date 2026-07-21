@@ -2,8 +2,9 @@
 //! WARN or ERROR logs (neither from ez-ffmpeg itself nor forwarded from FFmpeg).
 //!
 //! Scenarios mirror real-world "false error" reports: screenshot via
-//! max_frames=1, clip via recording_time, graceful stop(), abort(), and a
-//! plain full-EOF transcode as control.
+//! max_frames=1, clip via recording_time, graceful stop(), abort(), a
+//! packet-sink stop() with a full undrained channel, and a plain full-EOF
+//! transcode as control.
 
 use ez_ffmpeg::{FfmpegContext, Input, Output};
 use log::{Level, LevelFilter, Metadata, Record};
@@ -291,4 +292,50 @@ fn abort_emits_no_warn_or_error() {
     // releases its slot (the scheduler guard waits on drop); a worker that sees
     // the abort at its cleanup gate skips its flush/trailer.
     assert_no_noise("abort()");
+}
+
+#[test]
+fn sink_stop_with_full_channel_emits_no_warn_or_error() {
+    // x264 with zerolatency closes without queued frames, so a mid-stream
+    // stop is log-silent end to end; a delaying encoder (aac) would add its
+    // own benign "frames left in the queue on closing" notice and mask the
+    // signal this scenario guards.
+    if !ez_ffmpeg::codec::get_encoders()
+        .iter()
+        .any(|e| e.codec_name == "libx264")
+    {
+        eprintln!("skipping: libx264 not available in this FFmpeg build");
+        return;
+    }
+    init_logging();
+    let _guard = test_guard();
+    clear_recorded();
+
+    // Capacity-1 channel that is never drained: delivery parks in the
+    // cancellation-aware bounded send until stop() flips the status and the
+    // send bails out cooperatively. That exit settles as a clean stop, so it
+    // must not be logged as a muxing error either.
+    let (sink, receiver) =
+        ez_ffmpeg::packet_sink::PacketSink::channel(std::num::NonZeroUsize::new(1).unwrap());
+    let scheduler = FfmpegContext::builder()
+        .input(lavfi_input())
+        .output(
+            Output::from(sink)
+                .set_video_codec("libx264")
+                .set_video_codec_opt("preset", "ultrafast")
+                .set_video_codec_opt("tune", "zerolatency"),
+        )
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    // Give the pipeline time to fill the channel and park in the send.
+    std::thread::sleep(Duration::from_millis(500));
+    scheduler
+        .stop()
+        .expect("cooperative channel cancellation must stop cleanly");
+    drop(receiver);
+
+    assert_no_noise("packet-sink stop() with a full undrained channel");
 }

@@ -273,6 +273,10 @@ fn av_job_shares_one_time_origin() {
         "AAC must carry its AudioSpecificConfig"
     );
     assert_eq!(audio.sample_rate, 44100);
+    assert_eq!(
+        audio.channel_layout, "mono",
+        "the sine source is mono and the layout must reach the sink info"
+    );
     assert!(matches!(events.last(), Some(SinkEv::End { .. })));
 
     let packets = sink_packets(&log);
