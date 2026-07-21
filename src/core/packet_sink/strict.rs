@@ -956,11 +956,19 @@ mod tests {
         let info = &worker.infos[0];
         let avcc = info.extradata();
         assert_eq!(avcc[0], 1);
+        // avcC bytes 1..4 are SPS bytes 1..4 verbatim.
+        assert_eq!(&avcc[1..4], &SPS[1..4]);
         assert_eq!(avcc[4] & 0x03, 3, "4-byte NAL length prefixes");
         assert!(avcc[5] & 0x1F >= 1, "at least one SPS");
         let video = info.video().expect("typed video configuration");
         assert_eq!(video.codec_id(), AVCodecID::AV_CODEC_ID_H264);
-        assert!(video.codec_string().starts_with("avc1."));
+        // The typed header fields mirror the fixture SPS: profile_idc 66
+        // (Baseline), constraint flags 0xC0, level_idc 30 (level 3.0) —
+        // and the RFC 6381 string is their hex projection.
+        assert_eq!(video.profile(), 66);
+        assert_eq!(video.compatibility(), 0xC0);
+        assert_eq!(video.level(), 30);
+        assert_eq!(video.codec_string(), "avc1.42C01E");
         assert_eq!(video.frame_rate(), Some(AVRational { num: 25, den: 1 }));
         assert_eq!((video.width(), video.height()), (320, 240));
     }
