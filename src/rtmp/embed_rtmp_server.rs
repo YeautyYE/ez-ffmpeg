@@ -5,7 +5,8 @@ use crate::flv::flv_tag::FlvTag;
 use crate::rtmp::poller::{waker_pair, WakeHandle, Waker};
 use crate::rtmp::reactor::{
     effective_max_connections, PublisherFeed, PublisherRegistration, PublisherSource, Reactor,
-    StreamKeyClaim, CHANNEL_HEADROOM, PUBLISHER_CHANNEL_CAPACITY,
+    RegistrationHandoff, RegistrationKillSwitch, StreamKeyClaim, CHANNEL_HEADROOM,
+    PUBLISHER_CHANNEL_CAPACITY,
 };
 use bytes::{BufMut, Bytes};
 use log::{debug, error, info, warn};
@@ -41,8 +42,10 @@ pub struct EmbedRtmpServer<S> {
     // entirely.
     stream_keys: Arc<dashmap::DashSet<String>>,
     // Registrations for the reactor: key claim + publisher source (raw byte
-    // path or media-bypass feed)
-    publisher_sender: Option<crossbeam_channel::Sender<PublisherRegistration>>,
+    // path or media-bypass feed). Lock-shared with the worker rather than a
+    // channel, so the create paths' worker-liveness check and their enqueue
+    // form one critical section (see RegistrationHandoff).
+    registrations: Option<Arc<RegistrationHandoff>>,
     /// Producer-side wakeup for the reactor (PERF-3), set in `start()`.
     wake_handle: Option<WakeHandle>,
     gop_limit: usize,
@@ -61,7 +64,7 @@ impl<S: 'static> EmbedRtmpServer<S> {
             bound_addr: self.bound_addr,
             status: self.status,
             stream_keys: self.stream_keys,
-            publisher_sender: self.publisher_sender,
+            registrations: self.registrations,
             wake_handle: self.wake_handle,
             gop_limit: self.gop_limit,
             max_connections: self.max_connections,
@@ -149,7 +152,7 @@ impl EmbedRtmpServer<Initialization> {
             bound_addr: None,
             status: Arc::new(AtomicUsize::new(STATUS_INIT)),
             stream_keys: Default::default(),
-            publisher_sender: None,
+            registrations: None,
             wake_handle: None,
             gop_limit,
             max_connections: None,
@@ -203,8 +206,13 @@ impl EmbedRtmpServer<Initialization> {
         let effective_max = effective_max_connections(self.max_connections);
         let channel_capacity = effective_max.saturating_add(CHANNEL_HEADROOM);
         let (stream_sender, stream_receiver) = crossbeam_channel::bounded(channel_capacity);
-        let (publisher_sender, publisher_receiver) = crossbeam_channel::bounded(1024);
-        self.publisher_sender = Some(publisher_sender);
+        // Publisher registrations ride a lock-shared queue, not a channel:
+        // the worker-liveness check and the enqueue must share one critical
+        // section, and the worker's exit drain must be terminal (see
+        // RegistrationHandoff). The reactor picks registrations up on its
+        // normal loop turns (wake or poll timeout), as it did the channel.
+        let registrations = Arc::new(RegistrationHandoff::new());
+        self.registrations = Some(registrations.clone());
 
         // PERF-3: create the reactor wakeup pair. The Waker (read side) is moved
         // into the worker thread and registered with the poller; the WakeHandle
@@ -231,7 +239,7 @@ impl EmbedRtmpServer<Initialization> {
             .spawn(move || {
                 handle_connections(
                     stream_receiver,
-                    publisher_receiver,
+                    registrations,
                     stream_keys,
                     self.gop_limit,
                     max_connections,
@@ -619,29 +627,34 @@ impl EmbedRtmpServer<Running> {
     /// claim is a drop-releasing guard: whichever side ends up holding the
     /// registration when it dies releases the key, with no path releasing
     /// twice. Concretely:
-    /// - no publisher channel, or the send fails: the registration (returned
-    ///   inside the `SendError`) drops here, releasing the claim — the
-    ///   reactor never saw it, so nobody else could;
+    /// - no registration queue, or the enqueue is refused because the worker
+    ///   is gone: the registration drops here, releasing the claim — the
+    ///   refusal and a successful enqueue are the same critical section, so
+    ///   the reactor side can never have seen it;
     /// - the reactor consumes the registration: `add_publisher` either
     ///   disarms the claim into the accepted publisher's state (released
     ///   later by `remove_publisher`) or drops a refused one;
-    /// - the reactor stops, panics, or never drains the queue: the queued
-    ///   registration drops with the channel, releasing the claim.
+    /// - the worker dies — cleanly, by panic, or before the reactor even
+    ///   existed — with the registration still queued: the worker's
+    ///   `RegistrationKillSwitch` drains it, releasing the claim.
     fn register_publisher(
         &self,
         claim: StreamKeyClaim,
         source: PublisherSource,
     ) -> crate::error::Result<()> {
         let registration = PublisherRegistration { claim, source };
-        let publisher_sender = match self.publisher_sender.as_ref() {
-            Some(sender) => sender,
+        let registrations = match self.registrations.as_ref() {
+            Some(registrations) => registrations,
             None => {
-                error!("Publisher sender not initialized");
+                error!("Publisher registration queue not initialized");
                 return Err(RtmpCreateStream.into());
             }
         };
 
-        if publisher_sender.send(registration).is_err() {
+        if let Err(registration) = registrations.enqueue(registration) {
+            // The worker is gone and can never consume this registration:
+            // dropping it here releases its stream-key claim immediately.
+            drop(registration);
             if self.status.load(Ordering::Acquire) != STATUS_END {
                 warn!("Rtmp server worker already exited. Can't create stream sender.");
             } else {
@@ -731,13 +744,22 @@ fn contain_reactor_panic(status: &AtomicUsize, run_reactor: impl FnOnce()) {
 
 fn handle_connections(
     connection_receiver: crossbeam_channel::Receiver<TcpStream>,
-    publisher_receiver: crossbeam_channel::Receiver<PublisherRegistration>,
+    registrations: Arc<RegistrationHandoff>,
     stream_keys: Arc<dashmap::DashSet<String>>,
     gop_limit: usize,
     max_connections: Option<usize>,
     status: Arc<AtomicUsize>,
     waker: Option<Waker>,
 ) {
+    // FIRST statement of the worker, before the fallible reactor
+    // construction and before any log call: arm the kill switch. However
+    // this thread ends — `Reactor::new` failing, a user-installed logger
+    // panicking, `run()` unwinding, or a clean return — the switch's drop
+    // closes the registration intake and releases the key claims of every
+    // registration still queued. Declared before `reactor_slot` so it drops
+    // AFTER the reactor: the drain it performs is the worker's last word,
+    // with nothing left that could enqueue concurrently forever.
+    let kill_switch = RegistrationKillSwitch::arm(registrations);
     // The reactor is CREATED inside the contained closure so that a panicking
     // constructor also publishes `STATUS_END`, but STORED in this outer slot
     // so that on a contained panic it is dropped HERE, after the terminal
@@ -760,7 +782,7 @@ fn handle_connections(
         };
         reactor_slot
             .insert(reactor)
-            .run(connection_receiver, publisher_receiver, waker)
+            .run(connection_receiver, kill_switch.handoff(), waker)
     });
 
     if status.load(Ordering::Acquire) != STATUS_END {

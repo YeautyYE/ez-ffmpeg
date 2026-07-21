@@ -18,11 +18,11 @@ use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
 use rml_rtmp::messages::RtmpMessage;
 use rml_rtmp::rml_amf0::Amf0Value;
 use rml_rtmp::time::RtmpTimestamp;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read};
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 // ============================================================================
@@ -611,9 +611,9 @@ pub enum PublisherSource {
 ///
 /// [`claim`](Self::claim) inserts the key (insert-or-fail, so two concurrent
 /// claims cannot both win) and the guard releases it **exactly once**, on
-/// drop, wherever the value dies: a failed channel send, a scheduler refusal
+/// drop, wherever the value dies: a refused enqueue, a scheduler refusal
 /// in [`Reactor::add_publisher`], or a queued registration nobody ever
-/// received. [`into_key`](Self::into_key) disarms the guard instead —
+/// consumed. [`into_key`](Self::into_key) disarms the guard instead —
 /// the key stays claimed and releasing it becomes the job of whoever now
 /// stores it (the accepted publisher's state, released by
 /// [`Reactor::remove_publisher`]). Exactly one of `Drop`/`into_key` ever
@@ -668,37 +668,139 @@ impl Drop for StreamKeyClaim {
 
 /// A publisher registration in flight from the server's `register_publisher`
 /// to the reactor. It carries the key claim so a registration dropped
-/// anywhere short of [`Reactor::add_publisher`] taking ownership — a failed
-/// send, a reactor that stopped or panicked before draining the channel, the
-/// channel itself being torn down — releases the key automatically.
+/// anywhere short of [`Reactor::add_publisher`] taking ownership — refused
+/// at enqueue because the worker is gone, or still queued when the worker's
+/// [`RegistrationKillSwitch`] fires — releases the key automatically.
 pub(crate) struct PublisherRegistration {
     pub(crate) claim: StreamKeyClaim,
     pub(crate) source: PublisherSource,
 }
 
-/// Owns the reactor-side registration receiver and drains still-queued
-/// registrations when dropped, releasing their key claims.
-///
-/// Two reasons the explicit drain must exist even though each claim already
-/// releases itself on drop:
-/// - `run` checks the stop signal BEFORE draining registrations, so a
-///   registration racing a stop is enqueued but never consumed;
-/// - a bounded crossbeam channel frees its queued messages only when the
-///   LAST endpoint drops, and the server handle keeps a `Sender` alive
-///   arbitrarily long after the reactor thread is gone.
-///
-/// Draining in `Drop` (not at the end of `run`) also covers a panicking
-/// reactor: the unwind out of `run` drops this guard and the leftover claims
-/// release with the reactor, not with the last server handle.
-///
-/// A send racing this drain can still slip a registration in after the last
-/// `try_recv` saw the channel empty. That claim is not lost — it releases
-/// with the queued message when the channel's last endpoint drops.
-struct RegistrationDrain(crossbeam_channel::Receiver<PublisherRegistration>);
+/// The registration queue proper: the worker-liveness flag and the payload
+/// live behind ONE lock so no observer can see them disagree.
+pub(crate) struct RegistrationQueue {
+    /// `false` once the reactor worker has died. Flipped by
+    /// [`RegistrationKillSwitch`]'s drop under the same lock that guards
+    /// `queue`, so an enqueue either happens before the flip (and is drained
+    /// by the same critical section that flips it) or observes `false` and
+    /// is refused. There is no in-between.
+    alive: bool,
+    queue: VecDeque<PublisherRegistration>,
+}
 
-impl Drop for RegistrationDrain {
+/// Hands publisher registrations from the server's create paths to the
+/// reactor worker.
+///
+/// This is deliberately a lock-shared queue and not a channel. With a
+/// channel, "is the worker still there?" and "enqueue the payload" are two
+/// separate linearization points, which leaves structural gaps:
+/// - a send can land after the worker's last drain saw the queue empty, and
+///   a bounded crossbeam channel frees such a message only when its LAST
+///   endpoint drops — the server holds its sender endpoint for as long as
+///   the server value lives, so the message's stream-key claim would leak
+///   for that entire lifetime;
+/// - a drain loop that stops at `Empty` can be kept spinning by a steady
+///   producer, because nothing tells producers to stop.
+///
+/// Here [`enqueue`](Self::enqueue) checks liveness and pushes in one
+/// critical section, and the kill switch flips liveness and drains in one
+/// critical section, so every registration ends in exactly one of three
+/// hands — the reactor (via [`drain_into`](Self::drain_into)), the terminal
+/// kill-switch drain, or the refused caller — each of which releases the
+/// key claim by dropping the registration.
+pub(crate) struct RegistrationHandoff {
+    queue: Mutex<RegistrationQueue>,
+}
+
+impl RegistrationHandoff {
+    pub(crate) fn new() -> Self {
+        Self {
+            queue: Mutex::new(RegistrationQueue {
+                alive: true,
+                queue: VecDeque::new(),
+            }),
+        }
+    }
+
+    /// Lock the queue, riding over poisoning: the two fields carry no
+    /// cross-statement invariant a panic could tear (every critical section
+    /// is a flag test plus one queue edit), and the kill switch MUST finish
+    /// its terminal drain even if another holder panicked — the claims it
+    /// exists to release would otherwise leak.
+    fn lock(&self) -> MutexGuard<'_, RegistrationQueue> {
+        self.queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Enqueue a registration for the reactor, or hand it back if the worker
+    /// is gone. The liveness check and the push share one critical section,
+    /// so a registration accepted here is guaranteed visible to the drain
+    /// that runs when the worker dies — there is no window in which it can
+    /// be queued yet seen by nobody. The caller drops a refused
+    /// registration, releasing its key claim.
+    pub(crate) fn enqueue(
+        &self,
+        registration: PublisherRegistration,
+    ) -> Result<(), PublisherRegistration> {
+        let mut queue = self.lock();
+        if queue.alive {
+            queue.queue.push_back(registration);
+            Ok(())
+        } else {
+            Err(registration)
+        }
+    }
+
+    /// Move everything currently queued into `batch` under one lock. The
+    /// caller processes after this returns, off the lock, so enqueuers are
+    /// never blocked behind scheduler work.
+    fn drain_into(&self, batch: &mut Vec<PublisherRegistration>) {
+        batch.extend(self.lock().queue.drain(..));
+    }
+
+    /// Close the intake and take whatever is still queued, in one critical
+    /// section. After this returns no enqueue can succeed, so the returned
+    /// batch is the final one — a single bounded drain, no re-check loop for
+    /// producers to keep spinning.
+    fn kill(&self) -> VecDeque<PublisherRegistration> {
+        let mut queue = self.lock();
+        queue.alive = false;
+        std::mem::take(&mut queue.queue)
+    }
+}
+
+/// Worker-side guard for a [`RegistrationHandoff`]: dropping it — on normal
+/// exit and unwind alike — closes the registration intake and releases the
+/// key claim of everything still queued.
+///
+/// The worker must arm this as its very first statement, before the fallible
+/// reactor construction and before any log call (a user-installed logger can
+/// panic). From that point, however the worker dies, this drop runs, so no
+/// registration can outlive the worker inside the queue.
+pub(crate) struct RegistrationKillSwitch {
+    handoff: Arc<RegistrationHandoff>,
+}
+
+impl RegistrationKillSwitch {
+    pub(crate) fn arm(handoff: Arc<RegistrationHandoff>) -> Self {
+        Self { handoff }
+    }
+
+    /// The reactor's consume side borrows the handoff through the switch,
+    /// tying the consumer's lifetime to the guard that cleans up after it.
+    pub(crate) fn handoff(&self) -> &RegistrationHandoff {
+        &self.handoff
+    }
+}
+
+impl Drop for RegistrationKillSwitch {
     fn drop(&mut self) {
-        while self.0.try_recv().is_ok() {}
+        // Take the leftovers inside the critical section, drop them outside
+        // it: releasing a claim writes to the shared stream-key set, and no
+        // foreign Drop code should ever run under the queue lock.
+        let leftovers = self.handoff.kill();
+        drop(leftovers);
     }
 }
 
@@ -1677,18 +1779,10 @@ impl Reactor {
     pub fn run(
         &mut self,
         connection_receiver: crossbeam_channel::Receiver<TcpStream>,
-        publisher_receiver: crossbeam_channel::Receiver<PublisherRegistration>,
+        registrations: &RegistrationHandoff,
         waker: Option<Waker>,
     ) {
         info!("Reactor started");
-
-        // Hold the registration receiver in a drop-guard that drains
-        // leftovers when run() exits — by stop signal or by unwind. The stop
-        // check below runs BEFORE the registration drain, so a registration
-        // enqueued while the reactor is going down is never consumed; its
-        // queued claim would otherwise stay held until the last server
-        // handle drops its Sender (see RegistrationDrain).
-        let publisher_receiver = RegistrationDrain(publisher_receiver);
 
         // Register the wakeup handle. If it is absent (waker_pair() failed) or
         // registration fails, the reactor still works via the POLL_TIMEOUT_MS
@@ -1716,6 +1810,13 @@ impl Reactor {
         // it instead of allocating a fresh Vec every iteration.
         let mut events = Vec::new();
 
+        // Registration batch reused across iterations for the same reason.
+        // Registrations are moved out of the shared queue under its lock and
+        // processed here off the lock; leftovers queued when this loop exits
+        // are released by the worker's RegistrationKillSwitch, one level
+        // above — which also covers the case where this loop never ran.
+        let mut registration_batch: Vec<PublisherRegistration> = Vec::new();
+
         loop {
             // 1. Check stop signal
             if self.status.load(Ordering::Acquire) == STATUS_END {
@@ -1735,9 +1836,11 @@ impl Reactor {
                 }
             }
 
-            // 3. Non-blocking receive new publishers
+            // 3. Take the queued publisher registrations (one lock), then
+            // process them off the lock.
             let mut new_publisher_added = false;
-            while let Ok(registration) = publisher_receiver.0.try_recv() {
+            registrations.drain_into(&mut registration_batch);
+            for registration in registration_batch.drain(..) {
                 if self.add_publisher(registration).is_some() {
                     new_publisher_added = true;
                 }
@@ -2908,8 +3011,8 @@ mod tests {
 
     // A registration enqueued while the reactor is stopping is never
     // consumed — run() checks the stop flag before draining registrations.
-    // Its queued claim must not outlive the reactor: the key must be
-    // claimable again even though the server side still holds the Sender.
+    // Its queued claim must not outlive the worker: the key must be
+    // claimable again even though the server side still holds the handoff.
     #[test]
     fn reactor_stop_releases_enqueued_but_unconsumed_key_claims() {
         let stream_keys = Arc::new(dashmap::DashSet::new());
@@ -2919,25 +3022,31 @@ mod tests {
 
         let (_connection_sender, connection_receiver) =
             crossbeam_channel::bounded::<TcpStream>(1);
-        let (publisher_sender, publisher_receiver) = crossbeam_channel::bounded(4);
+        let registrations = Arc::new(RegistrationHandoff::new());
+        let kill_switch = RegistrationKillSwitch::arm(registrations.clone());
 
         // Enqueue a registration, then signal stop so run() exits on its
-        // first stop-flag check without ever draining the channel.
+        // first stop-flag check without ever draining the queue.
         let (_feed_tx, feed_rx) = crossbeam_channel::bounded::<PublisherFeed>(1);
         let claim = StreamKeyClaim::claim(stream_keys.clone(), "orphan".to_string())
             .expect("first claim must win");
-        publisher_sender
-            .send(PublisherRegistration {
+        registrations
+            .enqueue(PublisherRegistration {
                 claim,
                 source: PublisherSource::Feed(feed_rx),
             })
-            .expect("send on a live channel");
+            .unwrap_or_else(|_| panic!("enqueue while the worker lives"));
         status.store(STATUS_END, Ordering::Release);
 
-        reactor.run(connection_receiver, publisher_receiver, None);
+        reactor.run(connection_receiver, kill_switch.handoff(), None);
 
-        // The Sender is still alive, so only run()'s exit drain can have
-        // released the claim — channel teardown never happened.
+        // Tear the worker down in its real order: reactor first, then the
+        // kill switch fires the terminal drain.
+        drop(reactor);
+        drop(kill_switch);
+
+        // The server-side handle is still alive, so only the worker's exit
+        // drain can have released the claim.
         assert!(
             !stream_keys.contains("orphan"),
             "a stopped reactor must release queued, never-consumed key claims"
@@ -2946,7 +3055,104 @@ mod tests {
             StreamKeyClaim::claim(stream_keys.clone(), "orphan".to_string()).is_ok(),
             "the key must be claimable again after the reactor stopped"
         );
-        drop(publisher_sender);
+        drop(registrations);
+    }
+
+    // The worker can die BEFORE run() ever executes — Reactor::new failing
+    // is enough — and the create paths keep their handle to the handoff for
+    // as long as the server value lives. The kill switch is armed before the
+    // reactor is constructed, so even that early death must release queued
+    // claims (this leaked for the server's lifetime when the payload rode a
+    // channel: the queued message stayed alive with the server's endpoint).
+    #[test]
+    fn worker_death_before_reactor_construction_releases_queued_key_claims() {
+        let stream_keys: Arc<dashmap::DashSet<String>> = Arc::new(dashmap::DashSet::new());
+        let registrations = Arc::new(RegistrationHandoff::new());
+
+        // The worker arms the switch before anything fallible.
+        let kill_switch = RegistrationKillSwitch::arm(registrations.clone());
+
+        let (_feed_tx, feed_rx) = crossbeam_channel::bounded::<PublisherFeed>(1);
+        let claim = StreamKeyClaim::claim(stream_keys.clone(), "orphan".to_string())
+            .expect("first claim must win");
+        registrations
+            .enqueue(PublisherRegistration {
+                claim,
+                source: PublisherSource::Feed(feed_rx),
+            })
+            .unwrap_or_else(|_| panic!("enqueue while the worker lives"));
+
+        // Reactor::new failed: the worker dies without ever running the
+        // reactor, and only the switch's drop stands between the queued
+        // claim and a server-lifetime leak.
+        drop(kill_switch);
+
+        // The server still holds its handle, so only the worker-side drain
+        // can have released the claim.
+        assert!(
+            !stream_keys.contains("orphan"),
+            "a worker that died before constructing the reactor must release queued key claims"
+        );
+
+        // The same drop also closed the intake, under the same lock that
+        // drained the queue: a late create is refused in its own enqueue
+        // critical section — it can never park a claim in a queue nobody
+        // will ever drain again — and dropping the refusal releases its
+        // claim immediately.
+        let (_late_tx, late_rx) = crossbeam_channel::bounded::<PublisherFeed>(1);
+        let late_claim = StreamKeyClaim::claim(stream_keys.clone(), "late".to_string())
+            .expect("claim after worker death");
+        let refused = registrations.enqueue(PublisherRegistration {
+            claim: late_claim,
+            source: PublisherSource::Feed(late_rx),
+        });
+        assert!(
+            refused.is_err(),
+            "the registration intake must be closed once the worker died"
+        );
+        drop(refused);
+        assert!(
+            !stream_keys.contains("late"),
+            "a refused registration must release its key claim immediately"
+        );
+    }
+
+    // drain_into moves ownership: the batch holds the registrations (claims
+    // still armed) and the queue is left empty, so a registration is
+    // consumed exactly once and released exactly once.
+    #[test]
+    fn drain_into_hands_queued_registrations_to_the_consumer_exactly_once() {
+        let stream_keys: Arc<dashmap::DashSet<String>> = Arc::new(dashmap::DashSet::new());
+        let registrations = RegistrationHandoff::new();
+
+        for key in ["a", "b"] {
+            let (_feed_tx, feed_rx) = crossbeam_channel::bounded::<PublisherFeed>(1);
+            let claim = StreamKeyClaim::claim(stream_keys.clone(), key.to_string())
+                .expect("first claim must win");
+            registrations
+                .enqueue(PublisherRegistration {
+                    claim,
+                    source: PublisherSource::Feed(feed_rx),
+                })
+                .unwrap_or_else(|_| panic!("enqueue while alive"));
+        }
+
+        let mut batch = Vec::new();
+        registrations.drain_into(&mut batch);
+        assert_eq!(batch.len(), 2, "one drain takes everything queued");
+        assert!(
+            stream_keys.contains("a") && stream_keys.contains("b"),
+            "drained registrations still hold their claims"
+        );
+
+        registrations.drain_into(&mut batch);
+        assert_eq!(batch.len(), 2, "the queue must be empty after a drain");
+
+        drop(batch);
+        assert!(
+            !stream_keys.contains("a") && !stream_keys.contains("b"),
+            "dropping the batch must release the claims exactly once"
+        );
     }
 
     // H8.c: a server-initiated close must first try to flush what was queued
