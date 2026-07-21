@@ -131,6 +131,7 @@
 
 pub use crate::error::PacketSinkError;
 use crate::core::scheduler::ffmpeg_scheduler::{is_stopping, FfmpegScheduler, Running};
+use crate::core::scheduler::owned_run_iter::OwnedRunIter;
 use ffmpeg_sys_next::{AVCodecID, AVMediaType, AVRational};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1203,9 +1204,7 @@ impl PacketSinkReceiver {
     /// a worker parked in the channel send), then aborts the job.
     pub fn into_events(self, scheduler: FfmpegScheduler<Running>) -> PacketEventIter {
         PacketEventIter {
-            rx: Some(self.inner),
-            scheduler: Some(scheduler),
-            terminated: false,
+            inner: OwnedRunIter::new(self.inner, scheduler, std::convert::identity),
         }
     }
 }
@@ -1213,61 +1212,18 @@ impl PacketSinkReceiver {
 /// An owned-run iterator over [`PacketSinkEvent`]s; see
 /// [`PacketSinkReceiver::into_events`].
 pub struct PacketEventIter {
-    rx: Option<crossbeam_channel::Receiver<PacketSinkEvent>>,
-    scheduler: Option<FfmpegScheduler<Running>>,
-    terminated: bool,
-}
-
-impl PacketEventIter {
-    /// Joins the scheduler exactly once and maps its result to at most one
-    /// terminal error. Called when the channel disconnects.
-    fn finish(&mut self) -> Option<Result<PacketSinkEvent, crate::error::Error>> {
-        self.terminated = true;
-        // Drop the receiver before joining so a parked sender is released.
-        self.rx = None;
-        match self.scheduler.take() {
-            Some(scheduler) => match scheduler.wait() {
-                Ok(()) => None,
-                Err(e) => Some(Err(e)),
-            },
-            None => None,
-        }
-    }
+    inner: OwnedRunIter<PacketSinkEvent>,
 }
 
 impl Iterator for PacketEventIter {
     type Item = Result<PacketSinkEvent, crate::error::Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.terminated {
-            return None;
-        }
-        let recv = match self.rx.as_ref() {
-            Some(rx) => rx.recv(),
-            None => return self.finish(),
-        };
-        match recv {
-            Ok(event) => Some(Ok(event)),
-            // Channel closed: the pipeline finished or died. Join once.
-            Err(_) => self.finish(),
-        }
+        self.inner.next()
     }
 }
 
 impl std::iter::FusedIterator for PacketEventIter {}
-
-impl Drop for PacketEventIter {
-    fn drop(&mut self) {
-        // Drop the receiver FIRST (unblocks a worker parked in the channel
-        // send), THEN abort the scheduler (which joins the workers). Reversed
-        // order can deadlock: the worker only observes the abort between
-        // callbacks, but it is blocked inside one.
-        self.rx = None;
-        if let Some(scheduler) = self.scheduler.take() {
-            scheduler.abort();
-        }
-    }
-}
 
 /// Explicit muxing policy a packet-sink output pins for encoder setup.
 ///
