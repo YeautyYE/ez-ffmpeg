@@ -91,7 +91,8 @@ mod tests {
     fn video_keyframe_excludes_config_and_end_of_sequence() {
         assert!(tag(0x09, &[0x17, 0x01]).is_video_keyframe());
         // AVCPacketType 0x00 (sequence header) and 0x02 (end-of-sequence)
-        // are keyframe frame-types but not decodable IDR frames.
+        // carry the keyframe frame-type but are not NALU packets (0x01),
+        // i.e. not picture data.
         assert!(!tag(0x09, &[0x17, 0x00]).is_video_keyframe());
         assert!(!tag(0x09, &[0x17, 0x02]).is_video_keyframe());
     }
