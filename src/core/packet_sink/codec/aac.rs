@@ -21,14 +21,20 @@ impl AacRuntime {
     /// (ISO/IEC 14496-3 §1.6.2.1) is parsed with a bounds-checked bit
     /// reader: audioObjectType (5 bits, escape value 31 followed by 6
     /// extension bits), samplingFrequencyIndex (4 bits, index 15 followed
-    /// by a 24-bit explicit frequency), channelConfiguration (4 bits), and
-    /// for the SBR/PS signaled types (AOT 5 and 29) the full direct
-    /// extension block: extensionSamplingFrequencyIndex (with its own
-    /// index-15 case), the second GetAudioObjectType, and — when that
-    /// secondary type is ER BSAC (22) — the extensionChannelConfiguration.
-    /// Reserved sampling-frequency indexes (13/14) and channel
-    /// configuration 15 are rejected. Truncation inside any field is a
-    /// typed error — zero bits are never silently substituted.
+    /// by a 24-bit explicit frequency), channelConfiguration (4 bits), for
+    /// the SBR/PS signaled types (AOT 5 and 29) the full direct extension
+    /// block — extensionSamplingFrequencyIndex (with its own index-15
+    /// case), the second GetAudioObjectType, and, when that secondary type
+    /// is ER BSAC (22), the extensionChannelConfiguration — and, when the
+    /// object type left standing is a General Audio type, the fixed
+    /// GASpecificConfig head: frameLengthFlag, dependsOnCoreCoder (with
+    /// its 14-bit coreCoderDelay when set), and extensionFlag. Reserved
+    /// sampling-frequency indexes (13/14) are rejected, and so are channel
+    /// configurations 0 (the layout then lives in a program_config_element
+    /// this parser does not read — consumers need explicit channels) and
+    /// 15 (outside the channel table; the extension field likewise).
+    /// Truncation inside any field is a typed error — zero bits are never
+    /// silently substituted.
     pub(crate) fn from_extradata(
         extradata: &[u8],
         stream_index: usize,
@@ -146,16 +152,44 @@ fn read_sampling_frequency(
     Ok(())
 }
 
+/// The object types whose configuration payload is GASpecificConfig
+/// (the General Audio branch of the ISO/IEC 14496-3 §1.6.2.1 switch):
+/// AAC main/LC/SSR/LTP, Scalable, TwinVQ, and the ER variants ER AAC
+/// LC/LTP/Scalable, ER TwinVQ, ER BSAC, and ER AAC LD.
+fn is_ga_object_type(aot: u32) -> bool {
+    matches!(aot, 1..=4 | 6 | 7 | 17 | 19..=23)
+}
+
+/// Validates the fixed head of GASpecificConfig (ISO/IEC 14496-3 §4.4.1):
+/// frameLengthFlag (1 bit), dependsOnCoreCoder (1 bit) — when set, the
+/// 14-bit coreCoderDelay — and extensionFlag (1 bit). Fields beyond
+/// extensionFlag (layerNr, the extension payloads) are not validated.
+fn read_ga_specific_config_prefix(bits: &mut AscBits<'_>) -> Result<(), String> {
+    bits.read(1, "frameLengthFlag")?;
+    if bits.read(1, "dependsOnCoreCoder")? == 1 {
+        bits.read(14, "coreCoderDelay")?;
+    }
+    bits.read(1, "extensionFlag")?;
+    Ok(())
+}
+
 /// Parses the required AudioSpecificConfig prefix and returns the audio
 /// object type — mirroring `ff_mpeg4audio_get_config_gb` (FFmpeg
 /// libavcodec/mpeg4audio.c) through the direct-SBR/PS extension block:
 /// audioObjectType, samplingFrequencyIndex (with the index-15 explicit
-/// case), channelConfiguration (15 is outside the ISO channel table and
-/// rejected), and for AOT 5/29 the extensionSamplingFrequencyIndex plus a
-/// SECOND GetAudioObjectType, whose value 22 (ER BSAC) is followed by the
-/// extensionChannelConfiguration. AOT 29 honors the W6132 Annex MP3onMP4
-/// look-ahead: when the next 3 bits have a low bit set and the following
-/// 6 are zero, the extension block is absent.
+/// case), channelConfiguration, and for AOT 5/29 the
+/// extensionSamplingFrequencyIndex plus a SECOND GetAudioObjectType,
+/// whose value 22 (ER BSAC) is followed by the
+/// extensionChannelConfiguration. Channel configuration 0 is rejected:
+/// the layout then lives in a program_config_element inside the codec
+/// payload, which this parser does not read, and downstream consumers
+/// need explicit channels. Channel configuration 15 is outside the ISO
+/// channel table and rejected for the primary and extension fields
+/// alike. When the object type left standing — the secondary one when
+/// the extension block was parsed — is a General Audio type, the
+/// GASpecificConfig head is validated too. AOT 29 honors the W6132 Annex
+/// MP3onMP4 look-ahead: when the next 3 bits have a low bit set and the
+/// following 6 are zero, the extension block is absent.
 fn parse_required_asc_prefix(asc: &[u8]) -> Result<u32, String> {
     let mut bits = AscBits::new(asc);
     let aot = read_object_type(&mut bits, "audioObjectType", "audioObjectTypeExt")?;
@@ -164,6 +198,13 @@ fn parse_required_asc_prefix(asc: &[u8]) -> Result<u32, String> {
     }
     read_sampling_frequency(&mut bits, "samplingFrequencyIndex", "explicit samplingFrequency")?;
     let channel_config = bits.read(4, "channelConfiguration")?;
+    if channel_config == 0 {
+        return Err(
+            "channelConfiguration 0 defers the layout to a program_config_element, \
+             which this parser does not read"
+                .to_string(),
+        );
+    }
     if channel_config == 15 {
         return Err("channelConfiguration 15 is outside the channel table".to_string());
     }
@@ -173,6 +214,7 @@ fn parse_required_asc_prefix(asc: &[u8]) -> Result<u32, String> {
         29 => !(bits.peek(3) & 0x03 != 0 && bits.peek(9) & 0x3F == 0),
         _ => false,
     };
+    let mut base_object_type = aot;
     if parse_extension {
         read_sampling_frequency(
             &mut bits,
@@ -188,8 +230,17 @@ fn parse_required_asc_prefix(asc: &[u8]) -> Result<u32, String> {
             return Err("extension audioObjectType is the null object type".to_string());
         }
         if secondary == 22 {
-            bits.read(4, "extensionChannelConfiguration")?;
+            let extension_channel_config = bits.read(4, "extensionChannelConfiguration")?;
+            if extension_channel_config == 15 {
+                return Err(
+                    "extensionChannelConfiguration 15 is outside the channel table".to_string(),
+                );
+            }
         }
+        base_object_type = secondary;
+    }
+    if is_ga_object_type(base_object_type) {
+        read_ga_specific_config_prefix(&mut bits)?;
     }
     Ok(aot)
 }
@@ -200,21 +251,29 @@ mod tests {
 
     #[test]
     fn codec_string_reads_the_audio_object_type() {
-        // AAC-LC: AOT 2, 44.1 kHz (index 4), stereo -> 0x12 0x10 (13 required
-        // bits fit in two bytes).
+        // AAC-LC: AOT 2, 44.1 kHz (index 4), stereo -> 0x12 0x10. The
+        // all-zero GASpecificConfig head (frameLengthFlag,
+        // dependsOnCoreCoder, extensionFlag) lands the 16 required bits
+        // exactly on the two-byte boundary.
         let runtime = AacRuntime::from_extradata(&[0x12, 0x10], 0).unwrap();
         assert_eq!(runtime.codec_string(), "mp4a.40.2");
+        // The same configuration with dependsOnCoreCoder set: the 14-bit
+        // coreCoderDelay pushes extensionFlag to bit 29, four bytes.
+        let runtime = AacRuntime::from_extradata(&[0x12, 0x12, 0x00, 0x00], 0).unwrap();
+        assert_eq!(runtime.codec_string(), "mp4a.40.2");
         // HE-AAC (SBR): AOT 5, 48 kHz (index 3), stereo, extension index 8,
-        // secondary object type AAC-LC (2) — 22 required bits, three bytes.
-        let runtime = AacRuntime::from_extradata(&[0x29, 0x94, 0x08], 0).unwrap();
+        // secondary object type AAC-LC (2) plus its GASpecificConfig head
+        // — 25 required bits, four bytes.
+        let runtime = AacRuntime::from_extradata(&[0x29, 0x94, 0x08, 0x00], 0).unwrap();
         assert_eq!(runtime.codec_string(), "mp4a.40.5");
         // Direct SBR with secondary ER BSAC (22): the
-        // extensionChannelConfiguration (1) completes the prefix — 26
-        // required bits, four bytes.
+        // extensionChannelConfiguration (1) and the BSAC GASpecificConfig
+        // head complete the prefix — 29 required bits, four bytes.
         let runtime = AacRuntime::from_extradata(&[0x29, 0x94, 0x58, 0x40], 0).unwrap();
         assert_eq!(runtime.codec_string(), "mp4a.40.5");
         // AOT 29 tripping the W6132 MP3onMP4 look-ahead: no extension block
-        // follows, so 13 bits suffice.
+        // follows (and 29 is not a General Audio type, so no
+        // GASpecificConfig either) — 13 bits suffice.
         let runtime = AacRuntime::from_extradata(&[0xEA, 0x0A, 0x00], 0).unwrap();
         assert_eq!(runtime.codec_string(), "mp4a.40.29");
         // The MINIMAL two-byte form pins the look-ahead's zero-padding at
@@ -225,7 +284,8 @@ mod tests {
         assert_eq!(runtime.codec_string(), "mp4a.40.29");
         // Escape AOT: 31 escape + 6-bit extension 2 => AOT 34; with the
         // frequency index (4) and channel configuration (1) that is 19
-        // required bits, three bytes.
+        // required bits, three bytes (escaped types are 32+, never in the
+        // General Audio branch).
         let runtime = AacRuntime::from_extradata(&[0xF8, 0x48, 0x20], 0).unwrap();
         assert_eq!(runtime.codec_string(), "mp4a.40.34");
     }
@@ -233,7 +293,7 @@ mod tests {
     #[test]
     fn per_field_truncation_is_rejected_typed() {
         // (fixture, the field the truncation lands in)
-        let cases: [(&[u8], &str); 8] = [
+        let cases: [(&[u8], &str); 11] = [
             (&[], "audioObjectType"),
             // AOT 2 + 3 bits of the frequency index.
             (&[0x12], "samplingFrequencyIndex"),
@@ -257,6 +317,23 @@ mod tests {
             // Secondary ER BSAC (22) demands the extension channel
             // configuration: 24 bits present, 26 required.
             (&[0x29, 0x94, 0x58], "extensionChannelConfiguration"),
+            // The GASpecificConfig head starts at a bit offset that is 5,
+            // 6, or 2 (mod 8) — 13/37 for a plain GA type, 22/46/70 behind
+            // an SBR secondary, 26/50/74 behind an ER BSAC secondary — so
+            // a byte-aligned buffer can never end exactly AT
+            // frameLengthFlag or dependsOnCoreCoder; the head's truncation
+            // coverage lives in coreCoderDelay and extensionFlag.
+            //
+            // AAC-LC with dependsOnCoreCoder set: the 14-bit coreCoderDelay
+            // needs bits 15-28, only bit 15 exists.
+            (&[0x12, 0x12], "coreCoderDelay"),
+            // SBR secondary AAC-LC (offset 22, the mod-8 = 6 path): the
+            // head's first two flags are bits 22/23 and dependsOnCoreCoder
+            // is clear, so extensionFlag is bit 24 — one past three bytes.
+            (&[0x29, 0x94, 0x08], "extensionFlag"),
+            // The same secondary with dependsOnCoreCoder SET: the delay
+            // spans bits 24-37, eight of its fourteen bits exist.
+            (&[0x29, 0x94, 0x09, 0x00], "coreCoderDelay"),
         ];
         for (bad, field) in cases {
             match AacRuntime::from_extradata(bad, 3) {
@@ -314,6 +391,31 @@ mod tests {
         match AacRuntime::from_extradata(&[0x12, 0x78], 3) {
             Err(PacketSinkError::InvalidExtradata { reason, .. }) => {
                 assert!(reason.contains("channelConfiguration 15"), "got {reason:?}");
+            }
+            Err(other) => panic!("expected InvalidExtradata, got {other:?}"),
+            Ok(_) => panic!("expected InvalidExtradata, got a valid runtime"),
+        }
+        // channelConfiguration 0 parks the layout in a
+        // program_config_element this parser cannot reach.
+        match AacRuntime::from_extradata(&[0x12, 0x00], 3) {
+            Err(PacketSinkError::InvalidExtradata { reason, .. }) => {
+                assert!(
+                    reason.contains("channelConfiguration 0")
+                        && reason.contains("program_config_element"),
+                    "got {reason:?}"
+                );
+            }
+            Err(other) => panic!("expected InvalidExtradata, got {other:?}"),
+            Ok(_) => panic!("expected InvalidExtradata, got a valid runtime"),
+        }
+        // The out-of-table rule applies to the ER BSAC extension channel
+        // configuration too: AOT 5, secondary 22, extension field 15.
+        match AacRuntime::from_extradata(&[0x29, 0x94, 0x5B, 0xC0], 3) {
+            Err(PacketSinkError::InvalidExtradata { reason, .. }) => {
+                assert!(
+                    reason.contains("extensionChannelConfiguration 15"),
+                    "got {reason:?}"
+                );
             }
             Err(other) => panic!("expected InvalidExtradata, got {other:?}"),
             Ok(_) => panic!("expected InvalidExtradata, got a valid runtime"),
