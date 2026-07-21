@@ -9,13 +9,14 @@
 //! command must produce a program that type-checks.
 //!
 //! Type-checking is real: the generated source is compiled with
-//! `rustc --emit=metadata` against the newest `libez_ffmpeg` rlib in this
-//! test binary's own deps directory — the single authority, required to
-//! accept; no other coexisting rlib is consulted (no linking, so no
-//! native-library setup is needed).
+//! `rustc --emit=metadata` against the exact `libez_ffmpeg` rlib this test
+//! binary was linked with, resolved through cargo's fingerprint records —
+//! the single authority, required to accept; no other coexisting rlib is
+//! consulted (no linking, so no native-library setup is needed).
 
 #![cfg(feature = "cli")]
 
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn scratch_dir() -> std::path::PathBuf {
@@ -24,47 +25,166 @@ fn scratch_dir() -> std::path::PathBuf {
     dir
 }
 
-/// Locates this build's deps directory (where the test binary itself lives)
-/// and every `libez_ffmpeg-*.rlib` inside it, newest modification first.
-fn deps_and_rlibs() -> (std::path::PathBuf, Vec<std::path::PathBuf>) {
-    let exe = std::env::current_exe().unwrap();
-    let deps = exe.parent().unwrap().to_path_buf();
-    let mut rlibs: Vec<(std::time::SystemTime, std::path::PathBuf)> = std::fs::read_dir(&deps)
-        .unwrap()
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with("libez_ffmpeg-") && name.ends_with(".rlib") {
-                Some((entry.metadata().ok()?.modified().ok()?, entry.path()))
-            } else {
-                None
-            }
+/// Name of the lib dependency as cargo records it in fingerprint data (the
+/// `ez-ffmpeg` package builds a lib target named `ez_ffmpeg`).
+const LIB_DEP_NAME: &str = "ez_ffmpeg";
+
+/// Pulls the `ez_ffmpeg` dependency's fingerprint hash out of a unit
+/// fingerprint JSON. Entries in the `deps` array have the shape
+/// `[<pkg-id-hash>, "<dep name>", <bool>, <fingerprint-hash>]`, and the one
+/// named `ez_ffmpeg` is the lib this unit was built against. The scan is
+/// textual to keep the test dependency-free; any shape drift fails loudly
+/// instead of guessing.
+fn lib_dep_fingerprint(json: &str, source: &Path) -> u64 {
+    let marker = format!("\"{LIB_DEP_NAME}\",");
+    let mut hashes: Vec<u64> = json
+        .match_indices(&marker)
+        .filter_map(|(idx, _)| {
+            let entry = &json[idx + marker.len()..];
+            let entry = &entry[..entry.find(']')?];
+            entry.rsplit(',').next()?.trim().parse::<u64>().ok()
         })
         .collect();
-    rlibs.sort_by(|a, b| b.0.cmp(&a.0));
-    assert!(
-        !rlibs.is_empty(),
-        "no libez_ffmpeg rlib in {deps:?}; integration tests build the lib as a dependency"
-    );
-    (deps, rlibs.into_iter().map(|(_, path)| path).collect())
+    hashes.sort_unstable();
+    hashes.dedup();
+    match hashes[..] {
+        [fp] => fp,
+        [] => panic!(
+            "no `{LIB_DEP_NAME}` dep entry with a fingerprint hash in {}; cargo's fingerprint \
+             JSON may have changed shape — the rlib this test binary links cannot be identified",
+            source.display()
+        ),
+        _ => panic!(
+            "several distinct `{LIB_DEP_NAME}` dep fingerprints in {}: {hashes:?}; refusing to \
+             pick one",
+            source.display()
+        ),
+    }
 }
 
-/// Type-checks a generated program against the NEWEST `libez_ffmpeg` rlib —
-/// and ONLY that one. Multiple rlibs coexist in deps (feature variants,
-/// artifacts surviving toolchain updates), and any walk that keeps trying
-/// candidates until one accepts is a false-pass channel: a program the
-/// current crate rejects could still find one stale artifact that accepts
-/// it. So the newest rlib must accept outright; every failure — a genuine
-/// type error, but also an unusable artifact (metadata incompatibility
-/// after a toolchain change) — fails the test, and the message lists the
-/// coexisting rlibs so a stale-toolchain failure is recognizable and
-/// fixable (`cargo clean`) instead of silently routed around.
+/// Resolves the deps directory, the exact `libez_ffmpeg-<hash>.rlib` this
+/// test binary was linked against, and every other coexisting rlib (those
+/// feed diagnostics only — they are never consulted).
+///
+/// Identity, not recency: several `libez_ffmpeg-*.rlib` builds coexist in
+/// deps/ (feature variants, artifacts surviving interrupted builds), and any
+/// heuristic pick — newest mtime included — can hand the type-check an rlib
+/// this binary does not link, silently validating emitted code against the
+/// wrong crate build. Cargo records the real link, so follow its records:
+///
+///   1. the test executable's file name ends in this test unit's hash
+///      (`cli_emit_hardening-<unit-hash>`);
+///   2. `.fingerprint/<pkg>-<unit-hash>/test-integration-test-<name>.json`
+///      is this unit's build record, whose `deps` array carries the
+///      fingerprint hash of the `ez_ffmpeg` lib it was compiled against;
+///   3. the lib unit directory whose `lib-ez_ffmpeg` file holds that hash
+///      (cargo writes it as the hex of its little-endian bytes) names the
+///      rlib: `libez_ffmpeg-<lib-unit-hash>.rlib`.
+///
+/// Any step that cannot be completed fails the test naming the searched
+/// path. There is deliberately no fallback: a broken chain means the linked
+/// rlib cannot be identified, and guessing would reopen the false-pass hole.
+fn linked_rlib() -> (PathBuf, PathBuf, Vec<PathBuf>) {
+    let exe = std::env::current_exe().expect("cannot resolve the running test executable");
+    let deps = exe
+        .parent()
+        .unwrap_or_else(|| panic!("test executable {} has no parent directory", exe.display()))
+        .to_path_buf();
+    let stem = exe
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_else(|| panic!("test executable {} has no UTF-8 file stem", exe.display()));
+    let (target_name, unit_hash) = stem.rsplit_once('-').unwrap_or_else(|| {
+        panic!("test executable name {stem:?} carries no `-<unit-hash>` suffix; run under `cargo test`")
+    });
+    assert!(
+        unit_hash.len() == 16 && unit_hash.bytes().all(|b| b.is_ascii_hexdigit()),
+        "test executable suffix {unit_hash:?} is not a 16-digit unit hash ({})",
+        exe.display()
+    );
+    let fingerprint_root = deps
+        .parent()
+        .unwrap_or_else(|| panic!("deps directory {} has no parent", deps.display()))
+        .join(".fingerprint");
+    let unit_json = fingerprint_root
+        .join(format!("{}-{unit_hash}", env!("CARGO_PKG_NAME")))
+        .join(format!("test-integration-test-{target_name}.json"));
+    let json = std::fs::read_to_string(&unit_json).unwrap_or_else(|err| {
+        panic!(
+            "cannot read this test unit's fingerprint {} ({err}); without that record the rlib \
+             this binary links cannot be identified",
+            unit_json.display()
+        )
+    });
+    let needle: String = lib_dep_fingerprint(&json, &unit_json)
+        .to_le_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let entries = std::fs::read_dir(&fingerprint_root).unwrap_or_else(|err| {
+        panic!("cannot read fingerprint root {} ({err})", fingerprint_root.display())
+    });
+    let mut lib_hashes: Vec<String> = entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let name = entry.file_name().to_str()?.to_owned();
+            let hash = name.strip_prefix(concat!(env!("CARGO_PKG_NAME"), "-"))?.to_owned();
+            let recorded =
+                std::fs::read_to_string(entry.path().join(format!("lib-{LIB_DEP_NAME}"))).ok()?;
+            (recorded.trim() == needle).then_some(hash)
+        })
+        .collect();
+    lib_hashes.sort_unstable();
+    lib_hashes.dedup();
+    let lib_hash = match &lib_hashes[..] {
+        [hash] => hash,
+        [] => panic!(
+            "no lib unit under {} holds the dep fingerprint {needle} recorded in {}; the rlib \
+             this test binary links cannot be identified (a fresh `cargo test` rewrites both \
+             records consistently)",
+            fingerprint_root.display(),
+            unit_json.display()
+        ),
+        several => panic!(
+            "several lib units under {} hold the dep fingerprint {needle}: {several:?}; \
+             refusing to pick one",
+            fingerprint_root.display()
+        ),
+    };
+    let rlib = deps.join(format!("lib{LIB_DEP_NAME}-{lib_hash}.rlib"));
+    assert!(
+        rlib.is_file(),
+        "fingerprints name {} as the linked rlib, but it does not exist",
+        rlib.display()
+    );
+    let others: Vec<PathBuf> = std::fs::read_dir(&deps)
+        .unwrap_or_else(|err| panic!("cannot read deps directory {} ({err})", deps.display()))
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            let name = path.file_name()?.to_str()?;
+            (name.starts_with("libez_ffmpeg-") && name.ends_with(".rlib") && path != rlib)
+                .then_some(path)
+        })
+        .collect();
+    (deps, rlib, others)
+}
+
+/// Type-checks a generated program against the rlib this test binary was
+/// LINKED with — and ONLY that one. Multiple rlibs coexist in deps (feature
+/// variants, artifacts surviving interrupted builds), and any walk that
+/// keeps trying candidates until one accepts is a false-pass channel: a
+/// program the current crate rejects could still find one stale artifact
+/// that accepts it. So the linked rlib must accept outright; every failure
+/// — a genuine type error, but also an unusable artifact (metadata
+/// incompatibility between the `rustc` on PATH and the one cargo invoked) —
+/// fails the test, and the message lists the coexisting rlibs so a
+/// stale-artifact puzzle is recognizable and fixable (`cargo clean`)
+/// instead of silently routed around.
 fn assert_type_checks(code: &str, name: &str) {
     let dir = scratch_dir();
     let source = dir.join(format!("{name}.rs"));
     std::fs::write(&source, code).unwrap();
-    let (deps, rlibs) = deps_and_rlibs();
-    let newest = &rlibs[0];
+    let (deps, rlib, others) = linked_rlib();
     let out = Command::new("rustc")
         .arg("--edition")
         .arg("2021")
@@ -72,7 +192,7 @@ fn assert_type_checks(code: &str, name: &str) {
         .arg("bin")
         .arg("--emit=metadata")
         .arg("--extern")
-        .arg(format!("ez_ffmpeg={}", newest.display()))
+        .arg(format!("ez_ffmpeg={}", rlib.display()))
         .arg("-L")
         .arg(format!("dependency={}", deps.display()))
         .arg("--out-dir")
@@ -84,21 +204,18 @@ fn assert_type_checks(code: &str, name: &str) {
         return;
     }
     let stderr = String::from_utf8_lossy(&out.stderr);
-    let others: Vec<String> = rlibs[1..]
-        .iter()
-        .map(|rlib| rlib.display().to_string())
-        .collect();
+    let others: Vec<String> = others.iter().map(|path| path.display().to_string()).collect();
     let others = if others.is_empty() {
         "none".to_string()
     } else {
         others.join(", ")
     };
     panic!(
-        "generated program {name} failed to type-check against the newest rlib {}:\n{stderr}\n\
-         older coexisting rlibs (deliberately not consulted — an accept from a stale artifact \
-         proves nothing; if the failure above is a metadata incompatibility from a toolchain \
-         change, run `cargo clean`): {others}",
-        newest.display()
+        "generated program {name} failed to type-check against the linked rlib {}:\n{stderr}\n\
+         coexisting rlibs (deliberately not consulted — an accept from an artifact this test \
+         binary does not link proves nothing; if the failure above is a metadata \
+         incompatibility, run `cargo clean`): {others}",
+        rlib.display()
     );
 }
 
