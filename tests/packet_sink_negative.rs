@@ -308,7 +308,10 @@ fn failing_packet_callback_stops_the_job_without_on_end() {
         })
     })
     .on_delivery_error(move |e: &PacketSinkError| {
-        err_log.lock().unwrap().push(SinkEv::Error(e.to_string()))
+        err_log.lock().unwrap().push(SinkEv::Error {
+            message: e.to_string(),
+            thread: std::thread::current().id(),
+        })
     })
     .build();
 
@@ -340,10 +343,27 @@ fn failing_packet_callback_stops_the_job_without_on_end() {
         !events.iter().any(|e| matches!(e, SinkEv::End { .. })),
         "a failed callback must never be followed by on_end"
     );
-    assert!(
-        matches!(events.last(), Some(SinkEv::Error(_))),
-        "the terminal event is on_error"
+    // The failure terminal dispatches on the sink's own mux worker — the
+    // thread that delivered every packet — never on the controller thread.
+    let delivery_threads: std::collections::HashSet<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            SinkEv::Pkt(p) => Some(p.thread),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        delivery_threads.len(),
+        1,
+        "a single mux worker delivers this sink's packets"
     );
+    match events.last() {
+        Some(SinkEv::Error { thread, .. }) => assert!(
+            delivery_threads.contains(thread),
+            "the failure terminal must dispatch on the mux worker thread"
+        ),
+        other => panic!("the terminal event is on_error, got {other:?}"),
+    }
     let delivered = events
         .iter()
         .filter(|e| matches!(e, SinkEv::Pkt(_)))
