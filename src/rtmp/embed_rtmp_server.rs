@@ -76,6 +76,39 @@ fn close_intake_and_publish_end(registrations: &RegistrationHandoff, status: &At
     status.store(STATUS_END, Ordering::Release);
 }
 
+/// Unwind backstop for `start()`'s window between the lifecycle claim (the
+/// `compare_exchange` of `STATUS_INIT` to `STATUS_RUN`) and the successful
+/// handoff to the accept thread. Code in that window still logs, and
+/// `error!`/`info!` dispatch to a user-installed logger that can itself
+/// panic; an unwind escaping there would leave the family stuck at
+/// `STATUS_RUN` — every clone reporting a started server that no one can
+/// ever stop, and a worker thread that already spawned polling that status
+/// forever. Dropped while armed, the guard runs the same terminal sequence
+/// as `signal_stop`: the funnel (intake closed first, then `STATUS_END`),
+/// then the reactor wake. All steps are idempotent, so overlapping the
+/// explicit `signal_stop` on `start()`'s error returns is harmless. The
+/// success path disarms the guard once the accept thread owns the listener —
+/// from then on terminal transitions belong to `stop()`, the RAII guards
+/// and the worker's own fatal paths.
+struct StartFailGuard {
+    armed: bool,
+    registrations: Arc<RegistrationHandoff>,
+    status: Arc<AtomicUsize>,
+    wake_handle: Option<WakeHandle>,
+}
+
+impl Drop for StartFailGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        close_intake_and_publish_end(&self.registrations, &self.status);
+        if let Some(wake_handle) = &self.wake_handle {
+            wake_handle.wake();
+        }
+    }
+}
+
 impl<S: 'static> EmbedRtmpServer<S> {
     fn into_state<T>(self) -> EmbedRtmpServer<T> {
         EmbedRtmpServer {
@@ -220,7 +253,9 @@ impl EmbedRtmpServer<Initialization> {
     /// lifecycle can be started only once: the first `start()` wins, and
     /// every later attempt — a sibling clone while the server runs, or any
     /// clone after it stopped — fails with
-    /// [`RtmpServerAlreadyStarted`](crate::error::Error::RtmpServerAlreadyStarted).
+    /// [`RtmpServerAlreadyStarted`](crate::error::Error::RtmpServerAlreadyStarted),
+    /// refused before any socket is bound: a second start on a fixed port
+    /// reports the lifecycle error, not `AddrInUse` from the winner's port.
     /// A `start()` that fails before it claims the lifecycle (e.g. the
     /// bind) leaves it untouched, so a clone may retry; from the claim on,
     /// a failing `start()` stops the lifecycle for good.
@@ -232,6 +267,21 @@ impl EmbedRtmpServer<Initialization> {
     ///   value's lifecycle was already started once, or other I/O errors
     ///   occur.
     pub fn start(mut self) -> crate::error::Result<EmbedRtmpServer<Running>> {
+        // Admission, step one: refuse an already-started (or stopped)
+        // family before touching the address. Binding first would report a
+        // second start() on a fixed port as the winner's port being in use
+        // — Error::IO(AddrInUse) — instead of the typed lifecycle error,
+        // and right after stop() the outcome would flip between the two
+        // depending on how quickly the old accept thread released the
+        // listener. This load is advisory only; the compare_exchange below
+        // is the authoritative claim.
+        if self.status.load(Ordering::Acquire) != STATUS_INIT {
+            return Err(RtmpServerAlreadyStarted);
+        }
+
+        // Admission, step two: the bind. Failures from here up to the
+        // claim below leave the status at STATUS_INIT, so a failed bind
+        // stays retryable through a clone.
         let listener = TcpListener::bind(self.address.clone())
             .map_err(|e| <std::io::Error as Into<crate::error::Error>>::into(e))?;
 
@@ -244,28 +294,6 @@ impl EmbedRtmpServer<Initialization> {
         listener
             .set_nonblocking(true)
             .map_err(|e| <std::io::Error as Into<crate::error::Error>>::into(e))?;
-
-        // Single-start gate for the whole clone family. The status flag
-        // (and the key set) is shared by every clone of this server value,
-        // but each start() builds its own registration intake around it —
-        // so a second started server would leave the family with TWO
-        // intakes and one status: stopping either one closes only its own
-        // intake while publishing the shared STATUS_END, and the other's
-        // create paths would keep returning Ok on handles that report
-        // stopped. The CAS makes that state structurally impossible: the
-        // loser is refused right here, before any thread spawns, and its
-        // freshly bound listener drops with the return, releasing the
-        // port. This CAS is also the lifecycle's point of no return —
-        // failures above it leave the status at STATUS_INIT (a failed
-        // bind stays retryable through a clone); failures below it are
-        // terminal for the family.
-        if self
-            .status
-            .compare_exchange(STATUS_INIT, STATUS_RUN, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Err(RtmpServerAlreadyStarted);
-        }
 
         // Calculate effective max and create bounded channel with headroom
         // This prevents unbounded queue growth when reactor is at capacity
@@ -297,14 +325,51 @@ impl EmbedRtmpServer<Initialization> {
         };
         self.wake_handle = wake_handle;
 
+        // Admission, step three — the single-start gate for the whole clone
+        // family. The status flag (and the key set) is shared by every
+        // clone of this server value, but each start() builds its own
+        // registration intake around it — so a second started server would
+        // leave the family with TWO intakes and one status: stopping either
+        // one closes only its own intake while publishing the shared
+        // STATUS_END, and the other's create paths would keep returning Ok
+        // on handles that report stopped. The CAS makes that state
+        // structurally impossible: a racer that slipped past the advisory
+        // load above is refused right here, before any thread spawns, and
+        // its freshly bound listener drops with the return, releasing the
+        // port. This CAS is also the lifecycle's point of no return —
+        // failures above it leave the status at STATUS_INIT (retryable
+        // through a clone); failures below it are terminal for the family.
+        if self
+            .status
+            .compare_exchange(STATUS_INIT, STATUS_RUN, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(RtmpServerAlreadyStarted);
+        }
+
+        // The claim is consumed: from here to the disarm at the bottom,
+        // every exit — the explicit error returns as much as an unwind out
+        // of a log call whose user-installed logger panics — must publish
+        // the terminal state, or the family is stuck reporting a running
+        // server that no one can ever stop. The guard covers the unwinds;
+        // the error paths below also run the funnel explicitly, first
+        // thing, so the terminal state is published before they log.
+        let mut start_fail_guard = StartFailGuard {
+            armed: true,
+            registrations: registrations.clone(),
+            status: self.status.clone(),
+            wake_handle: self.wake_handle.clone(),
+        };
+
         let status = self.status.clone();
         let max_connections = self.max_connections;
+        let worker_registrations = registrations.clone();
         let result = std::thread::Builder::new()
             .name("rtmp-server-worker".to_string())
             .spawn(move || {
                 handle_connections(
                     stream_receiver,
-                    registrations,
+                    worker_registrations,
                     self.gop_limit,
                     max_connections,
                     status,
@@ -312,16 +377,18 @@ impl EmbedRtmpServer<Initialization> {
                 )
             });
         if let Err(e) = result {
-            error!("Thread[rtmp-server-worker] exited with error: {e}");
             // Nothing has spawned yet: no worker observes STATUS_RUN, and the
             // listener is still owned here (moved into the io closure only
             // below), so it drops on return and releases the port. The
             // family's one start has been consumed by the gate above,
             // though, so the status must not stay at STATUS_RUN — every
             // clone would report a running server forever. Publish the
-            // terminal state instead, intake closed first as on every
-            // terminal path.
+            // terminal state BEFORE logging, intake closed first as on
+            // every terminal path: `error!` can run a user-installed
+            // logger that itself panics, and that unwind must not skip
+            // the publication.
             self.signal_stop();
+            error!("Thread[rtmp-server-worker] exited with error: {e}");
             return Err(crate::error::Error::RtmpThreadExited);
         }
 
@@ -333,11 +400,8 @@ impl EmbedRtmpServer<Initialization> {
         let status = self.status.clone();
         // The accept loop owns one terminal transition of its own (the
         // worker's connection channel disconnecting below) and needs the
-        // intake to run it through the funnel.
-        let registrations = self
-            .registrations
-            .clone()
-            .expect("start() installs the registration handoff before spawning the accept thread");
+        // intake to run it through the funnel: it takes the handoff Arc
+        // still held from the setup above.
         let result = std::thread::Builder::new()
             .name("rtmp-server-io".to_string())
             .spawn(move || {
@@ -396,16 +460,22 @@ impl EmbedRtmpServer<Initialization> {
                 }
             });
         if let Err(e) = result {
-            error!("Thread[rtmp-server-io] exited with error: {e}");
             // The worker thread spawned successfully above and is now polling
-            // `status` (still STATUS_RUN); without this it would run forever and
-            // keep the port bound. Signal STATUS_END (and wake the reactor) so
-            // it exits. The listener was moved into the failed io closure and
-            // drops with it, releasing the port.
+            // `status` (still STATUS_RUN); without this it would run forever.
+            // Signal STATUS_END (and wake the reactor) so it exits, and do it
+            // BEFORE logging: `error!` can run a user-installed logger that
+            // itself panics, and that unwind must not strand the already
+            // running worker. The listener was moved into the failed io
+            // closure and drops with it, releasing the port.
             self.signal_stop();
+            error!("Thread[rtmp-server-io] exited with error: {e}");
             return Err(crate::error::Error::RtmpThreadExited);
         }
 
+        // Handoff complete: the accept thread owns the listener, and every
+        // terminal transition from here on belongs to stop(), the RAII
+        // guards or the worker's own fatal paths.
+        start_fail_guard.armed = false;
         Ok(self.into_state())
     }
 }
@@ -1952,6 +2022,85 @@ mod tests {
         );
     }
 
+    // StartFailGuard is the unwind backstop for start()'s window between
+    // the lifecycle claim (the INIT->RUN CAS) and the accept-thread
+    // handoff: a log call in that window can panic in a user-installed
+    // logger, and the escaping unwind must still publish the terminal
+    // state — otherwise every clone reports a started server no one can
+    // ever stop. Dropped by that unwind, the guard must run the same
+    // funnel as signal_stop: intake closed first, STATUS_END second.
+    #[test]
+    fn armed_start_fail_guard_publishes_terminal_state_on_unwind() {
+        let registrations = Arc::new(RegistrationHandoff::new());
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let guard = StartFailGuard {
+            armed: true,
+            registrations: registrations.clone(),
+            status: status.clone(),
+            wake_handle: None,
+        };
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = guard;
+            panic!("injected panic between the claim and the handoff");
+        }));
+        assert!(unwind.is_err(), "the injected panic must unwind");
+
+        assert_eq!(status.load(Ordering::Acquire), STATUS_END);
+        assert!(
+            matches!(
+                registrations.enqueue(probe_registration("after-unwind")),
+                Err(EnqueueRefused::Closed(_))
+            ),
+            "the guard must close the intake, not just flip the status"
+        );
+    }
+
+    // The success handoff disarms the guard: its drop must then leave the
+    // running lifecycle alone — no closed intake, no STATUS_END.
+    #[test]
+    fn disarmed_start_fail_guard_leaves_the_lifecycle_running() {
+        let registrations = Arc::new(RegistrationHandoff::new());
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let mut guard = StartFailGuard {
+            armed: true,
+            registrations: registrations.clone(),
+            status: status.clone(),
+            wake_handle: None,
+        };
+        guard.armed = false;
+        drop(guard);
+
+        assert_eq!(status.load(Ordering::Acquire), STATUS_RUN);
+        assert!(
+            registrations
+                .enqueue(probe_registration("still-open"))
+                .is_ok(),
+            "a disarmed guard must leave the intake open"
+        );
+    }
+
+    /// A hand-assembled `Initialization` sibling of `family`: it shares the
+    /// lifecycle (status flag) and key set exactly as clone() would, but
+    /// aims at `address` instead of the address the family was created
+    /// with, which clone() copies verbatim.
+    fn family_sibling<S: 'static>(
+        family: &EmbedRtmpServer<S>,
+        address: impl Into<String>,
+    ) -> EmbedRtmpServer<Initialization> {
+        EmbedRtmpServer::<Initialization> {
+            address: address.into(),
+            bound_addr: None,
+            status: family.status.clone(),
+            stream_keys: family.stream_keys.clone(),
+            registrations: None,
+            wake_handle: None,
+            gop_limit: 1,
+            max_connections: None,
+            state: PhantomData,
+        }
+    }
+
     // Initialization clones share one status flag and key set — one
     // lifecycle. Each start() would otherwise mint its own registration
     // intake around that shared status: stopping one started clone closed
@@ -1966,10 +2115,11 @@ mod tests {
         let third = first.clone();
 
         let running = first.start().expect("the family's first start must win");
+        let addr = running.local_addr().expect("bound address");
 
         // While the winner runs: a sibling clone must not start the family
-        // again. Its bind succeeds (another ephemeral port); the shared
-        // lifecycle is what refuses it, before any thread spawns.
+        // again. Its bind would even succeed (another ephemeral port); the
+        // shared lifecycle refuses it before that bind is ever attempted.
         let refused = second.start().err();
         assert!(
             matches!(refused, Some(crate::error::Error::RtmpServerAlreadyStarted)),
@@ -1978,6 +2128,21 @@ mod tests {
         assert!(
             !running.is_stopped(),
             "a refused start must not perturb the running server"
+        );
+
+        // The fixed-port shape of the same refusal: a sibling aimed at THE
+        // port the winner holds. The admission check must refuse it before
+        // any bind attempt — binding first would surface Error::IO
+        // (AddrInUse) from the winner's port instead of the typed
+        // lifecycle error.
+        let refused = family_sibling(&running, addr.to_string()).start().err();
+        assert!(
+            matches!(refused, Some(crate::error::Error::RtmpServerAlreadyStarted)),
+            "a second start on the winner's own port must get the typed refusal, got {refused:?}"
+        );
+        assert!(
+            !running.is_stopped(),
+            "the fixed-port refusal must not perturb the running server"
         );
 
         // After stop, STATUS_END is terminal for the family: restarting
@@ -1990,6 +2155,41 @@ mod tests {
             matches!(refused, Some(crate::error::Error::RtmpServerAlreadyStarted)),
             "a start after the family stopped must be refused, got {refused:?}"
         );
+
+        // The fixed-port shape right after stop(): the refusal must be
+        // decided by the lifecycle alone — never by a bind whose outcome
+        // depends on how quickly the stopped accept thread releases the
+        // listener (typed refusal one moment, AddrInUse the next).
+        let refused = family_sibling(&ended, addr.to_string()).start().err();
+        assert!(
+            matches!(refused, Some(crate::error::Error::RtmpServerAlreadyStarted)),
+            "a fixed-port start right after stop must get the typed refusal, got {refused:?}"
+        );
+    }
+
+    // Bind failures are pre-claim: they must surface as the typed IO error
+    // and leave the family's lifecycle at INIT, retryable through a clone —
+    // the admission refusal is reserved for families that actually started.
+    #[test]
+    fn failed_bind_leaves_the_family_retryable() {
+        // Hold a port so the family's first bind deterministically fails.
+        let blocker = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a port");
+        let blocked_addr = blocker.local_addr().expect("blocker address");
+
+        let first = EmbedRtmpServer::new(blocked_addr.to_string());
+        let survivor = first.clone();
+        let failed = first.start().err();
+        assert!(
+            matches!(failed, Some(crate::error::Error::IO(_))),
+            "binding a held port must surface the typed IO error, got {failed:?}"
+        );
+
+        // The failed bind claimed nothing: a sibling of the same family can
+        // still win its one start, on a bindable address.
+        let running = family_sibling(&survivor, "127.0.0.1:0")
+            .start()
+            .expect("a failed bind must leave the family startable");
+        assert!(running.stop().is_stopped());
     }
 
     #[test]
