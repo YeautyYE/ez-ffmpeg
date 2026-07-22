@@ -17,6 +17,9 @@ pub(crate) struct AacRuntime {
     /// Channel count declared by the program_config_element when
     /// channelConfiguration is 0 (`None` for table-signaled layouts).
     pce_channels: Option<u32>,
+    /// Whether the Parametric Stereo state turns the mono-core PCE into
+    /// stereo output (see [`AacRuntime::ps_doubles_mono_core`]).
+    ps_doubles_mono_core: bool,
 }
 
 impl AacRuntime {
@@ -35,7 +38,12 @@ impl AacRuntime {
     /// GASpecificConfig (see [`read_ga_specific_config`]), including the
     /// program_config_element that carries the layout when
     /// channelConfiguration is 0, followed by the 2-bit epConfig the ER
-    /// object types append at the AudioSpecificConfig level. Reserved
+    /// object types append at the AudioSpecificConfig level. For a
+    /// mono-core program_config_element the tail is additionally scanned
+    /// for the backward-compatible SBR/PS sync extension (see
+    /// [`read_tail_sync_extension`]): Parametric Stereo decides whether
+    /// that mono core decodes to stereo
+    /// ([`AacRuntime::ps_doubles_mono_core`]). Reserved
     /// sampling-frequency indexes (13/14) are rejected, and so are the
     /// reserved channel configurations 8-10 and the out-of-table value 15
     /// (for the primary and extension fields alike). Truncation inside any
@@ -54,6 +62,7 @@ impl AacRuntime {
             asc: extradata.to_vec(),
             audio_object_type: prefix.audio_object_type,
             pce_channels: prefix.pce_channels,
+            ps_doubles_mono_core: prefix.ps_doubles_mono_core,
         })
     }
 
@@ -84,9 +93,26 @@ impl AacRuntime {
     /// strict path compares this against the advertised stream metadata —
     /// with channelConfiguration 0 the PCE is the configuration's only
     /// channel declaration, so a disagreeing `channels` field would hand
-    /// consumers contradictory metadata.
+    /// consumers contradictory metadata (Parametric Stereo widens the
+    /// agreement to the doubled count — see
+    /// [`AacRuntime::ps_doubles_mono_core`]).
     pub(crate) fn pce_channel_count(&self) -> Option<u32> {
         self.pce_channels
+    }
+
+    /// True when the configuration's Parametric Stereo state decodes the
+    /// mono-core program_config_element to stereo: the PCE declares
+    /// exactly one channel and PS is signaled hierarchically
+    /// (audioObjectType 29), signaled by the backward-compatible sync
+    /// extension's psPresentFlag, or left implicit on an SBR-extended
+    /// AAC-LC core — the one shape FFmpeg's decode_ga_specific_config
+    /// upgrades to PS. FFmpeg's che_configure then emits TWO output
+    /// channels for a single_channel_element under PS
+    /// (libavcodec/aac/aacdec.c), so a mono core legitimately reaches
+    /// consumers as stereo, and the strict comparison accepts the doubled
+    /// count alongside the core count in exactly this case.
+    pub(crate) fn ps_doubles_mono_core(&self) -> bool {
+        self.ps_doubles_mono_core
     }
 }
 
@@ -107,6 +133,11 @@ impl<'a> AscBits<'a> {
     /// out-of-bounds demand into an in-bounds one.
     fn bit_len(&self) -> u64 {
         self.data.len() as u64 * 8
+    }
+
+    /// Unread bits left in the config.
+    fn remaining(&self) -> u64 {
+        self.bit_len() - self.pos as u64
     }
 
     /// Peeks `count` bits (<= 32) without consuming, zero-padded past the
@@ -161,19 +192,29 @@ fn read_object_type(bits: &mut AscBits<'_>, field: &str, ext_field: &str) -> Res
 /// One sampling-frequency field: a 4-bit index whose value 15 is followed
 /// by a 24-bit explicit frequency. Indexes 13 and 14 are reserved
 /// (FFmpeg's decoder rejects them via its `sampling_index > 12` check).
+/// Returns the index and the frequency it stands for — the
+/// program_config_element cross-check compares indexes, and the sync
+/// extension compares frequencies.
 fn read_sampling_frequency(
     bits: &mut AscBits<'_>,
     field: &str,
     explicit_field: &str,
-) -> Result<(), String> {
+) -> Result<(u32, u32), String> {
+    /// The ISO/IEC 14496-3 samplingFrequencyIndex table (FFmpeg's
+    /// ff_mpeg4audio_sample_rates, libavcodec/mpeg4audio_sample_rates.h).
+    const SAMPLE_RATES: [u32; 13] = [
+        96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350,
+    ];
     let index = bits.read(4, field)?;
     if index == 13 || index == 14 {
         return Err(format!("reserved {field} {index}"));
     }
-    if index == 15 {
-        bits.read(24, explicit_field)?;
-    }
-    Ok(())
+    let rate = if index == 15 {
+        bits.read(24, explicit_field)?
+    } else {
+        SAMPLE_RATES[index as usize]
+    };
+    Ok((index, rate))
 }
 
 /// The object types whose configuration payload is GASpecificConfig
@@ -186,25 +227,31 @@ fn is_ga_object_type(aot: u32) -> bool {
 
 /// Validates a complete GASpecificConfig (ISO/IEC 14496-3 §4.4.1, Table
 /// 4.1): frameLengthFlag (1 bit), dependsOnCoreCoder (1 bit) — when set,
-/// the 14-bit coreCoderDelay — extensionFlag (1 bit), the 3-bit layerNr
-/// for the scalable object types (6 and 20), the program_config_element
-/// when `channel_config` is 0 (preceded by its 4-bit
-/// element_instance_tag), and, when extensionFlag is set, the
+/// the 14-bit coreCoderDelay — extensionFlag (1 bit), the
+/// program_config_element when `channel_config` is 0 (preceded by its
+/// 4-bit element_instance_tag), the 3-bit layerNr for the scalable
+/// object types (6 and 20), and, when extensionFlag is set, the
 /// AOT-dependent extension fields — numOfSubFrame (5 bits) and
 /// layer_length (11 bits) for ER BSAC (22), the three data-resilience
 /// flags for ER AAC LC/LTP/Scalable/LD (17/19/20/23) — closed by
 /// extensionFlag3 (1 bit, contents reserved for version 3).
 ///
-/// Two deliberate departures from a literal Table 4.1 reading, both
-/// mirroring FFmpeg's decode_ga_specific_config
-/// (libavcodec/aac/aacdec.c):
-/// - layerNr is read BEFORE the program_config_element; Table 4.1 places
-///   it after. The orders only diverge for a scalable object type with
-///   channelConfiguration 0, which no known encoder emits, so the decoder
-///   that would consume the stream is the arbiter.
-/// - Table 4.1 says extensionFlag "shall be 1" for the ER object types;
-///   FFmpeg branches on the actual flag value instead of enforcing the
-///   shall, and so does this parser.
+/// Two departures from FFmpeg's decode_ga_specific_config
+/// (libavcodec/aac/aacdec.c), both following the ISO text where the two
+/// disagree:
+/// - FFmpeg reads layerNr BEFORE the program_config_element; Table 4.1
+///   places it after. The orders only diverge for a scalable object type
+///   with channelConfiguration 0, and FFmpeg's decoder never routes the
+///   scalable types into that function (the
+///   decode_audio_specific_config_gb switch dispatches AAC main/LC/SSR/
+///   LTP and ER AAC LC/LD there, nothing else), so its swapped order is
+///   unexercised for the only case where the orders differ and the ISO
+///   order is the one a conforming stream carries.
+/// - Table 4.1 requires extensionFlag to be 1 for the ER object types
+///   (17, 19-23): the ER extension fields above are part of their
+///   configuration, not an option. FFmpeg branches on the flag value
+///   without enforcing the requirement; this parser rejects the
+///   violation so an ER configuration cannot silently omit those fields.
 ///
 /// Returns the channel count declared by the program_config_element, or
 /// `None` when `channel_config` signals the layout by table.
@@ -212,22 +259,29 @@ fn read_ga_specific_config(
     bits: &mut AscBits<'_>,
     aot: u32,
     channel_config: u32,
+    sampling_index: u32,
 ) -> Result<Option<u32>, String> {
     bits.read(1, "frameLengthFlag")?;
     if bits.read(1, "dependsOnCoreCoder")? == 1 {
         bits.read(14, "coreCoderDelay")?;
     }
     let extension_flag = bits.read(1, "extensionFlag")?;
+    if extension_flag == 0 && matches!(aot, 17 | 19..=23) {
+        return Err(format!(
+            "extensionFlag 0 for ER object type {aot} \
+             (ISO/IEC 14496-3 Table 4.1 requires 1)"
+        ));
+    }
+    let pce_channels = if channel_config == 0 {
+        bits.read(4, "element_instance_tag")?;
+        Some(read_program_config_element(bits, sampling_index)?)
+    } else {
+        None
+    };
     // AAC Scalable (6) and ER AAC Scalable (20).
     if aot == 6 || aot == 20 {
         bits.read(3, "layerNr")?;
     }
-    let pce_channels = if channel_config == 0 {
-        bits.read(4, "element_instance_tag")?;
-        Some(read_program_config_element(bits)?)
-    } else {
-        None
-    };
     if extension_flag == 1 {
         if aot == 22 {
             bits.read(5, "numOfSubFrame")?;
@@ -257,9 +311,31 @@ fn read_ga_specific_config(
 /// field is skipped as opaque bytes: the height extension FFmpeg reads
 /// from inside it rearranges the layout without changing the channel
 /// count.
-fn read_program_config_element(bits: &mut AscBits<'_>) -> Result<u32, String> {
+///
+/// The PCE's 4-bit sampling_frequency_index must repeat the ASC's own
+/// samplingFrequencyIndex: FFmpeg's decode_pce diagnoses a mismatch
+/// against the configured index (a warning there; two frequency
+/// declarations in one configuration leave consumers no consistent
+/// metadata, so this tier reports the same contradiction as an error),
+/// and the reserved indexes 13/14 are rejected like their ASC-level
+/// counterparts.
+fn read_program_config_element(
+    bits: &mut AscBits<'_>,
+    asc_sampling_index: u32,
+) -> Result<u32, String> {
     bits.read(2, "PCE object_type")?;
-    bits.read(4, "PCE sampling_frequency_index")?;
+    let pce_sampling_index = bits.read(4, "PCE sampling_frequency_index")?;
+    if pce_sampling_index == 13 || pce_sampling_index == 14 {
+        return Err(format!(
+            "reserved PCE sampling_frequency_index {pce_sampling_index}"
+        ));
+    }
+    if pce_sampling_index != asc_sampling_index {
+        return Err(format!(
+            "PCE sampling_frequency_index {pce_sampling_index} contradicts \
+             samplingFrequencyIndex {asc_sampling_index}"
+        ));
+    }
     let num_front = bits.read(4, "num_front_channel_elements")?;
     let num_side = bits.read(4, "num_side_channel_elements")?;
     let num_back = bits.read(4, "num_back_channel_elements")?;
@@ -320,6 +396,62 @@ struct AscPrefix {
     /// Channel count from the program_config_element (channelConfiguration
     /// 0 only).
     pce_channels: Option<u32>,
+    /// The Parametric Stereo state decodes the mono-core PCE to stereo.
+    ps_doubles_mono_core: bool,
+}
+
+/// Scans the AudioSpecificConfig tail for the backward-compatible SBR/PS
+/// sync extension, updating the three-state `sbr`/`ps` flags — mirroring
+/// the sync-extension loop of ff_mpeg4audio_get_config_gb (FFmpeg
+/// libavcodec/mpeg4audio.c), which extradata parsing always runs
+/// (sync_extension is 1 there): while more than 15 bits remain, slide
+/// bit-by-bit until an 11-bit 0x2b7 syncExtensionType; on a hit read one
+/// GetAudioObjectType and, when it is SBR (5), the 1-bit sbrPresentFlag
+/// — a set flag is followed by the extension sampling frequency, whose
+/// equality with the core frequency returns SBR to the unknown state —
+/// then, when more than 11 bits remain, a second 11-bit
+/// syncExtensionType whose value 0x548 carries the 1-bit psPresentFlag.
+/// FFmpeg anchors its scan just past the frame-length flag and slides
+/// across the rest of the config; this parser anchors past the
+/// fully-validated prefix — the same spot for a well-formed stream,
+/// since ISO/IEC 14496-3 §1.6.2.1 places the extension after the
+/// object-type-specific config.
+fn read_tail_sync_extension(
+    bits: &mut AscBits<'_>,
+    sample_rate: u32,
+    sbr: &mut Option<bool>,
+    ps: &mut Option<bool>,
+) -> Result<(), String> {
+    while bits.remaining() > 15 {
+        if bits.peek(11) != 0x2b7 {
+            bits.read(1, "syncExtension scan")?;
+            continue;
+        }
+        bits.read(11, "syncExtensionType")?;
+        let extension_aot = read_object_type(
+            bits,
+            "sync-extension audioObjectType",
+            "sync-extension audioObjectTypeExt",
+        )?;
+        if extension_aot == 5 {
+            *sbr = Some(bits.read(1, "sbrPresentFlag")? == 1);
+            if *sbr == Some(true) {
+                let (_, extension_rate) = read_sampling_frequency(
+                    bits,
+                    "sync-extension extensionSamplingFrequencyIndex",
+                    "explicit sync-extension extensionSamplingFrequency",
+                )?;
+                if extension_rate == sample_rate {
+                    *sbr = None;
+                }
+            }
+        }
+        if bits.remaining() > 11 && bits.read(11, "syncExtensionType")? == 0x548 {
+            *ps = Some(bits.read(1, "psPresentFlag")? == 1);
+        }
+        break;
+    }
+    Ok(())
 }
 
 /// Rejects the channel-configuration values no layout table row backs:
@@ -338,11 +470,11 @@ fn check_channel_config(value: u32, field: &str) -> Result<(), String> {
 }
 
 /// Parses the required AudioSpecificConfig prefix and returns the audio
-/// object type plus the PCE-declared channel count — mirroring
-/// `ff_mpeg4audio_get_config_gb` (FFmpeg libavcodec/mpeg4audio.c) through
-/// the direct-SBR/PS extension block: audioObjectType,
-/// samplingFrequencyIndex (with the index-15 explicit case),
-/// channelConfiguration, and for AOT 5/29 the
+/// object type, the PCE-declared channel count, and the Parametric
+/// Stereo verdict — mirroring `ff_mpeg4audio_get_config_gb` (FFmpeg
+/// libavcodec/mpeg4audio.c) through the direct-SBR/PS extension block:
+/// audioObjectType, samplingFrequencyIndex (with the index-15 explicit
+/// case), channelConfiguration, and for AOT 5/29 the
 /// extensionSamplingFrequencyIndex plus a SECOND GetAudioObjectType,
 /// whose value 22 (ER BSAC) is followed by the
 /// extensionChannelConfiguration. Reserved channel configurations (8-10)
@@ -353,10 +485,7 @@ fn check_channel_config(value: u32, field: &str) -> Result<(), String> {
 /// program_config_element that carries the layout when
 /// channelConfiguration is 0), followed by the 2-bit epConfig the ER
 /// object types (17, 19-23) append at the AudioSpecificConfig level
-/// (ISO/IEC 14496-3 §1.6.2.1); epConfig 2 and 3 are rejected because an
-/// ErrorProtectionSpecificConfig follows that this parser cannot bound
-/// (FFmpeg's decoder refuses every nonzero epConfig as unimplemented,
-/// libavcodec/aac/aacdec.c). channelConfiguration 0 outside a General
+/// (ISO/IEC 14496-3 §1.6.2.1). channelConfiguration 0 outside a General
 /// Audio configuration is rejected: no reachable program_config_element
 /// can supply the layout, and downstream consumers need explicit
 /// channels. AOT 29 honors the W6132 Annex MP3onMP4 look-ahead: when the
@@ -368,7 +497,11 @@ fn parse_required_asc_prefix(asc: &[u8]) -> Result<AscPrefix, String> {
     if aot == 0 {
         return Err("AudioSpecificConfig declares the null audio object type".to_string());
     }
-    read_sampling_frequency(&mut bits, "samplingFrequencyIndex", "explicit samplingFrequency")?;
+    let (sampling_index, sample_rate) = read_sampling_frequency(
+        &mut bits,
+        "samplingFrequencyIndex",
+        "explicit samplingFrequency",
+    )?;
     let channel_config = bits.read(4, "channelConfiguration")?;
     check_channel_config(channel_config, "channelConfiguration")?;
     let parse_extension = match aot {
@@ -377,8 +510,18 @@ fn parse_required_asc_prefix(asc: &[u8]) -> Result<AscPrefix, String> {
         29 => !(bits.peek(3) & 0x03 != 0 && bits.peek(9) & 0x3F == 0),
         _ => false,
     };
+    // SBR/PS presence in ff_mpeg4audio_get_config_gb's three states:
+    // `None` = unsignaled (FFmpeg's -1), `Some(false)` = explicitly
+    // absent (0), `Some(true)` = explicitly present (1).
+    let mut sbr: Option<bool> = None;
+    let mut ps: Option<bool> = None;
     let mut base_object_type = aot;
     if parse_extension {
+        // Hierarchical signaling: AOT 29 is SBR plus PS by definition.
+        if aot == 29 {
+            ps = Some(true);
+        }
+        sbr = Some(true);
         read_sampling_frequency(
             &mut bits,
             "extensionSamplingFrequencyIndex",
@@ -399,10 +542,18 @@ fn parse_required_asc_prefix(asc: &[u8]) -> Result<AscPrefix, String> {
         base_object_type = secondary;
     }
     let pce_channels = if is_ga_object_type(base_object_type) {
-        let pce_channels = read_ga_specific_config(&mut bits, base_object_type, channel_config)?;
+        let pce_channels =
+            read_ga_specific_config(&mut bits, base_object_type, channel_config, sampling_index)?;
         // ER object types with a GASpecificConfig: ER AAC LC/LTP (17/19),
         // ER AAC Scalable (20), ER TwinVQ (21), ER BSAC (22), ER AAC LD
-        // (23).
+        // (23). Policy for their epConfig: 0 and 1 pass — ISO/IEC
+        // 14496-3 §1.6.2.1 appends nothing at this level for either —
+        // while 2 and 3 are rejected wholesale, because both append an
+        // ErrorProtectionSpecificConfig this parser cannot bound and
+        // FFmpeg's decoder refuses every nonzero epConfig as
+        // unimplemented (decode_ga_specific_config and
+        // decode_eld_specific_config, libavcodec/aac/aacdec.c), so the
+        // rejection cannot cost an FFmpeg-decodable stream.
         if matches!(base_object_type, 17 | 19..=23) {
             let ep_config = bits.read(2, "epConfig")?;
             if ep_config >= 2 {
@@ -422,9 +573,38 @@ fn parse_required_asc_prefix(asc: &[u8]) -> Result<AscPrefix, String> {
     } else {
         None
     };
+    // The backward-compatible sync extension can carry the SBR/PS
+    // signaling instead of the hierarchical extension block (FFmpeg scans
+    // for it exactly when that block was absent). Its only consumer here
+    // is the mono-core stereo question, so the tail is parsed when that
+    // question exists: the PCE declared a single channel.
+    if !parse_extension && pce_channels == Some(1) {
+        read_tail_sync_extension(&mut bits, sample_rate, &mut sbr, &mut ps)?;
+    }
+    // The ff_mpeg4audio_get_config_gb clamps: "PS requires SBR" (an
+    // explicitly-absent SBR clears PS) and "Limit implicit PS to the
+    // HE-AACv2 Profile" (unsignaled PS survives only on an AAC-LC core;
+    // the table-channel half of that clamp is moot here because the
+    // table count is 0 for channelConfiguration 0, the only shape whose
+    // channel comparison consults PS).
+    if sbr == Some(false) {
+        ps = Some(false);
+    }
+    if ps.is_none() && base_object_type != 2 {
+        ps = Some(false);
+    }
+    // FFmpeg's decode_ga_specific_config (libavcodec/aac/aacdec.c)
+    // resolves the PS state against the parsed layout: more than one
+    // core channel clears PS, and a one-channel layout under a known SBR
+    // extension upgrades the still-unsignaled state to PS. Its
+    // che_configure then emits two output channels for a
+    // single_channel_element under PS — the mono core decodes to stereo.
+    let ps_doubles_mono_core =
+        pce_channels == Some(1) && (ps == Some(true) || (sbr == Some(true) && ps.is_none()));
     Ok(AscPrefix {
         audio_object_type: aot,
         pce_channels,
+        ps_doubles_mono_core,
     })
 }
 
@@ -450,14 +630,10 @@ mod tests {
         let runtime = AacRuntime::from_extradata(&[0x29, 0x94, 0x08, 0x00], 0).unwrap();
         assert_eq!(runtime.codec_string(), "mp4a.40.5");
         // Direct SBR with secondary ER BSAC (22): the
-        // extensionChannelConfiguration (1), the GASpecificConfig with a
-        // clear extensionFlag, and the 2-bit ER epConfig (0) complete the
-        // prefix — 31 required bits, four bytes.
-        let runtime = AacRuntime::from_extradata(&[0x29, 0x94, 0x58, 0x40], 0).unwrap();
-        assert_eq!(runtime.codec_string(), "mp4a.40.5");
-        // The same configuration with extensionFlag SET: numOfSubFrame (5),
-        // layer_length (11) and extensionFlag3 push the epConfig to bits
-        // 46-47 — 48 required bits, six bytes.
+        // extensionChannelConfiguration (1), the GASpecificConfig with
+        // extensionFlag set — carrying numOfSubFrame (5), layer_length
+        // (11) and extensionFlag3 — and the 2-bit ER epConfig (0) at
+        // bits 46-47 complete the prefix: 48 required bits, six bytes.
         let runtime =
             AacRuntime::from_extradata(&[0x29, 0x94, 0x58, 0x48, 0x00, 0x00], 0).unwrap();
         assert_eq!(runtime.codec_string(), "mp4a.40.5");
@@ -545,9 +721,11 @@ mod tests {
             // ER AAC LC (AOT 17) with extensionFlag set: the resilience
             // flags start at bit 16.
             (&[0x8A, 0x09], "aacSectionDataResilienceFlag"),
-            // ER AAC LC with extensionFlag clear: the ASC-level epConfig
-            // needs bits 16-17.
-            (&[0x8A, 0x08], "epConfig"),
+            // ER BSAC (AOT 22) with dependsOnCoreCoder set: the 14-bit
+            // coreCoderDelay pushes the mandatory extension fields and
+            // extensionFlag3 to bits 29-46, so the ASC-level epConfig
+            // needs bits 47-48 — one past six bytes.
+            (&[0xB2, 0x0A, 0x00, 0x04, 0x00, 0x00], "epConfig"),
             // SBR secondary ER BSAC with extensionFlag set: numOfSubFrame
             // spans bits 29-33, three of its five bits exist.
             (&[0x29, 0x94, 0x58, 0x48], "numOfSubFrame"),
@@ -667,10 +845,37 @@ mod tests {
             Ok(_) => panic!("expected InvalidExtradata, got a valid runtime"),
         }
         // epConfig 2 (and 3) appends an ErrorProtectionSpecificConfig this
-        // parser cannot bound: ER AAC LC with epConfig 2.
-        match AacRuntime::from_extradata(&[0x8A, 0x08, 0x80], 3) {
+        // parser cannot bound: ER AAC LC with extensionFlag set (clear
+        // resilience flags and extensionFlag3) and epConfig 2 at bits
+        // 20-21.
+        match AacRuntime::from_extradata(&[0x8A, 0x09, 0x08], 3) {
             Err(PacketSinkError::InvalidExtradata { reason, .. }) => {
                 assert!(reason.contains("epConfig 2"), "got {reason:?}");
+            }
+            Err(other) => panic!("expected InvalidExtradata, got {other:?}"),
+            Ok(_) => panic!("expected InvalidExtradata, got a valid runtime"),
+        }
+        // ISO/IEC 14496-3 Table 4.1 requires extensionFlag 1 for the ER
+        // object types — their extension fields are configuration, not
+        // an option. Secondary ER BSAC (22) behind direct SBR with the
+        // flag clear...
+        match AacRuntime::from_extradata(&[0x29, 0x94, 0x58, 0x40], 3) {
+            Err(PacketSinkError::InvalidExtradata { reason, .. }) => {
+                assert!(
+                    reason.contains("extensionFlag 0 for ER object type 22"),
+                    "got {reason:?}"
+                );
+            }
+            Err(other) => panic!("expected InvalidExtradata, got {other:?}"),
+            Ok(_) => panic!("expected InvalidExtradata, got a valid runtime"),
+        }
+        // ...and a base ER AAC LC (17) with the flag clear.
+        match AacRuntime::from_extradata(&[0x8A, 0x08], 3) {
+            Err(PacketSinkError::InvalidExtradata { reason, .. }) => {
+                assert!(
+                    reason.contains("extensionFlag 0 for ER object type 17"),
+                    "got {reason:?}"
+                );
             }
             Err(other) => panic!("expected InvalidExtradata, got {other:?}"),
             Ok(_) => panic!("expected InvalidExtradata, got a valid runtime"),
@@ -700,6 +905,39 @@ mod tests {
         let runtime = AacRuntime::from_extradata(&minimal_stereo, 0).unwrap();
         assert_eq!(runtime.codec_string(), "mp4a.40.2");
         assert_eq!(runtime.pce_channel_count(), Some(2));
+        // AAC Scalable (AOT 6) with channelConfiguration 0: ISO/IEC
+        // 14496-3 Table 4.1 places the program_config_element BEFORE the
+        // 3-bit layerNr — the same one-CPE PCE as above, then layerNr 0.
+        let scalable_pce: [u8; 9] = [0x32, 0x00, 0x05, 0x04, 0x00, 0x00, 0x20, 0x00, 0x00];
+        let runtime = AacRuntime::from_extradata(&scalable_pce, 0).unwrap();
+        assert_eq!(runtime.codec_string(), "mp4a.40.6");
+        assert_eq!(runtime.pce_channel_count(), Some(2));
+        // The PCE's own sampling_frequency_index must repeat the ASC's:
+        // index 3 against the ASC's 4 is two frequency declarations in
+        // one configuration (FFmpeg's decode_pce diagnoses exactly this
+        // comparison).
+        match AacRuntime::from_extradata(&[0x12, 0x00, 0x04, 0xC4, 0x00, 0x00, 0x20, 0x00], 3) {
+            Err(PacketSinkError::InvalidExtradata { reason, .. }) => {
+                assert!(
+                    reason.contains("PCE sampling_frequency_index 3")
+                        && reason.contains("samplingFrequencyIndex 4"),
+                    "got {reason:?}"
+                );
+            }
+            Err(other) => panic!("expected InvalidExtradata, got {other:?}"),
+            Ok(_) => panic!("expected InvalidExtradata, got a valid runtime"),
+        }
+        // ...and the reserved indexes 13/14 are rejected outright.
+        match AacRuntime::from_extradata(&[0x12, 0x00, 0x07, 0x44, 0x00, 0x00, 0x20, 0x00], 3) {
+            Err(PacketSinkError::InvalidExtradata { reason, .. }) => {
+                assert!(
+                    reason.contains("reserved PCE sampling_frequency_index 13"),
+                    "got {reason:?}"
+                );
+            }
+            Err(other) => panic!("expected InvalidExtradata, got {other:?}"),
+            Ok(_) => panic!("expected InvalidExtradata, got a valid runtime"),
+        }
         // A table-signaled layout reports no PCE channel count.
         let runtime = AacRuntime::from_extradata(&[0x12, 0x10], 0).unwrap();
         assert_eq!(runtime.pce_channel_count(), None);
@@ -737,6 +975,59 @@ mod tests {
             Err(other) => panic!("expected InvalidExtradata, got {other:?}"),
             Ok(_) => panic!("expected InvalidExtradata, got a valid runtime"),
         }
+    }
+
+    #[test]
+    fn parametric_stereo_doubles_the_mono_core_pce() {
+        // Hierarchical PS (AOT 29): 22050 Hz core (index 7),
+        // channelConfiguration 0 whose PCE declares one front SCE, and a
+        // 44100 Hz extension frequency — FFmpeg reads this configuration
+        // as 44.1 kHz STEREO, the PS tool doubling the mono core.
+        let direct_ps: [u8; 9] = [0xEB, 0x82, 0x08, 0x02, 0xE2, 0x00, 0x00, 0x00, 0x00];
+        let runtime = AacRuntime::from_extradata(&direct_ps, 0).unwrap();
+        assert_eq!(runtime.codec_string(), "mp4a.40.29");
+        assert_eq!(runtime.pce_channel_count(), Some(1));
+        assert!(runtime.ps_doubles_mono_core());
+        // Backward-compatible signaling: an AAC-LC core (24 kHz, index
+        // 6) with a one-SCE PCE, then the 0x2b7 sync extension — SBR
+        // present at 48 kHz — and the 0x548 extension with psPresentFlag
+        // set.
+        let sync_extension_ps: [u8; 13] = [
+            0x13, 0x00, 0x05, 0x84, 0x00, 0x00, 0x00, 0x00, 0x56, 0xE5, 0x9D, 0x48, 0x80,
+        ];
+        let runtime = AacRuntime::from_extradata(&sync_extension_ps, 0).unwrap();
+        assert_eq!(runtime.codec_string(), "mp4a.40.2");
+        assert_eq!(runtime.pce_channel_count(), Some(1));
+        assert!(runtime.ps_doubles_mono_core());
+        // The same extension with psPresentFlag CLEAR is an explicit
+        // absence — no doubling (only the unsignaled state upgrades
+        // under SBR).
+        let sync_extension_no_ps: [u8; 13] = [
+            0x13, 0x00, 0x05, 0x84, 0x00, 0x00, 0x00, 0x00, 0x56, 0xE5, 0x9D, 0x48, 0x00,
+        ];
+        let runtime = AacRuntime::from_extradata(&sync_extension_no_ps, 0).unwrap();
+        assert!(!runtime.ps_doubles_mono_core());
+        // Direct SBR (AOT 5, secondary AAC-LC) over a mono-SCE PCE with
+        // no PS signal anywhere: the unsignaled state upgrades — the
+        // sbr == 1 && ps == -1 one-channel path of FFmpeg's
+        // decode_ga_specific_config.
+        let sbr_mono: [u8; 9] = [0x2B, 0x01, 0x88, 0x02, 0xC2, 0x00, 0x00, 0x00, 0x00];
+        let runtime = AacRuntime::from_extradata(&sbr_mono, 0).unwrap();
+        assert_eq!(runtime.codec_string(), "mp4a.40.5");
+        assert_eq!(runtime.pce_channel_count(), Some(1));
+        assert!(runtime.ps_doubles_mono_core());
+        // A stereo core never doubles: the direct-PS shape with a front
+        // CPE in place of the SCE.
+        let ps_stereo_core: [u8; 9] = [0xEB, 0x82, 0x08, 0x02, 0xE2, 0x00, 0x00, 0x10, 0x00];
+        let runtime = AacRuntime::from_extradata(&ps_stereo_core, 0).unwrap();
+        assert_eq!(runtime.pce_channel_count(), Some(2));
+        assert!(!runtime.ps_doubles_mono_core());
+        // A plain mono-SCE PCE with no extension anywhere stays mono:
+        // implicit PS without SBR never doubles.
+        let plain_mono: [u8; 8] = [0x12, 0x00, 0x05, 0x04, 0x00, 0x00, 0x00, 0x00];
+        let runtime = AacRuntime::from_extradata(&plain_mono, 0).unwrap();
+        assert_eq!(runtime.pce_channel_count(), Some(1));
+        assert!(!runtime.ps_doubles_mono_core());
     }
 
     #[test]

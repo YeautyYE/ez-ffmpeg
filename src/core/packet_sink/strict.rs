@@ -280,20 +280,36 @@ impl PacketSinkWorker {
                     // channel declaration; the advertised count must agree
                     // with it, or the delivered metadata (`channels`) and
                     // the delivered codec_config (the ASC consumers hand to
-                    // decoders) would contradict each other. Table-signaled
+                    // decoders) would contradict each other. When the
+                    // configuration's Parametric Stereo state doubles the
+                    // mono core (HE-AAC v2 — FFmpeg's che_configure emits
+                    // two output channels for the single channel element
+                    // under PS, libavcodec/aac/aacdec.c), the doubled
+                    // count agrees as well: it is what a decode-side
+                    // describer advertises, while the core count is what a
+                    // configuration-only parse advertises. Table-signaled
                     // layouts are exempt: SBR/PS decoding legitimately
                     // doubles a mono channelConfiguration (HE-AAC v2), so
                     // table count and advertised count may differ.
                     if let Some(pce_channels) = runtime.pce_channel_count() {
-                        if i64::from(pce_channels) != i64::from(channels) {
+                        let advertised = i64::from(channels);
+                        let doubled = runtime.ps_doubles_mono_core();
+                        if advertised != i64::from(pce_channels)
+                            && !(doubled && advertised == i64::from(pce_channels) * 2)
+                        {
                             return Err(Box::new((
                                 sink,
                                 PacketSinkError::InvalidExtradata {
                                     stream_index,
                                     reason: format!(
                                         "AudioSpecificConfig program_config_element declares \
-                                         {pce_channels} channels but the stream advertises \
-                                         {channels}"
+                                         {pce_channels} channels{} but the stream advertises \
+                                         {channels}",
+                                        if doubled {
+                                            " (stereo under Parametric Stereo)"
+                                        } else {
+                                            ""
+                                        },
                                     ),
                                 },
                             )));
@@ -1409,13 +1425,83 @@ mod tests {
                 AVRational { num: 1, den: 48000 },
             );
             let st = *(*ctx.ctx).streams.add(idx);
+            // add_stream defaults to 44.1 kHz; the reproduced ASC
+            // declares 48 kHz (index 3), so advertise the same rate —
+            // the acceptance this test vouches for is of fully coherent
+            // metadata.
+            (*(*st).codecpar).sample_rate = 48000;
             (*(*st).codecpar).ch_layout.nb_channels = 4;
         }
         let (sink, _events) = recording_sink();
         let worker = collect(&ctx, sink).unwrap();
         let audio = worker.infos[0].audio().expect("typed audio configuration");
         assert_eq!(audio.channels(), 4);
+        assert_eq!(audio.sample_rate(), 48000);
         assert_eq!(audio.codec_string(), "mp4a.40.2");
+    }
+
+    /// AudioSpecificConfig with hierarchical PS signaling
+    /// (audioObjectType 29): a 22050 Hz core (index 7),
+    /// channelConfiguration 0 whose PCE declares one front SCE, and a
+    /// 44100 Hz extension frequency. FFmpeg reads this configuration as
+    /// 44.1 kHz STEREO — Parametric Stereo doubles the mono core — so
+    /// the stereo advertisement is as coherent as the core mono one,
+    /// and anything else stays contradictory.
+    const PS_MONO_CORE_ASC: [u8; 9] = [0xEB, 0x82, 0x08, 0x02, 0xE2, 0x00, 0x00, 0x00, 0x00];
+
+    #[test]
+    fn ps_mono_core_accepts_stereo_and_mono_advertisements() {
+        for channels in [2, 1] {
+            let ctx = TestCtx::new();
+            unsafe {
+                let idx = ctx.add_stream(
+                    AVMediaType::AVMEDIA_TYPE_AUDIO,
+                    AVCodecID::AV_CODEC_ID_AAC,
+                    Some(&PS_MONO_CORE_ASC),
+                    AVRational { num: 1, den: 44100 },
+                );
+                let st = *(*ctx.ctx).streams.add(idx);
+                (*(*st).codecpar).ch_layout.nb_channels = channels;
+            }
+            let (sink, _events) = recording_sink();
+            let worker = collect(&ctx, sink).unwrap_or_else(|e| {
+                panic!("a PS mono core advertising {channels} channels must collect: {e:?}")
+            });
+            let audio = worker.infos[0].audio().expect("typed audio configuration");
+            assert_eq!(audio.channels(), channels);
+            assert_eq!(audio.codec_string(), "mp4a.40.29");
+        }
+        // The doubling is exact: a 3-channel advertisement is neither
+        // the core nor the PS output and stays contradictory.
+        let ctx = TestCtx::new();
+        unsafe {
+            let idx = ctx.add_stream(
+                AVMediaType::AVMEDIA_TYPE_AUDIO,
+                AVCodecID::AV_CODEC_ID_AAC,
+                Some(&PS_MONO_CORE_ASC),
+                AVRational { num: 1, den: 44100 },
+            );
+            let st = *(*ctx.ctx).streams.add(idx);
+            (*(*st).codecpar).ch_layout.nb_channels = 3;
+        }
+        let (sink, events) = recording_sink();
+        match collect(&ctx, sink) {
+            Err(PacketSinkError::InvalidExtradata {
+                stream_index: 0,
+                reason,
+            }) => {
+                assert!(
+                    reason.contains("Parametric Stereo") && reason.contains('3'),
+                    "got {reason:?}"
+                );
+            }
+            Err(other) => panic!("expected InvalidExtradata, got {other:?}"),
+            Ok(_) => panic!("collect must reject a channel count PS cannot produce"),
+        }
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "a configuration failure must precede every callback"
+        );
     }
 
     #[test]
