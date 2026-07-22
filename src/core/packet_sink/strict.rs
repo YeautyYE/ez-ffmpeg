@@ -1724,4 +1724,73 @@ mod tests {
             "a job error after clean drain reports on_delivery_error, never on_end"
         );
     }
+
+    /// Cancellation precedence when a sibling failure races the shutdown:
+    /// this sink observes a stopping status that carries NO recorded error
+    /// (an explicit stop()) and cancels its blocked send cooperatively; a
+    /// sibling's error is recorded only AFTER that observation. The terminal
+    /// must stay silent — neither `on_end` nor `on_delivery_error` — while
+    /// the recorded error is left untouched for `wait()` to report.
+    ///
+    /// Scope: the scheduler-level interleaving (a live stop() racing a live
+    /// sibling failure across worker threads) cannot be forced
+    /// deterministically, so this pins the worker-visible half of the race
+    /// end to end — the cooperative-cancel classification at the parked
+    /// send, the silent terminal, and the preserved job result that wait()
+    /// surfaces.
+    #[test]
+    fn cancelled_delivery_stays_silent_when_sibling_error_lands_later() {
+        use crate::core::scheduler::ffmpeg_scheduler::{STATUS_END, STATUS_RUN};
+        use std::sync::atomic::Ordering;
+
+        let ctx = video_ctx();
+        let (sink, rx) = PacketSink::channel(std::num::NonZeroUsize::new(1).unwrap());
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let result: Arc<Mutex<Option<crate::error::Result<()>>>> = Arc::new(Mutex::new(None));
+        let mut worker = unsafe {
+            PacketSinkWorker::collect(ctx.ctx, ctx.stream_count(), sink, &status, &result)
+        }
+        .map_err(|boxed| (*boxed).1)
+        .unwrap();
+        // The stream-info event fills the capacity-1 channel; nothing drains.
+        assert_eq!(worker.deliver_stream_info(), 0);
+        // stop(): a stopping status published with NO recorded error.
+        status.store(STATUS_END, Ordering::Release);
+        // The parked send observes the stop, finds no recorded error, and
+        // classifies the exit as cooperative cancellation.
+        let mut pb = packet(&idr_au(), 0, 0, tb25(), 0);
+        assert_eq!(
+            unsafe { worker.process_and_deliver(&mut pb) },
+            AVERROR_EXTERNAL
+        );
+        assert!(worker.cancelled_cleanly());
+        // The sibling's failure lands only now, after the classification.
+        *result.lock().unwrap() = Some(Err(crate::error::Error::WorkerPanicked(
+            "muxer1:mpegts".to_string(),
+        )));
+        // Terminal with the job error visible (what the mux worker reads
+        // after full settlement): cancellation still wins.
+        worker.finish(false, AVERROR_EXTERNAL, false, Some("muxer1:mpegts".to_string()));
+        drop(worker);
+        let (mut ends, mut errors) = (0, 0);
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                PacketSinkEvent::End => ends += 1,
+                PacketSinkEvent::Error(_) => errors += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            (ends, errors),
+            (0, 0),
+            "a cooperatively cancelled delivery must stay silent even when a \
+             sibling error is recorded before the terminal"
+        );
+        // The silent terminal left the sibling error in place: this mutex is
+        // exactly what wait() surfaces as the job result.
+        assert!(matches!(
+            result.lock().unwrap().as_ref(),
+            Some(Err(crate::error::Error::WorkerPanicked(_)))
+        ));
+    }
 }
