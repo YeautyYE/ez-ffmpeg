@@ -571,17 +571,21 @@ impl Output {
     /// tier contract, the callback order, and the **blocking backpressure**
     /// behavior (a slow callback stalls the pipeline; nothing is dropped).
     ///
-    /// Options that only make sense for a written container are rejected
-    /// when the context is built, with a typed
-    /// [`PacketSinkError`](crate::error::PacketSinkError). Currently that
-    /// covers `set_format`, `set_seek_callback`, `set_io_buffer_size`,
-    /// `set_format_opt(s)`, bitstream filters (`set_*_bsf`),
-    /// `set_video_filter`, `set_subtitle_codec`, attachments, the metadata
-    /// setters (`add_metadata`, `add_stream_metadata`, `add_chapter_metadata`,
-    /// `add_program_metadata`, `map_metadata`, `disable_auto_copy_metadata`),
-    /// stream copy, and the `flags` codec option; the set tracks the
-    /// validator and may grow. The v1 strict tier accepts only whitelisted
-    /// encoders (video: `libx264`; audio: AAC).
+    /// Options a packet sink cannot honor are rejected when the context is
+    /// built, with a typed
+    /// [`PacketSinkError`](crate::error::PacketSinkError). Container-only
+    /// options are rejected because no container is written: `set_format`,
+    /// `set_seek_callback`, `set_io_buffer_size`, `set_format_opt(s)`,
+    /// attachments, and the metadata setters (`add_metadata`,
+    /// `add_stream_metadata`, `add_chapter_metadata`, `add_program_metadata`,
+    /// `map_metadata_from_input`, `disable_auto_copy_metadata`). Pipeline
+    /// features outside the strict tier's delivery contract are rejected as
+    /// policy, not for lack of a container: `set_video_filter`, bitstream
+    /// filters (`set_*_bsf`), `set_subtitle_codec`, stream copy, and the
+    /// `flags` codec option (it could clear the `global_header` flag behind
+    /// the out-of-band configuration). The set tracks the validator and may
+    /// grow. The v1 strict tier accepts only whitelisted encoders (video:
+    /// `libx264`; audio: AAC).
     ///
     /// `Output::from(sink)` is the equivalent, crate-conventional spelling
     /// and the one used throughout the documentation.

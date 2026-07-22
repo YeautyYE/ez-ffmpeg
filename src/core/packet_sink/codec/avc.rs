@@ -834,7 +834,7 @@ mod tests {
     /// inject a synthetic AU through a real encoder; this IS the delivery
     /// code path.)
     #[test]
-    fn a4_trailing_zero_fixture_matches_movenc_output() {
+    fn a4_trailing_zero_fixture_matches_master_movenc_output() {
         let (runtime, _, _) = AvcRuntime::from_extradata(&annexb_config(), 0).unwrap();
         // SEI [06 05 FF] padded with two zeros, 3-byte start code, IDR slice
         // [65 88 84] padded with one zero at stream end.
