@@ -406,11 +406,15 @@ enum PreparedTarget {
     PacketSink(crate::core::packet_sink::PacketSink),
 }
 
-/// Build-time validation for packet-sink outputs: every option that only
-/// makes sense for a written container is a typed configuration error.
-/// Runs before the generic option validation, so these typed errors always
-/// win. Setter *use* is what is rejected (`set_io_buffer_size` stores
-/// `Some`, even when set to the default value).
+/// Build-time validation for packet-sink outputs: every option a sink
+/// cannot honor is a typed configuration error. Two families are rejected —
+/// container-only options (no container is written, so they could never
+/// take effect) and pipeline features outside the strict tier's delivery
+/// contract (filters, bitstream filters, subtitle codecs — rejected as
+/// policy, not for lack of a container). Runs before the generic option
+/// validation, so these typed errors always win. Setter *use* is what is
+/// rejected (`set_io_buffer_size` stores `Some`, even when set to the
+/// default value).
 fn validate_packet_sink_options(output: &Output) -> Result<()> {
     use crate::error::PacketSinkError;
     let unsupported: &[(&'static str, bool)] = &[
@@ -443,7 +447,7 @@ fn validate_packet_sink_options(output: &Output) -> Result<()> {
             "add_program_metadata",
             !output.program_metadata.is_empty(),
         ),
-        ("map_metadata", !output.metadata_map.is_empty()),
+        ("map_metadata_from_input", !output.metadata_map.is_empty()),
         // auto_copy_metadata only governs container metadata propagation;
         // toggling it on a sink is a configuration mistake like the rest.
         ("disable_auto_copy_metadata", !output.auto_copy_metadata),

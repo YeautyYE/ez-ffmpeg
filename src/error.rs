@@ -512,7 +512,11 @@ pub enum MuxingOperationError {
 #[derive(thiserror::Error, Debug, Clone)]
 #[non_exhaustive]
 pub enum PacketSinkError {
-    /// A muxer-only builder option was set on a packet-sink output.
+    /// A builder option the packet sink cannot honor was set: either a
+    /// container-only option (no container is written, so it could never
+    /// take effect) or a pipeline feature outside the strict tier's
+    /// delivery contract (filters, bitstream filters, subtitle codecs —
+    /// rejected as policy, not for lack of a container).
     #[error("{0} is not supported on packet-sink outputs")]
     UnsupportedOption(&'static str),
 

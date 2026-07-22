@@ -928,8 +928,10 @@ fn _mux_init(
             .take_pkt_receiver()
             .expect("mux worker without a packet queue");
         // Borrow of the guard-owned output context for the FFI calls below;
-        // NLL ends this borrow at its last use (the trailer), before the
-        // explicit drop(guard) in the teardown block.
+        // NLL ends this borrow at its last use — the trailer write on a
+        // container path that attempts one; earlier for a packet-sink
+        // worker (no trailer exists) or an abort (the trailer is skipped) —
+        // before the explicit drop(guard) in the teardown block.
         let out_fmt_ctx: &FormatContext = guard.ctx();
         // Per-output-stream BSF chains (None for streams without one), or an
         // empty vec when no output set a BSF at all. Owned by the worker; each
@@ -3186,9 +3188,13 @@ mod tests {
 
     // Slot-leak regression: the mux worker releases its pre-counted thread slot
     // via a MANUAL thread_done_with (not ThreadDoneGuard) so the release lands
-    // only after the trailer/join — mux completion itself (STATUS_END via
-    // MuxDoneGuard) is deliberately published BEFORE the encoder join. A panic
-    // before that manual call would leak the slot and hang wait_for_all_threads.
+    // only after the output's teardown — the trailer where a container writes
+    // one (packet-sink workers write none; streamless and header-failure
+    // outputs release the same pre-counted slot without a worker at all, via
+    // release_mux_slot), then the encoder join — while mux completion itself
+    // (STATUS_END via MuxDoneGuard) is deliberately published BEFORE the
+    // encoder join. A panic before that manual call would leak the slot and
+    // hang wait_for_all_threads.
     // MuxSlotGuard is the panic-only net: an ARMED drop (the unwind path) must
     // release the slot.
     #[test]
