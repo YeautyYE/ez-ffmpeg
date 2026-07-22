@@ -1858,14 +1858,18 @@ mod tests {
     /// (an explicit stop()) and cancels its blocked send cooperatively; a
     /// sibling's error is recorded only AFTER that observation. The terminal
     /// must stay silent — neither `on_end` nor `on_delivery_error` — while
-    /// the recorded error is left untouched for `wait()` to report.
+    /// the recorded error is left untouched in the job-result slot that the
+    /// driving `stop()` returns after settlement (`abort()` returns nothing,
+    /// and neither call leaves a handle to `wait()` on).
     ///
-    /// Scope: the scheduler-level interleaving (a live stop() racing a live
-    /// sibling failure across worker threads) cannot be forced
-    /// deterministically, so this pins the worker-visible half of the race
-    /// end to end — the cooperative-cancel classification at the parked
-    /// send, the silent terminal, and the preserved job result that wait()
-    /// surfaces.
+    /// Scope: what this pins is the WORKER-side precedence, end to end —
+    /// the cooperative-cancel classification at the parked send, the silent
+    /// terminal, and the job-result slot left untouched for the scheduler
+    /// to hand back. What it cannot pin: the scheduler-level interleaving
+    /// (a live stop() racing a live sibling failure across worker threads)
+    /// cannot be forced deterministically here, and stop() returning that
+    /// slot's error is scheduler surface this worker-level harness never
+    /// calls.
     #[test]
     fn cancelled_delivery_stays_silent_when_sibling_error_lands_later() {
         use crate::core::scheduler::ffmpeg_scheduler::{STATUS_END, STATUS_RUN};
@@ -1915,7 +1919,7 @@ mod tests {
              sibling error is recorded before the terminal"
         );
         // The silent terminal left the sibling error in place: this mutex is
-        // exactly what wait() surfaces as the job result.
+        // the job-result slot the driving stop() drains after settlement.
         assert!(matches!(
             result.lock().unwrap().as_ref(),
             Some(Err(crate::error::Error::WorkerPanicked(_)))
