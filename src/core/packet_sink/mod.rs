@@ -96,7 +96,8 @@
 //! yields `wait() == Ok`, and a failing job keeps its original error).
 //!
 //! That containment is **per callback box** (per handler box for
-//! [`PacketSinkHandler`]). A panic thrown by a callback, or by ONE
+//! [`PacketSinkHandler`](crate::packet_sink::PacketSinkHandler)). A panic
+//! thrown by a callback, or by ONE
 //! destructor — a captured value's, a stashed error source's, or a
 //! `panic_any` payload's — is contained, and the crate keeps every such
 //! unwind single: each box is destroyed under its own catch, and the
