@@ -24,29 +24,79 @@ use crate::error::PacketSinkError;
 const NAL_SPS_EXT: u8 = 13;
 
 /// Parsed parameter sets of one H.264 configuration, in original order.
-/// avcC synthesis consumes this form (movenc preserves wrapper order); the S8
-/// fingerprint uses [`Self::into_canonical`], which is wrapper- AND
-/// order-independent (the same sets can arrive as Annex-B, avcC or
-/// `NEW_EXTRADATA` side data, in any order — neither wrapper bytes nor
-/// ordering constitutes a configuration change).
+/// avcC synthesis consumes this form (movenc preserves wrapper order); the
+/// S8 comparison instead uses the [`ConfigFingerprint`] built during the
+/// same parse, which keys the sets by parameter-set identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ParameterSets {
     pub(crate) sps: Vec<Vec<u8>>,
     pub(crate) pps: Vec<Vec<u8>>,
 }
 
-impl ParameterSets {
-    /// The canonical S8 fingerprint form: parameter sets sorted by identity
-    /// (byte content) with exact duplicates removed. Duplicate policy: a
-    /// repeated identical set is redundant, never a change; two sets that
-    /// differ in any byte are distinct identities.
-    pub(crate) fn into_canonical(mut self) -> Self {
-        self.sps.sort_unstable();
-        self.sps.dedup();
-        self.pps.sort_unstable();
-        self.pps.dedup();
-        self
+/// The S8 fingerprint of one configuration: the EFFECTIVE parameter sets,
+/// keyed by the identity a decoder stores them under. H.264 parameter sets
+/// are addressed by id (`seq_parameter_set_id` / `pic_parameter_set_id`),
+/// and a re-sent id REPLACES its predecessor — the sps_list/pps_list slot
+/// overwrite in libavcodec/h264_ps.c — so what consumers can activate is
+/// the last-wins id map, not the byte multiset. Two configurations are
+/// equal exactly when every id maps to the same bytes: the order of
+/// DISTINCT ids never matters (wrapper bytes and array position address
+/// nothing), a repeated byte-identical set collapses into its slot and
+/// stays redundant, while reordering two same-id sets with different
+/// bytes swaps which one is active and IS a configuration change even
+/// though the byte set is unchanged. SPS-EXT bodies (the avcC
+/// `sequenceParameterSetExtNALUnit` array) are part of the delivered
+/// configuration and are fingerprinted in array order; their ids are not
+/// parsed, so adding, dropping or editing one changes the fingerprint.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ConfigFingerprint {
+    /// `seq_parameter_set_id` -> bytes of the last SPS carrying it,
+    /// ascending by id.
+    sps: Vec<(u32, Vec<u8>)>,
+    /// `pic_parameter_set_id` -> bytes of the last PPS carrying it,
+    /// ascending by id.
+    pps: Vec<(u32, Vec<u8>)>,
+    /// SPS-EXT bodies in record order (an Annex-B configuration carries
+    /// none — that path admits only SPS and PPS).
+    sps_ext: Vec<Vec<u8>>,
+}
+
+impl ConfigFingerprint {
+    /// Last-wins insertion: the slot for `id` is created at its
+    /// ascending-id position or overwritten when already present.
+    fn put(slots: &mut Vec<(u32, Vec<u8>)>, id: u32, bytes: &[u8]) {
+        match slots.binary_search_by_key(&id, |(slot, _)| *slot) {
+            Ok(i) => slots[i].1 = bytes.to_vec(),
+            Err(i) => slots.insert(i, (id, bytes.to_vec())),
+        }
     }
+
+    fn put_sps(&mut self, id: u32, bytes: &[u8]) {
+        Self::put(&mut self.sps, id, bytes);
+    }
+
+    fn put_pps(&mut self, id: u32, bytes: &[u8]) {
+        Self::put(&mut self.pps, id, bytes);
+    }
+
+    /// Whether `nal` is byte-identical to an ACTIVE set of the
+    /// configuration (a replaced same-id predecessor is not active).
+    fn has_active_sps(&self, nal: &[u8]) -> bool {
+        self.sps.iter().any(|(_, bytes)| bytes.as_slice() == nal)
+    }
+
+    fn has_active_pps(&self, nal: &[u8]) -> bool {
+        self.pps.iter().any(|(_, bytes)| bytes.as_slice() == nal)
+    }
+}
+
+/// One parsed configuration: the ordered sets avcC synthesis and the codec
+/// projection consume, plus the identity-keyed S8 fingerprint built during
+/// the same parse.
+#[derive(Debug)]
+pub(crate) struct AvcConfig {
+    pub(crate) sets: ParameterSets,
+    pub(crate) fingerprint: ConfigFingerprint,
 }
 
 /// Extracts parameter sets from extradata in either Annex-B or avcC form.
@@ -54,7 +104,7 @@ impl ParameterSets {
 /// body through [`parse_pps`] (the avcC branch inside
 /// [`parse_avcc_record`]), so the syntax guarantees are
 /// wrapper-independent.
-pub(crate) fn parse_parameter_sets(extradata: &[u8]) -> Result<ParameterSets, String> {
+pub(crate) fn parse_parameter_sets(extradata: &[u8]) -> Result<AvcConfig, String> {
     if extradata.first() == Some(&1) {
         parse_avcc_parameter_sets(extradata)
     } else {
@@ -62,61 +112,80 @@ pub(crate) fn parse_parameter_sets(extradata: &[u8]) -> Result<ParameterSets, St
             sps: Vec::new(),
             pps: Vec::new(),
         };
-        let mut bad_type: Option<u8> = None;
-        let mut bad_header: Option<u8> = None;
+        let mut fingerprint = ConfigFingerprint::default();
+        let mut summaries: Vec<SpsSummary> = Vec::new();
+        let mut error: Option<String> = None;
+        // Sequential, in stream order, mirroring decode_extradata_ps
+        // (libavcodec/h264_parse.c): an SPS enters the resolution context
+        // as it is encountered, and a PPS resolves its
+        // seq_parameter_set_id against the SPS seen SO FAR — parameter-set
+        // activation cannot reach forward, so a PPS ahead of every SPS
+        // carrying its id is the same dangling reference
+        // ff_h264_decode_picture_parameter_set fails ("sps_id ... out of
+        // range"). Every body must parse to its rbsp_trailing_bits, not
+        // just the first SPS avcC synthesis reads fields from; the first
+        // offense in stream order wins.
         walk_annexb(extradata, |nal| {
+            if error.is_some() {
+                return;
+            }
             // Full NAL header validation, not a type mask: FFmpeg's NAL
             // reader rejects a set forbidden_zero_bit the same way
             // (`h264_parse_nal_header`, libavcodec/h2645_parse.c) while
             // accepting any nal_ref_idc.
             if nal[0] & 0x80 != 0 {
-                bad_header = bad_header.or(Some(nal[0]));
+                error = Some(format!(
+                    "configuration NAL header 0x{:02X} has forbidden_zero_bit set",
+                    nal[0]
+                ));
                 return;
             }
             match nal[0] & 0x1F {
-                NAL_SPS => sets.sps.push(nal.to_vec()),
-                NAL_PPS => sets.pps.push(nal.to_vec()),
-                other => bad_type = bad_type.or(Some(other)),
+                NAL_SPS => match parse_sps(nal) {
+                    Ok(summary) => {
+                        fingerprint.put_sps(summary.sps_id, nal);
+                        summaries.push(summary);
+                        sets.sps.push(nal.to_vec());
+                    }
+                    Err(e) => error = Some(format!("SPS: {e}")),
+                },
+                NAL_PPS => match parse_pps(nal, &summaries) {
+                    Ok(pps_id) => {
+                        fingerprint.put_pps(pps_id, nal);
+                        sets.pps.push(nal.to_vec());
+                    }
+                    Err(e) => error = Some(format!("PPS: {e}")),
+                },
+                other => {
+                    error = Some(format!(
+                        "unexpected NAL type {other} in configuration data (expected SPS/PPS)"
+                    ));
+                }
             }
         })?;
-        if let Some(header) = bad_header {
-            return Err(format!(
-                "configuration NAL header 0x{header:02X} has forbidden_zero_bit set"
-            ));
-        }
-        if let Some(other) = bad_type {
-            return Err(format!(
-                "unexpected NAL type {other} in configuration data (expected SPS/PPS)"
-            ));
+        if let Some(reason) = error {
+            return Err(reason);
         }
         if sets.sps.is_empty() || sets.pps.is_empty() {
             return Err("configuration data lacks an SPS or a PPS".to_string());
         }
-        // Every parameter-set body must parse to its rbsp_trailing_bits,
-        // not just the first SPS avcC synthesis reads fields from. The SPS
-        // pass runs first because its summaries are the context every PPS
-        // resolves its seq_parameter_set_id against (collection already
-        // separated the types, so resolution is wrapper-order-independent).
-        let mut summaries = Vec::with_capacity(sets.sps.len());
-        for sps in &sets.sps {
-            summaries.push(parse_sps(sps).map_err(|e| format!("SPS: {e}"))?);
-        }
-        for pps in &sets.pps {
-            parse_pps(pps, &summaries).map_err(|e| format!("PPS: {e}"))?;
-        }
-        Ok(sets)
+        Ok(AvcConfig { sets, fingerprint })
     }
 }
 
 /// Parses an AVCDecoderConfigurationRecord, enforcing the strict-tier
 /// checks; the thin wrapper over [`parse_avcc_record`] that drops the
-/// structural fields once validation passed.
-pub(crate) fn parse_avcc_parameter_sets(avcc: &[u8]) -> Result<ParameterSets, String> {
-    parse_avcc_record(avcc).map(|record| record.sets)
+/// structural header fields once validation passed.
+pub(crate) fn parse_avcc_parameter_sets(avcc: &[u8]) -> Result<AvcConfig, String> {
+    parse_avcc_record(avcc).map(|record| AvcConfig {
+        sets: record.sets,
+        fingerprint: record.fingerprint,
+    })
 }
 
 /// One fully validated AVCDecoderConfigurationRecord: the header's declared
-/// projection, the optional profile-extension fields and the parameter sets.
+/// projection, the optional profile-extension fields, the parameter sets
+/// and their identity fingerprint (which includes any SPS-EXT bodies).
 #[derive(Debug)]
 struct AvccRecord {
     header: CodecProjection,
@@ -124,6 +193,7 @@ struct AvccRecord {
     /// the profile extension, when the record carries one.
     extension: Option<(u8, u8, u8)>,
     sets: ParameterSets,
+    fingerprint: ConfigFingerprint,
 }
 
 /// Parses an AVCDecoderConfigurationRecord, enforcing the strict-tier
@@ -199,20 +269,28 @@ fn parse_avcc_record(avcc: &[u8]) -> Result<AvccRecord, String> {
     }
     // Every parameter-set body must parse to its rbsp_trailing_bits — the
     // array framing above only proves the entries have the right NAL type.
-    // SPS first: the summaries are the context each PPS resolves its
-    // seq_parameter_set_id against.
+    // SPS first: the record's arrays put every SPS ahead of every PPS by
+    // construction, so the full SPS array IS the "seen so far" context a
+    // sequential read (decode_extradata_ps, libavcodec/h264_parse.c) would
+    // hand each PPS. The same loops feed the identity fingerprint.
+    let mut fingerprint = ConfigFingerprint::default();
     let mut summaries = Vec::with_capacity(sets.sps.len());
     for sps in &sets.sps {
-        summaries.push(parse_sps(sps).map_err(|e| format!("avcC SPS: {e}"))?);
+        let summary = parse_sps(sps).map_err(|e| format!("avcC SPS: {e}"))?;
+        fingerprint.put_sps(summary.sps_id, sps);
+        summaries.push(summary);
     }
     for pps in &sets.pps {
-        parse_pps(pps, &summaries).map_err(|e| format!("avcC PPS: {e}"))?;
+        let pps_id = parse_pps(pps, &summaries).map_err(|e| format!("avcC PPS: {e}"))?;
+        fingerprint.put_pps(pps_id, pps);
     }
-    let extension = parse_avcc_extension(avcc, pos, header.profile)?;
+    let (extension, sps_ext) = parse_avcc_extension(avcc, pos, header.profile)?;
+    fingerprint.sps_ext = sps_ext;
     let record = AvccRecord {
         header,
         extension,
         sets,
+        fingerprint,
     };
     check_avcc_consistency(&record)?;
     Ok(record)
@@ -250,14 +328,17 @@ fn check_ps_nal_header(header: u8, expected_type: u8, what: &str) -> Result<(), 
 /// (`ff_h264_decode_extradata`, libavcodec/h264_parse.c) stops there
 /// without ever requiring it — a record that ends there is accepted. When
 /// the block IS present it must be complete, carry all-ones reserved bits,
-/// hold SPS-EXT NALs only, and end the record.
+/// hold SPS-EXT NALs only, and end the record. The SPS-EXT bodies are
+/// RETAINED, not just header-checked: they are part of the delivered
+/// configuration, so the S8 fingerprint must see them — an announcement
+/// that adds, drops or edits one is a configuration change.
 fn parse_avcc_extension(
     avcc: &[u8],
     mut pos: usize,
     profile: u8,
-) -> Result<Option<(u8, u8, u8)>, String> {
+) -> Result<(Option<(u8, u8, u8)>, Vec<Vec<u8>>), String> {
     if pos == avcc.len() {
-        return Ok(None);
+        return Ok((None, Vec::new()));
     }
     let trailing = avcc.len() - pos;
     if profile == 66 || profile == 77 || profile == 88 {
@@ -290,9 +371,11 @@ fn parse_avcc_extension(
     let bit_depth_chroma = (avcc[pos + 2] & 0x07) + 8;
     let sps_ext_count = avcc[pos + 3] as usize;
     pos += 4;
+    let mut sps_ext = Vec::with_capacity(sps_ext_count);
     for _ in 0..sps_ext_count {
         let ps = read_u16_prefixed(avcc, &mut pos).map_err(|e| format!("SPS-EXT entry: {e}"))?;
         check_ps_nal_header(ps[0], NAL_SPS_EXT, "SPS-EXT")?;
+        sps_ext.push(ps);
     }
     if pos != avcc.len() {
         return Err(format!(
@@ -300,7 +383,10 @@ fn parse_avcc_extension(
             avcc.len() - pos
         ));
     }
-    Ok(Some((chroma_format_idc, bit_depth_luma, bit_depth_chroma)))
+    Ok((
+        Some((chroma_format_idc, bit_depth_luma, bit_depth_chroma)),
+        sps_ext,
+    ))
 }
 
 /// The avcC header and the record's own first SPS must describe one
@@ -501,7 +587,20 @@ fn parse_sps(sps: &[u8]) -> Result<SpsSummary, String> {
     let rbsp = unescape_rbsp(&sps[1..]);
     let mut r = BitReader::new(&rbsp);
     let profile_idc = r.bits(8)? as u8;
-    r.bits(8)?; // constraint flags + reserved
+    r.bits(6)?; // constraint_set0..5_flag
+    // reserved_zero_2bits "shall be equal to 0" (H.264 7.4.2.1.1) and
+    // conforming encoders comply. FFmpeg's decoder and its avcC writer's
+    // own SPS reader both skip the pair unchecked (`skip_bits(gb, 2)` in
+    // libavcodec/h264_ps.c and libavformat/avc.c); the CBS reader pins the
+    // field to zero (`u(2, reserved_zero_2bits, 0, 0)`,
+    // libavcodec/cbs_h264_syntax_template.c), and a validator has no
+    // reason to wave through bits the spec forbids.
+    let reserved_zero_2bits = r.bits(2)?;
+    if reserved_zero_2bits != 0 {
+        return Err(format!(
+            "reserved_zero_2bits is {reserved_zero_2bits} (7.4.2.1.1 requires 0)"
+        ));
+    }
     r.bits(8)?; // level_idc
     let sps_id = r.ue()?;
     if sps_id > 31 {
@@ -545,6 +644,17 @@ fn parse_sps(sps: &[u8]) -> Result<SpsSummary, String> {
                 bit_depth_chroma_minus8 as u8 + 8,
             )
         }
+        // Profiles outside the dispatch set carry no chroma block; the
+        // 4:2:0 / 8-bit projection mirrors BOTH FFmpeg parsers this file
+        // tracks: the decoder (libavcodec/h264_ps.c) and the avcC writer's
+        // own SPS reader (ff_avc_decode_sps, libavformat/avc.c) infer
+        // chroma_format_idc 1 unconditionally. FFmpeg's CBS reader instead
+        // infers monochrome for profile_idc 183 (`infer(chroma_format_idc,
+        // current->profile_idc == 183 ? 0 : 1)`,
+        // libavcodec/cbs_h264_syntax_template.c); following it here would
+        // make the synthesized avcC extension disagree with what
+        // ff_isom_write_avcc itself writes for the same SPS, and the
+        // header consistency check would then reject FFmpeg's own records.
         _ => (1, 8, 8),
     };
     let log2_max_frame_num_minus4 = r.ue()?;
@@ -632,12 +742,15 @@ fn skip_scaling_list(r: &mut BitReader, size: u32) -> Result<(), String> {
 }
 
 /// Parses one complete PPS NAL (header byte included) through
-/// `rbsp_trailing_bits` (H.264 7.3.2.2). Every extradata path routes each
-/// PPS body through this parse after the SPS pass, so `sps_context` holds
-/// one summary per already-validated SPS; the referenced SPS supplies the
-/// chroma_format_idc that sizes the pic_scaling_matrix block, the same way
-/// `ff_h264_decode_picture_parameter_set` (libavcodec/h264_ps.c) reads it
-/// from the `pps->sps` it resolves first.
+/// `rbsp_trailing_bits` (H.264 7.3.2.2), returning its
+/// `pic_parameter_set_id`. Every extradata path routes each PPS body
+/// through this parse; `sps_context` holds one summary per SPS that
+/// PRECEDES the PPS in the configuration — the sets a sequential reader
+/// (decode_extradata_ps, libavcodec/h264_parse.c) would have decoded when
+/// the PPS arrives, so a PPS can only bind backward. The referenced SPS
+/// supplies the chroma_format_idc that sizes the pic_scaling_matrix
+/// block, the same way `ff_h264_decode_picture_parameter_set`
+/// (libavcodec/h264_ps.c) reads it from the `pps->sps` it resolves first.
 ///
 /// Field bounds mirror h264_ps.c: `pic_parameter_set_id <= 255`
 /// (MAX_PPS_COUNT = 256), `seq_parameter_set_id <= 31` (MAX_SPS_COUNT =
@@ -661,7 +774,7 @@ fn skip_scaling_list(r: &mut BitReader, size: u32) -> Result<(), String> {
 ///   encoders pad the RBSP and it never verifies rbsp_trailing_bits. The
 ///   validator verifies the trailing bits instead, which accepts
 ///   conforming padding and rejects garbage tails on every profile.
-fn parse_pps(pps: &[u8], sps_context: &[SpsSummary]) -> Result<(), String> {
+fn parse_pps(pps: &[u8], sps_context: &[SpsSummary]) -> Result<u32, String> {
     let rbsp = unescape_rbsp(&pps[1..]);
     let mut r = BitReader::new(&rbsp);
     let pps_id = r.ue()?;
@@ -672,14 +785,16 @@ fn parse_pps(pps: &[u8], sps_context: &[SpsSummary]) -> Result<(), String> {
     if sps_id > 31 {
         return Err(format!("seq_parameter_set_id {sps_id} exceeds 31"));
     }
-    // The last summary with the id wins, mirroring the sps_list slot
-    // replacement in h264_ps.c (a re-sent id overwrites its predecessor).
+    // The last preceding summary with the id wins, mirroring the sps_list
+    // slot replacement in h264_ps.c (a re-sent id overwrites its
+    // predecessor); an SPS that only appears LATER in the configuration is
+    // invisible here, exactly as it is to a sequential decode.
     let sps = sps_context
         .iter()
         .rev()
         .find(|s| s.sps_id == sps_id)
         .ok_or_else(|| {
-            format!("references seq_parameter_set_id {sps_id}, which no SPS in the configuration carries")
+            format!("references seq_parameter_set_id {sps_id}, which no preceding SPS in the configuration carries")
         })?;
     r.bits(1)?; // entropy_coding_mode_flag
     r.bits(1)?; // bottom_field_pic_order_in_frame_present_flag
@@ -768,7 +883,8 @@ fn parse_pps(pps: &[u8], sps_context: &[SpsSummary]) -> Result<(), String> {
             ));
         }
     }
-    r.finish_rbsp()
+    r.finish_rbsp()?;
+    Ok(pps_id)
 }
 
 /// Consumes the multi-group slice_group_map syntax of 7.3.2.2 (map types
@@ -1000,9 +1116,10 @@ pub(crate) struct AvcRuntime {
     /// length-prefixed packets (validated in place). The forms never mix
     /// within one encoder.
     annexb_packets: bool,
-    /// Composite S8 baseline, part 1: canonical parameter-set fingerprint
-    /// (wrapper- and order-independent set identities).
-    baseline: ParameterSets,
+    /// Composite S8 baseline, part 1: the identity-keyed fingerprint of
+    /// the effective configuration ([`ConfigFingerprint`] — wrapper-
+    /// independent, last-wins per parameter-set id).
+    baseline: ConfigFingerprint,
     /// Composite S8 baseline, part 2: the derived codec projection the
     /// stream configuration exposes — same source as `on_stream_info`, so a
     /// reordering that changes what consumers were told (profile /
@@ -1025,22 +1142,22 @@ impl AvcRuntime {
             reason,
         };
         let annexb_packets = extradata.first() != Some(&1);
-        let ordered = parse_parameter_sets(extradata).map_err(&invalid)?;
-        let projection = CodecProjection::from_ordered_sets(&ordered).map_err(&invalid)?;
+        let config = parse_parameter_sets(extradata).map_err(&invalid)?;
+        let projection = CodecProjection::from_ordered_sets(&config.sets).map_err(&invalid)?;
         // Header/SPS agreement needs no separate step here: a pass-through
         // record was already held against its own first SPS by
         // `check_avcc_consistency` inside the parse (bytes 1..4 plus the
         // profile-extension fields), and a synthesized record copies those
         // bytes from that same first SPS.
         let delivered = if annexb_packets {
-            build_avcc(&ordered).map_err(&invalid)?
+            build_avcc(&config.sets).map_err(&invalid)?
         } else {
             extradata.to_vec()
         };
         Ok((
             Self {
                 annexb_packets,
-                baseline: ordered.into_canonical(),
+                baseline: config.fingerprint,
                 projection,
             },
             delivered,
@@ -1048,8 +1165,9 @@ impl AvcRuntime {
         ))
     }
 
-    /// S8: a `NEW_EXTRADATA` announcement — value-equal (canonicalized)
-    /// parameter sets are redundant and pass; anything else is a mid-stream
+    /// S8: a `NEW_EXTRADATA` announcement — one whose EFFECTIVE
+    /// configuration (the identity-keyed [`ConfigFingerprint`]) is
+    /// unchanged is redundant and passes; anything else is a mid-stream
     /// configuration change.
     ///
     /// An avcC-form announcement passes through the same full record
@@ -1062,7 +1180,7 @@ impl AvcRuntime {
         bytes: &[u8],
         stream_index: usize,
     ) -> Result<(), PacketSinkError> {
-        let ordered = parse_parameter_sets(bytes).map_err(|reason| {
+        let config = parse_parameter_sets(bytes).map_err(|reason| {
             PacketSinkError::ConfigChange {
                 stream_index,
                 what: format!("invalid NEW_EXTRADATA ({reason})"),
@@ -1072,8 +1190,8 @@ impl AvcRuntime {
         // told (profile/compatibility/level, from the announcement's own
         // ordered first SPS — the same derivation on_stream_info used). A
         // reorder that changes it IS a configuration change even when the
-        // set identities below are unchanged.
-        let projection = CodecProjection::from_ordered_sets(&ordered).map_err(|reason| {
+        // effective identity map below is unchanged.
+        let projection = CodecProjection::from_ordered_sets(&config.sets).map_err(|reason| {
             PacketSinkError::ConfigChange {
                 stream_index,
                 what: format!("invalid NEW_EXTRADATA SPS ({reason})"),
@@ -1089,11 +1207,12 @@ impl AvcRuntime {
                 ),
             });
         }
-        // Composite baseline, part 1: canonical set identities.
-        if ordered.into_canonical() != self.baseline {
+        // Composite baseline, part 1: the effective identity map (and the
+        // SPS-EXT list) must be unchanged.
+        if config.fingerprint != self.baseline {
             return Err(PacketSinkError::ConfigChange {
                 stream_index,
-                what: "NEW_EXTRADATA carries different parameter sets".to_string(),
+                what: "NEW_EXTRADATA changes the effective parameter sets".to_string(),
             });
         }
         Ok(())
@@ -1148,9 +1267,11 @@ impl AvcRuntime {
         Ok((scan.has_idr, data))
     }
 
-    /// In-band SPS/PPS: sets differing from the baseline are a configuration
-    /// change; value-equal sets fall through to the strict-tier in-band
-    /// rejection at the caller. `data` is length-prefixed (post-normalization).
+    /// In-band SPS/PPS: sets differing from the ACTIVE baseline (a
+    /// replaced same-id predecessor is no longer active) are a
+    /// configuration change; value-equal sets fall through to the
+    /// strict-tier in-band rejection at the caller. `data` is
+    /// length-prefixed (post-normalization).
     fn check_inband_parameter_sets(
         &self,
         data: &[u8],
@@ -1159,8 +1280,8 @@ impl AvcRuntime {
         let mut mismatch = false;
         let _ = walk_length_prefixed(data, |nal| {
             let matches_baseline = match nal[0] & 0x1F {
-                NAL_SPS => self.baseline.sps.iter().any(|s| s.as_slice() == nal),
-                NAL_PPS => self.baseline.pps.iter().any(|p| p.as_slice() == nal),
+                NAL_SPS => self.baseline.has_active_sps(nal),
+                NAL_PPS => self.baseline.has_active_pps(nal),
                 _ => return,
             };
             if !matches_baseline {
@@ -1193,6 +1314,15 @@ mod tests {
         0x00, 0x00, 0x03, 0x03, 0x20, 0xF1, 0x62, 0xE4, 0x80,
     ];
     const PPS: &[u8] = &[0x68, 0xCB, 0x83, 0xCB, 0x20];
+
+    // Same encoder, profile and level as `SPS` (identical bytes 1..4, so
+    // the derived projection matches) but coding 640x480: same
+    // seq_parameter_set_id 0 with a different tail, so it REPLACES `SPS`
+    // in the id map when both appear.
+    const SAME_PROJ_SPS: &[u8] = &[
+        0x67, 0x42, 0xC0, 0x1E, 0xD9, 0x00, 0xA0, 0x3D, 0xB0, 0x11, 0x00, 0x00, 0x03, 0x00,
+        0x01, 0x00, 0x00, 0x03, 0x00, 0x32, 0x0F, 0x16, 0x2E, 0x48,
+    ];
 
     // Same encoder and coded shape (320x240 yuv420p 8-bit, level_idc 30) at
     // High profile (profile_idc 100): chroma_format_idc 1 and 8-bit depths,
@@ -1320,12 +1450,19 @@ mod tests {
     // (last byte 0x20 -> 0x00); every parsed field is untouched.
     const BAD_STOP_BIT_PPS: &[u8] = &[0x68, 0xCB, 0x83, 0xCB, 0x00];
 
-    fn annexb_with(sps: &[u8], pps: &[u8]) -> Vec<u8> {
-        let mut v = vec![0, 0, 0, 1];
-        v.extend_from_slice(sps);
-        v.extend_from_slice(&[0, 0, 1]);
-        v.extend_from_slice(pps);
+    /// Joins NALs into an Annex-B configuration: a 4-byte start code, then
+    /// 3-byte separators.
+    fn annexb_concat(nals: &[&[u8]]) -> Vec<u8> {
+        let mut v = Vec::new();
+        for (i, nal) in nals.iter().enumerate() {
+            v.extend_from_slice(if i == 0 { &[0, 0, 0, 1][..] } else { &[0, 0, 1][..] });
+            v.extend_from_slice(nal);
+        }
         v
+    }
+
+    fn annexb_with(sps: &[u8], pps: &[u8]) -> Vec<u8> {
+        annexb_concat(&[sps, pps])
     }
 
     fn annexb_config() -> Vec<u8> {
@@ -1339,7 +1476,7 @@ mod tests {
 
     #[test]
     fn builds_and_reparses_avcc() {
-        let sets = parse_parameter_sets(&annexb_config()).unwrap();
+        let sets = parse_parameter_sets(&annexb_config()).unwrap().sets;
         assert_eq!(sets.sps, vec![SPS.to_vec()]);
         assert_eq!(sets.pps, vec![PPS.to_vec()]);
         let avcc = build_avcc(&sets).unwrap();
@@ -1347,7 +1484,7 @@ mod tests {
         assert_eq!(avcc[1], 66);
         assert_eq!(avcc[4] & 0x03, 3, "lengthSizeMinusOne must be 3");
         assert_eq!(avcc[5] & 0x1F, 1);
-        let reparsed = parse_avcc_parameter_sets(&avcc).unwrap();
+        let reparsed = parse_avcc_parameter_sets(&avcc).unwrap().sets;
         assert_eq!(reparsed, sets);
         // Baseline profile: no extension bytes.
         let sps_len = SPS.len();
@@ -1379,7 +1516,7 @@ mod tests {
 
     #[test]
     fn rejects_non_four_byte_avcc() {
-        let sets = parse_parameter_sets(&annexb_config()).unwrap();
+        let sets = parse_parameter_sets(&annexb_config()).unwrap().sets;
         let mut avcc = build_avcc(&sets).unwrap();
         avcc[4] = 0xFC | 1; // lengthSizeMinusOne = 1 (2-byte prefixes)
         assert!(parse_avcc_parameter_sets(&avcc).is_err());
@@ -1388,27 +1525,37 @@ mod tests {
     #[test]
     fn fingerprint_is_wrapper_independent() {
         let from_annexb = parse_parameter_sets(&annexb_config()).unwrap();
-        let avcc = build_avcc(&from_annexb).unwrap();
+        let avcc = build_avcc(&from_annexb.sets).unwrap();
         let from_avcc = parse_parameter_sets(&avcc).unwrap();
-        assert_eq!(from_annexb, from_avcc);
+        assert_eq!(from_annexb.sets, from_avcc.sets);
+        assert_eq!(from_annexb.fingerprint, from_avcc.fingerprint);
     }
 
+    /// The S8 fingerprint keys parameter sets by identity: reordering
+    /// DISTINCT ids or repeating a byte-identical set changes nothing,
+    /// while reordering two same-id sets with different bytes swaps which
+    /// one is active — the two orders are different configurations even
+    /// though their byte SET is identical.
     #[test]
-    fn canonical_form_is_order_insensitive_and_deduplicated() {
-        let a = ParameterSets {
-            sps: vec![SPS.to_vec(), HIGH_SPS.to_vec()],
-            pps: vec![PPS.to_vec(), PPS.to_vec()],
-        };
-        let b = ParameterSets {
-            sps: vec![HIGH_SPS.to_vec(), SPS.to_vec()],
-            pps: vec![PPS.to_vec()],
-        };
-        assert_ne!(a, b, "ordered forms differ");
-        assert_eq!(
-            a.clone().into_canonical(),
-            b.clone().into_canonical(),
-            "canonical forms are identical"
-        );
+    fn fingerprint_keys_parameter_sets_by_identity() {
+        let fp = |config: &[u8]| parse_parameter_sets(config).unwrap().fingerprint;
+        // Distinct ids (0 and 31): order is not part of the identity map.
+        let a = annexb_concat(&[SPS, SPS_ID_31, PPS]);
+        let b = annexb_concat(&[SPS_ID_31, SPS, PPS]);
+        assert_eq!(fp(&a), fp(&b), "distinct-id order must not matter");
+        // A byte-identical resend collapses into its slot.
+        let dup = annexb_concat(&[SPS, SPS, PPS, PPS]);
+        let single = annexb_concat(&[SPS, PPS]);
+        assert_eq!(fp(&dup), fp(&single), "identical resend is redundant");
+        // Two id-0 SPS with different bytes: the last one is active, so
+        // the two orders are DIFFERENT effective configurations.
+        let ab = annexb_concat(&[SPS, SAME_PROJ_SPS, PPS]);
+        let ba = annexb_concat(&[SAME_PROJ_SPS, SPS, PPS]);
+        assert_ne!(fp(&ab), fp(&ba), "same-id reorder swaps the active SPS");
+        // Same-id PPS pair: the same last-wins rule on the PPS side.
+        let pab = annexb_concat(&[SPS, PPS, MINIMAL_PPS]);
+        let pba = annexb_concat(&[SPS, MINIMAL_PPS, PPS]);
+        assert_ne!(fp(&pab), fp(&pba), "same-id reorder swaps the active PPS");
     }
 
     #[test]
@@ -1425,7 +1572,7 @@ mod tests {
 
         // avcC-configured stream: packets are already length-prefixed and
         // pass through unchanged (zero copy).
-        let avcc = build_avcc(&parse_parameter_sets(&annexb_config()).unwrap()).unwrap();
+        let avcc = build_avcc(&parse_parameter_sets(&annexb_config()).unwrap().sets).unwrap();
         let (runtime, _, _) = AvcRuntime::from_extradata(&avcc, 0).unwrap();
         let lp = vec![0, 0, 0, 2, 0x41, 0x9A];
         let mut scratch = Vec::new();
@@ -1545,7 +1692,7 @@ mod tests {
     fn rejects_truncated_configuration_data() {
         // Every strict prefix of a valid record is invalid: parsing must
         // fail cleanly (no panic, no partial acceptance) at every cut.
-        let avcc = build_avcc(&parse_parameter_sets(&annexb_config()).unwrap()).unwrap();
+        let avcc = build_avcc(&parse_parameter_sets(&annexb_config()).unwrap().sets).unwrap();
         for cut in 0..avcc.len() {
             assert!(
                 parse_avcc_parameter_sets(&avcc[..cut]).is_err(),
@@ -1568,7 +1715,7 @@ mod tests {
         // profile/compatibility/level accessors derive from the first SPS.
         // A record whose header disagrees would hand consumers two
         // conflicting stream descriptions and must be rejected.
-        let good = build_avcc(&parse_parameter_sets(&annexb_config()).unwrap()).unwrap();
+        let good = build_avcc(&parse_parameter_sets(&annexb_config()).unwrap().sets).unwrap();
         assert!(AvcRuntime::from_extradata(&good, 0).is_ok());
         for byte in 1..4 {
             let mut bad = good.clone();
@@ -1592,7 +1739,7 @@ mod tests {
 
     #[test]
     fn rejects_avcc_reserved_bits_cleared() {
-        let good = build_avcc(&parse_parameter_sets(&annexb_config()).unwrap()).unwrap();
+        let good = build_avcc(&parse_parameter_sets(&annexb_config()).unwrap().sets).unwrap();
         // Byte 4 keeps lengthSizeMinusOne = 3 but clears the six reserved
         // ones a conforming writer emits; masking would accept it.
         let mut bad = good.clone();
@@ -1691,7 +1838,7 @@ mod tests {
         // No extension is defined for Baseline/Main/Extended
         // (ff_isom_write_avcc appends it only for other profiles), so any
         // trailing byte on a profile-66 record is foreign data.
-        let mut avcc = build_avcc(&parse_parameter_sets(&annexb_config()).unwrap()).unwrap();
+        let mut avcc = build_avcc(&parse_parameter_sets(&annexb_config()).unwrap().sets).unwrap();
         avcc.push(0);
         let err = parse_avcc_parameter_sets(&avcc).unwrap_err();
         assert!(err.contains("no extension is defined"), "unexpected error: {err}");
@@ -1775,6 +1922,140 @@ mod tests {
         assert!(matches!(
             runtime.check_new_extradata(&tampered, 4),
             Err(PacketSinkError::ConfigChange { stream_index: 4, .. })
+        ));
+    }
+
+    /// S8 over a same-id reorder: both SPS carry seq_parameter_set_id 0
+    /// and identical projection bytes, so neither the projection gate nor
+    /// a byte-set view can tell the orders apart — but swapping them swaps
+    /// which SPS a decoder holds for id 0, so the announcement must fail.
+    /// Distinct-id reorders (ids 0 and 31) leave the identity map
+    /// untouched and stay redundant.
+    #[test]
+    fn s8_distinguishes_same_id_reorder_from_distinct_id_reorder() {
+        let config = annexb_concat(&[SPS, SAME_PROJ_SPS, PPS]);
+        let (runtime, _, _) = AvcRuntime::from_extradata(&config, 0).unwrap();
+        // The identical announcement is redundant and passes.
+        runtime.check_new_extradata(&config, 0).unwrap();
+        let swapped = annexb_concat(&[SAME_PROJ_SPS, SPS, PPS]);
+        assert!(matches!(
+            runtime.check_new_extradata(&swapped, 5),
+            Err(PacketSinkError::ConfigChange { stream_index: 5, .. })
+        ));
+
+        let config = annexb_concat(&[SPS, SPS_ID_31, PPS]);
+        let (runtime, _, _) = AvcRuntime::from_extradata(&config, 0).unwrap();
+        let swapped = annexb_concat(&[SPS_ID_31, SPS, PPS]);
+        runtime.check_new_extradata(&swapped, 0).unwrap();
+    }
+
+    /// A PPS ahead of every SPS carrying its id cannot bind: activation
+    /// cannot reach forward, and a sequential read (decode_extradata_ps,
+    /// libavcodec/h264_parse.c) fails the dangling seq_parameter_set_id
+    /// inside ff_h264_decode_picture_parameter_set. The avcC form needs no
+    /// counterpart — its arrays put every SPS ahead of every PPS by
+    /// construction.
+    #[test]
+    fn rejects_annexb_pps_ahead_of_its_sps() {
+        let config = annexb_concat(&[PPS, SPS]);
+        let err = parse_parameter_sets(&config).unwrap_err();
+        assert!(err.contains("no preceding SPS"), "unexpected error: {err}");
+        assert!(matches!(
+            AvcRuntime::from_extradata(&config, 2),
+            Err(PacketSinkError::InvalidExtradata { stream_index: 2, .. })
+        ));
+    }
+
+    /// A PPS binds the last same-id SPS seen SO FAR, never a later one:
+    /// the scaling-tail PPS parses only against the chroma-1 SPS (8 list
+    /// flags), so [chroma-1 SPS, PPS, chroma-3 SPS] must parse — binding
+    /// forward to the chroma-3 SPS would misalign the tail — while the
+    /// flipped order makes the chroma-3 set the visible context and must
+    /// fail.
+    #[test]
+    fn pps_binds_the_preceding_sps_not_a_later_one() {
+        let forward = annexb_concat(&[HIGH_SPS, SCALING_TAIL_8_PPS, CHROMA3_SCALING_SPS]);
+        parse_parameter_sets(&forward).unwrap();
+        let flipped = annexb_concat(&[CHROMA3_SCALING_SPS, SCALING_TAIL_8_PPS, HIGH_SPS]);
+        let err = parse_parameter_sets(&flipped).unwrap_err();
+        assert!(err.starts_with("PPS:"), "unexpected error: {err}");
+    }
+
+    /// SPS-EXT entries are part of the delivered configuration: an
+    /// announcement that edits, drops or adds one changes what consumers
+    /// hold, so S8 must see them; the byte-identical announcement stays
+    /// redundant.
+    #[test]
+    fn s8_sees_sps_ext_entries() {
+        let mut with_ext = build_avcc(&high_sets()).unwrap();
+        let count = with_ext.len() - 1;
+        with_ext[count] = 1;
+        with_ext.extend_from_slice(&[0, 2, 0x6D, 0x40]);
+        let (runtime, delivered, _) = AvcRuntime::from_extradata(&with_ext, 0).unwrap();
+        runtime.check_new_extradata(&delivered, 0).unwrap();
+        // Mutated SPS-EXT body: same SPS/PPS, different configuration.
+        let mut mutated = with_ext.clone();
+        let last = mutated.len() - 1;
+        mutated[last] = 0x41;
+        assert!(matches!(
+            runtime.check_new_extradata(&mutated, 3),
+            Err(PacketSinkError::ConfigChange { stream_index: 3, .. })
+        ));
+        // Dropped SPS-EXT array: ditto.
+        let without = build_avcc(&high_sets()).unwrap();
+        assert!(matches!(
+            runtime.check_new_extradata(&without, 3),
+            Err(PacketSinkError::ConfigChange { stream_index: 3, .. })
+        ));
+        // And the mirror: a baseline without SPS-EXT rejects an
+        // announcement that adds one.
+        let (runtime, _, _) = AvcRuntime::from_extradata(&without, 0).unwrap();
+        assert!(matches!(
+            runtime.check_new_extradata(&with_ext, 3),
+            Err(PacketSinkError::ConfigChange { stream_index: 3, .. })
+        ));
+    }
+
+    /// In-band comparison runs against the ACTIVE sets: an id-0 SPS the
+    /// configuration later replaced is no longer part of the stream
+    /// configuration, so carrying it in-band is a configuration change,
+    /// while the ACTIVE id-0 SPS is value-equal and falls through to the
+    /// strict-tier in-band rejection.
+    #[test]
+    fn inband_replaced_predecessor_is_a_config_change() {
+        let config = annexb_concat(&[SPS, SAME_PROJ_SPS, PPS]);
+        let (runtime, _, _) = AvcRuntime::from_extradata(&config, 0).unwrap();
+        let mut scratch = Vec::new();
+        let mut au = vec![0, 0, 0, 1];
+        au.extend_from_slice(SPS); // the REPLACED id-0 SPS
+        au.extend_from_slice(&[0, 0, 1, 0x65, 0x88, 0x80]);
+        assert!(matches!(
+            runtime.normalize_au(&au, &mut scratch, 1),
+            Err(PacketSinkError::ConfigChange { stream_index: 1, .. })
+        ));
+        let mut au = vec![0, 0, 0, 1];
+        au.extend_from_slice(SAME_PROJ_SPS); // the ACTIVE id-0 SPS
+        au.extend_from_slice(&[0, 0, 1, 0x65, 0x88, 0x80]);
+        assert!(matches!(
+            runtime.normalize_au(&au, &mut scratch, 1),
+            Err(PacketSinkError::InBandParameterSets { stream_index: 1 })
+        ));
+    }
+
+    /// reserved_zero_2bits after the constraint flags must be zero (H.264
+    /// 7.4.2.1.1). SPS byte 2 is exactly the flags-plus-reserved byte, so
+    /// setting its low bit perturbs nothing downstream — only the new
+    /// check can catch it.
+    #[test]
+    fn rejects_nonzero_reserved_zero_2bits() {
+        let mut sps = SPS.to_vec();
+        sps[2] |= 0x01;
+        let err = parse_sps(&sps).unwrap_err();
+        assert!(err.contains("reserved_zero_2bits"), "unexpected error: {err}");
+        let config = annexb_with(&sps, PPS);
+        assert!(matches!(
+            AvcRuntime::from_extradata(&config, 6),
+            Err(PacketSinkError::InvalidExtradata { stream_index: 6, .. })
         ));
     }
 
@@ -1989,7 +2270,7 @@ mod tests {
         );
         parse_pps(SPS_ID_31_PPS, &sps_ctx(&[SPS_ID_31])).unwrap();
         let err = parse_pps(SPS_ID_31_PPS, &sps_ctx(&[SPS])).unwrap_err();
-        assert!(err.contains("no SPS"), "unexpected error: {err}");
+        assert!(err.contains("no preceding SPS"), "unexpected error: {err}");
     }
 
     /// weighted_bipred_idc is a two-bit field whose value 3 does not exist
