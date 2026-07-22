@@ -1588,15 +1588,21 @@ mod tests {
         }
     }
 
-    /// Composite S8 baseline: reordering the same SPS/PPS identities is not
-    /// a configuration change — UNLESS the reorder changes the DERIVED codec
-    /// projection consumers were told (profile/compatibility/level from the
-    /// first SPS, the same source as on_stream_info). Both directions pinned.
+    /// Composite S8 baseline over reorders: both SPS fixtures carry
+    /// seq_parameter_set_id 0, and parameter sets are addressed by id
+    /// (a re-sent id replaces its predecessor — the sps_list slot
+    /// overwrite in libavcodec/h264_ps.c), so swapping them swaps which
+    /// SPS is ACTIVE — a configuration change even when the byte set and
+    /// the derived projection are both unchanged. The second variant also
+    /// flips the projection consumers were told (profile/compatibility/
+    /// level from the first SPS, the same source as on_stream_info) and
+    /// must be rejected as well.
     #[test]
-    fn reorder_is_config_change_only_when_the_projection_changes() {
+    fn same_id_reorder_is_a_config_change() {
         // Second SPS with an IDENTICAL projection (bytes 1..4) but a
         // different tail (same encoder, Constrained Baseline level 3.0,
-        // coding 640x480): reorder must pass.
+        // coding 640x480) under the same id 0: the reorder swaps the
+        // active id-0 SPS and must be rejected.
         const SAME_PROJ_SPS: &[u8] = &[
             0x67, 0x42, 0xC0, 0x1E, 0xD9, 0x00, 0xA0, 0x3D, 0xB0, 0x11, 0x00, 0x00, 0x03, 0x00,
             0x01, 0x00, 0x00, 0x03, 0x00, 0x32, 0x0F, 0x16, 0x2E, 0x48,
@@ -1637,13 +1643,17 @@ mod tests {
         }
         assert_eq!(
             unsafe { worker.process_and_deliver(&mut pb) },
-            0,
-            "reordered identical sets with an unchanged projection must pass"
+            AVERROR_EXTERNAL,
+            "a reorder that swaps the active same-id SPS must be rejected"
         );
+        assert!(matches!(
+            worker.pending_error_cloned(),
+            Some(PacketSinkError::ConfigChange { .. })
+        ));
 
-        // Same identities, but the reorder changes the first SPS's level
-        // byte — the derived projection consumers were told changes, so it
-        // IS a configuration change even though the canonical sets match.
+        // Same byte set, but this reorder ALSO changes the first SPS's
+        // level byte — the derived projection consumers were told; the
+        // announcement is rejected on that gate as well as the id map.
         let mut config = vec![0, 0, 0, 1];
         config.extend_from_slice(SPS);
         config.extend_from_slice(&[0, 0, 1]);
