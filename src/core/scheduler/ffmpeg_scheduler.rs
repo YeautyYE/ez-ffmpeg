@@ -59,7 +59,10 @@ impl Drop for SetEncRegisteredOnDrop {
 /// true once muxer `i`'s pre-counted slot has been handed to a worker or waiter
 /// (which will release it on STATUS_END); the rest are released here so
 /// `wait_for_all_threads` cannot block forever on a slot no thread owns.
-/// The success path disarms the guard after the RunningGuard takes over.
+/// The success path releases the settlement sentinel and disarms the guard
+/// back-to-back once the RunningGuard has taken over — nothing fallible in
+/// between, so a settlement waiter admitted by that release can never
+/// observe a clean job that a later unwind repaints as StartFailed.
 struct StartFailGuard {
     armed: bool,
     status: Arc<AtomicUsize>,
@@ -71,9 +74,9 @@ struct StartFailGuard {
     mux_handed: Vec<bool>,
     // Whether the settlement sentinel slot (claimed in start() before the
     // muxer pre-count) is still held. True from construction until
-    // release_sentinel() runs — on the success path explicitly after the
-    // last registration loop, on the failure path inside Drop AFTER the
-    // failure is recorded.
+    // release_sentinel() runs — on the success path at start()'s infallible
+    // tail, immediately before the disarm; on the failure path inside Drop
+    // AFTER the failure is recorded.
     sentinel_held: bool,
 }
 
@@ -387,15 +390,17 @@ impl FfmpegScheduler<Initialization> {
         let mux_done_remaining = Arc::new(AtomicUsize::new(self.ffmpeg_context.muxs.len()));
 
         // Settlement sentinel: one extra tracked slot, claimed before the
-        // first registration below and held by this thread until the last
-        // init loop completed (released by `release_sentinel`; the failure
-        // path records the error FIRST — see StartFailGuard::drop). While it
-        // is live and never settled, the packet-sink settlement barrier
-        // (`live <= settled`, thread_synchronizer.rs) cannot pass, so no
-        // fully-drained sink can decide its terminal (on_end vs JobFailed)
-        // against a job that is still launching workers: the terminal
-        // decision always samples a job whose registration either completed
-        // or failed with the error already recorded.
+        // first registration below and held by this thread until start()
+        // can no longer fail — the success path releases it (via
+        // `release_sentinel`) at the infallible tail, immediately before
+        // the guard disarm; the failure path records the error FIRST — see
+        // StartFailGuard::drop. While it is live and never settled, the
+        // packet-sink settlement barrier (`live <= settled`,
+        // thread_synchronizer.rs) cannot pass, so no fully-drained sink can
+        // decide its terminal (on_end vs JobFailed) against a job that can
+        // still fail: the terminal decision always samples a job whose
+        // start() either committed to success or failed with the error
+        // already recorded.
         thread_sync.thread_start();
 
         // Pre-count EVERY muxer's thread slot before any `mux_init` runs. A
@@ -714,10 +719,6 @@ impl FfmpegScheduler<Initialization> {
             )?;
         }
 
-        // Registration is complete: every worker this job will ever track has
-        // claimed its slot above. Reopen the packet-sink settlement barrier.
-        start_fail_guard.release_sentinel();
-
         input_controller.as_ref().update_locked(&scheduler_status);
 
         // Create Running state with guard for Drop implementation
@@ -741,6 +742,19 @@ impl FfmpegScheduler<Initialization> {
             demux_waiters,
             _interrupt_state: running_scheduler.ffmpeg_context.interrupt_state.clone(),
         });
+
+        // Registration is complete (every worker this job will ever track
+        // claimed its slot above) and the RunningGuard is installed: reopen
+        // the packet-sink settlement barrier. A drained sink this release
+        // admits samples the job result immediately and may dispatch on_end,
+        // so the release must sit where start() can no longer fail. Released
+        // before the balancing update and the Running-state construction
+        // above, a panic unwinding out of that remainder (say the balancing
+        // lock poisoned by a concurrently panicking mux worker) would record
+        // StartFailed AFTER that on_end — two contradictory terminals for
+        // one job. Nothing fallible may sit between this release and the
+        // disarm below.
+        start_fail_guard.release_sentinel();
 
         // Failure duty is now the RunningGuard's: it performs the same
         // terminal-state + join protocol for the scheduler's whole lifetime.
@@ -1351,10 +1365,16 @@ mod tests {
         // decision's exact shape.
         let observed_failure = Arc::new(AtomicBool::new(false));
         let admitted = Arc::new(AtomicBool::new(false));
+        let (registered_tx, registered_rx) = std::sync::mpsc::channel();
         let (sink_sync, sink_status, sink_result) = (sync.clone(), status.clone(), result.clone());
         let (observed_w, admitted_w) = (observed_failure.clone(), admitted.clone());
         let sink = std::thread::spawn(move || {
             sink_sync.register_settled();
+            // Registration latch: the guard must not drop before this
+            // registration is OBSERVED, or the test degenerates into "the
+            // sink arrived after the failure path already finished" and
+            // exercises no admission ordering at all.
+            registered_tx.send(()).unwrap();
             sink_sync.wait_peers_settled();
             admitted_w.store(true, Ordering::Release);
             let recorded = sink_result
@@ -1369,9 +1389,13 @@ mod tests {
             sink_sync.thread_done_with_settled(true, || {});
         });
 
-        // Registration still in progress: the sentinel must keep the sink
-        // parked even though every OTHER live slot is settled.
-        sleep(Duration::from_millis(80));
+        // Wait for the registration itself, not wall-clock time. Once it is
+        // observed the barrier arithmetic is pinned — live 2 (sentinel +
+        // sink) > settled 1 — so no scheduling of the sink thread can pass
+        // `wait_peers_settled` while the sentinel slot is live.
+        registered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the sink must register with the settlement barrier");
         assert!(
             !admitted.load(Ordering::Acquire),
             "the settlement barrier must hold while the sentinel slot is live"
@@ -1401,6 +1425,84 @@ mod tests {
             &*result.lock().unwrap(),
             Some(Err(crate::error::Error::StartFailed))
         ));
+    }
+
+    /// start()'s success tail: the settlement barrier stays shut across the
+    /// whole fallible remainder and reopens only at the release-then-disarm
+    /// pair, with nothing fallible between. The drained sink parked through
+    /// that window is admitted only once start() can no longer fail, samples
+    /// a clean job (its on_end), and the now-disarmed guard's later drop
+    /// records nothing that could contradict the dispatched callback.
+    #[test]
+    fn start_tail_admits_the_drained_sink_only_once_start_cannot_fail() {
+        use super::{StartFailGuard, STATUS_ABORT};
+        use crate::util::thread_synchronizer::ThreadSynchronizer;
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+        let sync = ThreadSynchronizer::new();
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let result: Arc<Mutex<Option<crate::error::Result<()>>>> = Arc::new(Mutex::new(None));
+
+        // start(): the sentinel slot, then a packet-sink worker's slot.
+        sync.thread_start();
+        sync.thread_start();
+
+        // A fully-drained sink parked at the barrier; on admission it
+        // decides its terminal the way the linearization point does — a
+        // clean sample (no recorded error, no abort) dispatches on_end.
+        let dispatched_on_end = Arc::new(AtomicBool::new(false));
+        let admitted = Arc::new(AtomicBool::new(false));
+        let (registered_tx, registered_rx) = std::sync::mpsc::channel();
+        let (sink_sync, sink_status, sink_result) = (sync.clone(), status.clone(), result.clone());
+        let (dispatched_w, admitted_w) = (dispatched_on_end.clone(), admitted.clone());
+        let sink = std::thread::spawn(move || {
+            sink_sync.register_settled();
+            registered_tx.send(()).unwrap();
+            sink_sync.wait_peers_settled();
+            admitted_w.store(true, Ordering::Release);
+            let aborted = sink_status.load(Ordering::Acquire) == STATUS_ABORT;
+            let clean = sink_result
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none();
+            dispatched_w.store(clean && !aborted, Ordering::Release);
+            sink_sync.thread_done_with_settled(true, || {});
+        });
+        registered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the sink must register with the settlement barrier");
+        assert!(
+            !admitted.load(Ordering::Acquire),
+            "the settlement barrier must hold until the success tail releases the sentinel"
+        );
+
+        let mut guard = StartFailGuard {
+            armed: true,
+            status: status.clone(),
+            result: result.clone(),
+            thread_sync: sync.clone(),
+            demux_waiters: Vec::new(),
+            mux_handed: Vec::new(),
+            sentinel_held: true,
+        };
+        // The success tail as start() runs it: release immediately followed
+        // by the disarm, nothing fallible between the two.
+        guard.release_sentinel();
+        guard.armed = false;
+        // Whatever drops the guard afterwards records nothing — the
+        // admitted sink's on_end can no longer be repainted as a failure.
+        drop(guard);
+
+        sink.join().unwrap();
+        assert!(admitted.load(Ordering::Acquire));
+        assert!(
+            dispatched_on_end.load(Ordering::Acquire),
+            "the sink admitted at the infallible tail must observe a clean job"
+        );
+        assert!(
+            result.lock().unwrap().is_none(),
+            "no failure may be recorded once the success tail admitted the sink"
+        );
     }
 
     /// Success path: `release_sentinel` releases exactly once (idempotent),
