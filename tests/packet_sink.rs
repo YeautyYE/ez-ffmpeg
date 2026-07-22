@@ -929,7 +929,11 @@ fn blocked_sibling_stays_interruptible_while_sink_finalizes() {
         eprintln!("skipping: libx264 not available in this FFmpeg build");
         return;
     }
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    // SO_RCVBUF is pinned small BEFORE listen(2) (Linux; silently falls back
+    // to a default listener elsewhere) so the receive queue pins within a
+    // couple of polls instead of megabytes later; the drain-and-refill proof
+    // below is buffer-size independent either way.
+    let (listener, _rcvbuf_shrunk) = common::make_backpressure_listener();
     let addr = listener.local_addr().unwrap();
     // Hand the accepted socket back to the test thread, which holds it open
     // without reading until the test ends and probes it for wedge evidence.
@@ -960,12 +964,25 @@ fn blocked_sibling_stays_interruptible_while_sink_finalizes() {
         .unwrap()
         .start()
         .unwrap();
-    // Wedge proof, deadline-bounded, instead of an open-loop sleep: peek()
-    // (non-draining) watches the unread peer's receive queue fill and then
-    // STOP growing — kernel backpressure with the sender's own send buffer
-    // (16 KiB, set on the URL) full behind it — while the infinite testsrc2
-    // input still has frames to give. After a held plateau the sibling's
-    // next write can only block, which is the state stop() must cut.
+    // Wedge proof: an acknowledged drain-and-refill handshake, not a timing
+    // guess. Stage 1: peek() (non-draining) watches the unread peer's
+    // receive queue fill and then STOP growing. A pinned count alone is NOT
+    // proof the sibling is blocked in write — the count also pins when the
+    // writer goes idle upstream (encoder stall, exhausted input) with
+    // nothing left to send. Stage 2 therefore drains chunks and requires
+    // the freed window to REFILL past what the sender's send buffer could
+    // have held as residue at the plateau: only a writer still pushing
+    // bytes against flow control can deliver that, and the infinite
+    // testsrc2 input guarantees the pipeline never runs dry on its own.
+    // Only after both stages is the sibling provably wedged in write — the
+    // state stop() must cut.
+    fn queued_bytes(stream: &std::net::TcpStream, buf: &mut [u8]) -> usize {
+        match stream.peek(buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
+            Err(e) => panic!("peek on the unread peer failed: {e}"),
+        }
+    }
     let stream = stream_rx
         .recv_timeout(std::time::Duration::from_secs(20))
         .expect("the sibling never connected to the TCP peer");
@@ -974,26 +991,63 @@ fn blocked_sibling_stays_interruptible_while_sink_finalizes() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut queued_prev = 0usize;
     let mut stable_polls = 0u32;
-    loop {
+    let pinned = loop {
         std::thread::sleep(std::time::Duration::from_millis(250));
         assert!(
             std::time::Instant::now() < deadline,
-            "the sibling never wedged on the unread peer"
+            "the unread peer's receive queue never reached a plateau"
         );
-        let queued = match stream.peek(&mut peek_buf) {
-            Ok(n) => n,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
-            Err(e) => panic!("peek on the unread peer failed: {e}"),
-        };
+        let queued = queued_bytes(&stream, &mut peek_buf);
+        if queued == peek_buf.len() {
+            // A count equal to the peek window is window saturation, not a
+            // queue plateau: widen until the real tail is visible.
+            peek_buf = vec![0u8; peek_buf.len() * 2];
+            stable_polls = 0;
+            queued_prev = 0;
+            continue;
+        }
         if queued > 0 && queued == queued_prev {
             stable_polls += 1;
             if stable_polls >= 6 {
-                break;
+                break queued;
             }
         } else {
             stable_polls = 0;
             queued_prev = queued;
         }
+    };
+
+    // Stage 2: drain and demand a refill. RESIDUE_BOUND exceeds anything the
+    // sender's send buffer could still hold at the plateau (16 KiB requested
+    // via send_buffer_size on the URL; Linux at most doubles the effective
+    // size), so cumulative arrivals past the bound prove the sibling wrote
+    // against the pinned queue AFTER the plateau — an idle writer's residue
+    // being flushed cannot account for them.
+    const RESIDUE_BOUND: usize = 64 * 1024;
+    let refill_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut drained_total = 0usize;
+    loop {
+        let queued = queued_bytes(&stream, &mut peek_buf);
+        // Bytes that arrived since the plateau: everything ever observed
+        // (still queued + drained by us) beyond the pinned level.
+        if (queued + drained_total).saturating_sub(pinned) > RESIDUE_BOUND {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < refill_deadline,
+            "the receive queue never refilled after a drain: the sibling was \
+             not blocked on flow control (writer idle or stalled upstream)"
+        );
+        if queued > 0 {
+            // Drain half the queue; a large chunk keeps the freed window
+            // above the receiver's silly-window-avoidance threshold so the
+            // sender is re-opened promptly.
+            let take = (queued / 2).max(1);
+            let n = std::io::Read::read(&mut (&stream), &mut peek_buf[..take])
+                .expect("draining the pinned receive queue");
+            drained_total += n;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
     }
 
     let (tx, rx) = std::sync::mpsc::channel();

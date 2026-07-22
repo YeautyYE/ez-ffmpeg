@@ -29,6 +29,14 @@ static PROCESS_LOCK: Mutex<()> = Mutex::new(());
 static WATCH_ARMED: AtomicBool = AtomicBool::new(false);
 static ABORT_OBSERVED: AtomicBool = AtomicBool::new(false);
 
+/// Whether the held packet was released by the acknowledged handshake (the
+/// controller's `abort_done` send, which happens only after `ABORT_OBSERVED`
+/// latched) rather than by the callback's failsafe timer. A timer release
+/// proves nothing about ordering — the packet would go free while the abort
+/// store might still be unpublished — so the test asserts this flag instead
+/// of trusting the timeout arithmetic.
+static RELEASED_BY_HANDSHAKE: AtomicBool = AtomicBool::new(false);
+
 struct MuxAbortWatchLogger;
 
 impl log::Log for MuxAbortWatchLogger {
@@ -290,6 +298,7 @@ fn abort_during_final_delivery_fires_no_terminal_callback() {
     install_watch_logger_once();
     WATCH_ARMED.store(false, Ordering::Release);
     ABORT_OBSERVED.store(false, Ordering::Release);
+    RELEASED_BY_HANDSHAKE.store(false, Ordering::Release);
     let (abort_request_tx, abort_request_rx) = std::sync::mpsc::channel::<()>();
     let (abort_done_tx, abort_done_rx) = std::sync::mpsc::channel::<()>();
 
@@ -301,9 +310,20 @@ fn abort_during_final_delivery_fires_no_terminal_callback() {
         if delivered == 10 {
             // Ask the controller to abort, and hold this packet until the
             // abort status has been stored — the terminal region then must
-            // observe it.
+            // observe it. The release is GATED on the controller's signal
+            // (sent only after `ABORT_OBSERVED` latched); the timeout is a
+            // failsafe for a wrecked run and sits deliberately far above the
+            // controller's 30s observation deadline. A failsafe below that
+            // deadline would let this packet go free on the timer while the
+            // controller still polls, silently voiding the happens-before
+            // edge under test. The failsafe also never delays a failing run:
+            // the observation poll's panic drops `abort_done_tx`, which
+            // releases this recv immediately (Disconnected).
             let _ = abort_request_tx.send(());
-            let _ = abort_done_rx.recv_timeout(Duration::from_secs(10));
+            let released_by_signal = abort_done_rx
+                .recv_timeout(Duration::from_secs(90))
+                .is_ok();
+            RELEASED_BY_HANDSHAKE.store(released_by_signal, Ordering::Release);
         }
         Ok(())
     })
@@ -370,6 +390,14 @@ fn abort_during_final_delivery_fires_no_terminal_callback() {
     abort_thread
         .join()
         .expect("abort() must return once the job tears down");
+    // abort() returns only after the delivering worker exited, so the
+    // callback's store is visible here: the release must have come from the
+    // handshake, or the ordering the assertions below rely on never held.
+    assert!(
+        RELEASED_BY_HANDSHAKE.load(Ordering::Acquire),
+        "the held packet was released by the failsafe timer, not by the \
+         observed-abort handshake"
+    );
     assert_no_terminal_event(&log, "abort_during_final_delivery");
 }
 
