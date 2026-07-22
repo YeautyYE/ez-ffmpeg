@@ -316,6 +316,11 @@ fn check_ps_nal_header(header: u8, expected_type: u8, what: &str) -> Result<(), 
     Ok(())
 }
 
+/// Parsed record tail past the PPS array: the optional profile-extension
+/// triple (`chroma_format_idc`, `bit_depth_luma`, `bit_depth_chroma`) and
+/// the retained SPS-EXT NAL bodies.
+type AvccExtensionTail = (Option<(u8, u8, u8)>, Vec<Vec<u8>>);
+
 /// Parses the trailing profile extension at `pos`, or verifies its legal
 /// absence — the record-level trailing-data policy.
 ///
@@ -336,7 +341,7 @@ fn parse_avcc_extension(
     avcc: &[u8],
     mut pos: usize,
     profile: u8,
-) -> Result<(Option<(u8, u8, u8)>, Vec<Vec<u8>>), String> {
+) -> Result<AvccExtensionTail, String> {
     if pos == avcc.len() {
         return Ok((None, Vec::new()));
     }
@@ -994,6 +999,7 @@ fn parse_pps(pps: &[u8], sps_context: &[SpsSummary]) -> Result<u32, String> {
 /// * type 6: the explicit table must not declare more entries than the
 ///   picture has map units, and every `slice_group_id[i]` <=
 ///   `num_slice_groups_minus1`.
+///
 /// Type 1 (dispersed) carries no syntax.
 fn check_slice_group_map(
     r: &mut BitReader,
