@@ -603,6 +603,17 @@ impl PacketSinkWorker {
     /// [`PacketSinkError::JobFailed`] when the job failed elsewhere (whether
     /// or not that failure truncated this sink's delivery — `wait()` keeps
     /// the original error); stays silent for aborts and clean cancellation.
+    ///
+    /// The stashed error reaches the callback BY REFERENCE — custody stays
+    /// with the worker. Its `error.source` can be the last `Arc` to a
+    /// caller-supplied error value (first-error-wins drops this worker's
+    /// job-result clone whenever a sibling's error won the slot), so moving
+    /// the error into a frame-local would make that local the final owner:
+    /// a panicking callback then drops it mid-unwind, where a panicking
+    /// source destructor is a panic-during-unwind process abort BEFORE the
+    /// terminal containment regains control. Borrowed, the unwind crosses
+    /// only a plain reference; the original is destroyed later inside
+    /// [`Self::dispose_contained`], under its own catch.
     pub(crate) fn finish(
         &mut self,
         all_streams_terminal: bool,
@@ -617,8 +628,8 @@ impl PacketSinkWorker {
         if aborted {
             return;
         }
-        if let Some(e) = self.pending_error.take() {
-            self.sink.dispatch_delivery_error(&e);
+        if let Some(e) = self.pending_error.as_ref() {
+            self.sink.dispatch_delivery_error(e);
             return;
         }
         if self.cancelled {
@@ -645,8 +656,10 @@ impl PacketSinkWorker {
     /// code under per-value panic containment: the sink's callback boxes
     /// (one catch each — see [`super::PacketSink::dispose_contained`]) and
     /// the stashed delivery error, whose `source` holds a caller-supplied
-    /// error type behind an `Arc`. The remaining fields are plain crate
-    /// data and drop bare. Returns true when any destructor panicked.
+    /// error type behind an `Arc` (still present after a dispatched
+    /// terminal — [`Self::finish`] borrows it, never consumes it). The
+    /// remaining fields are plain crate data and drop bare. Returns true
+    /// when any destructor panicked.
     pub(crate) fn dispose_contained(self) -> bool {
         let Self {
             sink,
