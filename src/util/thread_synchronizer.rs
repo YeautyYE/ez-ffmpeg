@@ -40,6 +40,15 @@ struct Counts {
     /// Live threads registered as settled (packet-sink workers in their
     /// terminal region).
     settled: usize,
+    /// Threads currently inside `wait_peers_settled`'s condvar wait. A
+    /// waiter is counted from the moment it commits to the wait (predicate
+    /// observed false, counter lock still held) until its post-wakeup
+    /// re-check, which also runs without releasing the lock — so an
+    /// observer holding this lock can never see a parked waiter
+    /// transiently uncounted. Lets ordering tests drive a release edge
+    /// only once a waiter is provably PARKED, not merely registered.
+    #[cfg(test)]
+    parked_settlement_waiters: usize,
 }
 
 impl ThreadSynchronizer {
@@ -49,6 +58,8 @@ impl ThreadSynchronizer {
                 counter: Mutex::new(Counts {
                     live: 0,
                     settled: 0,
+                    #[cfg(test)]
+                    parked_settlement_waiters: 0,
                 }),
                 condvar: Condvar::new(),
                 #[cfg(feature = "async")]
@@ -203,12 +214,31 @@ impl ThreadSynchronizer {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         while counts.live > counts.settled {
+            #[cfg(test)]
+            {
+                counts.parked_settlement_waiters += 1;
+            }
             counts = self
                 .inner
                 .condvar
                 .wait(counts)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            #[cfg(test)]
+            {
+                counts.parked_settlement_waiters -= 1;
+            }
         }
+    }
+
+    /// How many threads are currently parked inside [`Self::wait_peers_settled`]
+    /// (see `Counts::parked_settlement_waiters` for the exact counting window).
+    #[cfg(test)]
+    pub(crate) fn parked_settlement_waiters(&self) -> usize {
+        self.inner
+            .counter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .parked_settlement_waiters
     }
 
     pub(crate) fn wait_for_all_threads(&self) {
