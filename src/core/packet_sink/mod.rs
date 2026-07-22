@@ -92,6 +92,21 @@
 //! the already-settled job result (a delivered or decided `on_end` still
 //! yields `wait() == Ok`, and a failing job keeps its original error).
 //!
+//! That containment is **per callback box** (per handler box for
+//! [`PacketSinkHandler`]). A panic thrown by a callback, or by ONE
+//! destructor — a captured value's, a stashed error source's, or a
+//! `panic_any` payload's — is contained, and the crate keeps every such
+//! unwind single: each box is destroyed under its own catch, and the
+//! stashed delivery error stays in the worker's custody while
+//! `on_delivery_error` borrows it. The boundary is Rust's own unwind
+//! semantics: when one capture's destructor panics, the remaining captures
+//! OF THAT SAME BOX are dropped by the unwind itself — an erased box
+//! destroys its captures as one indivisible drop-glue call that nothing
+//! outside the box can decompose — so a SECOND panicking destructor there
+//! is a panic-during-unwind process abort, exactly as in any Rust struct
+//! whose field destructors both panic. Keep the destructors of values
+//! captured together panic-free relative to one another.
+//!
 //! # Backpressure: callbacks block the pipeline
 //!
 //! **The callbacks run on the delivery thread. A slow `on_packet` blocks that
@@ -264,6 +279,12 @@ pub type PacketCallbackResult = Result<(), PacketCallbackError>;
 /// delivery thread (never concurrently, never reentrantly), so `&mut self`
 /// state needs no locking. This is the strict-tier handler shape; see the
 /// [module docs](self) for the callback order and backpressure contract.
+///
+/// Teardown panic containment is per handler box: a panic from a method,
+/// or from ONE of the handler's fields' destructors, is contained; two
+/// fields whose destructors both panic compose into a panic-during-unwind
+/// process abort, as in any Rust struct — see "Failure and panic" in the
+/// [module docs](self).
 pub trait PacketSinkHandler: Send + 'static {
     /// One-time stream configuration, before any packet.
     fn on_stream_info(&mut self, _streams: &[PacketStreamInfo]) -> PacketCallbackResult {
@@ -725,6 +746,12 @@ impl PacketSink {
     /// without a packet consumer (a job that encodes into nothing is a
     /// configuration mistake, not a default; use [`PacketSink::discard`]
     /// when discarding is genuinely intended).
+    ///
+    /// Teardown panic containment is per callback box: a panic from the
+    /// closure, or from ONE captured value's destructor, is contained; two
+    /// captures of this same closure whose destructors both panic compose
+    /// into a panic-during-unwind process abort, as in any Rust struct —
+    /// see "Failure and panic" in the [module docs](self).
     pub fn builder<F>(on_packet: F) -> PacketSinkBuilder
     where
         F: for<'a> FnMut(&PacketView<'a>) -> PacketCallbackResult + Send + 'static,
@@ -749,6 +776,12 @@ impl PacketSink {
     /// the natural shape for consumers whose stream-info/packet/terminal
     /// handling shares state (packagers, senders); callbacks are serial, so
     /// the handler needs no locking.
+    ///
+    /// Teardown panic containment is per handler box: a panic from a
+    /// handler method, or from ONE of the handler's fields' destructors, is
+    /// contained; two fields of this same handler whose destructors both
+    /// panic compose into a panic-during-unwind process abort, as in any
+    /// Rust struct — see "Failure and panic" in the [module docs](self).
     pub fn from_handler<H: PacketSinkHandler>(handler: H) -> PacketSink {
         PacketSink {
             tier: PacketSinkTier::Strict,
@@ -943,6 +976,17 @@ fn drop_contained<T>(value: T) -> bool {
 /// an adversarial path is recoverable, while re-throwing would unwind
 /// frames that may still own user state — and a destructor panic during
 /// that unwind escalates to a process abort.
+///
+/// The containment boundary, here and in every catch this module owns, is
+/// per BOX: a panic thrown by a callback, or by ONE destructor (a
+/// capture's, a stashed error source's, or this payload's), is contained.
+/// A box whose own captured fields' destructors panic DURING that unwind —
+/// two bombs inside one erased `Box<dyn ..>` — aborts the process by
+/// Rust's panic-during-unwind rule before any catch regains control: the
+/// box destroys its captures as one indivisible drop-glue call that no
+/// code outside the box can decompose. That is identical to any Rust code
+/// path (a plain struct with two panicking field destructors aborts the
+/// same way), so it is documented as the boundary, not worked around.
 pub(crate) fn dispose_panic_payload(payload: Box<dyn std::any::Any + Send>) {
     let mut payload = payload;
     for _ in 0..4 {
@@ -1025,7 +1069,8 @@ pub struct PacketSinkBuilder {
 impl PacketSinkBuilder {
     /// One-time stream configuration callback, invoked before any packet.
     /// Return `Ok(())` to accept; an error fails the job before any packet is
-    /// delivered.
+    /// delivered. Teardown panic containment is per callback box — see
+    /// "Failure and panic" in the [module docs](self).
     pub fn on_stream_info<F>(mut self, f: F) -> Self
     where
         F: FnMut(&[PacketStreamInfo]) -> PacketCallbackResult + Send + 'static,
@@ -1037,7 +1082,10 @@ impl PacketSinkBuilder {
     /// Terminal success callback; see the [module docs](self) for the exact
     /// gate. Never invoked after an error or lost packets. Cancellation
     /// suppresses it only when it interrupts delivery: a `stop()` that lands
-    /// after this sink fully drained still delivers `on_end`.
+    /// after this sink fully drained still delivers `on_end`. A panic here
+    /// is contained per callback box and cannot change the settled job
+    /// result — see "Failure and panic" in the [module docs](self) for the
+    /// exact boundary.
     pub fn on_end<F>(mut self, f: F) -> Self
     where
         F: FnMut() + Send + 'static,
@@ -1054,6 +1102,11 @@ impl PacketSinkBuilder {
     /// while the job keeps its original error. Not invoked for cancellation
     /// or initial configuration failures — see "Failure and panic" in the
     /// [module docs](self).
+    ///
+    /// The borrowed error stays in the worker's custody for the whole call
+    /// (a panic here cannot run the error source's destructor mid-unwind),
+    /// and the panic is contained per callback box — see "Failure and
+    /// panic" in the [module docs](self) for the exact boundary.
     pub fn on_delivery_error<F>(mut self, f: F) -> Self
     where
         F: FnMut(&PacketSinkError) + Send + 'static,

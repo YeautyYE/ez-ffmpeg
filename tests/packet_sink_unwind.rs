@@ -490,6 +490,7 @@ fn sink_disposal_child() {
         None => {}
         Some("two_destructor_bombs") => child_two_destructor_bombs(),
         Some("panicking_payload_bomb") => child_panicking_payload_bomb(),
+        Some("delivery_error_source_bomb") => child_delivery_error_source_bomb(),
         Some(other) => panic!("unknown child scenario '{other}'"),
     }
 }
@@ -605,10 +606,176 @@ fn child_panicking_payload_bomb() {
     );
 }
 
+/// A caller-supplied error source whose destructor panics unconditionally
+/// — even mid-unwind, where an uncontained drop aborts the process. The
+/// shape of the delivery-error custody hazard: once first-error-wins let a
+/// sibling own the job result, the sink worker's stashed error holds the
+/// FINAL `Arc` to this source (the worker's own job-result clone was
+/// discarded), so whoever owns that last `Arc` while `on_delivery_error`
+/// panics decides between a contained teardown and an abort.
+#[derive(Debug)]
+struct SourceBomb(Arc<AtomicBool>);
+
+impl std::fmt::Display for SourceBomb {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("injected error source")
+    }
+}
+
+impl std::error::Error for SourceBomb {}
+
+impl Drop for SourceBomb {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+        panic!("injected error-source destructor panic");
+    }
+}
+
+/// The delivery-error custody composition: the sink's `on_packet` fails
+/// with a source whose destructor panics; a SIBLING output's error wins
+/// first-error-wins (the worker is held at its packet-error log while the
+/// gated sibling fails), so the worker's stash becomes the final owner of
+/// that source; and the consumer's `on_delivery_error` itself panics at
+/// the terminal. The terminal dispatch must hand the callback a borrow
+/// while the worker keeps custody: an owned frame-local would drop the
+/// final `Arc` mid-unwind, where the panicking source destructor aborts
+/// the process before any catch regains control. The child surviving —
+/// with the sibling's error intact on `wait()`, the terminal event
+/// delivered once, and the source destroyed under containment — is the
+/// verdict.
+fn child_delivery_error_source_bomb() {
+    install_logger_once();
+    disarm_all();
+
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let source_destroyed = Arc::new(AtomicBool::new(false));
+    let bomb_flag = source_destroyed.clone();
+    let (ev_end, ev_err) = (events.clone(), events.clone());
+    let sink = PacketSink::builder(move |_pkt| {
+        Err(
+            ez_ffmpeg::packet_sink::PacketCallbackError::with_source(
+                "sink consumer rejection",
+                SourceBomb(bomb_flag.clone()),
+            ),
+        )
+    })
+    .on_end(move || ev_end.lock().unwrap().push("end".to_string()))
+    .on_delivery_error(move |e| {
+        ev_err.lock().unwrap().push(format!("error: {e}"));
+        panic!("injected delivery-error callback panic");
+    })
+    .build();
+
+    // The sibling parks INSIDE its failing write until the gate opens, so
+    // its error cannot be recorded before the sink's own failure is
+    // stashed — and once released, it is recorded while the sink worker is
+    // still held below, winning first-error-wins.
+    let sibling_go = Arc::new(AtomicBool::new(false));
+    let go_cb = sibling_go.clone();
+    let mut written = 0usize;
+    let sibling = Output::new_by_write_callback(move |buf: &[u8]| {
+        written += buf.len();
+        if written > 1024 {
+            while !go_cb.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO)
+        } else {
+            buf.len() as i32
+        }
+    })
+    .set_format("mpegts")
+    .set_audio_codec("aac")
+    // Small AVIO buffer: TS writes flush continuously, so the gated write
+    // is reached during the run rather than at one big trailer flush.
+    .set_io_buffer_size(512);
+    struct GateOnDrop(Arc<AtomicBool>);
+    impl Drop for GateOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    // Park the sink worker at its packet-error log: AFTER the failing
+    // callback stashed the bomb-carrying error, BEFORE the worker offers
+    // that error to first-error-wins and enters its terminal region.
+    *HOLD.lock().unwrap_or_else(|e| e.into_inner()) = Some("Error muxing a packet");
+    let scheduler = FfmpegContext::builder()
+        .input(Input::from("sine=frequency=440:duration=2").set_format("lavfi"))
+        .input(Input::from("sine=frequency=330:duration=2").set_format("lavfi"))
+        .output(
+            Output::from(sink)
+                .set_audio_codec("aac")
+                .add_stream_map("0:a"),
+        )
+        .output(sibling.add_stream_map("1:a"))
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+    // AFTER the scheduler: on an assertion panic these drop FIRST (reverse
+    // declaration order), unparking the sibling gate and the held worker
+    // before scheduler teardown waits on them.
+    let _open_gate_on_unwind = GateOnDrop(sibling_go.clone());
+    let _release_on_unwind = ReleaseOnDrop;
+
+    // 1. The sink worker parks with the bomb error stashed.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !HELD.load(Ordering::Acquire) {
+        assert!(
+            Instant::now() < deadline,
+            "the sink worker never reached its packet-error log"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    // 2. The released sibling fails and records the job error. The held
+    // sink worker cannot publish, and a natural end is impossible while
+    // two muxers are parked, so a stopping status here proves the
+    // sibling's error is recorded (the result is stored before the status
+    // publishes).
+    sibling_go.store(true, Ordering::Release);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !scheduler.is_ended() {
+        assert!(
+            Instant::now() < deadline,
+            "the sibling's failure was never recorded"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    // 3. The sink worker resumes: its own error loses first-error-wins
+    // (the clone is discarded, leaving the stash as the final source
+    // owner), and the terminal dispatches `on_delivery_error` into the
+    // injected panic.
+    RELEASE.store(true, Ordering::Release);
+
+    let result = wait_with_watchdog(scheduler, 60, "delivery_error_source_bomb");
+    assert!(
+        matches!(result, Err(Error::Muxing(_))),
+        "the sibling's error must stay the job result — the contained \
+         terminal-callback panic must not repaint it: {result:?}"
+    );
+    assert!(
+        source_destroyed.load(Ordering::Acquire),
+        "the stashed error's source must be destroyed (under containment), not leaked"
+    );
+    let evs = events.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert_eq!(evs.len(), 1, "exactly one terminal event: {evs:?}");
+    assert!(
+        evs[0].starts_with("error") && evs[0].contains("sink consumer rejection"),
+        "the terminal must deliver the sink's own stashed error: {evs:?}"
+    );
+}
+
 /// Parent probe: the two-bomb aggregate disposal (see the child fn).
 #[test]
 fn sibling_capture_bombs_do_not_abort_the_process() {
     run_child_scenario("two_destructor_bombs");
+}
+
+/// Parent probe: the delivery-error custody composition (see the child fn).
+#[test]
+fn delivery_error_source_destructor_does_not_abort_the_process() {
+    run_child_scenario("delivery_error_source_bomb");
 }
 
 /// Parent probe: the panicking-payload discard (see the child fn).
