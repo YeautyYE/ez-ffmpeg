@@ -624,6 +624,25 @@ impl PacketSinkWorker {
             self.sink.dispatch_end();
         }
     }
+
+    /// Consumes the worker, destroying everything that can run user `Drop`
+    /// code under per-value panic containment: the sink's callback boxes
+    /// (one catch each — see [`super::PacketSink::dispose_contained`]) and
+    /// the stashed delivery error, whose `source` holds a caller-supplied
+    /// error type behind an `Arc`. The remaining fields are plain crate
+    /// data and drop bare. Returns true when any destructor panicked.
+    pub(crate) fn dispose_contained(self) -> bool {
+        let Self {
+            sink,
+            pending_error,
+            ..
+        } = self;
+        let mut panicked = sink.dispose_contained();
+        if let Some(error) = pending_error {
+            panicked |= super::drop_contained(error);
+        }
+        panicked
+    }
 }
 
 /// FFmpeg's textual channel-layout description (e.g. "stereo"), empty when
