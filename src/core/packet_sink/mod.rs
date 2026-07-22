@@ -866,6 +866,92 @@ impl PacketSink {
             SinkDispatch::Handler(h) => h.on_delivery_error(error),
         }
     }
+
+    /// Consumes the sink, dropping every user callback box under its OWN
+    /// panic containment. The derived drop glue runs the boxes as one
+    /// chain: after a first capture destructor panics, the REMAINING boxes
+    /// are destroyed by that unwind itself, where a second panicking
+    /// destructor aborts the process — so one `catch_unwind` around a plain
+    /// `drop` of the whole aggregate contains only the first bomb. Dropping
+    /// each box under its own catch keeps every unwind single. Returns true
+    /// when any destructor panicked (each caught payload is disposed
+    /// through [`dispose_panic_payload`], never re-dropped raw).
+    pub(crate) fn dispose_contained(self) -> bool {
+        let Self {
+            tier: _,
+            dispatch,
+            cancellation,
+        } = self;
+        let mut panicked = false;
+        match dispatch {
+            SinkDispatch::Closures {
+                on_stream_info,
+                on_packet,
+                on_end,
+                on_delivery_error,
+            } => {
+                // Field declaration order — the order the derived drop glue
+                // would have used.
+                if let Some(f) = on_stream_info {
+                    panicked |= drop_contained(f);
+                }
+                panicked |= drop_contained(on_packet);
+                if let Some(f) = on_end {
+                    panicked |= drop_contained(f);
+                }
+                if let Some(f) = on_delivery_error {
+                    panicked |= drop_contained(f);
+                }
+            }
+            SinkDispatch::Handler(handler) => {
+                panicked |= drop_contained(handler);
+            }
+        }
+        // The cancellation slot is crate data, but the shared job result
+        // behind it can hold arbitrary error types; the (normally non-final)
+        // Arc release is contained for the same price as the boxes.
+        if let Some(slot) = cancellation {
+            panicked |= drop_contained(slot);
+        }
+        panicked
+    }
+}
+
+/// Drops `value` under its own panic containment. Returns true when the
+/// destructor panicked; the caught payload is disposed, not re-dropped raw.
+fn drop_contained<T>(value: T) -> bool {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(value))) {
+        Ok(()) => false,
+        Err(payload) => {
+            dispose_panic_payload(payload);
+            true
+        }
+    }
+}
+
+/// Disposes a caught panic payload without letting the payload's own
+/// destructor start a second, uncontained unwind at the discard site.
+///
+/// `panic_any` lets panicking user code throw an ARBITRARY payload, and
+/// nothing forbids one whose `Drop` panics again — with yet another such
+/// payload. Discarding a `catch_unwind` error via `.is_err()` / `let _` /
+/// a wildcard therefore runs an uncontained user destructor exactly where
+/// the containment believed the panic was over. Each drop attempt here runs
+/// under its own catch, following replacement payloads a bounded number of
+/// times; a chain still panicking after the last attempt is deliberately
+/// LEAKED via `mem::forget`. That trade is intentional: a bounded leak on
+/// an adversarial path is recoverable, while re-throwing would unwind
+/// frames that may still own user state — and a destructor panic during
+/// that unwind escalates to a process abort.
+pub(crate) fn dispose_panic_payload(payload: Box<dyn std::any::Any + Send>) {
+    let mut payload = payload;
+    for _ in 0..4 {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(payload))) {
+            Ok(()) => return,
+            Err(next) => payload = next,
+        }
+    }
+    std::mem::forget(payload);
 }
 
 /// Cancellation-aware bounded send: blocks (in bounded slices) while the
@@ -1437,6 +1523,92 @@ mod tests {
             .expect_err("handler state must persist across calls");
         assert_eq!(err.kind, CallbackFailureKind::Failure);
         assert_eq!(err.to_string(), "enough");
+    }
+
+    /// A `panic_any` payload whose own `Drop` panics (with another such
+    /// payload) must be consumed without the disposal itself throwing —
+    /// both for chains within the attempt bound and for chains beyond it
+    /// (the remainder is leaked by design, never re-thrown).
+    #[test]
+    fn panic_payload_chains_are_disposed_without_escaping() {
+        struct ChainBomb(u32);
+        impl Drop for ChainBomb {
+            fn drop(&mut self) {
+                if self.0 > 0 {
+                    std::panic::panic_any(ChainBomb(self.0 - 1));
+                }
+            }
+        }
+        // Depth 3: attempts 1-3 each panic with the next link, attempt 4
+        // drops the final link cleanly.
+        dispose_panic_payload(Box::new(ChainBomb(3)));
+        // Deeper than the attempt bound: the helper must still return.
+        dispose_panic_payload(Box::new(ChainBomb(64)));
+    }
+
+    /// Every callback box must be destroyed even when SEVERAL capture
+    /// destructors panic. One catch around a plain drop of the aggregate
+    /// contains only the first bomb — the remaining boxes are then
+    /// destroyed by the unwind itself, where the second bomb aborts the
+    /// process. Reaching the assertions at all is the point.
+    #[test]
+    fn dispose_contained_destroys_every_box_across_multiple_drop_panics() {
+        use std::sync::atomic::AtomicBool;
+
+        struct DropBomb(Arc<AtomicBool>);
+        impl Drop for DropBomb {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+                panic!("injected capture-destructor panic");
+            }
+        }
+
+        let flags: Vec<Arc<AtomicBool>> = (0..3).map(|_| Arc::new(AtomicBool::new(false))).collect();
+        let (b0, b1, b2) = (
+            DropBomb(flags[0].clone()),
+            DropBomb(flags[1].clone()),
+            DropBomb(flags[2].clone()),
+        );
+        let sink = PacketSink::builder(move |_pkt| {
+            let _hold = &b0;
+            Ok(())
+        })
+        .on_end(move || {
+            let _hold = &b1;
+        })
+        .on_delivery_error(move |_e| {
+            let _hold = &b2;
+        })
+        .build();
+        assert!(
+            sink.dispose_contained(),
+            "three panicking capture destructors must be reported"
+        );
+        for (i, flag) in flags.iter().enumerate() {
+            assert!(
+                flag.load(Ordering::Acquire),
+                "callback box {i} was never destroyed"
+            );
+        }
+
+        struct BombHandler(Arc<AtomicBool>);
+        impl Drop for BombHandler {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+                panic!("injected handler-destructor panic");
+            }
+        }
+        impl PacketSinkHandler for BombHandler {
+            fn on_packet(&mut self, _packet: &PacketView<'_>) -> PacketCallbackResult {
+                Ok(())
+            }
+        }
+        let destroyed = Arc::new(AtomicBool::new(false));
+        assert!(PacketSink::from_handler(BombHandler(destroyed.clone())).dispose_contained());
+        assert!(destroyed.load(Ordering::Acquire));
+
+        // Benign sinks report no panic.
+        assert!(!PacketSink::builder(|_pkt| Ok(())).build().dispose_contained());
     }
 
     #[test]

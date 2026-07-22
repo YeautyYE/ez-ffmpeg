@@ -2,6 +2,7 @@ use crate::core::context::muxer::{Muxer, SqMuxPlan, StreamBsfChains};
 use crate::core::context::obj_pool::ObjPool;
 use crate::core::context::pre_mux_queue::PreMuxQueueReceiver;
 use crate::core::context::{PacketBox, PacketData};
+use crate::core::packet_sink::dispose_panic_payload;
 use crate::core::scheduler::ffmpeg_scheduler::{
     is_stopping, packet_is_null, set_scheduler_error, wait_until_not_paused, STATUS_ABORT,
     STATUS_END,
@@ -1456,8 +1457,27 @@ fn _mux_init(
             .then(|| interrupt_state.begin_output_finalize());
 
         // ---- Packet-sink terminal path (returns; containers continue below).
-        if let Some(mut sink) = sink_worker.take() {
-            debug!("Packet sink muxer finished.");
+        if let Some(sink) = sink_worker.take() {
+            // Region-wide ownership rule: from here to the slot release the
+            // worker (whose callback boxes hold user captures with arbitrary
+            // Drop code) is held by a disposal guard. EVERY exit — the
+            // explicit consumption at the terminal below, or any unwind
+            // crossing this frame — destroys those boxes one-per-catch, so
+            // a capture destructor's panic can never compose with an
+            // in-flight unwind into a panic-during-unwind process abort.
+            let mut sink = SinkDisposal::new(sink);
+            // The entry log runs under its own containment: a user-installed
+            // logger can panic on any record, and an uncontained unwind here
+            // would skip the terminal dispatch — no on_end for a healthy,
+            // fully drained job — while repainting the settled result as a
+            // worker panic. Contained, the panic changes nothing the settled
+            // result promised. The payload is disposed, not dropped raw: a
+            // panic_any payload's own destructor may panic again.
+            if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                debug!("Packet sink muxer finished.");
+            })) {
+                dispose_panic_payload(payload);
+            }
             // Sequence EVERY crate-side failure source BEFORE the terminal
             // decision, so a delivered on_end implies wait() == Ok (the
             // carve-outs — panics at or after the terminal, from the terminal
@@ -1557,8 +1577,13 @@ fn _mux_init(
             // panic publisher or change the settled result another sink's
             // delivered on_end already promised. Still this worker thread
             // (S9); before the slot release, so stop() cannot return while a
-            // blocking terminal callback or destructor runs.
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // blocking terminal callback or destructor runs. Every catch in
+            // the region — inner and outer — disposes its caught payload
+            // through the bounded helper instead of discarding it: a
+            // panic_any payload's own destructor may panic, and a raw
+            // discard would start that new unwind exactly where the
+            // containment believed the panic was over.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // Formatting sits in its own inner catch so a panicking
                 // Display cannot skip the terminal dispatch. Only the
                 // `e.to_string()` call can panic here (the lock handles
@@ -1574,7 +1599,8 @@ fn _mux_init(
                             .and_then(|result| result.as_ref().err())
                             .map(|e| e.to_string())
                     }))
-                    .unwrap_or_else(|_| {
+                    .unwrap_or_else(|payload| {
+                        dispose_panic_payload(payload);
                         Some(String::from(
                             "job error message unavailable: formatting the recorded error panicked",
                         ))
@@ -1582,19 +1608,27 @@ fn _mux_init(
                 } else {
                     None
                 };
-                let finish_panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    sink.finish(nb_done == stream_count, ret, aborted, job_error)
-                }))
-                .is_err();
+                let finish_panicked = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || sink.finish(nb_done == stream_count, ret, aborted, job_error),
+                )) {
+                    Ok(()) => false,
+                    Err(payload) => {
+                        dispose_panic_payload(payload);
+                        true
+                    }
+                };
                 // Consume the sink BEFORE any failure logging: a log call
                 // that panics unwinds to the outer boundary, and if the sink
                 // were still owned that unwind would run the capture
                 // destructors — a destructor panic at that point would be a
-                // panic-during-unwind abort. With the sink already consumed,
-                // the log calls below are the last code on this path and
-                // their unwind crosses only plain locals.
-                let teardown_panicked =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(sink))).is_err();
+                // panic-during-unwind abort. The disposal destroys each
+                // callback box under its own catch (one catch around the
+                // whole aggregate would contain only the FIRST panicking
+                // capture; the unwind would then destroy the remaining boxes
+                // uncontained, where a second bomb aborts). With the sink
+                // already consumed, the log calls below are the last code on
+                // this path and their unwind crosses only plain locals.
+                let teardown_panicked = sink.dispose();
                 if finish_panicked {
                     // Best-effort: a panic from this log call is swallowed by
                     // the outer boundary (possibly skipping the next log).
@@ -1608,6 +1642,15 @@ fn _mux_init(
                     );
                 }
             }));
+            if let Err(payload) = outcome {
+                // The boundary's own payload is disposed BEFORE the slot
+                // release: dropped raw, a panicking payload destructor would
+                // start a fresh unwind that skips the release — the settled
+                // job would then terminate through the unwind guards as a
+                // worker panic, repainting a result the delivered terminal
+                // already promised.
+                dispose_panic_payload(payload);
+            }
             slot_guard.release();
             return;
         }
@@ -2014,6 +2057,52 @@ impl Drop for MuxSlotGuard {
             .thread_done_with_settled(self.settled_registered.get(), move || {
                 status.store(STATUS_END, Ordering::Release);
         });
+    }
+}
+
+/// Terminal-region custody of the taken packet-sink worker.
+///
+/// The worker's callback boxes hold user captures whose `Drop` code is
+/// arbitrary. Holding the worker as a plain local would let ANY unwind
+/// crossing the terminal region run those destructors as ordinary drop
+/// glue — mid-unwind, uncontained, where one panicking capture aborts the
+/// process. Through this guard every exit path destroys the worker via its
+/// per-callback contained disposal instead: the explicit `dispose()` at the
+/// terminal on the normal path, or the guard's own Drop on unwind (each
+/// per-box catch stops the second panic INSIDE the destructor frame, which
+/// is exactly what keeps a panic-during-unwind from escalating).
+struct SinkDisposal(Option<crate::core::packet_sink::strict::PacketSinkWorker>);
+
+impl SinkDisposal {
+    fn new(worker: crate::core::packet_sink::strict::PacketSinkWorker) -> Self {
+        Self(Some(worker))
+    }
+
+    /// Forwards to the worker (`None` after disposal — no panic path).
+    fn pending_error_cloned(&self) -> Option<crate::error::PacketSinkError> {
+        self.0.as_ref().and_then(|worker| worker.pending_error_cloned())
+    }
+
+    /// Forwards the terminal dispatch to the worker (no-op after disposal).
+    fn finish(&mut self, all_streams_terminal: bool, ret: i32, aborted: bool, job_error: Option<String>) {
+        if let Some(worker) = self.0.as_mut() {
+            worker.finish(all_streams_terminal, ret, aborted, job_error);
+        }
+    }
+
+    /// Consumes the worker through its per-callback contained disposal;
+    /// true when any user destructor panicked. Idempotent — the Drop (and
+    /// any second call) then no-ops.
+    fn dispose(&mut self) -> bool {
+        self.0
+            .take()
+            .is_some_and(|worker| worker.dispose_contained())
+    }
+}
+
+impl Drop for SinkDisposal {
+    fn drop(&mut self) {
+        self.dispose();
     }
 }
 

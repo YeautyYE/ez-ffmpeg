@@ -10,11 +10,19 @@
 //! - terminal settlement: a late filter-worker panic (its final log fires
 //!   after the sink drained) must prevent `on_end`, and the terminal
 //!   region's panic compositions (capture-`Drop` + logger; terminal
-//!   callback + logger + unconditional capture-`Drop`) must neither
-//!   un-settle the delivered result nor abort the process;
+//!   callback + logger + unconditional capture-`Drop`; logger on the
+//!   terminal-entry record itself) must neither un-settle the delivered
+//!   result nor abort the process;
 //! - the linearization window: an abort landing while the worker is held
 //!   between its last packet completion and the terminal region suppresses
 //!   both terminal callbacks.
+//!
+//! A fourth family runs in CHILD processes: panic-source compositions whose
+//! pre-containment failure mode is a panic-during-unwind process ABORT
+//! (SIGABRT). In-process they would kill this whole binary, and no
+//! in-process assertion can observe "did not abort" — so the parent test
+//! re-execs this binary filtered to a dispatcher test and asserts the
+//! child's exit status.
 //!
 //! The logger is process-global, so this binary contains ONLY these
 //! serialized scenarios. Native AAC keeps them running on GPL-free CI.
@@ -384,6 +392,229 @@ fn settled_result_survives_finish_panic_logger_panic_and_drop_panic() {
         vec!["end".to_string()],
         "exactly one on_end (delivered before its panic) and no error callback"
     );
+}
+
+/// The terminal-ENTRY record: the sink is already taken for the terminal
+/// region when "Packet sink muxer finished." is logged, and a user logger
+/// panicking on that exact record used to unwind PAST the terminal
+/// dispatch — a healthy, fully drained job delivered no `on_end`, its
+/// captures were destroyed mid-unwind, and `wait()` repainted the settled
+/// completion as a worker panic. The entry log now runs under its own
+/// containment, so the terminal dispatch must still run: the delivered
+/// `on_end` and the Ok result are the observables.
+#[test]
+fn terminal_entry_logger_panic_still_delivers_on_end() {
+    let _lock = PROCESS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    install_logger_once();
+    disarm_all();
+
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let destroyed = Arc::new(AtomicBool::new(false));
+    let capture = FlagOnDrop(destroyed.clone());
+    let (ev_end, ev_err) = (events.clone(), events.clone());
+    let sink = PacketSink::builder(move |_pkt| {
+        let _hold = &capture;
+        Ok(())
+    })
+    .on_end(move || ev_end.lock().unwrap().push("end".to_string()))
+    .on_delivery_error(move |e| ev_err.lock().unwrap().push(format!("error: {e}")))
+    .build();
+
+    *TRIGGER.lock().unwrap_or_else(|e| e.into_inner()) = Some("Packet sink muxer finished.");
+    let scheduler = FfmpegContext::builder()
+        .input(Input::from("sine=frequency=440:duration=1").set_format("lavfi"))
+        .output(Output::from(sink).set_audio_codec("aac"))
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+    let result = wait_with_watchdog(scheduler, 60, "terminal_entry_logger_panic");
+
+    assert!(
+        TRIGGER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none(),
+        "the terminal-entry log must have fired and hit the armed logger"
+    );
+    disarm_all();
+    assert!(
+        result.is_ok(),
+        "a logger panic on the terminal-entry record must not fail the drained job: {result:?}"
+    );
+    assert!(
+        destroyed.load(Ordering::Acquire),
+        "the sink captures must be destroyed before wait() returns"
+    );
+    let evs = events.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert_eq!(
+        evs,
+        vec!["end".to_string()],
+        "the terminal dispatch must still run after the contained entry-log panic"
+    );
+}
+
+/// Scenario selector for the child-process probes: inert without it, so the
+/// dispatcher test is a no-op in a normal full run of this binary.
+const CHILD_SCENARIO_ENV: &str = "EZ_FFMPEG_SINK_DISPOSAL_CHILD";
+
+/// Runs one hostile-destructor scenario in a CHILD process and asserts the
+/// child exits cleanly. These scenarios' pre-containment failure mode is a
+/// panic-during-unwind process ABORT — in-process they would kill the whole
+/// binary, and an abort is not observable from inside the aborting process.
+/// The exit status carries the verdict (on Unix an abort reports SIGABRT).
+fn run_child_scenario(scenario: &str) {
+    let exe = std::env::current_exe().expect("test binary path");
+    let out = std::process::Command::new(&exe)
+        .arg("sink_disposal_child")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(CHILD_SCENARIO_ENV, scenario)
+        .output()
+        .expect("failed to spawn the child probe process");
+    assert!(
+        out.status.success(),
+        "child scenario '{scenario}' failed — a non-zero/signal exit here means a \
+         destructor panic escaped containment: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+/// Child-process dispatcher: runs the scenario named by the environment
+/// variable, nothing otherwise.
+#[test]
+fn sink_disposal_child() {
+    match std::env::var(CHILD_SCENARIO_ENV).ok().as_deref() {
+        None => {}
+        Some("two_destructor_bombs") => child_two_destructor_bombs(),
+        Some("panicking_payload_bomb") => child_panicking_payload_bomb(),
+        Some(other) => panic!("unknown child scenario '{other}'"),
+    }
+}
+
+/// TWO unconditional capture bombs in DIFFERENT callback boxes of the same
+/// sink. One catch around a plain drop of the aggregate contains only the
+/// first bomb: the unwind it stops still destroyed the remaining boxes
+/// mid-flight, where the second bomb is a panic-during-unwind abort. The
+/// disposal must instead destroy each box under its own catch — the child
+/// surviving to assert is the point.
+fn child_two_destructor_bombs() {
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let destroyed_first = Arc::new(AtomicBool::new(false));
+    let destroyed_second = Arc::new(AtomicBool::new(false));
+    let bomb_first = AlwaysPanicOnDrop(destroyed_first.clone());
+    let bomb_second = AlwaysPanicOnDrop(destroyed_second.clone());
+    let (ev_end, ev_err) = (events.clone(), events.clone());
+    let sink = PacketSink::builder(move |_pkt| {
+        let _hold = &bomb_first;
+        Ok(())
+    })
+    .on_end(move || ev_end.lock().unwrap().push("end".to_string()))
+    .on_delivery_error(move |e| {
+        let _hold = &bomb_second;
+        ev_err.lock().unwrap().push(format!("error: {e}"))
+    })
+    .build();
+
+    let scheduler = FfmpegContext::builder()
+        .input(Input::from("sine=frequency=440:duration=1").set_format("lavfi"))
+        .output(Output::from(sink).set_audio_codec("aac"))
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+    let result = wait_with_watchdog(scheduler, 60, "two_destructor_bombs");
+    assert!(
+        result.is_ok(),
+        "two contained capture-destructor panics must not fail the settled job: {result:?}"
+    );
+    assert!(
+        destroyed_first.load(Ordering::Acquire) && destroyed_second.load(Ordering::Acquire),
+        "both callback boxes must be destroyed before wait() returns"
+    );
+    let evs = events.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert_eq!(evs, vec!["end".to_string()], "exactly one on_end, no error");
+}
+
+/// Panics from `Drop` the first time it runs on a non-unwinding thread —
+/// the shape of a `panic_any` payload whose destructor panics at the
+/// discard site.
+struct PayloadBomb(Arc<AtomicBool>);
+
+impl Drop for PayloadBomb {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+        if !std::thread::panicking() {
+            panic!("injected payload-destructor panic");
+        }
+    }
+}
+
+/// A terminal callback that throws a `panic_any` payload whose own `Drop`
+/// panics. Discarding the caught payload raw starts that NEW unwind exactly
+/// where the containment believed the panic was over — while the sink (with
+/// an unconditional capture bomb) is still owned, so the composition used
+/// to abort the process. The payload must be disposed under containment and
+/// the sink per-callback: the child asserts the payload's destructor DID
+/// run, the captures were destroyed, and the settled result survived.
+fn child_panicking_payload_bomb() {
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let destroyed = Arc::new(AtomicBool::new(false));
+    let payload_disposed = Arc::new(AtomicBool::new(false));
+    let bomb = AlwaysPanicOnDrop(destroyed.clone());
+    let payload_flag = payload_disposed.clone();
+    let (ev_end, ev_err) = (events.clone(), events.clone());
+    let sink = PacketSink::builder(move |_pkt| {
+        let _hold = &bomb;
+        Ok(())
+    })
+    .on_end(move || {
+        ev_end.lock().unwrap().push("end".to_string());
+        std::panic::panic_any(PayloadBomb(payload_flag.clone()));
+    })
+    .on_delivery_error(move |e| ev_err.lock().unwrap().push(format!("error: {e}")))
+    .build();
+
+    let scheduler = FfmpegContext::builder()
+        .input(Input::from("sine=frequency=440:duration=1").set_format("lavfi"))
+        .output(Output::from(sink).set_audio_codec("aac"))
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+    let result = wait_with_watchdog(scheduler, 60, "panicking_payload_bomb");
+    assert!(
+        result.is_ok(),
+        "a disposed payload-destructor panic must not fail the settled job: {result:?}"
+    );
+    assert!(
+        payload_disposed.load(Ordering::Acquire),
+        "the panic payload must be destroyed (disposed), not leaked on the containment path"
+    );
+    assert!(
+        destroyed.load(Ordering::Acquire),
+        "the sink captures must be destroyed before wait() returns"
+    );
+    let evs = events.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert_eq!(
+        evs,
+        vec!["end".to_string()],
+        "exactly one on_end (delivered before its panic) and no error callback"
+    );
+}
+
+/// Parent probe: the two-bomb aggregate disposal (see the child fn).
+#[test]
+fn sibling_capture_bombs_do_not_abort_the_process() {
+    run_child_scenario("two_destructor_bombs");
+}
+
+/// Parent probe: the panicking-payload discard (see the child fn).
+#[test]
+fn panicking_payload_destructor_does_not_abort_the_process() {
+    run_child_scenario("panicking_payload_bomb");
 }
 
 /// Full-job settlement: a filter worker's FINAL log fires AFTER the sink
