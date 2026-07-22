@@ -390,30 +390,64 @@ mod tests {
     #[test]
     fn capture_data_defaults_off_and_copies_payloads_when_enabled() {
         // Default: scanning stays copy-free — no packet carries a payload.
+        // Record the sizes as the capture-independent reference.
         let mut scanner = PacketScanner::open("test.mp4").unwrap();
-        let mut scanned = 0usize;
-        for packet in scanner.packets() {
-            assert!(
-                packet.unwrap().data().is_none(),
-                "a capture-off scan must not copy payloads"
-            );
-            scanned += 1;
-        }
-        assert!(scanned > 0, "expected packets in the fixture");
-
-        // Re-scan with capture enabled: every packet carries its bytes.
-        let mut scanner = PacketScanner::open("test.mp4").unwrap();
-        scanner.set_capture_data(true);
-        let mut captured = 0usize;
+        let mut sizes = Vec::new();
         for packet in scanner.packets() {
             let info = packet.unwrap();
-            let data = info
+            assert!(
+                info.data().is_none(),
+                "a capture-off scan must not copy payloads"
+            );
+            sizes.push(info.size());
+        }
+        assert!(!sizes.is_empty(), "expected packets in the fixture");
+
+        // Re-scan with capture enabled, twice: every packet carries exactly
+        // `size` bytes, and two independent demux passes over the same file
+        // yield identical bytes — the capture is the packet's payload, not a
+        // transient buffer snapshot.
+        fn capture_scan() -> Vec<PacketInfo> {
+            let mut scanner = PacketScanner::open("test.mp4").unwrap();
+            scanner.set_capture_data(true);
+            scanner.packets().map(|p| p.unwrap()).collect()
+        }
+        let first = capture_scan();
+        let second = capture_scan();
+        assert_eq!(first.len(), sizes.len(), "both scans see the same packets");
+        assert_eq!(
+            second.len(),
+            first.len(),
+            "repeated capture scans see the same packets"
+        );
+        for (i, (a, b)) in first.iter().zip(&second).enumerate() {
+            let data_a = a
                 .data()
                 .expect("a capture-on scan must carry the payload");
-            assert!(!data.is_empty(), "captured payloads must not be empty");
-            captured += 1;
+            assert!(!data_a.is_empty(), "packet {i}: captured payload is empty");
+            assert_eq!(
+                data_a.len(),
+                a.size(),
+                "packet {i}: captured length must equal the packet size"
+            );
+            assert_eq!(
+                a.size(),
+                sizes[i],
+                "packet {i}: size differs from the capture-off scan"
+            );
+            let data_b = b
+                .data()
+                .expect("a capture-on rescan must carry the payload");
+            assert_eq!(
+                data_b.len(),
+                b.size(),
+                "packet {i}: rescan captured length must equal the packet size"
+            );
+            assert!(
+                data_a == data_b,
+                "packet {i}: payload bytes differ across two scans"
+            );
         }
-        assert_eq!(captured, scanned, "both scans see the same packets");
     }
 
     #[test]
