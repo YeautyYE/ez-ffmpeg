@@ -376,7 +376,14 @@ fn abort_during_final_delivery_fires_no_terminal_callback() {
     // record proves that store is published (see the latch's doc comment),
     // so the terminal region's fresh load is ordered after it.
     WATCH_ARMED.store(true, Ordering::Release);
-    let abort_thread = std::thread::spawn(move || scheduler.abort());
+    // abort() returns () — the channel carries completion, giving join a
+    // bound: a teardown regression after the observation record must FAIL
+    // the recv_timeout below, not hang the suite in an unbounded join.
+    let (abort_completed_tx, abort_completed_rx) = std::sync::mpsc::channel();
+    let abort_thread = std::thread::spawn(move || {
+        scheduler.abort();
+        let _ = abort_completed_tx.send(());
+    });
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while !ABORT_OBSERVED.load(Ordering::Acquire) {
         assert!(
@@ -387,6 +394,11 @@ fn abort_during_final_delivery_fires_no_terminal_callback() {
     }
     WATCH_ARMED.store(false, Ordering::Release);
     let _ = abort_done_tx.send(());
+    // 120 s sits comfortably above the callback's own 90 s failsafe, so a
+    // hang detected here is a real teardown wedge, not the failsafe firing.
+    abort_completed_rx
+        .recv_timeout(Duration::from_secs(120))
+        .expect("abort() never returned after the held packet was released");
     abort_thread
         .join()
         .expect("abort() must return once the job tears down");
