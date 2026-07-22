@@ -545,15 +545,25 @@ fn unescape_rbsp(payload: &[u8]) -> Vec<u8> {
 }
 
 /// The SPS fields later validation stages consume: the identity a PPS
-/// resolves its `seq_parameter_set_id` reference against, and the chroma /
-/// bit-depth block the avcC profile extension and the PPS scaling-matrix
-/// size derive from.
+/// resolves its `seq_parameter_set_id` reference against, the chroma /
+/// bit-depth block the avcC profile extension, the PPS scaling-matrix
+/// size and the `pic_init_qp_minus26` bound derive from, and the coded
+/// dimensions the PPS slice-group map is held against.
 #[derive(Debug, Clone, Copy)]
 struct SpsSummary {
     sps_id: u32,
     chroma_format_idc: u8,
     bit_depth_luma: u8,
     bit_depth_chroma: u8,
+    /// `PicWidthInMbs` (H.264 7-13): `pic_width_in_mbs_minus1 + 1`.
+    pic_width_in_mbs: u32,
+    /// `PicHeightInMapUnits` (H.264 7-16):
+    /// `pic_height_in_map_units_minus1 + 1` — map units, NOT frame
+    /// macroblock rows (a field-coded picture holds two map units per
+    /// frame MB column). `PicSizeInMapUnits`, the budget every FMO
+    /// slice-group shape is bounded by (7.4.2.2), is the product of
+    /// these two fields (7-17).
+    pic_height_in_map_units: u32,
 }
 
 impl SpsSummary {
@@ -575,14 +585,25 @@ impl SpsSummary {
 /// Field bounds mirror `ff_h264_decode_seq_parameter_set`
 /// (libavcodec/h264_ps.c): the high-profile dispatch set (including
 /// profile_idc 144), `seq_parameter_set_id <= 31` (MAX_SPS_COUNT),
+/// `delta_scale` in [-128, 127] inside scaling lists,
 /// `log2_max_frame_num_minus4 <= 12`, `pic_order_cnt_type <= 2`,
 /// `log2_max_pic_order_cnt_lsb_minus4 <= 12`,
-/// `num_ref_frames_in_pic_order_cnt_cycle < 256` and, inside the VUI HRD,
-/// `cpb_cnt_minus1 <= 31`. One deliberate divergence: for some broken
-/// encoders h264_ps.c only WARNS when declared-present VUI data runs out
-/// mid-structure, because a decoder can still play the stream; a validator
-/// has no decode path to fall back on, so truncation anywhere inside the
-/// declared syntax is rejected here.
+/// `num_ref_frames_in_pic_order_cnt_cycle < 256`,
+/// `max_num_ref_frames <= 16` (H264_MAX_DPB_FRAMES), the coded-dimension
+/// sanity gate (its av_image_check_size call), the cropping gate (a crop
+/// must leave at least one sample each way) and, inside the VUI HRD,
+/// `cpb_cnt_minus1 <= 31`. Deliberate divergences, each toward the spec
+/// where h264_ps.c substitutes a decoder recovery policy:
+/// * for some broken encoders h264_ps.c only WARNS when declared-present
+///   VUI data runs out mid-structure, because a decoder can still play
+///   the stream; a validator has no decode path to fall back on, so
+///   truncation anywhere inside the declared syntax is rejected here;
+/// * zeroed `timing_info` (h264_ps.c drops the flag and plays on) and
+///   out-of-range `chroma_sample_loc_type` (h2645_vui.c maps values above
+///   5 to "unspecified") are E.2.1 violations a validator rejects instead
+///   of scrubbing;
+/// * the bitstream_restriction denominators and MV-length exponents are
+///   held to their E.2.1 ceilings (16), which h264_ps.c reads unchecked.
 fn parse_sps(sps: &[u8]) -> Result<SpsSummary, String> {
     let rbsp = unescape_rbsp(&sps[1..]);
     let mut r = BitReader::new(&rbsp);
@@ -657,6 +678,7 @@ fn parse_sps(sps: &[u8]) -> Result<SpsSummary, String> {
         // header consistency check would then reject FFmpeg's own records.
         _ => (1, 8, 8),
     };
+    let (chroma_format_idc, bit_depth_luma, bit_depth_chroma) = chroma_info;
     let log2_max_frame_num_minus4 = r.ue()?;
     if log2_max_frame_num_minus4 > 12 {
         return Err(format!(
@@ -691,19 +713,66 @@ fn parse_sps(sps: &[u8]) -> Result<SpsSummary, String> {
         2 => {}
         other => return Err(format!("pic_order_cnt_type {other} (must be <= 2)")),
     }
-    r.ue()?; // max_num_ref_frames
+    let max_num_ref_frames = r.ue()?;
+    // H264_MAX_DPB_FRAMES: no level defines a DPB deeper than 16 frames
+    // (A.3.1), and h264_ps.c rejects a larger max_num_ref_frames outright
+    // ("too many reference frames").
+    if max_num_ref_frames > 16 {
+        return Err(format!(
+            "max_num_ref_frames {max_num_ref_frames} exceeds 16"
+        ));
+    }
     r.bits(1)?; // gaps_in_frame_num_value_allowed_flag
-    r.ue()?; // pic_width_in_mbs_minus1
-    r.ue()?; // pic_height_in_map_units_minus1
-    if r.bits(1)? == 0 {
-        // !frame_mbs_only_flag
+    let pic_width_in_mbs = r.ue()? as u64 + 1; // pic_width_in_mbs_minus1
+    let pic_height_in_map_units = r.ue()? as u64 + 1; // ..._minus1
+    let frame_mbs_only = r.bits(1)? == 1;
+    if !frame_mbs_only {
         r.bits(1)?; // mb_adaptive_frame_field_flag
+    }
+    // Coded-dimension sanity, the ff_h264_decode_seq_parameter_set gate
+    // ("mb_width/height overflow", via av_image_check_size): a dimension of
+    // zero is unrepresentable here (the syntax codes minus-one values), so
+    // the live bounds are the ceilings. 65535 caps both axes — larger
+    // sizes overflow the 16-bit VisualSampleEntry width/height fields
+    // (ISO/IEC 14496-12, 12.1.3.2) this configuration feeds — and the
+    // buffer-size product guard mirrors av_image_check_size2
+    // (libavutil/imgutils.c): the 8-bytes-per-sample linesize plus
+    // alignment slack, times the padded height, must stay below INT_MAX.
+    let width = 16 * pic_width_in_mbs;
+    let height = 16 * pic_height_in_map_units * if frame_mbs_only { 1 } else { 2 };
+    if width > 65535 || height > 65535 {
+        return Err(format!(
+            "coded picture size {width}x{height} exceeds 65535 on an axis"
+        ));
+    }
+    if (8 * width + 1024) * (height + 128) >= 1 << 31 {
+        return Err(format!(
+            "coded picture size {width}x{height} overflows the sample buffer bound"
+        ));
     }
     r.bits(1)?; // direct_8x8_inference_flag
     if r.bits(1)? == 1 {
-        // frame_cropping_flag
-        for _ in 0..4 {
-            r.ue()?; // frame_crop_{left,right,top,bottom}_offset
+        // frame_cropping_flag: the four offsets count in crop units — one
+        // chroma sample horizontally for 4:2:0/4:2:2 and vertically for
+        // 4:2:0, with the vertical unit doubled again for field-coded
+        // streams (7.4.2.1.1 via SubWidthC/SubHeightC; the same step_x /
+        // step_y derivation as h264_ps.c). A total crop reaching either
+        // coded dimension removes the whole picture and is rejected there
+        // ("crop values invalid").
+        let crop_left = r.ue()? as u64;
+        let crop_right = r.ue()? as u64;
+        let crop_top = r.ue()? as u64;
+        let crop_bottom = r.ue()? as u64;
+        let step_x: u64 = if chroma_format_idc == 1 || chroma_format_idc == 2 { 2 } else { 1 };
+        let step_y: u64 = (if chroma_format_idc == 1 { 2 } else { 1 })
+            * (if frame_mbs_only { 1 } else { 2 });
+        if (crop_left + crop_right) * step_x >= width
+            || (crop_top + crop_bottom) * step_y >= height
+        {
+            return Err(format!(
+                "frame cropping {crop_left}/{crop_right}/{crop_top}/{crop_bottom} \
+                 removes the whole {width}x{height} picture"
+            ));
         }
     }
     if r.bits(1)? == 1 {
@@ -711,12 +780,14 @@ fn parse_sps(sps: &[u8]) -> Result<SpsSummary, String> {
         skip_vui(&mut r)?;
     }
     r.finish_rbsp()?;
-    let (chroma_format_idc, bit_depth_luma, bit_depth_chroma) = chroma_info;
     Ok(SpsSummary {
         sps_id,
         chroma_format_idc,
         bit_depth_luma,
         bit_depth_chroma,
+        // Both fit u32: the 65535-pixel axis caps above bound them to 4095.
+        pic_width_in_mbs: pic_width_in_mbs as u32,
+        pic_height_in_map_units: pic_height_in_map_units as u32,
     })
 }
 
@@ -726,13 +797,19 @@ fn parse_sps(sps: &[u8]) -> Result<SpsSummary, String> {
 /// libavcodec/h264_ps.c: `nextScale = (lastScale + delta_scale + 256) % 256`,
 /// with `lastScale` carried forward once a zero `nextScale` switches the
 /// remainder of the list to the default matrix (no further `delta_scale`
-/// codes are present after that point).
+/// codes are present after that point). Each `delta_scale` must lie in
+/// [-128, 127] (7.4.2.1.1.1); `decode_scaling_list` rejects the same range
+/// ("delta scale %d is invalid").
 fn skip_scaling_list(r: &mut BitReader, size: u32) -> Result<(), String> {
     let mut last_scale: i64 = 8;
     let mut next_scale: i64 = 8;
     for _ in 0..size {
         if next_scale != 0 {
-            next_scale = (last_scale + r.se()? + 256).rem_euclid(256);
+            let delta_scale = r.se()?;
+            if !(-128..=127).contains(&delta_scale) {
+                return Err(format!("delta_scale {delta_scale} outside [-128, 127]"));
+            }
+            next_scale = (last_scale + delta_scale + 256).rem_euclid(256);
         }
         if next_scale != 0 {
             last_scale = next_scale;
@@ -758,13 +835,21 @@ fn skip_scaling_list(r: &mut BitReader, size: u32) -> Result<(), String> {
 /// fails there with the same "sps_id out of range" as an oversized id, and
 /// `ff_h264_decode_extradata` fails the whole extradata over it),
 /// `num_ref_idx_l0/l1_default_active_minus1 <= 31` ("reference overflow
-/// (pps)") and both chroma_qp_index_offset fields in [-12, 12].
+/// (pps)"), both chroma_qp_index_offset fields in [-12, 12], and
+/// `pic_init_qp_minus26` held to the range 7.4.2.2 grants under the
+/// REFERENCED SPS's bit depth — h264_ps.c folds the same
+/// `6 * bit_depth_luma_minus8` offset into `init_qp` and defers the range
+/// check to slice time (the "QP %u out of range" rejection in
+/// h264_slice.c); a validator has the resolved SPS in hand and needs no
+/// slice to check against.
 /// Divergences, each toward the spec where h264_ps.c substitutes a
 /// decoder-capability policy:
 /// * the multi-group slice_group_map syntax is parsed per 7.3.2.2 with
-///   `num_slice_groups_minus1 <= 7` (the Annex A.2.1 FMO limit);
-///   h264_ps.c instead refuses every multi-group PPS as unsupported FMO —
-///   a statement about its decoder, not about the bitstream;
+///   `num_slice_groups_minus1 <= 7` (the Annex A.2.1 FMO limit) and the
+///   per-shape semantic bounds held against the referenced SPS
+///   ([`check_slice_group_map`]); h264_ps.c instead refuses every
+///   multi-group PPS as unsupported FMO — a statement about its decoder,
+///   not about the bitstream;
 /// * `weighted_bipred_idc <= 2` (7.4.2.2); h264_ps.c reads the two bits
 ///   unchecked;
 /// * the `more_rbsp_data()` tail is decided by the spec definition (7.2,
@@ -805,7 +890,7 @@ fn parse_pps(pps: &[u8], sps_context: &[SpsSummary]) -> Result<u32, String> {
         ));
     }
     if num_slice_groups_minus1 > 0 {
-        skip_slice_group_map(&mut r, num_slice_groups_minus1)?;
+        check_slice_group_map(&mut r, num_slice_groups_minus1, sps)?;
     }
     let num_ref_idx_l0 = r.ue()?;
     let num_ref_idx_l1 = r.ue()?;
@@ -824,16 +909,19 @@ fn parse_pps(pps: &[u8], sps_context: &[SpsSummary]) -> Result<u32, String> {
     }
     let pic_init_qp_minus26 = r.se()?;
     // 7.4.2.2 bounds pic_init_qp_minus26 to -(26 + QpBdOffsetY) .. +25 with
-    // QpBdOffsetY = 6 * bit_depth_luma_minus8 — a floor of -62 at the
-    // deepest legal (14-bit) depth. h264_ps.c applies no bound at all here:
-    // init_qp is only validated against the active bit depth at slice time
-    // (h264_slice.c). The validator mirrors that tolerance with one fixed
-    // envelope, [-88, 25], strictly wider than every per-depth spec range:
-    // a value outside it cannot be legal under any SPS, while values inside
-    // defer to slice-time semantics exactly as FFmpeg does.
-    if !(-88..=25).contains(&pic_init_qp_minus26) {
+    // QpBdOffsetY = 6 * bit_depth_luma_minus8 (7.4.2.1.1): [-26, 25] for
+    // an 8-bit SPS, the floor deepening by 6 per extra bit down to -62 at
+    // the deepest legal (14-bit) depth. The bound follows the SPS this PPS
+    // RESOLVED above — the same pairing h264_ps.c uses when it folds
+    // qp_bd_offset into init_qp, deferring the range rejection to slice
+    // time ("QP %u out of range", h264_slice.c) only because a decoder has
+    // no earlier point where both halves meet; a validator does.
+    let qp_floor = -(26 + 6 * (sps.bit_depth_luma as i64 - 8));
+    if !(qp_floor..=25).contains(&pic_init_qp_minus26) {
         return Err(format!(
-            "pic_init_qp_minus26 {pic_init_qp_minus26} outside [-88, 25]"
+            "pic_init_qp_minus26 {pic_init_qp_minus26} outside [{qp_floor}, 25] \
+             (the referenced SPS codes {}-bit luma)",
+            sps.bit_depth_luma
         ));
     }
     let pic_init_qs_minus26 = r.se()?;
@@ -887,45 +975,104 @@ fn parse_pps(pps: &[u8], sps_context: &[SpsSummary]) -> Result<u32, String> {
     Ok(pps_id)
 }
 
-/// Consumes the multi-group slice_group_map syntax of 7.3.2.2 (map types
-/// 0..=6). h264_ps.c has no equivalent to mirror — it refuses every
-/// `num_slice_groups_minus1 > 0` PPS as unsupported FMO — so the shapes
-/// come straight from the spec: per-group run lengths (type 0), foreground
-/// rectangles for all but the last group (type 2, which loops
-/// `num_slice_groups_minus1` times — the final group is the leftover
-/// background), a change direction and rate (types 3..=5), and an explicit
-/// per-map-unit group-id table (type 6). Type 1 (dispersed) carries no
-/// syntax. The type-6 table length needs no artificial bound: every entry
-/// consumes at least one bit, so a declared count beyond the RBSP fails in
-/// the reader.
-fn skip_slice_group_map(r: &mut BitReader, num_slice_groups_minus1: u32) -> Result<(), String> {
+/// Parses the multi-group slice_group_map syntax of 7.3.2.2 (map types
+/// 0..=6) and holds each shape to its 7.4.2.2 semantics against the
+/// REFERENCED SPS. h264_ps.c has no equivalent to mirror — it refuses
+/// every `num_slice_groups_minus1 > 0` PPS as unsupported FMO — so both
+/// the shapes and the bounds come straight from the spec, with
+/// `PicSizeInMapUnits = PicWidthInMbs * PicHeightInMapUnits` (7-17) as the
+/// map-unit budget:
+/// * type 0: each `run_length_minus1[i]` <= PicSizeInMapUnits - 1;
+/// * type 2: foreground rectangles for all but the last group (the loop
+///   runs `num_slice_groups_minus1` times — the final group is the
+///   leftover background); `bottom_right[i]` < PicSizeInMapUnits,
+///   `top_left[i] <= bottom_right[i]`, and the column order
+///   `top_left[i] % PicWidthInMbs <= bottom_right[i] % PicWidthInMbs`;
+/// * types 3..=5 (the changing maps): defined only for exactly two slice
+///   groups (`num_slice_groups_minus1` shall be 1), with
+///   `slice_group_change_rate_minus1 <= PicSizeInMapUnits - 1`;
+/// * type 6: the explicit table must not declare more entries than the
+///   picture has map units, and every `slice_group_id[i]` <=
+///   `num_slice_groups_minus1`.
+/// Type 1 (dispersed) carries no syntax.
+fn check_slice_group_map(
+    r: &mut BitReader,
+    num_slice_groups_minus1: u32,
+    sps: &SpsSummary,
+) -> Result<(), String> {
+    let pic_size_in_map_units =
+        sps.pic_width_in_mbs as u64 * sps.pic_height_in_map_units as u64;
     let map_type = r.ue()?;
     match map_type {
         0 => {
             for _ in 0..=num_slice_groups_minus1 {
-                r.ue()?; // run_length_minus1[i]
+                let run_length_minus1 = r.ue()?;
+                if run_length_minus1 as u64 >= pic_size_in_map_units {
+                    return Err(format!(
+                        "slice-group run_length_minus1 {run_length_minus1} reaches past \
+                         the {pic_size_in_map_units} map units of the referenced SPS"
+                    ));
+                }
             }
         }
         1 => {}
         2 => {
             for _ in 0..num_slice_groups_minus1 {
-                r.ue()?; // top_left[i]
-                r.ue()?; // bottom_right[i]
+                let top_left = r.ue()?;
+                let bottom_right = r.ue()?;
+                if bottom_right as u64 >= pic_size_in_map_units {
+                    return Err(format!(
+                        "slice-group bottom_right {bottom_right} is outside the \
+                         {pic_size_in_map_units} map units of the referenced SPS"
+                    ));
+                }
+                let width = sps.pic_width_in_mbs;
+                if top_left > bottom_right || top_left % width > bottom_right % width {
+                    return Err(format!(
+                        "slice-group rectangle {top_left}..{bottom_right} is inverted \
+                         (7.4.2.2 orders both corners, by map unit and by column)"
+                    ));
+                }
             }
         }
         3..=5 => {
+            if num_slice_groups_minus1 != 1 {
+                return Err(format!(
+                    "slice_group_map_type {map_type} requires exactly two slice groups \
+                     (num_slice_groups_minus1 is {num_slice_groups_minus1})"
+                ));
+            }
             r.bits(1)?; // slice_group_change_direction_flag
-            r.ue()?; // slice_group_change_rate_minus1
+            let change_rate_minus1 = r.ue()?;
+            if change_rate_minus1 as u64 >= pic_size_in_map_units {
+                return Err(format!(
+                    "slice_group_change_rate_minus1 {change_rate_minus1} reaches past \
+                     the {pic_size_in_map_units} map units of the referenced SPS"
+                ));
+            }
         }
         6 => {
             let pic_size_in_map_units_minus1 = r.ue()?;
+            if pic_size_in_map_units_minus1 as u64 + 1 > pic_size_in_map_units {
+                return Err(format!(
+                    "slice-group table declares {} map units but the referenced SPS \
+                     codes {pic_size_in_map_units}",
+                    pic_size_in_map_units_minus1 as u64 + 1
+                ));
+            }
             // slice_group_id[i] is u(v) with v = Ceil(Log2(
             // num_slice_groups_minus1 + 1)) (7.4.2.2), which equals the bit
             // length of num_slice_groups_minus1 for every value >= 1 —
             // 1..=3 bits over the 2..=8 groups admitted above.
             let width = 32 - num_slice_groups_minus1.leading_zeros();
             for _ in 0..=pic_size_in_map_units_minus1 {
-                r.bits(width)?; // slice_group_id[i]
+                let slice_group_id = r.bits(width)?;
+                if slice_group_id > num_slice_groups_minus1 {
+                    return Err(format!(
+                        "slice_group_id {slice_group_id} exceeds \
+                         num_slice_groups_minus1 {num_slice_groups_minus1}"
+                    ));
+                }
             }
         }
         other => return Err(format!("slice_group_map_type {other} (must be <= 6)")),
@@ -936,7 +1083,14 @@ fn skip_slice_group_map(r: &mut BitReader, num_slice_groups_minus1: u32) -> Resu
 /// Consumes `vui_parameters()` (H.264 E.1.1), the field set
 /// libavcodec/h2645_vui.c and h264_ps.c read. Values are not retained; the
 /// pass exists so a declared-present VUI that ends mid-structure fails the
-/// parse instead of leaving unread syntax in front of `rbsp_trailing_bits`.
+/// parse instead of leaving unread syntax in front of `rbsp_trailing_bits`,
+/// and so the E.2.1 value bounds hold: `chroma_sample_loc_type_* <= 5`,
+/// nonzero `timing_info` (the h264_ps.c "time_scale/num_units_in_tick
+/// invalid" condition — it scrubs the flag, a validator rejects), and the
+/// bitstream_restriction set (`max_bytes_per_pic_denom <= 16`,
+/// `max_bits_per_mb_denom <= 16`, `log2_max_mv_length_* <= 16`,
+/// `max_num_reorder_frames <= max_dec_frame_buffering` and `<= 16` — the
+/// h264_ps.c "illegal num_reorder_frames" rejection).
 fn skip_vui(r: &mut BitReader) -> Result<(), String> {
     if r.bits(1)? == 1 {
         // aspect_ratio_info_present_flag
@@ -962,13 +1116,24 @@ fn skip_vui(r: &mut BitReader) -> Result<(), String> {
     }
     if r.bits(1)? == 1 {
         // chroma_loc_info_present_flag
-        r.ue()?; // chroma_sample_loc_type_top_field
-        r.ue()?; // chroma_sample_loc_type_bottom_field
+        let top = r.ue()?; // chroma_sample_loc_type_top_field
+        let bottom = r.ue()?; // chroma_sample_loc_type_bottom_field
+        if top > 5 || bottom > 5 {
+            return Err(format!(
+                "chroma_sample_loc_type {top}/{bottom} exceeds 5"
+            ));
+        }
     }
     if r.bits(1)? == 1 {
-        // timing_info_present_flag
-        r.bits(32)?; // num_units_in_tick
-        r.bits(32)?; // time_scale
+        // timing_info_present_flag: E.2.1 requires both fields nonzero (a
+        // zero denominator or numerator makes the declared tick undefined).
+        let num_units_in_tick = r.bits(32)?;
+        let time_scale = r.bits(32)?;
+        if num_units_in_tick == 0 || time_scale == 0 {
+            return Err(format!(
+                "timing_info {num_units_in_tick}/{time_scale} carries a zero field"
+            ));
+        }
         r.bits(1)?; // fixed_frame_rate_flag
     }
     let nal_hrd = r.bits(1)? == 1; // nal_hrd_parameters_present_flag
@@ -986,12 +1151,37 @@ fn skip_vui(r: &mut BitReader) -> Result<(), String> {
     if r.bits(1)? == 1 {
         // bitstream_restriction_flag
         r.bits(1)?; // motion_vectors_over_pic_boundaries_flag
-        r.ue()?; // max_bytes_per_pic_denom
-        r.ue()?; // max_bits_per_mb_denom
-        r.ue()?; // log2_max_mv_length_horizontal
-        r.ue()?; // log2_max_mv_length_vertical
-        r.ue()?; // max_num_reorder_frames
-        r.ue()?; // max_dec_frame_buffering
+        let max_bytes_per_pic_denom = r.ue()?;
+        let max_bits_per_mb_denom = r.ue()?;
+        let log2_max_mv_length_horizontal = r.ue()?;
+        let log2_max_mv_length_vertical = r.ue()?;
+        let max_num_reorder_frames = r.ue()?;
+        let max_dec_frame_buffering = r.ue()?;
+        if max_bytes_per_pic_denom > 16 {
+            return Err(format!(
+                "max_bytes_per_pic_denom {max_bytes_per_pic_denom} exceeds 16"
+            ));
+        }
+        if max_bits_per_mb_denom > 16 {
+            return Err(format!(
+                "max_bits_per_mb_denom {max_bits_per_mb_denom} exceeds 16"
+            ));
+        }
+        if log2_max_mv_length_horizontal > 16 || log2_max_mv_length_vertical > 16 {
+            return Err(format!(
+                "log2_max_mv_length {log2_max_mv_length_horizontal}/\
+                 {log2_max_mv_length_vertical} exceeds 16"
+            ));
+        }
+        // E.2.1 bounds max_num_reorder_frames by max_dec_frame_buffering,
+        // and no level admits more than 16 held frames (H264_MAX_DPB_FRAMES;
+        // h264_ps.c rejects above 16 the same way).
+        if max_num_reorder_frames > 16 || max_num_reorder_frames > max_dec_frame_buffering {
+            return Err(format!(
+                "max_num_reorder_frames {max_num_reorder_frames} exceeds 16 or \
+                 max_dec_frame_buffering {max_dec_frame_buffering}"
+            ));
+        }
     }
     Ok(())
 }
@@ -1400,6 +1590,86 @@ mod tests {
         0x67, 0x64, 0x00, 0x1E, 0xAC, 0xD9, 0x41, 0x41, 0xFB, 0x01, 0x10, 0x00, 0x00, 0x03,
         0x00, 0x10, 0x00, 0x00, 0x03, 0x03, 0x20, 0xF1, 0x62, 0xD9, 0x40,
     ];
+    // max_num_ref_frames 16 (the H264_MAX_DPB_FRAMES ceiling) and 17: one
+    // ue bit apart on the Constrained Baseline 320x240 skeleton.
+    const REF_FRAMES_16_SPS: &[u8] = &[0x67, 0x42, 0xC0, 0x1E, 0xD8, 0x44, 0x14, 0x1F, 0x90];
+    const REF_FRAMES_17_SPS: &[u8] = &[0x67, 0x42, 0xC0, 0x1E, 0xD8, 0x48, 0x14, 0x1F, 0x90];
+    // pic_width_in_mbs_minus1 4094 (width 65520, the widest coded picture
+    // both 16-bit sample-entry fields and the buffer bound admit at height
+    // 16) and 4095 (width 65536, past the 16-bit axis cap).
+    const WIDTH_65520_SPS: &[u8] = &[0x67, 0x42, 0xC0, 0x1E, 0xDA, 0x00, 0x0F, 0xFF, 0xE4];
+    const WIDTH_65536_SPS: &[u8] = &[0x67, 0x42, 0xC0, 0x1E, 0xDA, 0x00, 0x04, 0x00, 0x39];
+    // 65520x65520: each axis is individually inside the 16-bit cap, the
+    // sample-buffer product is not.
+    const PIXEL_PRODUCT_SPS: &[u8] = &[
+        0x67, 0x42, 0xC0, 0x1E, 0xDA, 0x00, 0x0F, 0xFF, 0x00, 0x1F, 0xFF, 0x90,
+    ];
+    // Horizontal crop in 4:2:0 chroma units on the 320x240 skeleton:
+    // (79 + 80) * 2 = 318 of 320 luma columns survive one column, while
+    // (80 + 80) * 2 = 320 removes the whole picture. One ue bit apart.
+    const NEAR_FULL_CROP_SPS: &[u8] = &[
+        0x67, 0x42, 0xC0, 0x1E, 0xDA, 0x05, 0x07, 0xF0, 0x28, 0x01, 0x47, 0x40,
+    ];
+    const FULL_CROP_SPS: &[u8] = &[
+        0x67, 0x42, 0xC0, 0x1E, 0xDA, 0x05, 0x07, 0xF0, 0x28, 0x81, 0x47, 0x40,
+    ];
+    // VUI bitstream_restriction fixtures on the skeleton: every bounded
+    // field at its E.2.1 ceiling (both denominators and both MV-length
+    // exponents 16, max_num_reorder_frames 16 <= max_dec_frame_buffering
+    // 16), then one field over at a time — reorder 17, reorder 2 against
+    // buffering 1, max_bytes_per_pic_denom 17, max_bits_per_mb_denom 17,
+    // log2_max_mv_length_horizontal 17.
+    const REORDER_16_SPS: &[u8] = &[
+        0x67, 0x42, 0xC0, 0x1E, 0xDA, 0x05, 0x07, 0xE8, 0x06, 0x11, 0x08, 0x84, 0x42, 0x21,
+        0x10, 0x8C,
+    ];
+    const REORDER_17_SPS: &[u8] = &[
+        0x67, 0x42, 0xC0, 0x1E, 0xDA, 0x05, 0x07, 0xE8, 0x07, 0xE1, 0x20, 0x94,
+    ];
+    const REORDER_ABOVE_BUFFERING_SPS: &[u8] = &[
+        0x67, 0x42, 0xC0, 0x1E, 0xDA, 0x05, 0x07, 0xE8, 0x07, 0xED, 0x40,
+    ];
+    const BYTES_DENOM_17_SPS: &[u8] = &[
+        0x67, 0x42, 0xC0, 0x1E, 0xDA, 0x05, 0x07, 0xE8, 0x06, 0x12, 0xFC,
+    ];
+    const MB_DENOM_17_SPS: &[u8] = &[
+        0x67, 0x42, 0xC0, 0x1E, 0xDA, 0x05, 0x07, 0xE8, 0x07, 0x09, 0x7C,
+    ];
+    const MV_LEN_17_SPS: &[u8] = &[
+        0x67, 0x42, 0xC0, 0x1E, 0xDA, 0x05, 0x07, 0xE8, 0x07, 0x84, 0xBC,
+    ];
+    // VUI timing_info with time_scale 0, then with num_units_in_tick 0:
+    // either zero leaves the declared tick undefined (E.2.1).
+    const ZERO_TIME_SCALE_SPS: &[u8] = &[
+        0x67, 0x42, 0xC0, 0x1E, 0xDA, 0x05, 0x07, 0xE8, 0x40, 0x00, 0x00, 0x03, 0x00, 0x40,
+        0x00, 0x00, 0x03, 0x00, 0x01,
+    ];
+    const ZERO_NUM_UNITS_SPS: &[u8] = &[
+        0x67, 0x42, 0xC0, 0x1E, 0xDA, 0x05, 0x07, 0xE8, 0x40, 0x00, 0x00, 0x03, 0x00, 0x00,
+        0x03, 0x00, 0x00, 0x06, 0x41,
+    ];
+    // chroma_sample_loc_type 5 on both fields (the E.2.1 ceiling) and 6.
+    const CHROMA_LOC_5_SPS: &[u8] = &[
+        0x67, 0x42, 0xC0, 0x1E, 0xDA, 0x05, 0x07, 0xE8, 0x98, 0xC0, 0x80,
+    ];
+    const CHROMA_LOC_6_SPS: &[u8] = &[
+        0x67, 0x42, 0xC0, 0x1E, 0xDA, 0x05, 0x07, 0xE8, 0x9E, 0x08,
+    ];
+    // High10 (profile_idc 110) 320x240 at 10-bit depth: QpBdOffsetY = 12,
+    // deepening the pic_init_qp_minus26 floor of a referencing PPS to -38.
+    const TEN_BIT_SPS: &[u8] = &[
+        0x67, 0x6E, 0x00, 0x1E, 0xA6, 0xCB, 0x40, 0xA0, 0xFC, 0x80,
+    ];
+    // Profile-100 scaling list 0 opening with delta_scale -128 (the
+    // decode_scaling_list floor; nextScale = (8 - 128 + 256) % 256 = 136,
+    // so all sixteen codes are present) and with +128, one past the
+    // ceiling — the pair differs inside one se code.
+    const DELTA_SCALE_M128_SPS: &[u8] = &[
+        0x67, 0x64, 0x00, 0x1E, 0xAD, 0x80, 0x40, 0x7F, 0xFF, 0x80, 0xB4, 0x0A, 0x0F, 0xC8,
+    ];
+    const DELTA_SCALE_128_SPS: &[u8] = &[
+        0x67, 0x64, 0x00, 0x1E, 0xAD, 0x80, 0x40, 0x3F, 0xFF, 0x80, 0xB4, 0x0A, 0x0F, 0xC8,
+    ];
 
     // Hand-assembled 7.3.2.2 PPS bit streams. The skeleton (`MINIMAL_PPS`)
     // codes both ids 0, CAVLC, one slice group, every ue/se field at its
@@ -1421,7 +1691,13 @@ mod tests {
     // chroma_qp_index_offset +12 and +13: one bit apart inside the se code.
     const CHROMA_QP_12_PPS: &[u8] = &[0x68, 0xCE, 0x30, 0xC0, 0x80];
     const CHROMA_QP_13_PPS: &[u8] = &[0x68, 0xCE, 0x30, 0xD0, 0x80];
-    // pic_init_qp_minus26 -88 (the envelope floor) and -89: one bit apart.
+    // pic_init_qp_minus26 fixtures: -26 (the 8-bit floor) and -27 (one se
+    // bit past it); -32, legal only under a 9-bit-or-deeper SPS
+    // (QpBdOffsetY >= 6); -88 and -89, below the floor of every legal
+    // depth (the 14-bit floor is -62).
+    const INIT_QP_M26_PPS: &[u8] = &[0x68, 0xCE, 0x01, 0xAE, 0x20];
+    const INIT_QP_M27_PPS: &[u8] = &[0x68, 0xCE, 0x01, 0xBE, 0x20];
+    const INIT_QP_M32_PPS: &[u8] = &[0x68, 0xCE, 0x00, 0x83, 0x88];
     const INIT_QP_M88_PPS: &[u8] = &[0x68, 0xCE, 0x00, 0x58, 0xE2];
     const INIT_QP_M89_PPS: &[u8] = &[0x68, 0xCE, 0x00, 0x59, 0xE2];
     // pic_init_qs_minus26 -27 (one below the flat -26 floor).
@@ -1446,6 +1722,25 @@ mod tests {
     // both shapes the spec does not define.
     const FMO_GROUPS_8_PPS: &[u8] = &[0x68, 0xC1, 0x30];
     const FMO_TYPE7_PPS: &[u8] = &[0x68, 0xC4, 0x22];
+    // Slice-group shapes that overrun the 300 map units of the referenced
+    // 320x240 SPS (20x15 map units): a type-0 run_length_minus1 of 300, a
+    // type-2 bottom_right of 300, a type-3 change rate of 300, and a
+    // type-6 table declaring 301 entries.
+    const FMO_TYPE0_RUN_300_PPS: &[u8] = &[0x68, 0xC5, 0x00, 0x96, 0xF1, 0xC4];
+    const FMO_TYPE2_BR_300_PPS: &[u8] = &[0x68, 0xC4, 0xE0, 0x12, 0xDC, 0x71];
+    const FMO_RATE_300_PPS: &[u8] = &[0x68, 0xC4, 0x40, 0x04, 0xB7, 0x1C, 0x40];
+    const FMO_TYPE6_SIZE_300_PPS: &[u8] = &[0x68, 0xC4, 0x70, 0x09, 0x6B, 0x1C, 0x40];
+    // Inverted type-2 rectangles: map units 40..20 invert the rows, and
+    // 1..20 invert the columns (1 % 20 = 1 > 20 % 20 = 0) on the 20-wide
+    // SPS.
+    const FMO_TYPE2_INVERTED_PPS: &[u8] = &[0x68, 0xC4, 0xC1, 0x48, 0x57, 0x1C, 0x40];
+    const FMO_TYPE2_COLUMN_PPS: &[u8] = &[0x68, 0xC4, 0xD0, 0x57, 0x1C, 0x40];
+    // A changing map (type 3) over three slice groups: 7.4.2.2 defines the
+    // changing maps for exactly two.
+    const FMO_TYPE3_GROUPS_3_PPS: &[u8] = &[0x68, 0xC6, 0x47, 0x1C, 0x40];
+    // Type 6 with three groups (two-bit ids) whose only entry codes group
+    // id 3, one past num_slice_groups_minus1 2.
+    const FMO_TYPE6_ID_3_PPS: &[u8] = &[0x68, 0xC6, 0x7F, 0x8E, 0x20];
     // The real `PPS` with only its rbsp_trailing_bits stop bit cleared
     // (last byte 0x20 -> 0x00); every parsed field is untouched.
     const BAD_STOP_BIT_PPS: &[u8] = &[0x68, 0xCB, 0x83, 0xCB, 0x00];
@@ -2287,9 +2582,12 @@ mod tests {
     }
 
     /// QP-family bounds, each pinned at its boundary: chroma_qp_index_offset
-    /// in [-12, 12] (h264_ps.c rejects 13 identically), pic_init_qp_minus26
-    /// in the all-depths envelope [-88, 25], pic_init_qs_minus26 in the
-    /// flat [-26, 25].
+    /// in [-12, 12] (h264_ps.c rejects 13 identically), pic_init_qs_minus26
+    /// in the flat [-26, 25], and pic_init_qp_minus26 in the 7.4.2.2 range
+    /// of the REFERENCED SPS — [-26, 25] against the 8-bit fixtures, so
+    /// both -27 (one bit past the floor) and the old fixed-envelope floor
+    /// -88 are rejected there, while -32 flips per referenced depth: legal
+    /// under the 10-bit SPS (floor -38), rejected under the 8-bit one.
     #[test]
     fn rejects_out_of_range_pps_qp_fields() {
         let ctx = sps_ctx(&[SPS]);
@@ -2299,12 +2597,22 @@ mod tests {
             err.contains("chroma_qp_index_offset 13"),
             "unexpected error: {err}"
         );
-        parse_pps(INIT_QP_M88_PPS, &ctx).unwrap();
-        let err = parse_pps(INIT_QP_M89_PPS, &ctx).unwrap_err();
-        assert!(
-            err.contains("pic_init_qp_minus26 -89"),
-            "unexpected error: {err}"
-        );
+        parse_pps(INIT_QP_M26_PPS, &ctx).unwrap();
+        for (fixture, qp) in [
+            (INIT_QP_M27_PPS, -27),
+            (INIT_QP_M32_PPS, -32),
+            (INIT_QP_M88_PPS, -88),
+            (INIT_QP_M89_PPS, -89),
+        ] {
+            let err = parse_pps(fixture, &ctx).unwrap_err();
+            assert!(
+                err.contains(&format!("pic_init_qp_minus26 {qp}")),
+                "unexpected error: {err}"
+            );
+        }
+        // The same -32 PPS binds a 10-bit SPS: QpBdOffsetY 12 deepens the
+        // floor to -38 and the parse succeeds.
+        parse_pps(INIT_QP_M32_PPS, &sps_ctx(&[TEN_BIT_SPS])).unwrap();
         let err = parse_pps(INIT_QS_M27_PPS, &ctx).unwrap_err();
         assert!(
             err.contains("pic_init_qs_minus26 -27"),
@@ -2359,5 +2667,109 @@ mod tests {
             err.contains("slice_group_map_type 7"),
             "unexpected error: {err}"
         );
+    }
+
+    /// The slice-group shapes are held to the referenced SPS (7.4.2.2):
+    /// every map-unit index and count fits the SPS's PicSizeInMapUnits,
+    /// type-2 rectangles are corner-ordered, changing maps require exactly
+    /// two groups and type-6 ids stay within the declared group count. The
+    /// in-budget accepts live in `parses_the_slice_group_map_types`.
+    #[test]
+    fn bounds_the_slice_group_map_against_the_referenced_sps() {
+        let ctx = sps_ctx(&[SPS]);
+        for (fixture, needle) in [
+            (FMO_TYPE0_RUN_300_PPS, "run_length_minus1 300"),
+            (FMO_TYPE2_BR_300_PPS, "bottom_right 300"),
+            (FMO_RATE_300_PPS, "slice_group_change_rate_minus1 300"),
+            (FMO_TYPE6_SIZE_300_PPS, "declares 301 map units"),
+            (FMO_TYPE2_INVERTED_PPS, "rectangle 40..20 is inverted"),
+            (FMO_TYPE2_COLUMN_PPS, "rectangle 1..20 is inverted"),
+            (FMO_TYPE3_GROUPS_3_PPS, "requires exactly two slice groups"),
+            (FMO_TYPE6_ID_3_PPS, "slice_group_id 3"),
+        ] {
+            let err = parse_pps(fixture, &ctx).unwrap_err();
+            assert!(err.contains(needle), "expected {needle:?}, got: {err}");
+        }
+    }
+
+    /// max_num_ref_frames is bounded to 16 (H264_MAX_DPB_FRAMES; the
+    /// h264_ps.c "too many reference frames" rejection): the fixtures sit
+    /// one ue bit apart across the boundary.
+    #[test]
+    fn rejects_max_num_ref_frames_above_16() {
+        assert_eq!(parse_sps(REF_FRAMES_16_SPS).unwrap().chroma_info(), (1, 8, 8));
+        let err = parse_sps(REF_FRAMES_17_SPS).unwrap_err();
+        assert!(err.contains("max_num_ref_frames 17"), "unexpected error: {err}");
+    }
+
+    /// Coded-dimension sanity (the av_image_check_size gate of h264_ps.c):
+    /// 65520x16 is the widest accepted shape, one more macroblock column
+    /// overflows the 16-bit axis cap, and 65520x65520 — each axis legal —
+    /// fails the sample-buffer product bound.
+    #[test]
+    fn rejects_oversized_coded_dimensions() {
+        let summary = parse_sps(WIDTH_65520_SPS).unwrap();
+        assert_eq!(
+            (summary.pic_width_in_mbs, summary.pic_height_in_map_units),
+            (4095, 1)
+        );
+        let err = parse_sps(WIDTH_65536_SPS).unwrap_err();
+        assert!(err.contains("65536x16"), "unexpected error: {err}");
+        let err = parse_sps(PIXEL_PRODUCT_SPS).unwrap_err();
+        assert!(
+            err.contains("65520x65520") && err.contains("buffer"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Cropping must leave at least one sample per axis (the h264_ps.c
+    /// "crop values invalid" gate): a 4:2:0 horizontal crop of 318 of 320
+    /// columns passes, 320 of 320 removes the whole picture. One ue bit
+    /// apart.
+    #[test]
+    fn rejects_cropping_that_removes_the_whole_picture() {
+        assert_eq!(parse_sps(NEAR_FULL_CROP_SPS).unwrap().chroma_info(), (1, 8, 8));
+        let err = parse_sps(FULL_CROP_SPS).unwrap_err();
+        assert!(
+            err.contains("removes the whole"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// VUI value bounds (E.2.1): the all-ceilings bitstream_restriction
+    /// fixture parses, then each field one past its bound is rejected —
+    /// reorder depth over 16 and over max_dec_frame_buffering, both
+    /// denominators, the MV-length exponent, zeroed timing_info fields and
+    /// chroma_sample_loc_type 6.
+    #[test]
+    fn rejects_out_of_range_vui_fields() {
+        assert_eq!(parse_sps(REORDER_16_SPS).unwrap().chroma_info(), (1, 8, 8));
+        assert_eq!(parse_sps(CHROMA_LOC_5_SPS).unwrap().chroma_info(), (1, 8, 8));
+        for (fixture, needle) in [
+            (REORDER_17_SPS, "max_num_reorder_frames 17"),
+            (REORDER_ABOVE_BUFFERING_SPS, "max_num_reorder_frames 2"),
+            (BYTES_DENOM_17_SPS, "max_bytes_per_pic_denom 17"),
+            (MB_DENOM_17_SPS, "max_bits_per_mb_denom 17"),
+            (MV_LEN_17_SPS, "log2_max_mv_length 17/0"),
+            (ZERO_TIME_SCALE_SPS, "timing_info 1/0"),
+            (ZERO_NUM_UNITS_SPS, "timing_info 0/25"),
+            (CHROMA_LOC_6_SPS, "chroma_sample_loc_type 6/0"),
+        ] {
+            let err = parse_sps(fixture).unwrap_err();
+            assert!(err.contains(needle), "expected {needle:?}, got: {err}");
+        }
+    }
+
+    /// delta_scale is bounded to [-128, 127] (7.4.2.1.1.1; the
+    /// decode_scaling_list rejection): the floor value parses through all
+    /// sixteen codes, +128 differs inside one se code and is rejected.
+    #[test]
+    fn rejects_delta_scale_outside_range() {
+        assert_eq!(
+            parse_sps(DELTA_SCALE_M128_SPS).unwrap().chroma_info(),
+            (1, 8, 8)
+        );
+        let err = parse_sps(DELTA_SCALE_128_SPS).unwrap_err();
+        assert!(err.contains("delta_scale 128"), "unexpected error: {err}");
     }
 }
