@@ -7,10 +7,15 @@
 //! a caller-reserved scratch buffer; the already-length-prefixed and AAC paths
 //! do no byte work at all).
 //!
-//! Boundary conventions mirror libavformat exactly (`nal.c`):
+//! Boundary conventions mirror libavformat (`nal.c`):
 //! * a NAL ends at the next `00 00 01` triple, backing up one byte when the
-//!   preceding byte is zero (4-byte start-code attribution);
-//! * `trailing_zero_8bits` are trimmed from every NAL before it is emitted.
+//!   preceding byte is zero (4-byte start-code attribution) — identical
+//!   across FFmpeg versions;
+//! * `trailing_zero_8bits` are trimmed from every NAL before it is emitted,
+//!   matching FFmpeg master's (n8.2+) `nal_parse_units`. FFmpeg 7.1/8.1
+//!   length-prefix the NAL unchanged, carrying the padding into the sample;
+//!   the divergence is fixture-only, since real encoders emit no
+//!   trailing_zero_8bits.
 
 /// NAL unit types the strict tier cares about (H.264 table 7-1).
 pub(crate) const NAL_IDR: u8 = 5;
@@ -235,10 +240,13 @@ mod tests {
     }
 
     /// FFmpeg-equivalence fixture: trailing_zero_8bits after a NAL (before a
-    /// following start code and at stream end) are trimmed exactly like
-    /// libavformat/nal.c before length-prefixing.
+    /// following start code and at stream end) are trimmed before
+    /// length-prefixing, like FFmpeg master's (n8.2+) `nal_parse_units`
+    /// (libavformat/nal.c); FFmpeg 7.1/8.1 length-prefix the NAL unchanged
+    /// and carry the padding into the sample, a divergence that stays
+    /// fixture-only because real encoders emit no trailing_zero_8bits.
     #[test]
-    fn trailing_zero_bytes_are_trimmed_like_ffmpeg() {
+    fn trailing_zero_bytes_are_trimmed_like_ffmpeg_master() {
         // NAL [65 AA] + two trailing zeros + 3-byte startcode + NAL [06 05].
         let au = vec![0, 0, 0, 1, 0x65, 0xAA, 0, 0, 0, 0, 1, 0x06, 0x05];
         let nals = collect_annexb(&au).unwrap();

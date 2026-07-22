@@ -1929,11 +1929,13 @@ impl Drop for MuxDoneGuard {
 /// Panic-only release net for the mux worker's pre-counted thread slot.
 ///
 /// The mux worker uses a MANUAL `thread_done_with` (not `ThreadDoneGuard`) so
-/// the slot is released only AFTER writing the trailer, joining its encoders
-/// and freeing the output context — wait()/stop() must not return while that
-/// teardown still runs. (Mux completion is published separately and EARLIER:
-/// the last muxer's `MuxDoneGuard` deliberately stores STATUS_END BEFORE the
-/// encoder join, so a parked encoder observes it and exits joinably.) That
+/// the slot is released only AFTER the output's teardown — writing the
+/// trailer where a container is written (a packet sink has none), joining its
+/// encoders and freeing the output context — wait()/stop() must not return
+/// while that teardown still runs. (Mux completion is published separately
+/// and EARLIER: the last muxer's `MuxDoneGuard` deliberately stores
+/// STATUS_END BEFORE the encoder join, so a parked encoder observes it and
+/// exits joinably.) That
 /// manual call is skipped if the worker unwinds (panics) partway through,
 /// leaking the slot — then `wait_for_all_threads` (`RunningGuard::Drop`) hangs
 /// forever. This guard releases the slot on unwind; the normal path goes
