@@ -6,8 +6,8 @@
 //!   wrappers (full structural validation of the record: reserved bits, NAL
 //!   headers, the profile extension, trailing data and header/SPS
 //!   consistency), avcC synthesis mirroring `ff_isom_write_avcc` (including
-//!   the chroma/bit-depth extension), and the full SPS parse every
-//!   extradata path routes each SPS body through;
+//!   the chroma/bit-depth extension), and the full SPS and PPS parses
+//!   every extradata path routes each parameter-set body through;
 //! * [`AvcRuntime`] — the per-stream state machine the orchestrator drives:
 //!   payload normalization via the streaming NAL walkers (a census walk
 //!   then a write walk for Annex-B input), IDR classification, S8
@@ -50,8 +50,9 @@ impl ParameterSets {
 }
 
 /// Extracts parameter sets from extradata in either Annex-B or avcC form.
-/// Both forms parse every SPS body through [`parse_sps`] (the avcC branch
-/// inside [`parse_avcc_record`]), so the syntax guarantees are
+/// Both forms parse every SPS body through [`parse_sps`] and every PPS
+/// body through [`parse_pps`] (the avcC branch inside
+/// [`parse_avcc_record`]), so the syntax guarantees are
 /// wrapper-independent.
 pub(crate) fn parse_parameter_sets(extradata: &[u8]) -> Result<ParameterSets, String> {
     if extradata.first() == Some(&1) {
@@ -91,10 +92,17 @@ pub(crate) fn parse_parameter_sets(extradata: &[u8]) -> Result<ParameterSets, St
         if sets.sps.is_empty() || sets.pps.is_empty() {
             return Err("configuration data lacks an SPS or a PPS".to_string());
         }
-        // Every SPS body must parse to its rbsp_trailing_bits, not just the
-        // first one avcC synthesis reads fields from.
+        // Every parameter-set body must parse to its rbsp_trailing_bits,
+        // not just the first SPS avcC synthesis reads fields from. The SPS
+        // pass runs first because its summaries are the context every PPS
+        // resolves its seq_parameter_set_id against (collection already
+        // separated the types, so resolution is wrapper-order-independent).
+        let mut summaries = Vec::with_capacity(sets.sps.len());
         for sps in &sets.sps {
-            parse_sps(sps).map_err(|e| format!("SPS: {e}"))?;
+            summaries.push(parse_sps(sps).map_err(|e| format!("SPS: {e}"))?);
+        }
+        for pps in &sets.pps {
+            parse_pps(pps, &summaries).map_err(|e| format!("PPS: {e}"))?;
         }
         Ok(sets)
     }
@@ -126,9 +134,9 @@ struct AvccRecord {
 /// packet's prefixes), at least one SPS and one PPS, every array entry
 /// carrying a valid NAL header of the type its array declares, a
 /// complete-or-absent profile extension with nothing after it
-/// ([`parse_avcc_extension`]), every SPS body parsing through
-/// `rbsp_trailing_bits` ([`parse_sps`]), and a header that agrees with the
-/// record's own first SPS ([`check_avcc_consistency`]).
+/// ([`parse_avcc_extension`]), every SPS and PPS body parsing through
+/// `rbsp_trailing_bits` ([`parse_sps`], [`parse_pps`]), and a header that
+/// agrees with the record's own first SPS ([`check_avcc_consistency`]).
 fn parse_avcc_record(avcc: &[u8]) -> Result<AvccRecord, String> {
     if avcc.len() < 7 {
         return Err(format!("avcC too short ({} bytes)", avcc.len()));
@@ -189,10 +197,16 @@ fn parse_avcc_record(avcc: &[u8]) -> Result<AvccRecord, String> {
     if sets.sps.is_empty() || sets.pps.is_empty() {
         return Err("avcC lacks an SPS or a PPS".to_string());
     }
-    // Every SPS body must parse to its rbsp_trailing_bits — the array
-    // framing above only proves the entries have the right NAL type.
+    // Every parameter-set body must parse to its rbsp_trailing_bits — the
+    // array framing above only proves the entries have the right NAL type.
+    // SPS first: the summaries are the context each PPS resolves its
+    // seq_parameter_set_id against.
+    let mut summaries = Vec::with_capacity(sets.sps.len());
     for sps in &sets.sps {
-        parse_sps(sps).map_err(|e| format!("avcC SPS: {e}"))?;
+        summaries.push(parse_sps(sps).map_err(|e| format!("avcC SPS: {e}"))?);
+    }
+    for pps in &sets.pps {
+        parse_pps(pps, &summaries).map_err(|e| format!("avcC PPS: {e}"))?;
     }
     let extension = parse_avcc_extension(avcc, pos, header.profile)?;
     let record = AvccRecord {
@@ -311,7 +325,7 @@ fn check_avcc_consistency(record: &AvccRecord) -> Result<(), String> {
     }
     if let Some((chroma, luma, chroma_depth)) = record.extension {
         let first_sps = record.sets.sps.first().ok_or("no SPS")?;
-        let sps_fields = parse_sps(first_sps)?;
+        let sps_fields = parse_sps(first_sps)?.chroma_info();
         if (chroma, luma, chroma_depth) != sps_fields {
             let (sps_chroma, sps_luma, sps_chroma_depth) = sps_fields;
             return Err(format!(
@@ -377,7 +391,8 @@ pub(crate) fn build_avcc(sets: &ParameterSets) -> Result<Vec<u8>, String> {
     }
     let profile = first_sps[1];
     if profile != 66 && profile != 77 && profile != 88 {
-        let (chroma_format_idc, bit_depth_luma, bit_depth_chroma) = parse_sps(first_sps)?;
+        let (chroma_format_idc, bit_depth_luma, bit_depth_chroma) =
+            parse_sps(first_sps)?.chroma_info();
         out.push(0xFC | (chroma_format_idc & 0x03));
         out.push(0xF8 | ((bit_depth_luma - 8) & 0x07));
         out.push(0xF8 | ((bit_depth_chroma - 8) & 0x07));
@@ -423,28 +438,9 @@ impl CodecProjection {
     }
 }
 
-/// Parses one complete SPS NAL (header byte included) through
-/// `rbsp_trailing_bits` (H.264 7.3.2.1.1), returning `(chroma_format_idc,
-/// bit_depth_luma, bit_depth_chroma)` — 4:2:0 / 8-bit defaults when the
-/// profile does not carry the fields. Every extradata path routes each SPS
-/// body through this parse, so a configuration whose SPS cannot be read to
-/// its end (truncated syntax, out-of-range fields, a corrupt stop bit) is
-/// rejected up front instead of being handed to consumers as valid.
-///
-/// Field bounds mirror `ff_h264_decode_seq_parameter_set`
-/// (libavcodec/h264_ps.c): the high-profile dispatch set (including
-/// profile_idc 144), `seq_parameter_set_id <= 31` (MAX_SPS_COUNT),
-/// `log2_max_frame_num_minus4 <= 12`, `pic_order_cnt_type <= 2`,
-/// `log2_max_pic_order_cnt_lsb_minus4 <= 12`,
-/// `num_ref_frames_in_pic_order_cnt_cycle < 256` and, inside the VUI HRD,
-/// `cpb_cnt_minus1 <= 31`. One deliberate divergence: for some broken
-/// encoders h264_ps.c only WARNS when declared-present VUI data runs out
-/// mid-structure, because a decoder can still play the stream; a validator
-/// has no decode path to fall back on, so truncation anywhere inside the
-/// declared syntax is rejected here.
-fn parse_sps(sps: &[u8]) -> Result<(u8, u8, u8), String> {
-    // Strip emulation prevention bytes (00 00 03 -> 00 00) from the RBSP.
-    let payload = &sps[1..];
+/// Strips emulation prevention bytes (`00 00 03` -> `00 00`) from a NAL
+/// payload (header byte excluded), yielding the RBSP (H.264 7.4.1.1).
+fn unescape_rbsp(payload: &[u8]) -> Vec<u8> {
     let mut rbsp = Vec::with_capacity(payload.len());
     let mut zeros = 0u32;
     for &b in payload {
@@ -459,6 +455,50 @@ fn parse_sps(sps: &[u8]) -> Result<(u8, u8, u8), String> {
         }
         rbsp.push(b);
     }
+    rbsp
+}
+
+/// The SPS fields later validation stages consume: the identity a PPS
+/// resolves its `seq_parameter_set_id` reference against, and the chroma /
+/// bit-depth block the avcC profile extension and the PPS scaling-matrix
+/// size derive from.
+#[derive(Debug, Clone, Copy)]
+struct SpsSummary {
+    sps_id: u32,
+    chroma_format_idc: u8,
+    bit_depth_luma: u8,
+    bit_depth_chroma: u8,
+}
+
+impl SpsSummary {
+    /// The `(chroma_format_idc, bit_depth_luma, bit_depth_chroma)` triple
+    /// the avcC profile extension mirrors.
+    fn chroma_info(&self) -> (u8, u8, u8) {
+        (self.chroma_format_idc, self.bit_depth_luma, self.bit_depth_chroma)
+    }
+}
+
+/// Parses one complete SPS NAL (header byte included) through
+/// `rbsp_trailing_bits` (H.264 7.3.2.1.1), returning the [`SpsSummary`] —
+/// 4:2:0 / 8-bit defaults when the profile does not carry the chroma
+/// fields. Every extradata path routes each SPS body through this parse,
+/// so a configuration whose SPS cannot be read to its end (truncated
+/// syntax, out-of-range fields, a corrupt stop bit) is rejected up front
+/// instead of being handed to consumers as valid.
+///
+/// Field bounds mirror `ff_h264_decode_seq_parameter_set`
+/// (libavcodec/h264_ps.c): the high-profile dispatch set (including
+/// profile_idc 144), `seq_parameter_set_id <= 31` (MAX_SPS_COUNT),
+/// `log2_max_frame_num_minus4 <= 12`, `pic_order_cnt_type <= 2`,
+/// `log2_max_pic_order_cnt_lsb_minus4 <= 12`,
+/// `num_ref_frames_in_pic_order_cnt_cycle < 256` and, inside the VUI HRD,
+/// `cpb_cnt_minus1 <= 31`. One deliberate divergence: for some broken
+/// encoders h264_ps.c only WARNS when declared-present VUI data runs out
+/// mid-structure, because a decoder can still play the stream; a validator
+/// has no decode path to fall back on, so truncation anywhere inside the
+/// declared syntax is rejected here.
+fn parse_sps(sps: &[u8]) -> Result<SpsSummary, String> {
+    let rbsp = unescape_rbsp(&sps[1..]);
     let mut r = BitReader::new(&rbsp);
     let profile_idc = r.bits(8)? as u8;
     r.bits(8)?; // constraint flags + reserved
@@ -561,7 +601,13 @@ fn parse_sps(sps: &[u8]) -> Result<(u8, u8, u8), String> {
         skip_vui(&mut r)?;
     }
     r.finish_rbsp()?;
-    Ok(chroma_info)
+    let (chroma_format_idc, bit_depth_luma, bit_depth_chroma) = chroma_info;
+    Ok(SpsSummary {
+        sps_id,
+        chroma_format_idc,
+        bit_depth_luma,
+        bit_depth_chroma,
+    })
 }
 
 /// Consumes one `scaling_list()` (H.264 7.3.2.1.1.1) without storing the
@@ -581,6 +627,192 @@ fn skip_scaling_list(r: &mut BitReader, size: u32) -> Result<(), String> {
         if next_scale != 0 {
             last_scale = next_scale;
         }
+    }
+    Ok(())
+}
+
+/// Parses one complete PPS NAL (header byte included) through
+/// `rbsp_trailing_bits` (H.264 7.3.2.2). Every extradata path routes each
+/// PPS body through this parse after the SPS pass, so `sps_context` holds
+/// one summary per already-validated SPS; the referenced SPS supplies the
+/// chroma_format_idc that sizes the pic_scaling_matrix block, the same way
+/// `ff_h264_decode_picture_parameter_set` (libavcodec/h264_ps.c) reads it
+/// from the `pps->sps` it resolves first.
+///
+/// Field bounds mirror h264_ps.c: `pic_parameter_set_id <= 255`
+/// (MAX_PPS_COUNT = 256), `seq_parameter_set_id <= 31` (MAX_SPS_COUNT =
+/// 32) with the reference required to resolve (a PPS naming an absent SPS
+/// fails there with the same "sps_id out of range" as an oversized id, and
+/// `ff_h264_decode_extradata` fails the whole extradata over it),
+/// `num_ref_idx_l0/l1_default_active_minus1 <= 31` ("reference overflow
+/// (pps)") and both chroma_qp_index_offset fields in [-12, 12].
+/// Divergences, each toward the spec where h264_ps.c substitutes a
+/// decoder-capability policy:
+/// * the multi-group slice_group_map syntax is parsed per 7.3.2.2 with
+///   `num_slice_groups_minus1 <= 7` (the Annex A.2.1 FMO limit);
+///   h264_ps.c instead refuses every multi-group PPS as unsupported FMO —
+///   a statement about its decoder, not about the bitstream;
+/// * `weighted_bipred_idc <= 2` (7.4.2.2); h264_ps.c reads the two bits
+///   unchecked;
+/// * the `more_rbsp_data()` tail is decided by the spec definition (7.2,
+///   via [`BitReader::more_rbsp_data`]); h264_ps.c substitutes a profile
+///   heuristic (`more_rbsp_data_in_pps`) that ignores the tail wholesale
+///   on constrained Baseline/Main/Extended streams because some such
+///   encoders pad the RBSP and it never verifies rbsp_trailing_bits. The
+///   validator verifies the trailing bits instead, which accepts
+///   conforming padding and rejects garbage tails on every profile.
+fn parse_pps(pps: &[u8], sps_context: &[SpsSummary]) -> Result<(), String> {
+    let rbsp = unescape_rbsp(&pps[1..]);
+    let mut r = BitReader::new(&rbsp);
+    let pps_id = r.ue()?;
+    if pps_id > 255 {
+        return Err(format!("pic_parameter_set_id {pps_id} exceeds 255"));
+    }
+    let sps_id = r.ue()?;
+    if sps_id > 31 {
+        return Err(format!("seq_parameter_set_id {sps_id} exceeds 31"));
+    }
+    // The last summary with the id wins, mirroring the sps_list slot
+    // replacement in h264_ps.c (a re-sent id overwrites its predecessor).
+    let sps = sps_context
+        .iter()
+        .rev()
+        .find(|s| s.sps_id == sps_id)
+        .ok_or_else(|| {
+            format!("references seq_parameter_set_id {sps_id}, which no SPS in the configuration carries")
+        })?;
+    r.bits(1)?; // entropy_coding_mode_flag
+    r.bits(1)?; // bottom_field_pic_order_in_frame_present_flag
+    let num_slice_groups_minus1 = r.ue()?;
+    if num_slice_groups_minus1 > 7 {
+        return Err(format!(
+            "num_slice_groups_minus1 {num_slice_groups_minus1} exceeds 7"
+        ));
+    }
+    if num_slice_groups_minus1 > 0 {
+        skip_slice_group_map(&mut r, num_slice_groups_minus1)?;
+    }
+    let num_ref_idx_l0 = r.ue()?;
+    let num_ref_idx_l1 = r.ue()?;
+    if num_ref_idx_l0 > 31 || num_ref_idx_l1 > 31 {
+        return Err(format!(
+            "num_ref_idx_l0/l1_default_active_minus1 {num_ref_idx_l0}/{num_ref_idx_l1} \
+             exceeds 31"
+        ));
+    }
+    r.bits(1)?; // weighted_pred_flag
+    let weighted_bipred_idc = r.bits(2)?;
+    if weighted_bipred_idc > 2 {
+        return Err(format!(
+            "weighted_bipred_idc {weighted_bipred_idc} (must be <= 2)"
+        ));
+    }
+    let pic_init_qp_minus26 = r.se()?;
+    // 7.4.2.2 bounds pic_init_qp_minus26 to -(26 + QpBdOffsetY) .. +25 with
+    // QpBdOffsetY = 6 * bit_depth_luma_minus8 — a floor of -62 at the
+    // deepest legal (14-bit) depth. h264_ps.c applies no bound at all here:
+    // init_qp is only validated against the active bit depth at slice time
+    // (h264_slice.c). The validator mirrors that tolerance with one fixed
+    // envelope, [-88, 25], strictly wider than every per-depth spec range:
+    // a value outside it cannot be legal under any SPS, while values inside
+    // defer to slice-time semantics exactly as FFmpeg does.
+    if !(-88..=25).contains(&pic_init_qp_minus26) {
+        return Err(format!(
+            "pic_init_qp_minus26 {pic_init_qp_minus26} outside [-88, 25]"
+        ));
+    }
+    let pic_init_qs_minus26 = r.se()?;
+    // SP/SI quantization has no bit-depth offset: -26 .. +25 flat (7.4.2.2).
+    if !(-26..=25).contains(&pic_init_qs_minus26) {
+        return Err(format!(
+            "pic_init_qs_minus26 {pic_init_qs_minus26} outside [-26, 25]"
+        ));
+    }
+    let chroma_qp_index_offset = r.se()?;
+    if !(-12..=12).contains(&chroma_qp_index_offset) {
+        return Err(format!(
+            "chroma_qp_index_offset {chroma_qp_index_offset} outside [-12, 12]"
+        ));
+    }
+    r.bits(1)?; // deblocking_filter_control_present_flag
+    r.bits(1)?; // constrained_intra_pred_flag
+    r.bits(1)?; // redundant_pic_cnt_present_flag
+    if r.more_rbsp_data() {
+        let transform_8x8_mode_flag = r.bits(1)? == 1;
+        if r.bits(1)? == 1 {
+            // pic_scaling_matrix_present_flag: six 4x4 lists, plus the 8x8
+            // block only under transform_8x8_mode_flag — two lists, or six
+            // when the referenced SPS codes 4:4:4 (7.3.2.2; the set
+            // decode_scaling_matrices reads for a PPS).
+            let lists = 6
+                + if transform_8x8_mode_flag {
+                    if sps.chroma_format_idc != 3 {
+                        2
+                    } else {
+                        6
+                    }
+                } else {
+                    0
+                };
+            for i in 0..lists {
+                if r.bits(1)? == 1 {
+                    skip_scaling_list(&mut r, if i < 6 { 16 } else { 64 })?;
+                }
+            }
+        }
+        let second_chroma_qp_index_offset = r.se()?;
+        if !(-12..=12).contains(&second_chroma_qp_index_offset) {
+            return Err(format!(
+                "second_chroma_qp_index_offset {second_chroma_qp_index_offset} \
+                 outside [-12, 12]"
+            ));
+        }
+    }
+    r.finish_rbsp()
+}
+
+/// Consumes the multi-group slice_group_map syntax of 7.3.2.2 (map types
+/// 0..=6). h264_ps.c has no equivalent to mirror — it refuses every
+/// `num_slice_groups_minus1 > 0` PPS as unsupported FMO — so the shapes
+/// come straight from the spec: per-group run lengths (type 0), foreground
+/// rectangles for all but the last group (type 2, which loops
+/// `num_slice_groups_minus1` times — the final group is the leftover
+/// background), a change direction and rate (types 3..=5), and an explicit
+/// per-map-unit group-id table (type 6). Type 1 (dispersed) carries no
+/// syntax. The type-6 table length needs no artificial bound: every entry
+/// consumes at least one bit, so a declared count beyond the RBSP fails in
+/// the reader.
+fn skip_slice_group_map(r: &mut BitReader, num_slice_groups_minus1: u32) -> Result<(), String> {
+    let map_type = r.ue()?;
+    match map_type {
+        0 => {
+            for _ in 0..=num_slice_groups_minus1 {
+                r.ue()?; // run_length_minus1[i]
+            }
+        }
+        1 => {}
+        2 => {
+            for _ in 0..num_slice_groups_minus1 {
+                r.ue()?; // top_left[i]
+                r.ue()?; // bottom_right[i]
+            }
+        }
+        3..=5 => {
+            r.bits(1)?; // slice_group_change_direction_flag
+            r.ue()?; // slice_group_change_rate_minus1
+        }
+        6 => {
+            let pic_size_in_map_units_minus1 = r.ue()?;
+            // slice_group_id[i] is u(v) with v = Ceil(Log2(
+            // num_slice_groups_minus1 + 1)) (7.4.2.2), which equals the bit
+            // length of num_slice_groups_minus1 for every value >= 1 —
+            // 1..=3 bits over the 2..=8 groups admitted above.
+            let width = 32 - num_slice_groups_minus1.leading_zeros();
+            for _ in 0..=pic_size_in_map_units_minus1 {
+                r.bits(width)?; // slice_group_id[i]
+            }
+        }
+        other => return Err(format!("slice_group_map_type {other} (must be <= 6)")),
     }
     Ok(())
 }
@@ -687,12 +919,27 @@ impl<'a> BitReader<'a> {
             let byte = self
                 .data
                 .get(self.pos / 8)
-                .ok_or_else(|| "SPS truncated".to_string())?;
+                .ok_or_else(|| "RBSP truncated".to_string())?;
             let bit = (byte >> (7 - (self.pos % 8))) & 1;
             v = (v << 1) | bit as u32;
             self.pos += 1;
         }
         Ok(v)
+    }
+
+    /// `more_rbsp_data()` (H.264 7.2): syntax data remains exactly when the
+    /// current position is strictly before the last set bit of the RBSP —
+    /// that bit being the rbsp_stop_one_bit. A remainder with no set bit at
+    /// all reports false and leaves the malformed trailing bits to
+    /// [`Self::finish_rbsp`].
+    fn more_rbsp_data(&self) -> bool {
+        for (i, &b) in self.data.iter().enumerate().rev() {
+            if b != 0 {
+                let last_set = i * 8 + 7 - b.trailing_zeros() as usize;
+                return self.pos < last_set;
+            }
+        }
+        false
     }
 
     /// Unsigned Exp-Golomb.
@@ -1024,12 +1271,70 @@ mod tests {
         0x00, 0x10, 0x00, 0x00, 0x03, 0x03, 0x20, 0xF1, 0x62, 0xD9, 0x40,
     ];
 
-    fn annexb_config() -> Vec<u8> {
+    // Hand-assembled 7.3.2.2 PPS bit streams. The skeleton (`MINIMAL_PPS`)
+    // codes both ids 0, CAVLC, one slice group, every ue/se field at its
+    // smallest code and no more_rbsp_data tail; each bound fixture below
+    // perturbs it at one field, and each reject sits one ue/se code (most
+    // one bit) from an accepted sibling.
+    const MINIMAL_PPS: &[u8] = &[0x68, 0xCE, 0x38, 0x80];
+    // pic_parameter_set_id 255 (the largest legal value) and 256: the pair
+    // differs in the final bit of the 17-bit ue code.
+    const PPS_ID_255_PPS: &[u8] = &[0x68, 0x00, 0x80, 0x4E, 0x38, 0x80];
+    const PPS_ID_256_PPS: &[u8] = &[0x68, 0x00, 0x80, 0xCE, 0x38, 0x80];
+    // seq_parameter_set_id 31 (legal, resolvable against `SPS_ID_31`) and
+    // 32 (out of range): one bit apart.
+    const SPS_ID_31_PPS: &[u8] = &[0x68, 0x82, 0x03, 0x8E, 0x20];
+    const SPS_ID_32_PPS: &[u8] = &[0x68, 0x82, 0x13, 0x8E, 0x20];
+    // weighted_bipred_idc 2 (the largest legal value) and 3: one bit apart.
+    const WEIGHTED_BIPRED_2_PPS: &[u8] = &[0x68, 0xCE, 0xB8, 0x80];
+    const WEIGHTED_BIPRED_3_PPS: &[u8] = &[0x68, 0xCE, 0xF8, 0x80];
+    // chroma_qp_index_offset +12 and +13: one bit apart inside the se code.
+    const CHROMA_QP_12_PPS: &[u8] = &[0x68, 0xCE, 0x30, 0xC0, 0x80];
+    const CHROMA_QP_13_PPS: &[u8] = &[0x68, 0xCE, 0x30, 0xD0, 0x80];
+    // pic_init_qp_minus26 -88 (the envelope floor) and -89: one bit apart.
+    const INIT_QP_M88_PPS: &[u8] = &[0x68, 0xCE, 0x00, 0x58, 0xE2];
+    const INIT_QP_M89_PPS: &[u8] = &[0x68, 0xCE, 0x00, 0x59, 0xE2];
+    // pic_init_qs_minus26 -27 (one below the flat -26 floor).
+    const INIT_QS_M27_PPS: &[u8] = &[0x68, 0xCE, 0x20, 0xDE, 0x20];
+    // num_ref_idx_l0_default_active_minus1 32.
+    const REF_IDX_L0_32_PPS: &[u8] = &[0x68, 0xC8, 0x21, 0x8E, 0x20];
+    // more_rbsp_data tails with transform_8x8_mode_flag and
+    // pic_scaling_matrix_present_flag set and every list flag zero: eight
+    // flag bits (the 4:2:0 / 4:2:2 count) vs twelve (the 4:4:4 count),
+    // each followed by second_chroma_qp_index_offset se(0).
+    const SCALING_TAIL_8_PPS: &[u8] = &[0x68, 0xCE, 0x38, 0xC0, 0x30];
+    const SCALING_TAIL_12_PPS: &[u8] = &[0x68, 0xCE, 0x38, 0xC0, 0x03];
+    // Multi-group slice_group_map fixtures, two slice groups each: type 0
+    // (two run lengths), type 2 (ONE top_left/bottom_right pair — the
+    // rectangle loop runs num_slice_groups_minus1 times), type 3 (change
+    // direction + rate), and type 6 (four one-bit slice_group_id entries).
+    const FMO_TYPE0_PPS: &[u8] = &[0x68, 0xC5, 0xF1, 0xC4];
+    const FMO_TYPE2_PPS: &[u8] = &[0x68, 0xC4, 0xFC, 0x71];
+    const FMO_TYPE3_PPS: &[u8] = &[0x68, 0xC4, 0x47, 0x1C, 0x40];
+    const FMO_TYPE6_PPS: &[u8] = &[0x68, 0xC4, 0x72, 0x2E, 0x38, 0x80];
+    // num_slice_groups_minus1 8 (nine groups) and slice_group_map_type 7:
+    // both shapes the spec does not define.
+    const FMO_GROUPS_8_PPS: &[u8] = &[0x68, 0xC1, 0x30];
+    const FMO_TYPE7_PPS: &[u8] = &[0x68, 0xC4, 0x22];
+    // The real `PPS` with only its rbsp_trailing_bits stop bit cleared
+    // (last byte 0x20 -> 0x00); every parsed field is untouched.
+    const BAD_STOP_BIT_PPS: &[u8] = &[0x68, 0xCB, 0x83, 0xCB, 0x00];
+
+    fn annexb_with(sps: &[u8], pps: &[u8]) -> Vec<u8> {
         let mut v = vec![0, 0, 0, 1];
-        v.extend_from_slice(SPS);
+        v.extend_from_slice(sps);
         v.extend_from_slice(&[0, 0, 1]);
-        v.extend_from_slice(PPS);
+        v.extend_from_slice(pps);
         v
+    }
+
+    fn annexb_config() -> Vec<u8> {
+        annexb_with(SPS, PPS)
+    }
+
+    /// SPS summaries for a PPS parse, in configuration order.
+    fn sps_ctx(sps_list: &[&[u8]]) -> Vec<SpsSummary> {
+        sps_list.iter().map(|s| parse_sps(s).unwrap()).collect()
     }
 
     #[test]
@@ -1512,7 +1817,8 @@ mod tests {
     /// ue(31) parses, ue(32) is rejected by value, not by shape.
     #[test]
     fn rejects_seq_parameter_set_id_above_31() {
-        assert_eq!(parse_sps(SPS_ID_31).unwrap(), (1, 8, 8));
+        assert_eq!(parse_sps(SPS_ID_31).unwrap().chroma_info(), (1, 8, 8));
+        assert_eq!(parse_sps(SPS_ID_31).unwrap().sps_id, 31);
         let err = parse_sps(SPS_ID_32).unwrap_err();
         assert!(err.contains("seq_parameter_set_id 32"), "unexpected error: {err}");
     }
@@ -1522,7 +1828,7 @@ mod tests {
     /// num_ref_frames_in_pic_order_cnt_cycle < 256 (all as in h264_ps.c).
     #[test]
     fn rejects_out_of_range_frame_num_and_poc_fields() {
-        assert_eq!(parse_sps(LOG2_FRAME_NUM_12).unwrap(), (1, 8, 8));
+        assert_eq!(parse_sps(LOG2_FRAME_NUM_12).unwrap().chroma_info(), (1, 8, 8));
         let err = parse_sps(LOG2_FRAME_NUM_13).unwrap_err();
         assert!(
             err.contains("log2_max_frame_num_minus4 13"),
@@ -1530,7 +1836,7 @@ mod tests {
         );
         let err = parse_sps(POC_TYPE_3).unwrap_err();
         assert!(err.contains("pic_order_cnt_type 3"), "unexpected error: {err}");
-        assert_eq!(parse_sps(POC_CYCLE_255).unwrap(), (1, 8, 8));
+        assert_eq!(parse_sps(POC_CYCLE_255).unwrap().chroma_info(), (1, 8, 8));
         let err = parse_sps(POC_CYCLE_256).unwrap_err();
         assert!(
             err.contains("num_ref_frames_in_pic_order_cnt_cycle 256"),
@@ -1576,9 +1882,9 @@ mod tests {
     /// nextScale == 0. The spliced fixture also synthesizes a working avcC.
     #[test]
     fn accepts_scaling_matrix_sps_variants() {
-        assert_eq!(parse_sps(HIGH_SPS_SCALING).unwrap(), (1, 8, 8));
-        assert_eq!(parse_sps(SCALING_LIST_SPS).unwrap(), (1, 8, 8));
-        assert_eq!(parse_sps(CHROMA3_SCALING_SPS).unwrap(), (3, 8, 8));
+        assert_eq!(parse_sps(HIGH_SPS_SCALING).unwrap().chroma_info(), (1, 8, 8));
+        assert_eq!(parse_sps(SCALING_LIST_SPS).unwrap().chroma_info(), (1, 8, 8));
+        assert_eq!(parse_sps(CHROMA3_SCALING_SPS).unwrap().chroma_info(), (3, 8, 8));
         let sets = ParameterSets {
             sps: vec![HIGH_SPS_SCALING.to_vec()],
             pps: vec![HIGH_PPS.to_vec()],
@@ -1595,12 +1901,182 @@ mod tests {
     /// dispatch set.
     #[test]
     fn accepts_profile_144_with_the_chroma_block() {
-        assert_eq!(parse_sps(PROFILE_144_SPS).unwrap(), (1, 8, 8));
+        assert_eq!(parse_sps(PROFILE_144_SPS).unwrap().chroma_info(), (1, 8, 8));
         let sets = ParameterSets {
             sps: vec![PROFILE_144_SPS.to_vec()],
             pps: vec![HIGH_PPS.to_vec()],
         };
         let avcc = build_avcc(&sets).unwrap();
         assert!(AvcRuntime::from_extradata(&avcc, 0).is_ok());
+    }
+
+    /// The encoder-produced PPS bodies parse to their trailing bits against
+    /// their own SPS: the Constrained Baseline one (CAVLC, no tail) and the
+    /// High one, whose more_rbsp_data tail carries transform_8x8_mode_flag
+    /// and second_chroma_qp_index_offset behind weighted_bipred_idc 2. The
+    /// minimal hand fixture pins the skeleton the rejection fixtures
+    /// perturb.
+    #[test]
+    fn parses_real_and_minimal_pps_bodies() {
+        parse_pps(PPS, &sps_ctx(&[SPS])).unwrap();
+        parse_pps(HIGH_PPS, &sps_ctx(&[HIGH_SPS])).unwrap();
+        parse_pps(MINIMAL_PPS, &sps_ctx(&[SPS])).unwrap();
+    }
+
+    /// A PPS cut mid-syntax (here inside pic_init_qp_minus26) must fail on
+    /// BOTH wrapper paths and through runtime construction, exactly like a
+    /// truncated SPS.
+    #[test]
+    fn rejects_truncated_pps_on_both_paths() {
+        let cut = &PPS[..3];
+        let err = parse_parameter_sets(&annexb_with(SPS, cut)).unwrap_err();
+        assert!(
+            err.contains("PPS") && err.contains("truncated"),
+            "unexpected error: {err}"
+        );
+        let err = parse_avcc_parameter_sets(&raw_avcc(66, 0xC0, 0x1E, SPS, cut)).unwrap_err();
+        assert!(
+            err.contains("PPS") && err.contains("truncated"),
+            "unexpected error: {err}"
+        );
+        assert!(matches!(
+            AvcRuntime::from_extradata(&annexb_with(SPS, cut), 4),
+            Err(PacketSinkError::InvalidExtradata { stream_index: 4, .. })
+        ));
+    }
+
+    /// A single cleared stop bit leaves every parsed PPS field intact, so
+    /// only the rbsp_trailing_bits check can catch it. The avcC entry
+    /// framing preserves the now-zero trailing byte, so the rejection is
+    /// pinned through the full record path and runtime construction.
+    #[test]
+    fn rejects_pps_with_corrupt_rbsp_trailing_bits() {
+        let err = parse_pps(BAD_STOP_BIT_PPS, &sps_ctx(&[SPS])).unwrap_err();
+        assert!(err.contains("stop bit"), "unexpected error: {err}");
+        let avcc = raw_avcc(66, 0xC0, 0x1E, SPS, BAD_STOP_BIT_PPS);
+        let err = parse_avcc_parameter_sets(&avcc).unwrap_err();
+        assert!(err.contains("stop bit"), "unexpected error: {err}");
+        assert!(matches!(
+            AvcRuntime::from_extradata(&avcc, 8),
+            Err(PacketSinkError::InvalidExtradata { stream_index: 8, .. })
+        ));
+    }
+
+    /// pic_parameter_set_id is bounded to 255 (MAX_PPS_COUNT = 256 in
+    /// h264_ps.c); the fixtures differ in the final bit of the ue code, so
+    /// 256 is rejected by value, not by shape.
+    #[test]
+    fn rejects_pic_parameter_set_id_above_255() {
+        parse_pps(PPS_ID_255_PPS, &sps_ctx(&[SPS])).unwrap();
+        let err = parse_pps(PPS_ID_256_PPS, &sps_ctx(&[SPS])).unwrap_err();
+        assert!(
+            err.contains("pic_parameter_set_id 256"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// seq_parameter_set_id 32 is out of range outright (MAX_SPS_COUNT =
+    /// 32); 31 is legal but must RESOLVE — against the id-31 SPS it parses,
+    /// while against a configuration whose only SPS is id 0 it is the
+    /// dangling reference h264_ps.c fails with the same "sps_id out of
+    /// range" error.
+    #[test]
+    fn rejects_pps_sps_reference_out_of_range_or_dangling() {
+        let err = parse_pps(SPS_ID_32_PPS, &sps_ctx(&[SPS])).unwrap_err();
+        assert!(
+            err.contains("seq_parameter_set_id 32"),
+            "unexpected error: {err}"
+        );
+        parse_pps(SPS_ID_31_PPS, &sps_ctx(&[SPS_ID_31])).unwrap();
+        let err = parse_pps(SPS_ID_31_PPS, &sps_ctx(&[SPS])).unwrap_err();
+        assert!(err.contains("no SPS"), "unexpected error: {err}");
+    }
+
+    /// weighted_bipred_idc is a two-bit field whose value 3 does not exist
+    /// (7.4.2.2 bounds it to 2); h264_ps.c reads the bits unchecked, so the
+    /// boundary pair pins the validator's added bound.
+    #[test]
+    fn rejects_weighted_bipred_idc_three() {
+        parse_pps(WEIGHTED_BIPRED_2_PPS, &sps_ctx(&[SPS])).unwrap();
+        let err = parse_pps(WEIGHTED_BIPRED_3_PPS, &sps_ctx(&[SPS])).unwrap_err();
+        assert!(
+            err.contains("weighted_bipred_idc 3"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// QP-family bounds, each pinned at its boundary: chroma_qp_index_offset
+    /// in [-12, 12] (h264_ps.c rejects 13 identically), pic_init_qp_minus26
+    /// in the all-depths envelope [-88, 25], pic_init_qs_minus26 in the
+    /// flat [-26, 25].
+    #[test]
+    fn rejects_out_of_range_pps_qp_fields() {
+        let ctx = sps_ctx(&[SPS]);
+        parse_pps(CHROMA_QP_12_PPS, &ctx).unwrap();
+        let err = parse_pps(CHROMA_QP_13_PPS, &ctx).unwrap_err();
+        assert!(
+            err.contains("chroma_qp_index_offset 13"),
+            "unexpected error: {err}"
+        );
+        parse_pps(INIT_QP_M88_PPS, &ctx).unwrap();
+        let err = parse_pps(INIT_QP_M89_PPS, &ctx).unwrap_err();
+        assert!(
+            err.contains("pic_init_qp_minus26 -89"),
+            "unexpected error: {err}"
+        );
+        let err = parse_pps(INIT_QS_M27_PPS, &ctx).unwrap_err();
+        assert!(
+            err.contains("pic_init_qs_minus26 -27"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// num_ref_idx_l0_default_active_minus1 at 32 is the "reference
+    /// overflow (pps)" rejection of h264_ps.c.
+    #[test]
+    fn rejects_pps_reference_count_overflow() {
+        let err = parse_pps(REF_IDX_L0_32_PPS, &sps_ctx(&[SPS])).unwrap_err();
+        assert!(err.contains("num_ref_idx"), "unexpected error: {err}");
+    }
+
+    /// The pic_scaling_matrix list count follows the REFERENCED SPS's
+    /// chroma_format_idc (6 + 2 lists under 4:2:0/4:2:2, 6 + 6 under 4:4:4,
+    /// transform_8x8_mode_flag set in both fixtures): each parses against
+    /// the SPS shape it was assembled for and misaligns into rejection
+    /// against the other, so the SPS context is load-bearing.
+    #[test]
+    fn pps_scaling_block_count_follows_the_referenced_sps() {
+        let chroma1 = sps_ctx(&[HIGH_SPS]);
+        let chroma3 = sps_ctx(&[CHROMA3_SCALING_SPS]);
+        parse_pps(SCALING_TAIL_8_PPS, &chroma1).unwrap();
+        assert!(parse_pps(SCALING_TAIL_8_PPS, &chroma3).is_err());
+        parse_pps(SCALING_TAIL_12_PPS, &chroma3).unwrap();
+        assert!(parse_pps(SCALING_TAIL_12_PPS, &chroma1).is_err());
+    }
+
+    /// The multi-group slice_group_map shapes of 7.3.2.2, one accept per
+    /// family (types 0, 2, 3, 6 — type 2 would overrun into rejection if
+    /// the rectangle loop wrongly ran num_slice_groups_minus1 + 1 times),
+    /// plus the two bounds: nine slice groups exceeds the A.2.1 limit and
+    /// map type 7 does not exist.
+    #[test]
+    fn parses_the_slice_group_map_types() {
+        let ctx = sps_ctx(&[SPS]);
+        for (i, fixture) in [FMO_TYPE0_PPS, FMO_TYPE2_PPS, FMO_TYPE3_PPS, FMO_TYPE6_PPS]
+            .iter()
+            .enumerate()
+        {
+            parse_pps(fixture, &ctx).unwrap_or_else(|e| panic!("FMO fixture {i}: {e}"));
+        }
+        let err = parse_pps(FMO_GROUPS_8_PPS, &ctx).unwrap_err();
+        assert!(
+            err.contains("num_slice_groups_minus1 8"),
+            "unexpected error: {err}"
+        );
+        let err = parse_pps(FMO_TYPE7_PPS, &ctx).unwrap_err();
+        assert!(
+            err.contains("slice_group_map_type 7"),
+            "unexpected error: {err}"
+        );
     }
 }
