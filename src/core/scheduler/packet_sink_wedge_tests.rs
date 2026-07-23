@@ -314,6 +314,39 @@ fn pin_peer_rcvbuf(stream: &std::net::TcpStream) {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn pin_peer_rcvbuf(_stream: &std::net::TcpStream) {}
 
+/// Forensic snapshot of the unread peer: its current `SO_RCVBUF` and the
+/// bytes queued unread (`FIONREAD`). Sampled at stage-4 exit and again
+/// after stop() so a failed acknowledgment distinguishes the two ways a
+/// "parked" write can complete on its own: the queue GREW between the
+/// samples (the advertised window was not really shut — receiver side),
+/// versus a frozen queue with the write still returning success (the
+/// sender's own buffer absorbed it — sender side).
+#[cfg(unix)]
+fn peer_socket_stats(stream: &std::net::TcpStream) -> (libc::c_int, libc::c_int) {
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+    // SAFETY: getsockopt/ioctl on a live fd with correctly sized outputs.
+    unsafe {
+        let mut rcvbuf: libc::c_int = -1;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &mut rcvbuf as *mut libc::c_int as *mut libc::c_void,
+            &mut len,
+        );
+        let mut unread: libc::c_int = -1;
+        libc::ioctl(fd, libc::FIONREAD, &mut unread);
+        (rcvbuf, unread)
+    }
+}
+
+#[cfg(not(unix))]
+fn peer_socket_stats(_stream: &std::net::TcpStream) -> (i32, i32) {
+    (-1, -1)
+}
+
 /// Pins stage 3 against the confounder it exists for: a writer that
 /// delivers a refill burst after the drain and then goes IDLE, its residue
 /// fully drained. Stages 1-2 accept that shape — the burst satisfies the
@@ -615,6 +648,7 @@ fn blocked_sibling_stays_interruptible_while_sink_finalizes() {
     .expect("stage 3");
     let parked_gen = require_write_parked(Instant::now() + Duration::from_secs(20))
         .expect("stage 4: the sibling must be parked inside a tcp write");
+    let (rcvbuf_at_park, unread_at_park) = peer_socket_stats(&stream);
     // The liveness half of the contract: a parked write on an ENDED job
     // would be teardown noise, not the running wedge stop() must cut.
     assert!(
@@ -687,6 +721,11 @@ fn blocked_sibling_stays_interruptible_while_sink_finalizes() {
     // cut — it finished or cycled on its own and stage 4 watched a healthy
     // writer, exactly the pass-without-a-wedge this acknowledgment exists
     // to reject.
+    let (rcvbuf_settled, unread_settled) = peer_socket_stats(&stream);
+    eprintln!(
+        "wedge peer at park: rcvbuf={rcvbuf_at_park} unread={unread_at_park}; \
+         settled: rcvbuf={rcvbuf_settled} unread={unread_settled}"
+    );
     let entered = tcp_write_probe::ENTERED.load(Ordering::Acquire);
     let returned = tcp_write_probe::RETURNED.load(Ordering::Acquire);
     assert_eq!(
@@ -697,7 +736,11 @@ fn blocked_sibling_stays_interruptible_while_sink_finalizes() {
     let last_ret = tcp_write_probe::LAST_RET.load(Ordering::Acquire);
     assert!(
         last_ret < 0,
-        "the parked write returned {last_ret} (success): stop() cut nothing"
+        "the parked write returned {last_ret} (success): stop() cut nothing \
+         (peer at park: rcvbuf={rcvbuf_at_park} unread={unread_at_park}; \
+         settled: rcvbuf={rcvbuf_settled} unread={unread_settled} — a grown \
+         unread count means the advertised window was not shut; a frozen one \
+         means the sender's own buffer absorbed the write)"
     );
     let err_gen = tcp_write_probe::LAST_ERR_GEN.load(Ordering::Acquire);
     assert_eq!(
