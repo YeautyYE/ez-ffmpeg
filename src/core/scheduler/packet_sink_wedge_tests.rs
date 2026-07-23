@@ -54,7 +54,15 @@ fn require_write_parked(deadline: Instant) -> Result<u64, String> {
         if entered == returned + 1 && prev == Some((entered, returned)) {
             stable += 1;
             if stable >= 6 {
-                return Ok(entered);
+                // Confirm against a return racing the two loads above: the
+                // load order (returned first) means a call returning
+                // between them still presents entered == returned + 1. A
+                // genuinely parked call cannot return, so RETURNED moving
+                // since the `returned` load unmasks the tear — resample.
+                if tcp_write_probe::RETURNED.load(Ordering::Acquire) == returned {
+                    return Ok(entered);
+                }
+                stable = 0;
             }
         } else {
             stable = 0;
@@ -463,18 +471,23 @@ fn blocked_sibling_stays_interruptible_while_sink_finalizes() {
         }
     });
 
-    // Terminal sink events are counted, not logged: nothing may fire while
-    // the coordinator is parked, and across the stop exactly one event —
-    // the delivery error surfacing the cut — may fire for the finalizing
-    // sink.
+    // Terminal sink events are counted, and the delivered error's text is
+    // kept: nothing may fire while the coordinator is parked, and across
+    // the stop exactly one event — the delivery error surfacing the cut —
+    // may fire for the finalizing sink.
     let ends = Arc::new(AtomicUsize::new(0));
     let errors = Arc::new(AtomicUsize::new(0));
+    let delivered_error = Arc::new(std::sync::Mutex::new(None::<String>));
     let (ends_cb, errors_cb) = (ends.clone(), errors.clone());
+    let delivered_cb = delivered_error.clone();
     let sink = PacketSink::builder(move |_pkt| Ok(()))
         .on_end(move || {
             ends_cb.fetch_add(1, Ordering::AcqRel);
         })
-        .on_delivery_error(move |_err| {
+        .on_delivery_error(move |err| {
+            *delivered_cb
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(err.to_string());
             errors_cb.fetch_add(1, Ordering::AcqRel);
         })
         .build();
@@ -567,17 +580,31 @@ fn blocked_sibling_stays_interruptible_while_sink_finalizes() {
     );
 
     let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
+    let stop_worker = std::thread::spawn(move || {
         let _ = tx.send(scheduler.stop());
     });
-    let result = rx
-        .recv_timeout(Duration::from_secs(30))
-        .expect("stop() hung: the sink held the finalize exemption over a blocked sibling");
+    let result = match rx.recv_timeout(Duration::from_secs(30)) {
+        Ok(result) => {
+            stop_worker.join().expect("the stop worker panicked");
+            result
+        }
+        Err(_) => {
+            // A hung stop() must not outlive the serialization guard: left
+            // detached, its muxer would keep driving the process-wide
+            // probe counters under the next test's samples. Close the
+            // unread peer to cut the wedged write loose, join the worker,
+            // then fail.
+            drop(stream);
+            let _ = stop_worker.join();
+            panic!("stop() hung: the sink held the finalize exemption over a blocked sibling");
+        }
+    };
     // Cut acknowledgment, tied to the parked generation. stop() joins every
     // worker before returning, so the counters are settled: exactly the
     // parked call — write number `parked_gen` — may have returned (the write
     // loop exits on its first failed write, and the trailer bypasses the
-    // probe), and it must have returned an ERROR. The peer's queue stayed
+    // probe), it must have returned an ERROR, and the erroring call's own
+    // recorded generation must be the parked one. The peer's queue stayed
     // pinned and unread throughout, so flow control could never complete
     // that write on its own: only the stop-driven output interrupt can have
     // unparked it. Any other final state means the "parked" write was not
@@ -596,22 +623,41 @@ fn blocked_sibling_stays_interruptible_while_sink_finalizes() {
         last_ret < 0,
         "the parked write returned {last_ret} (success): stop() cut nothing"
     );
-    // The cut must also be VISIBLE downstream: the write error is recorded
-    // as the job result before the muxer releases its slot, so stop()
-    // surfaces it, and the sink coordinator — admitted only after that
-    // release — must deliver exactly one terminal event, the delivery
-    // error. An on_end here would certify a clean job whose sibling was
-    // just cut mid-write.
-    assert!(
-        result.is_err(),
-        "stop() must surface the cut write's failure as the job result"
+    let err_gen = tcp_write_probe::LAST_ERR_GEN.load(Ordering::Acquire);
+    assert_eq!(
+        err_gen, parked_gen,
+        "the write that returned the error is not the parked one"
     );
+    // The cut must also be VISIBLE downstream, in its exact shape: the
+    // write loop records a failed PACKET write as an interleaved-write
+    // error before the muxer releases its slot (an EOF break records
+    // nothing there, and a trailer failure records the distinct trailer
+    // variant), so stop() must surface precisely that variant, and the
+    // sink coordinator — admitted only after that release — must deliver
+    // exactly one terminal event: the delivery error carrying it. An
+    // on_end here would certify a clean job whose sibling was just cut
+    // mid-write.
+    match &result {
+        Err(crate::error::Error::Muxing(
+            crate::error::MuxingOperationError::InterleavedWriteError(_),
+        )) => {}
+        other => panic!("stop() must surface the cut interleaved write, got {other:?}"),
+    }
     let (end_count, error_count) = (ends.load(Ordering::Acquire), errors.load(Ordering::Acquire));
     assert_eq!(
         (end_count, error_count),
         (0, 1),
         "the finalizing sink must deliver exactly the cut's failure \
          ({end_count} end, {error_count} error)"
+    );
+    let delivered = delivered_error
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .expect("the delivery error must have been captured");
+    assert!(
+        delivered.contains("during interleaved write"),
+        "the sink must be handed the cut write's failure, got: {delivered}"
     );
     // The peer socket stayed open (unread) across the whole stop; the accept
     // thread already exited after handing it over.
