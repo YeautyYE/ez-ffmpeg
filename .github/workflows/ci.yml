@@ -537,15 +537,18 @@ jobs:
       #
       # xnu regrows an unread TCP receive window past an explicitly pinned
       # SO_RCVBUF (observed on these runners: pinned to 16384 at accept,
-      # grown back past 500k by the time the packet-sink wedge test parks),
-      # so a never-reading peer cannot hold a sender blocked. Capping the
-      # autotune ceilings restores the backpressure the wedge proof needs;
-      # the test itself skips its cut acknowledgment when the cap is absent.
+      # grown back past 500k by the packet-sink wedge test's park — the
+      # test's own drain probes feed the autotuner), so a never-reading peer
+      # cannot hold a sender blocked under the 4 MiB default ceiling. Cap
+      # the ceilings to a bound the stream saturates within the test's
+      # first second. The bound must stay comfortably above the loopback
+      # MSS (16 KiB): at 16384 a drained window cannot re-announce itself
+      # and the wedge stages starve waiting for a refill that never comes.
       - name: Cap TCP buffer autotuning (macOS)
         if: matrix.os == 'macos'
         run: |
-          sudo sysctl -w net.inet.tcp.autorcvbufmax=16384
-          sudo sysctl -w net.inet.tcp.autosndbufmax=16384
+          sudo sysctl -w net.inet.tcp.autorcvbufmax=131072
+          sudo sysctl -w net.inet.tcp.autosndbufmax=131072
       - name: Run CPU-only library tests
         run: cargo test --lib --test avoption_warnings --test build_probe --test builder_option_validation --test frame_export_test --test frame_export_uniform_test --test frame_export_audio_test --test hls_fmp4 --test video_writer --test rawvideo_seek_gating --test per_output_video_filter --test packet_sink --test packet_sink_negative --test packet_sink_teardown --test packet_sink_unwind --test cli_emit_hardening --features "${{ matrix.test_features }}" ${{ matrix.test_args }}
 

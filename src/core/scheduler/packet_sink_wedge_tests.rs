@@ -194,15 +194,16 @@ fn require_flow_control_repin(
 /// accepted connections inherit the small receive buffer. Linux only applies a
 /// receive-buffer size to CHILD sockets when it is set before listen; shrinking
 /// an already-listening `std::net::TcpListener` does not propagate to accepted
-/// connections. On macOS a small inherited size alone proved insufficient:
-/// an unread peer's window still grew while the stream kept arriving, the
-/// reopened window drained the sender through ACKs, and a parked write
-/// completed with success mid-test — breaking stage 4's premise that the
-/// park holds until stop() cuts it. The accepted socket therefore gets its
-/// own clamp on top ([`pin_peer_rcvbuf`]). Returns `None` if the raw socket
+/// connections. Linux-only: macOS children do not inherit the listener's
+/// size at all (observed: 16384 set before listen, accepted sockets come up
+/// at the platform default), an explicit `SO_RCVBUF` on any socket does not
+/// disarm xnu's receive autotuning, and a clamp at or below the 16 KiB
+/// loopback MSS starves the window-update machinery outright — there the
+/// bound comes from the CI lane's `net.inet.tcp.autorcvbufmax` cap instead
+/// (see [`receive_autotune_uncapped`]). Returns `None` if the raw socket
 /// setup fails (the caller then falls back to a default listener and the
 /// weaker assertion).
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn listener_with_small_rcvbuf(rcvbuf: libc::c_int) -> Option<std::net::TcpListener> {
     use std::os::unix::io::FromRawFd;
     // SAFETY: the standard socket(2)/setsockopt(2)/bind(2)/listen(2) sequence on
@@ -251,11 +252,11 @@ fn listener_with_small_rcvbuf(rcvbuf: libc::c_int) -> Option<std::net::TcpListen
 /// be provably shrunk before `listen(2)`. On the remaining platforms (or on
 /// raw-socket failure) a default listener is used; the stage 1-3
 /// drain-and-refill proofs are buffer-size independent, while stage 4's
-/// park-until-cut premise additionally needs the pinned buffer wherever the
-/// kernel autotunes an unread receive window upward (macOS — see
-/// [`listener_with_small_rcvbuf`]).
+/// park-until-cut premise additionally needs the window BOUNDED — via this
+/// listener on Linux, via the autotune-ceiling sysctl on macOS
+/// ([`receive_autotune_uncapped`]).
 fn make_backpressure_listener() -> (std::net::TcpListener, bool) {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     {
         if let Some(l) = listener_with_small_rcvbuf(16 * 1024) {
             return (l, true);
@@ -264,15 +265,17 @@ fn make_backpressure_listener() -> (std::net::TcpListener, bool) {
     (std::net::TcpListener::bind("127.0.0.1:0").unwrap(), false)
 }
 
-/// Clamps the accepted peer's receive buffer AFTER accept as well. The
-/// pre-listen clamp is not sufficient on macOS: the child copies the
-/// listener's buffer size, but the un-parked writes observed there mean the
-/// child's receive window still grew while unread data kept arriving —
-/// consistent with the child re-arming receive autotuning. An explicit
-/// `setsockopt` on the accepted socket pins THAT socket, whatever the
-/// inheritance semantics. The observed sizes are printed so a failing lane
-/// carries the evidence.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+/// Clamps the accepted peer's receive buffer AFTER accept on Linux (children
+/// created before the listener clamp landed would otherwise ride the
+/// default) and prints the observed sizes either way, so a failing lane
+/// carries the evidence. On macOS the clamp is deliberately NOT applied: an
+/// explicit `SO_RCVBUF` neither disarms xnu's receive autotuning (observed:
+/// pinned to 16384 at accept, regrown past 500k by the park) nor survives a
+/// value at or below the 16 KiB loopback MSS (a fully drained window then
+/// never re-announces itself and the drain-and-refill stages starve). The
+/// macOS bound comes from the CI lane's autotune-ceiling sysctl instead
+/// ([`receive_autotune_uncapped`]).
+#[cfg(unix)]
 fn pin_peer_rcvbuf(stream: &std::net::TcpStream) {
     use std::os::unix::io::AsRawFd;
     let fd = stream.as_raw_fd();
@@ -288,14 +291,19 @@ fn pin_peer_rcvbuf(stream: &std::net::TcpStream) {
             &mut inherited as *mut libc::c_int as *mut libc::c_void,
             &mut len,
         );
-        let val: libc::c_int = 16 * 1024;
-        let set_rc = libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
-            &val as *const libc::c_int as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
+        #[cfg(target_os = "linux")]
+        let set_rc = {
+            let val: libc::c_int = 16 * 1024;
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &val as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        #[cfg(not(target_os = "linux"))]
+        let set_rc: libc::c_int = -1;
         let mut effective: libc::c_int = 0;
         let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
         libc::getsockopt(
@@ -311,7 +319,7 @@ fn pin_peer_rcvbuf(stream: &std::net::TcpStream) {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(unix))]
 fn pin_peer_rcvbuf(_stream: &std::net::TcpStream) {}
 
 /// Forensic snapshot of the unread peer: its current `SO_RCVBUF` and the
@@ -347,12 +355,14 @@ fn peer_socket_stats(_stream: &std::net::TcpStream) -> (i32, i32) {
     (-1, -1)
 }
 
-/// True when xnu may regrow an unread receive window past the pinned size.
-/// An explicit `SO_RCVBUF` does not disarm receive autotuning there (the CI
-/// lanes observed 16384 at accept regrown past 500k by the park), so with
-/// `net.inet.tcp.autorcvbufmax` above the pin the never-reading peer cannot
-/// keep the sender blocked and the wedge's cut acknowledgment is vacuous.
-/// The macOS CI lanes cap the sysctl; default machines do not.
+/// True when xnu may regrow an unread receive window essentially without
+/// bound. An explicit `SO_RCVBUF` does not disarm receive autotuning there
+/// (observed: 16384 at accept regrown past 500k by the park — the wedge's
+/// own drain probes feed the autotuner), so under the 4 MiB default ceiling
+/// the never-reading peer cannot keep the sender blocked and the cut
+/// acknowledgment is vacuous. A ceiling the stream saturates within the
+/// stage deadlines (the CI lanes set 131072) bounds the window instead;
+/// anything past 256 KiB is treated as unbounded for this test's horizon.
 #[cfg(target_os = "macos")]
 fn receive_autotune_uncapped() -> bool {
     let name = std::ffi::CString::new("net.inet.tcp.autorcvbufmax").unwrap();
@@ -368,7 +378,7 @@ fn receive_autotune_uncapped() -> bool {
             0,
         )
     };
-    rc != 0 || val > 16 * 1024
+    rc != 0 || val > 256 * 1024
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -580,12 +590,13 @@ fn write_parked_probe_rejects_a_stalled_writer_with_residue() {
 #[test]
 fn blocked_sibling_stays_interruptible_while_sink_finalizes() {
     let _serial = tcp_write_probe::exclusive();
-    // SO_RCVBUF is pinned small BEFORE listen(2) (Linux and macOS; silently
-    // falls back to a default listener elsewhere) so the receive queue pins
-    // within a couple of polls instead of megabytes later, and pinned AGAIN
-    // on the accepted socket, which is what actually holds the window shut
-    // on macOS (see pin_peer_rcvbuf). The drain-and-refill proofs are
-    // buffer-size independent; stage 4's park-until-cut is not.
+    // The receive window must be BOUNDED for stage 4's park to hold until
+    // the cut: on Linux SO_RCVBUF is pinned small before listen(2) and again
+    // on the accepted socket; on macOS neither pin works (children do not
+    // inherit, explicit sizes do not disarm autotuning) and the bound is the
+    // CI lane's autotune-ceiling sysctl — checked at the acknowledgment via
+    // receive_autotune_uncapped. The stage 1-3 drain-and-refill proofs are
+    // buffer-size independent either way.
     let (listener, _rcvbuf_shrunk) = make_backpressure_listener();
     let addr = listener.local_addr().unwrap();
     // Hand the accepted socket back to the test thread, which holds it open
