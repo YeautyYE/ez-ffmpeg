@@ -2418,6 +2418,25 @@ struct MuxWriteState<'a> {
     nb_done: &'a mut usize,
 }
 
+/// In-flight probe for container writes to `tcp://` outputs. Every muxer
+/// write funnels through [`write_packet`], so `ENTERED - RETURNED` is the
+/// number of `av_interleaved_write_frame` calls currently executing for a
+/// tcp output: a value of 1 frozen across a sampling window means one muxer
+/// thread is parked INSIDE the write (blocked by socket flow control), which
+/// no socket-side observation can distinguish from a producer that went
+/// idle. Gated on the `tcp://` prefix because the library's unit tests share
+/// one process: file-, null- and sink-backed outputs in concurrently running
+/// tests must never move these counters.
+#[cfg(test)]
+pub(crate) mod tcp_write_probe {
+    use std::sync::atomic::AtomicU64;
+
+    /// `av_interleaved_write_frame` calls entered for a `tcp://` output.
+    pub(crate) static ENTERED: AtomicU64 = AtomicU64::new(0);
+    /// The subset of those calls that has returned.
+    pub(crate) static RETURNED: AtomicU64 = AtomicU64::new(0);
+}
+
 /// # Safety
 /// - `cfg.out_fmt_ctx` must reference the live output context (its pointer is
 ///   passed to `av_interleaved_write_frame`).
@@ -2436,7 +2455,25 @@ unsafe fn write_packet(
     (*sq_packet_box.packet.as_mut_ptr()).stream_index =
         sq_packet_box.packet_data.output_stream_index;
 
-    av_interleaved_write_frame(cfg.out_fmt_ctx.as_ptr(), sq_packet_box.packet.as_mut_ptr())
+    #[cfg(test)]
+    let counted = {
+        let url = (*cfg.out_fmt_ctx.as_ptr()).url;
+        let tcp = !url.is_null()
+            && std::ffi::CStr::from_ptr(url)
+                .to_bytes()
+                .starts_with(b"tcp://");
+        if tcp {
+            tcp_write_probe::ENTERED.fetch_add(1, Ordering::Release);
+        }
+        tcp
+    };
+    let ret =
+        av_interleaved_write_frame(cfg.out_fmt_ctx.as_ptr(), sq_packet_box.packet.as_mut_ptr());
+    #[cfg(test)]
+    if counted {
+        tcp_write_probe::RETURNED.fetch_add(1, Ordering::Release);
+    }
+    ret
 }
 
 /// Write one packet the `sq_mux` released, via the per-stream BSF (or the direct
