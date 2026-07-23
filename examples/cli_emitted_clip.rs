@@ -1,6 +1,6 @@
 // Generated from an ffmpeg command by the ez-ffmpeg CLI-compat emitter.
 // command: ffmpeg -ss 10 -i in.mp4 -t 4 -c:v libx264 -crf 23 -c:a aac -y clip.mp4
-// dialect: ffmpeg 7.1 command line; manifest: r4; crate: ez-ffmpeg 0.14.0; cargo features: none required
+// dialect: ffmpeg 7.1 command line; manifest: r4; crate: ez-ffmpeg 0.15.0; cargo features: none required
 // status: verified shape V2 (re-encoded clip (input -ss, output -t)) — verified by the manifest-driven semantic golden suite (oracle: Clip) against the ffmpeg CLI; canonical emission compile-pinned as examples/cli_emitted_clip.rs
 
 use ez_ffmpeg::{FfmpegContext, Input, Output};
