@@ -194,9 +194,14 @@ fn require_flow_control_repin(
 /// accepted connections inherit the small receive buffer. Linux only applies a
 /// receive-buffer size to CHILD sockets when it is set before listen; shrinking
 /// an already-listening `std::net::TcpListener` does not propagate to accepted
-/// connections. Returns `None` if the raw socket setup fails (the caller then
-/// falls back to a default listener and the weaker assertion). Linux-only.
-#[cfg(target_os = "linux")]
+/// connections. On macOS the explicit size ALSO disables the kernel's receive
+/// autotuning: a default listener there keeps growing the unread peer's
+/// window while the stream arrives, the reopened window drains the sender
+/// through ACKs, and a parked write completes with success mid-test —
+/// breaking stage 4's premise that the park holds until stop() cuts it.
+/// Returns `None` if the raw socket setup fails (the caller then falls back
+/// to a default listener and the weaker assertion).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn listener_with_small_rcvbuf(rcvbuf: libc::c_int) -> Option<std::net::TcpListener> {
     use std::os::unix::io::FromRawFd;
     // SAFETY: the standard socket(2)/setsockopt(2)/bind(2)/listen(2) sequence on
@@ -222,14 +227,12 @@ fn listener_with_small_rcvbuf(rcvbuf: libc::c_int) -> Option<std::net::TcpListen
             libc::close(fd);
             return None;
         }
-        let addr = libc::sockaddr_in {
-            sin_family: libc::AF_INET as libc::sa_family_t,
-            sin_port: 0, // ephemeral port
-            sin_addr: libc::in_addr {
-                s_addr: u32::from(std::net::Ipv4Addr::LOCALHOST).to_be(),
-            },
-            sin_zero: [0; 8],
-        };
+        // Zero-init instead of a struct literal: BSD sockaddr_in carries a
+        // sin_len field Linux lacks, and zero is a valid value for it.
+        let mut addr: libc::sockaddr_in = std::mem::zeroed();
+        addr.sin_family = libc::AF_INET as libc::sa_family_t;
+        addr.sin_port = 0; // ephemeral port
+        addr.sin_addr.s_addr = u32::from(std::net::Ipv4Addr::LOCALHOST).to_be();
         let bound = libc::bind(
             fd,
             &addr as *const libc::sockaddr_in as *const libc::sockaddr,
@@ -244,11 +247,14 @@ fn listener_with_small_rcvbuf(rcvbuf: libc::c_int) -> Option<std::net::TcpListen
 }
 
 /// Build the backpressure listener and report whether its receive buffer could
-/// be provably shrunk before `listen(2)`. On non-Linux (or on raw-socket
-/// failure) a default listener is used; the drain-and-refill proof is
-/// buffer-size independent either way.
+/// be provably shrunk before `listen(2)`. On the remaining platforms (or on
+/// raw-socket failure) a default listener is used; the stage 1-3
+/// drain-and-refill proofs are buffer-size independent, while stage 4's
+/// park-until-cut premise additionally needs the pinned buffer wherever the
+/// kernel autotunes an unread receive window upward (macOS — see
+/// [`listener_with_small_rcvbuf`]).
 fn make_backpressure_listener() -> (std::net::TcpListener, bool) {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         if let Some(l) = listener_with_small_rcvbuf(16 * 1024) {
             return (l, true);
