@@ -148,12 +148,20 @@ pub enum Error {
     RtmpCreateStream,
 
     #[cfg(feature = "rtmp")]
+    #[error("Rtmp registration queue is full: too many streams are waiting to be registered")]
+    RtmpRegistrationQueueFull,
+
+    #[cfg(feature = "rtmp")]
     #[error("Rtmp server thread exited")]
     RtmpThreadExited,
 
     #[cfg(feature = "rtmp")]
     #[error("Rtmp stream closed: the server is no longer consuming this stream")]
     RtmpStreamClosed,
+
+    #[cfg(feature = "rtmp")]
+    #[error("Rtmp server already started: clones of one server share a single lifecycle, which can be started only once")]
+    RtmpServerAlreadyStarted,
 
     #[cfg(feature = "subtitle")]
     #[error("Subtitle error: {0}")]
@@ -308,8 +316,10 @@ impl PartialEq for Error {
             | (Bug, Bug) => true,
             #[cfg(feature = "rtmp")]
             (RtmpCreateStream, RtmpCreateStream)
+            | (RtmpRegistrationQueueFull, RtmpRegistrationQueueFull)
             | (RtmpThreadExited, RtmpThreadExited)
-            | (RtmpStreamClosed, RtmpStreamClosed) => true,
+            | (RtmpStreamClosed, RtmpStreamClosed)
+            | (RtmpServerAlreadyStarted, RtmpServerAlreadyStarted) => true,
             _ => false,
         }
     }

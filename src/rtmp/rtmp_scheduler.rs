@@ -1,3 +1,6 @@
+use crate::flv::flv_tag_body::{
+    is_audio_sequence_header, is_video_keyframe, is_video_sequence_header,
+};
 use crate::rtmp::gop::{FrameData, Gops};
 use crate::rtmp::write_queue::QUEUE_WARN_BYTES;
 use bytes::Bytes;
@@ -95,7 +98,12 @@ const MAX_CACHEABLE_SEQUENCE_HEADER_BYTES: usize = 256 * 1024;
 
 enum ClientAction {
     Waiting,
-    Publishing(String), // Publishing to a stream key
+    // Publishing to a stream key. `Rc<str>` because the in-process media path
+    // clones the key once per audio/video tag (to end the borrow of `clients`
+    // before mutating `channels`); a refcount bump there beats a per-tag String
+    // allocation. The scheduler lives on the single reactor thread and already
+    // holds `Rc<StreamMetadata>`, so `Rc` adds no new threading constraint.
+    Publishing(Rc<str>),
     Watching { stream_key: String, stream_id: u32 },
 }
 
@@ -224,7 +232,7 @@ impl RtmpScheduler {
         let client = Client {
             session,
             connection_id: publisher_connection_id,
-            current_action: ClientAction::Publishing(stream_key.clone()),
+            current_action: ClientAction::Publishing(Rc::from(stream_key.as_str())),
             has_received_video_keyframe: false,
         };
 
@@ -435,7 +443,7 @@ impl RtmpScheduler {
         // needs no gate here (and, returning no Result, could not terminate the
         // feed anyway).
         self.handle_audio_video_data_received(
-            stream_key,
+            &stream_key,
             timestamp,
             data,
             data_type,
@@ -537,7 +545,7 @@ impl RtmpScheduler {
             Some(client_id) => {
                 let client = self.clients.remove(client_id);
                 match client.current_action {
-                    ClientAction::Publishing(stream_key) => self.publishing_ended(stream_key),
+                    ClientAction::Publishing(stream_key) => self.publishing_ended(&stream_key),
                     _ => {}
                 }
             }
@@ -569,7 +577,7 @@ impl RtmpScheduler {
             },
             None => return server_results,
         };
-        self.handle_publish_finished(String::new(), stream_key, &mut server_results);
+        self.handle_publish_finished(String::new(), &stream_key, &mut server_results);
         server_results
     }
 
@@ -659,7 +667,7 @@ impl RtmpScheduler {
                 app_name,
                 stream_key,
             } => {
-                self.handle_publish_finished(app_name, stream_key, server_results);
+                self.handle_publish_finished(app_name, &stream_key, server_results);
             }
 
             ServerSessionEvent::PlayStreamRequested {
@@ -707,7 +715,7 @@ impl RtmpScheduler {
                 // queue-critical threshold — is enforced at the top of this
                 // function via oversized_sequence_header_error.
                 self.handle_audio_video_data_received(
-                    stream_key,
+                    &stream_key,
                     timestamp,
                     data,
                     ReceivedDataType::Video,
@@ -724,7 +732,7 @@ impl RtmpScheduler {
                 // Same ingest bound for an oversized audio sequence header,
                 // enforced at the top via oversized_sequence_header_error.
                 self.handle_audio_video_data_received(
-                    stream_key,
+                    &stream_key,
                     timestamp,
                     data,
                     ReceivedDataType::Audio,
@@ -795,12 +803,12 @@ impl RtmpScheduler {
     fn handle_publish_finished(
         &mut self,
         app_name: String,
-        stream_key: String,
+        stream_key: &str,
         server_results: &mut Vec<ServerResult>,
     ) {
         debug!("Rtmp publish finished on app '{app_name}' and stream key '{stream_key}'");
 
-        let channel = match self.channels.get(&stream_key) {
+        let channel = match self.channels.get(stream_key) {
             Some(channel) => channel,
             None => return,
         };
@@ -877,8 +885,8 @@ impl RtmpScheduler {
         // A connection that switches streams with a second `play` must leave
         // the previous channel's watcher set before its action is overwritten:
         // otherwise the old channel's fanout keeps delivering frames to it,
-        // and the old stream's live IDR could wrongly re-open the keyframe
-        // gate for the new stream.
+        // and the old stream's next live keyframe could wrongly re-open the
+        // keyframe gate for the new stream.
         let previous_watch = {
             let client_id = self
                 .connection_to_client_map
@@ -930,16 +938,16 @@ impl RtmpScheduler {
             };
             // Reset the keyframe gate for this play request: has_received_video_keyframe
             // is persistent client state, so a connection that previously watched
-            // another stream (and saw its IDR) must not carry that True over and let
-            // should_send_to_watcher forward this stream's delta frames before an IDR
-            // is replayed or arrives live. Replay of a GOP with
-            // a real IDR, or a later live IDR, re-sets it.
+            // another stream (and saw its keyframe) must not carry that True over and
+            // let should_send_to_watcher forward this stream's delta frames before a
+            // keyframe is replayed or arrives live. Replay of a GOP carrying a
+            // keyframe, or a later live keyframe, re-sets it.
             client.has_received_video_keyframe = false;
 
             let channel = self
                 .channels
                 .entry(stream_key.clone())
-                .or_insert(MediaChannel::new(self.gop_limit));
+                .or_insert_with(|| MediaChannel::new(self.gop_limit));
 
             channel.watching_client_ids.insert(*client_id);
             accept_result = client.session.accept_request(request_id);
@@ -1100,13 +1108,13 @@ impl RtmpScheduler {
 
     fn handle_audio_video_data_received(
         &mut self,
-        stream_key: String,
+        stream_key: &str,
         timestamp: RtmpTimestamp,
         data: Bytes,
         data_type: ReceivedDataType,
         server_results: &mut Vec<ServerResult>,
     ) {
-        let channel = match self.channels.get_mut(&stream_key) {
+        let channel = match self.channels.get_mut(stream_key) {
             Some(channel) => channel,
             None => return,
         };
@@ -1155,7 +1163,7 @@ impl RtmpScheduler {
                     // Same reasoning as the video path. Audio frames share this
                     // channel's single GOP cache, so an audio codec change also
                     // clears the cached video GOPs. That is safe (a joiner just
-                    // replays fewer frames and catches up on the next live IDR)
+                    // replays fewer frames and catches up on the next live keyframe)
                     // and audio-config changes are rare; correctness over a
                     // marginally longer catch-up.
                     if channel
@@ -1234,6 +1242,15 @@ impl RtmpScheduler {
                         .send_audio_data(active_stream_id, data.clone(), timestamp, true)
                 }
                 ReceivedDataType::Video => {
+                    // The keyframe gate trusts the container flag: is_keyframe
+                    // means the encoder flagged this packet as a keyframe (FLV
+                    // frame type 1, AVC NALU packet type 0x01). The NAL payload
+                    // is not inspected, so a mis-flagged packet passes the
+                    // gate. FFmpeg's flvdec (libavformat/flvdec.c derives
+                    // AV_PKT_FLAG_KEY from the same frame-type nibble) and
+                    // mainstream RTMP servers place the same trust in the
+                    // container flag, which keeps this per-packet path free of
+                    // NAL parsing.
                     if is_keyframe {
                         client.has_received_video_keyframe = true;
                     }
@@ -1269,8 +1286,8 @@ impl RtmpScheduler {
         }
     }
 
-    fn publishing_ended(&mut self, stream_key: String) {
-        let should_remove = if let Some(channel) = self.channels.get_mut(&stream_key) {
+    fn publishing_ended(&mut self, stream_key: &str) {
+        let should_remove = if let Some(channel) = self.channels.get_mut(stream_key) {
             // Reset the FULL publisher-scoped state, not just metadata. During
             // the close linger the channel outlives its publisher (lingering
             // watchers keep it), yet `stream_keys` is released at once, so a NEW
@@ -1278,7 +1295,7 @@ impl RtmpScheduler {
             // same sequence header, the clear-on-change in
             // `handle_audio_video_data_received` never fires — without this, a
             // fresh joiner would replay the PREVIOUS session's cached GOPs and
-            // the new publisher's first IDR would freeze the old open GOP,
+            // the new publisher's first keyframe would freeze the old open GOP,
             // mixing two sessions. Watchers already mid-delivery are unaffected:
             // `build_join_burst` snapshots at join time, so a cleared cache only
             // means a FUTURE joiner replays fewer frames.
@@ -1294,7 +1311,7 @@ impl RtmpScheduler {
             return;
         };
         if should_remove {
-            self.channels.remove(&stream_key);
+            self.channels.remove(stream_key);
         }
     }
 
@@ -1370,7 +1387,7 @@ fn should_send_to_watcher(
 /// The index of the first GOP segment to replay to a joining watcher: the
 /// longest suffix of `sizes` whose byte total stays within `budget`. Whole
 /// segments only — a GOP entered mid-way hands the watcher delta frames whose
-/// IDR was trimmed away, which decodes as a smeared picture.
+/// opening keyframe was trimmed away, which decodes as a smeared picture.
 ///
 /// The accumulation uses `checked_add` so a corrupt or absurd segment size
 /// fails closed (older segments dropped) instead of wrapping around and
@@ -1399,8 +1416,8 @@ fn select_replay_start(sizes: &[usize], budget: usize) -> usize {
 /// GOP segments selected by [`select_replay_start`] oldest -> newest, with
 /// the open (current) GOP as the final segment. The current GOP must be
 /// included: the live delta frames the watcher receives right after joining
-/// reference the current GOP's IDR, so skipping it smears the picture until
-/// the next keyframe arrives.
+/// reference the current GOP's opening keyframe, so skipping it smears the
+/// picture until the next keyframe arrives.
 ///
 /// The sequence headers are sent outside (before) the budget trim,
 /// unconditionally: they are required to decode anything at all and are
@@ -1437,12 +1454,13 @@ fn join_replay_prefix_bytes(
         .saturating_add(accept_packet_bytes)
 }
 
-/// A watcher must receive a real IDR before any delta frame it is expected
-/// to decode. Only the first replayed segment can be keyframeless — either
-/// the pre-first-IDR headers+audio, or (mid-GOP publish start) a run of
-/// deltas with no IDR. Replay only audio from such a segment and do not flip
-/// the keyframe gate until a segment that actually carries an IDR is reached;
-/// from then on every frame is decodable (normal GOPs start with their IDR).
+/// A watcher must receive a video keyframe before any delta frame it is
+/// expected to decode. Only the first replayed segment can be keyframeless —
+/// either the pre-first-keyframe headers+audio, or (mid-GOP publish start) a
+/// run of deltas with no keyframe. Replay only audio from such a segment and
+/// do not flip the keyframe gate until a segment carrying a flagged keyframe
+/// is reached; from then on every replayed video frame follows its GOP's
+/// keyframe (GOPs freeze on keyframe boundaries).
 fn build_join_burst(
     channel: &MediaChannel,
     client: &mut Client,
@@ -1564,23 +1582,24 @@ fn build_join_burst(
     ));
     let start = select_replay_start(&sizes, budget);
 
-    let mut replayed_idr = false;
+    let mut replayed_keyframe = false;
     for segment_index in start..sizes.len() {
         let frames = if segment_index < frozen.len() {
             frozen[segment_index].frames()
         } else {
             current_frames
         };
-        if !replayed_idr && gop_contains_video_keyframe(frames) {
-            replayed_idr = true;
+        if !replayed_keyframe && gop_contains_video_keyframe(frames) {
+            replayed_keyframe = true;
             client.has_received_video_keyframe = true;
         }
         for frame_data in frames {
             match frame_data {
                 FrameData::Video { timestamp, data } => {
-                    // Skip undecodable pre-IDR video; the AVC sequence header
-                    // is already sent separately above.
-                    if !replayed_idr {
+                    // Skip pre-keyframe video (deltas whose reference frames
+                    // were never sent); the AVC sequence header is already
+                    // sent separately above.
+                    if !replayed_keyframe {
                         continue;
                     }
                     let is_keyframe = is_video_keyframe(data);
@@ -1634,25 +1653,17 @@ fn build_join_burst(
     }
 }
 
-/// Whether replaying `frames` gives a watcher a decodable starting point, i.e.
-/// the GOP contains a real IDR (not merely the AVC sequence header or audio).
-/// Used to gate has_received_video_keyframe during GOP replay: a GOP frozen
-/// before the first IDR must not flip the gate.
+/// Whether replaying `frames` hands a watcher a video keyframe: a frame the
+/// encoder flagged as one (FLV frame type 1, AVC NALU packet type 0x01 — the
+/// NAL payload is not inspected, see [`is_video_keyframe`]), not merely the
+/// AVC sequence header or audio. Used to gate has_received_video_keyframe
+/// during GOP replay: a GOP frozen before the first keyframe must not flip
+/// the gate.
 fn gop_contains_video_keyframe(frames: &[FrameData]) -> bool {
     frames.iter().any(|f| match f {
         FrameData::Video { data, .. } => is_video_keyframe(data),
         FrameData::Audio { .. } => false,
     })
-}
-
-fn is_video_sequence_header(data: &Bytes) -> bool {
-    // This is assuming h264.
-    data.len() >= 2 && data[0] == 0x17 && data[1] == 0x00
-}
-
-fn is_audio_sequence_header(data: &Bytes) -> bool {
-    // This is assuming aac.
-    data.len() >= 2 && data[0] == 0xaf && data[1] == 0x00
 }
 
 /// Whether `data` is a sequence header (of `data_type`) too large to cache.
@@ -1690,14 +1701,6 @@ fn oversized_sequence_header_error(event: &ServerSessionEvent) -> Option<Schedul
     } else {
         None
     }
-}
-
-fn is_video_keyframe(data: &Bytes) -> bool {
-    // Assuming h264. 0x17 = keyframe frame-type + AVC codec; AVCPacketType 0x01
-    // is a NALU (the actual IDR). Require == 0x01 rather than != 0x00 so the
-    // sequence header (0x00) AND the AVC end-of-sequence marker (0x02) are both
-    // excluded — only a decodable IDR frame may flip the keyframe gate.
-    data.len() >= 2 && data[0] == 0x17 && data[1] == 0x01
 }
 
 #[cfg(test)]
@@ -1806,7 +1809,7 @@ mod tests {
         let mut server_results = Vec::new();
         let audio_data = Bytes::from(vec![0xAF, 0x01, 0xDD, 0xEE]);
         scheduler.handle_audio_video_data_received(
-            stream_key.clone(),
+            &stream_key,
             RtmpTimestamp { value: 50 },
             audio_data,
             ReceivedDataType::Audio,
@@ -2123,7 +2126,7 @@ mod tests {
         let data = Bytes::from(vec![0x17, 0x01, 0x00, 0x00, 0x00]); // Video data
 
         scheduler.handle_audio_video_data_received(
-            stream_key.clone(),
+            &stream_key,
             timestamp,
             data,
             ReceivedDataType::Video,
@@ -2169,7 +2172,7 @@ mod tests {
         let keyframe_data = Bytes::from(vec![0x17, 0x01, 0x00, 0x00, 0x00, 0xAA, 0xBB]);
         let timestamp = RtmpTimestamp { value: 1000 };
         scheduler.handle_audio_video_data_received(
-            stream_key.clone(),
+            &stream_key,
             timestamp,
             keyframe_data,
             ReceivedDataType::Video,
@@ -2196,7 +2199,7 @@ mod tests {
         server_results.clear();
         let non_keyframe_data = Bytes::from(vec![0x27, 0x01, 0x00, 0x00, 0x00, 0xCC]);
         scheduler.handle_audio_video_data_received(
-            stream_key.clone(),
+            &stream_key,
             RtmpTimestamp { value: 1033 },
             non_keyframe_data,
             ReceivedDataType::Video,
@@ -2225,7 +2228,7 @@ mod tests {
         server_results.clear();
         let audio_data = Bytes::from(vec![0xAF, 0x01, 0xDD, 0xEE]);
         scheduler.handle_audio_video_data_received(
-            stream_key.clone(),
+            &stream_key,
             RtmpTimestamp { value: 1040 },
             audio_data,
             ReceivedDataType::Audio,
@@ -2285,7 +2288,7 @@ mod tests {
         let mut server_results = Vec::new();
         let keyframe_data = Bytes::from(vec![0x17, 0x01, 0x00, 0x00, 0x00]);
         scheduler.handle_audio_video_data_received(
-            stream_key.clone(),
+            &stream_key,
             RtmpTimestamp { value: 0 },
             keyframe_data,
             ReceivedDataType::Video,
@@ -2342,7 +2345,7 @@ mod tests {
         let mut server_results = Vec::new();
         let sequence_header = Bytes::from(vec![0x17, 0x00, 0x00, 0x00, 0x00, 0x01, 0x64]);
         scheduler.handle_audio_video_data_received(
-            stream_key.clone(),
+            &stream_key,
             RtmpTimestamp { value: 0 },
             sequence_header.clone(),
             ReceivedDataType::Video,
@@ -2393,7 +2396,7 @@ mod tests {
         let mut server_results = Vec::new();
         let non_keyframe = Bytes::from(vec![0x27, 0x01, 0x00, 0x00, 0x00]);
         scheduler.handle_audio_video_data_received(
-            stream_key.clone(),
+            &stream_key,
             RtmpTimestamp { value: 100 },
             non_keyframe,
             ReceivedDataType::Video,
@@ -2409,7 +2412,7 @@ mod tests {
         // Now send keyframe
         let keyframe = Bytes::from(vec![0x17, 0x01, 0x00, 0x00, 0x00]);
         scheduler.handle_audio_video_data_received(
-            stream_key.clone(),
+            &stream_key,
             RtmpTimestamp { value: 200 },
             keyframe,
             ReceivedDataType::Video,
@@ -2444,7 +2447,7 @@ mod tests {
         let mut server_results = Vec::new();
         let audio_data = Bytes::from(vec![0xAF, 0x01, 0xDD, 0xEE]);
         scheduler.handle_audio_video_data_received(
-            stream_key.clone(),
+            &stream_key,
             RtmpTimestamp { value: 50 },
             audio_data.clone(),
             ReceivedDataType::Audio,
@@ -2460,7 +2463,7 @@ mod tests {
         // Send video keyframe
         let keyframe = Bytes::from(vec![0x17, 0x01, 0x00, 0x00, 0x00]);
         scheduler.handle_audio_video_data_received(
-            stream_key.clone(),
+            &stream_key,
             RtmpTimestamp { value: 100 },
             keyframe,
             ReceivedDataType::Video,
@@ -2470,7 +2473,7 @@ mod tests {
         // Now send audio again
         server_results.clear();
         scheduler.handle_audio_video_data_received(
-            stream_key.clone(),
+            &stream_key,
             RtmpTimestamp { value: 150 },
             audio_data,
             ReceivedDataType::Audio,
@@ -2509,7 +2512,7 @@ mod tests {
         let mut server_results = Vec::new();
         let audio_seq_header = Bytes::from(vec![0xAF, 0x00, 0x12, 0x10]);
         scheduler.handle_audio_video_data_received(
-            stream_key.clone(),
+            &stream_key,
             RtmpTimestamp { value: 0 },
             audio_seq_header.clone(),
             ReceivedDataType::Audio,
@@ -2579,7 +2582,7 @@ mod tests {
         let mut server_results = Vec::new();
         let keyframe = Bytes::from(vec![0x17, 0x01, 0x00, 0x00, 0x00]);
         scheduler.handle_audio_video_data_received(
-            stream_key.clone(),
+            &stream_key,
             RtmpTimestamp { value: 0 },
             keyframe,
             ReceivedDataType::Video,
@@ -2602,7 +2605,7 @@ mod tests {
         server_results.clear();
         let frame = Bytes::from(vec![0x27, 0x01, 0x00, 0x00, 0x00]);
         scheduler.handle_audio_video_data_received(
-            stream_key.clone(),
+            &stream_key,
             RtmpTimestamp { value: 33 },
             frame,
             ReceivedDataType::Video,
@@ -2625,7 +2628,7 @@ mod tests {
         }
     }
 
-    // The first GOP is frozen before the first IDR and
+    // The first GOP is frozen before the first keyframe and
     // carries only the AVC sequence header (0x17 0x00) + pre-roll audio. GOP
     // replay must not mark a watcher as having a keyframe from such a GOP, or
     // should_send_to_watcher would forward undecodable delta frames to it.
@@ -2639,14 +2642,15 @@ mod tests {
             timestamp: RtmpTimestamp { value: 0 },
             data: Bytes::from_static(&[0xaf, 0x01, 0x21]),
         };
-        // A GOP with only the sequence header and audio (no IDR) must NOT flip.
+        // A GOP with only the sequence header and audio (no keyframe) must NOT flip.
         assert!(
             !gop_contains_video_keyframe(&[seq_header.clone(), pre_roll_audio.clone()]),
             "a sequence-header-only GOP must not flip the keyframe gate"
         );
 
-        // A real GOP starts with an IDR (0x17 0x01, AVC NALU) and must flip it.
-        let idr = FrameData::Video {
+        // A normal GOP starts with a flagged keyframe (0x17 0x01, AVC NALU
+        // packet) and must flip it.
+        let keyframe = FrameData::Video {
             timestamp: RtmpTimestamp { value: 33 },
             data: Bytes::from_static(&[0x17, 0x01, 0x00, 0x00, 0x00]),
         };
@@ -2655,20 +2659,21 @@ mod tests {
             data: Bytes::from_static(&[0x27, 0x01, 0x00, 0x00, 0x00]),
         };
         assert!(
-            gop_contains_video_keyframe(&[idr, delta.clone(), pre_roll_audio.clone()]),
-            "a GOP containing a real IDR must flip the keyframe gate"
+            gop_contains_video_keyframe(&[keyframe, delta.clone(), pre_roll_audio.clone()]),
+            "a GOP carrying a flagged keyframe must flip the keyframe gate"
         );
 
         // Mid-GOP publish start: the first frozen GOP can be delta frames only
-        // (no IDR, no sequence header). It must not flip the gate — the replay
+        // (no keyframe, no sequence header). It must not flip the gate — the replay
         // loop skips its undecodable video and forwards only audio.
         assert!(
             !gop_contains_video_keyframe(&[delta.clone(), delta, pre_roll_audio]),
             "a delta-only GOP (mid-GOP start) must not flip the keyframe gate"
         );
 
-        // AVC end-of-sequence (0x17 0x02) is a keyframe frame-type but not a
-        // decodable IDR; it must not flip the gate either.
+        // AVC end-of-sequence (0x17 0x02) carries the keyframe frame-type but
+        // is not a NALU packet (no picture data); it must not flip the gate
+        // either.
         let end_of_seq = FrameData::Video {
             timestamp: RtmpTimestamp { value: 99 },
             data: Bytes::from_static(&[0x17, 0x02, 0x00, 0x00, 0x00]),
@@ -2700,7 +2705,7 @@ mod tests {
     ) -> Vec<ServerResult> {
         let mut results = Vec::new();
         scheduler.handle_audio_video_data_received(
-            stream_key.to_string(),
+            stream_key,
             RtmpTimestamp { value: timestamp },
             Bytes::from_static(data),
             ReceivedDataType::Video,
@@ -2709,15 +2714,15 @@ mod tests {
         results
     }
 
-    const IDR: &[u8] = &[0x17, 0x01, 0x00, 0x00, 0x00];
+    const KEYFRAME: &[u8] = &[0x17, 0x01, 0x00, 0x00, 0x00];
     const DELTA: &[u8] = &[0x27, 0x01, 0x00, 0x00, 0x00];
 
     // Pre-existing multi-play bug:
     // a client that plays stream A and then plays stream B on the same
     // connection must leave A's watcher set, stop receiving A's frames, and
-    // have its keyframe gate reset so B's deltas are withheld until B's IDR.
+    // have its keyframe gate reset so B's deltas are withheld until B's keyframe.
     #[test]
-    fn switching_streams_leaves_the_old_channel_and_regates_on_the_new_idr() {
+    fn switching_streams_leaves_the_old_channel_and_regates_on_the_new_keyframe() {
         let mut scheduler = RtmpScheduler::new(10);
         let publisher_a_conn = 100;
         let watcher_conn = 2;
@@ -2735,9 +2740,9 @@ mod tests {
             .watching_client_ids
             .contains(&client_id));
 
-        // A's live IDR reaches the watcher and opens its keyframe gate.
-        let results = feed_video(&mut scheduler, "stream_a", 0, IDR);
-        assert_eq!(results.len(), 1, "watcher should receive A's IDR");
+        // A's live keyframe reaches the watcher and opens its keyframe gate.
+        let results = feed_video(&mut scheduler, "stream_a", 0, KEYFRAME);
+        assert_eq!(results.len(), 1, "watcher should receive A's keyframe");
         assert!(
             scheduler
                 .clients
@@ -2787,8 +2792,8 @@ mod tests {
         );
 
         // A's frames are no longer delivered to the switched client, and A's
-        // IDR must not re-open the gate for B.
-        let results = feed_video(&mut scheduler, "stream_a", 33, IDR);
+        // keyframe must not re-open the gate for B.
+        let results = feed_video(&mut scheduler, "stream_a", 33, KEYFRAME);
         assert!(
             results.is_empty(),
             "A's frames must not reach a client that switched to B"
@@ -2799,19 +2804,19 @@ mod tests {
                 .get(client_id)
                 .unwrap()
                 .has_received_video_keyframe,
-            "A's live IDR must not open the gate of a client watching B"
+            "A's live keyframe must not open the gate of a client watching B"
         );
 
-        // B's delta frames are withheld until B's own IDR arrives.
+        // B's delta frames are withheld until B's own keyframe arrives.
         let results = feed_video(&mut scheduler, "stream_b", 40, DELTA);
         assert!(
             results.is_empty(),
-            "B's deltas must be withheld until B's IDR"
+            "B's deltas must be withheld until B's keyframe"
         );
-        let results = feed_video(&mut scheduler, "stream_b", 66, IDR);
-        assert_eq!(results.len(), 1, "B's IDR must be delivered");
+        let results = feed_video(&mut scheduler, "stream_b", 66, KEYFRAME);
+        assert_eq!(results.len(), 1, "B's keyframe must be delivered");
         let results = feed_video(&mut scheduler, "stream_b", 100, DELTA);
-        assert_eq!(results.len(), 1, "B's deltas flow after B's IDR");
+        assert_eq!(results.len(), 1, "B's deltas flow after B's keyframe");
     }
 
     #[test]
@@ -2888,8 +2893,8 @@ mod tests {
             .get(&watcher_conn)
             .unwrap();
 
-        let results = feed_video(&mut scheduler, "stream_a", 0, IDR);
-        assert_eq!(results.len(), 1, "watcher should receive the IDR");
+        let results = feed_video(&mut scheduler, "stream_a", 0, KEYFRAME);
+        assert_eq!(results.len(), 1, "watcher should receive the keyframe");
         assert!(
             scheduler
                 .clients
@@ -2927,7 +2932,7 @@ mod tests {
 
         // The published channel itself must survive, and its frames must no
         // longer be delivered to the finished client.
-        let results = feed_video(&mut scheduler, "stream_a", 33, IDR);
+        let results = feed_video(&mut scheduler, "stream_a", 33, KEYFRAME);
         assert!(results.is_empty(), "no frames after the play finished");
     }
 
@@ -3076,10 +3081,10 @@ mod tests {
 
     // PERF-5a: the in-process media bypass (publish_media_received) must feed
     // the exact same channel machinery the serialize path reaches, so a live
-    // watcher observes sequence-header-first, IDR-first, correctly gated and
+    // watcher observes sequence-header-first, keyframe-first, correctly gated and
     // interleaved audio/video.
     #[test]
-    fn in_process_bypass_delivers_seq_header_then_gated_idr_then_interleaved() {
+    fn in_process_bypass_delivers_seq_header_then_gated_keyframe_then_interleaved() {
         let mut scheduler = RtmpScheduler::new(10);
         let publisher_conn = 100;
         let watcher_conn = 2;
@@ -3122,14 +3127,14 @@ mod tests {
             }
         ));
 
-        // A delta frame and audio before the first IDR are withheld (gate).
+        // A delta frame and audio before the first keyframe are withheld (gate).
         assert!(
             feed_media(&mut scheduler, publisher_conn, 0x09, 33, DELTA).is_empty(),
-            "delta before the IDR must be withheld"
+            "delta before the keyframe must be withheld"
         );
         assert!(
             feed_media(&mut scheduler, publisher_conn, 0x08, 33, AUDIO_FRAME).is_empty(),
-            "audio before the first IDR must be withheld"
+            "audio before the first keyframe must be withheld"
         );
         assert!(
             !scheduler
@@ -3139,9 +3144,9 @@ mod tests {
                 .has_received_video_keyframe
         );
 
-        // The IDR opens the gate and is delivered as a keyframe.
-        let results = feed_media(&mut scheduler, publisher_conn, 0x09, 66, IDR);
-        assert_eq!(results.len(), 1, "the IDR must be delivered");
+        // The keyframe opens the gate and is delivered with is_keyframe set.
+        let results = feed_media(&mut scheduler, publisher_conn, 0x09, 66, KEYFRAME);
+        assert_eq!(results.len(), 1, "the keyframe must be delivered");
         assert!(matches!(
             &results[0],
             ServerResult::OutboundPacket {
@@ -3158,9 +3163,9 @@ mod tests {
                 .has_received_video_keyframe
         );
 
-        // After the IDR, audio and delta video interleave through to the watcher.
+        // After the keyframe, audio and delta video interleave through to the watcher.
         let results = feed_media(&mut scheduler, publisher_conn, 0x08, 70, AUDIO_FRAME);
-        assert_eq!(results.len(), 1, "audio flows after the IDR");
+        assert_eq!(results.len(), 1, "audio flows after the keyframe");
         assert!(matches!(
             &results[0],
             ServerResult::OutboundPacket {
@@ -3171,7 +3176,7 @@ mod tests {
         ));
 
         let results = feed_media(&mut scheduler, publisher_conn, 0x09, 99, DELTA);
-        assert_eq!(results.len(), 1, "delta flows after the IDR");
+        assert_eq!(results.len(), 1, "delta flows after the keyframe");
         assert!(matches!(
             &results[0],
             ServerResult::OutboundPacket {
@@ -3195,11 +3200,11 @@ mod tests {
         // Publish a full GOP via the bypass before any watcher joins.
         feed_media(&mut scheduler, publisher_conn, 0x09, 0, VIDEO_SEQ);
         feed_media(&mut scheduler, publisher_conn, 0x08, 0, AUDIO_SEQ);
-        feed_media(&mut scheduler, publisher_conn, 0x09, 33, IDR);
+        feed_media(&mut scheduler, publisher_conn, 0x09, 33, KEYFRAME);
         feed_media(&mut scheduler, publisher_conn, 0x08, 34, AUDIO_FRAME);
         feed_media(&mut scheduler, publisher_conn, 0x09, 66, DELTA);
-        // A second IDR freezes the first GOP into the replay cache.
-        feed_media(&mut scheduler, publisher_conn, 0x09, 99, IDR);
+        // A second keyframe freezes the first GOP into the replay cache.
+        feed_media(&mut scheduler, publisher_conn, 0x09, 99, KEYFRAME);
 
         // The bypass must have cached the sequence headers and their timestamps
         // (byte-identical to the serialize path), and frozen the completed GOP.
@@ -3238,7 +3243,7 @@ mod tests {
             stream_id: 1,
         };
 
-        let results = feed_video(&mut scheduler, "stream_a", 0, IDR);
+        let results = feed_video(&mut scheduler, "stream_a", 0, KEYFRAME);
         assert!(
             results.is_empty(),
             "frames must not be delivered through a stale watcher membership"
@@ -3340,11 +3345,11 @@ mod tests {
         channel.video_sequence_header = Some(Bytes::from_static(VIDEO_SEQ));
         channel.audio_sequence_header = Some(Bytes::from_static(AUDIO_SEQ));
 
-        // Frozen GOP: IDR + audio + delta; the second IDR freezes it and
-        // opens the current GOP.
+        // Frozen GOP: keyframe + audio + delta; the second keyframe freezes
+        // it and opens the current GOP.
         channel
             .gops
-            .save_frame_data(video_frame(0, Bytes::from_static(IDR)), true);
+            .save_frame_data(video_frame(0, Bytes::from_static(KEYFRAME)), true);
         channel
             .gops
             .save_frame_data(audio_frame(10, Bytes::from_static(AUDIO_FRAME)), false);
@@ -3353,7 +3358,7 @@ mod tests {
             .save_frame_data(video_frame(33, Bytes::from_static(DELTA)), false);
         channel
             .gops
-            .save_frame_data(video_frame(66, Bytes::from_static(IDR)), true);
+            .save_frame_data(video_frame(66, Bytes::from_static(KEYFRAME)), true);
 
         let mut client = make_watching_client(7, "live", 1);
         let mut out = Vec::new();
@@ -3374,16 +3379,16 @@ mod tests {
                 (false, false, false), // metadata
                 (false, true, true),   // video sequence header
                 (false, true, false),  // audio sequence header
-                (true, false, true),   // frozen GOP IDR
+                (true, false, true),   // frozen GOP keyframe
                 (false, false, false), // frozen GOP audio
                 (false, false, true),  // frozen GOP delta
-                (true, false, true),   // current GOP IDR
+                (true, false, true),   // current GOP keyframe
             ],
             "every replayed packet must carry the flags the live path computes"
         );
         assert!(
             client.has_received_video_keyframe,
-            "replaying a real IDR must open the keyframe gate"
+            "replaying a flagged keyframe must open the keyframe gate"
         );
     }
 
@@ -3393,10 +3398,10 @@ mod tests {
         channel.video_sequence_header = Some(Bytes::from_static(VIDEO_SEQ));
         channel.audio_sequence_header = Some(Bytes::from_static(AUDIO_SEQ));
 
-        // Three ~400KiB single-IDR GOPs (marker at data[2]) plus a small
+        // Three ~400KiB single-keyframe GOPs (marker at data[2]) plus a small
         // current GOP. Newest-first the 960KiB budget admits current + GOP3 +
         // GOP2 (~800KiB) but not GOP1.
-        let make_idr = |marker: u8| {
+        let make_keyframe = |marker: u8| {
             let mut data = vec![0u8; 400 * 1024];
             data[0] = 0x17;
             data[1] = 0x01;
@@ -3406,12 +3411,12 @@ mod tests {
         for (i, marker) in [1u8, 2, 3].into_iter().enumerate() {
             channel
                 .gops
-                .save_frame_data(video_frame(i as u32 * 100, make_idr(marker)), true);
+                .save_frame_data(video_frame(i as u32 * 100, make_keyframe(marker)), true);
         }
-        // The fourth IDR freezes GOP3 and becomes the (small) current GOP.
+        // The fourth keyframe freezes GOP3 and becomes the (small) current GOP.
         channel
             .gops
-            .save_frame_data(video_frame(300, Bytes::from_static(IDR)), true);
+            .save_frame_data(video_frame(300, Bytes::from_static(KEYFRAME)), true);
 
         let mut client = make_watching_client(7, "live", 1);
         let mut out = Vec::new();
@@ -3430,7 +3435,7 @@ mod tests {
         );
         assert!(
             packet_contains(&out[2], &[0x17, 0x01, 2]),
-            "the replay must start at GOP2's IDR"
+            "the replay must start at GOP2's keyframe"
         );
         assert!(packet_contains(&out[3], &[0x17, 0x01, 3]));
         assert!(client.has_received_video_keyframe);
@@ -3466,32 +3471,32 @@ mod tests {
         );
         assert!(
             !client.has_received_video_keyframe,
-            "no IDR was replayed, so live deltas must stay gated until a live IDR"
+            "no keyframe was replayed, so live deltas must stay gated until a live keyframe"
         );
     }
 
     // H8.a regression: the replay used to iterate frozen GOPs only. A joiner
-    // then received live deltas referencing the open GOP's IDR it never got —
+    // then received live deltas referencing the open GOP's keyframe it never got —
     // a smeared picture until the next keyframe.
     #[test]
     fn join_burst_includes_the_open_current_gop_as_the_last_segment() {
-        const CURRENT_IDR: &[u8] = &[0x17, 0x01, 0xB2, 0x00, 0x00];
+        const CURRENT_KEYFRAME: &[u8] = &[0x17, 0x01, 0xB2, 0x00, 0x00];
         const CURRENT_DELTA: &[u8] = &[0x27, 0x01, 0xB3, 0x00, 0x00];
 
         let mut channel = MediaChannel::new(10);
         channel.video_sequence_header = Some(Bytes::from_static(VIDEO_SEQ));
 
-        // Frozen GOP: IDR + delta. Open GOP: a second IDR + delta not yet
-        // frozen by any later keyframe.
+        // Frozen GOP: keyframe + delta. Open GOP: a second keyframe + delta
+        // not yet frozen by any later keyframe.
         channel
             .gops
-            .save_frame_data(video_frame(0, Bytes::from_static(IDR)), true);
+            .save_frame_data(video_frame(0, Bytes::from_static(KEYFRAME)), true);
         channel
             .gops
             .save_frame_data(video_frame(33, Bytes::from_static(DELTA)), false);
         channel
             .gops
-            .save_frame_data(video_frame(66, Bytes::from_static(CURRENT_IDR)), true);
+            .save_frame_data(video_frame(66, Bytes::from_static(CURRENT_KEYFRAME)), true);
         channel
             .gops
             .save_frame_data(video_frame(99, Bytes::from_static(CURRENT_DELTA)), false);
@@ -3500,15 +3505,15 @@ mod tests {
         let mut out = Vec::new();
         build_join_burst(&channel, &mut client, 7, 1, 0, &mut out);
 
-        // vseq + frozen (IDR, delta) + current (IDR, delta).
+        // vseq + frozen (keyframe, delta) + current (keyframe, delta).
         assert_eq!(
             out.len(),
             5,
             "the open GOP must be replayed after the frozen ones"
         );
         assert!(
-            packet_contains(&out[3], CURRENT_IDR),
-            "the open GOP's IDR must be replayed — live deltas reference it"
+            packet_contains(&out[3], CURRENT_KEYFRAME),
+            "the open GOP's keyframe must be replayed — live deltas reference it"
         );
         assert!(packet_contains(&out[4], CURRENT_DELTA));
         assert_eq!(
@@ -3524,7 +3529,7 @@ mod tests {
         channel.audio_sequence_header = Some(Bytes::from_static(AUDIO_SEQ));
 
         // Publish started mid-GOP: the open GOP holds deltas and audio, no
-        // IDR, and nothing is frozen yet.
+        // keyframe, and nothing is frozen yet.
         channel
             .gops
             .save_frame_data(video_frame(0, Bytes::from_static(DELTA)), false);
@@ -3550,7 +3555,7 @@ mod tests {
                 (false, false, false), // audio
                 (false, false, false), // audio
             ],
-            "undecodable pre-IDR deltas must be skipped while audio still flows"
+            "undecodable pre-keyframe deltas must be skipped while audio still flows"
         );
         assert!(
             !client.has_received_video_keyframe,
@@ -3638,15 +3643,15 @@ mod tests {
         channel.video_sequence_header = Some(Bytes::from_static(VIDEO_SEQ));
         channel.audio_sequence_header = Some(Bytes::from_static(AUDIO_SEQ));
 
-        // A single ~950 KiB IDR GOP: it fits the raw 960 KiB budget, but not
+        // A single ~950 KiB one-keyframe GOP: it fits the raw 960 KiB budget, but not
         // once ~60 KiB of metadata is subtracted.
-        let mut idr = vec![0u8; 950 * 1024];
-        idr[0] = 0x17;
-        idr[1] = 0x01;
-        idr[2] = 0xC1;
+        let mut keyframe = vec![0u8; 950 * 1024];
+        keyframe[0] = 0x17;
+        keyframe[1] = 0x01;
+        keyframe[2] = 0xC1;
         channel
             .gops
-            .save_frame_data(video_frame(0, Bytes::from(idr)), true);
+            .save_frame_data(video_frame(0, Bytes::from(keyframe)), true);
 
         let mut client = make_watching_client(7, "live", 1);
         let mut out = Vec::new();
@@ -3668,8 +3673,8 @@ mod tests {
     /// once per-frame chunk framing is counted.
     #[test]
     fn join_burst_many_small_frames_framing_trims_older_gops() {
-        const OLD_IDR: &[u8] = &[0x17, 0x01, 0xD1];
-        const NEW_IDR: &[u8] = &[0x17, 0x01, 0xD2];
+        const OLD_KEYFRAME: &[u8] = &[0x17, 0x01, 0xD1];
+        const NEW_KEYFRAME: &[u8] = &[0x17, 0x01, 0xD2];
         let warn = crate::rtmp::write_queue::QUEUE_WARN_BYTES;
 
         let mut channel = MediaChannel::new(10);
@@ -3679,7 +3684,7 @@ mod tests {
         // Two GOPs of 3000 x 150-byte frames each. Payload sum (~880 KiB) fits
         // the 960 KiB budget, but the per-frame framing (3000 x 18 bytes/GOP)
         // pushes the pair over it, so the older GOP is trimmed as a whole.
-        let idr = |marker: u8| {
+        let keyframe = |marker: u8| {
             let mut d = vec![0u8; 150];
             d[0] = 0x17;
             d[1] = 0x01;
@@ -3694,16 +3699,16 @@ mod tests {
         };
         channel
             .gops
-            .save_frame_data(video_frame(0, idr(0xD1)), true);
+            .save_frame_data(video_frame(0, keyframe(0xD1)), true);
         for i in 0..2999u32 {
             channel
                 .gops
                 .save_frame_data(video_frame(i + 1, delta()), false);
         }
-        // The second IDR freezes the first GOP and opens the second.
+        // The second keyframe freezes the first GOP and opens the second.
         channel
             .gops
-            .save_frame_data(video_frame(3000, idr(0xD2)), true);
+            .save_frame_data(video_frame(3000, keyframe(0xD2)), true);
         for i in 0..2999u32 {
             channel
                 .gops
@@ -3715,11 +3720,11 @@ mod tests {
         build_join_burst(&channel, &mut client, 7, 1, 0, &mut out);
 
         assert!(
-            out.iter().any(|p| packet_contains(p, NEW_IDR)),
+            out.iter().any(|p| packet_contains(p, NEW_KEYFRAME)),
             "the newest GOP must be replayed"
         );
         assert!(
-            !out.iter().any(|p| packet_contains(p, OLD_IDR)),
+            !out.iter().any(|p| packet_contains(p, OLD_KEYFRAME)),
             "framing must trim the older GOP even though its payload alone fits"
         );
         assert!(
@@ -3742,13 +3747,13 @@ mod tests {
         header[1] = 0x00;
         channel.video_sequence_header = Some(Bytes::from(header));
 
-        let mut idr = vec![0u8; 4096];
-        idr[0] = 0x17;
-        idr[1] = 0x01;
-        idr[2] = 0xE1;
+        let mut keyframe = vec![0u8; 4096];
+        keyframe[0] = 0x17;
+        keyframe[1] = 0x01;
+        keyframe[2] = 0xE1;
         channel
             .gops
-            .save_frame_data(video_frame(0, Bytes::from(idr)), true);
+            .save_frame_data(video_frame(0, Bytes::from(keyframe)), true);
 
         let mut client = make_watching_client(7, "live", 1);
         let mut out = Vec::new();
@@ -3761,7 +3766,7 @@ mod tests {
         );
         assert!(
             !client.has_received_video_keyframe,
-            "no IDR was replayed, so the keyframe gate must stay closed"
+            "no keyframe was replayed, so the keyframe gate must stay closed"
         );
     }
 
@@ -3775,17 +3780,17 @@ mod tests {
         const GOP_MARKER: &[u8] = &[0x17, 0x01, 0xF1];
         let warn = crate::rtmp::write_queue::QUEUE_WARN_BYTES;
 
-        // A single ~950 KiB IDR GOP: it fits the raw 960 KiB budget on its own.
+        // A single ~950 KiB one-keyframe GOP: it fits the raw 960 KiB budget on its own.
         let make_channel = || {
             let mut channel = MediaChannel::new(10);
             channel.video_sequence_header = Some(Bytes::from_static(VIDEO_SEQ));
-            let mut idr = vec![0u8; 950 * 1024];
-            idr[0] = 0x17;
-            idr[1] = 0x01;
-            idr[2] = 0xF1;
+            let mut keyframe = vec![0u8; 950 * 1024];
+            keyframe[0] = 0x17;
+            keyframe[1] = 0x01;
+            keyframe[2] = 0xF1;
             channel
                 .gops
-                .save_frame_data(video_frame(0, Bytes::from(idr)), true);
+                .save_frame_data(video_frame(0, Bytes::from(keyframe)), true);
             channel
         };
 
@@ -4074,31 +4079,32 @@ mod tests {
     // ---- F4: a codec-config change must not replay old-config GOPs ----
 
     /// After a video sequence-header change, cached GOPs from the old config are
-    /// dropped: a joiner arriving after the change never receives an old IDR.
+    /// dropped: a joiner arriving after the change never receives an
+    /// old-config keyframe.
     #[test]
     fn codec_config_change_clears_stale_gops_from_the_replay() {
         const VIDEO_SEQ_A: &[u8] = &[0x17, 0x00, 0x00, 0x00, 0x00, 0x01, 0x64];
         const VIDEO_SEQ_B: &[u8] = &[0x17, 0x00, 0x00, 0x00, 0x00, 0x01, 0x2a];
-        const IDR_A1: &[u8] = &[0x17, 0x01, 0xa1, 0x00, 0x00];
-        const IDR_A2: &[u8] = &[0x17, 0x01, 0xa2, 0x00, 0x00];
-        const IDR_B: &[u8] = &[0x17, 0x01, 0xb1, 0x00, 0x00];
+        const KEYFRAME_A1: &[u8] = &[0x17, 0x01, 0xa1, 0x00, 0x00];
+        const KEYFRAME_A2: &[u8] = &[0x17, 0x01, 0xa2, 0x00, 0x00];
+        const KEYFRAME_B: &[u8] = &[0x17, 0x01, 0xb1, 0x00, 0x00];
 
         let mut scheduler = RtmpScheduler::new(10);
         let publisher_conn = 100;
         assert!(scheduler.new_channel("live".to_string(), publisher_conn));
 
-        // Old config: header A then two IDRs, so a GOP-A is frozen and one is open.
+        // Old config: header A then two keyframes, so a GOP-A is frozen and one is open.
         feed_media(&mut scheduler, publisher_conn, 0x09, 0, VIDEO_SEQ_A);
-        feed_media(&mut scheduler, publisher_conn, 0x09, 33, IDR_A1);
-        feed_media(&mut scheduler, publisher_conn, 0x09, 66, IDR_A2);
+        feed_media(&mut scheduler, publisher_conn, 0x09, 33, KEYFRAME_A1);
+        feed_media(&mut scheduler, publisher_conn, 0x09, 66, KEYFRAME_A2);
         assert!(
             scheduler.channels.get("live").unwrap().gops.frozen_count() >= 1,
             "a GOP-A must be frozen before the config change"
         );
 
-        // Config change: a DIFFERENT header B, then a new-config IDR.
+        // Config change: a DIFFERENT header B, then a new-config keyframe.
         feed_media(&mut scheduler, publisher_conn, 0x09, 99, VIDEO_SEQ_B);
-        feed_media(&mut scheduler, publisher_conn, 0x09, 132, IDR_B);
+        feed_media(&mut scheduler, publisher_conn, 0x09, 132, KEYFRAME_B);
 
         let channel = scheduler.channels.get("live").unwrap();
         assert_eq!(
@@ -4112,16 +4118,16 @@ mod tests {
         build_join_burst(channel, &mut client, 7, 1, 0, &mut out);
 
         assert!(
-            out.iter().any(|p| packet_contains(p, IDR_B)),
-            "the new-config IDR must be replayable to a joiner"
+            out.iter().any(|p| packet_contains(p, KEYFRAME_B)),
+            "the new-config keyframe must be replayable to a joiner"
         );
         assert!(
             !out.iter().any(|p| packet_contains(p, &[0x17, 0x01, 0xa1])),
-            "the old-config IDR A1 must have been cleared on the header change"
+            "the old-config keyframe A1 must have been cleared on the header change"
         );
         assert!(
             !out.iter().any(|p| packet_contains(p, &[0x17, 0x01, 0xa2])),
-            "the old-config IDR A2 must have been cleared on the header change"
+            "the old-config keyframe A2 must have been cleared on the header change"
         );
     }
 
@@ -4129,16 +4135,16 @@ mod tests {
     /// cache — otherwise every duplicate header would wipe the replay history.
     #[test]
     fn identical_sequence_header_resend_keeps_the_gop_cache() {
-        const IDR_1: &[u8] = &[0x17, 0x01, 0x51, 0x00, 0x00];
-        const IDR_2: &[u8] = &[0x17, 0x01, 0x52, 0x00, 0x00];
+        const KEYFRAME_1: &[u8] = &[0x17, 0x01, 0x51, 0x00, 0x00];
+        const KEYFRAME_2: &[u8] = &[0x17, 0x01, 0x52, 0x00, 0x00];
 
         let mut scheduler = RtmpScheduler::new(10);
         let publisher_conn = 100;
         assert!(scheduler.new_channel("live".to_string(), publisher_conn));
 
         feed_media(&mut scheduler, publisher_conn, 0x09, 0, VIDEO_SEQ);
-        feed_media(&mut scheduler, publisher_conn, 0x09, 33, IDR_1);
-        feed_media(&mut scheduler, publisher_conn, 0x09, 66, IDR_2);
+        feed_media(&mut scheduler, publisher_conn, 0x09, 33, KEYFRAME_1);
+        feed_media(&mut scheduler, publisher_conn, 0x09, 66, KEYFRAME_2);
         let frozen_before = scheduler.channels.get("live").unwrap().gops.frozen_count();
         assert!(frozen_before >= 1);
 
@@ -4156,7 +4162,7 @@ mod tests {
         build_join_burst(channel, &mut client, 7, 1, 0, &mut out);
         assert!(
             out.iter().any(|p| packet_contains(p, &[0x17, 0x01, 0x51])),
-            "the cached IDR must survive an identical header resend"
+            "the cached keyframe must survive an identical header resend"
         );
     }
 
@@ -4168,20 +4174,20 @@ mod tests {
     /// only B's session.
     #[test]
     fn publisher_end_resets_channel_so_same_key_reuse_replays_only_the_new_session() {
-        const IDR_A: &[u8] = &[0x17, 0x01, 0xa1, 0x00, 0x00];
-        const IDR_B: &[u8] = &[0x17, 0x01, 0xb1, 0x00, 0x00];
+        const KEYFRAME_A: &[u8] = &[0x17, 0x01, 0xa1, 0x00, 0x00];
+        const KEYFRAME_B: &[u8] = &[0x17, 0x01, 0xb1, 0x00, 0x00];
 
         let mut scheduler = RtmpScheduler::new(10);
         let publisher_a = 100;
         let publisher_b = 101;
         let lingering_watcher = 2;
 
-        // Publisher A publishes header H and IDR-A while a watcher is attached
+        // Publisher A publishes header H and keyframe A while a watcher is attached
         // (so the channel outlives A's departure).
         assert!(scheduler.new_channel("live".to_string(), publisher_a));
         play(&mut scheduler, lingering_watcher, "live");
         feed_media(&mut scheduler, publisher_a, 0x09, 0, VIDEO_SEQ);
-        feed_media(&mut scheduler, publisher_a, 0x09, 33, IDR_A);
+        feed_media(&mut scheduler, publisher_a, 0x09, 33, KEYFRAME_A);
         assert_eq!(
             scheduler.channel_video_sequence_header("live").as_deref(),
             Some(VIDEO_SEQ),
@@ -4200,23 +4206,23 @@ mod tests {
             "publisher-end must clear the cached sequence header"
         );
 
-        // Publisher B reclaims the same key with the SAME header and its own IDR.
+        // Publisher B reclaims the same key with the SAME header and its own keyframe.
         assert!(scheduler.new_channel("live".to_string(), publisher_b));
         feed_media(&mut scheduler, publisher_b, 0x09, 0, VIDEO_SEQ);
-        feed_media(&mut scheduler, publisher_b, 0x09, 33, IDR_B);
+        feed_media(&mut scheduler, publisher_b, 0x09, 33, KEYFRAME_B);
 
-        // A fresh joiner must receive ONLY publisher B's IDR, never A's.
+        // A fresh joiner must receive ONLY publisher B's keyframe, never A's.
         let channel = scheduler.channels.get("live").unwrap();
         let mut joiner = make_watching_client(7, "live", 1);
         let mut out = Vec::new();
         build_join_burst(channel, &mut joiner, 7, 1, 0, &mut out);
         assert!(
-            out.iter().any(|p| packet_contains(p, IDR_B)),
-            "the new session's IDR must be replayable"
+            out.iter().any(|p| packet_contains(p, KEYFRAME_B)),
+            "the new session's keyframe must be replayable"
         );
         assert!(
-            !out.iter().any(|p| packet_contains(p, IDR_A)),
-            "the previous session's IDR must never leak into the new session"
+            !out.iter().any(|p| packet_contains(p, KEYFRAME_A)),
+            "the previous session's keyframe must never leak into the new session"
         );
     }
 }

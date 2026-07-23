@@ -1,3 +1,4 @@
+use crate::flv::flv_tag_body;
 use crate::flv::flv_tag_header::FlvTagHeader;
 use crate::flv::{FLV_TAG_HEADER_LENGTH, PREVIOUS_TAG_SIZE_LENGTH};
 
@@ -39,26 +40,60 @@ impl FlvTag {
     }
 
     pub fn is_video_sequence_header(&self) -> bool {
-        if !self.is_video() {
-            return false;
-        }
-        // This is assuming h264.
-        self.data.len() >= 2 && self.data[0] == 0x17 && self.data[1] == 0x00
+        self.is_video() && flv_tag_body::is_video_sequence_header(&self.data)
     }
 
     pub fn is_audio_sequence_header(&self) -> bool {
-        if !self.is_audio() {
-            return false;
-        }
-        // This is assuming aac.
-        self.data.len() >= 2 && self.data[0] == 0xaf && self.data[1] == 0x00
+        self.is_audio() && flv_tag_body::is_audio_sequence_header(&self.data)
     }
 
+    /// Returns `true` iff this is a video tag whose first two body bytes are
+    /// `0x17 0x01`: frame type 1 (keyframe) + codec id 7 (AVC) in the first
+    /// byte, `AVCPacketType` `0x01` (NALU) in the second.
+    ///
+    /// Only those two bytes are inspected — the NALU payload is not parsed,
+    /// so nothing is verified about the NAL units (if any) that follow. AVC
+    /// sequence headers (`0x17 0x00`) and end-of-sequence markers
+    /// (`0x17 0x02`) also carry the keyframe frame type but return `false`.
     pub fn is_video_keyframe(&self) -> bool {
-        if !self.is_video() {
-            return false;
+        self.is_video() && flv_tag_body::is_video_keyframe(&self.data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tag(tag_type: u8, data: &'static [u8]) -> FlvTag {
+        FlvTag {
+            header: FlvTagHeader {
+                tag_type,
+                data_size: data.len() as u32,
+                timestamp: 0,
+                timestamp_ext: 0,
+                stream_id: 0,
+            },
+            data: bytes::Bytes::from_static(data),
+            previous_tag_size: 0,
         }
-        // Assuming h264.
-        self.data.len() >= 2 && self.data[0] == 0x17 && self.data[1] != 0x00 // 0x00 is the sequence header, don't count that for now
+    }
+
+    #[test]
+    fn classification_is_gated_on_tag_type() {
+        // Payload bytes alone are not enough: the tag type must match.
+        assert!(tag(0x09, &[0x17, 0x00]).is_video_sequence_header());
+        assert!(!tag(0x08, &[0x17, 0x00]).is_video_sequence_header());
+        assert!(tag(0x08, &[0xaf, 0x00]).is_audio_sequence_header());
+        assert!(!tag(0x09, &[0xaf, 0x00]).is_audio_sequence_header());
+    }
+
+    #[test]
+    fn video_keyframe_excludes_config_and_end_of_sequence() {
+        assert!(tag(0x09, &[0x17, 0x01]).is_video_keyframe());
+        // AVCPacketType 0x00 (sequence header) and 0x02 (end-of-sequence)
+        // carry the keyframe frame-type but are not NALU packets (0x01),
+        // i.e. not picture data.
+        assert!(!tag(0x09, &[0x17, 0x00]).is_video_keyframe());
+        assert!(!tag(0x09, &[0x17, 0x02]).is_video_keyframe());
     }
 }

@@ -173,28 +173,32 @@ mod linux {
             Ok(())
         }
 
-        pub fn poll(&mut self, timeout: Option<Duration>) -> io::Result<Vec<Event>> {
+        /// Waits for IO readiness and refills `events` with this wakeup's
+        /// events. The buffer is cleared first, so the caller can reuse one
+        /// `Vec` across wakeups instead of paying a fresh allocation per poll.
+        pub fn poll(&mut self, timeout: Option<Duration>, events: &mut Vec<Event>) -> io::Result<()> {
+            events.clear();
             let timeout_ms = timeout.map(|d| d.as_millis() as i32).unwrap_or(-1);
 
             // SAFETY: std::mem::zeroed() for an epoll_event array is safe:
             // - epoll_event is a POD type with no invalid bit patterns
             // - All zero bytes represent valid (empty) events
             // - The array is immediately overwritten by epoll_wait
-            let mut events: [libc::epoll_event; 256] = unsafe { std::mem::zeroed() };
+            let mut raw_events: [libc::epoll_event; 256] = unsafe { std::mem::zeroed() };
 
             loop {
                 // SAFETY: epoll_wait requires:
                 // - self.epfd is valid (created in new(), owned by self)
-                // - events.as_mut_ptr() points to valid, writable memory for 256 events
-                // - events.len() correctly reports the array capacity
+                // - raw_events.as_mut_ptr() points to valid, writable memory for 256 events
+                // - raw_events.len() correctly reports the array capacity
                 // - timeout_ms is a valid i32 (-1 for infinite, >=0 for milliseconds)
                 // Error (including EINTR) is checked immediately
                 // Thread safety: Poller requires &mut self, ensuring exclusive access
                 let ret = unsafe {
                     libc::epoll_wait(
                         self.epfd,
-                        events.as_mut_ptr(),
-                        events.len() as i32,
+                        raw_events.as_mut_ptr(),
+                        raw_events.len() as i32,
                         timeout_ms,
                     )
                 };
@@ -207,13 +211,12 @@ mod linux {
                     return Err(err);
                 }
 
-                let mut result = Vec::with_capacity(ret as usize);
-                for ev in events.iter().take(ret as usize) {
+                for ev in raw_events.iter().take(ret as usize) {
                     // Copy the fields out by value: epoll_event is packed on
                     // x86_64, so no references into it may be created.
                     let bits = ev.events;
                     let token = ev.u64 as usize;
-                    result.push(Event {
+                    events.push(Event {
                         token,
                         readable: bits & libc::EPOLLIN as u32 != 0,
                         writable: bits & libc::EPOLLOUT as u32 != 0,
@@ -221,7 +224,7 @@ mod linux {
                         hangup: bits & libc::EPOLLHUP as u32 != 0,
                     });
                 }
-                return Ok(result);
+                return Ok(());
             }
         }
     }
@@ -552,7 +555,11 @@ mod bsd {
             Ok(())
         }
 
-        pub fn poll(&mut self, timeout: Option<Duration>) -> io::Result<Vec<Event>> {
+        /// Waits for IO readiness and refills `events` with this wakeup's
+        /// events. The buffer is cleared first, so the caller can reuse one
+        /// `Vec` across wakeups instead of paying a fresh allocation per poll.
+        pub fn poll(&mut self, timeout: Option<Duration>, events: &mut Vec<Event>) -> io::Result<()> {
+            events.clear();
             let timespec = timeout.map(|d| Timespec {
                 tv_sec: d.as_secs() as isize,
                 tv_nsec: d.subsec_nanos() as isize,
@@ -567,14 +574,14 @@ mod bsd {
             // - Kevent is a POD type with no invalid bit patterns
             // - All zero bytes represent valid (empty) events
             // - The array is immediately overwritten by kevent()
-            let mut events: [Kevent; 256] = unsafe { std::mem::zeroed() };
+            let mut raw_events: [Kevent; 256] = unsafe { std::mem::zeroed() };
 
             loop {
                 // SAFETY: kevent() for polling requires:
                 // - self.kq is valid (created in new(), owned by self)
                 // - changelist is null (no changes to submit)
-                // - events.as_mut_ptr() points to valid, writable memory for 256 Kevents
-                // - events.len() correctly reports the array capacity
+                // - raw_events.as_mut_ptr() points to valid, writable memory for 256 Kevents
+                // - raw_events.len() correctly reports the array capacity
                 // - timeout_ptr points to valid Timespec or is null for blocking
                 // Error (including EINTR) is checked immediately
                 // Thread safety: Poller requires &mut self, ensuring exclusive access
@@ -583,8 +590,8 @@ mod bsd {
                         self.kq,
                         std::ptr::null(),
                         0,
-                        events.as_mut_ptr(),
-                        events.len() as i32,
+                        raw_events.as_mut_ptr(),
+                        raw_events.len() as i32,
                         timeout_ptr,
                     )
                 };
@@ -602,7 +609,7 @@ mod bsd {
                 let mut event_map: HashMap<usize, Event> = HashMap::new();
 
                 for i in 0..ret as usize {
-                    let ev = &events[i];
+                    let ev = &raw_events[i];
                     let token = ev.udata as usize;
 
                     let entry = event_map.entry(token).or_insert(Event {
@@ -627,7 +634,8 @@ mod bsd {
                     }
                 }
 
-                return Ok(event_map.into_values().collect());
+                events.extend(event_map.into_values());
+                return Ok(());
             }
         }
     }
@@ -772,13 +780,17 @@ mod windows {
             }
         }
 
-        pub fn poll(&mut self, timeout: Option<Duration>) -> io::Result<Vec<Event>> {
+        /// Waits for IO readiness and refills `events` with this wakeup's
+        /// events. The buffer is cleared first, so the caller can reuse one
+        /// `Vec` across wakeups instead of paying a fresh allocation per poll.
+        pub fn poll(&mut self, timeout: Option<Duration>, events: &mut Vec<Event>) -> io::Result<()> {
+            events.clear();
             if self.entries.is_empty() {
                 // No fds to poll - sleep for timeout and return empty
                 if let Some(dur) = timeout {
                     std::thread::sleep(dur);
                 }
-                return Ok(Vec::new());
+                return Ok(());
             }
 
             let timeout_ms = timeout.map(|d| d.as_millis() as i32).unwrap_or(-1);
@@ -816,10 +828,9 @@ mod windows {
                     return Err(io::Error::from_raw_os_error(err));
                 }
 
-                let mut result = Vec::new();
                 for (i, pollfd) in pollfds.iter().enumerate() {
                     if pollfd.revents != 0 {
-                        result.push(Event {
+                        events.push(Event {
                             token: self.entries[i].token,
                             readable: (pollfd.revents & POLLIN) != 0,
                             writable: (pollfd.revents & POLLOUT) != 0,
@@ -828,7 +839,7 @@ mod windows {
                         });
                     }
                 }
-                return Ok(result);
+                return Ok(());
             }
         }
     }
@@ -1197,6 +1208,8 @@ mod tests {
             .set_nonblocking(true)
             .expect("Failed to set nonblocking");
 
+        let mut events = Vec::new();
+
         #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
@@ -1213,8 +1226,8 @@ mod tests {
                 .expect("Failed to register");
 
             // Server should be immediately writable
-            let events = poller
-                .poll(Some(Duration::from_millis(100)))
+            poller
+                .poll(Some(Duration::from_millis(100)), &mut events)
                 .expect("Failed to poll");
             assert!(events.iter().any(|e| e.token == 2 && e.is_writable()));
 
@@ -1222,8 +1235,8 @@ mod tests {
             server.write_all(b"hello").expect("Failed to write");
 
             // Client should become readable
-            let events = poller
-                .poll(Some(Duration::from_millis(100)))
+            poller
+                .poll(Some(Duration::from_millis(100)), &mut events)
                 .expect("Failed to poll");
             assert!(events.iter().any(|e| e.token == 1 && e.is_readable()));
 
@@ -1245,15 +1258,15 @@ mod tests {
                 .register(server_fd, 2, Interest::WRITABLE)
                 .expect("Failed to register");
 
-            let events = poller
-                .poll(Some(Duration::from_millis(100)))
+            poller
+                .poll(Some(Duration::from_millis(100)), &mut events)
                 .expect("Failed to poll");
             assert!(events.iter().any(|e| e.token == 2 && e.is_writable()));
 
             server.write_all(b"hello").expect("Failed to write");
 
-            let events = poller
-                .poll(Some(Duration::from_millis(100)))
+            poller
+                .poll(Some(Duration::from_millis(100)), &mut events)
                 .expect("Failed to poll");
             assert!(events.iter().any(|e| e.token == 1 && e.is_readable()));
 
@@ -1292,8 +1305,9 @@ mod tests {
                 .expect("Failed to register");
         }
 
-        let events = poller
-            .poll(Some(Duration::from_millis(200)))
+        let mut events = Vec::new();
+        poller
+            .poll(Some(Duration::from_millis(200)), &mut events)
             .expect("Failed to poll");
         let mut tokens: Vec<usize> = events
             .iter()
@@ -1310,6 +1324,56 @@ mod tests {
     }
 
     #[test]
+    fn poll_clears_the_reused_buffer_between_wakeups() {
+        let mut poller = Poller::new().expect("Failed to create poller");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to get address");
+
+        let client = TcpStream::connect(addr).expect("Failed to connect");
+        client
+            .set_nonblocking(true)
+            .expect("Failed to set nonblocking");
+        let (server, _) = listener.accept().expect("Failed to accept");
+        server
+            .set_nonblocking(true)
+            .expect("Failed to set nonblocking");
+
+        #[cfg(unix)]
+        let server_fd = {
+            use std::os::unix::io::AsRawFd;
+            server.as_raw_fd()
+        };
+        #[cfg(windows)]
+        let server_fd = {
+            use std::os::windows::io::AsRawSocket;
+            server.as_raw_socket()
+        };
+
+        poller
+            .register(server_fd, 7, Interest::WRITABLE)
+            .expect("Failed to register");
+
+        // First wakeup fills the buffer with the writable event.
+        let mut events = Vec::new();
+        poller
+            .poll(Some(Duration::from_millis(100)), &mut events)
+            .expect("Failed to poll");
+        assert!(events.iter().any(|e| e.token == 7 && e.is_writable()));
+
+        // Second wakeup reuses the SAME buffer after the fd is gone: poll must
+        // clear it, not append to (or retain) the previous round's events.
+        poller.deregister(server_fd).expect("Failed to deregister");
+        poller
+            .poll(Some(Duration::from_millis(50)), &mut events)
+            .expect("Failed to poll");
+        assert!(
+            events.is_empty(),
+            "a reused buffer must not carry stale events into the next wakeup"
+        );
+    }
+
+    #[test]
     fn test_deregister_no_events() {
         let mut poller = Poller::new().expect("Failed to create poller");
 
@@ -1320,6 +1384,8 @@ mod tests {
         client
             .set_nonblocking(true)
             .expect("Failed to set nonblocking");
+
+        let mut events = Vec::new();
 
         #[cfg(unix)]
         {
@@ -1332,8 +1398,8 @@ mod tests {
             poller.deregister(fd).expect("Failed to deregister");
 
             // After deregister, no events should be reported for this fd
-            let events = poller
-                .poll(Some(Duration::from_millis(50)))
+            poller
+                .poll(Some(Duration::from_millis(50)), &mut events)
                 .expect("Failed to poll");
             assert!(!events.iter().any(|e| e.token == 1));
         }
@@ -1348,8 +1414,8 @@ mod tests {
                 .expect("Failed to register");
             poller.deregister(fd).expect("Failed to deregister");
 
-            let events = poller
-                .poll(Some(Duration::from_millis(50)))
+            poller
+                .poll(Some(Duration::from_millis(50)), &mut events)
                 .expect("Failed to poll");
             assert!(!events.iter().any(|e| e.token == 1));
         }
@@ -1364,8 +1430,10 @@ mod tests {
             .register(waker.raw_handle(), WAKER_TOKEN, Interest::READABLE)
             .expect("Failed to register waker");
 
+        let mut events = Vec::new();
+
         // No wake yet: a short poll times out with no waker event.
-        let events = poller.poll(Some(Duration::from_millis(50))).expect("poll");
+        poller.poll(Some(Duration::from_millis(50)), &mut events).expect("poll");
         assert!(
             events.iter().all(|e| e.token != WAKER_TOKEN),
             "no wake => no waker event"
@@ -1374,7 +1442,7 @@ mod tests {
         // Two coalesced wakes still produce a single readable event.
         handle.wake();
         handle.wake();
-        let events = poller.poll(Some(Duration::from_millis(500))).expect("poll");
+        poller.poll(Some(Duration::from_millis(500)), &mut events).expect("poll");
         assert!(
             events
                 .iter()
@@ -1384,7 +1452,7 @@ mod tests {
 
         // Drain clears the token; the next poll times out again.
         waker.drain();
-        let events = poller.poll(Some(Duration::from_millis(50))).expect("poll");
+        poller.poll(Some(Duration::from_millis(50)), &mut events).expect("poll");
         assert!(
             events.iter().all(|e| e.token != WAKER_TOKEN),
             "drain() must clear the wake token"
@@ -1409,6 +1477,8 @@ mod tests {
             .set_nonblocking(true)
             .expect("Failed to set nonblocking");
 
+        let mut events = Vec::new();
+
         #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
@@ -1425,8 +1495,8 @@ mod tests {
                 .expect("Failed to modify");
 
             // Should be writable now
-            let events = poller
-                .poll(Some(Duration::from_millis(100)))
+            poller
+                .poll(Some(Duration::from_millis(100)), &mut events)
                 .expect("Failed to poll");
             assert!(events.iter().any(|e| e.token == 1 && e.is_writable()));
 
@@ -1445,8 +1515,8 @@ mod tests {
                 .modify(server_fd, 1, Interest::WRITABLE)
                 .expect("Failed to modify");
 
-            let events = poller
-                .poll(Some(Duration::from_millis(100)))
+            poller
+                .poll(Some(Duration::from_millis(100)), &mut events)
                 .expect("Failed to poll");
             assert!(events.iter().any(|e| e.token == 1 && e.is_writable()));
 
