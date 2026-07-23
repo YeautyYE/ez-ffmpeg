@@ -410,8 +410,10 @@ type AvccExtensionTail = (Option<(u8, u8, u8)>, Vec<Vec<u8>>);
 /// readers never parse SPS-EXT (`ff_h264_decode_extradata`,
 /// libavcodec/h264_parse.c, walks the avcC SPS and PPS arrays and stops,
 /// and its Annex-B path ignores NAL type 13 in `decode_extradata_ps`),
-/// and CBS (`ff_cbs_read_extradata`) parses it as a full syntax tree, not
-/// a stored-bytes identity.
+/// and CBS's avcC split (`cbs_h264_split_fragment`) extracts only the
+/// SPS and PPS arrays, warning off the trailing bytes — it decomposes a
+/// type-13 unit into syntax fields only on the Annex-B/NAL-stream path,
+/// keeping the raw bytes alongside the parsed content even then.
 fn parse_avcc_extension(
     avcc: &[u8],
     mut pos: usize,
@@ -549,9 +551,9 @@ fn read_u16_prefixed(data: &[u8], pos: &mut usize) -> Result<Vec<u8>, String> {
 /// outside the writer's list the triple is its (1, 8, 8) default no
 /// matter what the SPS codes — an avcC FFmpeg synthesizes from Annex-B
 /// for a profile-144 4:4:4 stream says (1, 8, 8) — so synthesis emits
-/// this triple and record identities canonicalize to it. The consistency
-/// check additionally admits the raw-syntax triple, which survives
-/// FFmpeg's verbatim extradata copy on remux.
+/// this triple and a present record extension canonicalizes to it. The
+/// consistency check additionally admits the raw-syntax triple, which
+/// survives FFmpeg's verbatim extradata copy on remux.
 fn writer_extension_triple(profile_idc: u8, summary: &SpsSummary) -> (u8, u8, u8) {
     match profile_idc {
         100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 => {
@@ -570,9 +572,10 @@ fn writer_extension_triple(profile_idc: u8, summary: &SpsSummary) -> (u8, u8, u8
 /// entry of the SPS array it just wrote — and the three values are what
 /// its own SPS reader decodes from that same first SPS
 /// ([`writer_extension_triple`]). Synthesis ([`build_avcc`]), the
-/// Annex-B fingerprint and the record-side fingerprint all canonicalize
-/// to this derivation, so the synthesize-reparse gate compares like with
-/// like; the record consistency check is wider — it also admits the raw
+/// Annex-B fingerprint and a record-side fingerprint whose extension is
+/// present all canonicalize to this derivation — a record that legally
+/// ends at the PPS array keeps `None` — so the synthesize-reparse gate
+/// compares like with like; the record consistency check is wider — it also admits the raw
 /// SPS-coded triple, which survives the writer's verbatim copy of a
 /// non-Annex-B extradata.
 fn derived_extension(first_sps: &[u8], first_summary: &SpsSummary) -> Option<(u8, u8, u8)> {
@@ -2790,9 +2793,10 @@ mod tests {
     /// set's: this crate keys the entry by its post-header payload, the
     /// same identity policy the SPS/PPS maps use. (The decoder's own
     /// extradata readers give nothing to mirror — `ff_h264_decode_extradata`
-    /// stops after the PPS array and `decode_extradata_ps` ignores type
-    /// 13 — and CBS's `ff_cbs_read_extradata` parses SPS-EXT as a full
-    /// syntax tree, not a stored-bytes identity.) An entry re-sent with a
+    /// stops after the PPS array, `decode_extradata_ps` ignores type 13,
+    /// and CBS's avcC split warns off the bytes after the PPS array,
+    /// decomposing SPS-EXT only when one arrives on the Annex-B/NAL
+    /// path.) An entry re-sent with a
     /// different legal `nal_ref_idc` (0x6D -> 0x4D, both type 13) lands
     /// in identical stored state and must stay redundant, while a payload
     /// difference behind the same header is still a configuration change.
