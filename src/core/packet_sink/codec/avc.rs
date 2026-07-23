@@ -47,21 +47,25 @@ pub(crate) struct ParameterSets {
 /// * every PPS slot also records the payload of the SPS generation the
 ///   PPS resolved: `ff_h264_decode_picture_parameter_set`
 ///   (libavcodec/h264_ps.c) binds the arriving PPS to the same-id SPS
-///   live at that moment (its `sps_ref`) and derives PPS state from it,
-///   and a later same-id SPS replaces the list slot, not that binding —
-///   so two configurations with equal id maps still differ when a PPS
-///   bound a different SPS body on the way there.
+///   live at that moment (the `PPS::sps` reference, libavcodec/h264_ps.h)
+///   and derives PPS state from it, and a later same-id SPS replaces the
+///   list slot, not that binding — so two configurations with equal id
+///   maps still differ when a PPS bound a different SPS body on the way
+///   there.
 ///
 /// Two configurations are equal exactly when every id maps to the same
-/// payload AND every PPS bound the same SPS generation: the order of
-/// DISTINCT ids never matters (wrapper bytes and array position address
-/// nothing), a repeated payload-identical set collapses into its slot and
-/// stays redundant, while reordering two same-id sets with different
-/// payloads swaps which one is active and IS a configuration change even
-/// though the byte set is unchanged. SPS-EXT bodies (the avcC
+/// payload, every PPS bound the same SPS generation AND the record tail —
+/// the profile-extension triple and the SPS-EXT list — agrees: the order
+/// of DISTINCT ids never matters (wrapper bytes and array position
+/// address nothing), a repeated payload-identical set collapses into its
+/// slot and stays redundant, while reordering two same-id sets with
+/// different payloads swaps which one is active and IS a configuration
+/// change even though the byte set is unchanged. SPS-EXT bodies (the avcC
 /// `sequenceParameterSetExtNALUnit` array) are part of the delivered
-/// configuration and are fingerprinted in array order; their ids are not
-/// parsed, so adding, dropping or editing one changes the fingerprint.
+/// configuration and are fingerprinted in array order as post-header
+/// payloads; their ids are not parsed, so adding, dropping or editing one
+/// changes the fingerprint, while a header-only `nal_ref_idc` variant
+/// stores identically and does not.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ConfigFingerprint {
     /// `seq_parameter_set_id` -> post-header payload of the last SPS
@@ -70,8 +74,18 @@ pub(crate) struct ConfigFingerprint {
     /// `pic_parameter_set_id` -> slot of the last PPS carrying it,
     /// ascending by id.
     pps: Vec<(u32, PpsSlot)>,
-    /// SPS-EXT bodies in record order (an Annex-B configuration carries
-    /// none — that path admits only SPS and PPS).
+    /// The profile-extension triple (`chroma_format_idc`,
+    /// `bit_depth_luma`, `bit_depth_chroma`) of the delivered record: the
+    /// validated declared block for avcC input (`None` when the record
+    /// legally ends at the PPS array), the [`derived_extension`] triple
+    /// synthesis will write for Annex-B input. Two first SPS can share
+    /// all three projection bytes yet differ here (chroma format and bit
+    /// depth are not header bytes), so the id maps alone would miss the
+    /// change.
+    extension: Option<(u8, u8, u8)>,
+    /// Post-header payloads of the SPS-EXT entries in record order (an
+    /// Annex-B configuration carries none — that path admits only SPS
+    /// and PPS).
     sps_ext: Vec<Vec<u8>>,
 }
 
@@ -202,6 +216,11 @@ pub(crate) fn parse_parameter_sets(extradata: &[u8]) -> Result<AvcConfig, String
         if sets.sps.is_empty() || sets.pps.is_empty() {
             return Err("configuration data lacks an SPS or a PPS".to_string());
         }
+        // Annex-B input is delivered as a synthesized record, so the
+        // fingerprint carries the extension triple synthesis will write —
+        // derived from the first SPS in announcement order, the one source
+        // `ff_isom_write_avcc` reads (libavformat/avc.c).
+        fingerprint.extension = derived_extension(&sets.sps[0], &summaries[0]);
         Ok(AvcConfig { sets, fingerprint })
     }
 }
@@ -318,6 +337,7 @@ fn parse_avcc_record(avcc: &[u8]) -> Result<AvccRecord, String> {
         fingerprint.put_pps(pps_id, pps, &sets.sps[bound]);
     }
     let (extension, sps_ext) = parse_avcc_extension(avcc, pos, header.profile)?;
+    fingerprint.extension = extension;
     fingerprint.sps_ext = sps_ext;
     let record = AvccRecord {
         header,
@@ -351,7 +371,7 @@ fn check_ps_nal_header(header: u8, expected_type: u8, what: &str) -> Result<(), 
 
 /// Parsed record tail past the PPS array: the optional profile-extension
 /// triple (`chroma_format_idc`, `bit_depth_luma`, `bit_depth_chroma`) and
-/// the retained SPS-EXT NAL bodies.
+/// the post-header payloads of the SPS-EXT entries, in record order.
 type AvccExtensionTail = (Option<(u8, u8, u8)>, Vec<Vec<u8>>);
 
 /// Parses the trailing profile extension at `pos`, or verifies its legal
@@ -367,9 +387,13 @@ type AvccExtensionTail = (Option<(u8, u8, u8)>, Vec<Vec<u8>>);
 /// without ever requiring it — a record that ends there is accepted. When
 /// the block IS present it must be complete, carry all-ones reserved bits,
 /// hold SPS-EXT NALs only, and end the record. The SPS-EXT bodies are
-/// RETAINED, not just header-checked: they are part of the delivered
-/// configuration, so the S8 fingerprint must see them — an announcement
-/// that adds, drops or edits one is a configuration change.
+/// RETAINED as post-header payloads, not just header-checked: they are
+/// part of the delivered configuration, so the S8 fingerprint must see
+/// them — an announcement that adds, drops or edits one is a
+/// configuration change, while one that only rewrites an entry's
+/// `nal_ref_idc` is not: the header byte is framing the reader consumes
+/// before the body is stored (`h264_parse_nal_header`,
+/// libavcodec/h2645_parse.c), the same rule the SPS and PPS maps key by.
 fn parse_avcc_extension(
     avcc: &[u8],
     mut pos: usize,
@@ -413,7 +437,7 @@ fn parse_avcc_extension(
     for _ in 0..sps_ext_count {
         let ps = read_u16_prefixed(avcc, &mut pos).map_err(|e| format!("SPS-EXT entry: {e}"))?;
         check_ps_nal_header(ps[0], NAL_SPS_EXT, "SPS-EXT")?;
-        sps_ext.push(ps);
+        sps_ext.push(ps[1..].to_vec());
     }
     if pos != avcc.len() {
         return Err(format!(
@@ -479,10 +503,27 @@ fn read_u16_prefixed(data: &[u8], pos: &mut usize) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// The avcC profile-extension triple these parameter sets are delivered
+/// with, `None` when no block is defined for them. Mirrors
+/// `ff_isom_write_avcc` (libavformat/avc.c): the chroma-format/bit-depth
+/// block is appended only when the FIRST SPS's profile_idc is none of
+/// Baseline (66), Main (77) or Extended (88) — its
+/// `sps[3] != 66 && sps[3] != 77 && sps[3] != 88` gate reads the first
+/// entry of the SPS array it just wrote — and the three values come from
+/// that same first SPS (`ff_avc_decode_sps(&seq, sps + 3, ...)`).
+/// Synthesis ([`build_avcc`]) and the Annex-B fingerprint share this one
+/// derivation so the synthesize-reparse gate compares like with like.
+fn derived_extension(first_sps: &[u8], first_summary: &SpsSummary) -> Option<(u8, u8, u8)> {
+    match first_sps[1] {
+        66 | 77 | 88 => None,
+        _ => Some(first_summary.chroma_info()),
+    }
+}
+
 /// Builds an AVCDecoderConfigurationRecord from parsed parameter sets,
 /// mirroring `ff_isom_write_avcc`: `lengthSizeMinusOne = 3`, and the
-/// chroma-format/bit-depth extension appended for profiles other than
-/// Baseline (66), Main (77) and Extended (88).
+/// chroma-format/bit-depth extension appended under the
+/// [`derived_extension`] first-SPS profile rule.
 pub(crate) fn build_avcc(sets: &ParameterSets) -> Result<Vec<u8>, String> {
     let first_sps = sets.sps.first().ok_or("no SPS")?;
     if first_sps.len() < 4 {
@@ -513,10 +554,9 @@ pub(crate) fn build_avcc(sets: &ParameterSets) -> Result<Vec<u8>, String> {
         out.extend_from_slice(&(pps.len() as u16).to_be_bytes());
         out.extend_from_slice(pps);
     }
-    let profile = first_sps[1];
-    if profile != 66 && profile != 77 && profile != 88 {
-        let (chroma_format_idc, bit_depth_luma, bit_depth_chroma) =
-            parse_sps(first_sps)?.chroma_info();
+    if let Some((chroma_format_idc, bit_depth_luma, bit_depth_chroma)) =
+        derived_extension(first_sps, &parse_sps(first_sps)?)
+    {
         out.push(0xFC | (chroma_format_idc & 0x03));
         out.push(0xF8 | ((bit_depth_luma - 8) & 0x07));
         out.push(0xF8 | ((bit_depth_chroma - 8) & 0x07));
@@ -1421,8 +1461,9 @@ impl AvcRuntime {
             // or one whose PPS no longer parses under the rebound SPS at
             // all. The delivered record must mean exactly the
             // configuration validated above, so it is reparsed through the
-            // same avcC parser and its identity fingerprint (bindings
-            // included) must agree. Single-generation orderings with each
+            // same avcC parser and its identity fingerprint (bindings and
+            // the extension triple included) must agree. Single-generation
+            // orderings with each
             // PPS after its SPS — every real encoder handoff — bind
             // identically on both reads and pass unchanged.
             let reparsed = parse_avcc_parameter_sets(&record).map_err(|reason| {
@@ -2346,6 +2387,58 @@ mod tests {
         ));
     }
 
+    /// The delivered profile-extension triple derives from the FIRST SPS
+    /// (`ff_isom_write_avcc`, libavformat/avc.c), so a permutation that
+    /// changes which SPS comes first changes what consumers are told the
+    /// stream's chroma format and bit depths are. TEN_BIT_SPS and
+    /// CHROMA3_SCALING_SPS share id 0 and all three projection bytes
+    /// (0x6E 0x00 0x1E) while differing in chroma_info, and duplicating
+    /// the 4:4:4 SPS keeps the final id map AND the PPS binding identical
+    /// across the permutation — the extension slot is the only
+    /// fingerprint entry that can tell the two configurations apart.
+    #[test]
+    fn s8_sees_the_derived_extension_triple() {
+        assert_eq!(parse_sps(TEN_BIT_SPS).unwrap().sps_id, 0);
+        assert_eq!(parse_sps(CHROMA3_SCALING_SPS).unwrap().sps_id, 0);
+        assert_eq!(TEN_BIT_SPS[1..4], CHROMA3_SCALING_SPS[1..4]);
+        assert_eq!(parse_sps(TEN_BIT_SPS).unwrap().chroma_info(), (1, 10, 10));
+        assert_eq!(parse_sps(CHROMA3_SCALING_SPS).unwrap().chroma_info(), (3, 8, 8));
+        let ten_first = annexb_concat(&[
+            TEN_BIT_SPS,
+            CHROMA3_SCALING_SPS,
+            CHROMA3_SCALING_SPS,
+            MINIMAL_PPS,
+        ]);
+        let chroma3_first = annexb_concat(&[
+            CHROMA3_SCALING_SPS,
+            TEN_BIT_SPS,
+            CHROMA3_SCALING_SPS,
+            MINIMAL_PPS,
+        ]);
+        // Everything but the derived triple is identical: same last-wins
+        // id maps, same bound generation, no SPS-EXT.
+        let a = parse_parameter_sets(&ten_first).unwrap().fingerprint;
+        let b = parse_parameter_sets(&chroma3_first).unwrap().fingerprint;
+        assert_eq!(a.sps, b.sps);
+        assert_eq!(a.pps, b.pps);
+        assert_eq!(a.sps_ext, b.sps_ext);
+        assert_ne!(a.extension, b.extension, "the first SPS decides the triple");
+        // Both orders are faithful (each PPS behind its bound SPS, one
+        // binding on both reads): construction accepts them, and each
+        // synthesized record carries its own first SPS's triple.
+        let (runtime, delivered, _) = AvcRuntime::from_extradata(&ten_first, 0).unwrap();
+        assert_eq!(&delivered[delivered.len() - 4..], &[0xFD, 0xFA, 0xFA, 0x00]);
+        let (_, delivered, _) = AvcRuntime::from_extradata(&chroma3_first, 0).unwrap();
+        assert_eq!(&delivered[delivered.len() - 4..], &[0xFF, 0xF8, 0xF8, 0x00]);
+        // The identical announcement stays redundant; the permutation
+        // flips the delivered triple and is a configuration change.
+        runtime.check_new_extradata(&ten_first, 0).unwrap();
+        assert!(matches!(
+            runtime.check_new_extradata(&chroma3_first, 5),
+            Err(PacketSinkError::ConfigChange { stream_index: 5, .. })
+        ));
+    }
+
     /// S8 over a same-id reorder: both SPS carry seq_parameter_set_id 0
     /// and identical projection bytes, so neither the projection gate nor
     /// a byte-set view can tell the orders apart — but swapping them swaps
@@ -2374,9 +2467,9 @@ mod tests {
     /// just the final id map: [A, P] and [B, P, A] both end with active
     /// sps = A and pps = P — equal id maps — but the second ordering's
     /// PPS resolved B when it arrived, and a decoder keeps that binding
-    /// (the `sps_ref` held by ff_h264_decode_picture_parameter_set,
-    /// libavcodec/h264_ps.c) after A replaces the list slot. A and B
-    /// share seq_parameter_set_id AND projection bytes, so only the
+    /// (the `PPS::sps` reference ff_h264_decode_picture_parameter_set
+    /// takes, libavcodec/h264_ps.c) after A replaces the list slot. A and
+    /// B share seq_parameter_set_id AND projection bytes, so only the
     /// binding entry can tell the two configurations apart.
     #[test]
     fn s8_sees_the_sps_generation_each_pps_bound() {
@@ -2400,6 +2493,39 @@ mod tests {
             runtime.check_new_extradata(&announced, 5),
             Err(PacketSinkError::ConfigChange { stream_index: 5, .. })
         ));
+        // [A, B, P] vs [A, P, B]: SAME SPS list and SAME final map either
+        // way (B is the last id-0 SPS in both), so a fingerprint that
+        // recorded every seen SPS payload — ordered or not — could not
+        // tell them apart; only the generation P bound (B vs A) differs.
+        let bound_b = annexb_concat(&[SPS, SAME_PROJ_SPS, PPS]);
+        let bound_a = annexb_concat(&[SPS, PPS, SAME_PROJ_SPS]);
+        assert_ne!(
+            fp(&bound_b),
+            fp(&bound_a),
+            "equal SPS lists with a different binding must not collapse"
+        );
+        let (runtime, _, _) = AvcRuntime::from_extradata(&bound_b, 0).unwrap();
+        runtime.check_new_extradata(&bound_b, 0).unwrap();
+        assert!(matches!(
+            runtime.check_new_extradata(&bound_a, 5),
+            Err(PacketSinkError::ConfigChange { stream_index: 5, .. })
+        ));
+        // Two-id case: the PPS names id 0, so it binds across the nearer
+        // id-31 SPS. The slot must record the id-RESOLVED generation —
+        // whichever configuration position it sits at — never simply the
+        // nearest, first or last SPS of the list.
+        for config in [
+            annexb_concat(&[SPS, SPS_ID_31, PPS]),
+            annexb_concat(&[SPS_ID_31, SPS, PPS]),
+        ] {
+            let prints = fp(&config);
+            let (_, (_, bound)) = &prints.pps[0];
+            assert_eq!(
+                bound.as_slice(),
+                &SPS[1..],
+                "the PPS slot must record the id-0 generation it bound"
+            );
+        }
     }
 
     /// The one-byte NAL header is framing, not configuration: the reader
@@ -2433,6 +2559,16 @@ mod tests {
         au.extend_from_slice(&sps_idc2);
         au.extend_from_slice(&[0, 0, 1, 0x65, 0x88, 0x80]);
         let mut scratch = Vec::new();
+        assert!(matches!(
+            runtime.normalize_au(&au, &mut scratch, 1),
+            Err(PacketSinkError::InBandParameterSets { stream_index: 1 })
+        ));
+        // The PPS side of the same rule: the header-only PPS variant is
+        // value-equal in the PPS map too, so it must classify as in-band
+        // parameter sets, not as a configuration change.
+        let mut au = vec![0, 0, 0, 1];
+        au.extend_from_slice(&pps_idc2);
+        au.extend_from_slice(&[0, 0, 1, 0x65, 0x88, 0x80]);
         assert!(matches!(
             runtime.normalize_au(&au, &mut scratch, 1),
             Err(PacketSinkError::InBandParameterSets { stream_index: 1 })
@@ -2552,6 +2688,34 @@ mod tests {
         let (runtime, _, _) = AvcRuntime::from_extradata(&without, 0).unwrap();
         assert!(matches!(
             runtime.check_new_extradata(&with_ext, 3),
+            Err(PacketSinkError::ConfigChange { stream_index: 3, .. })
+        ));
+    }
+
+    /// The SPS-EXT NAL header is framing like every other parameter
+    /// set's: the reader consumes it before the body is stored
+    /// (h264_parse_nal_header, libavcodec/h2645_parse.c), so an entry
+    /// re-sent with a different legal `nal_ref_idc` (0x6D -> 0x4D, both
+    /// type 13) lands in identical stored state and must stay redundant,
+    /// while a payload difference behind the same header is still a
+    /// configuration change.
+    #[test]
+    fn s8_keys_sps_ext_by_post_header_payload() {
+        let with_ext = |header: u8, body: u8| {
+            let mut avcc = build_avcc(&high_sets()).unwrap();
+            let count = avcc.len() - 1;
+            avcc[count] = 1;
+            avcc.extend_from_slice(&[0, 2, header, body]);
+            avcc
+        };
+        let (runtime, delivered, _) =
+            AvcRuntime::from_extradata(&with_ext(0x6D, 0x40), 0).unwrap();
+        runtime.check_new_extradata(&delivered, 0).unwrap();
+        // nal_ref_idc 3 -> 2 over an identical payload: identity-equal.
+        runtime.check_new_extradata(&with_ext(0x4D, 0x40), 0).unwrap();
+        // Identical header, different payload: a configuration change.
+        assert!(matches!(
+            runtime.check_new_extradata(&with_ext(0x6D, 0x41), 3),
             Err(PacketSinkError::ConfigChange { stream_index: 3, .. })
         ));
     }
