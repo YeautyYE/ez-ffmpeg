@@ -283,8 +283,10 @@ impl PacketSinkWorker {
                     // decoders) would contradict each other. When the
                     // configuration's Parametric Stereo state doubles the
                     // mono core (HE-AAC v2 — FFmpeg's che_configure emits
-                    // two output channels for the single channel element
-                    // under PS, libavcodec/aac/aacdec.c), the doubled
+                    // two output channels under PS for a
+                    // single_channel_element and only for that element
+                    // type, libavcodec/aac/aacdec.c; a PCE whose lone
+                    // element is an LFE stays one channel), the doubled
                     // count agrees as well: it is what a decode-side
                     // describer advertises, while the core count is what a
                     // configuration-only parse advertises. Table-signaled
@@ -1510,6 +1512,70 @@ mod tests {
             }
             Err(other) => panic!("expected InvalidExtradata, got {other:?}"),
             Ok(_) => panic!("collect must reject a channel count PS cannot produce"),
+        }
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "a configuration failure must precede every callback"
+        );
+    }
+
+    /// The same hierarchical-PS shape with the PCE's sole output element
+    /// swapped from a front SCE to an LFE. Parametric Stereo doubles
+    /// only a single_channel_element (FFmpeg's che_configure emits the
+    /// second output channel for TYPE_SCE alone,
+    /// libavcodec/aac/aacdec.c), so this configuration decodes to ONE
+    /// channel: the mono advertisement is the coherent one and stereo is
+    /// contradictory metadata.
+    const PS_LFE_CORE_ASC: [u8; 9] = [0xEB, 0x82, 0x08, 0x02, 0xE0, 0x00, 0x80, 0x00, 0x00];
+
+    #[test]
+    fn ps_lfe_core_accepts_only_the_mono_advertisement() {
+        let ctx = TestCtx::new();
+        unsafe {
+            let idx = ctx.add_stream(
+                AVMediaType::AVMEDIA_TYPE_AUDIO,
+                AVCodecID::AV_CODEC_ID_AAC,
+                Some(&PS_LFE_CORE_ASC),
+                AVRational { num: 1, den: 44100 },
+            );
+            let st = *(*ctx.ctx).streams.add(idx);
+            (*(*st).codecpar).ch_layout.nb_channels = 1;
+        }
+        let (sink, _events) = recording_sink();
+        let worker = collect(&ctx, sink)
+            .unwrap_or_else(|e| panic!("an LFE mono core advertising 1 channel must collect: {e:?}"));
+        let audio = worker.infos[0].audio().expect("typed audio configuration");
+        assert_eq!(audio.channels(), 1);
+        assert_eq!(audio.codec_string(), "mp4a.40.29");
+
+        // The stereo advertisement PS cannot produce from an LFE stays
+        // contradictory.
+        let ctx = TestCtx::new();
+        unsafe {
+            let idx = ctx.add_stream(
+                AVMediaType::AVMEDIA_TYPE_AUDIO,
+                AVCodecID::AV_CODEC_ID_AAC,
+                Some(&PS_LFE_CORE_ASC),
+                AVRational { num: 1, den: 44100 },
+            );
+            let st = *(*ctx.ctx).streams.add(idx);
+            (*(*st).codecpar).ch_layout.nb_channels = 2;
+        }
+        let (sink, events) = recording_sink();
+        match collect(&ctx, sink) {
+            Err(PacketSinkError::InvalidExtradata {
+                stream_index: 0,
+                reason,
+            }) => {
+                assert!(
+                    reason.contains("program_config_element")
+                        && reason.contains('1')
+                        && reason.contains('2'),
+                    "got {reason:?}"
+                );
+            }
+            Err(other) => panic!("expected InvalidExtradata, got {other:?}"),
+            Ok(_) => panic!("collect must reject the stereo advertisement of an LFE mono core"),
         }
         assert!(
             events.lock().unwrap().is_empty(),
