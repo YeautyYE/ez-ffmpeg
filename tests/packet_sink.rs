@@ -1017,6 +1017,43 @@ fn aac_only_delivery_streams_through_into_events() {
     assert!(packets > 50, "2 s of AAC is ~86 frames, got {packets}");
 }
 
+/// The iterator's deterministic ending under a lagging consumer. `on_end`
+/// pushes `End` into the channel with a non-blocking send (teardown must
+/// not wait on the consumer), so with capacity 1 and a consumer that dawdles
+/// between events the queued `End` is routinely lost at the source —
+/// `into_events` must re-synthesize it after the clean join, and a stream
+/// that yielded no `Err` must end with exactly one `End`.
+#[test]
+fn lagging_consumer_still_ends_with_end() {
+    let (sink, receiver) =
+        ez_ffmpeg::packet_sink::PacketSink::channel(std::num::NonZeroUsize::new(1).unwrap());
+    let scheduler = FfmpegContext::builder()
+        .input(Input::from("sine=frequency=440:duration=1").set_format("lavfi"))
+        .output(Output::from(sink).set_audio_codec("aac"))
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let events = receiver
+        .into_events(scheduler)
+        .expect("receiver paired with the scheduler running its sink");
+    let mut ends = 0usize;
+    let mut after_end = 0usize;
+    for event in events {
+        // Stay behind the producer so the channel is full whenever the
+        // terminal send fires.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        match event.expect("job failed") {
+            ez_ffmpeg::packet_sink::PacketSinkEvent::End => ends += 1,
+            _ if ends > 0 => after_end += 1,
+            _ => {}
+        }
+    }
+    assert_eq!(ends, 1, "a stream without Err must end with exactly one End");
+    assert_eq!(after_end, 0, "nothing may follow the terminal End");
+}
+
 /// Run-token pairing: `into_events` must reject a scheduler that is not
 /// running this receiver's sink. Without the check, receiver A silently
 /// cross-wires with job B — streaming A's events while joining (and, on
