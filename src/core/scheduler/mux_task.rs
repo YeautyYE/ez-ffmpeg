@@ -2434,7 +2434,7 @@ struct MuxWriteState<'a> {
 /// tests must never move these counters.
 #[cfg(test)]
 pub(crate) mod tcp_write_probe {
-    use std::sync::atomic::{AtomicI32, AtomicU64};
+    use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
     use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
     /// `av_interleaved_write_frame` calls entered for a `tcp://` output.
@@ -2442,13 +2442,15 @@ pub(crate) mod tcp_write_probe {
     /// The subset of those calls that has returned.
     pub(crate) static RETURNED: AtomicU64 = AtomicU64::new(0);
     /// Return code of the most recently returned tcp write, stored BEFORE
-    /// `RETURNED` is bumped: a sampler that has seen `RETURNED` reach a
-    /// target generation reads the code that very call produced — under a
-    /// single-concurrent-tcp-writer topology. `exclusive()` serializes
-    /// TESTS, not writers within one test: a job with two tcp outputs
-    /// could overwrite this slot between another call's store and bump,
-    /// which is why the cut acknowledgment also pins the erroring call
-    /// through `LAST_ERR_GEN`.
+    /// `RETURNED` is bumped. Meaningful to a sampler only at WRITER
+    /// QUIESCENCE (after stop() has joined the workers): even a single
+    /// writer can bump `RETURNED` for generation g, enter g+1 and store
+    /// its return code before bumping again, so a live sampler seeing
+    /// `RETURNED == g` can read g+1's code. `exclusive()` serializes
+    /// TESTS, not writers within one test, and does not close that race —
+    /// which is why the cut acknowledgment pins the erroring call through
+    /// `LAST_ERR_GEN` and the electing interrupt through `CUT_GEN` rather
+    /// than leaning on this slot alone.
     pub(crate) static LAST_RET: AtomicI32 = AtomicI32::new(0);
     /// Generation — the post-increment `ENTERED` value — of the most
     /// recent tcp write that returned a NEGATIVE code (0 = none yet).
@@ -2456,6 +2458,30 @@ pub(crate) mod tcp_write_probe {
     /// equals a previously captured parked generation proves THAT write,
     /// not a later one or another output's, is the call that errored.
     pub(crate) static LAST_ERR_GEN: AtomicU64 = AtomicU64::new(0);
+    /// Generation of the tcp write that an output-interrupt ELECTION cut
+    /// (0 = no election ever fired while a tcp write was in flight on the
+    /// electing thread). The callback runs on the muxer's own thread,
+    /// inside the blocked call's retry loop, so a recorded value proves
+    /// the interrupt chose to cut while THAT write was executing — a
+    /// write that failed on its own (peer reset, kernel error) never
+    /// passes through an electing callback and leaves this untouched.
+    pub(crate) static CUT_GEN: AtomicU64 = AtomicU64::new(0);
+    thread_local! {
+        /// Generation of the tcp write executing on THIS thread, set by
+        /// [`write_packet`](super::write_packet) around the FFI call so
+        /// the interrupt callback can attribute its election.
+        pub(crate) static IN_FLIGHT: std::cell::Cell<Option<u64>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// Called by the output interrupt callback when it elects to
+    /// interrupt: records the generation of the tcp write this thread is
+    /// currently inside, if any.
+    pub(crate) fn note_cut_election() {
+        if let Some(generation) = IN_FLIGHT.with(std::cell::Cell::get) {
+            CUT_GEN.store(generation, Ordering::Release);
+        }
+    }
 
     /// Serializes every test that drives or samples these process-wide
     /// counters. A muxer parked in a write by one test would satisfy — or
@@ -2498,10 +2524,15 @@ unsafe fn write_packet(
         // increment.
         tcp.then(|| tcp_write_probe::ENTERED.fetch_add(1, Ordering::Release) + 1)
     };
+    #[cfg(test)]
+    if let Some(generation) = counted {
+        tcp_write_probe::IN_FLIGHT.with(|slot| slot.set(Some(generation)));
+    }
     let ret =
         av_interleaved_write_frame(cfg.out_fmt_ctx.as_ptr(), sq_packet_box.packet.as_mut_ptr());
     #[cfg(test)]
     if let Some(generation) = counted {
+        tcp_write_probe::IN_FLIGHT.with(|slot| slot.set(None));
         tcp_write_probe::LAST_RET.store(ret, Ordering::Release);
         if ret < 0 {
             tcp_write_probe::LAST_ERR_GEN.store(generation, Ordering::Release);

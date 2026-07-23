@@ -63,6 +63,11 @@ mod frame_filter_pipeline;
 mod frame_source_task;
 pub(crate) mod input_controller;
 mod mux_task;
+/// The output interrupt callback lives outside this module tree and must
+/// reach the probe to record its cut election; the probe itself stays
+/// test-only.
+#[cfg(test)]
+pub(crate) use mux_task::tcp_write_probe;
 pub(crate) mod owned_run_iter;
 #[cfg(test)]
 mod packet_sink_wedge_tests;
