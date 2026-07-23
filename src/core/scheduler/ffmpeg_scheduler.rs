@@ -1832,13 +1832,21 @@ mod tests {
         // by a genuinely gated worker — no byte-budget arithmetic can show
         // that, and a set-once "entered" flag could not either: it stays
         // true after its read burns the fallback and finishes the file.
-        // While the gate is closed a counted read can leave ONLY through
-        // the (recorded, test-failing) fallback, so the two loads cannot
-        // tear into a false positive. Only then has the pre-start holder
-        // served its purpose and goes back.
+        // The two loads CAN tear — a fallback exit between them shows
+        // fresh enters against stale exits — but that exit records
+        // `gate_wait_timed_out` before bumping exits, so the loop fails
+        // fast on the flag with the specific diagnosis, and a tear that
+        // slips past it is caught by the same flag right below before any
+        // inspection runs. Only with a read provably parked has the
+        // pre-start holder served its purpose and goes back.
         let handshake_deadline = std::time::Instant::now() + Duration::from_secs(10);
         while gate_wait_enters.load(Ordering::Acquire) <= gate_wait_exits.load(Ordering::Acquire)
         {
+            assert!(
+                !gate_wait_timed_out.load(Ordering::Acquire),
+                "a gated read burned its 10 s fallback while the handshake \
+                 was still waiting: the gate is not holding the worker"
+            );
             assert!(
                 std::time::Instant::now() < handshake_deadline,
                 "no read is parked in the closed gate: build-time probing \
@@ -1846,6 +1854,10 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(2));
         }
+        assert!(
+            !gate_wait_timed_out.load(Ordering::Acquire),
+            "a gated read burned its 10 s fallback with the gate still closed"
+        );
         release_holder();
 
         // (3) The gated demux worker still holds its slot, so the sentinel

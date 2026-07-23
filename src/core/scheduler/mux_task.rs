@@ -2443,10 +2443,19 @@ pub(crate) mod tcp_write_probe {
     pub(crate) static RETURNED: AtomicU64 = AtomicU64::new(0);
     /// Return code of the most recently returned tcp write, stored BEFORE
     /// `RETURNED` is bumped: a sampler that has seen `RETURNED` reach a
-    /// target generation reads the code that very call produced. A cut
-    /// blocked write surfaces here as a negative code; a write that
-    /// completed on its own surfaces as `>= 0`.
+    /// target generation reads the code that very call produced — under a
+    /// single-concurrent-tcp-writer topology. `exclusive()` serializes
+    /// TESTS, not writers within one test: a job with two tcp outputs
+    /// could overwrite this slot between another call's store and bump,
+    /// which is why the cut acknowledgment also pins the erroring call
+    /// through `LAST_ERR_GEN`.
     pub(crate) static LAST_RET: AtomicI32 = AtomicI32::new(0);
+    /// Generation — the post-increment `ENTERED` value — of the most
+    /// recent tcp write that returned a NEGATIVE code (0 = none yet).
+    /// Ties an observed failure to one specific call: asserting this
+    /// equals a previously captured parked generation proves THAT write,
+    /// not a later one or another output's, is the call that errored.
+    pub(crate) static LAST_ERR_GEN: AtomicU64 = AtomicU64::new(0);
 
     /// Serializes every test that drives or samples these process-wide
     /// counters. A muxer parked in a write by one test would satisfy — or
@@ -2485,16 +2494,18 @@ unsafe fn write_packet(
             && std::ffi::CStr::from_ptr(url)
                 .to_bytes()
                 .starts_with(b"tcp://");
-        if tcp {
-            tcp_write_probe::ENTERED.fetch_add(1, Ordering::Release);
-        }
-        tcp
+        // The captured value is this call's generation: ENTERED after the
+        // increment.
+        tcp.then(|| tcp_write_probe::ENTERED.fetch_add(1, Ordering::Release) + 1)
     };
     let ret =
         av_interleaved_write_frame(cfg.out_fmt_ctx.as_ptr(), sq_packet_box.packet.as_mut_ptr());
     #[cfg(test)]
-    if counted {
+    if let Some(generation) = counted {
         tcp_write_probe::LAST_RET.store(ret, Ordering::Release);
+        if ret < 0 {
+            tcp_write_probe::LAST_ERR_GEN.store(generation, Ordering::Release);
+        }
         tcp_write_probe::RETURNED.fetch_add(1, Ordering::Release);
     }
     ret
