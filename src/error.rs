@@ -1113,9 +1113,13 @@ pub enum OpenOutputError {
     /// component, and a directed path from the input to the output (fftools
     /// fg_create_simple's contract plus the topology rules a simple graph
     /// implies — a disconnected or unreachable description would encode
-    /// unrelated frames or hang instead of filtering the stream). `reason`
-    /// names the violated rule. Descriptions that split, merge or source
-    /// streams belong in the context-level `filter_desc`.
+    /// unrelated frames or hang instead of filtering the stream). The path
+    /// requirement is structural: the input pad must be wired into the flow
+    /// that feeds the output pad, while a filter that may discard it at
+    /// runtime (`streamselect` whose applied `map` selects another input —
+    /// rewritable mid-stream via `sendcmd`) is accepted, matching the CLI.
+    /// `reason` names the violated rule. Descriptions that split, merge or
+    /// source streams belong in the context-level `filter_desc`.
     #[error(
         "Simple filtergraph '{desc}' is not a single connected chain: {reason}; \
          use FfmpegContextBuilder::filter_desc for complex graphs"

@@ -321,6 +321,15 @@ jobs:
         run: |
           EZ_FFMPEG_CLI="$HOME/${{ matrix.prefix }}/bin/ffmpeg" cargo test --features cli --lib cli::
 
+      # The `cli::` filter above cannot reach the frame-export byte-parity
+      # golden (`core::frame_export::color_goldens::default_tier_matches_cli_bytes`),
+      # whose gate compares libswscale builds and treats a skip as a failure
+      # under EZ_FFMPEG_CLI. The crate links the same install the strict
+      # binary comes from, so the parity comparison actually executes here.
+      - name: Run the frame-export goldens with the strict CLI
+        run: |
+          EZ_FFMPEG_CLI="$HOME/${{ matrix.prefix }}/bin/ffmpeg" cargo test --features cli --lib core::frame_export::color_goldens
+
       - name: Emit-hardening integration tests
         run: cargo test --features cli --test cli_emit_hardening
 
@@ -337,8 +346,8 @@ jobs:
             os: macos
             target: aarch64-apple-darwin
             ffmpeg: "8.1"
-            build_features: ffmpeg-sys-next/build-videotoolbox,async,opengl,wgpu,rtmp,flv,subtitle
-            test_features: ffmpeg-sys-next/build-videotoolbox,async,rtmp,flv,subtitle,wgpu
+            build_features: ffmpeg-sys-next/build-videotoolbox,async,opengl,wgpu,rtmp,flv,subtitle,cli
+            test_features: ffmpeg-sys-next/build-videotoolbox,async,rtmp,flv,subtitle,wgpu,cli
             default_ffmpeg_features: --features ffmpeg-sys-next/build-videotoolbox
             test_args: >-
               --
@@ -349,8 +358,8 @@ jobs:
             os: macos
             target: aarch64-apple-darwin
             ffmpeg: "7.1"
-            build_features: async,opengl,wgpu,rtmp,flv,subtitle
-            test_features: async,rtmp,flv,subtitle,wgpu
+            build_features: async,opengl,wgpu,rtmp,flv,subtitle,cli
+            test_features: async,rtmp,flv,subtitle,wgpu,cli
             default_ffmpeg_features: ""
             test_args: >-
               --
@@ -364,8 +373,8 @@ jobs:
             vcpkg_triplet: x64-windows
             vcpkg_ref: b5229343b4b80264ed51e89c6a7dcd0cbe85e9cc
             vcpkg_cache: b5229343-ffmpeg-8.1.2-v1
-            build_features: async,opengl,wgpu,rtmp,flv,subtitle
-            test_features: async,rtmp,flv,subtitle,wgpu
+            build_features: async,opengl,wgpu,rtmp,flv,subtitle,cli
+            test_features: async,rtmp,flv,subtitle,wgpu,cli
             default_ffmpeg_features: ""
             test_args: ""
           - runner: windows-2025
@@ -376,8 +385,8 @@ jobs:
             vcpkg_triplet: x64-windows
             vcpkg_ref: 6070d5cb2f818921c10ccdf6f35f3415a2503369
             vcpkg_cache: 6070d5cb-ffmpeg-7.1.2-p5-v1
-            build_features: async,opengl,wgpu,rtmp,flv,subtitle
-            test_features: async,rtmp,flv,subtitle,wgpu
+            build_features: async,opengl,wgpu,rtmp,flv,subtitle,cli
+            test_features: async,rtmp,flv,subtitle,wgpu,cli
             default_ffmpeg_features: ""
             test_args: ""
           - runner: windows-11-arm
@@ -388,8 +397,8 @@ jobs:
             vcpkg_triplet: arm64-windows
             vcpkg_ref: b5229343b4b80264ed51e89c6a7dcd0cbe85e9cc
             vcpkg_cache: b5229343-ffmpeg-8.1.2-v1
-            build_features: async,opengl,wgpu,rtmp,flv,subtitle
-            test_features: async,rtmp,flv,subtitle,wgpu
+            build_features: async,opengl,wgpu,rtmp,flv,subtitle,cli
+            test_features: async,rtmp,flv,subtitle,wgpu,cli
             default_ffmpeg_features: ""
             test_args: -- --test-threads=1
           - runner: windows-11-arm
@@ -400,8 +409,8 @@ jobs:
             vcpkg_triplet: arm64-windows
             vcpkg_ref: 6070d5cb2f818921c10ccdf6f35f3415a2503369
             vcpkg_cache: 6070d5cb-ffmpeg-7.1.2-p5-v1
-            build_features: async,opengl,wgpu,rtmp,flv,subtitle
-            test_features: async,rtmp,flv,subtitle,wgpu
+            build_features: async,opengl,wgpu,rtmp,flv,subtitle,cli
+            test_features: async,rtmp,flv,subtitle,wgpu,cli
             default_ffmpeg_features: ""
             test_args: -- --test-threads=1
     env:
@@ -515,8 +524,18 @@ jobs:
       # also cannot create a VideoToolbox compression session, so its two
       # hardware-encoder tests stay compile-only. The remaining suite exercises
       # the platform scheduler, device, socket, RTMP, subtitle, and async paths.
+      # The cli suite is profile-aware: on linked 8.1 its execution tests
+      # assert the typed UnverifiedRuntimeProfile refusal, on the vcpkg 7.1
+      # lanes the semantic goldens skip deterministically (today no
+      # version-matched ffmpeg binary is on PATH, and even if one ever lands
+      # there the goldens' lenient gate skips every shape whose canonical
+      # command names an encoder this libx264-less link lacks; the
+      # in-process gates accept EncoderUnavailable on that link), and on the
+      # Homebrew 7.1 lane they run in full against the matching CLI. The
+      # emit-hardening tests type-check emitted programs with
+      # `rustc --emit=metadata`, needing no native linking.
       - name: Run CPU-only library tests
-        run: cargo test --lib --test avoption_warnings --test build_probe --test builder_option_validation --test frame_export_test --test frame_export_uniform_test --test frame_export_audio_test --test hls_fmp4 --test video_writer --test rawvideo_seek_gating --test per_output_video_filter --test packet_sink --test packet_sink_negative --test packet_sink_teardown --test packet_sink_unwind --features "${{ matrix.test_features }}" ${{ matrix.test_args }}
+        run: cargo test --lib --test avoption_warnings --test build_probe --test builder_option_validation --test frame_export_test --test frame_export_uniform_test --test frame_export_audio_test --test hls_fmp4 --test video_writer --test rawvideo_seek_gating --test per_output_video_filter --test packet_sink --test packet_sink_negative --test packet_sink_teardown --test packet_sink_unwind --test cli_emit_hardening --features "${{ matrix.test_features }}" ${{ matrix.test_args }}
 
       - name: Check packet-sink examples
         run: cargo check --example packet_sink_avc --example packet_sink_aac_channel --example packet_sink_av_transport --features "${{ matrix.test_features }}"

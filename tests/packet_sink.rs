@@ -357,8 +357,8 @@ fn on_end_fires_after_recording_time_truncation() {
     );
 }
 
-/// The correctness review's two-output probe: a SIBLING output failing after
-/// this sink drained must never let the sink report success — on_end from a
+/// The two-output failure case: a SIBLING output failing after this sink
+/// drained must never let the sink report success — on_end from a
 /// transiently clean snapshot followed by wait() == Err was the bug. The
 /// settlement barrier waits for every job thread to settle; the sink then
 /// reports the job failure through on_delivery_error and wait() keeps the
@@ -918,7 +918,7 @@ fn sibling_sink_terminal_panic_never_rewrites_the_settled_result() {
     );
 }
 
-/// The round-7 correctness probe: a delivered on_end must imply wait() ==
+/// The completion contract: a delivered on_end must imply wait() ==
 /// Ok. The single documented carve-out is user code failing AFTER the fact —
 /// here a callback capture whose Drop panics during teardown: the panic is
 /// caught at the worker's defined destruction point, logged, and must NOT

@@ -179,14 +179,18 @@ pub enum WriterError {
     /// so they could never influence the encoded output — and an unbounded
     /// side source would keep the job from ever finishing.
     ///
-    /// This check works at FILTER granularity: it follows links between
-    /// filters, not streams within a filter. A filter that internally routes
-    /// distinct streams between pad pairs (multi-stream `concat` is the
-    /// notable case) can therefore pass it while still steering the pushed
-    /// frames into a sink leg — libavfilter exposes no static per-pad
-    /// dataflow to validate against. Such a graph has to be constructed
-    /// deliberately and stands on the same footing as any other
-    /// `filter_desc` whose declared routing is what runs.
+    /// This check is STRUCTURAL: it follows the links between filters, and
+    /// inside each filter every input pad is assumed to influence every
+    /// output pad. Filter routing is not pruned by the applied options,
+    /// because libavfilter routing is not static — a selector's `map`
+    /// (`streamselect`) can be rewritten mid-stream by `sendcmd` or the
+    /// send-command API, and ffmpeg itself accepts and runs descriptions
+    /// whose current selection drops the pushed stream. A description that
+    /// discards the pushed frames at runtime (an unselected `streamselect`
+    /// input, a multi-stream `concat` steering them into a sink leg, ...)
+    /// therefore passes this gate and runs as declared, exactly like the
+    /// CLI; what cannot pass is a graph where no wiring could ever carry the
+    /// pushed frames toward the encoder.
     #[error(
         "filter_desc has no directed path from its input pad to its output \
          pad; the pushed frames could not influence the encoded output"
@@ -417,11 +421,14 @@ impl VideoWriterBuilder {
     /// the input, until the generator ends or the job is aborted — that is
     /// the semantics asked for, not a writer malfunction.
     ///
-    /// The validation is best-effort at filter granularity (see
-    /// [`WriterError::UnreachableFilterOutput`]): a description that
-    /// deliberately routes the pushed stream into a sink through a
-    /// stream-routing filter (multi-stream `concat`, …) runs exactly as
-    /// declared, like it would in the CLI.
+    /// The validation is structural (see
+    /// [`WriterError::UnreachableFilterOutput`]): the pushed frames must be
+    /// wired into the flow that feeds the output, but a filter that may
+    /// discard them at runtime is accepted — a `streamselect` whose current
+    /// `map` selects another input still passes, since that map is
+    /// commandable mid-stream (`sendcmd`), and a multi-stream `concat`
+    /// steering the pushed stream into a sink leg runs exactly as declared,
+    /// like both would in the CLI.
     ///
     /// The opened `Output`'s `set_video_filter` supplies the same chain from
     /// the output side and is honored when this builder-level description is

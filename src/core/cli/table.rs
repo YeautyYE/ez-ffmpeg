@@ -12,9 +12,9 @@ use super::error::CliError;
 pub(crate) enum ScopeRule {
     /// Legal anywhere; applies to the run, not a file (`-y`, `-loglevel`).
     Global,
-    /// Only between the input and the output path. (No Round-1 option is
-    /// input-only; a variant for that scope returns with the Round-2 rows
-    /// that need it.)
+    /// Only between the input and the output path. (No supported option is
+    /// input-only; a variant for that scope can be added together with the
+    /// first rows that need it.)
     OutputOnly,
     /// Legal in both file scopes with position-dependent meaning (`-ss`).
     InputOrOutput,
@@ -31,11 +31,12 @@ pub(crate) enum Arity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ValueRule {
     /// Decimal seconds (`10`, `2.5`). `HH:MM:SS` and negative forms are
-    /// explicitly out of the Round-1 grammar.
+    /// explicitly out of the supported grammar.
     Seconds,
     /// Codec name or `copy` (`[A-Za-z0-9_-]+`).
     Codec,
-    /// `NNN`, `NNNk`, `NNNM` bitrate spellings.
+    /// Bitrate spellings: digits with an optional `k`/`K`/`m`/`M` suffix,
+    /// passed to FFmpeg verbatim.
     Bitrate,
     /// Integer 0..=51.
     Crf,
@@ -45,7 +46,7 @@ pub(crate) enum ValueRule {
     PositiveInt,
     /// Pixel format name (`[a-z0-9_]+`); existence is checked at build time.
     PixFmt,
-    /// Exactly `1` (Round 1 supports single-frame output only).
+    /// Exactly `1` (single-frame output only).
     FramesOne,
     /// A single simple `scale=…` chain: no chains, labels, parentheses or
     /// quoting.
@@ -67,6 +68,35 @@ pub(crate) enum ValueRule {
     Path,
     /// `-loglevel` value: known level name or integer.
     LogLevel,
+}
+
+impl ValueRule {
+    /// One-line rendering of the accepted value grammar, written for the
+    /// generated support table (the docs must state the REAL rule per row,
+    /// not a generic "takes a value"). Must stay in sync with
+    /// [`validate_value`].
+    #[cfg(test)]
+    pub(crate) fn grammar(self) -> &'static str {
+        match self {
+            ValueRule::Seconds => "decimal seconds only (`10`, `2.5`)",
+            ValueRule::Codec => "codec name or `copy` (`[A-Za-z0-9_-]+`)",
+            ValueRule::Bitrate => "`NNN` with optional `k`/`K`/`m`/`M` suffix",
+            ValueRule::Crf => "integer 0..=51",
+            ValueRule::Preset => "x264 preset name",
+            ValueRule::PositiveInt => "positive integer",
+            ValueRule::PixFmt => "pixel format name (`[a-z0-9_]+`)",
+            ValueRule::FramesOne => "exactly `1`",
+            ValueRule::ScaleFilter => "single `scale=…` chain only",
+            ValueRule::MapBasic => "basic index maps only (`0`, `0:v`, `0:a:1`, `0:1`, …)",
+            ValueRule::FormatName => "container/demuxer name (`[a-z0-9_]+`)",
+            ValueRule::MovflagsFaststart => "exactly `+faststart`",
+            ValueRule::HlsTime => "decimal seconds > 0",
+            ValueRule::HlsPlaylistVod => "exactly `vod`",
+            ValueRule::HlsListSizeZero => "exactly `0`",
+            ValueRule::Path => "non-empty path; `-`-leading values rejected",
+            ValueRule::LogLevel => "`[repeat+][level+]LEVEL`",
+        }
+    }
 }
 
 /// What an option addresses — the seven-tuple's media/stream selector,
@@ -182,7 +212,7 @@ const fn noop_value(name: &'static str, rule: ValueRule) -> OptSpec {
     }
 }
 
-/// The Round-1 accept surface. `-i` is handled structurally by the parser and
+/// The current accept surface. `-i` is handled structurally by the parser and
 /// is not a table row.
 pub(crate) const OPTION_TABLE: &[OptSpec] = &[
     // Globals.
@@ -398,56 +428,56 @@ pub(crate) const KNOWN_REJECTIONS: &[(&str, &str, Option<&str>)] = &[
     ("-codec", "unsplit -codec is ambiguous across media types", Some("did you mean `-c:v` and/or `-c:a`?")),
     ("-vcodec", "alias spellings are outside the subset", Some("did you mean `-c:v`?")),
     ("-acodec", "alias spellings are outside the subset", Some("did you mean `-c:a`?")),
-    ("-scodec", "subtitle streams are not in the Round-1 subset", None),
+    ("-scodec", "subtitle streams are not in the current supported subset", None),
     ("-codec:v", "alias spellings are outside the subset", Some("did you mean `-c:v`?")),
     ("-codec:a", "alias spellings are outside the subset", Some("did you mean `-c:a`?")),
     ("-b", "unsplit -b is ambiguous (the ffmpeg CLI itself says: Please use -b:a or -b:v)", Some("did you mean `-b:v` or `-b:a`?")),
-    ("-q", "fixed-quality scale is not in the Round-1 subset", None),
-    ("-qscale", "fixed-quality scale is not in the Round-1 subset; the CLI itself calls unsplit -qscale ambiguous", None),
-    ("-q:v", "fixed-quality scale is not in the Round-1 subset", None),
-    ("-q:a", "fixed-quality scale is not in the Round-1 subset", None),
+    ("-q", "fixed-quality scale is not in the current supported subset", None),
+    ("-qscale", "fixed-quality scale is not in the current supported subset; the CLI itself calls unsplit -qscale ambiguous", None),
+    ("-q:v", "fixed-quality scale is not in the current supported subset", None),
+    ("-q:a", "fixed-quality scale is not in the current supported subset", None),
     ("-fps_mode", "frame sync modes are permanently excluded: the crate models vsync per output, not per stream, so no -fps_mode form can be mapped faithfully", None),
     ("-vsync", "frame sync modes are permanently excluded: the crate models vsync per output, not per stream, so no -vsync form can be mapped faithfully", None),
-    ("-filter_complex", "complex filtergraphs are planned for Round 2 (fully labeled graphs only)", None),
-    ("-lavfi", "complex filtergraphs are planned for Round 2 (fully labeled graphs only)", None),
+    ("-filter_complex", "complex filtergraphs are planned for a future release (fully labeled graphs only)", None),
+    ("-lavfi", "complex filtergraphs are planned for a future release (fully labeled graphs only)", None),
     ("-filter:v", "alias spellings are outside the subset", Some("did you mean `-vf`?")),
-    ("-af", "audio filters are planned for Round 2 (needs the per-output audio filter API)", None),
-    ("-filter:a", "audio filters are planned for Round 2 (needs the per-output audio filter API)", None),
+    ("-af", "audio filters are planned for a future release (needs the per-output audio filter API)", None),
+    ("-filter:a", "audio filters are planned for a future release (needs the per-output audio filter API)", None),
     ("-pass", "two-pass encoding is a documented gap: the stats-file handshake between runs has no ez-ffmpeg equivalent", None),
     ("-passlogfile", "two-pass encoding is a documented gap: the stats-file handshake between runs has no ez-ffmpeg equivalent", None),
-    ("-map_metadata", "metadata mapping is planned for Round 2", None),
-    ("-metadata", "explicit metadata is planned for Round 2 (implicit metadata copying already matches the CLI default)", None),
-    ("-shortest", "-shortest is planned for Round 2 (the builder equivalent exists: Output::set_shortest)", None),
-    ("-re", "readrate streaming is planned for Round 2 (the builder equivalent exists: Input::set_readrate)", None),
-    ("-readrate", "readrate streaming is planned for Round 2 (the builder equivalent exists: Input::set_readrate)", None),
-    ("-stream_loop", "input looping is not in the Round-1 subset (the builder equivalent exists: Input::set_stream_loop)", None),
-    ("-r", "output frame rate is not in the Round-1 subset (the builder equivalent exists: Output::set_framerate)", None),
-    ("-s", "frame size is not in the Round-1 subset", Some("did you mean `-vf scale=W:H`?")),
-    ("-sn", "subtitle streams are not in the Round-1 subset", None),
-    ("-dn", "data streams are not in the Round-1 subset", None),
+    ("-map_metadata", "metadata mapping is planned for a future release", None),
+    ("-metadata", "explicit metadata is planned for a future release (implicit metadata copying already matches the CLI default)", None),
+    ("-shortest", "-shortest is planned for a future release (the builder equivalent exists: Output::set_shortest)", None),
+    ("-re", "readrate streaming is planned for a future release (the builder equivalent exists: Input::set_readrate)", None),
+    ("-readrate", "readrate streaming is planned for a future release (the builder equivalent exists: Input::set_readrate)", None),
+    ("-stream_loop", "input looping is not in the current supported subset (the builder equivalent exists: Input::set_stream_loop)", None),
+    ("-r", "output frame rate is not in the current supported subset (the builder equivalent exists: Output::set_framerate)", None),
+    ("-s", "frame size is not in the current supported subset", Some("did you mean `-vf scale=W:H`?")),
+    ("-sn", "subtitle streams are not in the current supported subset", None),
+    ("-dn", "data streams are not in the current supported subset", None),
     ("-progress", "progress reporting is a documented gap: the CLI's encoder statistics pipeline has no in-process equivalent", None),
     ("-stats_period", "progress reporting is a documented gap", None),
     ("-t:v", "per-stream indexed/typed variants are permanently excluded: the crate models these options per media type, not per stream", None),
-    ("-profile", "encoder profiles are not in the Round-1 subset; the CLI itself calls unsplit -profile ambiguous", None),
-    ("-profile:v", "encoder profiles are not in the Round-1 subset", None),
-    ("-level", "encoder levels are not in the Round-1 subset", None),
-    ("-g", "GOP-size tuning is not in the Round-1 subset", None),
-    ("-force_key_frames", "forced keyframes are not in the Round-1 subset (the builder equivalent exists: Output::set_force_key_frames)", None),
-    ("-threads", "thread-count tuning is not in the Round-1 subset (the crate already defaults encoders to auto threading like the CLI)", None),
-    ("-hwaccel", "hardware acceleration is planned for Round 2 (the builder equivalent exists: Input::set_hwaccel)", None),
+    ("-profile", "encoder profiles are not in the current supported subset; the CLI itself calls unsplit -profile ambiguous", None),
+    ("-profile:v", "encoder profiles are not in the current supported subset", None),
+    ("-level", "encoder levels are not in the current supported subset", None),
+    ("-g", "GOP-size tuning is not in the current supported subset", None),
+    ("-force_key_frames", "forced keyframes are not in the current supported subset (the builder equivalent exists: Output::set_force_key_frames)", None),
+    ("-threads", "thread-count tuning is not in the current supported subset (the crate already defaults encoders to auto threading like the CLI)", None),
+    ("-hwaccel", "hardware acceleration is planned for a future release (the builder equivalent exists: Input::set_hwaccel)", None),
     ("-tag:v", "codec tags are a documented gap: the crate does not expose per-stream tags; re-tag with an external remux", None),
     ("-tag:a", "codec tags are a documented gap: the crate does not expose per-stream tags; re-tag with an external remux", None),
-    ("-attach", "attachments are not in the Round-1 subset (the builder equivalent exists: Output::add_attachment)", None),
-    ("-hls_flags", "only the single-rendition VOD HLS option set is in Round 1 (hls_time, hls_playlist_type vod, hls_list_size 0, hls_segment_filename)", None),
-    ("-hls_segment_type", "only the single-rendition VOD HLS option set is in Round 1", None),
+    ("-attach", "attachments are not in the current supported subset (the builder equivalent exists: Output::add_attachment)", None),
+    ("-hls_flags", "only the single-rendition VOD HLS option set is in the current supported subset (hls_time, hls_playlist_type vod, hls_list_size 0, hls_segment_filename)", None),
+    ("-hls_segment_type", "only the single-rendition VOD HLS option set is in the current supported subset", None),
     ("-hls_key_info_file", "encrypted HLS is permanently excluded from the subset", None),
     ("-master_pl_name", "multi-rendition HLS is excluded; use the HlsLadder recipe instead", None),
     ("-var_stream_map", "multi-rendition HLS is excluded; use the HlsLadder recipe instead", None),
-    ("-segment_time", "the segment muxer is planned for Round 2 (use Output::set_format(\"segment\") with set_format_opt meanwhile)", None),
+    ("-segment_time", "the segment muxer is planned for a future release (use Output::set_format(\"segment\") with set_format_opt meanwhile)", None),
     ("-ss:v", "per-stream indexed/typed variants are permanently excluded", None),
-    ("-frames:a", "only -frames:v 1 (single video frame) is in the Round-1 subset", None),
-    ("-frames", "only -frames:v 1 (single video frame) is in the Round-1 subset", None),
-    ("-vframes", "legacy alias; only -frames:v 1 is in the Round-1 subset", Some("did you mean `-frames:v 1`?")),
+    ("-frames:a", "only -frames:v 1 (single video frame) is in the current supported subset", None),
+    ("-frames", "only -frames:v 1 (single video frame) is in the current supported subset", None),
+    ("-vframes", "legacy alias; only -frames:v 1 is in the current supported subset", Some("did you mean `-frames:v 1`?")),
     ("-update", "image2 update mode is applied automatically for -frames:v 1 outputs; the explicit option is not in the subset", None),
 ];
 
@@ -502,7 +532,8 @@ pub(crate) fn validate_value(
                 Ok(())
             } else {
                 Err(fail(
-                    "bitrates use the NNN / NNNk / NNNM spellings in this subset".to_string(),
+                    "bitrates are digits with an optional k/K/m/M suffix in this subset"
+                        .to_string(),
                 ))
             }
         }
@@ -544,7 +575,8 @@ pub(crate) fn validate_value(
                 Ok(())
             } else {
                 Err(fail(
-                    "Round 1 supports single-frame output only (-frames:v 1)".to_string(),
+                    "only single-frame output (-frames:v 1) is in the current supported subset"
+                        .to_string(),
                 ))
             }
         }
@@ -568,7 +600,8 @@ pub(crate) fn validate_value(
                 Ok(())
             } else {
                 Err(fail(
-                    "only the exact `-movflags +faststart` is in the Round-1 subset".to_string(),
+                    "only the exact `-movflags +faststart` is in the current supported subset"
+                        .to_string(),
                 ))
             }
         }
@@ -583,8 +616,8 @@ pub(crate) fn validate_value(
                 Ok(())
             } else {
                 Err(fail(
-                    "only `-hls_playlist_type vod` (single-rendition VOD) is in the Round-1 \
-                     subset"
+                    "only `-hls_playlist_type vod` (single-rendition VOD) is in the current \
+                     supported subset"
                         .to_string(),
                 ))
             }
@@ -594,7 +627,7 @@ pub(crate) fn validate_value(
                 Ok(())
             } else {
                 Err(fail(
-                    "only `-hls_list_size 0` (keep every segment, VOD) is in the Round-1 subset"
+                    "only `-hls_list_size 0` (keep every segment, VOD) is in the current supported subset"
                         .to_string(),
                 ))
             }
@@ -602,6 +635,14 @@ pub(crate) fn validate_value(
         ValueRule::Path => {
             if value.is_empty() {
                 Err(fail("expected a non-empty path".to_string()))
+            } else if value.starts_with('-') {
+                // A `-`-leading value here almost always means the path was
+                // omitted and the next option was swallowed as the value.
+                Err(fail(
+                    "a `-`-leading value is rejected as a swallowed option; for a path that \
+                     genuinely starts with `-`, write it as `./-name`"
+                        .to_string(),
+                ))
             } else {
                 Ok(())
             }
@@ -638,16 +679,17 @@ pub(crate) fn validate_value(
 }
 
 /// Decimal seconds -> microseconds. Rejects negatives, `HH:MM:SS`, unit
-/// suffixes, and out-of-range values — the Round-1 time grammar is decimal
+/// suffixes, and out-of-range values — the supported time grammar is decimal
 /// seconds only.
 pub(crate) fn parse_seconds_us(value: &str) -> Result<i64, String> {
     if value.contains(':') {
         return Err(
-            "the HH:MM:SS form is not in the Round-1 subset; use decimal seconds".to_string(),
+            "the HH:MM:SS form is not in the current supported subset; use decimal seconds"
+                .to_string(),
         );
     }
     if value.starts_with('-') || value.starts_with('+') {
-        return Err("signed times are not in the Round-1 subset".to_string());
+        return Err("signed times are not in the current supported subset".to_string());
     }
     let mut parts = value.split('.');
     let (int_part, frac_part) = (parts.next().unwrap_or(""), parts.next());
@@ -671,8 +713,8 @@ pub(crate) fn parse_seconds_us(value: &str) -> Result<i64, String> {
 fn validate_scale_filter(value: &str) -> Result<(), String> {
     let Some(args) = value.strip_prefix("scale=") else {
         return Err(
-            "Round 1 accepts a single simple scale filter only (e.g. `scale=1280:-2`); other \
-             filters and chains are planned for Round 2"
+            "the current supported subset accepts a single simple scale filter only (e.g. \
+             `scale=1280:-2`); other filters and chains are planned for a future release"
                 .to_string(),
         );
     };
@@ -694,10 +736,10 @@ fn validate_scale_filter(value: &str) -> Result<(), String> {
 }
 
 fn validate_map_basic(value: &str) -> Result<(), String> {
-    const REASON: &str = "Round 1 accepts basic index maps only: `0`, `0:v`, `0:a`, `0:v:0`, \
-                          `0:a:1`, `0:1`. Optional (`?`), negative (`-`), label (`[…]`), \
-                          program/metadata/disposition selectors and subtitle/data maps are \
-                          excluded";
+    const REASON: &str = "the current supported subset accepts basic index maps only: `0`, \
+                          `0:v`, `0:a`, `0:v:0`, `0:a:1`, `0:1`. Optional (`?`), negative \
+                          (`-`), label (`[…]`), program/metadata/disposition selectors and \
+                          subtitle/data maps are excluded";
     if value.starts_with('-') {
         return Err(format!("negative mappings are excluded. {REASON}"));
     }
@@ -732,7 +774,7 @@ fn validate_map_basic(value: &str) -> Result<(), String> {
                 },
                 s if stream_ok(s) && rest.is_none() => Ok(()),
                 "s" | "d" | "t" => Err(format!(
-                    "subtitle/data/attachment maps are not in the Round-1 subset. {REASON}"
+                    "subtitle/data/attachment maps are not in the current supported subset. {REASON}"
                 )),
                 _ => Err(REASON.to_string()),
             }
@@ -825,6 +867,20 @@ mod tests {
         for bad in ["192q", "k", "", "1.5M", "192 k"] {
             assert!(
                 check(ValueRule::Bitrate, bad).is_err(),
+                "expected Err for {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_rejects_empty_and_dash_leading_values() {
+        assert!(check(ValueRule::Path, "seg_%03d.ts").is_ok());
+        // The documented escape hatch for a genuinely dash-leading name.
+        assert!(check(ValueRule::Path, "./-seg.ts").is_ok());
+        assert!(check(ValueRule::Path, "").is_err());
+        for bad in ["-hls_flags", "-y", "-"] {
+            assert!(
+                check(ValueRule::Path, bad).is_err(),
                 "expected Err for {bad:?}"
             );
         }
@@ -1053,8 +1109,11 @@ mod tests {
                     .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_')
                     .collect();
                 if !method.is_empty() {
+                    // The `(` closes the identifier: a bare `fn {method}`
+                    // prefix-matches a surviving sibling (`set_video_codec`
+                    // matching `set_video_codec_opt`) and misses the rename.
                     assert!(
-                        haystack.contains(&format!("fn {method}")),
+                        haystack.contains(&format!("fn {method}(")),
                         "{}: sink cites `{method}`, which is not a builder method",
                         spec.name
                     );

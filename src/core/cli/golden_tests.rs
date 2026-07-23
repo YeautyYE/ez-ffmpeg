@@ -26,9 +26,13 @@
 //!
 //! Reference-binary resolution: `EZ_FFMPEG_CLI=<path>` is the STRICT lane
 //! (any failure, including a skip condition, fails the test); with the
-//! variable unset, `ffmpeg` from PATH is probed and exactly two conditions
-//! skip with a stderr note — no binary, or a libavcodec/libavformat
-//! major.minor mismatch with the linked build.
+//! variable unset, `ffmpeg` from PATH is probed and exactly three conditions
+//! skip with a stderr note — no binary, a libavcodec/libavformat
+//! major.minor mismatch with the linked build, or a linked build that lacks
+//! an encoder the shape's canonical command names. The last one is what
+//! keeps PATH discovery safe: an ambient version-matched binary must only
+//! ARM the comparison, never push a partially provisioned link (say a
+//! no-GPL build without libx264) into a guaranteed in-process failure.
 
 use std::process::Command;
 
@@ -136,6 +140,33 @@ fn cli_gate() -> CliGate {
 
 fn major_minor(v: u32) -> (u32, u32) {
     (v >> 16, (v >> 8) & 0xff)
+}
+
+/// The encoders a shape's canonical command names (`-c:v` / `-c:a` values,
+/// `copy` excluded — the fixtures themselves only use always-present native
+/// encoders).
+fn canonical_encoders(shape: &VerifiedShape) -> Vec<&'static str> {
+    shape
+        .canonical_argv
+        .iter()
+        .enumerate()
+        .filter(|(_, token)| **token == "-c:v" || **token == "-c:a")
+        .filter_map(|(i, _)| shape.canonical_argv.get(i + 1).copied())
+        .filter(|codec| *codec != "copy")
+        .collect()
+}
+
+/// The lenient lane's second gate: `cli_gate` proves a reference BINARY
+/// exists, this proves the LINKED build can execute the canonical command.
+/// Returns the first named encoder the linked build lacks. Only consulted
+/// when `EZ_FFMPEG_CLI` is unset — an explicit variable is the lane owner's
+/// promise that the environment is fully provisioned, and a missing encoder
+/// there must fail loudly downstream instead of skipping.
+fn missing_linked_encoder(shape: &VerifiedShape) -> Option<&'static str> {
+    let encoders = crate::core::codec::get_encoders();
+    canonical_encoders(shape)
+        .into_iter()
+        .find(|name| !encoders.iter().any(|e| e.codec_name == *name))
 }
 
 fn parse_lib_version(banner: &str, lib: &str) -> Option<(u32, u32)> {
@@ -281,6 +312,10 @@ struct StreamSummary {
     height: i32,
     sample_rate: i32,
     channels: i32,
+    /// Container-declared stream bitrate (mp4: the esds average), 0 when
+    /// the demuxer does not know one. Only oracles with a bitrate-shaped
+    /// option under test read it.
+    bit_rate: i64,
 }
 
 fn summarize(path: &str) -> Vec<StreamSummary> {
@@ -300,11 +335,13 @@ fn summarize(path: &str) -> Vec<StreamSummary> {
                 height,
                 sample_rate: 0,
                 channels: 0,
+                bit_rate: 0,
             },
             StreamInfo::Audio {
                 codec_name,
                 sample_rate,
                 nb_channels,
+                bit_rate,
                 ..
             } => StreamSummary {
                 kind: "audio",
@@ -313,6 +350,7 @@ fn summarize(path: &str) -> Vec<StreamSummary> {
                 height: 0,
                 sample_rate,
                 channels: nb_channels,
+                bit_rate,
             },
             other => StreamSummary {
                 kind: "other",
@@ -321,6 +359,7 @@ fn summarize(path: &str) -> Vec<StreamSummary> {
                 height: 0,
                 sample_rate: 0,
                 channels: 0,
+                bit_rate: 0,
             },
         })
         .collect()
@@ -444,6 +483,25 @@ fn run_shape(shape: &VerifiedShape) -> Option<GoldenRun> {
             return None;
         }
     };
+    // PATH discovery only ARMS the comparison; executing the canonical
+    // command additionally needs every encoder it names in the LINKED build.
+    // Without this, an ambient version-matched binary on a partially
+    // provisioned link (a no-GPL build without libx264) would walk the
+    // libx264 shapes straight into a guaranteed from_cli_args failure below.
+    // An explicit EZ_FFMPEG_CLI skips this check on purpose: the strict lane
+    // promises its environment and must fail loudly, never skip.
+    if std::env::var("EZ_FFMPEG_CLI").is_err() {
+        if let Some(missing) = missing_linked_encoder(shape) {
+            eprintln!(
+                "skipping {}: the linked FFmpeg lacks the `{missing}` encoder named by the \
+                 shape's canonical command; the PATH-discovered `{bin}` arms the semantic \
+                 goldens only on a fully provisioned build (set EZ_FFMPEG_CLI to make this \
+                 lane strict)",
+                shape.id
+            );
+            return None;
+        }
+    }
     let fixture = fixture_for(shape.id);
     let canonical_output = shape.canonical_argv.last().unwrap().to_string();
 
@@ -528,9 +586,12 @@ fn run_shape(shape: &VerifiedShape) -> Option<GoldenRun> {
 /// `cargo test --lib` alone does not build examples).
 fn example_binary(name: &str) -> std::path::PathBuf {
     let deps_dir = std::env::current_exe().unwrap();
-    // target/debug/deps/<test-bin> -> target/debug/examples/<name>
+    // target/debug/deps/<test-bin> -> target/debug/examples/<name>, carrying
+    // the platform executable suffix (`.exe` on Windows, empty elsewhere).
     let debug_dir = deps_dir.parent().unwrap().parent().unwrap();
-    let path = debug_dir.join("examples").join(name);
+    let path = debug_dir
+        .join("examples")
+        .join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
     if path.exists() {
         return path;
     }
@@ -570,6 +631,63 @@ fn verified_shapes_pass_their_semantic_goldens() {
     }
 }
 
+/// The lenient encoder gate must read the canonical argv correctly: the
+/// libx264 shapes name it, the aac-only and mjpeg-only shapes do not — a
+/// drifted extraction would either skip too much (silent coverage loss on
+/// lenient lanes) or too little (a partially provisioned link walks into a
+/// guaranteed failure again). Runs ungated: pure argv inspection.
+#[test]
+fn canonical_encoder_extraction_matches_the_manifest() {
+    let by_id = |id: &str| {
+        canonical_encoders(VERIFIED_SHAPES.iter().find(|shape| shape.id == id).unwrap())
+    };
+    assert_eq!(by_id("V1"), vec!["libx264", "aac"]);
+    assert_eq!(by_id("V3"), vec!["aac"]);
+    assert_eq!(by_id("V4"), vec!["mjpeg"]);
+    for shape in VERIFIED_SHAPES {
+        assert!(
+            !canonical_encoders(shape).is_empty(),
+            "{}: every verified canonical command names its encoders explicitly",
+            shape.id
+        );
+    }
+}
+
+/// Structural evidence that V1's -crf/-preset survive the pipeline: the
+/// lowered plan carries both as encoder options and the emitted program
+/// makes both builder calls. The preset has no cheap deterministic runtime
+/// observable (the x264 SEI encodes it only through version-dependent
+/// derived settings), so this pin is its coverage; crf additionally gets a
+/// discriminating runtime probe inside `oracle_transcode`. Runs ungated —
+/// parse, lower and emit are pure.
+#[test]
+fn v1_crf_preset_ride_the_lowered_plan_and_emission() {
+    let shape = VERIFIED_SHAPES
+        .iter()
+        .find(|shape| shape.id == "V1")
+        .unwrap();
+    let args: Vec<String> = shape.canonical_argv.iter().map(|s| s.to_string()).collect();
+    let ir = super::parse::parse(&args).unwrap();
+    let lowered = super::lower::lower(&ir);
+    assert_eq!(
+        lowered.output.video_codec_opts,
+        vec![
+            ("crf".to_string(), "23".to_string()),
+            ("preset".to_string(), "fast".to_string()),
+        ],
+        "the lowered plan must carry -crf and -preset as encoder options"
+    );
+    let code = super::emit_rust_code_from_args(shape.canonical_argv).unwrap();
+    assert!(
+        code.contains(".set_video_codec_opt(\"crf\", \"23\")"),
+        "emitted program lost the -crf call:\n{code}"
+    );
+    assert!(
+        code.contains(".set_video_codec_opt(\"preset\", \"fast\")"),
+        "emitted program lost the -preset call:\n{code}"
+    );
+}
+
 fn oracle_transcode(run: &GoldenRun) {
     let ours = summarize(&run.ours_output);
     assert_eq!(ours.len(), 2);
@@ -580,15 +698,57 @@ fn oracle_transcode(run: &GoldenRun) {
         Some(FIXTURE_TITLE),
         "the fixture title must be implicitly copied"
     );
+    // -crf runtime observability. libx264 stamps its resolved option string
+    // into an SEI of the first access unit, so `crf=NN.N` is readable off
+    // the output bytes. The canonical command's crf 23 equals the x264
+    // DEFAULT, so its marker alone proves only that the SEI methodology
+    // works on this build (asserted across all three lanes); the
+    // discriminating evidence is a second in-process run with the
+    // non-default crf 30 — had the -crf lowering vanished, x264 would fall
+    // back to its default and stamp crf=23.0 instead.
+    let sei_carries = |path: &str, marker: &[u8]| {
+        let bytes = std::fs::read(path).unwrap();
+        bytes.windows(marker.len()).any(|w| w == marker)
+    };
+    for (lane, path) in [
+        ("theirs", &run.theirs_output),
+        ("ours", &run.ours_output),
+        ("emitted", &run.emitted_output),
+    ] {
+        assert!(
+            sei_carries(path, b"crf=23.0"),
+            "V1 {lane}: x264 SEI does not carry the crf marker"
+        );
+    }
+    let probe_dir = tmp_dir("V1_crf_probe");
+    let probe_out = probe_dir.join("crf30.mp4").to_string_lossy().into_owned();
+    let fixture = fixture_for("V1");
+    let probe_args = [
+        "-i", &fixture, "-c:v", "libx264", "-crf", "30", "-preset", "fast", "-c:a", "aac",
+        "-y", &probe_out,
+    ];
+    let context = from_cli_args(&probe_args).expect("V1 crf probe must pass the gates");
+    run_context(context, "V1 crf probe");
+    assert!(
+        sei_carries(&probe_out, b"crf=30.0"),
+        "V1 crf probe: -crf 30 never reached the encoder"
+    );
+    assert!(
+        !sei_carries(&probe_out, b"crf=23.0"),
+        "V1 crf probe: encoder ran at the crf default despite -crf 30"
+    );
 }
 
 fn oracle_clip(run: &GoldenRun) {
-    // -ss 10 on a 16s fixture with -t 20: ~6s remain; both engines agreed
-    // (three-lane oracle), pin the absolute window too.
+    // -ss 10 on the 16s fixture leaves ~6s of tail; -t 4 must cut it to
+    // ~4s. The upper bound is the load-bearing edge: a command whose -t
+    // lowering silently vanished still yields a valid ~6s clip, and only
+    // this window catches that. Both engines agreed (three-lane oracle);
+    // pin the absolute window too.
     let duration = get_duration_us(&run.ours_output).unwrap();
     assert!(
-        (5_500_000..=6_500_000).contains(&duration),
-        "clip duration {duration}us outside the expected ~6s window"
+        (3_500_000..=4_500_000).contains(&duration),
+        "clip duration {duration}us outside the expected ~4s window"
     );
 }
 
@@ -603,6 +763,29 @@ fn oracle_audio_extract(run: &GoldenRun) {
         (1, 44100),
         "the DEFAULT-disposition bonus must select the mono track"
     );
+    // -b:a 192k observability, on ALL THREE lanes. On this input (the
+    // fixture's already AAC-quantized mono sine) the encoder cannot spend
+    // the full request — the esds average lands near 92k (measured: 91608
+    // on FFmpeg 7.1.3) — while the NO-OPTION default configuration lands
+    // near 69k (measured: 69118). The reference CLI's own figure is the
+    // anchor: it must clear the absolute window whose lower bound excludes
+    // the default figure, and every in-process lane must land within ±15%
+    // of it — a lane whose -b:a lowering vanished reproduces the default,
+    // ~25% below the anchor, and fails the tolerance.
+    let theirs = summarize(&run.theirs_output);
+    let emitted = summarize(&run.emitted_output);
+    let anchor = theirs[0].bit_rate;
+    assert!(
+        (80_000..=210_000).contains(&anchor),
+        "V3 reference audio bitrate {anchor} outside the -b:a 192k window"
+    );
+    for (lane, bit_rate) in [("ours", ours[0].bit_rate), ("emitted", emitted[0].bit_rate)] {
+        assert!(
+            (bit_rate - anchor).abs() * 100 <= anchor * 15,
+            "V3 {lane}: audio bitrate {bit_rate} deviates more than 15% from the reference \
+             CLI's {anchor} — the -b:a 192k lowering did not reach the encoder"
+        );
+    }
 
     // Fixture B (reference-CLI-built, forced dispositions): audio #0 STEREO
     // without DEFAULT, audio #1 MONO with DEFAULT. The correct selection is
@@ -838,8 +1021,8 @@ fn oracle_hls(run: &GoldenRun) {
 }
 
 // ---------------------------------------------------------------------------
-// The V5 structural-uniqueness prerequisite (review probe): a two-video
-// input must be rejected, not silently filtered over a selected stream.
+// The V5 structural-uniqueness prerequisite: a two-video input must be
+// rejected, not silently filtered over a selected stream.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1021,6 +1204,9 @@ fn vf_uniqueness_gate_opens_the_input_exactly_once() {
     .iter()
     .map(|s| s.to_string())
     .collect();
+    let have_libx264 = crate::core::codec::get_encoders()
+        .iter()
+        .any(|e| e.codec_name == "libx264");
     match from_cli_args(&args) {
         Ok(context) => {
             drop(context);
@@ -1034,6 +1220,27 @@ fn vf_uniqueness_gate_opens_the_input_exactly_once() {
         Err(CliError::UnverifiedRuntimeProfile { .. }) if !linked_profile_verified() => {
             // The profile gate fires before any I/O: zero openings.
             assert_eq!(opens_of(&fixture) - before, 0);
+        }
+        Err(CliError::Build(err)) if linked_profile_verified() && !have_libx264 => {
+            // A verified profile whose linked build lacks libx264 (e.g. a
+            // no-GPL FFmpeg): the pipeline opens its input first — encoder
+            // resolution runs in output binding, strictly after
+            // open_input_files — so the typed encoder failure must still
+            // leave exactly one recorded opening.
+            assert!(
+                matches!(
+                    &err,
+                    crate::error::Error::OpenOutput(
+                        crate::error::OpenOutputError::EncoderUnavailable { name }
+                    ) if name == "libx264"
+                ),
+                "expected EncoderUnavailable(libx264) on this build, got: {err}"
+            );
+            assert_eq!(
+                opens_of(&fixture) - before,
+                1,
+                "encoder resolution happens after the single opening"
+            );
         }
         Err(other) => panic!("single-video -vf build failed unexpectedly: {other}"),
     }

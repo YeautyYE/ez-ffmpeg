@@ -20,11 +20,11 @@
 
 use super::ir::CliIr;
 #[cfg(test)]
-use super::table::{Arity, Repeat, ScopeRule, Selector, OPTION_TABLE};
+use super::table::{Repeat, ScopeRule, Selector, OPTION_TABLE};
 
 /// Manifest revision. Bump on ANY change to the accept surface, the shape
 /// tables, or a rejection reason. Emitted code headers carry this value.
-pub(crate) const MANIFEST_REVISION: u32 = 3;
+pub(crate) const MANIFEST_REVISION: u32 = 4;
 
 /// The CLI dialect this parser implements: the option grammar was written
 /// against the FFmpeg 7.1 command-line documentation and fftools sources.
@@ -130,8 +130,8 @@ fn pins_v6(ir: &CliIr) -> bool {
         && ir.output.hls_segment_filename.is_some()
 }
 
-/// The R6 six: transcode, re-encoded clip, audio extract, thumbnail, scaled
-/// transcode, VOD HLS.
+/// The six verified shapes: transcode, re-encoded clip, audio extract,
+/// thumbnail, scaled transcode, VOD HLS.
 pub(crate) const VERIFIED_SHAPES: &[VerifiedShape] = &[
     VerifiedShape {
         id: "V1",
@@ -153,8 +153,12 @@ pub(crate) const VERIFIED_SHAPES: &[VerifiedShape] = &[
         oracle: GoldenOracle::Clip,
         pins: pins_v2,
         output_ext: "mp4",
+        // -t 4 is deliberately SHORTER than the golden fixture's remaining
+        // tail after -ss 10 (16s fixture -> ~6s left), so the duration
+        // oracle observes the -t lowering doing real work: dropping it
+        // yields a ~6s clip and fails the window.
         canonical_argv: &[
-            "-ss", "10", "-i", "in.mp4", "-t", "20", "-c:v", "libx264", "-crf", "23", "-c:a",
+            "-ss", "10", "-i", "in.mp4", "-t", "4", "-c:v", "libx264", "-crf", "23", "-c:a",
             "aac", "-y", "clip.mp4",
         ],
         emitted_example: "cli_emitted_clip",
@@ -505,12 +509,15 @@ pub(crate) fn manifest_docs_markdown() -> String {
             Repeat::Accumulate => "accumulates",
             Repeat::Free => "repeatable",
         };
-        let notes = if spec.selector == Selector::NoOp {
-            "accepted, no in-process effect"
-        } else if spec.arity == Arity::Flag {
-            "flag"
-        } else {
-            "takes a value"
+        // The notes column carries the REAL value grammar (from the same
+        // table row validation reads), never a generic "takes a value".
+        let notes = match (spec.selector, spec.value) {
+            (Selector::NoOp, Some(rule)) => {
+                format!("no in-process effect; value: {}", rule.grammar())
+            }
+            (Selector::NoOp, None) => "accepted, no in-process effect".to_string(),
+            (_, Some(rule)) => rule.grammar().to_string(),
+            (_, None) => "flag".to_string(),
         };
         let selector = match spec.selector {
             Selector::NoOp => "no-op",
@@ -525,6 +532,9 @@ pub(crate) fn manifest_docs_markdown() -> String {
             spec.name, scope, selector, repeat, notes, spec.sink
         ));
     }
+    out.push_str(
+        "\nCommand layout is fixed: exactly one `-i` input and exactly one output\npath, in the canonical `[global/input options] -i INPUT [output options]\nOUTPUT [global options]` order — after the output path only GLOBAL options\nare accepted (e.g. a trailing `-y`). The `-` stdin/stdout pseudo-paths are\nexcluded — pipe I/O is process wiring, not part of the in-process subset.\n",
+    );
     out.push_str(
         "\nVerified shapes (may execute; each is backed by a semantic golden and a\ncompile-pinned emitted example):\n\n",
     );
