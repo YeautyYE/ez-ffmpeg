@@ -51,6 +51,7 @@ pub(crate) struct ParameterSets {
 ///   and a later same-id SPS replaces the list slot, not that binding —
 ///   so two configurations with equal id maps still differ when a PPS
 ///   bound a different SPS body on the way there.
+///
 /// Two configurations are equal exactly when every id maps to the same
 /// payload AND every PPS bound the same SPS generation: the order of
 /// DISTINCT ids never matters (wrapper bytes and array position address
