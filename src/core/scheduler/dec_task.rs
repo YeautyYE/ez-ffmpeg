@@ -12,7 +12,7 @@ use crate::error::{
 use crate::hwaccel::HWAccelID::{HwaccelAuto, HwaccelGeneric};
 use crate::hwaccel::{
     hw_device_get_by_name, hw_device_get_by_type, hw_device_init_from_type,
-    hw_device_match_by_codec, HWAccelID,
+    hw_device_match_by_codec, hw_device_type_name, HWAccelID,
 };
 use crate::util::ffmpeg_utils::av_rescale_q_rnd;
 use crate::util::ffmpeg_utils::{av_err2str, hashmap_to_avdictionary, DictGuard};
@@ -27,7 +27,7 @@ use ffmpeg_sys_next::AVSubtitleType::SUBTITLE_BITMAP;
 use ffmpeg_sys_next::{
     av_buffer_create, av_buffer_ref, av_calloc, av_dict_set, av_frame_apply_cropping,
     av_frame_copy_props, av_frame_move_ref, av_frame_ref, av_frame_unref, av_free, av_freep,
-    av_gcd, av_hwdevice_get_type_name, av_hwframe_transfer_data, av_inv_q, av_mallocz, av_memdup,
+    av_gcd, av_hwframe_transfer_data, av_inv_q, av_mallocz, av_memdup,
     av_mul_q, av_opt_set_dict2, av_pix_fmt_desc_get, av_rescale_delta, av_rescale_q, av_strdup,
     avcodec_alloc_context3, avcodec_decode_subtitle2, avcodec_flush_buffers,
     avcodec_get_hw_config, avcodec_open2, avcodec_parameters_to_context, avcodec_receive_frame,
@@ -1051,17 +1051,12 @@ fn hw_device_setup_for_decode(
                 if dp.hwaccel_id == HWAccelID::HwaccelAuto {
                     dp.hwaccel_device_type = dev.device_type;
                 } else if dp.hwaccel_device_type != dev.device_type {
-                    unsafe {
-                        let dev_device_name = av_hwdevice_get_type_name(dev.device_type);
-                        let dev_device_name = CStr::from_ptr(dev_device_name).to_str();
-                        let dp_device_name = av_hwdevice_get_type_name(dp.hwaccel_device_type);
-                        let dp_device_name = CStr::from_ptr(dp_device_name).to_str();
-                        if let (Ok(dev_device_name), Ok(dp_device_name)) =
-                            (dev_device_name, dp_device_name)
-                        {
-                            error!("Invalid hwaccel device specified for decoder: device {} of type {} is not usable with hwaccel {}.",
+                    if let (Some(dev_device_name), Some(dp_device_name)) = (
+                        hw_device_type_name(dev.device_type),
+                        hw_device_type_name(dp.hwaccel_device_type),
+                    ) {
+                        error!("Invalid hwaccel device specified for decoder: device {} of type {} is not usable with hwaccel {}.",
                         dev.name, dp_device_name, dev_device_name);
-                        }
                     }
 
                     return AVERROR(EINVAL);
@@ -1114,14 +1109,11 @@ fn hw_device_setup_for_decode(
             device_type = unsafe { (*config).device_type };
             dev = hw_device_get_by_type(device_type);
             if let Some(dev) = &dev {
-                unsafe {
-                    let dev_device_type = av_hwdevice_get_type_name(device_type);
-                    if let Ok(dev_device_type) = CStr::from_ptr(dev_device_type).to_str() {
-                        info!(
-                            "Using auto hwaccel type {dev_device_type} with existing device {}.",
-                            dev.name
-                        );
-                    }
+                if let Some(dev_device_type) = hw_device_type_name(device_type) {
+                    info!(
+                        "Using auto hwaccel type {dev_device_type} with existing device {}.",
+                        dev.name
+                    );
                 }
                 break;
             }
@@ -1148,16 +1140,13 @@ fn hw_device_setup_for_decode(
                 continue;
             }
 
-            unsafe {
-                let dev_device_type = av_hwdevice_get_type_name(device_type);
-                if let Ok(dev_device_type) = CStr::from_ptr(dev_device_type).to_str() {
-                    match &dp.hwaccel_device {
-                        Some(hwaccel_device) => {
-                            info!("Using auto hwaccel type {dev_device_type} with new device created from {hwaccel_device}.");
-                        }
-                        None => {
-                            info!("Using auto hwaccel type {dev_device_type} with new default device.");
-                        }
+            if let Some(dev_device_type) = hw_device_type_name(device_type) {
+                match &dp.hwaccel_device {
+                    Some(hwaccel_device) => {
+                        info!("Using auto hwaccel type {dev_device_type} with new device created from {hwaccel_device}.");
+                    }
+                    None => {
+                        info!("Using auto hwaccel type {dev_device_type} with new default device.");
                     }
                 }
             }
@@ -1174,14 +1163,12 @@ fn hw_device_setup_for_decode(
 
     match dev {
         None => {
-            unsafe {
-                let dev_device_type = av_hwdevice_get_type_name(device_type);
-                let dev_device_type = CStr::from_ptr(dev_device_type).to_str();
-                let codec_name = (*codec).name;
-                let codec_name = CStr::from_ptr(codec_name).to_str();
-                if let (Ok(dev_device_type), Ok(codec_name)) = (dev_device_type, codec_name) {
-                    info!("No device available for decoder: device type {dev_device_type} needed for codec {codec_name}.");
-                }
+            let dev_device_type = hw_device_type_name(device_type);
+            // SAFETY: `codec` is the caller's live decoder; a registered
+            // codec's name is a valid, non-null C string.
+            let codec_name = unsafe { CStr::from_ptr((*codec).name).to_str() };
+            if let (Some(dev_device_type), Ok(codec_name)) = (dev_device_type, codec_name) {
+                info!("No device available for decoder: device type {dev_device_type} needed for codec {codec_name}.");
             }
             err
         }

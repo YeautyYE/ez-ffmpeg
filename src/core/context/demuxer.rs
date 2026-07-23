@@ -13,9 +13,10 @@ use ffmpeg_sys_next::AVMediaType::{AVMEDIA_TYPE_AUDIO, AVMEDIA_TYPE_SUBTITLE, AV
 use ffmpeg_sys_next::AVPixelFormat::{
     AV_PIX_FMT_CUDA, AV_PIX_FMT_MEDIACODEC, AV_PIX_FMT_NONE, AV_PIX_FMT_QSV,
 };
+use crate::hwaccel::hw_device_type_name;
 use ffmpeg_sys_next::{
     av_channel_layout_default, av_codec_is_decoder, av_codec_iterate, av_get_pix_fmt,
-    av_hwdevice_find_type_by_name, av_hwdevice_get_type_name, avcodec_descriptor_get,
+    av_hwdevice_find_type_by_name, avcodec_descriptor_get,
     avcodec_descriptor_get_by_name, avcodec_find_decoder, avcodec_find_decoder_by_name,
     avcodec_get_hw_config, AVChannelOrder, AVCodecID, AVCodecParameters, AVFormatContext,
     AVHWDeviceType, AVMediaType, AVPixelFormat, AVRational, AVERROR, EINVAL,
@@ -470,9 +471,8 @@ fn choose_decoder(
                             if (*config).device_type == hwaccel_device_type {
                                 let name = (*c).name;
                                 let name = CStr::from_ptr(name).to_str();
-                                let type_name = av_hwdevice_get_type_name(hwaccel_device_type);
-                                let type_name = CStr::from_ptr(type_name).to_str();
-                                if let (Ok(name), Ok(type_name)) = (name, type_name) {
+                                let type_name = hw_device_type_name(hwaccel_device_type);
+                                if let (Ok(name), Some(type_name)) = (name, type_name) {
                                     debug!("Selecting decoder '{name}' because of requested hwaccel method {type_name}");
                                 }
 
