@@ -671,7 +671,8 @@ impl SpsSummary {
 /// sanity gate (its av_image_check_size call), the cropping gate (a crop
 /// must leave at least one sample each way) and, inside the VUI HRD,
 /// `cpb_cnt_minus1 <= 31`. Deliberate divergences, each toward the spec
-/// where h264_ps.c substitutes a decoder recovery policy:
+/// where h264_ps.c substitutes a decoder recovery policy or omits the
+/// check:
 /// * for some broken encoders h264_ps.c only WARNS when declared-present
 ///   VUI data runs out mid-structure, because a decoder can still play
 ///   the stream; a validator has no decode path to fall back on, so
@@ -682,10 +683,15 @@ impl SpsSummary {
 ///   of scrubbing;
 /// * the bitstream_restriction denominators and MV-length exponents are
 ///   held to their E.2.1 ceilings (16), which h264_ps.c reads unchecked,
-///   and `max_dec_frame_buffering` to `max_num_ref_frames..=16` — the
-///   E.2.1 floor (the declared DPB must hold the reference frames) under
-///   the H264_MAX_DPB_FRAMES ceiling; h264_ps.c reads the field and
-///   bounds only the reorder depth against it.
+///   and `max_dec_frame_buffering` to `max_num_ref_frames..=16`. The 16
+///   ceiling on both DPB fields is FFmpeg's CBS bound
+///   (`ue(..., 0, H264_MAX_DPB_FRAMES)`,
+///   cbs_h264_syntax_template.c:196-197); the floor is E.2.1's own rule —
+///   max_dec_frame_buffering shall be >= max_num_ref_frames, the declared
+///   DPB must hold the reference frames — which no FFmpeg path enforces:
+///   h264_ps.c only reads the field, and its reorder-depth check tests
+///   `> 16` alone, the max_dec_frame_buffering clauses sitting inside a
+///   comment.
 fn parse_sps(sps: &[u8]) -> Result<SpsSummary, String> {
     let rbsp = unescape_rbsp(&sps[1..]);
     let mut r = BitReader::new(&rbsp);
@@ -1183,11 +1189,17 @@ fn check_slice_group_map(
 /// invalid" condition — it scrubs the flag, a validator rejects), and the
 /// bitstream_restriction set (`max_bytes_per_pic_denom <= 16`,
 /// `max_bits_per_mb_denom <= 16`, `log2_max_mv_length_* <= 16`,
-/// `max_num_reorder_frames <= max_dec_frame_buffering` and `<= 16` — the
-/// h264_ps.c "illegal num_reorder_frames" rejection — and
-/// `max_num_ref_frames <= max_dec_frame_buffering <= 16`, the E.2.1
-/// floor under the H264_MAX_DPB_FRAMES ceiling; the caller passes the
-/// SPS's `max_num_ref_frames` in for that floor).
+/// `max_num_reorder_frames <= max_dec_frame_buffering` and `<= 16`, and
+/// `max_num_ref_frames <= max_dec_frame_buffering <= 16`). On the DPB
+/// pair, FFmpeg enforces only the 16 ceiling — CBS codes both fields as
+/// `ue(..., 0, H264_MAX_DPB_FRAMES)` (cbs_h264_syntax_template.c:196-197),
+/// and the h264_ps.c "illegal num_reorder_frames" rejection fires on
+/// `> 16` alone, its max_dec_frame_buffering clauses sitting inside a
+/// comment. The cross-field bounds are E.2.1's own rules:
+/// max_num_reorder_frames shall not exceed max_dec_frame_buffering, and
+/// max_dec_frame_buffering shall be >= max_num_ref_frames — a ref-count
+/// floor no FFmpeg path checks; the caller passes the SPS's
+/// `max_num_ref_frames` in for it.
 fn skip_vui(r: &mut BitReader, max_num_ref_frames: u32) -> Result<(), String> {
     if r.bits(1)? == 1 {
         // aspect_ratio_info_present_flag
@@ -1271,20 +1283,25 @@ fn skip_vui(r: &mut BitReader, max_num_ref_frames: u32) -> Result<(), String> {
             ));
         }
         // E.2.1 bounds max_num_reorder_frames by max_dec_frame_buffering,
-        // and no level admits more than 16 held frames (H264_MAX_DPB_FRAMES;
-        // h264_ps.c rejects above 16 the same way).
+        // and no level admits more than 16 held frames. Of the two
+        // clauses only the 16 ceiling is FFmpeg practice
+        // (H264_MAX_DPB_FRAMES: cbs_h264_syntax_template.c:196, and the
+        // h264_ps.c "illegal num_reorder_frames" check, whose
+        // max_dec_frame_buffering comparison is commented out); the
+        // cross-field bound is E.2.1's own rule.
         if max_num_reorder_frames > 16 || max_num_reorder_frames > max_dec_frame_buffering {
             return Err(format!(
                 "max_num_reorder_frames {max_num_reorder_frames} exceeds 16 or \
                  max_dec_frame_buffering {max_dec_frame_buffering}"
             ));
         }
-        // max_dec_frame_buffering itself is bounded both ways: E.2.1
-        // floors it at max_num_ref_frames — the declared DPB must hold at
-        // least the reference frames the SPS keeps — and no level admits
-        // more than 16 held frames (H264_MAX_DPB_FRAMES, the same ceiling
-        // bounding max_num_ref_frames; cbs_h264_syntax_template.c codes
-        // the field with that ceiling).
+        // max_dec_frame_buffering itself is bounded both ways. The 16
+        // ceiling is FFmpeg's CBS bound (`ue(max_dec_frame_buffering, 0,
+        // H264_MAX_DPB_FRAMES)`, cbs_h264_syntax_template.c:197). The
+        // floor is E.2.1's own rule — max_dec_frame_buffering shall be
+        // >= max_num_ref_frames, the declared DPB must hold at least the
+        // reference frames the SPS keeps — which no FFmpeg path enforces:
+        // h264_ps.c only reads the field.
         if max_dec_frame_buffering > 16 || max_dec_frame_buffering < max_num_ref_frames {
             return Err(format!(
                 "max_dec_frame_buffering {max_dec_frame_buffering} is outside \
