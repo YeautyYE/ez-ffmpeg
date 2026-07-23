@@ -2421,23 +2421,43 @@ struct MuxWriteState<'a> {
     nb_done: &'a mut usize,
 }
 
-/// In-flight probe for container writes to `tcp://` outputs. Every muxer
-/// write funnels through [`write_packet`], so `ENTERED - RETURNED` is the
-/// number of `av_interleaved_write_frame` calls currently executing for a
-/// tcp output: a value of 1 frozen across a sampling window means one muxer
-/// thread is parked INSIDE the write (blocked by socket flow control), which
-/// no socket-side observation can distinguish from a producer that went
-/// idle. Gated on the `tcp://` prefix because the library's unit tests share
-/// one process: file-, null- and sink-backed outputs in concurrently running
+/// In-flight probe for container writes to `tcp://` outputs. Every
+/// interleaved PACKET write funnels through [`write_packet`]
+/// (`avformat_write_header` and `av_write_trailer` are issued elsewhere and
+/// bypass it), so `ENTERED - RETURNED` is the number of
+/// `av_interleaved_write_frame` calls currently executing for a tcp output:
+/// a value of 1 frozen across a sampling window means one muxer thread is
+/// parked INSIDE the write (blocked by socket flow control), which no
+/// socket-side observation can distinguish from a producer that went idle.
+/// Gated on the `tcp://` prefix because the library's unit tests share one
+/// process: file-, null- and sink-backed outputs in concurrently running
 /// tests must never move these counters.
 #[cfg(test)]
 pub(crate) mod tcp_write_probe {
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicI32, AtomicU64};
+    use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
     /// `av_interleaved_write_frame` calls entered for a `tcp://` output.
     pub(crate) static ENTERED: AtomicU64 = AtomicU64::new(0);
     /// The subset of those calls that has returned.
     pub(crate) static RETURNED: AtomicU64 = AtomicU64::new(0);
+    /// Return code of the most recently returned tcp write, stored BEFORE
+    /// `RETURNED` is bumped: a sampler that has seen `RETURNED` reach a
+    /// target generation reads the code that very call produced. A cut
+    /// blocked write surfaces here as a negative code; a write that
+    /// completed on its own surfaces as `>= 0`.
+    pub(crate) static LAST_RET: AtomicI32 = AtomicI32::new(0);
+
+    /// Serializes every test that drives or samples these process-wide
+    /// counters. A muxer parked in a write by one test would satisfy — or
+    /// starve — another test's sampling window, so any test that opens a
+    /// `tcp://` output must hold this guard for its whole run.
+    pub(crate) fn exclusive() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 /// # Safety
@@ -2474,6 +2494,7 @@ unsafe fn write_packet(
         av_interleaved_write_frame(cfg.out_fmt_ctx.as_ptr(), sq_packet_box.packet.as_mut_ptr());
     #[cfg(test)]
     if counted {
+        tcp_write_probe::LAST_RET.store(ret, Ordering::Release);
         tcp_write_probe::RETURNED.fetch_add(1, Ordering::Release);
     }
     ret

@@ -33,25 +33,17 @@ use crate::core::context::input::Input;
 use crate::core::context::output::Output;
 use crate::core::packet_sink::PacketSink;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-/// The wedge tests and the probe confounders sample the same process-wide
-/// `tcp_write_probe` counters, so they must not overlap: a muxer parked in
-/// a write by one test would satisfy (or starve) another test's sampling.
-fn serial() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
 
 /// Stage 4: requires the probe to show exactly one tcp write entered and
 /// not returned, with both counters FROZEN across six consecutive 250 ms
 /// samples. A healthy writer cycles the pair between samples; a starved
 /// muxer (parked in its packet queue) and an exited one sit at
 /// entered == returned. `returned` is loaded before `entered` so a racing
-/// completion can never fake an in-flight call.
+/// completion can never fake an in-flight call. Returns the parked call's
+/// generation — the value of `ENTERED` with that call in flight — so the
+/// caller can later tie the stop() cut back to THIS write and no other.
 fn require_write_parked(deadline: Instant) -> Result<u64, String> {
     let mut prev: Option<(u64, u64)> = None;
     let mut stable = 0u32;
@@ -261,7 +253,7 @@ fn make_backpressure_listener() -> (std::net::TcpListener, bool) {
 /// stage 3 must reject it.
 #[test]
 fn flow_control_repin_rejects_a_writer_that_stalls_after_the_refill() {
-    let _serial = serial();
+    let _serial = tcp_write_probe::exclusive();
     let (listener, _rcvbuf_shrunk) = make_backpressure_listener();
     let addr = listener.local_addr().unwrap();
     let (stream_tx, stream_rx) = std::sync::mpsc::channel();
@@ -366,7 +358,7 @@ fn flow_control_repin_rejects_a_writer_that_stalls_after_the_refill() {
 /// no wedge test is running concurrently).
 #[test]
 fn write_parked_probe_rejects_a_stalled_writer_with_residue() {
-    let _serial = serial();
+    let _serial = tcp_write_probe::exclusive();
     let (listener, _rcvbuf_shrunk) = make_backpressure_listener();
     let addr = listener.local_addr().unwrap();
     let (stream_tx, stream_rx) = std::sync::mpsc::channel();
@@ -444,15 +436,18 @@ fn write_parked_probe_rejects_a_stalled_writer_with_residue() {
 }
 
 /// The finalize-gating probe: a packet sink must never hold the
-/// scheduler-wide I/O finalize exemption. With a sink waiting in its terminal
-/// coordinator and a sibling container blocked on an unread TCP peer,
-/// stop() must still cut the sibling within the grace window and return —
-/// an (ungated) sink-held finalize guard would suppress the cut and hang.
-/// Native codecs only (AAC sink chain, mpeg4 sibling), so every CI lane runs
-/// this — the property is scheduler-wide gating, not encoder behavior.
+/// scheduler-wide I/O finalize exemption. With a sink provably parked in
+/// its terminal coordinator and a sibling container provably blocked inside
+/// a TCP write, stop() must cut that very write within the grace window and
+/// return — an (ungated) sink-held finalize guard would suppress the cut
+/// and hang. The cut is acknowledged end to end: the parked write (and no
+/// other) returns an error, stop() surfaces it, and the sink delivers
+/// exactly one terminal event, the delivery error. Native codecs only (AAC
+/// sink chain, mpeg4 sibling), so every CI lane runs this — the property is
+/// scheduler-wide gating, not encoder behavior.
 #[test]
 fn blocked_sibling_stays_interruptible_while_sink_finalizes() {
-    let _serial = serial();
+    let _serial = tcp_write_probe::exclusive();
     // SO_RCVBUF is pinned small BEFORE listen(2) (Linux; silently falls back
     // to a default listener elsewhere) so the receive queue pins within a
     // couple of polls instead of megabytes later; the drain-and-refill proof
@@ -468,8 +463,10 @@ fn blocked_sibling_stays_interruptible_while_sink_finalizes() {
         }
     });
 
-    // Terminal sink events are counted, not logged: at most one of
-    // on_end/on_delivery_error may fire for the finalizing sink.
+    // Terminal sink events are counted, not logged: nothing may fire while
+    // the coordinator is parked, and across the stop exactly one event —
+    // the delivery error surfacing the cut — may fire for the finalizing
+    // sink.
     let ends = Arc::new(AtomicUsize::new(0));
     let errors = Arc::new(AtomicUsize::new(0));
     let (ends_cb, errors_cb) = (ends.clone(), errors.clone());
@@ -538,7 +535,7 @@ fn blocked_sibling_stays_interruptible_while_sink_finalizes() {
         Instant::now() + Duration::from_secs(20),
     )
     .expect("stage 3");
-    let _in_flight = require_write_parked(Instant::now() + Duration::from_secs(20))
+    let parked_gen = require_write_parked(Instant::now() + Duration::from_secs(20))
         .expect("stage 4: the sibling must be parked inside a tcp write");
     // The liveness half of the contract: a parked write on an ENDED job
     // would be teardown noise, not the running wedge stop() must cut.
@@ -546,6 +543,27 @@ fn blocked_sibling_stays_interruptible_while_sink_finalizes() {
         !scheduler.is_ended(),
         "the job settled during the wedge proof: the sibling exited instead \
          of blocking, so stop() would be cutting nothing"
+    );
+    // The finalizer half: the sink's terminal coordinator must be PARKED in
+    // the settlement barrier when the cut lands — that overlap is the whole
+    // scene. The 300 ms recording limit makes it likely long before the
+    // socket stages finish, but only the barrier's own waiter count proves
+    // it; a sink still short of its wait would let stop() cut the sibling
+    // with no finalize exemption in play. Parked also means not admitted:
+    // no terminal event may have fired yet.
+    let sink_parked_deadline = Instant::now() + Duration::from_secs(10);
+    while scheduler.parked_settlement_waiters() == 0 {
+        assert!(
+            Instant::now() < sink_parked_deadline,
+            "the sink never parked in the settlement barrier: stop() would \
+             not be racing a finalizing sink"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(
+        (ends.load(Ordering::Acquire), errors.load(Ordering::Acquire)),
+        (0, 0),
+        "a terminal sink event fired while the coordinator was still parked"
     );
 
     let (tx, rx) = std::sync::mpsc::channel();
@@ -555,14 +573,45 @@ fn blocked_sibling_stays_interruptible_while_sink_finalizes() {
     let result = rx
         .recv_timeout(Duration::from_secs(30))
         .expect("stop() hung: the sink held the finalize exemption over a blocked sibling");
-    // The sibling was either cut mid-write (an error) or exited between
-    // writes (clean); both are acceptable — the property under test is that
-    // stop() RETURNS.
-    let _ = result;
-    let (end_count, error_count) = (ends.load(Ordering::Acquire), errors.load(Ordering::Acquire));
+    // Cut acknowledgment, tied to the parked generation. stop() joins every
+    // worker before returning, so the counters are settled: exactly the
+    // parked call — write number `parked_gen` — may have returned (the write
+    // loop exits on its first failed write, and the trailer bypasses the
+    // probe), and it must have returned an ERROR. The peer's queue stayed
+    // pinned and unread throughout, so flow control could never complete
+    // that write on its own: only the stop-driven output interrupt can have
+    // unparked it. Any other final state means the "parked" write was not
+    // cut — it finished or cycled on its own and stage 4 watched a healthy
+    // writer, exactly the pass-without-a-wedge this acknowledgment exists
+    // to reject.
+    let entered = tcp_write_probe::ENTERED.load(Ordering::Acquire);
+    let returned = tcp_write_probe::RETURNED.load(Ordering::Acquire);
+    assert_eq!(
+        (entered, returned),
+        (parked_gen, parked_gen),
+        "tcp writes moved past the parked generation across stop()"
+    );
+    let last_ret = tcp_write_probe::LAST_RET.load(Ordering::Acquire);
     assert!(
-        end_count + error_count <= 1,
-        "at most one terminal sink event may fire ({end_count} end, {error_count} error)"
+        last_ret < 0,
+        "the parked write returned {last_ret} (success): stop() cut nothing"
+    );
+    // The cut must also be VISIBLE downstream: the write error is recorded
+    // as the job result before the muxer releases its slot, so stop()
+    // surfaces it, and the sink coordinator — admitted only after that
+    // release — must deliver exactly one terminal event, the delivery
+    // error. An on_end here would certify a clean job whose sibling was
+    // just cut mid-write.
+    assert!(
+        result.is_err(),
+        "stop() must surface the cut write's failure as the job result"
+    );
+    let (end_count, error_count) = (ends.load(Ordering::Acquire), errors.load(Ordering::Acquire));
+    assert_eq!(
+        (end_count, error_count),
+        (0, 1),
+        "the finalizing sink must deliver exactly the cut's failure \
+         ({end_count} end, {error_count} error)"
     );
     // The peer socket stayed open (unread) across the whole stop; the accept
     // thread already exited after handing it over.
