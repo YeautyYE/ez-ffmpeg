@@ -393,6 +393,15 @@ impl<S: 'static> FfmpegScheduler<S> {
     pub fn is_ended(&self) -> bool {
         is_stopping(self.status.load(Ordering::Acquire))
     }
+
+    /// Test-only: how many threads are currently parked in the settlement
+    /// barrier (`wait_peers_settled`). Lets a test prove a terminal
+    /// coordinator is genuinely parked while the rest of the job runs,
+    /// without exposing the synchronizer itself.
+    #[cfg(test)]
+    pub(crate) fn parked_settlement_waiters(&self) -> usize {
+        self.thread_sync.parked_settlement_waiters()
+    }
 }
 
 impl FfmpegScheduler<Initialization> {
