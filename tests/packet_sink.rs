@@ -1008,30 +1008,23 @@ fn prove_post_plateau_refill(
 }
 
 /// Stage 3: with draining stopped for good, requires the queue to pin a
-/// SECOND time at (or above) the first exhaustion level. Stage 2 alone can
-/// exit with the queue well below the pinned level — receive window open,
-/// writer possibly gone idle after a final burst — so this repin is what
-/// proves the window is closed and the sibling is IN a blocked write when
-/// the caller proceeds. The level check allows one segment of slack: the
-/// second exhaustion can differ from the first by in-flight segment
-/// granularity, never by more.
+/// SECOND time. Stage 2 alone can exit mid-refill — receive window open,
+/// arrivals in flight — so the repin is what proves arrivals have CEASED
+/// against a window nobody is opening: a delivering writer would keep
+/// changing the count until flow control stops it. What the socket alone
+/// cannot distinguish is WHY arrivals ceased — blocked in write, or the
+/// writer exited after a final burst that happened to fill the queue. No
+/// byte-count threshold can close that gap (exhaustion levels vary by
+/// segment coalescing and SKB accounting), so callers must pair the repin
+/// with a liveness check on the producing job; the finalize-gating probe
+/// asserts the scheduler has not ended before it proceeds.
 fn require_flow_control_repin(
     stream: &std::net::TcpStream,
     peek_buf: &mut Vec<u8>,
-    pinned: usize,
     deadline: std::time::Instant,
 ) -> Result<usize, String> {
-    const SEGMENT_SLACK: usize = 8 * 1024;
-    let repinned = wait_for_receive_queue_plateau(stream, peek_buf, deadline)
-        .map_err(|e| format!("no second plateau after the refill: {e}"))?;
-    if repinned + SEGMENT_SLACK < pinned {
-        return Err(format!(
-            "the queue re-pinned at {repinned} bytes, below the {pinned}-byte \
-             exhaustion level: the receive window is still open, so the \
-             sibling is not provably blocked in write"
-        ));
-    }
-    Ok(repinned)
+    wait_for_receive_queue_plateau(stream, peek_buf, deadline)
+        .map_err(|e| format!("no second plateau after the refill: {e}"))
 }
 
 /// Pins stage 3 against the confounder it exists for: a writer that
@@ -1120,7 +1113,6 @@ fn flow_control_repin_rejects_a_writer_that_stalls_after_the_refill() {
     let verdict = require_flow_control_repin(
         &stream,
         &mut peek_buf,
-        pinned,
         std::time::Instant::now() + std::time::Duration::from_secs(5),
     );
     let rejection = verdict.expect_err(
@@ -1128,7 +1120,7 @@ fn flow_control_repin_rejects_a_writer_that_stalls_after_the_refill() {
          the finalize-gating probe would run against an unblocked sibling",
     );
     assert!(
-        rejection.contains("no second plateau") || rejection.contains("below the"),
+        rejection.contains("no second plateau"),
         "the rejection must name the missing repin, got: {rejection}"
     );
     drop(stream);
@@ -1220,10 +1212,19 @@ fn blocked_sibling_stays_interruptible_while_sink_finalizes() {
     let _repinned = require_flow_control_repin(
         &stream,
         &mut peek_buf,
-        pinned,
         std::time::Instant::now() + std::time::Duration::from_secs(20),
     )
     .expect("stage 3");
+    // The liveness half of the stage-3 contract: a repinned queue with the
+    // job still running means the sibling is parked IN a blocked write (the
+    // infinite inputs cannot run dry); a repinned queue on an ENDED job is
+    // a writer that exited after a final burst — the confounder the socket
+    // observables cannot separate on their own.
+    assert!(
+        !scheduler.is_ended(),
+        "the job settled during the wedge proof: the sibling exited instead \
+         of blocking, so stop() would be cutting nothing"
+    );
 
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
