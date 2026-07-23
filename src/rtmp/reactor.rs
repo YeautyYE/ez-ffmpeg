@@ -18,11 +18,11 @@ use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
 use rml_rtmp::messages::RtmpMessage;
 use rml_rtmp::rml_amf0::Amf0Value;
 use rml_rtmp::time::RtmpTimestamp;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read};
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 // ============================================================================
@@ -59,6 +59,18 @@ const MAX_PUBLISH_BYTES_PER_POLL: usize = MAX_READ_PER_POLL;
 /// for streams of tiny packets whose byte total stays low. Equal to the
 /// channel capacity: one round can at most clear a full backlog.
 const MAX_PUBLISH_ITEMS_PER_POLL: usize = PUBLISHER_CHANNEL_CAPACITY;
+/// Capacity of the registration handoff between the create paths and the
+/// reactor — the same bound the crossbeam channel it replaced had. Every
+/// queued registration parks a stream-key claim, so an uncapped queue lets a
+/// stalled reactor accumulate claims without limit; at the bound the enqueue
+/// refuses instead, and the caller surfaces a typed error.
+const REGISTRATION_QUEUE_CAPACITY: usize = 1024;
+/// Per-round budget for registrations drained out of the handoff. Without
+/// it, one round transfers the entire backlog and `add_publisher` runs for
+/// all of it before the next poll or stop check, starving sockets; a
+/// remainder instead forces a zero-timeout poll, so the next batch runs
+/// promptly rather than after the poll fallback.
+const MAX_REGISTRATIONS_PER_POLL: usize = 128;
 const DEFAULT_MAX_CONNECTIONS: usize = 10000; // Default max connections (auto-adjusted by system FD limit)
 #[cfg(windows)]
 const DEFAULT_MAX_CONNECTIONS_WINDOWS: usize = 8000; // Conservative default for Windows (no direct FD limit API)
@@ -607,9 +619,240 @@ pub enum PublisherSource {
     Feed(crossbeam_channel::Receiver<PublisherFeed>),
 }
 
+/// RAII claim on a stream key in the shared `stream_keys` set.
+///
+/// [`claim`](Self::claim) inserts the key (insert-or-fail, so two concurrent
+/// claims cannot both win) and the guard releases it **exactly once**, on
+/// drop, wherever the value dies: a refused enqueue, a scheduler refusal
+/// in [`Reactor::add_publisher`], a queued registration nobody ever
+/// consumed, or an accepted publisher's [`PublisherState`] reaching its end
+/// of life ([`Reactor::remove_publisher`], or the reactor being torn down
+/// with publishers still live). The guard is never disarmed — ownership
+/// only ever moves, registration to state — so there is no instant at
+/// which the key is claimed but no guard would release it, and a release
+/// can never fire twice and free a claim another create has re-won in the
+/// meantime.
+pub(crate) struct StreamKeyClaim {
+    stream_keys: Arc<dashmap::DashSet<String>>,
+    /// `Some` while the guard is armed; taken by `drop` (release).
+    stream_key: Option<String>,
+}
+
+impl StreamKeyClaim {
+    /// Atomically claim `stream_key`; gives the key back if already claimed.
+    pub(crate) fn claim(
+        stream_keys: Arc<dashmap::DashSet<String>>,
+        stream_key: String,
+    ) -> Result<Self, String> {
+        if stream_keys.insert(stream_key.clone()) {
+            Ok(Self {
+                stream_keys,
+                stream_key: Some(stream_key),
+            })
+        } else {
+            Err(stream_key)
+        }
+    }
+
+    /// Borrow the claimed key, for scheduler lookups and logging.
+    pub(crate) fn key(&self) -> &str {
+        self.stream_key
+            .as_deref()
+            .expect("an armed claim always holds its key")
+    }
+}
+
+impl Drop for StreamKeyClaim {
+    fn drop(&mut self) {
+        if let Some(stream_key) = self.stream_key.take() {
+            self.stream_keys.remove(&stream_key);
+        }
+    }
+}
+
+/// A publisher registration in flight from the server's `register_publisher`
+/// to the reactor. It carries the key claim so a registration dropped
+/// anywhere short of [`Reactor::add_publisher`] taking ownership — refused
+/// at enqueue because the intake is closed or full, or still queued when the
+/// worker's [`RegistrationKillSwitch`] fires — releases the key automatically.
+pub(crate) struct PublisherRegistration {
+    pub(crate) claim: StreamKeyClaim,
+    pub(crate) source: PublisherSource,
+}
+
+/// The registration queue proper: the worker-liveness flag and the payload
+/// live behind ONE lock so no observer can see them disagree.
+pub(crate) struct RegistrationQueue {
+    /// `false` once the worker has died ([`RegistrationKillSwitch`]'s drop,
+    /// which also drains the queue in the same critical section) or the
+    /// server was signaled to stop ([`RegistrationHandoff::close`], which
+    /// leaves queued entries to the reactor's remaining rounds, backstopped
+    /// by the kill switch's terminal drain). Either flip shares the lock
+    /// with every enqueue: an enqueue happens entirely before it, or
+    /// observes `false` and is refused. There is no in-between.
+    alive: bool,
+    queue: VecDeque<PublisherRegistration>,
+}
+
+/// Hands publisher registrations from the server's create paths to the
+/// reactor worker.
+///
+/// This is deliberately a lock-shared queue and not a channel. With a
+/// channel, "is the worker still there?" and "enqueue the payload" are two
+/// separate linearization points, which leaves structural gaps:
+/// - a send can land after the worker's last drain saw the queue empty, and
+///   a bounded crossbeam channel frees such a message only when its LAST
+///   endpoint drops — the server holds its sender endpoint for as long as
+///   the server value lives, so the message's stream-key claim would leak
+///   for that entire lifetime;
+/// - a drain loop that stops at `Empty` can be kept spinning by a steady
+///   producer, because nothing tells producers to stop.
+///
+/// Here [`enqueue`](Self::enqueue) checks liveness and capacity and pushes
+/// in one critical section, and the kill switch flips liveness and drains in
+/// one critical section, so every registration ends in exactly one of three
+/// hands — the reactor (via [`drain_into`](Self::drain_into)), the terminal
+/// kill-switch drain, or the refused caller — each of which releases the
+/// key claim by dropping the registration.
+pub(crate) struct RegistrationHandoff {
+    queue: Mutex<RegistrationQueue>,
+}
+
+/// Why [`RegistrationHandoff::enqueue`] refused a registration. Both arms
+/// hand the registration back, and dropping it releases the key claim; the
+/// split exists so the create paths can surface distinct errors for "the
+/// server is gone" and "the server is backlogged".
+pub(crate) enum EnqueueRefused {
+    /// The intake is closed: the worker died, or the server was signaled to
+    /// stop. No reactor round will consume the queue again, so accepting
+    /// the registration would report a success that cannot happen.
+    Closed(PublisherRegistration),
+    /// The queue already holds [`REGISTRATION_QUEUE_CAPACITY`] registrations
+    /// the reactor has not picked up. The worker is alive; the caller may
+    /// retry once the backlog drains.
+    Full(PublisherRegistration),
+}
+
+impl RegistrationHandoff {
+    pub(crate) fn new() -> Self {
+        Self {
+            queue: Mutex::new(RegistrationQueue {
+                alive: true,
+                queue: VecDeque::new(),
+            }),
+        }
+    }
+
+    /// Lock the queue, riding over poisoning: the two fields carry no
+    /// cross-statement invariant a panic could tear (every critical section
+    /// is a flag test plus one queue edit), and the kill switch MUST finish
+    /// its terminal drain even if another holder panicked — the claims it
+    /// exists to release would otherwise leak.
+    fn lock(&self) -> MutexGuard<'_, RegistrationQueue> {
+        self.queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Enqueue a registration for the reactor, or hand it back if the worker
+    /// is gone or the queue is at capacity. The liveness check, the capacity
+    /// check and the push share one critical section, so a registration
+    /// accepted here is guaranteed visible to the drain that runs when the
+    /// worker dies — there is no window in which it can be queued yet seen
+    /// by nobody — and the queue can never exceed its bound. The caller
+    /// drops a refused registration, releasing its key claim.
+    pub(crate) fn enqueue(
+        &self,
+        registration: PublisherRegistration,
+    ) -> Result<(), EnqueueRefused> {
+        let mut queue = self.lock();
+        if !queue.alive {
+            Err(EnqueueRefused::Closed(registration))
+        } else if queue.queue.len() >= REGISTRATION_QUEUE_CAPACITY {
+            Err(EnqueueRefused::Full(registration))
+        } else {
+            queue.queue.push_back(registration);
+            Ok(())
+        }
+    }
+
+    /// Close the intake without draining: every enqueue from this point on
+    /// is refused as [`EnqueueRefused::Closed`]. The stop signal calls this
+    /// so a caller that observes the server as stopped can no longer be
+    /// told Ok for a registration no reactor round will consume. Whatever
+    /// is already queued keeps its owner — the reactor's remaining rounds,
+    /// with the kill switch's terminal drain as the claims backstop.
+    pub(crate) fn close(&self) {
+        self.lock().alive = false;
+    }
+
+    /// Move up to [`MAX_REGISTRATIONS_PER_POLL`] queued registrations into
+    /// `batch` under one lock, front first, and report whether any remain.
+    /// The caller processes after this returns, off the lock, so enqueuers
+    /// are never blocked behind scheduler work; the budget keeps a large
+    /// backlog from monopolizing one reactor round, and a `true` return
+    /// tells the caller to come back promptly for the remainder instead of
+    /// sleeping out a full poll timeout on it.
+    fn drain_into(&self, batch: &mut Vec<PublisherRegistration>) -> bool {
+        let mut queue = self.lock();
+        let take = queue.queue.len().min(MAX_REGISTRATIONS_PER_POLL);
+        batch.extend(queue.queue.drain(..take));
+        !queue.queue.is_empty()
+    }
+
+    /// Close the intake and take whatever is still queued, in one critical
+    /// section. After this returns no enqueue can succeed, so the returned
+    /// batch is the final one — a single bounded drain, no re-check loop for
+    /// producers to keep spinning.
+    fn kill(&self) -> VecDeque<PublisherRegistration> {
+        let mut queue = self.lock();
+        queue.alive = false;
+        std::mem::take(&mut queue.queue)
+    }
+}
+
+/// Worker-side guard for a [`RegistrationHandoff`]: dropping it — on normal
+/// exit and unwind alike — closes the registration intake and releases the
+/// key claim of everything still queued.
+///
+/// The worker must arm this as its very first statement, before the fallible
+/// reactor construction and before any log call (a user-installed logger can
+/// panic). From that point, however the worker dies, this drop runs, so no
+/// registration can outlive the worker inside the queue.
+pub(crate) struct RegistrationKillSwitch {
+    handoff: Arc<RegistrationHandoff>,
+}
+
+impl RegistrationKillSwitch {
+    pub(crate) fn arm(handoff: Arc<RegistrationHandoff>) -> Self {
+        Self { handoff }
+    }
+
+    /// The reactor's consume side borrows the handoff through the switch,
+    /// tying the consumer's lifetime to the guard that cleans up after it.
+    pub(crate) fn handoff(&self) -> &RegistrationHandoff {
+        &self.handoff
+    }
+}
+
+impl Drop for RegistrationKillSwitch {
+    fn drop(&mut self) {
+        // Take the leftovers inside the critical section, drop them outside
+        // it: releasing a claim writes to the shared stream-key set, and no
+        // foreign Drop code should ever run under the queue lock.
+        let leftovers = self.handoff.kill();
+        drop(leftovers);
+    }
+}
+
 /// Publisher state
+///
+/// Owns the stream-key claim for as long as the publisher is accepted.
+/// Dropping the state — [`Reactor::remove_publisher`], or the reactor's
+/// `publishers` slab being dropped on teardown, clean exit and unwind
+/// alike — releases the key.
 pub struct PublisherState {
-    pub stream_key: String,
+    pub(crate) claim: StreamKeyClaim,
     pub source: PublisherSource,
 }
 
@@ -665,13 +908,10 @@ pub struct Reactor {
     generations: HashMap<usize, u32>,
     /// Business scheduler
     scheduler: RtmpScheduler,
-    /// Publishers
+    /// Publishers. Each state owns its stream-key claim, so dropping this
+    /// slab (reactor teardown with publishers still live) releases every
+    /// accepted key back to the server's shared set.
     publishers: slab::Slab<PublisherState>,
-    /// stream_key set, shared with the owning `EmbedRtmpServer`. Must be the
-    /// `Arc` the server also reads: `DashSet`'s `Clone` is a deep copy, so a
-    /// by-value set here would leave the server's duplicate-key check reading
-    /// a set nobody writes to and `RtmpStreamAlreadyExists` dead code.
-    stream_keys: Arc<dashmap::DashSet<String>>,
     /// Stop flag
     status: Arc<AtomicUsize>,
     /// Maximum allowed connections (auto-adjusted by system FD limit)
@@ -688,8 +928,8 @@ pub struct Reactor {
     read_pending: HashSet<usize>,
     /// Connections whose poller interest may need updating (dirty tracking for O(m) instead of O(n))
     interest_dirty: HashSet<usize>,
-    /// Reusable buffer for connection IDs (to avoid Vec allocation in hot path)
-    #[allow(dead_code)]
+    /// Reusable scratch for the ids that enqueued fanout data in the current
+    /// `write_pending_packets` pass (avoids a Vec allocation per fanout)
     conn_ids_buffer: Vec<usize>,
     /// Reusable buffer for packets to write (avoids allocation in handle_readable)
     packets_buffer: Vec<(usize, Vec<u8>, bool, bool, bool)>,
@@ -712,15 +952,18 @@ impl Reactor {
     /// # Arguments
     /// * `gop_limit` - Maximum number of GOPs to cache per stream
     /// * `max_connections` - Maximum connections limit (None = auto-detect based on system FD limit)
-    /// * `stream_keys` - Shared set of active stream keys
     /// * `status` - Shared status flag for graceful shutdown
+    ///
+    /// The reactor holds no handle to the server's shared stream-key set:
+    /// every key it ever releases arrives inside a [`StreamKeyClaim`] guard
+    /// (carrying its own reference to that set) and is released by dropping
+    /// the guard.
     ///
     /// The effective max_connections is calculated as:
     /// `min(config_value, 0.8 * system_fd_limit)` to leave headroom for other FDs.
     pub fn new(
         gop_limit: usize,
         max_connections: Option<usize>,
-        stream_keys: Arc<dashmap::DashSet<String>>,
         status: Arc<AtomicUsize>,
     ) -> io::Result<Self> {
         let poller = Poller::new()?;
@@ -734,7 +977,6 @@ impl Reactor {
             generations: HashMap::new(),
             scheduler: RtmpScheduler::new(gop_limit),
             publishers: slab::Slab::with_capacity(64),
-            stream_keys,
             status,
             max_connections: effective_max,
             pending_flush: HashSet::with_capacity(256),
@@ -864,27 +1106,42 @@ impl Reactor {
         }
     }
 
-    /// Add publishers
-    pub fn add_publisher(&mut self, stream_key: String, source: PublisherSource) -> Option<usize> {
+    /// Add publishers.
+    ///
+    /// In-process publishers claim their key in the server's shared set at
+    /// create time (insert-or-fail) and the registration carries that claim
+    /// here, so success does not insert. Acceptance moves the still-armed
+    /// claim into the publisher's state, which owns it until the state drops
+    /// at publisher end-of-life. The move happens before the log call, so
+    /// even a panicking log handler cannot unwind past a key that is claimed
+    /// yet owned by no guard. Refusal drops the claim, which releases the
+    /// key — `new_channel` can refuse a key a network session is already
+    /// publishing to, and leaving the claim in place would block that key
+    /// for in-process creates forever.
+    pub fn add_publisher(&mut self, registration: PublisherRegistration) -> Option<usize> {
+        let PublisherRegistration { claim, source } = registration;
         let entry = self.publishers.vacant_entry();
         let id = entry.key();
 
-        if self.scheduler.new_channel(stream_key.clone(), id) {
-            self.stream_keys.insert(stream_key.clone());
-            entry.insert(PublisherState { stream_key, source });
-            debug!("Publisher {} added", id);
+        if self.scheduler.new_channel(claim.key().to_string(), id) {
+            let state = entry.insert(PublisherState { claim, source });
+            debug!("Publisher {} added for stream: {}", id, state.claim.key());
             Some(id)
         } else {
+            // Dropping `claim` releases the key.
             None
         }
     }
 
-    /// Remove publishers
+    /// Remove publishers.
+    ///
+    /// Dropping the removed state releases its stream-key claim, so the key
+    /// is claimable again the moment the publisher dies here.
     pub fn remove_publisher(&mut self, id: usize) {
         if let Some(pub_state) = self.publishers.try_remove(id) {
             self.scheduler.notify_publisher_closed(id);
-            self.stream_keys.remove(&pub_state.stream_key);
             debug!("Publisher {} removed", id);
+            drop(pub_state);
         }
     }
 
@@ -1125,10 +1382,17 @@ impl Reactor {
         }
     }
 
-    /// Write pending packets to target connections
+    /// Write pending packets to target connections.
+    ///
+    /// Drains `packets_buffer`, enqueueing each packet to its target. Targets
+    /// that accepted data are marked for pending flush and interest update;
+    /// targets that refused (backpressure cap) are pushed into
+    /// `ids_to_close_buffer` — how those close is the caller's decision.
+    /// Shared by the readable-path fanout and `process_publishers`.
     fn write_pending_packets(&mut self) {
-        // Collect IDs that successfully enqueued data for dirty marking
-        let mut enqueued_ids = Vec::new();
+        // Collect the ids that successfully enqueued data for dirty marking
+        // (clear + reuse the scratch buffer; this runs per fanout round).
+        self.conn_ids_buffer.clear();
 
         for (target_id, data, is_keyframe, is_sequence_header, is_video) in
             self.packets_buffer.drain(..)
@@ -1151,7 +1415,7 @@ impl Reactor {
                     is_video,
                 );
                 if enqueued {
-                    enqueued_ids.push(target_id);
+                    self.conn_ids_buffer.push(target_id);
                 } else {
                     // Backpressure too high, cannot enqueue, close target connection
                     self.ids_to_close_buffer.push(target_id);
@@ -1160,7 +1424,7 @@ impl Reactor {
         }
 
         // Mark all connections that received data for pending flush and interest update
-        for id in enqueued_ids {
+        for &id in &self.conn_ids_buffer {
             self.pending_flush.insert(id);
             self.interest_dirty.insert(id);
         }
@@ -1368,36 +1632,18 @@ impl Reactor {
             }
         }
 
-        // Write pending packets and collect IDs that successfully enqueued
-        let mut enqueued_ids = Vec::new();
-        for (target_id, data, is_keyframe, is_sequence_header, is_video) in packets_to_write {
-            if let Some(target_conn) = self.connections.get_mut(target_id) {
-                // Same rule as the readable-path fanout: never append new live
-                // media to a condemned connection — its final tail must drain and
-                // close, not be reopened by a post-condemn packet.
-                if target_conn.is_condemned() {
-                    continue;
-                }
-                let enqueued = target_conn.enqueue_data(
-                    Bytes::from(data),
-                    is_keyframe,
-                    is_sequence_header,
-                    is_video,
-                );
-                if enqueued {
-                    enqueued_ids.push(target_id);
-                } else {
-                    // Backpressure too high, close target connection
-                    ids_to_close.push(target_id);
-                }
-            }
-        }
-
-        // Mark all connections that received data for pending flush and interest update
-        for id in enqueued_ids {
-            self.pending_flush.insert(id);
-            self.interest_dirty.insert(id);
-        }
+        // Fan out through the shared enqueue path: move this round's packets
+        // into `packets_buffer` (empty here — every user drains it fully) and
+        // let `write_pending_packets` apply the condemned-skip and
+        // backpressure rules identically to the readable-path fanout. The
+        // loop above must collect into locals instead of pushing straight
+        // into `packets_buffer`: `dispatch_publish_bytes` already borrows
+        // `self` mutably.
+        self.packets_buffer.append(&mut packets_to_write);
+        self.write_pending_packets();
+        // Backpressured targets are closed the same way as scheduler-driven
+        // ones, appended after them so the close order matches arrival order.
+        ids_to_close.append(&mut self.ids_to_close_buffer);
 
         // Close connections that need closing, flushing the status packet
         // (e.g. finish_playing) enqueued just above in the same round.
@@ -1582,7 +1828,7 @@ impl Reactor {
     pub fn run(
         &mut self,
         connection_receiver: crossbeam_channel::Receiver<TcpStream>,
-        publisher_receiver: crossbeam_channel::Receiver<(String, PublisherSource)>,
+        registrations: &RegistrationHandoff,
         waker: Option<Waker>,
     ) {
         info!("Reactor started");
@@ -1609,6 +1855,17 @@ impl Reactor {
         // will ever announce.
         let mut publishers_pending = false;
 
+        // Event buffer reused across poll wakeups: poll clears and refills
+        // it instead of allocating a fresh Vec every iteration.
+        let mut events = Vec::new();
+
+        // Registration batch reused across iterations for the same reason.
+        // Registrations are moved out of the shared queue under its lock and
+        // processed here off the lock; leftovers queued when this loop exits
+        // are released by the worker's RegistrationKillSwitch, one level
+        // above — which also covers the case where this loop never ran.
+        let mut registration_batch: Vec<PublisherRegistration> = Vec::new();
+
         loop {
             // 1. Check stop signal
             if self.status.load(Ordering::Acquire) == STATUS_END {
@@ -1628,11 +1885,14 @@ impl Reactor {
                 }
             }
 
-            // 3. Non-blocking receive new publishers
+            // 3. Take up to a budget of queued publisher registrations (one
+            // lock), then process them off the lock. The budget bounds how
+            // long this step can keep sockets waiting; a remainder makes the
+            // poll below non-blocking so the next round picks it up promptly.
             let mut new_publisher_added = false;
-            while let Ok((stream_key, source)) = publisher_receiver.try_recv() {
-                if self.add_publisher(stream_key.clone(), source).is_some() {
-                    debug!("New publisher added for stream: {}", stream_key);
+            let registrations_pending = registrations.drain_into(&mut registration_batch);
+            for registration in registration_batch.drain(..) {
+                if self.add_publisher(registration).is_some() {
                     new_publisher_added = true;
                 }
             }
@@ -1648,24 +1908,25 @@ impl Reactor {
             // immediately instead of stalling on the poll timeout (PERF-5a).
             //
             // The same applies when the previous round's publisher drain hit
-            // its budget: the leftover items sit on a channel the poller
-            // cannot see, so a blocking poll would add up to POLL_TIMEOUT_MS
-            // of latency per excess batch. Poll non-blocking and let steps
-            // 5-10 run in between, which is exactly what the budget exists
-            // to guarantee.
-            let poll_wait =
-                if new_publisher_added || publishers_pending || !self.read_pending.is_empty() {
-                    Duration::ZERO
-                } else {
-                    poll_timeout
-                };
-            let events = match self.poller.poll(Some(poll_wait)) {
-                Ok(events) => events,
-                Err(e) => {
-                    error!("Poller error: {:?}", e);
-                    continue;
-                }
+            // its budget, and when this round's registration drain left a
+            // remainder: the leftover items sit on a channel or queue the
+            // poller cannot see, so a blocking poll would add up to
+            // POLL_TIMEOUT_MS of latency per excess batch. Poll non-blocking
+            // and let steps 5-10 run in between, which is exactly what the
+            // budgets exist to guarantee.
+            let poll_wait = if new_publisher_added
+                || publishers_pending
+                || registrations_pending
+                || !self.read_pending.is_empty()
+            {
+                Duration::ZERO
+            } else {
+                poll_timeout
             };
+            if let Err(e) = self.poller.poll(Some(poll_wait), &mut events) {
+                error!("Poller error: {:?}", e);
+                continue;
+            }
 
             // 5-pre. Snapshot the cap-hit re-drain set BEFORE processing this
             // round's events: ids inserted during step 5 below belong to the
@@ -1683,7 +1944,7 @@ impl Reactor {
             let mut ids_to_close = Vec::new();
             let mut read_ids: Vec<usize> = Vec::new();
 
-            for event in events {
+            for event in &events {
                 let poller_token = event.token;
 
                 // Wakeup token: drain it and fall through to the channel-drain
@@ -1994,10 +2255,8 @@ mod tests {
 
     #[test]
     fn test_check_timeouts_throttle_and_detection() {
-        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
-        let mut reactor =
-            Reactor::new(3, None, stream_keys, status).expect("Failed to create reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("Failed to create reactor");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
         let addr = listener.local_addr().expect("Failed to get address");
@@ -2043,20 +2302,17 @@ mod tests {
 
     #[test]
     fn test_reactor_creation() {
-        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
 
-        let reactor = Reactor::new(3, None, stream_keys, status);
+        let reactor = Reactor::new(3, None, status);
         assert!(reactor.is_ok());
     }
 
     #[test]
     fn test_connection_generation_increments() {
-        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
 
-        let mut reactor =
-            Reactor::new(3, None, stream_keys, status).expect("Failed to create reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("Failed to create reactor");
 
         // Create a listener and accept multiple connections
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
@@ -2090,11 +2346,9 @@ mod tests {
 
     #[test]
     fn test_token_validation() {
-        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
 
-        let mut reactor =
-            Reactor::new(3, None, stream_keys, status).expect("Failed to create reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("Failed to create reactor");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
         let addr = listener.local_addr().expect("Failed to get address");
@@ -2127,11 +2381,9 @@ mod tests {
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn test_generation_prevents_aba_problem() {
-        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
 
-        let mut reactor =
-            Reactor::new(3, None, stream_keys, status).expect("Failed to create reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("Failed to create reactor");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
         let addr = listener.local_addr().expect("Failed to get address");
@@ -2176,11 +2428,9 @@ mod tests {
     /// Note: This test creates connections but doesn't run the full RTMP handshake
     #[test]
     fn test_many_connections_creation() {
-        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
 
-        let mut reactor =
-            Reactor::new(3, None, stream_keys, status).expect("Failed to create reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("Failed to create reactor");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
         let addr = listener.local_addr().expect("Failed to get address");
@@ -2223,11 +2473,9 @@ mod tests {
     fn perf_connection_scaling() {
         use std::time::Instant;
 
-        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
 
-        let mut reactor =
-            Reactor::new(3, None, stream_keys, status).expect("Failed to create reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("Failed to create reactor");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
         let addr = listener.local_addr().expect("Failed to get address");
@@ -2299,11 +2547,9 @@ mod tests {
         use std::io::Write;
         use std::time::Instant;
 
-        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
 
-        let mut reactor =
-            Reactor::new(3, None, stream_keys, status).expect("Failed to create reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("Failed to create reactor");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
         let addr = listener.local_addr().expect("Failed to get address");
@@ -2371,11 +2617,9 @@ mod tests {
     fn test_handle_writable_marks_interest_dirty_on_queue_drain() {
         use std::io::Read;
 
-        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
 
-        let mut reactor =
-            Reactor::new(3, None, stream_keys, status).expect("Failed to create reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("Failed to create reactor");
 
         // Create a listener and connection pair
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
@@ -2436,11 +2680,9 @@ mod tests {
     fn test_flush_pending_marks_interest_dirty_on_queue_drain() {
         use std::io::Read;
 
-        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
 
-        let mut reactor =
-            Reactor::new(3, None, stream_keys, status).expect("Failed to create reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("Failed to create reactor");
 
         // Create a listener and connection pair
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
@@ -2521,10 +2763,8 @@ mod tests {
     fn test_flush_pending_wouldblock_registers_writable_not_pending_flush() {
         use std::os::unix::io::AsRawFd;
 
-        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
-        let mut reactor =
-            Reactor::new(3, None, stream_keys, status).expect("Failed to create reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("Failed to create reactor");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
         let addr = listener.local_addr().expect("Failed to get address");
@@ -2580,11 +2820,9 @@ mod tests {
     /// Test that flush_pending marks interest_dirty when connection has no pending writes
     #[test]
     fn test_flush_pending_marks_interest_dirty_when_no_pending_writes() {
-        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
 
-        let mut reactor =
-            Reactor::new(3, None, stream_keys, status).expect("Failed to create reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("Failed to create reactor");
 
         // Create a listener and connection pair
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
@@ -2638,12 +2876,16 @@ mod tests {
 
         let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
-        let mut reactor = Reactor::new(3, None, stream_keys, status).expect("reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("reactor");
 
         // Register an in-process (create_rtmp_input-style) Feed publisher.
         let (feed_tx, feed_rx) = crossbeam_channel::bounded(64);
+        let claim = StreamKeyClaim::claim(stream_keys, "live".to_string()).expect("claim");
         let pub_id = reactor
-            .add_publisher("live".to_string(), PublisherSource::Feed(feed_rx))
+            .add_publisher(PublisherRegistration {
+                claim,
+                source: PublisherSource::Feed(feed_rx),
+            })
             .expect("publisher registered");
 
         // Realistic mixed sequence on ONE FIFO feed: connect/createStream/publish
@@ -2676,7 +2918,7 @@ mod tests {
                 data: Bytes::from_static(&[0x17, 0x01, 0xAA, 0xBB]),
             })
             .unwrap();
-        // A second IDR freezes the first GOP into the replay cache.
+        // A second keyframe freezes the first GOP into the replay cache.
         feed_tx
             .send(PublisherFeed::Media {
                 tag_type: 0x09,
@@ -2724,6 +2966,491 @@ mod tests {
         );
     }
 
+    // The claim guard has exactly one exit: drop releases the key. Moving
+    // the guard (into a registration, into the accepted publisher's state)
+    // neither releases nor re-inserts anything.
+    #[test]
+    fn stream_key_claim_releases_on_drop_but_not_on_move() {
+        let stream_keys: Arc<dashmap::DashSet<String>> = Arc::new(dashmap::DashSet::new());
+
+        let claim = StreamKeyClaim::claim(stream_keys.clone(), "k".to_string()).expect("claim");
+        assert!(
+            StreamKeyClaim::claim(stream_keys.clone(), "k".to_string()).is_err(),
+            "a second claim for a held key must lose"
+        );
+
+        // A move is not an exit: the moved-from binding runs no Drop.
+        let moved = claim;
+        assert!(
+            stream_keys.contains("k"),
+            "moving the guard must keep the key claimed"
+        );
+
+        drop(moved);
+        assert!(!stream_keys.contains("k"), "drop must release the claim");
+    }
+
+    // add_publisher owns the claim it is handed: acceptance moves the
+    // still-armed claim into the publisher's state, released when that
+    // state drops (here via remove_publisher); refusal (a network session
+    // already publishes the key, which never touches stream_keys) drops
+    // the claim and frees the key immediately.
+    #[test]
+    fn add_publisher_acceptance_defers_release_refusal_frees_the_key() {
+        let stream_keys = Arc::new(dashmap::DashSet::new());
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let mut reactor = Reactor::new(3, None, status).expect("reactor");
+
+        let (_feed_tx, feed_rx) = crossbeam_channel::bounded::<PublisherFeed>(1);
+        let claim =
+            StreamKeyClaim::claim(stream_keys.clone(), "live".to_string()).expect("claim");
+        let id = reactor
+            .add_publisher(PublisherRegistration {
+                claim,
+                source: PublisherSource::Feed(feed_rx),
+            })
+            .expect("accepted");
+        assert!(
+            stream_keys.contains("live"),
+            "acceptance must keep the key claimed"
+        );
+        reactor.remove_publisher(id);
+        assert!(
+            !stream_keys.contains("live"),
+            "removing the publisher must release its key"
+        );
+
+        // Simulate a network publisher owning "net" inside the scheduler.
+        assert!(reactor.scheduler.new_channel("net".to_string(), 777));
+        let (_feed_tx2, feed_rx2) = crossbeam_channel::bounded::<PublisherFeed>(1);
+        let claim = StreamKeyClaim::claim(stream_keys.clone(), "net".to_string()).expect("claim");
+        assert!(
+            reactor
+                .add_publisher(PublisherRegistration {
+                    claim,
+                    source: PublisherSource::Feed(feed_rx2),
+                })
+                .is_none(),
+            "a key already being published must be refused"
+        );
+        assert!(
+            !stream_keys.contains("net"),
+            "a refused registration must release its key claim"
+        );
+    }
+
+    // A registration enqueued while the reactor is stopping is never
+    // consumed — run() checks the stop flag before draining registrations.
+    // Its queued claim must not outlive the worker: the key must be
+    // claimable again even though the server side still holds the handoff.
+    #[test]
+    fn reactor_stop_releases_enqueued_but_unconsumed_key_claims() {
+        let stream_keys = Arc::new(dashmap::DashSet::new());
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let mut reactor = Reactor::new(3, None, status.clone()).expect("reactor");
+
+        let (_connection_sender, connection_receiver) =
+            crossbeam_channel::bounded::<TcpStream>(1);
+        let registrations = Arc::new(RegistrationHandoff::new());
+        let kill_switch = RegistrationKillSwitch::arm(registrations.clone());
+
+        // Enqueue a registration, then signal stop so run() exits on its
+        // first stop-flag check without ever draining the queue.
+        let (_feed_tx, feed_rx) = crossbeam_channel::bounded::<PublisherFeed>(1);
+        let claim = StreamKeyClaim::claim(stream_keys.clone(), "orphan".to_string())
+            .expect("first claim must win");
+        registrations
+            .enqueue(PublisherRegistration {
+                claim,
+                source: PublisherSource::Feed(feed_rx),
+            })
+            .unwrap_or_else(|_| panic!("enqueue while the worker lives"));
+        status.store(STATUS_END, Ordering::Release);
+
+        reactor.run(connection_receiver, kill_switch.handoff(), None);
+
+        // Tear the worker down in its real order: reactor first, then the
+        // kill switch fires the terminal drain.
+        drop(reactor);
+        drop(kill_switch);
+
+        // The server-side handle is still alive, so only the worker's exit
+        // drain can have released the claim.
+        assert!(
+            !stream_keys.contains("orphan"),
+            "a stopped reactor must release queued, never-consumed key claims"
+        );
+        assert!(
+            StreamKeyClaim::claim(stream_keys.clone(), "orphan".to_string()).is_ok(),
+            "the key must be claimable again after the reactor stopped"
+        );
+        drop(registrations);
+    }
+
+    // Reactor teardown must release accepted publishers' key claims: run()
+    // can exit — stop signal or unwind — with publishers still in the slab,
+    // and dropping the reactor is the worker's last word on them, so the
+    // keys must be claimable again afterwards.
+    #[test]
+    fn reactor_teardown_releases_accepted_publisher_key_claims() {
+        let stream_keys = Arc::new(dashmap::DashSet::new());
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let mut reactor = Reactor::new(3, None, status.clone()).expect("reactor");
+
+        let (_feed_tx, feed_rx) = crossbeam_channel::bounded::<PublisherFeed>(1);
+        let claim =
+            StreamKeyClaim::claim(stream_keys.clone(), "live".to_string()).expect("claim");
+        reactor
+            .add_publisher(PublisherRegistration {
+                claim,
+                source: PublisherSource::Feed(feed_rx),
+            })
+            .expect("accepted");
+        assert!(
+            stream_keys.contains("live"),
+            "an accepted publisher's key stays claimed while the reactor lives"
+        );
+
+        // run() exits on the stop flag with the publisher still in the slab.
+        let (_connection_sender, connection_receiver) =
+            crossbeam_channel::bounded::<TcpStream>(1);
+        let registrations = Arc::new(RegistrationHandoff::new());
+        let kill_switch = RegistrationKillSwitch::arm(registrations);
+        status.store(STATUS_END, Ordering::Release);
+        reactor.run(connection_receiver, kill_switch.handoff(), None);
+
+        drop(reactor);
+        assert!(
+            !stream_keys.contains("live"),
+            "tearing the reactor down must release accepted publishers' keys"
+        );
+        assert!(
+            StreamKeyClaim::claim(stream_keys.clone(), "live".to_string()).is_ok(),
+            "the key must be claimable again after teardown"
+        );
+    }
+
+    // The worker can die BEFORE run() ever executes — Reactor::new failing
+    // is enough — and the create paths keep their handle to the handoff for
+    // as long as the server value lives. The kill switch is armed before the
+    // reactor is constructed, so even that early death must release queued
+    // claims (this leaked for the server's lifetime when the payload rode a
+    // channel: the queued message stayed alive with the server's endpoint).
+    #[test]
+    fn worker_death_before_reactor_construction_releases_queued_key_claims() {
+        let stream_keys: Arc<dashmap::DashSet<String>> = Arc::new(dashmap::DashSet::new());
+        let registrations = Arc::new(RegistrationHandoff::new());
+
+        // The worker arms the switch before anything fallible.
+        let kill_switch = RegistrationKillSwitch::arm(registrations.clone());
+
+        let (_feed_tx, feed_rx) = crossbeam_channel::bounded::<PublisherFeed>(1);
+        let claim = StreamKeyClaim::claim(stream_keys.clone(), "orphan".to_string())
+            .expect("first claim must win");
+        registrations
+            .enqueue(PublisherRegistration {
+                claim,
+                source: PublisherSource::Feed(feed_rx),
+            })
+            .unwrap_or_else(|_| panic!("enqueue while the worker lives"));
+
+        // Reactor::new failed: the worker dies without ever running the
+        // reactor, and only the switch's drop stands between the queued
+        // claim and a server-lifetime leak.
+        drop(kill_switch);
+
+        // The server still holds its handle, so only the worker-side drain
+        // can have released the claim.
+        assert!(
+            !stream_keys.contains("orphan"),
+            "a worker that died before constructing the reactor must release queued key claims"
+        );
+
+        // The same drop also closed the intake, under the same lock that
+        // drained the queue: a late create is refused in its own enqueue
+        // critical section — it can never park a claim in a queue nobody
+        // will ever drain again — and dropping the refusal releases its
+        // claim immediately.
+        let (_late_tx, late_rx) = crossbeam_channel::bounded::<PublisherFeed>(1);
+        let late_claim = StreamKeyClaim::claim(stream_keys.clone(), "late".to_string())
+            .expect("claim after worker death");
+        let refused = registrations.enqueue(PublisherRegistration {
+            claim: late_claim,
+            source: PublisherSource::Feed(late_rx),
+        });
+        assert!(
+            refused.is_err(),
+            "the registration intake must be closed once the worker died"
+        );
+        drop(refused);
+        assert!(
+            !stream_keys.contains("late"),
+            "a refused registration must release its key claim immediately"
+        );
+    }
+
+    // drain_into moves ownership: the batch holds the registrations (claims
+    // still armed) and the queue is left empty, so a registration is
+    // consumed exactly once and released exactly once.
+    #[test]
+    fn drain_into_hands_queued_registrations_to_the_consumer_exactly_once() {
+        let stream_keys: Arc<dashmap::DashSet<String>> = Arc::new(dashmap::DashSet::new());
+        let registrations = RegistrationHandoff::new();
+
+        for key in ["a", "b"] {
+            let (_feed_tx, feed_rx) = crossbeam_channel::bounded::<PublisherFeed>(1);
+            let claim = StreamKeyClaim::claim(stream_keys.clone(), key.to_string())
+                .expect("first claim must win");
+            registrations
+                .enqueue(PublisherRegistration {
+                    claim,
+                    source: PublisherSource::Feed(feed_rx),
+                })
+                .unwrap_or_else(|_| panic!("enqueue while alive"));
+        }
+
+        let mut batch = Vec::new();
+        registrations.drain_into(&mut batch);
+        assert_eq!(batch.len(), 2, "one drain takes everything queued");
+        assert!(
+            stream_keys.contains("a") && stream_keys.contains("b"),
+            "drained registrations still hold their claims"
+        );
+
+        registrations.drain_into(&mut batch);
+        assert_eq!(batch.len(), 2, "the queue must be empty after a drain");
+
+        drop(batch);
+        assert!(
+            !stream_keys.contains("a") && !stream_keys.contains("b"),
+            "dropping the batch must release the claims exactly once"
+        );
+    }
+
+    // The intake is bounded at REGISTRATION_QUEUE_CAPACITY — the bound the
+    // crossbeam channel this queue replaced enforced. The capacity check
+    // shares the enqueue's critical section, so the entry past the bound is
+    // refused as Full with the queue still exactly at capacity; dropping
+    // the refusal reopens its key immediately. A stalled reactor thus costs
+    // callers a typed error, not an unbounded backlog of parked claims.
+    #[test]
+    fn full_registration_queue_refuses_enqueue_and_reopens_the_key() {
+        let stream_keys: Arc<dashmap::DashSet<String>> = Arc::new(dashmap::DashSet::new());
+        let registrations = RegistrationHandoff::new();
+
+        for i in 0..REGISTRATION_QUEUE_CAPACITY {
+            let (_feed_tx, feed_rx) = crossbeam_channel::bounded::<PublisherFeed>(1);
+            let claim = StreamKeyClaim::claim(stream_keys.clone(), format!("k-{i}"))
+                .expect("first claim must win");
+            registrations
+                .enqueue(PublisherRegistration {
+                    claim,
+                    source: PublisherSource::Feed(feed_rx),
+                })
+                .unwrap_or_else(|_| panic!("enqueue {i} within the bound must be accepted"));
+        }
+
+        let (_feed_tx, feed_rx) = crossbeam_channel::bounded::<PublisherFeed>(1);
+        let claim = StreamKeyClaim::claim(stream_keys.clone(), "overflow".to_string())
+            .expect("first claim must win");
+        let refused = registrations.enqueue(PublisherRegistration {
+            claim,
+            source: PublisherSource::Feed(feed_rx),
+        });
+        assert!(
+            matches!(refused, Err(EnqueueRefused::Full(_))),
+            "the enqueue past the bound must be refused as Full"
+        );
+
+        drop(refused);
+        assert!(
+            !stream_keys.contains("overflow"),
+            "a refused registration must release its key claim"
+        );
+        assert!(
+            StreamKeyClaim::claim(stream_keys.clone(), "overflow".to_string()).is_ok(),
+            "the key must be claimable again right after the refusal"
+        );
+
+        // The refusal is backpressure, not closure: draining the backlog
+        // makes the same intake accept again, and no queued entry was lost
+        // to the refused push.
+        let mut batch = Vec::new();
+        while registrations.drain_into(&mut batch) {}
+        assert_eq!(
+            batch.len(),
+            REGISTRATION_QUEUE_CAPACITY,
+            "the refusal must leave the queued entries intact"
+        );
+        let (_feed_tx, feed_rx) = crossbeam_channel::bounded::<PublisherFeed>(1);
+        let claim = StreamKeyClaim::claim(stream_keys.clone(), "after-drain".to_string())
+            .expect("claim after the drain");
+        assert!(
+            registrations
+                .enqueue(PublisherRegistration {
+                    claim,
+                    source: PublisherSource::Feed(feed_rx),
+                })
+                .is_ok(),
+            "a drained intake must accept registrations again"
+        );
+    }
+
+    // drain_into is budgeted: one call takes at most
+    // MAX_REGISTRATIONS_PER_POLL entries — front first — and reports
+    // whether a remainder is left, which the run loop turns into a
+    // zero-timeout poll. A backlog larger than the budget therefore spreads
+    // across rounds without losing entries or reordering them, instead of
+    // monopolizing a single round while sockets wait.
+    #[test]
+    fn drain_into_budgets_each_round_without_losing_or_reordering_entries() {
+        let stream_keys: Arc<dashmap::DashSet<String>> = Arc::new(dashmap::DashSet::new());
+        let registrations = RegistrationHandoff::new();
+
+        let total = MAX_REGISTRATIONS_PER_POLL * 2 + 3;
+        for i in 0..total {
+            let (_feed_tx, feed_rx) = crossbeam_channel::bounded::<PublisherFeed>(1);
+            let claim = StreamKeyClaim::claim(stream_keys.clone(), format!("k-{i:04}"))
+                .expect("first claim must win");
+            registrations
+                .enqueue(PublisherRegistration {
+                    claim,
+                    source: PublisherSource::Feed(feed_rx),
+                })
+                .unwrap_or_else(|_| panic!("enqueue {i} within the bound"));
+        }
+
+        // One budgeted batch per simulated reactor round.
+        let mut drained_keys = Vec::new();
+        let mut rounds = 0;
+        loop {
+            let mut batch = Vec::new();
+            let more = registrations.drain_into(&mut batch);
+            assert!(
+                batch.len() <= MAX_REGISTRATIONS_PER_POLL,
+                "one round must not exceed the drain budget"
+            );
+            drained_keys.extend(batch.iter().map(|r| r.claim.key().to_string()));
+            rounds += 1;
+            if !more {
+                break;
+            }
+            assert_eq!(
+                batch.len(),
+                MAX_REGISTRATIONS_PER_POLL,
+                "a round that reports a remainder must have used its whole budget"
+            );
+        }
+
+        assert_eq!(
+            rounds, 3,
+            "the backlog must spread across ceil(total / budget) rounds"
+        );
+        let expected: Vec<String> = (0..total).map(|i| format!("k-{i:04}")).collect();
+        assert_eq!(
+            drained_keys, expected,
+            "every entry must arrive exactly once, in enqueue order"
+        );
+    }
+
+    // A worker can construct the reactor and still die before consuming a
+    // queued registration — run() may never be reached, or exit on the stop
+    // flag ahead of its first drain. The registration's claim lives in the
+    // handoff queue, not in the reactor, so worker teardown (reactor drop,
+    // then kill-switch drop) must release it and reopen the key even though
+    // the server side keeps its handle to the handoff alive.
+    #[test]
+    fn worker_exit_without_consuming_registration_reopens_the_key() {
+        let stream_keys: Arc<dashmap::DashSet<String>> = Arc::new(dashmap::DashSet::new());
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let reactor = Reactor::new(3, None, status).expect("reactor");
+
+        let registrations = Arc::new(RegistrationHandoff::new());
+        let kill_switch = RegistrationKillSwitch::arm(registrations.clone());
+
+        let (_feed_tx, feed_rx) = crossbeam_channel::bounded::<PublisherFeed>(1);
+        let claim = StreamKeyClaim::claim(stream_keys.clone(), "held".to_string())
+            .expect("first claim must win");
+        registrations
+            .enqueue(PublisherRegistration {
+                claim,
+                source: PublisherSource::Feed(feed_rx),
+            })
+            .unwrap_or_else(|_| panic!("enqueue while the worker lives"));
+        assert!(
+            stream_keys.contains("held"),
+            "a queued registration keeps its key claimed"
+        );
+
+        // Worker teardown in its real order, the registration never
+        // consumed: the reactor goes first, then the kill switch fires the
+        // terminal drain.
+        drop(reactor);
+        drop(kill_switch);
+
+        assert!(
+            !stream_keys.contains("held"),
+            "worker exit must release a never-consumed registration's key claim"
+        );
+        assert!(
+            StreamKeyClaim::claim(stream_keys.clone(), "held".to_string()).is_ok(),
+            "a create for the same key must win again after the worker died"
+        );
+    }
+
+    // An accepted publisher's claim rides the full chain — enqueued into the
+    // handoff, drained by the consume side, moved into PublisherState by
+    // add_publisher — and its last owner is the reactor's publisher slab.
+    // Dropping the reactor with the publisher still live (exactly what a
+    // run() exit leaves behind: nothing calls remove_publisher on shutdown)
+    // must release the key and make it claimable again.
+    #[test]
+    fn reactor_drop_with_live_consumed_publisher_reopens_the_key() {
+        let stream_keys: Arc<dashmap::DashSet<String>> = Arc::new(dashmap::DashSet::new());
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let mut reactor = Reactor::new(3, None, status).expect("reactor");
+
+        let registrations = Arc::new(RegistrationHandoff::new());
+        let kill_switch = RegistrationKillSwitch::arm(registrations.clone());
+
+        let (_feed_tx, feed_rx) = crossbeam_channel::bounded::<PublisherFeed>(1);
+        let claim = StreamKeyClaim::claim(stream_keys.clone(), "live".to_string())
+            .expect("first claim must win");
+        registrations
+            .enqueue(PublisherRegistration {
+                claim,
+                source: PublisherSource::Feed(feed_rx),
+            })
+            .unwrap_or_else(|_| panic!("enqueue while the worker lives"));
+
+        // The reactor's consume side: one drain, then acceptance moves the
+        // still-armed claim into PublisherState.
+        let mut batch = Vec::new();
+        kill_switch.handoff().drain_into(&mut batch);
+        assert_eq!(batch.len(), 1, "the queued registration must be drained");
+        for registration in batch.drain(..) {
+            reactor.add_publisher(registration).expect("accepted");
+        }
+        assert!(
+            stream_keys.contains("live"),
+            "an accepted publisher keeps its key claimed while the reactor lives"
+        );
+
+        // run() exits with the publisher still in the slab; the reactor drop
+        // is the worker's last word on it. The kill switch is still armed, so
+        // the release below can only come from the publisher slab dropping.
+        drop(reactor);
+        assert!(
+            !stream_keys.contains("live"),
+            "dropping the reactor must release live publishers' key claims"
+        );
+        assert!(
+            StreamKeyClaim::claim(stream_keys.clone(), "live".to_string()).is_ok(),
+            "a create for the same key must win again after the reactor died"
+        );
+        drop(kill_switch);
+    }
+
     // H8.c: a server-initiated close must first try to flush what was queued
     // in the same round — most visibly the finish_playing status a watcher
     // gets when the publisher ends. A raw remove_connection dropped it: the
@@ -2732,9 +3459,8 @@ mod tests {
     fn close_connection_after_flush_delivers_the_queued_tail() {
         use std::io::Read;
 
-        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
-        let mut reactor = Reactor::new(3, None, stream_keys, status).expect("reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("reactor");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
         let addr = listener.local_addr().expect("Failed to get address");
@@ -2785,9 +3511,8 @@ mod tests {
         use std::io::Read;
         use std::os::unix::io::AsRawFd;
 
-        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
-        let mut reactor = Reactor::new(3, None, stream_keys, status).expect("reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("reactor");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
         let addr = listener.local_addr().expect("Failed to get address");
@@ -2869,9 +3594,8 @@ mod tests {
     fn condemn_deadline_backstops_a_peer_that_never_reads() {
         use std::os::unix::io::AsRawFd;
 
-        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
-        let mut reactor = Reactor::new(3, None, stream_keys, status).expect("reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("reactor");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
         let addr = listener.local_addr().expect("Failed to get address");
@@ -2935,9 +3659,8 @@ mod tests {
     fn condemned_connection_is_skipped_by_live_fanout_and_closes_on_drain() {
         use std::io::Read;
 
-        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
-        let mut reactor = Reactor::new(3, None, stream_keys, status).expect("reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("reactor");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
         let addr = listener.local_addr().expect("Failed to get address");
@@ -3027,12 +3750,16 @@ mod tests {
     fn publisher_drain_item_budget_bounds_one_round() {
         let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
-        let mut reactor = Reactor::new(3, None, stream_keys, status).expect("reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("reactor");
 
         // Channel larger than the budget so the backlog fits in one send burst.
         let (feed_tx, feed_rx) = crossbeam_channel::bounded(MAX_PUBLISH_ITEMS_PER_POLL + 64);
+        let claim = StreamKeyClaim::claim(stream_keys, "live".to_string()).expect("claim");
         reactor
-            .add_publisher("live".to_string(), PublisherSource::Feed(feed_rx))
+            .add_publisher(PublisherRegistration {
+                claim,
+                source: PublisherSource::Feed(feed_rx),
+            })
             .expect("publisher registered");
 
         // Budget + 6 tiny audio tags queued ahead of a single drain.
@@ -3069,11 +3796,15 @@ mod tests {
     fn publisher_drain_byte_budget_bounds_one_round() {
         let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
-        let mut reactor = Reactor::new(3, None, stream_keys, status).expect("reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("reactor");
 
         let (feed_tx, feed_rx) = crossbeam_channel::bounded(16);
+        let claim = StreamKeyClaim::claim(stream_keys, "live".to_string()).expect("claim");
         reactor
-            .add_publisher("live".to_string(), PublisherSource::Feed(feed_rx))
+            .add_publisher(PublisherRegistration {
+                claim,
+                source: PublisherSource::Feed(feed_rx),
+            })
             .expect("publisher registered");
 
         // 3 x 200KiB crosses the 512KiB byte budget on the third item
@@ -3118,11 +3849,15 @@ mod tests {
     fn publisher_drain_oversized_item_is_consumed_not_dropped() {
         let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
-        let mut reactor = Reactor::new(3, None, stream_keys, status).expect("reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("reactor");
 
         let (feed_tx, feed_rx) = crossbeam_channel::bounded(4);
+        let claim = StreamKeyClaim::claim(stream_keys, "live".to_string()).expect("claim");
         reactor
-            .add_publisher("live".to_string(), PublisherSource::Feed(feed_rx))
+            .add_publisher(PublisherRegistration {
+                claim,
+                source: PublisherSource::Feed(feed_rx),
+            })
             .expect("publisher registered");
 
         // A single 600KiB audio sequence header (> byte budget), then a small
@@ -3182,10 +3917,8 @@ mod tests {
     fn reactor_with_handshake_bytes_pending() -> (Reactor, ConnectionToken, TcpStream) {
         use std::io::Write;
 
-        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
-        let mut reactor =
-            Reactor::new(3, None, stream_keys, status).expect("Failed to create reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("Failed to create reactor");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
         let addr = listener.local_addr().expect("Failed to get address");
@@ -3267,10 +4000,8 @@ mod tests {
     /// connection that reused the id. Removal must scrub the set.
     #[test]
     fn remove_connection_scrubs_read_pending() {
-        let stream_keys = Arc::new(dashmap::DashSet::new());
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
-        let mut reactor =
-            Reactor::new(3, None, stream_keys, status).expect("Failed to create reactor");
+        let mut reactor = Reactor::new(3, None, status).expect("Failed to create reactor");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
         let addr = listener.local_addr().expect("Failed to get address");

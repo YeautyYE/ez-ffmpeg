@@ -1,11 +1,14 @@
 use crate::core::context::output::Output;
-use crate::error::Error::{RtmpCreateStream, RtmpStreamAlreadyExists};
+use crate::error::Error::{
+    RtmpCreateStream, RtmpRegistrationQueueFull, RtmpServerAlreadyStarted, RtmpStreamAlreadyExists,
+};
 use crate::flv::flv_buffer::FlvBuffer;
 use crate::flv::flv_tag::FlvTag;
 use crate::rtmp::poller::{waker_pair, WakeHandle, Waker};
 use crate::rtmp::reactor::{
-    effective_max_connections, PublisherFeed, PublisherSource, Reactor, CHANNEL_HEADROOM,
-    PUBLISHER_CHANNEL_CAPACITY,
+    effective_max_connections, EnqueueRefused, PublisherFeed, PublisherRegistration,
+    PublisherSource, Reactor, RegistrationHandoff, RegistrationKillSwitch, StreamKeyClaim,
+    CHANNEL_HEADROOM, PUBLISHER_CHANNEL_CAPACITY,
 };
 use bytes::{BufMut, Bytes};
 use log::{debug, error, info, warn};
@@ -31,13 +34,20 @@ pub struct EmbedRtmpServer<S> {
     address: String,
     bound_addr: Option<std::net::SocketAddr>,
     status: Arc<AtomicUsize>,
-    // Arc-shared with the reactor: the duplicate-key check in create_* reads
-    // the keys the reactor inserts. DashSet's Clone is a deep copy, so a
-    // non-Arc field cloned into the worker thread would split server and
-    // reactor onto two disjoint sets and disable the check entirely.
+    // Arc-shared with the reactor. create_* claims a key by wrapping it in a
+    // StreamKeyClaim (insert-or-fail, so concurrent creates cannot both win);
+    // the claim rides inside the queued registration and releases itself on
+    // drop unless the reactor accepts the publisher — from then on removal
+    // of the publisher releases the key. DashSet's Clone is a deep copy, so
+    // a non-Arc field cloned into the worker thread would split server and
+    // reactor onto two disjoint sets and disable the duplicate-key check
+    // entirely.
     stream_keys: Arc<dashmap::DashSet<String>>,
-    // stream_key -> publisher source (raw byte path or media-bypass feed)
-    publisher_sender: Option<crossbeam_channel::Sender<(String, PublisherSource)>>,
+    // Registrations for the reactor: key claim + publisher source (raw byte
+    // path or media-bypass feed). Lock-shared with the worker rather than a
+    // channel, so the create paths' worker-liveness check and their enqueue
+    // form one critical section (see RegistrationHandoff).
+    registrations: Option<Arc<RegistrationHandoff>>,
     /// Producer-side wakeup for the reactor (PERF-3), set in `start()`.
     wake_handle: Option<WakeHandle>,
     gop_limit: usize,
@@ -49,6 +59,56 @@ const STATUS_INIT: usize = 0;
 const STATUS_RUN: usize = 1;
 const STATUS_END: usize = 2;
 
+/// The one funnel for the server's terminal transition: close the
+/// registration intake FIRST, then release-store `STATUS_END`.
+///
+/// The release-store orders the close ahead of any observer's acquire-load
+/// of the status, so a caller that saw `is_stopped() == true` can no longer
+/// enqueue a registration and be told `Ok` when no reactor round will
+/// consume it (the reactor checks the stop flag before draining the queue).
+/// Every path that publishes `STATUS_END` must run through here — a store
+/// over a still-open intake reintroduces exactly that lie. Both steps are
+/// idempotent, so racing terminal paths (a stop signal against a worker
+/// panic, or the accept loop noticing the worker died) may each run this
+/// with no ordering between them.
+fn close_intake_and_publish_end(registrations: &RegistrationHandoff, status: &AtomicUsize) {
+    registrations.close();
+    status.store(STATUS_END, Ordering::Release);
+}
+
+/// Unwind backstop for `start()`'s window between the lifecycle claim (the
+/// `compare_exchange` of `STATUS_INIT` to `STATUS_RUN`) and the successful
+/// handoff to the accept thread. Code in that window still logs, and
+/// `error!`/`info!` dispatch to a user-installed logger that can itself
+/// panic; an unwind escaping there would leave the family stuck at
+/// `STATUS_RUN` — every clone reporting a started server that no one can
+/// ever stop, and a worker thread that already spawned polling that status
+/// forever. Dropped while armed, the guard runs the same terminal sequence
+/// as `signal_stop`: the funnel (intake closed first, then `STATUS_END`),
+/// then the reactor wake. All steps are idempotent, so overlapping the
+/// explicit `signal_stop` on `start()`'s error returns is harmless. The
+/// success path disarms the guard once the accept thread owns the listener —
+/// from then on terminal transitions belong to `stop()`, the RAII guards
+/// and the worker's own fatal paths.
+struct StartFailGuard {
+    armed: bool,
+    registrations: Arc<RegistrationHandoff>,
+    status: Arc<AtomicUsize>,
+    wake_handle: Option<WakeHandle>,
+}
+
+impl Drop for StartFailGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        close_intake_and_publish_end(&self.registrations, &self.status);
+        if let Some(wake_handle) = &self.wake_handle {
+            wake_handle.wake();
+        }
+    }
+}
+
 impl<S: 'static> EmbedRtmpServer<S> {
     fn into_state<T>(self) -> EmbedRtmpServer<T> {
         EmbedRtmpServer {
@@ -56,7 +116,7 @@ impl<S: 'static> EmbedRtmpServer<S> {
             bound_addr: self.bound_addr,
             status: self.status,
             stream_keys: self.stream_keys,
-            publisher_sender: self.publisher_sender,
+            registrations: self.registrations,
             wake_handle: self.wake_handle,
             gop_limit: self.gop_limit,
             max_connections: self.max_connections,
@@ -82,19 +142,35 @@ impl<S: 'static> EmbedRtmpServer<S> {
 
     /// Signal the server threads to stop without consuming the server.
     ///
-    /// Idempotent: storing `STATUS_END` again and re-waking an already-woken
-    /// reactor are both no-ops. The wake matters — without it the reactor
-    /// notices the flag only on its next poll timeout, and a reactor parked
-    /// in `poll()` would otherwise hold the shutdown for up to 100ms. When no
-    /// wake handle exists (waker_pair creation failed at start), that 100ms
-    /// poll fallback is exactly the degraded path the reactor already runs on.
+    /// Idempotent: re-closing a closed intake, storing `STATUS_END` again and
+    /// re-waking an already-woken reactor are all no-ops. The wake matters —
+    /// without it the reactor notices the flag only on its next poll timeout,
+    /// and a reactor parked in `poll()` would otherwise hold the shutdown for
+    /// up to 100ms. When no wake handle exists (waker_pair creation failed at
+    /// start), that 100ms poll fallback is exactly the degraded path the
+    /// reactor already runs on.
     ///
     /// This exists because `EmbedRtmpServer` cannot implement `Drop` itself:
     /// `into_state()` moves fields out of `self`, which the compiler forbids
     /// for types with a `Drop` impl (E0509). Shared owners that only hold a
     /// reference (e.g. [`StreamHandle`]) stop the server through this instead.
     fn signal_stop(&self) {
-        self.status.store(STATUS_END, Ordering::Release);
+        // Close-then-publish through the shared funnel (see
+        // `close_intake_and_publish_end` for the ordering argument).
+        // Registrations already queued keep their owners — the reactor's
+        // remaining rounds, with the worker's kill-switch drain as the
+        // backstop.
+        match &self.registrations {
+            Some(registrations) => close_intake_and_publish_end(registrations, &self.status),
+            // Defensive arm, unreachable today: every caller reaches this
+            // with the handoff installed (`stop()`, the RAII guards and
+            // `start()`'s failure paths all run after `start()` stored
+            // it). Should a signal path for never-started handles ever
+            // appear, it must not use this plain store while a started
+            // sibling's intake exists — route it through that intake and
+            // the funnel instead.
+            None => self.status.store(STATUS_END, Ordering::Release),
+        }
         if let Some(wake_handle) = &self.wake_handle {
             wake_handle.wake();
         }
@@ -144,7 +220,7 @@ impl EmbedRtmpServer<Initialization> {
             bound_addr: None,
             status: Arc::new(AtomicUsize::new(STATUS_INIT)),
             stream_keys: Default::default(),
-            publisher_sender: None,
+            registrations: None,
             wake_handle: None,
             gop_limit,
             max_connections: None,
@@ -173,11 +249,39 @@ impl EmbedRtmpServer<Initialization> {
     /// accepts incoming client connections. This method spawns background threads
     /// to handle the connections and publish events.
     ///
+    /// Clones of one server value share a single lifecycle, and that
+    /// lifecycle can be started only once: the first `start()` wins, and
+    /// every later attempt — a sibling clone while the server runs, or any
+    /// clone after it stopped — fails with
+    /// [`RtmpServerAlreadyStarted`](crate::error::Error::RtmpServerAlreadyStarted),
+    /// refused before any socket is bound: a second start on a fixed port
+    /// reports the lifecycle error, not `AddrInUse` from the winner's port.
+    /// A `start()` that fails before it claims the lifecycle (e.g. the
+    /// bind) leaves it untouched, so a clone may retry; from the claim on,
+    /// a failing `start()` stops the lifecycle for good.
+    ///
     /// # Returns
     ///
     /// * `Ok(())` if the server successfully starts listening.
-    /// * An error variant if the socket could not be bound or other I/O errors occur.
+    /// * An error variant if the socket could not be bound, this server
+    ///   value's lifecycle was already started once, or other I/O errors
+    ///   occur.
     pub fn start(mut self) -> crate::error::Result<EmbedRtmpServer<Running>> {
+        // Admission, step one: refuse an already-started (or stopped)
+        // family before touching the address. Binding first would report a
+        // second start() on a fixed port as the winner's port being in use
+        // — Error::IO(AddrInUse) — instead of the typed lifecycle error,
+        // and right after stop() the outcome would flip between the two
+        // depending on how quickly the old accept thread released the
+        // listener. This load is advisory only; the compare_exchange below
+        // is the authoritative claim.
+        if self.status.load(Ordering::Acquire) != STATUS_INIT {
+            return Err(RtmpServerAlreadyStarted);
+        }
+
+        // Admission, step two: the bind. Failures from here up to the
+        // claim below leave the status at STATUS_INIT, so a failed bind
+        // stays retryable through a clone.
         let listener = TcpListener::bind(self.address.clone())
             .map_err(|e| <std::io::Error as Into<crate::error::Error>>::into(e))?;
 
@@ -191,15 +295,18 @@ impl EmbedRtmpServer<Initialization> {
             .set_nonblocking(true)
             .map_err(|e| <std::io::Error as Into<crate::error::Error>>::into(e))?;
 
-        self.status.store(STATUS_RUN, Ordering::Release);
-
         // Calculate effective max and create bounded channel with headroom
         // This prevents unbounded queue growth when reactor is at capacity
         let effective_max = effective_max_connections(self.max_connections);
         let channel_capacity = effective_max.saturating_add(CHANNEL_HEADROOM);
         let (stream_sender, stream_receiver) = crossbeam_channel::bounded(channel_capacity);
-        let (publisher_sender, publisher_receiver) = crossbeam_channel::bounded(1024);
-        self.publisher_sender = Some(publisher_sender);
+        // Publisher registrations ride a lock-shared queue, not a channel:
+        // the worker-liveness check and the enqueue must share one critical
+        // section, and the worker's exit drain must be terminal (see
+        // RegistrationHandoff). The reactor picks registrations up on its
+        // normal loop turns (wake or poll timeout), as it did the channel.
+        let registrations = Arc::new(RegistrationHandoff::new());
+        self.registrations = Some(registrations.clone());
 
         // PERF-3: create the reactor wakeup pair. The Waker (read side) is moved
         // into the worker thread and registered with the poller; the WakeHandle
@@ -218,16 +325,51 @@ impl EmbedRtmpServer<Initialization> {
         };
         self.wake_handle = wake_handle;
 
-        let stream_keys = self.stream_keys.clone();
+        // Admission, step three — the single-start gate for the whole clone
+        // family. The status flag (and the key set) is shared by every
+        // clone of this server value, but each start() builds its own
+        // registration intake around it — so a second started server would
+        // leave the family with TWO intakes and one status: stopping either
+        // one closes only its own intake while publishing the shared
+        // STATUS_END, and the other's create paths would keep returning Ok
+        // on handles that report stopped. The CAS makes that state
+        // structurally impossible: a racer that slipped past the advisory
+        // load above is refused right here, before any thread spawns, and
+        // its freshly bound listener drops with the return, releasing the
+        // port. This CAS is also the lifecycle's point of no return —
+        // failures above it leave the status at STATUS_INIT (retryable
+        // through a clone); failures below it are terminal for the family.
+        if self
+            .status
+            .compare_exchange(STATUS_INIT, STATUS_RUN, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(RtmpServerAlreadyStarted);
+        }
+
+        // The claim is consumed: from here to the disarm at the bottom,
+        // every exit — the explicit error returns as much as an unwind out
+        // of a log call whose user-installed logger panics — must publish
+        // the terminal state, or the family is stuck reporting a running
+        // server that no one can ever stop. The guard covers the unwinds;
+        // the error paths below also run the funnel explicitly, first
+        // thing, so the terminal state is published before they log.
+        let mut start_fail_guard = StartFailGuard {
+            armed: true,
+            registrations: registrations.clone(),
+            status: self.status.clone(),
+            wake_handle: self.wake_handle.clone(),
+        };
+
         let status = self.status.clone();
         let max_connections = self.max_connections;
+        let worker_registrations = registrations.clone();
         let result = std::thread::Builder::new()
             .name("rtmp-server-worker".to_string())
             .spawn(move || {
                 handle_connections(
                     stream_receiver,
-                    publisher_receiver,
-                    stream_keys,
+                    worker_registrations,
                     self.gop_limit,
                     max_connections,
                     status,
@@ -235,11 +377,18 @@ impl EmbedRtmpServer<Initialization> {
                 )
             });
         if let Err(e) = result {
-            error!("Thread[rtmp-server-worker] exited with error: {e}");
             // Nothing has spawned yet: no worker observes STATUS_RUN, and the
             // listener is still owned here (moved into the io closure only
-            // below), so it drops on return and releases the port. No stop
-            // signal is needed.
+            // below), so it drops on return and releases the port. The
+            // family's one start has been consumed by the gate above,
+            // though, so the status must not stay at STATUS_RUN — every
+            // clone would report a running server forever. Publish the
+            // terminal state BEFORE logging, intake closed first as on
+            // every terminal path: `error!` can run a user-installed
+            // logger that itself panics, and that unwind must not skip
+            // the publication.
+            self.signal_stop();
+            error!("Thread[rtmp-server-worker] exited with error: {e}");
             return Err(crate::error::Error::RtmpThreadExited);
         }
 
@@ -249,6 +398,10 @@ impl EmbedRtmpServer<Initialization> {
         );
 
         let status = self.status.clone();
+        // The accept loop owns one terminal transition of its own (the
+        // worker's connection channel disconnecting below) and needs the
+        // intake to run it through the funnel: it takes the handoff Arc
+        // still held from the setup above.
         let result = std::thread::Builder::new()
             .name("rtmp-server-io".to_string())
             .spawn(move || {
@@ -277,7 +430,15 @@ impl EmbedRtmpServer<Initialization> {
                                 }
                                 Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
                                     error!("Connection channel disconnected");
-                                    status.store(STATUS_END, Ordering::Release);
+                                    // The worker died out from under this
+                                    // loop. Its own teardown closes the
+                                    // intake too, but this thread cannot
+                                    // order itself after that: funnel the
+                                    // close ahead of the store here as
+                                    // well, so STATUS_END is never
+                                    // observable over an open intake no
+                                    // matter whose store lands first.
+                                    close_intake_and_publish_end(&registrations, &status);
                                     return;
                                 }
                             }
@@ -299,16 +460,22 @@ impl EmbedRtmpServer<Initialization> {
                 }
             });
         if let Err(e) = result {
-            error!("Thread[rtmp-server-io] exited with error: {e}");
             // The worker thread spawned successfully above and is now polling
-            // `status` (still STATUS_RUN); without this it would run forever and
-            // keep the port bound. Signal STATUS_END (and wake the reactor) so
-            // it exits. The listener was moved into the failed io closure and
-            // drops with it, releasing the port.
+            // `status` (still STATUS_RUN); without this it would run forever.
+            // Signal STATUS_END (and wake the reactor) so it exits, and do it
+            // BEFORE logging: `error!` can run a user-installed logger that
+            // itself panics, and that unwind must not strand the already
+            // running worker. The listener was moved into the failed io
+            // closure and drops with it, releasing the port.
             self.signal_stop();
+            error!("Thread[rtmp-server-io] exited with error: {e}");
             return Err(crate::error::Error::RtmpThreadExited);
         }
 
+        // Handoff complete: the accept thread owns the listener, and every
+        // terminal transition from here on belongs to stop(), the RAII
+        // guards or the worker's own fatal paths.
+        start_fail_guard.armed = false;
         Ok(self.into_state())
     }
 }
@@ -551,12 +718,17 @@ impl EmbedRtmpServer<Running> {
         stream_key: impl Into<String>,
     ) -> crate::error::Result<RtmpStreamSender> {
         let stream_key = stream_key.into();
-        if self.stream_keys.contains(&stream_key) {
+        // Claim the key atomically: `claim` inserts-or-fails, so two
+        // concurrent creates for the same key cannot both pass. A separate
+        // contains() check would let both pass before either registration
+        // reached the reactor; both would return Ok and the loser would only
+        // fail later with an opaque send error.
+        let Ok(claim) = StreamKeyClaim::claim(self.stream_keys.clone(), stream_key.clone()) else {
             return Err(RtmpStreamAlreadyExists(stream_key));
-        }
+        };
 
         let (sender, receiver) = crossbeam_channel::bounded(PUBLISHER_CHANNEL_CAPACITY);
-        self.register_publisher(stream_key.clone(), PublisherSource::Raw(receiver))?;
+        self.register_publisher(claim, PublisherSource::Raw(receiver))?;
 
         // Prime the raw byte channel with the connect / createStream / publish
         // handshake the server session expects before any media.
@@ -565,6 +737,14 @@ impl EmbedRtmpServer<Running> {
                 error!("Can't send publish control command to rtmp server.");
                 return Err(RtmpCreateStream.into());
             }
+        }
+        // The registration and its primed handshake ride a queue and a
+        // channel the poller cannot see. Wake the reactor once so it picks
+        // them up now instead of on the next 100ms poll fallback — the same
+        // wake create_rtmp_input performs after priming; RtmpStreamSender
+        // wakes per send, but nothing else announces this handshake.
+        if let Some(wake_handle) = &self.wake_handle {
+            wake_handle.wake();
         }
         Ok(RtmpStreamSender {
             inner: sender,
@@ -584,12 +764,13 @@ impl EmbedRtmpServer<Running> {
         stream_key: impl Into<String>,
     ) -> crate::error::Result<crossbeam_channel::Sender<PublisherFeed>> {
         let stream_key = stream_key.into();
-        if self.stream_keys.contains(&stream_key) {
+        // Claim the key atomically (insert-or-fail); see create_stream_sender.
+        let Ok(claim) = StreamKeyClaim::claim(self.stream_keys.clone(), stream_key.clone()) else {
             return Err(RtmpStreamAlreadyExists(stream_key));
-        }
+        };
 
         let (sender, receiver) = crossbeam_channel::bounded(PUBLISHER_CHANNEL_CAPACITY);
-        self.register_publisher(stream_key.clone(), PublisherSource::Feed(receiver))?;
+        self.register_publisher(claim, PublisherSource::Feed(receiver))?;
 
         // Prime the feed with the same connect / createStream / publish bytes
         // the raw path would send, wrapped as PublisherFeed::Raw.
@@ -603,28 +784,62 @@ impl EmbedRtmpServer<Running> {
     }
 
     /// Hands a newly registered publisher's receiving end to the reactor.
+    ///
+    /// The registration carries the caller's `stream_keys` claim, and the
+    /// claim is a drop-releasing guard: whichever side ends up holding the
+    /// registration when it dies releases the key, with no path releasing
+    /// twice. Concretely:
+    /// - no registration queue, or the enqueue is refused because the intake
+    ///   is closed (worker gone, server stopped) or at capacity: the
+    ///   registration drops here, releasing the claim — the refusal and a
+    ///   successful enqueue are the same critical section, so the reactor
+    ///   side can never have seen it;
+    /// - the reactor consumes the registration: `add_publisher` either
+    ///   moves the still-armed claim into the accepted publisher's state
+    ///   (released when that state drops — `remove_publisher`, or reactor
+    ///   teardown) or drops a refused one;
+    /// - the worker dies — cleanly, by panic, or before the reactor even
+    ///   existed — with the registration still queued: the worker's
+    ///   `RegistrationKillSwitch` drains it, releasing the claim.
     fn register_publisher(
         &self,
-        stream_key: String,
+        claim: StreamKeyClaim,
         source: PublisherSource,
     ) -> crate::error::Result<()> {
-        let publisher_sender = match self.publisher_sender.as_ref() {
-            Some(sender) => sender,
+        let registration = PublisherRegistration { claim, source };
+        let registrations = match self.registrations.as_ref() {
+            Some(registrations) => registrations,
             None => {
-                error!("Publisher sender not initialized");
+                error!("Publisher registration queue not initialized");
                 return Err(RtmpCreateStream.into());
             }
         };
 
-        if publisher_sender.send((stream_key, source)).is_err() {
-            if self.status.load(Ordering::Acquire) != STATUS_END {
-                warn!("Rtmp server worker already exited. Can't create stream sender.");
-            } else {
-                error!("Rtmp Server aborted. Can't create stream sender.");
+        match registrations.enqueue(registration) {
+            Ok(()) => Ok(()),
+            Err(EnqueueRefused::Closed(registration)) => {
+                // The worker is gone, or the server was signaled to stop:
+                // nothing will ever consume this registration. Dropping it
+                // here releases its stream-key claim immediately.
+                drop(registration);
+                if self.status.load(Ordering::Acquire) != STATUS_END {
+                    warn!("Rtmp server worker already exited. Can't create stream sender.");
+                } else {
+                    error!("Rtmp Server aborted. Can't create stream sender.");
+                }
+                Err(RtmpCreateStream)
             }
-            return Err(RtmpCreateStream.into());
+            Err(EnqueueRefused::Full(registration)) => {
+                // The worker is alive but the reactor has a full queue of
+                // earlier registrations to pick up. Refusing keeps the
+                // parked key claims bounded; dropping the refusal reopens
+                // this key immediately, so the caller may retry once the
+                // backlog drains.
+                drop(registration);
+                warn!("Rtmp registration queue is full. Can't create stream sender.");
+                Err(RtmpRegistrationQueueFull)
+            }
         }
-        Ok(())
     }
 
     /// Stops the RTMP server by signaling the listening and connection-handling threads
@@ -670,27 +885,93 @@ fn is_fd_exhaustion(e: &std::io::Error) -> bool {
     }
 }
 
+/// The single unwind boundary of the rtmp-server-worker thread.
+///
+/// The reactor is the only consumer of the connection/publisher channels. An
+/// uncontained panic — in the reactor's construction just as much as in its
+/// loop — would kill the worker thread without ever publishing `STATUS_END`:
+/// `is_stopped()` would stay `false` forever and the accept thread — whose
+/// loop exits only on the status flag or a disconnected channel send — would
+/// keep feeding connections nobody drains. Containing the unwind here closes
+/// the registration intake and publishes the terminal status so the accept
+/// thread exits on its next ~100ms cycle, and returns normally so the
+/// caller's `Reactor` drop still runs, closing every accepted connection.
+///
+/// Both terminal steps are idempotent: a clean return only reaches
+/// `STATUS_END` through `signal_stop` (or the worker's own fatal paths, all
+/// of which close the intake first), and this function touches neither the
+/// intake nor the status unless it actually caught an unwind.
+fn contain_reactor_panic(
+    registrations: &RegistrationHandoff,
+    status: &AtomicUsize,
+    run_reactor: impl FnOnce(),
+) {
+    // AssertUnwindSafe: the closure borrows the caller's reactor slot mutably,
+    // and `&mut T` is not `UnwindSafe`. That is acceptable here because after
+    // an unwind the slot's reactor is never used again — the caller only
+    // drops it.
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run_reactor)) {
+        // Publish the terminal state BEFORE logging: `error!` can run a
+        // user-installed logger that itself panics, and that unwind must not
+        // skip the store and leave the server half-dead after all. The
+        // funnel closes the intake ahead of the store, so no create path
+        // can observe the stopped status and still be told Ok; the worker's
+        // kill switch re-closes it during its terminal drain — a no-op.
+        close_intake_and_publish_end(registrations, status);
+        let msg = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("non-string panic payload");
+        error!("Rtmp reactor panicked ({msg}); the server is stopped and all connections will be closed.");
+    }
+}
+
 fn handle_connections(
     connection_receiver: crossbeam_channel::Receiver<TcpStream>,
-    publisher_receiver: crossbeam_channel::Receiver<(String, PublisherSource)>,
-    stream_keys: Arc<dashmap::DashSet<String>>,
+    registrations: Arc<RegistrationHandoff>,
     gop_limit: usize,
     max_connections: Option<usize>,
     status: Arc<AtomicUsize>,
     waker: Option<Waker>,
 ) {
-    // Create Reactor
-    let mut reactor = match Reactor::new(gop_limit, max_connections, stream_keys, status.clone()) {
-        Ok(r) => r,
-        Err(e) => {
-            error!("Failed to create Reactor: {:?}", e);
-            status.store(STATUS_END, Ordering::Release);
-            return;
-        }
-    };
-
-    // Run Reactor main loop
-    reactor.run(connection_receiver, publisher_receiver, waker);
+    // FIRST statement of the worker, before the fallible reactor
+    // construction and before any log call: arm the kill switch. However
+    // this thread ends — `Reactor::new` failing, a user-installed logger
+    // panicking, `run()` unwinding, or a clean return — the switch's drop
+    // closes the registration intake and releases the key claims of every
+    // registration still queued. Declared before `reactor_slot` so it drops
+    // AFTER the reactor: the drain it performs is the worker's last word,
+    // with nothing left that could enqueue concurrently forever.
+    let kill_switch = RegistrationKillSwitch::arm(registrations);
+    // The reactor is CREATED inside the contained closure so that a panicking
+    // constructor also publishes `STATUS_END`, but STORED in this outer slot
+    // so that on a contained panic it is dropped HERE, after the terminal
+    // status is published — a `Drop` panicking mid-unwind would abort the
+    // process instead. This drop is also what releases the key claims of
+    // publishers still accepted when the worker dies: each claim lives in
+    // its `PublisherState`, torn down with the reactor's publisher slab.
+    let mut reactor_slot: Option<Reactor> = None;
+    contain_reactor_panic(kill_switch.handoff(), &status, || {
+        let reactor = match Reactor::new(gop_limit, max_connections, status.clone()) {
+            Ok(r) => r,
+            Err(e) => {
+                // Publish the terminal state BEFORE logging, mirroring the
+                // panic arm above: `error!` can run a user-installed logger
+                // that itself panics, and that unwind must not leave the
+                // worker dead with the status still running and the accept
+                // loop parked forever. The funnel closes the intake ahead
+                // of the store; the kill switch re-closes it on the way
+                // out — a no-op.
+                close_intake_and_publish_end(kill_switch.handoff(), &status);
+                error!("Failed to create Reactor: {:?}", e);
+                return;
+            }
+        };
+        reactor_slot
+            .insert(reactor)
+            .run(connection_receiver, kill_switch.handoff(), waker)
+    });
 
     if status.load(Ordering::Acquire) != STATUS_END {
         error!("Rtmp Server aborted.");
@@ -1240,7 +1521,7 @@ mod bypass_parity_tests {
     }
 
     #[test]
-    fn large_idr_spanning_multiple_chunks_round_trips_identically() {
+    fn large_keyframe_spanning_multiple_chunks_round_trips_identically() {
         // A keyframe larger than the default 128-byte chunk size forces the
         // serializer to split it into continuation chunks; the deserializer
         // must reassemble the exact same bytes.
@@ -1428,16 +1709,12 @@ mod tests {
             .create_rtmp_input("app", "dup-key")
             .expect("first create must succeed");
 
-        // Registration travels over a channel to the reactor thread; poll
-        // until the shared key set reflects it.
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while !server.stream_keys.contains("dup-key") {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the stream key must appear in the shared set within 1s"
-            );
-            sleep(Duration::from_millis(10));
-        }
+        // The key is claimed synchronously inside create_*, before the
+        // registration ever reaches the reactor thread.
+        assert!(
+            server.stream_keys.contains("dup-key"),
+            "the stream key must be claimed by the time create returns"
+        );
 
         let second = server.create_rtmp_input("app", "dup-key");
         assert!(
@@ -1447,6 +1724,47 @@ mod tests {
             ),
             "a second create for a registered key must fail with RtmpStreamAlreadyExists"
         );
+
+        server.stop();
+    }
+
+    // Claiming a stream key must be atomic with the duplicate check: when two
+    // threads race create with the same key, exactly one may get Ok and the
+    // other must fail immediately with the typed RtmpStreamAlreadyExists
+    // error, not with a later opaque send failure.
+    #[test]
+    fn racing_creates_for_same_key_yield_exactly_one_winner() {
+        let server = EmbedRtmpServer::new("127.0.0.1:0").start().expect("start");
+
+        for round in 0..8 {
+            let key = format!("race-key-{round}");
+            let barrier = std::sync::Barrier::new(2);
+            let (a, b) = std::thread::scope(|s| {
+                let ta = s.spawn(|| {
+                    barrier.wait();
+                    server.create_rtmp_input("app", key.as_str())
+                });
+                let tb = s.spawn(|| {
+                    barrier.wait();
+                    server.create_rtmp_input("app", key.as_str())
+                });
+                (ta.join().expect("thread a"), tb.join().expect("thread b"))
+            });
+
+            let oks = a.is_ok() as usize + b.is_ok() as usize;
+            assert_eq!(
+                oks, 1,
+                "round {round}: exactly one racing create may claim the key, got {oks} Ok"
+            );
+            let loser = if a.is_ok() { b } else { a };
+            assert!(
+                matches!(
+                    loser,
+                    Err(crate::error::Error::RtmpStreamAlreadyExists(ref k)) if k == &key
+                ),
+                "round {round}: the losing create must fail with RtmpStreamAlreadyExists"
+            );
+        }
 
         server.stop();
     }
@@ -1466,6 +1784,412 @@ mod tests {
         let ended = server.stop();
         assert!(ended.is_stopped());
         assert!(wait_for_port_release(addr));
+    }
+
+    // signal_stop must close the registration intake in the same breath as
+    // publishing the stopped status. Without that, a server clone could
+    // observe is_stopped() == true, still enqueue a registration, and be
+    // told Ok even though no reactor round would ever consume it — the kill
+    // switch would eventually release the claim, but the Ok reported a
+    // stream that could never exist. No socket is bound here: the create
+    // path touches only the handoff, the key set and the status flag.
+    #[test]
+    fn stop_signal_closes_the_registration_intake() {
+        let server = EmbedRtmpServer::<Running> {
+            address: String::new(),
+            bound_addr: None,
+            status: Arc::new(AtomicUsize::new(STATUS_RUN)),
+            stream_keys: Default::default(),
+            registrations: Some(Arc::new(RegistrationHandoff::new())),
+            wake_handle: None,
+            gop_limit: 1,
+            max_connections: None,
+            state: PhantomData,
+        };
+
+        let _live = server
+            .create_rtmp_input("app", "before")
+            .expect("create while running must succeed");
+
+        server.signal_stop();
+        assert!(server.is_stopped());
+
+        let after = server.create_rtmp_input("app", "after");
+        assert!(
+            matches!(after, Err(crate::error::Error::RtmpCreateStream)),
+            "a create issued after the stop signal must fail with the stopped error"
+        );
+        assert!(
+            !server.stream_keys.contains("after"),
+            "the refused create must release its key claim immediately"
+        );
+    }
+
+    // The claim-release chain end to end, through the public lifecycle: a
+    // create claims the key and queues the registration, the running worker
+    // consumes it and moves the claim into the accepted publisher's state,
+    // and stop() must unwind that whole chain so the key is claimable again
+    // afterwards. The server is assembled exactly as start() builds it —
+    // same shared status, key set and handoff, and the same worker body
+    // start() spawns (handle_connections) — minus the TCP listener and
+    // accept thread, so no port is bound and every wait is a bounded poll
+    // against a deadline.
+    #[test]
+    fn stopped_server_releases_accepted_stream_keys() {
+        let registrations = Arc::new(RegistrationHandoff::new());
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let server = EmbedRtmpServer::<Running> {
+            address: String::new(),
+            bound_addr: None,
+            status: status.clone(),
+            stream_keys: Default::default(),
+            registrations: Some(registrations.clone()),
+            wake_handle: None,
+            gop_limit: 1,
+            max_connections: None,
+            state: PhantomData,
+        };
+
+        // The accept thread's side of the connection channel, kept open and
+        // idle for the worker's lifetime — a listener that never accepts.
+        let (_connection_sender, connection_receiver) =
+            crossbeam_channel::bounded::<TcpStream>(1);
+        let worker = {
+            let status = status.clone();
+            std::thread::Builder::new()
+                .name("rtmp-server-worker".to_string())
+                .spawn(move || {
+                    handle_connections(connection_receiver, registrations, 1, None, status, None)
+                })
+                .expect("spawn the worker thread")
+        };
+
+        // The create claims the key synchronously and queues the
+        // registration, primed with the connect / createStream / publish
+        // handshake, for the worker.
+        let sender = server
+            .create_stream_sender("app", "lifecycle-key")
+            .expect("create on the running server must succeed");
+
+        // Wait until the reactor drains that primed handshake (with no wake
+        // handle it picks the registration up on a ~100ms poll timeout). An
+        // empty channel means the worker consumed the registration, so the
+        // claim now lives in the reactor's publisher state — the ownership
+        // stop() must tear down.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !sender.inner.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the worker must drain the primed publish handshake within 5s"
+            );
+            sleep(Duration::from_millis(10));
+        }
+
+        // The accepted publisher holds the key: a duplicate create is
+        // refused with the typed already-exists error.
+        assert!(
+            matches!(
+                server.create_stream_sender("app", "lifecycle-key"),
+                Err(crate::error::Error::RtmpStreamAlreadyExists(ref key)) if key == "lifecycle-key"
+            ),
+            "the key must stay held while its publisher is accepted and live"
+        );
+
+        // Stop through the public seam; a surviving clone observes the
+        // aftermath, as any second owner of the server value would.
+        let observer = server.clone();
+        assert!(server.stop().is_stopped());
+
+        // The worker notices the stop flag on its next poll cycle and
+        // exits; joining it orders every teardown release before the
+        // assertions below.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !worker.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the worker must exit within 5s of stop()"
+            );
+            sleep(Duration::from_millis(10));
+        }
+        worker.join().expect("the worker must exit cleanly");
+
+        // The key is claimable again: the second create gets past the
+        // duplicate-key gate, and what refuses it is the stopped server's
+        // closed intake — not a lingering claim.
+        assert!(
+            matches!(
+                observer.create_stream_sender("app", "lifecycle-key"),
+                Err(crate::error::Error::RtmpCreateStream)
+            ),
+            "after stop the key must be free; only the closed intake may refuse the create"
+        );
+        assert!(
+            !observer.stream_keys.contains("lifecycle-key"),
+            "no claim may survive the worker's teardown"
+        );
+    }
+
+    /// A minimal registration for probing whether an intake accepts or
+    /// refuses enqueues. Its claim lives in a key set private to the probe.
+    fn probe_registration(key: &str) -> PublisherRegistration {
+        let (_feed_tx, feed_rx) = crossbeam_channel::bounded::<PublisherFeed>(1);
+        PublisherRegistration {
+            claim: StreamKeyClaim::claim(Arc::new(dashmap::DashSet::new()), key.to_string())
+                .expect("a fresh key set accepts its first claim"),
+            source: PublisherSource::Feed(feed_rx),
+        }
+    }
+
+    // A reactor panic must not leave the server half-dead: the unwind
+    // boundary closes the registration intake and publishes STATUS_END so
+    // is_stopped() flips true, creates are refused, and the accept thread's
+    // per-iteration status check terminates its loop.
+    #[test]
+    fn reactor_panic_publishes_terminal_status() {
+        let registrations = RegistrationHandoff::new();
+        let status = AtomicUsize::new(STATUS_RUN);
+        contain_reactor_panic(&registrations, &status, || panic!("injected reactor panic"));
+        assert_eq!(status.load(Ordering::Acquire), STATUS_END);
+        assert!(
+            matches!(
+                registrations.enqueue(probe_registration("panicked")),
+                Err(EnqueueRefused::Closed(_))
+            ),
+            "the contained panic must close the intake, not just flip the status"
+        );
+    }
+
+    // The clean path owns no transition at all: a normally-returning reactor
+    // reaches STATUS_END only through signal_stop (or the worker's own fatal
+    // paths), and the containment must force neither STATUS_END onto a live
+    // status nor a close onto an open intake.
+    #[test]
+    fn reactor_clean_return_leaves_status_untouched() {
+        let registrations = RegistrationHandoff::new();
+        let status = AtomicUsize::new(STATUS_RUN);
+        contain_reactor_panic(&registrations, &status, || {});
+        assert_eq!(status.load(Ordering::Acquire), STATUS_RUN);
+        assert!(
+            registrations
+                .enqueue(probe_registration("still-open"))
+                .is_ok(),
+            "a clean reactor return must leave the intake open"
+        );
+    }
+
+    // Fatal worker paths must uphold the same ordering as signal_stop: the
+    // intake closes BEFORE STATUS_END becomes observable. The reactor checks
+    // the stop flag before draining registrations, so a create accepted
+    // after that flag is up would be an Ok for a stream that can never
+    // exist — the kill switch discards the queued registration without any
+    // reactor round consuming it. This drives the panic-containment path
+    // against the real create path, wired to one handoff and status exactly
+    // as start() builds them.
+    #[test]
+    fn reactor_panic_refuses_creates_on_surviving_handles() {
+        let registrations = Arc::new(RegistrationHandoff::new());
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let server = EmbedRtmpServer::<Running> {
+            address: String::new(),
+            bound_addr: None,
+            status: status.clone(),
+            stream_keys: Default::default(),
+            registrations: Some(registrations.clone()),
+            wake_handle: None,
+            gop_limit: 1,
+            max_connections: None,
+            state: PhantomData,
+        };
+
+        let _live = server
+            .create_rtmp_input("app", "before-panic")
+            .expect("create while running must succeed");
+
+        contain_reactor_panic(&registrations, &status, || panic!("injected reactor panic"));
+
+        assert!(
+            server.is_stopped(),
+            "the contained panic must stop the server"
+        );
+        let refused = server.create_rtmp_input("app", "after-panic").err();
+        assert!(
+            matches!(refused, Some(crate::error::Error::RtmpCreateStream)),
+            "a create observing the panic-stopped server must be refused, got {refused:?}"
+        );
+        assert!(
+            !server.stream_keys.contains("after-panic"),
+            "the refused create must release its key claim immediately"
+        );
+    }
+
+    // StartFailGuard is the unwind backstop for start()'s window between
+    // the lifecycle claim (the INIT->RUN CAS) and the accept-thread
+    // handoff: a log call in that window can panic in a user-installed
+    // logger, and the escaping unwind must still publish the terminal
+    // state — otherwise every clone reports a started server no one can
+    // ever stop. Dropped by that unwind, the guard must run the same
+    // funnel as signal_stop: intake closed first, STATUS_END second.
+    #[test]
+    fn armed_start_fail_guard_publishes_terminal_state_on_unwind() {
+        let registrations = Arc::new(RegistrationHandoff::new());
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let guard = StartFailGuard {
+            armed: true,
+            registrations: registrations.clone(),
+            status: status.clone(),
+            wake_handle: None,
+        };
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = guard;
+            panic!("injected panic between the claim and the handoff");
+        }));
+        assert!(unwind.is_err(), "the injected panic must unwind");
+
+        assert_eq!(status.load(Ordering::Acquire), STATUS_END);
+        assert!(
+            matches!(
+                registrations.enqueue(probe_registration("after-unwind")),
+                Err(EnqueueRefused::Closed(_))
+            ),
+            "the guard must close the intake, not just flip the status"
+        );
+    }
+
+    // The success handoff disarms the guard: its drop must then leave the
+    // running lifecycle alone — no closed intake, no STATUS_END.
+    #[test]
+    fn disarmed_start_fail_guard_leaves_the_lifecycle_running() {
+        let registrations = Arc::new(RegistrationHandoff::new());
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let mut guard = StartFailGuard {
+            armed: true,
+            registrations: registrations.clone(),
+            status: status.clone(),
+            wake_handle: None,
+        };
+        guard.armed = false;
+        drop(guard);
+
+        assert_eq!(status.load(Ordering::Acquire), STATUS_RUN);
+        assert!(
+            registrations
+                .enqueue(probe_registration("still-open"))
+                .is_ok(),
+            "a disarmed guard must leave the intake open"
+        );
+    }
+
+    /// A hand-assembled `Initialization` sibling of `family`: it shares the
+    /// lifecycle (status flag) and key set exactly as clone() would, but
+    /// aims at `address` instead of the address the family was created
+    /// with, which clone() copies verbatim.
+    fn family_sibling<S: 'static>(
+        family: &EmbedRtmpServer<S>,
+        address: impl Into<String>,
+    ) -> EmbedRtmpServer<Initialization> {
+        EmbedRtmpServer::<Initialization> {
+            address: address.into(),
+            bound_addr: None,
+            status: family.status.clone(),
+            stream_keys: family.stream_keys.clone(),
+            registrations: None,
+            wake_handle: None,
+            gop_limit: 1,
+            max_connections: None,
+            state: PhantomData,
+        }
+    }
+
+    // Initialization clones share one status flag and key set — one
+    // lifecycle. Each start() would otherwise mint its own registration
+    // intake around that shared status: stopping one started clone closed
+    // only its own intake while publishing the shared STATUS_END, so the
+    // other kept accepting creates on handles that reported stopped. The
+    // single-start gate makes that state unreachable: exactly one start()
+    // per family may ever succeed.
+    #[test]
+    fn second_start_of_a_cloned_family_is_refused() {
+        let first = EmbedRtmpServer::new("127.0.0.1:0");
+        let second = first.clone();
+        let third = first.clone();
+
+        let running = first.start().expect("the family's first start must win");
+        let addr = running.local_addr().expect("bound address");
+
+        // While the winner runs: a sibling clone must not start the family
+        // again. Its bind would even succeed (another ephemeral port); the
+        // shared lifecycle refuses it before that bind is ever attempted.
+        let refused = second.start().err();
+        assert!(
+            matches!(refused, Some(crate::error::Error::RtmpServerAlreadyStarted)),
+            "a second start on a running family must be refused, got {refused:?}"
+        );
+        assert!(
+            !running.is_stopped(),
+            "a refused start must not perturb the running server"
+        );
+
+        // The fixed-port shape of the same refusal: a sibling aimed at THE
+        // port the winner holds. The admission check must refuse it before
+        // any bind attempt — binding first would surface Error::IO
+        // (AddrInUse) from the winner's port instead of the typed
+        // lifecycle error.
+        let refused = family_sibling(&running, addr.to_string()).start().err();
+        assert!(
+            matches!(refused, Some(crate::error::Error::RtmpServerAlreadyStarted)),
+            "a second start on the winner's own port must get the typed refusal, got {refused:?}"
+        );
+        assert!(
+            !running.is_stopped(),
+            "the fixed-port refusal must not perturb the running server"
+        );
+
+        // After stop, STATUS_END is terminal for the family: restarting
+        // would flip stopped handles back to not-stopped around an intake
+        // that is closed for good.
+        let ended = running.stop();
+        assert!(ended.is_stopped());
+        let refused = third.start().err();
+        assert!(
+            matches!(refused, Some(crate::error::Error::RtmpServerAlreadyStarted)),
+            "a start after the family stopped must be refused, got {refused:?}"
+        );
+
+        // The fixed-port shape right after stop(): the refusal must be
+        // decided by the lifecycle alone — never by a bind whose outcome
+        // depends on how quickly the stopped accept thread releases the
+        // listener (typed refusal one moment, AddrInUse the next).
+        let refused = family_sibling(&ended, addr.to_string()).start().err();
+        assert!(
+            matches!(refused, Some(crate::error::Error::RtmpServerAlreadyStarted)),
+            "a fixed-port start right after stop must get the typed refusal, got {refused:?}"
+        );
+    }
+
+    // Bind failures are pre-claim: they must surface as the typed IO error
+    // and leave the family's lifecycle at INIT, retryable through a clone —
+    // the admission refusal is reserved for families that actually started.
+    #[test]
+    fn failed_bind_leaves_the_family_retryable() {
+        // Hold a port so the family's first bind deterministically fails.
+        let blocker = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a port");
+        let blocked_addr = blocker.local_addr().expect("blocker address");
+
+        let first = EmbedRtmpServer::new(blocked_addr.to_string());
+        let survivor = first.clone();
+        let failed = first.start().err();
+        assert!(
+            matches!(failed, Some(crate::error::Error::IO(_))),
+            "binding a held port must surface the typed IO error, got {failed:?}"
+        );
+
+        // The failed bind claimed nothing: a sibling of the same family can
+        // still win its one start, on a bindable address.
+        let running = family_sibling(&survivor, "127.0.0.1:0")
+            .start()
+            .expect("a failed bind must leave the family startable");
+        assert!(running.stop().is_stopped());
     }
 
     #[test]

@@ -345,6 +345,11 @@ impl FlvBuffer {
         // instead of `vec![0u8; data_size]` + overwrite, which zero-filled the
         // whole payload (a full-payload memset per FLV tag on the ingest path)
         // just to immediately overwrite it.
+        //
+        // The per-tag allocation itself is required: the returned tag's
+        // `Bytes` escapes into long-lived consumers (e.g. an RTMP GOP cache
+        // that replays it to late joiners), so a pooled or recycled buffer
+        // could never be reclaimed while any such consumer still holds it.
         let mut data = Vec::with_capacity(data_size as usize);
         let data_start = self.head + FLV_TAG_HEADER_LENGTH;
         self.read_data_append(data_start, data_size as usize, &mut data);

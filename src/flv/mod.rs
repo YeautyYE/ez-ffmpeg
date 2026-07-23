@@ -7,6 +7,7 @@
 pub mod flv_buffer;
 mod flv_header;
 pub mod flv_tag;
+pub(crate) mod flv_tag_body;
 pub mod flv_tag_header;
 
 // Define constants for commonly used lengths
