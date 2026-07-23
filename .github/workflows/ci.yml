@@ -101,6 +101,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # The 8.1 lane git-clones and statically builds FFmpeg inside target/
+      # alongside the crate's own build tree, and the sum has exhausted the
+      # stock image's free disk. Drop preinstalled toolchains this job never
+      # touches (~25 GiB) before the first build.
+      - name: Free disk space (from-source FFmpeg lane)
+        if: matrix.ffmpeg == '8.1'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
       - name: Install FFmpeg build toolchain
         run: |
           sudo apt-get update
@@ -199,6 +210,17 @@ jobs:
     # as test.mp4.
     steps:
       - uses: actions/checkout@v7
+
+      # The 8.1 lane git-clones and statically builds FFmpeg inside target/
+      # alongside the crate's own build tree, and the sum has exhausted the
+      # stock image's free disk. Drop preinstalled toolchains this job never
+      # touches (~25 GiB) before the first build.
+      - name: Free disk space (from-source FFmpeg lane)
+        if: matrix.ffmpeg == '8.1'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
 
       - name: Install FFmpeg build toolchain
         run: |
