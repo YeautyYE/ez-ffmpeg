@@ -640,7 +640,11 @@ impl SpsSummary {
 ///   5 to "unspecified") are E.2.1 violations a validator rejects instead
 ///   of scrubbing;
 /// * the bitstream_restriction denominators and MV-length exponents are
-///   held to their E.2.1 ceilings (16), which h264_ps.c reads unchecked.
+///   held to their E.2.1 ceilings (16), which h264_ps.c reads unchecked,
+///   and `max_dec_frame_buffering` to `max_num_ref_frames..=16` — the
+///   E.2.1 floor (the declared DPB must hold the reference frames) under
+///   the H264_MAX_DPB_FRAMES ceiling; h264_ps.c reads the field and
+///   bounds only the reorder depth against it.
 fn parse_sps(sps: &[u8]) -> Result<SpsSummary, String> {
     let rbsp = unescape_rbsp(&sps[1..]);
     let mut r = BitReader::new(&rbsp);
@@ -814,7 +818,7 @@ fn parse_sps(sps: &[u8]) -> Result<SpsSummary, String> {
     }
     if r.bits(1)? == 1 {
         // vui_parameters_present_flag
-        skip_vui(&mut r)?;
+        skip_vui(&mut r, max_num_ref_frames)?;
     }
     r.finish_rbsp()?;
     Ok(SpsSummary {
@@ -1031,9 +1035,11 @@ fn parse_pps(pps: &[u8], sps_context: &[SpsSummary]) -> Result<(u32, usize), Str
 /// * types 3..=5 (the changing maps): defined only for exactly two slice
 ///   groups (`num_slice_groups_minus1` shall be 1), with
 ///   `slice_group_change_rate_minus1 <= PicSizeInMapUnits - 1`;
-/// * type 6: the explicit table must not declare more entries than the
-///   picture has map units, and every `slice_group_id[i]` <=
-///   `num_slice_groups_minus1`.
+/// * type 6: the explicit table covers the picture exactly —
+///   `pic_size_in_map_units_minus1` shall EQUAL PicSizeInMapUnits - 1
+///   (7.4.2.2; cbs_h264_syntax_template.c codes the field with that
+///   value as both of its ue bounds) — and every `slice_group_id[i]`
+///   <= `num_slice_groups_minus1`.
 ///
 /// Type 1 (dispersed) carries no syntax.
 fn check_slice_group_map(
@@ -1093,8 +1099,14 @@ fn check_slice_group_map(
             }
         }
         6 => {
+            // 7.4.2.2 fixes the table to the picture:
+            // pic_size_in_map_units_minus1 shall be EQUAL to
+            // PicSizeInMapUnits - 1 (cbs_h264_syntax_template.c pins the
+            // ue range to exactly that value). An undersized table is as
+            // broken as an oversized one — the map units past its end
+            // belong to no slice group.
             let pic_size_in_map_units_minus1 = r.ue()?;
-            if pic_size_in_map_units_minus1 as u64 + 1 > pic_size_in_map_units {
+            if pic_size_in_map_units_minus1 as u64 + 1 != pic_size_in_map_units {
                 return Err(format!(
                     "slice-group table declares {} map units but the referenced SPS \
                      codes {pic_size_in_map_units}",
@@ -1131,8 +1143,11 @@ fn check_slice_group_map(
 /// bitstream_restriction set (`max_bytes_per_pic_denom <= 16`,
 /// `max_bits_per_mb_denom <= 16`, `log2_max_mv_length_* <= 16`,
 /// `max_num_reorder_frames <= max_dec_frame_buffering` and `<= 16` — the
-/// h264_ps.c "illegal num_reorder_frames" rejection).
-fn skip_vui(r: &mut BitReader) -> Result<(), String> {
+/// h264_ps.c "illegal num_reorder_frames" rejection — and
+/// `max_num_ref_frames <= max_dec_frame_buffering <= 16`, the E.2.1
+/// floor under the H264_MAX_DPB_FRAMES ceiling; the caller passes the
+/// SPS's `max_num_ref_frames` in for that floor).
+fn skip_vui(r: &mut BitReader, max_num_ref_frames: u32) -> Result<(), String> {
     if r.bits(1)? == 1 {
         // aspect_ratio_info_present_flag
         if r.bits(8)? == 255 {
@@ -1221,6 +1236,18 @@ fn skip_vui(r: &mut BitReader) -> Result<(), String> {
             return Err(format!(
                 "max_num_reorder_frames {max_num_reorder_frames} exceeds 16 or \
                  max_dec_frame_buffering {max_dec_frame_buffering}"
+            ));
+        }
+        // max_dec_frame_buffering itself is bounded both ways: E.2.1
+        // floors it at max_num_ref_frames — the declared DPB must hold at
+        // least the reference frames the SPS keeps — and no level admits
+        // more than 16 held frames (H264_MAX_DPB_FRAMES, the same ceiling
+        // bounding max_num_ref_frames; cbs_h264_syntax_template.c codes
+        // the field with that ceiling).
+        if max_dec_frame_buffering > 16 || max_dec_frame_buffering < max_num_ref_frames {
+            return Err(format!(
+                "max_dec_frame_buffering {max_dec_frame_buffering} is outside \
+                 max_num_ref_frames {max_num_ref_frames}..=16"
             ));
         }
     }
@@ -1688,8 +1715,9 @@ mod tests {
     // VUI bitstream_restriction fixtures on the skeleton: every bounded
     // field at its E.2.1 ceiling (both denominators and both MV-length
     // exponents 16, max_num_reorder_frames 16 <= max_dec_frame_buffering
-    // 16), then one field over at a time — reorder 17, reorder 2 against
-    // buffering 1, max_bytes_per_pic_denom 17, max_bits_per_mb_denom 17,
+    // 16 — which also pins buffering accepted AT the ceiling), then one
+    // field over at a time — reorder 17, reorder 2 against buffering 1,
+    // max_bytes_per_pic_denom 17, max_bits_per_mb_denom 17,
     // log2_max_mv_length_horizontal 17.
     const REORDER_16_SPS: &[u8] = &[
         0x67, 0x42, 0xC0, 0x1E, 0xDA, 0x05, 0x07, 0xE8, 0x06, 0x11, 0x08, 0x84, 0x42, 0x21,
@@ -1709,6 +1737,21 @@ mod tests {
     ];
     const MV_LEN_17_SPS: &[u8] = &[
         0x67, 0x42, 0xC0, 0x1E, 0xDA, 0x05, 0x07, 0xE8, 0x07, 0x84, 0xBC,
+    ];
+    // max_dec_frame_buffering boundaries against the skeleton's
+    // max_num_ref_frames 1 (reorder 0 in all three, so only the buffering
+    // bound decides): 17 breaches the H264_MAX_DPB_FRAMES ceiling, 0
+    // undercuts the E.2.1 floor (a DPB that cannot hold the declared
+    // reference frame), and the accept pins the floor AT the ceiling —
+    // max_num_ref_frames 16 with buffering 16.
+    const BUFFERING_17_SPS: &[u8] = &[
+        0x67, 0x42, 0xC0, 0x1E, 0xDA, 0x05, 0x07, 0xE8, 0x05, 0xF0, 0x94,
+    ];
+    const BUFFERING_BELOW_REF_SPS: &[u8] = &[
+        0x67, 0x42, 0xC0, 0x1E, 0xDA, 0x05, 0x07, 0xE8, 0x05, 0xFC,
+    ];
+    const REF_EQUALS_BUFFERING_SPS: &[u8] = &[
+        0x67, 0x42, 0xC0, 0x1E, 0xD8, 0x44, 0x14, 0x1F, 0xA0, 0x17, 0xC2, 0x30,
     ];
     // VUI timing_info with time_scale 0, then with num_units_in_tick 0:
     // either zero leaves the declared tick undefined (E.2.1).
@@ -1742,6 +1785,10 @@ mod tests {
     const DELTA_SCALE_128_SPS: &[u8] = &[
         0x67, 0x64, 0x00, 0x1E, 0xAD, 0x80, 0x40, 0x3F, 0xFF, 0x80, 0xB4, 0x0A, 0x0F, 0xC8,
     ];
+    // 32x32 variant of the skeleton: 2x2 = 4 map units, the
+    // hand-manageable PicSizeInMapUnits an explicit type-6 slice-group
+    // table must cover exactly.
+    const MAP_UNITS_4_SPS: &[u8] = &[0x67, 0x42, 0xC0, 0x1E, 0xDA, 0x25, 0x90];
 
     // Hand-assembled 7.3.2.2 PPS bit streams. The skeleton (`MINIMAL_PPS`)
     // codes both ids 0, CAVLC, one slice group, every ue/se field at its
@@ -1785,7 +1832,10 @@ mod tests {
     // Multi-group slice_group_map fixtures, two slice groups each: type 0
     // (two run lengths), type 2 (ONE top_left/bottom_right pair — the
     // rectangle loop runs num_slice_groups_minus1 times), type 3 (change
-    // direction + rate), and type 6 (four one-bit slice_group_id entries).
+    // direction + rate), and type 6 (four one-bit slice_group_id entries
+    // — exactly the 4 map units of `MAP_UNITS_4_SPS`; against the
+    // 300-map-unit skeleton the same table is the undersize reject, since
+    // 7.4.2.2 fixes the type-6 table size to the picture).
     const FMO_TYPE0_PPS: &[u8] = &[0x68, 0xC5, 0xF1, 0xC4];
     const FMO_TYPE2_PPS: &[u8] = &[0x68, 0xC4, 0xFC, 0x71];
     const FMO_TYPE3_PPS: &[u8] = &[0x68, 0xC4, 0x47, 0x1C, 0x40];
@@ -1797,7 +1847,8 @@ mod tests {
     // Slice-group shapes that overrun the 300 map units of the referenced
     // 320x240 SPS (20x15 map units): a type-0 run_length_minus1 of 300, a
     // type-2 bottom_right of 300, a type-3 change rate of 300, and a
-    // type-6 table declaring 301 entries.
+    // type-6 table declaring 301 entries (the oversize arm of the exact
+    // size rule; `FMO_TYPE6_PPS` against this SPS is the undersize arm).
     const FMO_TYPE0_RUN_300_PPS: &[u8] = &[0x68, 0xC5, 0x00, 0x96, 0xF1, 0xC4];
     const FMO_TYPE2_BR_300_PPS: &[u8] = &[0x68, 0xC4, 0xE0, 0x12, 0xDC, 0x71];
     const FMO_RATE_300_PPS: &[u8] = &[0x68, 0xC4, 0x40, 0x04, 0xB7, 0x1C, 0x40];
@@ -1810,9 +1861,11 @@ mod tests {
     // A changing map (type 3) over three slice groups: 7.4.2.2 defines the
     // changing maps for exactly two.
     const FMO_TYPE3_GROUPS_3_PPS: &[u8] = &[0x68, 0xC6, 0x47, 0x1C, 0x40];
-    // Type 6 with three groups (two-bit ids) whose only entry codes group
-    // id 3, one past num_slice_groups_minus1 2.
-    const FMO_TYPE6_ID_3_PPS: &[u8] = &[0x68, 0xC6, 0x7F, 0x8E, 0x20];
+    // Type 6 with three groups (two-bit ids) and a full four-entry table
+    // for `MAP_UNITS_4_SPS` whose last entry codes group id 3, one past
+    // num_slice_groups_minus1 2 — the size check passes so only the id
+    // bound can reject it.
+    const FMO_TYPE6_ID_3_PPS: &[u8] = &[0x68, 0xC6, 0x72, 0x0D, 0xE3, 0x88];
     // The real `PPS` with only its rbsp_trailing_bits stop bit cleared
     // (last byte 0x20 -> 0x00); every parsed field is untouched.
     const BAD_STOP_BIT_PPS: &[u8] = &[0x68, 0xCB, 0x83, 0xCB, 0x00];
@@ -2836,18 +2889,21 @@ mod tests {
 
     /// The multi-group slice_group_map shapes of 7.3.2.2, one accept per
     /// family (types 0, 2, 3, 6 — type 2 would overrun into rejection if
-    /// the rectangle loop wrongly ran num_slice_groups_minus1 + 1 times),
-    /// plus the two bounds: nine slice groups exceeds the A.2.1 limit and
-    /// map type 7 does not exist.
+    /// the rectangle loop wrongly ran num_slice_groups_minus1 + 1 times;
+    /// type 6 pairs with the SPS whose 4 map units its table covers
+    /// exactly), plus the two bounds: nine slice groups exceeds the A.2.1
+    /// limit and map type 7 does not exist.
     #[test]
     fn parses_the_slice_group_map_types() {
         let ctx = sps_ctx(&[SPS]);
-        for (i, fixture) in [FMO_TYPE0_PPS, FMO_TYPE2_PPS, FMO_TYPE3_PPS, FMO_TYPE6_PPS]
+        for (i, fixture) in [FMO_TYPE0_PPS, FMO_TYPE2_PPS, FMO_TYPE3_PPS]
             .iter()
             .enumerate()
         {
             parse_pps(fixture, &ctx).unwrap_or_else(|e| panic!("FMO fixture {i}: {e}"));
         }
+        parse_pps(FMO_TYPE6_PPS, &sps_ctx(&[MAP_UNITS_4_SPS]))
+            .unwrap_or_else(|e| panic!("FMO type-6 fixture: {e}"));
         let err = parse_pps(FMO_GROUPS_8_PPS, &ctx).unwrap_err();
         assert!(
             err.contains("num_slice_groups_minus1 8"),
@@ -2861,10 +2917,13 @@ mod tests {
     }
 
     /// The slice-group shapes are held to the referenced SPS (7.4.2.2):
-    /// every map-unit index and count fits the SPS's PicSizeInMapUnits,
-    /// type-2 rectangles are corner-ordered, changing maps require exactly
-    /// two groups and type-6 ids stay within the declared group count. The
-    /// in-budget accepts live in `parses_the_slice_group_map_types`.
+    /// every map-unit index fits the SPS's PicSizeInMapUnits, the type-6
+    /// table covers it EXACTLY — an oversized table indexes past the
+    /// picture and an undersized one leaves map units with no slice
+    /// group, so both directions reject — type-2 rectangles are
+    /// corner-ordered, changing maps require exactly two groups and
+    /// type-6 ids stay within the declared group count. The in-budget
+    /// accepts live in `parses_the_slice_group_map_types`.
     #[test]
     fn bounds_the_slice_group_map_against_the_referenced_sps() {
         let ctx = sps_ctx(&[SPS]);
@@ -2873,14 +2932,19 @@ mod tests {
             (FMO_TYPE2_BR_300_PPS, "bottom_right 300"),
             (FMO_RATE_300_PPS, "slice_group_change_rate_minus1 300"),
             (FMO_TYPE6_SIZE_300_PPS, "declares 301 map units"),
+            (FMO_TYPE6_PPS, "declares 4 map units"),
             (FMO_TYPE2_INVERTED_PPS, "rectangle 40..20 is inverted"),
             (FMO_TYPE2_COLUMN_PPS, "rectangle 1..20 is inverted"),
             (FMO_TYPE3_GROUPS_3_PPS, "requires exactly two slice groups"),
-            (FMO_TYPE6_ID_3_PPS, "slice_group_id 3"),
         ] {
             let err = parse_pps(fixture, &ctx).unwrap_err();
             assert!(err.contains(needle), "expected {needle:?}, got: {err}");
         }
+        // The id bound needs a table that already covers its picture: the
+        // four-entry table against the 4-map-unit SPS passes the size
+        // check and fails only on its final id.
+        let err = parse_pps(FMO_TYPE6_ID_3_PPS, &sps_ctx(&[MAP_UNITS_4_SPS])).unwrap_err();
+        assert!(err.contains("slice_group_id 3"), "unexpected error: {err}");
     }
 
     /// max_num_ref_frames is bounded to 16 (H264_MAX_DPB_FRAMES; the
@@ -2929,16 +2993,26 @@ mod tests {
 
     /// VUI value bounds (E.2.1): the all-ceilings bitstream_restriction
     /// fixture parses, then each field one past its bound is rejected —
-    /// reorder depth over 16 and over max_dec_frame_buffering, both
-    /// denominators, the MV-length exponent, zeroed timing_info fields and
+    /// reorder depth over 16 and over max_dec_frame_buffering, buffering
+    /// over 16 and under the SPS's max_num_ref_frames (the DPB must hold
+    /// at least the declared reference frames), both denominators, the
+    /// MV-length exponent, zeroed timing_info fields and
     /// chroma_sample_loc_type 6.
     #[test]
     fn rejects_out_of_range_vui_fields() {
         assert_eq!(parse_sps(REORDER_16_SPS).unwrap().chroma_info(), (1, 8, 8));
         assert_eq!(parse_sps(CHROMA_LOC_5_SPS).unwrap().chroma_info(), (1, 8, 8));
+        // The E.2.1 floor meeting the ceiling stays legal:
+        // max_num_ref_frames 16 == max_dec_frame_buffering 16.
+        assert_eq!(
+            parse_sps(REF_EQUALS_BUFFERING_SPS).unwrap().chroma_info(),
+            (1, 8, 8)
+        );
         for (fixture, needle) in [
             (REORDER_17_SPS, "max_num_reorder_frames 17"),
             (REORDER_ABOVE_BUFFERING_SPS, "max_num_reorder_frames 2"),
+            (BUFFERING_17_SPS, "max_dec_frame_buffering 17"),
+            (BUFFERING_BELOW_REF_SPS, "max_dec_frame_buffering 0"),
             (BYTES_DENOM_17_SPS, "max_bytes_per_pic_denom 17"),
             (MB_DENOM_17_SPS, "max_bits_per_mb_denom 17"),
             (MV_LEN_17_SPS, "log2_max_mv_length 17/0"),
