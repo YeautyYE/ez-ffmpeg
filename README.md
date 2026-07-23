@@ -397,29 +397,53 @@ the `AudioSpecificConfig`. Feed a `VideoDecoder`/`AudioDecoder` in a WebView,
 packetize for RTP/SRT, forward over a WebSocket, or build fMP4 segments —
 without parsing container bytes first.
 
-```rust,ignore
-use ez_ffmpeg::packet_sink::PacketSink;
+```rust
+use ez_ffmpeg::packet_sink::{PacketCallbackError, PacketSink};
 use ez_ffmpeg::{FfmpegContext, Output};
 
-let sink = PacketSink::builder(|packet| {
-    // One H.264 access unit (AVCC layout), timestamps in stream ticks
-    // plus *_us conveniences, IDR-accurate keyframe flag.
-    send_chunk(packet.pts_us(), packet.is_key(), packet.data());
-    Ok(())
-})
-.on_stream_info(|streams| {
-    let video = streams[0].video().unwrap();
-    configure_decoder(video.codec_string(), video.codec_config());
-    Ok(())
-})
-.build();
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let sink = PacketSink::builder(|packet| {
+        // One H.264 access unit (AVCC layout), timestamps in stream ticks
+        // plus *_us conveniences, IDR-accurate keyframe flag.
+        println!(
+            "pts {} us, key {}, {} bytes",
+            packet.pts_us(),
+            packet.is_key(),
+            packet.data().len()
+        );
+        Ok(())
+    })
+    .on_stream_info(|streams| {
+        // Ready-made WebCodecs config: codec string + avcC description.
+        // Select the stream by kind, not position — an audio-only input
+        // configures no video stream at all.
+        let video = streams
+            .iter()
+            .find_map(|stream| stream.video())
+            .ok_or_else(|| PacketCallbackError::new("no video stream"))?;
+        println!(
+            "codec \"{}\", avcC {} bytes",
+            video.codec_string(),
+            video.codec_config().len()
+        );
+        Ok(())
+    })
+    .build();
 
-FfmpegContext::builder()
-    .input("input.mp4")
-    .output(Output::from(sink).set_video_codec("libx264"))
-    .build()?
-    .start()?
-    .wait()?;
+    FfmpegContext::builder()
+        .input("input.mp4")
+        // Deliver video only; without `disable_audio()` an input that also
+        // carries audio would hand AAC packets to the same callback.
+        .output(
+            Output::from(sink)
+                .set_video_codec("libx264")
+                .disable_audio(),
+        )
+        .build()?
+        .start()?
+        .wait()?;
+    Ok(())
+}
 ```
 
 Callbacks run on the delivery thread and block the pipeline while they run
@@ -427,10 +451,12 @@ Callbacks run on the delivery thread and block the pipeline while they run
 there is a bounded owned-event channel (`PacketSink::channel`) with a
 `FrameIter`-style iterator (`PacketSinkReceiver::into_events`). Strict-tier
 validation rejects anything it cannot promise: mid-stream configuration
-changes, non-monotonic timestamps, missing durations, non-whitelisted
-encoders (video is libx264-only in v1). See the `packet_sink` module docs for
-the delivery contract, and the `packet_sink_avc`, `packet_sink_aac_channel`
-and `packet_sink_av_transport` examples.
+changes, non-monotonic timestamps, underivable durations (a zero or absent
+duration is accepted when the constant frame rate or the AAC frame size
+derives one), non-whitelisted encoders (video is libx264-only in v1). See
+the `packet_sink` module docs for the delivery contract, and the
+`packet_sink_avc`, `packet_sink_aac_channel` and `packet_sink_av_transport`
+examples.
 
 ## Streaming protocol outputs (WHIP / SRT)
 

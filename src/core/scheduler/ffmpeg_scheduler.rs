@@ -42,6 +42,89 @@ impl Drop for SetEncRegisteredOnDrop {
     }
 }
 
+/// Test-only observation of the settlement sentinel's release moment. The
+/// release is the admission edge for packet sinks parked in the settlement
+/// barrier: whatever the scheduler state is at that instant is what an
+/// admitted sink's terminal decision (on_end vs a reported failure) can
+/// sample. A test thread woken BY the release inherently races the releasing
+/// thread's next statements, so these snapshots are taken on the releasing
+/// thread itself, inside `release_sentinel`, where they are exact.
+///
+/// Slots are keyed by the scheduler-status Arc's address: a test arms its
+/// own scheduler and concurrent tests' unarmed schedulers pass through
+/// untouched. The armed test keeps its status Arc alive from `arm` to
+/// `take`, so the address cannot be reused by another scheduler in between.
+#[cfg(test)]
+pub(crate) mod start_tail_probe {
+    use std::sync::Mutex;
+
+    #[derive(Clone, Copy)]
+    pub(crate) struct ReleaseSnapshot {
+        /// Whether a scheduler result was already recorded when the sentinel
+        /// released. The failure path must record BEFORE releasing; the
+        /// success tail must release with nothing recorded.
+        pub(crate) result_recorded: bool,
+        /// Whether the scheduler status was already terminal at the release.
+        pub(crate) status_stopping: bool,
+        /// Whether the RunningGuard had been installed when the release ran.
+        /// On the success tail the release must sit AFTER the installation:
+        /// only then is the fallible remainder of start() behind it, and the
+        /// failure duty already has a taker for the scheduler's lifetime.
+        pub(crate) running_guard_installed: bool,
+    }
+
+    struct Slot {
+        status_ptr: usize,
+        running_guard_installed: bool,
+        release: Option<ReleaseSnapshot>,
+    }
+
+    static SLOTS: Mutex<Vec<Slot>> = Mutex::new(Vec::new());
+
+    /// Starts observing the scheduler whose status Arc lives at `status_ptr`.
+    pub(crate) fn arm(status_ptr: usize) {
+        let mut slots = SLOTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        slots.retain(|slot| slot.status_ptr != status_ptr);
+        slots.push(Slot {
+            status_ptr,
+            running_guard_installed: false,
+            release: None,
+        });
+    }
+
+    /// Called by `start()` immediately after installing the RunningGuard.
+    pub(crate) fn note_running_guard_installed(status_ptr: usize) {
+        let mut slots = SLOTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(slot) = slots.iter_mut().find(|slot| slot.status_ptr == status_ptr) {
+            slot.running_guard_installed = true;
+        }
+    }
+
+    /// Called by `release_sentinel` at the instant it commits to releasing.
+    /// First release wins — `release_sentinel` is idempotent and only the
+    /// releasing call is an admission edge.
+    pub(crate) fn record_release(status_ptr: usize, result_recorded: bool, status_stopping: bool) {
+        let mut slots = SLOTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(slot) = slots.iter_mut().find(|slot| slot.status_ptr == status_ptr) {
+            if slot.release.is_none() {
+                slot.release = Some(ReleaseSnapshot {
+                    result_recorded,
+                    status_stopping,
+                    running_guard_installed: slot.running_guard_installed,
+                });
+            }
+        }
+    }
+
+    /// Stops observing and returns the release-moment snapshot, if the
+    /// sentinel was released while armed.
+    pub(crate) fn take(status_ptr: usize) -> Option<ReleaseSnapshot> {
+        let mut slots = SLOTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let idx = slots.iter().position(|slot| slot.status_ptr == status_ptr)?;
+        slots.remove(idx).release
+    }
+}
+
 /// Failure cleanup for `start()` once one or more worker threads may already be
 /// running, as a guard so it covers BOTH the explicit `Err` returns and a panic
 /// unwinding out of any init call (e.g. a user log hook panicking on the
@@ -59,15 +142,56 @@ impl Drop for SetEncRegisteredOnDrop {
 /// true once muxer `i`'s pre-counted slot has been handed to a worker or waiter
 /// (which will release it on STATUS_END); the rest are released here so
 /// `wait_for_all_threads` cannot block forever on a slot no thread owns.
-/// The success path disarms the guard after the RunningGuard takes over.
+/// The success path releases the settlement sentinel and disarms the guard
+/// back-to-back once the RunningGuard has taken over — nothing fallible in
+/// between, so a settlement waiter admitted by that release can never
+/// observe a clean job that a later unwind repaints as StartFailed.
 struct StartFailGuard {
     armed: bool,
     status: Arc<AtomicUsize>,
+    result: Arc<Mutex<Option<crate::error::Result<()>>>>,
     thread_sync: ThreadSynchronizer,
     // Cloned upfront: Drop cannot borrow ffmpeg_context (start() holds it
     // mutably), and the demuxer set is fixed before any worker spawns.
     demux_waiters: Vec<Arc<crate::util::sch_waiter::SchWaiter>>,
     mux_handed: Vec<bool>,
+    // Whether the settlement sentinel slot (claimed in start() before the
+    // muxer pre-count) is still held. True from construction until
+    // release_sentinel() runs — on the success path at start()'s infallible
+    // tail, immediately before the disarm; on the failure path inside Drop
+    // AFTER the failure is recorded.
+    sentinel_held: bool,
+}
+
+impl StartFailGuard {
+    /// Releases the settlement sentinel slot exactly once, reopening the
+    /// packet-sink settlement barrier (`live <= settled`). Like any worker
+    /// slot release, it must publish the terminal state when it turns out to
+    /// be the last live slot (a job whose muxers all finished inside
+    /// `mux_init`, e.g. every output streamless), or a woken `wait()` would
+    /// observe a non-terminal status.
+    fn release_sentinel(&mut self) {
+        if !self.sentinel_held {
+            return;
+        }
+        // Snapshot what a settlement waiter admitted by THIS release could
+        // observe, taken here on the releasing thread so ordering tests
+        // need not race it. Compiled out of production builds.
+        #[cfg(test)]
+        start_tail_probe::record_release(
+            Arc::as_ptr(&self.status) as usize,
+            self.result
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some(),
+            is_stopping(self.status.load(Ordering::Acquire)),
+        );
+        self.sentinel_held = false;
+        let status = self.status.clone();
+        self.thread_sync.thread_done_with(|| {
+            status.store(STATUS_END, Ordering::Release);
+        });
+    }
 }
 
 impl Drop for StartFailGuard {
@@ -75,6 +199,16 @@ impl Drop for StartFailGuard {
         if !self.armed {
             return;
         }
+        // Record the start failure BEFORE publishing the terminal status or
+        // releasing any slot (first-error-wins keeps a more specific error a
+        // worker recorded earlier). start() returns the actual init error to
+        // its caller; this recorded error exists for CONCURRENT observers: a
+        // fully-drained packet sink parked in the settlement barrier is
+        // admitted by the releases below and samples the scheduler result
+        // right after — with nothing recorded, it would deliver `on_end` for
+        // a job whose start() failed, and a truncated sink would stay silent
+        // instead of reporting the failure.
+        set_scheduler_error(&self.status, &self.result, crate::error::Error::StartFailed);
         self.status.store(STATUS_END, Ordering::Release);
         notify_pause_waiters();
         // Wake choked demuxers so they observe the terminal state and exit
@@ -87,6 +221,10 @@ impl Drop for StartFailGuard {
                 crate::core::scheduler::mux_task::release_mux_slot(&self.status, &self.thread_sync);
             }
         }
+        // Only after the failure is published: a settlement waiter this
+        // release admits must observe the recorded error, never a clean
+        // terminal state.
+        self.release_sentinel();
         self.thread_sync.wait_for_all_threads();
     }
 }
@@ -255,6 +393,15 @@ impl<S: 'static> FfmpegScheduler<S> {
     pub fn is_ended(&self) -> bool {
         is_stopping(self.status.load(Ordering::Acquire))
     }
+
+    /// Test-only: how many threads are currently parked in the settlement
+    /// barrier (`wait_peers_settled`). Lets a test prove a terminal
+    /// coordinator is genuinely parked while the rest of the job runs,
+    /// without exposing the synchronizer itself.
+    #[cfg(test)]
+    pub(crate) fn parked_settlement_waiters(&self) -> usize {
+        self.thread_sync.parked_settlement_waiters()
+    }
 }
 
 impl FfmpegScheduler<Initialization> {
@@ -346,6 +493,20 @@ impl FfmpegScheduler<Initialization> {
         // still choked by the balancing pass (see MuxDoneGuard in mux_task.rs).
         let mux_done_remaining = Arc::new(AtomicUsize::new(self.ffmpeg_context.muxs.len()));
 
+        // Settlement sentinel: one extra tracked slot, claimed before the
+        // first registration below and held by this thread until start()
+        // can no longer fail — the success path releases it (via
+        // `release_sentinel`) at the infallible tail, immediately before
+        // the guard disarm; the failure path records the error FIRST — see
+        // StartFailGuard::drop. While it is live and never settled, the
+        // packet-sink settlement barrier (`live <= settled`,
+        // thread_synchronizer.rs) cannot pass, so no fully-drained sink can
+        // decide its terminal (on_end vs JobFailed) against a job that can
+        // still fail: the terminal decision always samples a job whose
+        // start() either committed to success or failed with the error
+        // already recorded.
+        thread_sync.thread_start();
+
         // Pre-count EVERY muxer's thread slot before any `mux_init` runs. A
         // streamless (AVFMT_NOSTREAMS) output releases its slot synchronously
         // inside `mux_init` (`release_mux_slot`); counted one-at-a-time, an
@@ -354,6 +515,25 @@ impl FfmpegScheduler<Initialization> {
         // which stops (truncates) those still-pending outputs. Counting all
         // muxers up front keeps the counter > 0 until every muxer — and every
         // later worker — is genuinely done.
+        //
+        // Muxers are the ONLY workers whose slots need pre-counting. Every
+        // other worker (encoder, filter graph, frame pipeline, decoder,
+        // demuxer, frame source) claims its slot on THIS thread inside its
+        // own init call, strictly before its worker thread spawns, and none
+        // of those inits releases a slot synchronously — so the counter never
+        // dips as registration proceeds. Their later registration is also
+        // invisible to every counter consumer: wait()/stop() cannot run yet
+        // (no Running handle exists before start() returns), and a packet
+        // sink cannot outrun the registration sequence to a premature on_end,
+        // twice over. First, a sink's completion requires a per-stream EOF
+        // marker for EVERY stream, and those originate only in producer
+        // workers (encoders, or a demuxer's recording-time EOF) — each stage's
+        // channel senders stay parked inside FfmpegContext until that stage's
+        // init (slot claimed first) moves them into its worker, so neither an
+        // EOF marker nor even a disconnect is observable before the whole
+        // producing chain, up to the sources spawned by the LAST init loops,
+        // has registered. Second, the settlement sentinel above holds the
+        // barrier shut for the whole window regardless.
         for _ in 0..self.ffmpeg_context.muxs.len() {
             thread_sync.thread_start();
         }
@@ -366,6 +546,7 @@ impl FfmpegScheduler<Initialization> {
         let mut start_fail_guard = StartFailGuard {
             armed: true,
             status: scheduler_status.clone(),
+            result: scheduler_result.clone(),
             thread_sync: thread_sync.clone(),
             demux_waiters: self
                 .ffmpeg_context
@@ -381,6 +562,7 @@ impl FfmpegScheduler<Initialization> {
                 })
                 .collect(),
             mux_handed: vec![false; self.ffmpeg_context.muxs.len()],
+            sentinel_held: true,
         };
 
         // Muxer
@@ -664,6 +846,25 @@ impl FfmpegScheduler<Initialization> {
             demux_waiters,
             _interrupt_state: running_scheduler.ffmpeg_context.interrupt_state.clone(),
         });
+        // Test-only: the sentinel release below must find this installation
+        // already done; tests pin that ordering through the real start().
+        #[cfg(test)]
+        start_tail_probe::note_running_guard_installed(
+            Arc::as_ptr(&running_scheduler.status) as usize,
+        );
+
+        // Registration is complete (every worker this job will ever track
+        // claimed its slot above) and the RunningGuard is installed: reopen
+        // the packet-sink settlement barrier. A drained sink this release
+        // admits samples the job result immediately and may dispatch on_end,
+        // so the release must sit where start() can no longer fail. Released
+        // before the balancing update and the Running-state construction
+        // above, a panic unwinding out of that remainder (say the balancing
+        // lock poisoned by a concurrently panicking mux worker) would record
+        // StartFailed AFTER that on_end — two contradictory terminals for
+        // one job. Nothing fallible may sit between this release and the
+        // disarm below.
+        start_fail_guard.release_sentinel();
 
         // Failure duty is now the RunningGuard's: it performs the same
         // terminal-state + join protocol for the scheduler's whole lifetime.
@@ -685,6 +886,24 @@ impl FfmpegScheduler<Initialization> {
 }
 
 impl FfmpegScheduler<Running> {
+    /// Whether this scheduler's job contains the channel-adapter packet sink
+    /// identified by `token` (Arc pointer identity of its `CancellationSlot`).
+    /// Backs the [`PacketSinkReceiver::into_events`] pairing check; the
+    /// tokens live on the muxers (never taken by the worker handoff), so the
+    /// check is race-free against a running job.
+    ///
+    /// [`PacketSinkReceiver::into_events`]: crate::core::packet_sink::PacketSinkReceiver::into_events
+    pub(crate) fn runs_packet_sink(
+        &self,
+        token: &crate::core::packet_sink::CancellationSlot,
+    ) -> bool {
+        self.ffmpeg_context.muxs.iter().any(|mux| {
+            mux.packet_sink_token
+                .as_ref()
+                .is_some_and(|t| Arc::ptr_eq(t, token))
+        })
+    }
+
     /// Pauses a running FFmpeg job, transitioning from `Running` to `Paused`.
     ///
     /// Internally sets the FFmpeg pipeline threads to a paused state. Depending
@@ -1230,6 +1449,509 @@ mod tests {
             unwind.load(Ordering::Acquire),
             "must publish enc_registered on unwind"
         );
+    }
+
+    /// The settlement sentinel must hold the packet-sink barrier shut for the
+    /// whole registration window, and a failing start() must record the
+    /// scheduler error BEFORE the sentinel release admits a parked waiter — a
+    /// fully-drained sink sampling the job right after admission must observe
+    /// the failure, never a clean terminal state it would report as on_end.
+    ///
+    /// Two mechanisms make this deterministic rather than schedule-lucky:
+    /// the guard drops only once the sink is provably PARKED in the wait
+    /// (not merely registered — a delayed sink that parks after the whole
+    /// failure path finished would sample the error trivially and prove no
+    /// ordering), and the record-before-release order is asserted on the
+    /// release-moment snapshot taken by the releasing thread itself, which
+    /// no sink-side scheduling can blur.
+    #[test]
+    fn start_fail_guard_publishes_the_failure_before_admitting_settlement_waiters() {
+        use super::{is_stopping, start_tail_probe, StartFailGuard};
+        use crate::util::thread_synchronizer::ThreadSynchronizer;
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+        let sync = ThreadSynchronizer::new();
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let result: Arc<Mutex<Option<crate::error::Result<()>>>> = Arc::new(Mutex::new(None));
+        start_tail_probe::arm(Arc::as_ptr(&status) as usize);
+
+        // start(): the sentinel slot, then a packet-sink worker's slot.
+        sync.thread_start();
+        sync.thread_start();
+
+        // A locally-complete sink: registers settled, parks at the barrier,
+        // and samples the job state right after admission — the terminal
+        // decision's exact shape.
+        let observed_failure = Arc::new(AtomicBool::new(false));
+        let admitted = Arc::new(AtomicBool::new(false));
+        let (registered_tx, registered_rx) = std::sync::mpsc::channel();
+        let (sink_sync, sink_status, sink_result) = (sync.clone(), status.clone(), result.clone());
+        let (observed_w, admitted_w) = (observed_failure.clone(), admitted.clone());
+        let sink = std::thread::spawn(move || {
+            sink_sync.register_settled();
+            // First latch phase: registration observed (see the parked spin
+            // below for the second phase).
+            registered_tx.send(()).unwrap();
+            sink_sync.wait_peers_settled();
+            admitted_w.store(true, Ordering::Release);
+            let recorded = sink_result
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let failure_visible = matches!(
+                &*recorded,
+                Some(Err(crate::error::Error::StartFailed))
+            ) && is_stopping(sink_status.load(Ordering::Acquire));
+            drop(recorded);
+            observed_w.store(failure_visible, Ordering::Release);
+            sink_sync.thread_done_with_settled(true, || {});
+        });
+
+        // Wait for the registration itself, not wall-clock time. Once it is
+        // observed the barrier arithmetic is pinned — live 2 (sentinel +
+        // sink) > settled 1 — so no scheduling of the sink thread can pass
+        // `wait_peers_settled` while the sentinel slot is live.
+        registered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the sink must register with the settlement barrier");
+        // Second latch phase: the sink is PARKED in the settlement wait, so
+        // the admission below can only come from the guard's release edge —
+        // a sink that merely arrived late could never distinguish
+        // record-then-release from release-then-record.
+        let parked_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while sync.parked_settlement_waiters() == 0 {
+            assert!(
+                std::time::Instant::now() < parked_deadline,
+                "the sink never parked in the settlement wait"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            !admitted.load(Ordering::Acquire),
+            "the settlement barrier must hold while the sentinel slot is live"
+        );
+
+        // A later init fails: the armed guard drops. Its Drop records the
+        // error, publishes the terminal state, releases the sentinel and
+        // joins the sink worker.
+        drop(StartFailGuard {
+            armed: true,
+            status: status.clone(),
+            result: result.clone(),
+            thread_sync: sync.clone(),
+            demux_waiters: Vec::new(),
+            mux_handed: Vec::new(),
+            sentinel_held: true,
+        });
+
+        sink.join().unwrap();
+        assert!(admitted.load(Ordering::Acquire));
+        assert!(
+            observed_failure.load(Ordering::Acquire),
+            "an admitted settlement waiter must observe the recorded start failure"
+        );
+        // The release-moment snapshot pins the order on the releasing thread
+        // itself: at the instant the sentinel release admitted the parked
+        // sink, the failure was already recorded and the terminal state
+        // already published — not caught up with later.
+        let snapshot = start_tail_probe::take(Arc::as_ptr(&status) as usize)
+            .expect("the failing guard's drop must release the sentinel");
+        assert!(
+            snapshot.result_recorded,
+            "the failure must be recorded before the sentinel release admits a waiter"
+        );
+        assert!(
+            snapshot.status_stopping,
+            "the terminal status must be published before the sentinel release admits a waiter"
+        );
+        // First-error-wins left the start failure as the recorded result.
+        assert!(matches!(
+            &*result.lock().unwrap(),
+            Some(Err(crate::error::Error::StartFailed))
+        ));
+    }
+
+    /// start()'s success tail, driven through the REAL start() of a minimal
+    /// copy job (not a synthetic guard, which would stay green however the
+    /// production tail were reordered). A drained-sink-shaped waiter parks in
+    /// the settlement barrier and the input's reads are gated so the job
+    /// cannot finish while the tail is inspected. Pinned:
+    ///   1. start() releases the sentinel through `release_sentinel` with the
+    ///      RunningGuard ALREADY installed — asserted on the release-moment
+    ///      snapshot the releasing thread records, so the release provably
+    ///      sits after the installation (and after everything before it:
+    ///      the balancing update and the Running-state construction);
+    ///   2. at that instant nothing was recorded and the status was not
+    ///      terminal — the tail's admission edge shows waiters a clean job;
+    ///   3. the release admits no waiter while workers hold slots — after
+    ///      start() returns the gated worker still pins the barrier shut;
+    ///   4. end-to-end, the waiter is admitted only at full settlement and
+    ///      samples the clean terminal (its on_end), which nothing repaints.
+    /// NOT pinned: that the remainder between the release and the disarm is
+    /// empty of fallible code — an empty window has no runtime observable.
+    /// Any code moved between the installation and the release trips
+    /// assertion 1; code inserted after the release is out of this test's
+    /// reach and must keep the disarm adjacent.
+    #[test]
+    fn start_tail_releases_the_sentinel_only_after_the_running_guard_is_installed() {
+        use super::{is_stopping, start_tail_probe, STATUS_ABORT, STATUS_END};
+        use std::fs::File;
+        use std::io::{Read, Seek, SeekFrom};
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+        // test.mp4 through read/seek callbacks whose post-build reads are
+        // held by a gate: while the gate is closed the demux worker cannot
+        // reach EOF, so the job provably cannot settle and admit the parked
+        // waiter through worker-slot releases. Shrinking the io buffer to
+        // 4 KiB and capping probesize at 4 KiB starves build-time probing,
+        // but no byte budget can PROVE a post-gate read happens (probing
+        // reads and demuxer seeks are unbounded in count) — so the callback
+        // counts reads entering and leaving the closed gate, and the test
+        // refuses to proceed until one is provably parked there and then.
+        // Each wait is bounded so a failing run cannot wedge the worker
+        // forever, but a fallback that fires with the gate still closed is
+        // recorded and fails the test at the end: every inspection below
+        // assumes the gate held its worker throughout.
+        let file = Arc::new(Mutex::new(
+            File::open("test.mp4").expect("test input must exist"),
+        ));
+        let gate = Arc::new(AtomicBool::new(false));
+        let gate_wait_enters = Arc::new(AtomicUsize::new(0));
+        let gate_wait_exits = Arc::new(AtomicUsize::new(0));
+        let gate_wait_timed_out = Arc::new(AtomicBool::new(false));
+        let (gate_r, file_r) = (gate.clone(), file.clone());
+        let (enters_r, exits_r, timed_out_r) = (
+            gate_wait_enters.clone(),
+            gate_wait_exits.clone(),
+            gate_wait_timed_out.clone(),
+        );
+        let read_callback: Box<dyn FnMut(&mut [u8]) -> i32 + Send> = Box::new(move |buf| {
+            if gate_r.load(Ordering::Acquire) {
+                enters_r.fetch_add(1, Ordering::AcqRel);
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while gate_r.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                if gate_r.load(Ordering::Acquire) {
+                    timed_out_r.store(true, Ordering::Release);
+                }
+                exits_r.fetch_add(1, Ordering::AcqRel);
+            }
+            let mut file = file_r.lock().unwrap();
+            match file.read(buf) {
+                Ok(0) => ffmpeg_sys_next::AVERROR_EOF,
+                Ok(n) => n as i32,
+                Err(_) => ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO),
+            }
+        });
+        let seek_file = file.clone();
+        let seek_callback: Box<dyn FnMut(i64, i32) -> i64 + Send> =
+            Box::new(move |offset, whence| {
+                let mut file = seek_file.lock().unwrap();
+                if whence == ffmpeg_sys_next::AVSEEK_SIZE {
+                    return match file.metadata() {
+                        Ok(meta) => meta.len() as i64,
+                        Err(_) => ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO) as i64,
+                    };
+                }
+                let seek = match whence {
+                    ffmpeg_sys_next::SEEK_SET => file.seek(SeekFrom::Start(offset as u64)),
+                    ffmpeg_sys_next::SEEK_CUR => file.seek(SeekFrom::Current(offset)),
+                    ffmpeg_sys_next::SEEK_END => file.seek(SeekFrom::End(offset)),
+                    _ => return ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::ESPIPE) as i64,
+                };
+                match seek {
+                    Ok(pos) => pos as i64,
+                    Err(_) => ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO) as i64,
+                }
+            });
+        let mut input: Input = read_callback.into();
+        input.seek_callback = Some(seek_callback);
+        input.io_buffer_size = 4096;
+        let input = input.set_format_opt("probesize", "4096");
+
+        // Build probes the input, so the gate closes only afterwards.
+        let context = FfmpegContext::builder()
+            .input(input)
+            .output(
+                Output::from("-")
+                    .set_format("null")
+                    .add_stream_map_with_copy("0:v"),
+            )
+            .build()
+            .expect("a copy job to the null muxer must build");
+        gate.store(true, Ordering::Release);
+
+        let scheduler = FfmpegScheduler::new(context);
+        let sync = scheduler.thread_sync.clone();
+        let status = scheduler.status.clone();
+        let result = scheduler.result.clone();
+        let status_key = Arc::as_ptr(&status) as usize;
+        start_tail_probe::arm(status_key);
+
+        // The drained-sink-shaped waiter: slot claimed BEFORE start() (as a
+        // packet-sink worker's slot is claimed before its thread spawns),
+        // registered settled, parked in the settlement barrier. On admission
+        // it decides its terminal the way the linearization point does — a
+        // clean sample (no recorded error, no abort) dispatches on_end.
+        //
+        // The extra holder slot stands in for the settlement sentinel, which
+        // start() has not claimed yet: without it the waiter would be the
+        // only live slot (live 1 <= settled 1) and pass the barrier before
+        // start() even ran. In production a sink can never observe that
+        // state — the sentinel slot is claimed before any registration. The
+        // holder is released once start() has returned, when the gated
+        // workers hold the barrier instead.
+        sync.thread_start();
+        sync.thread_start();
+        let dispatched_on_end = Arc::new(AtomicBool::new(false));
+        let admitted = Arc::new(AtomicBool::new(false));
+        let (sink_sync, sink_status, sink_result) = (sync.clone(), status.clone(), result.clone());
+        let (dispatched_w, admitted_w) = (dispatched_on_end.clone(), admitted.clone());
+        let sink = std::thread::spawn(move || {
+            sink_sync.register_settled();
+            sink_sync.wait_peers_settled();
+            admitted_w.store(true, Ordering::Release);
+            let aborted = sink_status.load(Ordering::Acquire) == STATUS_ABORT;
+            let clean = sink_result
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none();
+            dispatched_w.store(clean && !aborted, Ordering::Release);
+            // The waiter can be the job's last released slot, so its release
+            // publishes the terminal state exactly as a worker's would.
+            let end_status = sink_status.clone();
+            sink_sync.thread_done_with_settled(true, move || {
+                end_status.store(STATUS_END, Ordering::Release);
+            });
+        });
+        let parked_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while sync.parked_settlement_waiters() == 0 {
+            assert!(
+                std::time::Instant::now() < parked_deadline,
+                "the settlement waiter never parked"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        // The holder slot exists only in this test, so a failing start()
+        // would deadlock on it: StartFailGuard::drop waits for every slot,
+        // and the test thread that would release the holder is inside
+        // start(). Two rescuers cover that, each opening the gate BEFORE
+        // returning the holder so the failure's own joins drain instead of
+        // stalling every gated read to its fallback: a status watcher that
+        // reacts the moment the failure guard publishes the terminal status
+        // (which it does before its joins), and a 30 s failsafe for a
+        // start() that hangs without ever publishing one. The swap makes
+        // the release exactly-once whichever side gets there.
+        let holder_released = Arc::new(AtomicBool::new(false));
+        let release_holder = {
+            let (sync, flag) = (sync.clone(), holder_released.clone());
+            move || {
+                if !flag.swap(true, Ordering::AcqRel) {
+                    sync.thread_done_with(|| {});
+                }
+            }
+        };
+        let watcher_done = Arc::new(AtomicBool::new(false));
+        let start_fail_watcher = {
+            let (status, gate, release_holder, done) = (
+                status.clone(),
+                gate.clone(),
+                release_holder.clone(),
+                watcher_done.clone(),
+            );
+            std::thread::spawn(move || {
+                while !done.load(Ordering::Acquire) {
+                    if is_stopping(status.load(Ordering::Acquire)) {
+                        gate.store(false, Ordering::Release);
+                        release_holder();
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            })
+        };
+        let failsafe_fired = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let holder_failsafe = {
+            let release_holder = release_holder.clone();
+            let gate = gate.clone();
+            let fired = failsafe_fired.clone();
+            std::thread::spawn(move || {
+                if started_rx.recv_timeout(Duration::from_secs(30)).is_err() {
+                    fired.store(true, Ordering::Release);
+                    gate.store(false, Ordering::Release);
+                    release_holder();
+                }
+            })
+        };
+
+        // Reopen the gate on EVERY exit path, in two phases around the
+        // fallible start(): the pre-start guard covers a start() that
+        // returns an error — the failed expect's unwind opens the gate at
+        // once (the joins INSIDE a failing start() are unwedged by the
+        // status watcher above, with the read fallback and the failsafe as
+        // last resorts) — and is disarmed when the post-start guards take
+        // over in the drop order that matters there.
+        struct OpenOnExit(Option<Arc<AtomicBool>>);
+        impl OpenOnExit {
+            fn disarm(&mut self) {
+                self.0 = None;
+            }
+        }
+        impl Drop for OpenOnExit {
+            fn drop(&mut self) {
+                if let Some(gate) = self.0.take() {
+                    gate.store(false, Ordering::Release);
+                }
+            }
+        }
+        let mut pre_start_gate = OpenOnExit(Some(gate.clone()));
+        let running = scheduler.start().expect("the minimal copy job must start");
+        watcher_done.store(true, Ordering::Release);
+        start_fail_watcher.join().unwrap();
+        let _ = started_tx.send(());
+        holder_failsafe.join().unwrap();
+        // Post-start unwind, in reverse declaration order: the gate opens
+        // FIRST (declared last), then the holder goes back, and only then
+        // does `running`'s guard join — its workers drain through an open
+        // gate with no artificial slot left to wait on.
+        struct ReleaseOnExit<F: FnMut()>(F);
+        impl<F: FnMut()> Drop for ReleaseOnExit<F> {
+            fn drop(&mut self) {
+                (self.0)();
+            }
+        }
+        let _holder_guard = ReleaseOnExit(release_holder.clone());
+        let _open_gate = OpenOnExit(Some(gate.clone()));
+        pre_start_gate.disarm();
+
+        // The handshake the gate's premise rests on: a demux read is parked
+        // in the closed gate RIGHT NOW (enters > exits), so EOF was not
+        // reachable from build-time buffering alone and the barrier is held
+        // by a genuinely gated worker — no byte-budget arithmetic can show
+        // that, and a set-once "entered" flag could not either: it stays
+        // true after its read burns the fallback and finishes the file.
+        // The two loads CAN tear — a fallback exit between them shows
+        // fresh enters against stale exits — but that exit records
+        // `gate_wait_timed_out` before bumping exits, so the loop fails
+        // fast on the flag with the specific diagnosis and the post-loop
+        // check catches most of the rest early. Neither is the soundness
+        // argument: a fallback can fire at ANY later point (even
+        // mid-inspection, where an unrelated assertion may trip first),
+        // and the end-of-test assertion on the same flag is what keeps
+        // every such run from going green. Only with a read provably
+        // parked has the pre-start holder served its purpose and goes
+        // back.
+        let handshake_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while gate_wait_enters.load(Ordering::Acquire) <= gate_wait_exits.load(Ordering::Acquire)
+        {
+            assert!(
+                !gate_wait_timed_out.load(Ordering::Acquire),
+                "a gated read burned its 10 s fallback while the handshake \
+                 was still waiting: the gate is not holding the worker"
+            );
+            assert!(
+                std::time::Instant::now() < handshake_deadline,
+                "no read is parked in the closed gate: build-time probing \
+                 consumed the input and the gate holds nothing"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            !gate_wait_timed_out.load(Ordering::Acquire),
+            "a gated read burned its 10 s fallback with the gate still closed"
+        );
+        release_holder();
+
+        // (3) The gated demux worker still holds its slot, so the sentinel
+        // release cannot have admitted the waiter.
+        assert!(
+            !admitted.load(Ordering::Acquire),
+            "no settlement waiter may be admitted while workers hold slots"
+        );
+        // (1) + (2) The release-moment snapshot from the releasing thread.
+        let snapshot = start_tail_probe::take(status_key)
+            .expect("start()'s success tail must release the sentinel via release_sentinel");
+        assert!(
+            snapshot.running_guard_installed,
+            "the sentinel release must sit after the RunningGuard installation"
+        );
+        assert!(
+            !snapshot.result_recorded && !snapshot.status_stopping,
+            "the success tail must release the sentinel against a clean job"
+        );
+        assert!(
+            running._guard.is_some(),
+            "start() must return with the RunningGuard installed"
+        );
+
+        // (4) Open the gate: the job drains and settles; only then is the
+        // waiter admitted, and it samples the clean terminal.
+        gate.store(false, Ordering::Release);
+        running.wait().expect("the copy job must complete cleanly");
+        sink.join().unwrap();
+        assert!(admitted.load(Ordering::Acquire));
+        assert!(
+            dispatched_on_end.load(Ordering::Acquire),
+            "the waiter admitted at settlement must observe a clean job"
+        );
+        assert!(
+            result.lock().unwrap().is_none(),
+            "no failure may be recorded after the success tail admitted the waiter"
+        );
+        // Gate health, checked LAST: if any gated read burned its fallback
+        // or the failsafe fired, some window above ran against a job the
+        // gate was no longer holding and every conclusion is vacuous.
+        assert!(
+            !gate_wait_timed_out.load(Ordering::Acquire),
+            "a gated read burned its 10 s fallback with the gate still closed"
+        );
+        assert!(
+            !failsafe_fired.load(Ordering::Acquire),
+            "the 30 s failsafe fired: start() never handed control back \
+             within the inspection budget"
+        );
+    }
+
+    /// Success path: `release_sentinel` releases exactly once (idempotent),
+    /// publishes STATUS_END when the sentinel is the last live slot (a job
+    /// whose muxers all finished inside `mux_init`), and a disarmed guard
+    /// records nothing on drop.
+    #[test]
+    fn start_sentinel_success_release_publishes_end_and_records_no_error() {
+        use super::StartFailGuard;
+        use crate::util::thread_synchronizer::ThreadSynchronizer;
+        use std::sync::atomic::AtomicUsize;
+
+        let sync = ThreadSynchronizer::new();
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let result: Arc<Mutex<Option<crate::error::Result<()>>>> = Arc::new(Mutex::new(None));
+
+        sync.thread_start();
+        let mut guard = StartFailGuard {
+            armed: true,
+            status: status.clone(),
+            result: result.clone(),
+            thread_sync: sync.clone(),
+            demux_waiters: Vec::new(),
+            mux_handed: Vec::new(),
+            sentinel_held: true,
+        };
+
+        guard.release_sentinel();
+        // The sentinel was the last live slot: the release must publish the
+        // terminal state before any waiter wakes.
+        sync.wait_for_all_threads();
+        assert_eq!(status.load(Ordering::Acquire), super::STATUS_END);
+        // A second release must not touch the (now zero) counter.
+        guard.release_sentinel();
+        sync.wait_for_all_threads();
+
+        // The success path disarms; the drop must record nothing.
+        guard.armed = false;
+        drop(guard);
+        assert!(result.lock().unwrap().is_none());
     }
 
     // conc-06: workers parked in wait_until_not_paused must all wake and observe

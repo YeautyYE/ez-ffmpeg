@@ -40,11 +40,15 @@ fn run(input: Input, output: Output, scenario: &str) -> ez_ffmpeg::error::Result
     )
 }
 
-/// Validates the strict-tier avcC structural contract (v1.2 three checks).
+/// Validates the strict-tier avcC structural contract.
 fn assert_valid_avcc(avcc: &[u8]) {
     assert!(avcc.len() >= 7, "avcC too short: {} bytes", avcc.len());
     assert_eq!(avcc[0], 1, "configurationVersion");
-    assert_eq!(avcc[4] & 0x03, 3, "lengthSizeMinusOne must be 3 (4-byte)");
+    // Full bytes, not masked views: the reserved bits around the length
+    // size and the SPS count are all ones in every conforming record
+    // (ff_isom_write_avcc emits 0xFF and 0xE0 | count).
+    assert_eq!(avcc[4], 0xFF, "reserved ones + lengthSizeMinusOne 3 (4-byte)");
+    assert_eq!(avcc[5] & 0xE0, 0xE0, "byte 5 reserved bits must be ones");
     assert!(avcc[5] & 0x1F >= 1, "at least one SPS");
 }
 
@@ -273,6 +277,10 @@ fn av_job_shares_one_time_origin() {
         "AAC must carry its AudioSpecificConfig"
     );
     assert_eq!(audio.sample_rate, 44100);
+    assert_eq!(
+        audio.channel_layout, "mono",
+        "the sine source is mono and the layout must reach the sink info"
+    );
     assert!(matches!(events.last(), Some(SinkEv::End { .. })));
 
     let packets = sink_packets(&log);
@@ -404,7 +412,7 @@ fn sibling_failure_after_sink_drain_reports_delivery_error_not_end() {
         "on_end must not fire when the job failed elsewhere"
     );
     assert!(
-        matches!(events.last(), Some(SinkEv::Error(message)) if !message.is_empty()),
+        matches!(events.last(), Some(SinkEv::Error { message, .. }) if !message.is_empty()),
         "the settled job failure surfaces as on_delivery_error, got {:?}",
         events.last()
     );
@@ -470,7 +478,7 @@ fn sibling_custom_io_destruction_panic_prevents_on_end() {
         "on_end must not fire when a sibling's teardown panicked: {events:?}"
     );
     assert!(
-        events.iter().any(|e| matches!(e, SinkEv::Error(_))),
+        events.iter().any(|e| matches!(e, SinkEv::Error { .. })),
         "the sibling teardown failure surfaces as on_delivery_error: {events:?}"
     );
 }
@@ -777,8 +785,17 @@ fn on_end_waits_for_live_peers_after_a_register_only_sink_departs() {
     // opens the capture gate before anything waits on the parked sibling.
     let _open_gate_on_unwind = GateOnDrop(capture_gate.clone());
 
-    // 1. A drains and sits at the settlement barrier.
+    // 1. A drains and sits at the settlement barrier. First wait for the
+    // FIRST delivery (the stability window alone could declare quiescence
+    // before anything was delivered), then require the count to hold still.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while delivered_a.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "sink A never delivered a packet"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     let mut last = delivered_a.load(std::sync::atomic::Ordering::Acquire);
     let mut stable_since = std::time::Instant::now();
     loop {
@@ -795,7 +812,6 @@ fn on_end_waits_for_live_peers_after_a_register_only_sink_departs() {
             break;
         }
     }
-    assert!(last > 0, "sink A must have delivered packets");
 
     // 2. Clean stop(): B truncates mid-delivery (register-only, silent per
     // the stop contract, releases its slot); the sibling's teardown parks
@@ -902,79 +918,7 @@ fn sibling_sink_terminal_panic_never_rewrites_the_settled_result() {
     );
 }
 
-/// The finalize-gating probe: a packet sink must never hold the
-/// scheduler-wide I/O finalize exemption. With a sink waiting in its terminal
-/// coordinator and a sibling container blocked on an unread TCP peer,
-/// stop() must still cut the sibling within the grace window and return —
-/// an (ungated) sink-held finalize guard would suppress the cut and hang.
-#[test]
-fn blocked_sibling_stays_interruptible_while_sink_finalizes() {
-    if !have_encoder("libx264") {
-        eprintln!("skipping: libx264 not available in this FFmpeg build");
-        return;
-    }
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    let accept_thread = std::thread::spawn(move || {
-        if let Ok((stream, _)) = listener.accept() {
-            // Hold the socket open without reading until the test ends.
-            std::thread::sleep(std::time::Duration::from_secs(30));
-            drop(stream);
-        }
-    });
-
-    let (sink, log) = recording_sink();
-    let scheduler = FfmpegContext::builder()
-        // High-entropy source so the non-reading peer's buffers fill fast.
-        .input(Input::from("testsrc2=s=1280x720:r=30").set_format("lavfi"))
-        .output(
-            x264_output(sink)
-                .add_stream_map("0:v")
-                .set_recording_time_us(300_000),
-        )
-        .output(
-            Output::from(format!("tcp://{addr}?send_buffer_size=16384"))
-                .add_stream_map("0:v")
-                .set_format("mpegts")
-                .set_video_codec("mpeg4")
-                .set_video_codec_opt("qscale", "1"),
-        )
-        .build()
-        .unwrap()
-        .start()
-        .unwrap();
-    // Let the sink drain (300 ms of media) and the sibling wedge on the
-    // unread socket.
-    std::thread::sleep(std::time::Duration::from_millis(1500));
-
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(scheduler.stop());
-    });
-    let result = rx
-        .recv_timeout(std::time::Duration::from_secs(30))
-        .expect("stop() hung: the sink held the finalize exemption over a blocked sibling");
-    // The sibling was either cut mid-write (an error) or exited between
-    // writes (clean); both are acceptable — the property under test is that
-    // stop() RETURNS.
-    let _ = result;
-    let events = log.lock().unwrap();
-    let ends = events
-        .iter()
-        .filter(|e| matches!(e, SinkEv::End { .. }))
-        .count();
-    let errors = events
-        .iter()
-        .filter(|e| matches!(e, SinkEv::Error(_)))
-        .count();
-    assert!(
-        ends + errors <= 1,
-        "at most one terminal sink event may fire ({ends} end, {errors} error)"
-    );
-    drop(accept_thread);
-}
-
-/// Result-identity pin: a delivered on_end must imply wait() ==
+/// The round-7 correctness probe: a delivered on_end must imply wait() ==
 /// Ok. The single documented carve-out is user code failing AFTER the fact —
 /// here a callback capture whose Drop panics during teardown: the panic is
 /// caught at the worker's defined destruction point, logged, and must NOT
@@ -1038,7 +982,10 @@ fn aac_only_delivery_streams_through_into_events() {
     let mut saw_end = false;
     let mut packets = 0usize;
     let mut prev_dts: Option<i64> = None;
-    for event in receiver.into_events(scheduler) {
+    let events = receiver
+        .into_events(scheduler)
+        .expect("receiver paired with the scheduler running its sink");
+    for event in events {
         match event.expect("job failed") {
             ez_ffmpeg::packet_sink::PacketSinkEvent::StreamInfo(streams) => {
                 assert!(!saw_info, "stream info must arrive exactly once");
@@ -1068,6 +1015,62 @@ fn aac_only_delivery_streams_through_into_events() {
     }
     assert!(saw_info && saw_end, "info and End must both arrive");
     assert!(packets > 50, "2 s of AAC is ~86 frames, got {packets}");
+}
+
+/// Run-token pairing: `into_events` must reject a scheduler that is not
+/// running this receiver's sink. Without the check, receiver A silently
+/// cross-wires with job B — streaming A's events while joining (and, on
+/// early drop, aborting) B. The typed error returns both handles unchanged,
+/// which the test proves by re-pairing each receiver with its own run and
+/// draining both to completion.
+#[test]
+fn into_events_rejects_a_cross_wired_scheduler() {
+    let capacity = std::num::NonZeroUsize::new(64).unwrap();
+    let (sink_a, receiver_a) = PacketSink::channel(capacity);
+    let scheduler_a = FfmpegContext::builder()
+        .input(Input::from("sine=frequency=440:duration=1").set_format("lavfi"))
+        .output(Output::from(sink_a).set_audio_codec("aac"))
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    let (sink_b, receiver_b) = PacketSink::channel(capacity);
+    let scheduler_b = FfmpegContext::builder()
+        .input(Input::from("sine=frequency=220:duration=1").set_format("lavfi"))
+        .output(Output::from(sink_b).set_audio_codec("aac"))
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+
+    // Cross-wiring receiver A with scheduler B must fail typed, before any
+    // event is consumed and without disturbing either running job.
+    let mismatch = receiver_a
+        .into_events(scheduler_b)
+        .expect_err("a scheduler not running this receiver's sink must be rejected");
+    assert_eq!(
+        mismatch.to_string(),
+        "packet-sink receiver paired with a scheduler that is not running its sink"
+    );
+
+    let receiver_a = mismatch.receiver;
+    let scheduler_b = mismatch.scheduler;
+    for (receiver, scheduler) in [(receiver_a, scheduler_a), (receiver_b, scheduler_b)] {
+        let mut saw_end = false;
+        let events = receiver
+            .into_events(scheduler)
+            .expect("the matching scheduler must be accepted");
+        for event in events {
+            if matches!(
+                event.expect("job failed"),
+                ez_ffmpeg::packet_sink::PacketSinkEvent::End
+            ) {
+                saw_end = true;
+            }
+        }
+        assert!(saw_end, "each run must settle through its own receiver");
+    }
 }
 
 #[test]

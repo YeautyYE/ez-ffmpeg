@@ -274,6 +274,15 @@ pub(crate) struct Muxer {
     /// stream binding enforces the strict-tier whitelist (see
     /// `add_enc_stream` / `new_copy_stream`).
     pub(crate) packet_sink: Option<crate::core::packet_sink::PacketSink>,
+
+    /// Pairing identity of a channel-adapter packet sink: a clone of the
+    /// sink's `CancellationSlot` Arc, whose pointer identity names the
+    /// `PacketSink::channel` call that produced the sink/receiver pair.
+    /// Unlike `packet_sink`, this is never taken, so the scheduler can still
+    /// verify receiver/scheduler pairing after the worker handoff. `None`
+    /// for non-sink outputs and for plain callback sinks (which have no
+    /// receiver to pair).
+    pub(crate) packet_sink_token: Option<crate::core::packet_sink::CancellationSlot>,
 }
 
 // SAFETY: Muxer can be sent to another thread. The raw FFmpeg pointers are only
@@ -416,6 +425,7 @@ impl Muxer {
             swr_opts,
             attachments,
             packet_sink: None,
+            packet_sink_token: None,
         }
     }
 

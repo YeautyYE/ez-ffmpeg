@@ -131,6 +131,14 @@ pub enum Error {
     #[error("Worker thread '{0}' panicked; output may be incomplete")]
     WorkerPanicked(String),
 
+    /// Recorded as the scheduler result when `start()` fails after some
+    /// worker threads were already launched. `start()` itself returns the
+    /// actual init error to its caller; this recorded value is what
+    /// concurrent observers (packet-sink terminal callbacks) report, so a
+    /// sink can never mistake a torn-down startup for a settled-Ok job.
+    #[error("Scheduler start failed; the job was torn down during startup")]
+    StartFailed,
+
     #[cfg(feature = "rtmp")]
     #[error("Rtmp stream already exists with key: {0}")]
     RtmpStreamAlreadyExists(String),
@@ -510,20 +518,33 @@ pub enum MuxingOperationError {
 /// The strict tier fails fast: configuration problems surface from `build()`
 /// or from the job **before any sink callback runs**; per-packet violations
 /// stop the job with the offending packet never delivered. `Clone` is
-/// deliberate — the same value is recorded as the job error and handed to the
-/// sink's `on_error` callback.
+/// deliberate — for delivery-path errors the same value is recorded as the
+/// job error and handed to the sink's `on_delivery_error` callback.
+/// [`JobFailed`](Self::JobFailed) is the exception: it is synthesized for
+/// that callback only, while first-error-wins may leave the job result owned
+/// by a sibling worker's error.
 #[derive(thiserror::Error, Debug, Clone)]
 #[non_exhaustive]
 pub enum PacketSinkError {
+    /// A builder option the packet sink cannot honor was set: either a
+    /// container-only option (no container is written, so it could never
+    /// take effect) or a pipeline feature outside the strict tier's
+    /// delivery contract (filters, bitstream filters, subtitle codecs —
+    /// rejected as policy, not for lack of a container).
     #[error("{0} is not supported on packet-sink outputs")]
     UnsupportedOption(&'static str),
 
+    /// A stream was configured as `copy`; packet sinks require encoded
+    /// streams.
     #[error("stream copy is not supported on packet-sink outputs (strict tier requires encoded streams)")]
     StreamCopyUnsupported,
 
+    /// The output mapped a stream the strict tier cannot deliver (non-H.264
+    /// video, non-AAC audio, or a non-audio/video kind).
     #[error("{kind} streams are not supported on packet-sink outputs (strict tier)")]
     UnsupportedStream { kind: &'static str },
 
+    /// The configured encoder is outside the strict-tier v1 whitelist.
     #[error("encoder '{encoder}' is not on the strict-tier whitelist for {kind} (v1 accepts: {allowed})")]
     EncoderNotWhitelisted {
         kind: &'static str,
@@ -531,15 +552,20 @@ pub enum PacketSinkError {
         allowed: &'static str,
     },
 
+    /// No stream was mapped to the packet-sink output.
     #[error("packet-sink output has no streams")]
     NoStreams,
 
+    /// An encoder finalized without the out-of-band codec configuration the
+    /// strict tier delivers via `on_stream_info`.
     #[error("output stream {stream_index}: encoder produced no extradata; the strict tier requires codec configuration (avcC / AudioSpecificConfig) before the first callback")]
     MissingExtradata { stream_index: usize },
 
+    /// The encoder's codec configuration failed strict-tier validation.
     #[error("output stream {stream_index}: invalid codec configuration: {reason}")]
     InvalidExtradata { stream_index: usize, reason: String },
 
+    /// A stream's time base is not a positive rational.
     #[error("output stream {stream_index}: invalid time base {num}/{den} (positive numerator and denominator required)")]
     InvalidTimeBase {
         stream_index: usize,
@@ -547,6 +573,7 @@ pub enum PacketSinkError {
         den: i32,
     },
 
+    /// A packet was stamped in a time base other than its stream's.
     #[error("output stream {stream_index}: packet time base {packet_num}/{packet_den} differs from the stream time base {stream_num}/{stream_den}")]
     PacketTimeBaseMismatch {
         stream_index: usize,
@@ -556,12 +583,14 @@ pub enum PacketSinkError {
         stream_den: i32,
     },
 
+    /// A packet carries no pts or dts (`AV_NOPTS_VALUE`).
     #[error("output stream {stream_index}: packet carries no {which} (strict tier rejects AV_NOPTS_VALUE)")]
     MissingTimestamp {
         stream_index: usize,
         which: &'static str,
     },
 
+    /// A packet's dts did not strictly increase within its stream.
     #[error("output stream {stream_index}: non-monotonic dts (previous {prev}, current {current})")]
     NonMonotonicDts {
         stream_index: usize,
@@ -569,9 +598,11 @@ pub enum PacketSinkError {
         current: i64,
     },
 
+    /// A packet's pts collided with a still-pending pts on the same stream.
     #[error("output stream {stream_index}: duplicate pts {pts}")]
     DuplicatePts { stream_index: usize, pts: i64 },
 
+    /// A packet's pts is earlier than its dts.
     #[error("output stream {stream_index}: pts {pts} is earlier than dts {dts}")]
     PtsBeforeDts {
         stream_index: usize,
@@ -579,36 +610,46 @@ pub enum PacketSinkError {
         dts: i64,
     },
 
+    /// Rescaling a timestamp onto the shared time origin overflowed.
     #[error("output stream {stream_index}: timestamp overflow while applying the shared time origin")]
     TimestampOverflow { stream_index: usize },
 
+    /// A packet has no positive duration and none could be derived from the
+    /// stream configuration (frame rate / codec frame size).
     #[error("output stream {stream_index}: packet duration is absent and cannot be derived (strict tier requires a positive duration)")]
     MissingDuration { stream_index: usize },
 
+    /// The packet payload failed bitstream validation.
     #[error("output stream {stream_index}: malformed packet payload: {reason}")]
     MalformedPacket {
         stream_index: usize,
         reason: String,
     },
 
+    /// Internal sequencing violation: a packet surfaced outside the delivery
+    /// phase.
     #[error("output stream {stream_index}: packet processed outside the delivery phase (internal sequencing violation)")]
     PhaseViolation { stream_index: usize },
 
+    /// The stream configuration changed after `on_stream_info` delivered it.
     #[error("output stream {stream_index}: mid-stream configuration change ({what}); the strict tier requires an immutable stream configuration")]
     ConfigChange {
         stream_index: usize,
         what: String,
     },
 
+    /// An H.264 access unit carried in-band SPS/PPS parameter sets.
     #[error("output stream {stream_index}: in-band SPS/PPS parameter sets are not supported in the strict tier (WebCodecs avc requires out-of-band configuration)")]
     InBandParameterSets { stream_index: usize },
 
+    /// The sink's `on_stream_info` callback rejected the configuration.
     #[error("on_stream_info callback rejected the stream configuration: {error}")]
     StreamInfoCallbackFailed {
         #[source]
         error: crate::core::packet_sink::PacketCallbackError,
     },
 
+    /// The sink's `on_packet` callback returned an error.
     #[error("on_packet callback failed on output stream {stream_index}: {error}")]
     PacketCallbackFailed {
         stream_index: usize,
@@ -616,10 +657,14 @@ pub enum PacketSinkError {
         error: crate::core::packet_sink::PacketCallbackError,
     },
 
+    /// The channel adapter's receiver was dropped, cancelling delivery and
+    /// the job.
     #[error("the packet-sink channel receiver was dropped; delivery cancelled")]
     ChannelDisconnected,
 
-    #[error("the job failed after this packet sink finished delivering: {message}")]
+    /// The job failed outside this sink's delivery path; handed to
+    /// `on_delivery_error` only, while `wait()` keeps the original error.
+    #[error("the job failed outside this packet sink; delivery may have been truncated: {message}")]
     JobFailed { message: String },
 }
 

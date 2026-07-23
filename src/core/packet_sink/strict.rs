@@ -63,7 +63,13 @@ struct ParamProjection {
 struct StreamRuntime {
     codec: CodecRuntime,
     time_base: AVRational,
-    frame_rate: Option<AVRational>,
+    /// Duration substituted for durationless packets, in stream time-base
+    /// ticks; 0 when underivable (such a packet then fails typed). Both
+    /// derivations are stream-invariant — one CFR frame interval over the
+    /// fixed frame rate for video, the fixed codec frame size over the
+    /// sample rate for audio — so they are computed once at collection
+    /// instead of per packet.
+    derived_duration: i64,
     projection: ParamProjection,
     timeline: StreamTimeline,
 }
@@ -131,7 +137,7 @@ pub(crate) struct PacketSinkWorker {
     /// Shared origin state machine.
     timeline: Timeline,
     /// First delivery-path error; cloned into the job result and handed to
-    /// `on_error` at the terminal slot.
+    /// `on_delivery_error` at the terminal slot.
     pending_error: Option<PacketSinkError>,
     /// Reused Annex-B -> AVCC conversion buffer (high-water sized).
     scratch: Vec<u8>,
@@ -202,7 +208,7 @@ impl PacketSinkWorker {
                 }
             };
 
-            let (codec, info, frame_rate) = match media_type {
+            let (codec, info, derived_duration) = match media_type {
                 AVMEDIA_TYPE_VIDEO => {
                     // The encoder whitelist was enforced at build time; this
                     // guards the codec id itself (h264 only in v1).
@@ -239,7 +245,21 @@ impl PacketSinkWorker {
                         sample_aspect_ratio: (sar.num > 0 && sar.den > 0).then_some(sar),
                         frame_rate,
                     });
-                    (CodecRuntime::Avc(runtime), info, frame_rate)
+                    // One CFR frame interval in stream time-base ticks; 0
+                    // when no frame rate is advertised (a durationless
+                    // packet then fails typed).
+                    let derived_duration = match frame_rate {
+                        Some(fr) => av_rescale_q(
+                            1,
+                            AVRational {
+                                num: fr.den,
+                                den: fr.num,
+                            },
+                            time_base,
+                        ),
+                        None => 0,
+                    };
+                    (CodecRuntime::Avc(runtime), info, derived_duration)
                 }
                 AVMEDIA_TYPE_AUDIO => {
                     if (*codecpar).codec_id != ffmpeg_sys_next::AVCodecID::AV_CODEC_ID_AAC {
@@ -254,6 +274,49 @@ impl PacketSinkWorker {
                         Ok(runtime) => runtime,
                         Err(e) => return Err(Box::new((sink, e))),
                     };
+                    let channels = (*codecpar).ch_layout.nb_channels;
+                    // With channelConfiguration 0 the ASC's embedded
+                    // program_config_element is the configuration's only
+                    // channel declaration; the advertised count must agree
+                    // with it, or the delivered metadata (`channels`) and
+                    // the delivered codec_config (the ASC consumers hand to
+                    // decoders) would contradict each other. When the
+                    // configuration's Parametric Stereo state doubles the
+                    // mono core (HE-AAC v2 — FFmpeg's che_configure emits
+                    // two output channels under PS for a
+                    // single_channel_element and only for that element
+                    // type, libavcodec/aac/aacdec.c; a PCE whose lone
+                    // element is an LFE stays one channel), the doubled
+                    // count agrees as well: it is what a decode-side
+                    // describer advertises, while the core count is what a
+                    // configuration-only parse advertises. Table-signaled
+                    // layouts are exempt: SBR/PS decoding legitimately
+                    // doubles a mono channelConfiguration (HE-AAC v2), so
+                    // table count and advertised count may differ.
+                    if let Some(pce_channels) = runtime.pce_channel_count() {
+                        let advertised = i64::from(channels);
+                        let doubled = runtime.ps_doubles_mono_core();
+                        if advertised != i64::from(pce_channels)
+                            && !(doubled && advertised == i64::from(pce_channels) * 2)
+                        {
+                            return Err(Box::new((
+                                sink,
+                                PacketSinkError::InvalidExtradata {
+                                    stream_index,
+                                    reason: format!(
+                                        "AudioSpecificConfig program_config_element declares \
+                                         {pce_channels} channels{} but the stream advertises \
+                                         {channels}",
+                                        if doubled {
+                                            " (stereo under Parametric Stereo)"
+                                        } else {
+                                            ""
+                                        },
+                                    ),
+                                },
+                            )));
+                        }
+                    }
                     let info = PacketStreamInfo::Audio(AudioPacketConfig {
                         stream_index,
                         codec_id: (*codecpar).codec_id,
@@ -261,10 +324,30 @@ impl PacketSinkWorker {
                         codec_config: extradata.clone(),
                         time_base,
                         sample_rate: (*codecpar).sample_rate,
-                        channels: (*codecpar).ch_layout.nb_channels,
+                        channels,
                         channel_layout: describe_channel_layout(codecpar),
                     });
-                    (CodecRuntime::Aac(runtime), info, None)
+                    // The AAC frame duration is stream-invariant:
+                    // av_get_audio_frame_duration2 reads only codecpar (the
+                    // fixed codec frame size) for AAC and treats the byte
+                    // count purely as a nonzero gate, so a unit stand-in
+                    // derives the same value as any real payload (empty
+                    // payloads are rejected before duration handling).
+                    let samples = av_get_audio_frame_duration2(codecpar, 1);
+                    let sample_rate = (*codecpar).sample_rate;
+                    let derived_duration = if samples > 0 && sample_rate > 0 {
+                        av_rescale_q(
+                            samples as i64,
+                            AVRational {
+                                num: 1,
+                                den: sample_rate,
+                            },
+                            time_base,
+                        )
+                    } else {
+                        0
+                    };
+                    (CodecRuntime::Aac(runtime), info, derived_duration)
                 }
                 _ => {
                     return Err(Box::new((
@@ -280,7 +363,7 @@ impl PacketSinkWorker {
             streams.push(StreamRuntime {
                 codec,
                 time_base,
-                frame_rate,
+                derived_duration,
                 projection: ParamProjection {
                     width: (*codecpar).width,
                     height: (*codecpar).height,
@@ -296,7 +379,7 @@ impl PacketSinkWorker {
             infos,
             streams,
             stream_time_bases,
-            timeline: Timeline::new(),
+            timeline: Timeline::new(stream_count),
             pending_error: None,
             scratch: Vec::new(),
             phase: Phase::Collected,
@@ -345,16 +428,12 @@ impl PacketSinkWorker {
     /// error stashed.
     ///
     /// # Safety
-    /// - `out_fmt_ctx` must be the live output context this worker was
-    ///   collected from, and `packet_box.packet_data.output_stream_index`
-    ///   must be a valid stream index of it (same contract as `write_packet`).
-    /// - `packet_box.packet` must wrap a live packet.
-    pub(crate) unsafe fn process_and_deliver(
-        &mut self,
-        out_fmt_ctx: *const AVFormatContext,
-        packet_box: &mut PacketBox,
-    ) -> i32 {
-        match self.process(out_fmt_ctx, packet_box) {
+    /// - `packet_box.packet` must wrap a live packet, and
+    ///   `packet_box.packet_data.output_stream_index` must be a valid stream
+    ///   index of the output this worker was collected from (same contract
+    ///   as `write_packet`).
+    pub(crate) unsafe fn process_and_deliver(&mut self, packet_box: &mut PacketBox) -> i32 {
+        match self.process(packet_box) {
             Ok(()) => 0,
             Err(ProcessFailure::Cancelled) => {
                 self.cancelled = true;
@@ -374,11 +453,7 @@ impl PacketSinkWorker {
 
     /// # Safety
     /// - Same contract as [`Self::process_and_deliver`] (its only caller).
-    unsafe fn process(
-        &mut self,
-        out_fmt_ctx: *const AVFormatContext,
-        packet_box: &mut PacketBox,
-    ) -> Result<(), ProcessFailure> {
+    unsafe fn process(&mut self, packet_box: &mut PacketBox) -> Result<(), ProcessFailure> {
         let stream_index = packet_box.packet_data.output_stream_index as usize;
         debug_assert!(stream_index < self.streams.len());
         // Real phase guard (not debug-only): a packet may only be processed
@@ -488,9 +563,9 @@ impl PacketSinkWorker {
             CodecRuntime::Aac(_) => (true, payload),
         };
 
-        // 6. Duration: pass the encoder's through; derive when absent; a
-        // value that stays underivable is an error, never a silent zero.
-        let stream = &self.streams[stream_index];
+        // 6. Duration: pass the encoder's through; substitute this stream's
+        // collection-derived interval when absent; a value that stays
+        // underivable is an error, never a silent zero.
         let mut duration = (*pkt).duration;
         if duration < 0 {
             return Err(ProcessFailure::from(PacketSinkError::MissingDuration {
@@ -498,38 +573,7 @@ impl PacketSinkWorker {
             }));
         }
         if duration == 0 {
-            duration = match &stream.codec {
-                CodecRuntime::Avc(_) => match stream.frame_rate {
-                    // One CFR frame interval, in stream time-base ticks.
-                    Some(fr) => av_rescale_q(
-                        1,
-                        AVRational {
-                            num: fr.den,
-                            den: fr.num,
-                        },
-                        stream.time_base,
-                    ),
-                    None => 0,
-                },
-                CodecRuntime::Aac(_) => {
-                    let codecpar: *mut AVCodecParameters =
-                        (**(*out_fmt_ctx).streams.add(stream_index)).codecpar;
-                    let samples = av_get_audio_frame_duration2(codecpar, size);
-                    let sample_rate = (*codecpar).sample_rate;
-                    if samples > 0 && sample_rate > 0 {
-                        av_rescale_q(
-                            samples as i64,
-                            AVRational {
-                                num: 1,
-                                den: sample_rate,
-                            },
-                            stream.time_base,
-                        )
-                    } else {
-                        0
-                    }
-                }
-            };
+            duration = stream.derived_duration;
         }
         if duration <= 0 {
             return Err(ProcessFailure::from(PacketSinkError::MissingDuration {
@@ -557,10 +601,21 @@ impl PacketSinkWorker {
     /// Terminal slot (where the muxer would write its trailer). One-way phase
     /// transition — a second call is a no-op, so no terminal event can ever
     /// fire twice. Fires `on_end` only through the strong gate; fires
-    /// `on_error` for a stashed delivery-path error, or as
+    /// `on_delivery_error` for a stashed delivery-path error, or as
     /// [`PacketSinkError::JobFailed`] when the job failed elsewhere (whether
     /// or not that failure truncated this sink's delivery — `wait()` keeps
     /// the original error); stays silent for aborts and clean cancellation.
+    ///
+    /// The stashed error reaches the callback BY REFERENCE — custody stays
+    /// with the worker. Its `error.source` can be the last `Arc` to a
+    /// caller-supplied error value (first-error-wins drops this worker's
+    /// job-result clone whenever a sibling's error won the slot), so moving
+    /// the error into a frame-local would make that local the final owner:
+    /// a panicking callback then drops it mid-unwind, where a panicking
+    /// source destructor is a panic-during-unwind process abort BEFORE the
+    /// terminal containment regains control. Borrowed, the unwind crosses
+    /// only a plain reference; the original is destroyed later inside
+    /// [`Self::dispose_contained`], under its own catch.
     pub(crate) fn finish(
         &mut self,
         all_streams_terminal: bool,
@@ -575,8 +630,8 @@ impl PacketSinkWorker {
         if aborted {
             return;
         }
-        if let Some(e) = self.pending_error.take() {
-            self.sink.dispatch_delivery_error(&e);
+        if let Some(e) = self.pending_error.as_ref() {
+            self.sink.dispatch_delivery_error(e);
             return;
         }
         if self.cancelled {
@@ -597,6 +652,27 @@ impl PacketSinkWorker {
         if ret >= 0 && all_streams_terminal {
             self.sink.dispatch_end();
         }
+    }
+
+    /// Consumes the worker, destroying everything that can run user `Drop`
+    /// code under per-value panic containment: the sink's callback boxes
+    /// (one catch each — see [`super::PacketSink::dispose_contained`]) and
+    /// the stashed delivery error, whose `source` holds a caller-supplied
+    /// error type behind an `Arc` (still present after a dispatched
+    /// terminal — [`Self::finish`] borrows it, never consumes it). The
+    /// remaining fields are plain crate data and drop bare. Returns true
+    /// when any destructor panicked.
+    pub(crate) fn dispose_contained(self) -> bool {
+        let Self {
+            sink,
+            pending_error,
+            ..
+        } = self;
+        let mut panicked = sink.dispose_contained();
+        if let Some(error) = pending_error {
+            panicked |= super::drop_contained(error);
+        }
+        panicked
     }
 }
 
@@ -749,9 +825,20 @@ mod tests {
     use std::ptr::{null, null_mut};
     use std::sync::{Arc, Mutex};
 
-    const SPS: &[u8] = &[0x67, 66, 0xC0, 0x1E, 0xAC, 0xD9, 0x40];
-    const PPS: &[u8] = &[0x68, 0xCE, 0x3C, 0x80];
-    const OTHER_SPS: &[u8] = &[0x67, 66, 0xC0, 0x28, 0xAC, 0xD9, 0x41];
+    // Encoder-produced parameter sets (x264 via the ffmpeg CLI): Constrained
+    // Baseline (profile_idc 66, compatibility 0xC0), level_idc 30, coding the
+    // same 320x240 yuv420p shape the test streams declare in codecpar.
+    const SPS: &[u8] = &[
+        0x67, 0x42, 0xC0, 0x1E, 0xD9, 0x01, 0x41, 0xFB, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10,
+        0x00, 0x00, 0x03, 0x03, 0x20, 0xF1, 0x62, 0xE4, 0x80,
+    ];
+    const PPS: &[u8] = &[0x68, 0xCB, 0x83, 0xCB, 0x20];
+    // Same encoder and coded shape at level 4.0: level_idc (SPS byte 3) is
+    // 0x28, so the derived codec projection differs from `SPS`.
+    const OTHER_SPS: &[u8] = &[
+        0x67, 0x42, 0xC0, 0x28, 0xD9, 0x01, 0x41, 0xFB, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10,
+        0x00, 0x00, 0x03, 0x03, 0x20, 0xF1, 0x83, 0x24, 0x80,
+    ];
 
     fn annexb_config() -> Vec<u8> {
         let mut v = vec![0, 0, 0, 1];
@@ -956,11 +1043,23 @@ mod tests {
         let info = &worker.infos[0];
         let avcc = info.extradata();
         assert_eq!(avcc[0], 1);
-        assert_eq!(avcc[4] & 0x03, 3, "4-byte NAL length prefixes");
+        // avcC bytes 1..4 are SPS bytes 1..4 verbatim.
+        assert_eq!(&avcc[1..4], &SPS[1..4]);
+        // Bytes 4 and 5 carry all-ones reserved bits around the length size
+        // and the SPS count (ff_isom_write_avcc emits 0xFF and 0xE0 | count);
+        // the assertions pin the full bytes, not a masked view.
+        assert_eq!(avcc[4], 0xFF, "reserved ones + 4-byte NAL length prefixes");
+        assert_eq!(avcc[5] & 0xE0, 0xE0, "byte 5 reserved bits must be ones");
         assert!(avcc[5] & 0x1F >= 1, "at least one SPS");
         let video = info.video().expect("typed video configuration");
         assert_eq!(video.codec_id(), AVCodecID::AV_CODEC_ID_H264);
-        assert!(video.codec_string().starts_with("avc1."));
+        // The typed header fields mirror the fixture SPS: profile_idc 66
+        // with constraint flags 0xC0 (Constrained Baseline), level_idc 30
+        // (level 3.0) — and the RFC 6381 string is their hex projection.
+        assert_eq!(video.profile(), 66);
+        assert_eq!(video.compatibility(), 0xC0);
+        assert_eq!(video.level(), 30);
+        assert_eq!(video.codec_string(), "avc1.42C01E");
         assert_eq!(video.frame_rate(), Some(AVRational { num: 25, den: 1 }));
         assert_eq!((video.width(), video.height()), (320, 240));
     }
@@ -976,7 +1075,7 @@ mod tests {
         assert_eq!(worker.deliver_stream_info(), 0);
         let mut pb = packet(&idr_au(), 4, 4, tb25(), 0);
         assert_eq!(
-            unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) },
+            unsafe { worker.process_and_deliver(&mut pb) },
             0
         );
         let events = events.lock().unwrap();
@@ -1003,7 +1102,7 @@ mod tests {
         let mut worker = collect(&ctx, sink).unwrap();
         assert_eq!(worker.deliver_stream_info(), 0);
         let mut pb = packet(&p_au(), 0, 0, tb25(), 0);
-        assert_eq!(unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) }, 0);
+        assert_eq!(unsafe { worker.process_and_deliver(&mut pb) }, 0);
         let events = events.lock().unwrap();
         let PacketSinkEvent::Packet(p) = &events[1] else {
             panic!("expected a packet event after the stream info");
@@ -1020,7 +1119,7 @@ mod tests {
 
         let mut nopts = packet(&idr_au(), ffmpeg_sys_next::AV_NOPTS_VALUE, 0, tb25(), 0);
         assert_eq!(
-            unsafe { worker.process_and_deliver(ctx.ctx, &mut nopts) },
+            unsafe { worker.process_and_deliver(&mut nopts) },
             AVERROR_EXTERNAL
         );
         assert!(matches!(
@@ -1034,7 +1133,7 @@ mod tests {
         assert_eq!(worker.deliver_stream_info(), 0);
         let mut bad = packet(&idr_au(), 1, 2, tb25(), 0);
         assert_eq!(
-            unsafe { worker.process_and_deliver(ctx.ctx, &mut bad) },
+            unsafe { worker.process_and_deliver(&mut bad) },
             AVERROR_EXTERNAL
         );
         assert!(matches!(
@@ -1047,10 +1146,10 @@ mod tests {
         let mut worker = collect(&ctx, sink).unwrap();
         assert_eq!(worker.deliver_stream_info(), 0);
         let mut first = packet(&idr_au(), 0, 0, tb25(), 0);
-        assert_eq!(unsafe { worker.process_and_deliver(ctx.ctx, &mut first) }, 0);
+        assert_eq!(unsafe { worker.process_and_deliver(&mut first) }, 0);
         let mut stale = packet(&p_au(), 5, 0, tb25(), 0);
         assert_eq!(
-            unsafe { worker.process_and_deliver(ctx.ctx, &mut stale) },
+            unsafe { worker.process_and_deliver(&mut stale) },
             AVERROR_EXTERNAL
         );
         assert!(matches!(
@@ -1063,10 +1162,10 @@ mod tests {
         let mut worker = collect(&ctx, sink).unwrap();
         assert_eq!(worker.deliver_stream_info(), 0);
         let mut a = packet(&idr_au(), 3, 0, tb25(), 0);
-        assert_eq!(unsafe { worker.process_and_deliver(ctx.ctx, &mut a) }, 0);
+        assert_eq!(unsafe { worker.process_and_deliver(&mut a) }, 0);
         let mut b = packet(&p_au(), 3, 1, tb25(), 0);
         assert_eq!(
-            unsafe { worker.process_and_deliver(ctx.ctx, &mut b) },
+            unsafe { worker.process_and_deliver(&mut b) },
             AVERROR_EXTERNAL
         );
         assert!(matches!(
@@ -1093,7 +1192,7 @@ mod tests {
         assert_eq!(worker.deliver_stream_info(), 0);
         let mut pb = packet(&idr_au(), 0, 0, tb25(), 0);
         assert_eq!(
-            unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) },
+            unsafe { worker.process_and_deliver(&mut pb) },
             AVERROR_EXTERNAL
         );
         assert!(matches!(
@@ -1121,7 +1220,7 @@ mod tests {
             assert!(!sd.is_null());
             std::ptr::copy_nonoverlapping(config.as_ptr(), sd, config.len());
         }
-        assert_eq!(unsafe { worker.process_and_deliver(ctx.ctx, &mut same) }, 0);
+        assert_eq!(unsafe { worker.process_and_deliver(&mut same) }, 0);
 
         // A different SPS is a mid-stream configuration change.
         let mut changed = packet(&p_au(), 1, 1, tb25(), 0);
@@ -1139,7 +1238,7 @@ mod tests {
             std::ptr::copy_nonoverlapping(config.as_ptr(), sd, config.len());
         }
         assert_eq!(
-            unsafe { worker.process_and_deliver(ctx.ctx, &mut changed) },
+            unsafe { worker.process_and_deliver(&mut changed) },
             AVERROR_EXTERNAL
         );
         assert!(matches!(
@@ -1169,7 +1268,7 @@ mod tests {
             assert!(!sd.is_null());
             std::ptr::copy_nonoverlapping(payload.as_ptr(), sd, payload.len());
         }
-        assert_eq!(unsafe { worker.process_and_deliver(ctx.ctx, &mut same) }, 0);
+        assert_eq!(unsafe { worker.process_and_deliver(&mut same) }, 0);
 
         // A resolution change is rejected typed.
         let (sink, _events) = recording_sink();
@@ -1189,7 +1288,7 @@ mod tests {
             std::ptr::copy_nonoverlapping(payload.as_ptr(), sd, payload.len());
         }
         assert_eq!(
-            unsafe { worker.process_and_deliver(ctx.ctx, &mut changed) },
+            unsafe { worker.process_and_deliver(&mut changed) },
             AVERROR_EXTERNAL
         );
         assert!(matches!(
@@ -1210,7 +1309,7 @@ mod tests {
         au.extend_from_slice(&[0, 0, 1, 0x65, 0x88, 0x84]);
         let mut pb = packet(&au, 0, 0, tb25(), 0);
         assert_eq!(
-            unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) },
+            unsafe { worker.process_and_deliver(&mut pb) },
             AVERROR_EXTERNAL
         );
         assert!(matches!(
@@ -1227,7 +1326,7 @@ mod tests {
         au.extend_from_slice(&[0, 0, 1, 0x65, 0x88, 0x84]);
         let mut pb = packet(&au, 0, 0, tb25(), 0);
         assert_eq!(
-            unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) },
+            unsafe { worker.process_and_deliver(&mut pb) },
             AVERROR_EXTERNAL
         );
         assert!(matches!(
@@ -1259,11 +1358,11 @@ mod tests {
 
         // First delivered packet: video dts 5 (at 1/25) anchors the origin.
         let mut v = packet(&idr_au(), 5, 5, tb25(), 0);
-        assert_eq!(unsafe { worker.process_and_deliver(ctx.ctx, &mut v) }, 0);
+        assert_eq!(unsafe { worker.process_and_deliver(&mut v) }, 0);
         // Audio at original dts 0 keeps its true relative offset: negative.
         let mut a = packet(&[0x21, 0x10, 0x04], 0, 0, AVRational { num: 1, den: 44100 }, 1);
         a.packet_data.codec_type = AVMediaType::AVMEDIA_TYPE_AUDIO;
-        assert_eq!(unsafe { worker.process_and_deliver(ctx.ctx, &mut a) }, 0);
+        assert_eq!(unsafe { worker.process_and_deliver(&mut a) }, 0);
 
         let events = events.lock().unwrap();
         let packets: Vec<_> = events
@@ -1285,6 +1384,205 @@ mod tests {
         assert_eq!(packets[1].duration(), 1024);
     }
 
+    /// AudioSpecificConfig produced by FFmpeg's native AAC encoder with
+    /// forced PCE signaling (channelConfiguration 0, quad layout: one
+    /// front CPE + one back CPE = 4 channels):
+    ///   ffmpeg -f lavfi -i anullsrc=channel_layout=quad:sample_rate=48000 \
+    ///          -c:a aac -aac_pce 1 -bitexact -frames:a 3 out.mp4
+    const PCE_QUAD_ASC: [u8; 16] = [
+        0x11, 0x80, 0x04, 0xC4, 0x04, 0x00, 0x21, 0x10, 0x04, 0x4C, 0x61, 0x76, 0x63, 0x56, 0xE5,
+        0x00,
+    ];
+
+    #[test]
+    fn pce_channel_count_must_match_the_advertised_metadata() {
+        // The default test stream advertises 2 channels; the PCE declares
+        // 4 — contradictory metadata must fail before any callback.
+        let ctx = TestCtx::new();
+        unsafe {
+            ctx.add_stream(
+                AVMediaType::AVMEDIA_TYPE_AUDIO,
+                AVCodecID::AV_CODEC_ID_AAC,
+                Some(&PCE_QUAD_ASC),
+                AVRational { num: 1, den: 48000 },
+            );
+        }
+        let (sink, events) = recording_sink();
+        match collect(&ctx, sink) {
+            Err(PacketSinkError::InvalidExtradata {
+                stream_index: 0,
+                reason,
+            }) => {
+                assert!(
+                    reason.contains("program_config_element")
+                        && reason.contains('4')
+                        && reason.contains('2'),
+                    "got {reason:?}"
+                );
+            }
+            Err(other) => panic!("expected InvalidExtradata, got {other:?}"),
+            Ok(_) => panic!("collect must reject a PCE/metadata channel mismatch"),
+        }
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "a configuration failure must precede every callback"
+        );
+    }
+
+    #[test]
+    fn pce_channel_count_agreeing_with_the_metadata_collects() {
+        let ctx = TestCtx::new();
+        unsafe {
+            let idx = ctx.add_stream(
+                AVMediaType::AVMEDIA_TYPE_AUDIO,
+                AVCodecID::AV_CODEC_ID_AAC,
+                Some(&PCE_QUAD_ASC),
+                AVRational { num: 1, den: 48000 },
+            );
+            let st = *(*ctx.ctx).streams.add(idx);
+            // add_stream defaults to 44.1 kHz; the reproduced ASC
+            // declares 48 kHz (index 3), so advertise the same rate —
+            // the acceptance this test vouches for is of fully coherent
+            // metadata.
+            (*(*st).codecpar).sample_rate = 48000;
+            (*(*st).codecpar).ch_layout.nb_channels = 4;
+        }
+        let (sink, _events) = recording_sink();
+        let worker = collect(&ctx, sink).unwrap();
+        let audio = worker.infos[0].audio().expect("typed audio configuration");
+        assert_eq!(audio.channels(), 4);
+        assert_eq!(audio.sample_rate(), 48000);
+        assert_eq!(audio.codec_string(), "mp4a.40.2");
+    }
+
+    /// AudioSpecificConfig with hierarchical PS signaling
+    /// (audioObjectType 29): a 22050 Hz core (index 7),
+    /// channelConfiguration 0 whose PCE declares one front SCE, and a
+    /// 44100 Hz extension frequency. FFmpeg reads this configuration as
+    /// 44.1 kHz STEREO — Parametric Stereo doubles the mono core — so
+    /// the stereo advertisement is as coherent as the core mono one,
+    /// and anything else stays contradictory.
+    const PS_MONO_CORE_ASC: [u8; 9] = [0xEB, 0x82, 0x08, 0x02, 0xE2, 0x00, 0x00, 0x00, 0x00];
+
+    #[test]
+    fn ps_mono_core_accepts_stereo_and_mono_advertisements() {
+        for channels in [2, 1] {
+            let ctx = TestCtx::new();
+            unsafe {
+                let idx = ctx.add_stream(
+                    AVMediaType::AVMEDIA_TYPE_AUDIO,
+                    AVCodecID::AV_CODEC_ID_AAC,
+                    Some(&PS_MONO_CORE_ASC),
+                    AVRational { num: 1, den: 44100 },
+                );
+                let st = *(*ctx.ctx).streams.add(idx);
+                (*(*st).codecpar).ch_layout.nb_channels = channels;
+            }
+            let (sink, _events) = recording_sink();
+            let worker = collect(&ctx, sink).unwrap_or_else(|e| {
+                panic!("a PS mono core advertising {channels} channels must collect: {e:?}")
+            });
+            let audio = worker.infos[0].audio().expect("typed audio configuration");
+            assert_eq!(audio.channels(), channels);
+            assert_eq!(audio.codec_string(), "mp4a.40.29");
+        }
+        // The doubling is exact: a 3-channel advertisement is neither
+        // the core nor the PS output and stays contradictory.
+        let ctx = TestCtx::new();
+        unsafe {
+            let idx = ctx.add_stream(
+                AVMediaType::AVMEDIA_TYPE_AUDIO,
+                AVCodecID::AV_CODEC_ID_AAC,
+                Some(&PS_MONO_CORE_ASC),
+                AVRational { num: 1, den: 44100 },
+            );
+            let st = *(*ctx.ctx).streams.add(idx);
+            (*(*st).codecpar).ch_layout.nb_channels = 3;
+        }
+        let (sink, events) = recording_sink();
+        match collect(&ctx, sink) {
+            Err(PacketSinkError::InvalidExtradata {
+                stream_index: 0,
+                reason,
+            }) => {
+                assert!(
+                    reason.contains("Parametric Stereo") && reason.contains('3'),
+                    "got {reason:?}"
+                );
+            }
+            Err(other) => panic!("expected InvalidExtradata, got {other:?}"),
+            Ok(_) => panic!("collect must reject a channel count PS cannot produce"),
+        }
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "a configuration failure must precede every callback"
+        );
+    }
+
+    /// The same hierarchical-PS shape with the PCE's sole output element
+    /// swapped from a front SCE to an LFE. Parametric Stereo doubles
+    /// only a single_channel_element (FFmpeg's che_configure emits the
+    /// second output channel for TYPE_SCE alone,
+    /// libavcodec/aac/aacdec.c), so this configuration decodes to ONE
+    /// channel: the mono advertisement is the coherent one and stereo is
+    /// contradictory metadata.
+    const PS_LFE_CORE_ASC: [u8; 9] = [0xEB, 0x82, 0x08, 0x02, 0xE0, 0x00, 0x80, 0x00, 0x00];
+
+    #[test]
+    fn ps_lfe_core_accepts_only_the_mono_advertisement() {
+        let ctx = TestCtx::new();
+        unsafe {
+            let idx = ctx.add_stream(
+                AVMediaType::AVMEDIA_TYPE_AUDIO,
+                AVCodecID::AV_CODEC_ID_AAC,
+                Some(&PS_LFE_CORE_ASC),
+                AVRational { num: 1, den: 44100 },
+            );
+            let st = *(*ctx.ctx).streams.add(idx);
+            (*(*st).codecpar).ch_layout.nb_channels = 1;
+        }
+        let (sink, _events) = recording_sink();
+        let worker = collect(&ctx, sink)
+            .unwrap_or_else(|e| panic!("an LFE mono core advertising 1 channel must collect: {e:?}"));
+        let audio = worker.infos[0].audio().expect("typed audio configuration");
+        assert_eq!(audio.channels(), 1);
+        assert_eq!(audio.codec_string(), "mp4a.40.29");
+
+        // The stereo advertisement PS cannot produce from an LFE stays
+        // contradictory.
+        let ctx = TestCtx::new();
+        unsafe {
+            let idx = ctx.add_stream(
+                AVMediaType::AVMEDIA_TYPE_AUDIO,
+                AVCodecID::AV_CODEC_ID_AAC,
+                Some(&PS_LFE_CORE_ASC),
+                AVRational { num: 1, den: 44100 },
+            );
+            let st = *(*ctx.ctx).streams.add(idx);
+            (*(*st).codecpar).ch_layout.nb_channels = 2;
+        }
+        let (sink, events) = recording_sink();
+        match collect(&ctx, sink) {
+            Err(PacketSinkError::InvalidExtradata {
+                stream_index: 0,
+                reason,
+            }) => {
+                assert!(
+                    reason.contains("program_config_element")
+                        && reason.contains('1')
+                        && reason.contains('2'),
+                    "got {reason:?}"
+                );
+            }
+            Err(other) => panic!("expected InvalidExtradata, got {other:?}"),
+            Ok(_) => panic!("collect must reject the stereo advertisement of an LFE mono core"),
+        }
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "a configuration failure must precede every callback"
+        );
+    }
+
     #[test]
     fn failing_packet_callback_stops_with_typed_error_and_no_on_end() {
         let ctx = video_ctx();
@@ -1304,7 +1602,7 @@ mod tests {
         let mut worker = collect(&ctx, sink).unwrap();
         assert_eq!(worker.deliver_stream_info(), 0);
         let mut pb = packet(&idr_au(), 0, 0, tb25(), 0);
-        let ret = unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) };
+        let ret = unsafe { worker.process_and_deliver(&mut pb) };
         assert_eq!(ret, AVERROR_EXTERNAL);
         assert_ne!(ret, ffmpeg_sys_next::AVERROR_EOF);
         match worker.pending_error_cloned() {
@@ -1334,10 +1632,10 @@ mod tests {
             let mut worker = collect(&ctx, sink).unwrap();
         assert_eq!(worker.deliver_stream_info(), 0);
             let mut a = packet(&idr_au(), first.0, first.1, tb25(), 0);
-            assert_eq!(unsafe { worker.process_and_deliver(ctx.ctx, &mut a) }, 0);
+            assert_eq!(unsafe { worker.process_and_deliver(&mut a) }, 0);
             let mut b = packet(&p_au(), second.0, second.1, tb25(), 0);
             assert_eq!(
-                unsafe { worker.process_and_deliver(ctx.ctx, &mut b) },
+                unsafe { worker.process_and_deliver(&mut b) },
                 AVERROR_EXTERNAL,
                 "({},{}) then ({},{}) must be rejected",
                 first.0,
@@ -1387,7 +1685,7 @@ mod tests {
         assert_eq!(worker.deliver_stream_info(), 0);
         let mut pb = packet(&idr_au(), 0, 0, AVRational { num: 1, den: 30 }, 0);
         assert_eq!(
-            unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) },
+            unsafe { worker.process_and_deliver(&mut pb) },
             AVERROR_EXTERNAL
         );
         assert!(matches!(
@@ -1444,7 +1742,7 @@ mod tests {
                 std::ptr::copy_nonoverlapping(payload.as_ptr(), sd, payload.len());
             }
             assert_eq!(
-                unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) },
+                unsafe { worker.process_and_deliver(&mut pb) },
                 AVERROR_EXTERNAL,
                 "{what} must be rejected"
             );
@@ -1455,15 +1753,25 @@ mod tests {
         }
     }
 
-    /// Composite S8 baseline: reordering the same SPS/PPS identities is not
-    /// a configuration change — UNLESS the reorder changes the DERIVED codec
-    /// projection consumers were told (profile/compatibility/level from the
-    /// first SPS, the same source as on_stream_info). Both directions pinned.
+    /// Composite S8 baseline over reorders: both SPS fixtures carry
+    /// seq_parameter_set_id 0, and parameter sets are addressed by id
+    /// (a re-sent id replaces its predecessor — the sps_list slot
+    /// overwrite in libavcodec/h264_ps.c), so swapping them swaps which
+    /// SPS is ACTIVE — a configuration change even when the byte set and
+    /// the derived projection are both unchanged. The second variant also
+    /// flips the projection consumers were told (profile/compatibility/
+    /// level from the first SPS, the same source as on_stream_info) and
+    /// must be rejected as well.
     #[test]
-    fn reorder_is_config_change_only_when_the_projection_changes() {
+    fn same_id_reorder_is_a_config_change() {
         // Second SPS with an IDENTICAL projection (bytes 1..4) but a
-        // different tail: reorder must pass.
-        const SAME_PROJ_SPS: &[u8] = &[0x67, 66, 0xC0, 0x1E, 0xAA, 0x11, 0x22];
+        // different tail (same encoder, Constrained Baseline level 3.0,
+        // coding 640x480) under the same id 0: the reorder swaps the
+        // active id-0 SPS and must be rejected.
+        const SAME_PROJ_SPS: &[u8] = &[
+            0x67, 0x42, 0xC0, 0x1E, 0xD9, 0x00, 0xA0, 0x3D, 0xB0, 0x11, 0x00, 0x00, 0x03, 0x00,
+            0x01, 0x00, 0x00, 0x03, 0x00, 0x32, 0x0F, 0x16, 0x2E, 0x48,
+        ];
         let mut config = vec![0, 0, 0, 1];
         config.extend_from_slice(SPS);
         config.extend_from_slice(&[0, 0, 1]);
@@ -1499,14 +1807,18 @@ mod tests {
             std::ptr::copy_nonoverlapping(swapped.as_ptr(), sd, swapped.len());
         }
         assert_eq!(
-            unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) },
-            0,
-            "reordered identical sets with an unchanged projection must pass"
+            unsafe { worker.process_and_deliver(&mut pb) },
+            AVERROR_EXTERNAL,
+            "a reorder that swaps the active same-id SPS must be rejected"
         );
+        assert!(matches!(
+            worker.pending_error_cloned(),
+            Some(PacketSinkError::ConfigChange { .. })
+        ));
 
-        // Same identities, but the reorder changes the first SPS's level
-        // byte — the derived projection consumers were told changes, so it
-        // IS a configuration change even though the canonical sets match.
+        // Same byte set, but this reorder ALSO changes the first SPS's
+        // level byte — the derived projection consumers were told; the
+        // announcement is rejected on that gate as well as the id map.
         let mut config = vec![0, 0, 0, 1];
         config.extend_from_slice(SPS);
         config.extend_from_slice(&[0, 0, 1]);
@@ -1542,7 +1854,7 @@ mod tests {
             std::ptr::copy_nonoverlapping(swapped.as_ptr(), sd, swapped.len());
         }
         assert_eq!(
-            unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) },
+            unsafe { worker.process_and_deliver(&mut pb) },
             AVERROR_EXTERNAL,
             "a reorder that changes the derived projection must be rejected"
         );
@@ -1561,7 +1873,7 @@ mod tests {
         let mut worker = collect(&ctx, sink).unwrap();
         let mut pb = packet(&idr_au(), 0, 0, tb25(), 0);
         assert_eq!(
-            unsafe { worker.process_and_deliver(ctx.ctx, &mut pb) },
+            unsafe { worker.process_and_deliver(&mut pb) },
             AVERROR_EXTERNAL
         );
         assert!(matches!(
@@ -1605,5 +1917,78 @@ mod tests {
             (0, 1),
             "a job error after clean drain reports on_delivery_error, never on_end"
         );
+    }
+
+    /// Cancellation precedence when a sibling failure races the shutdown:
+    /// this sink observes a stopping status that carries NO recorded error
+    /// (an explicit stop()) and cancels its blocked send cooperatively; a
+    /// sibling's error is recorded only AFTER that observation. The terminal
+    /// must stay silent — neither `on_end` nor `on_delivery_error` — while
+    /// the recorded error is left untouched in the job-result slot that the
+    /// driving `stop()` returns after settlement (`abort()` returns nothing,
+    /// and neither call leaves a handle to `wait()` on).
+    ///
+    /// Scope: what this pins is the WORKER-side precedence, end to end —
+    /// the cooperative-cancel classification at the parked send, the silent
+    /// terminal, and the job-result slot left untouched for the scheduler
+    /// to hand back. What it cannot pin: the scheduler-level interleaving
+    /// (a live stop() racing a live sibling failure across worker threads)
+    /// cannot be forced deterministically here, and stop() returning that
+    /// slot's error is scheduler surface this worker-level harness never
+    /// calls.
+    #[test]
+    fn cancelled_delivery_stays_silent_when_sibling_error_lands_later() {
+        use crate::core::scheduler::ffmpeg_scheduler::{STATUS_END, STATUS_RUN};
+        use std::sync::atomic::Ordering;
+
+        let ctx = video_ctx();
+        let (sink, rx) = PacketSink::channel(std::num::NonZeroUsize::new(1).unwrap());
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let result: Arc<Mutex<Option<crate::error::Result<()>>>> = Arc::new(Mutex::new(None));
+        let mut worker = unsafe {
+            PacketSinkWorker::collect(ctx.ctx, ctx.stream_count(), sink, &status, &result)
+        }
+        .map_err(|boxed| (*boxed).1)
+        .unwrap();
+        // The stream-info event fills the capacity-1 channel; nothing drains.
+        assert_eq!(worker.deliver_stream_info(), 0);
+        // stop(): a stopping status published with NO recorded error.
+        status.store(STATUS_END, Ordering::Release);
+        // The parked send observes the stop, finds no recorded error, and
+        // classifies the exit as cooperative cancellation.
+        let mut pb = packet(&idr_au(), 0, 0, tb25(), 0);
+        assert_eq!(
+            unsafe { worker.process_and_deliver(&mut pb) },
+            AVERROR_EXTERNAL
+        );
+        assert!(worker.cancelled_cleanly());
+        // The sibling's failure lands only now, after the classification.
+        *result.lock().unwrap() = Some(Err(crate::error::Error::WorkerPanicked(
+            "muxer1:mpegts".to_string(),
+        )));
+        // Terminal with the job error visible (what the mux worker reads
+        // after full settlement): cancellation still wins.
+        worker.finish(false, AVERROR_EXTERNAL, false, Some("muxer1:mpegts".to_string()));
+        drop(worker);
+        let (mut ends, mut errors) = (0, 0);
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                PacketSinkEvent::End => ends += 1,
+                PacketSinkEvent::Error(_) => errors += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            (ends, errors),
+            (0, 0),
+            "a cooperatively cancelled delivery must stay silent even when a \
+             sibling error is recorded before the terminal"
+        );
+        // The silent terminal left the sibling error in place: this mutex is
+        // the job-result slot the driving stop() drains after settlement.
+        assert!(matches!(
+            result.lock().unwrap().as_ref(),
+            Some(Err(crate::error::Error::WorkerPanicked(_)))
+        ));
     }
 }

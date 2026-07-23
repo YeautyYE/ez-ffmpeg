@@ -1,6 +1,6 @@
 //! Packet-sink rejection paths: build-time validation, the strict-tier
-//! encoder whitelist, open-GOP `is_key` semantics, and the failing-callback
-//! circuit breaker.
+//! encoder whitelist, open-GOP `is_key` semantics, the failing-callback
+//! circuit breaker, and start()-failure reporting.
 
 mod common;
 
@@ -308,7 +308,10 @@ fn failing_packet_callback_stops_the_job_without_on_end() {
         })
     })
     .on_delivery_error(move |e: &PacketSinkError| {
-        err_log.lock().unwrap().push(SinkEv::Error(e.to_string()))
+        err_log.lock().unwrap().push(SinkEv::Error {
+            message: e.to_string(),
+            thread: std::thread::current().id(),
+        })
     })
     .build();
 
@@ -340,10 +343,27 @@ fn failing_packet_callback_stops_the_job_without_on_end() {
         !events.iter().any(|e| matches!(e, SinkEv::End { .. })),
         "a failed callback must never be followed by on_end"
     );
-    assert!(
-        matches!(events.last(), Some(SinkEv::Error(_))),
-        "the terminal event is on_error"
+    // The failure terminal dispatches on the sink's own mux worker — the
+    // thread that delivered every packet — never on the controller thread.
+    let delivery_threads: std::collections::HashSet<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            SinkEv::Pkt(p) => Some(p.thread),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        delivery_threads.len(),
+        1,
+        "a single mux worker delivers this sink's packets"
     );
+    match events.last() {
+        Some(SinkEv::Error { thread, .. }) => assert!(
+            delivery_threads.contains(thread),
+            "the failure terminal must dispatch on the mux worker thread"
+        ),
+        other => panic!("the terminal event is on_error, got {other:?}"),
+    }
     let delivered = events
         .iter()
         .filter(|e| matches!(e, SinkEv::Pkt(_)))
@@ -368,4 +388,59 @@ fn zero_stream_packet_sink_fails_typed_at_build() {
         Error::PacketSink(PacketSinkError::NoStreams) => {}
         other => panic!("expected PacketSink(NoStreams), got {other:?}"),
     }
+}
+
+/// A start() failure landing after earlier workers launched (a second input
+/// whose decoder options are rejected at decoder open, while the sink
+/// muxer's delayed-start waiter and encoders are already live) must tear the
+/// job down cleanly: start() returns the decoder error without hanging, and
+/// the never-started sink fires NO callback at all — the documented
+/// narrow-coverage rule ("the job fails before any callback runs"), which
+/// the scheduler's failure-recording must not widen into a spurious
+/// `JobFailed` dispatch.
+#[test]
+fn start_failure_tears_down_cleanly_and_keeps_the_unstarted_sink_silent() {
+    if !have_encoder("libx264") {
+        eprintln!("skipping: libx264 not available");
+        return;
+    }
+    let (sink, log) = recording_sink();
+    let out_path = tmp_path_in(TMP_SUBDIR, "start_failure_sibling.mp4");
+    let context = FfmpegContext::builder()
+        .input(testsrc(1))
+        .input(testsrc(1).set_video_codec_opt("threads", "definitely_not_a_thread_count"))
+        .output(
+            Output::new_by_packet_sink(sink)
+                .set_video_codec("libx264")
+                .set_video_codec_opt("preset", "ultrafast")
+                .add_stream_map("0:v"),
+        )
+        .output(Output::from(out_path.as_str()).add_stream_map("1:v"))
+        .build()
+        .expect("decoder options are applied at start(), not at build()");
+
+    // start() must fail at the second input's decoder open; run it on a
+    // watchdog thread so a teardown hang fails the test instead of jamming
+    // the suite.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(context.start().map(|_| ()));
+    });
+    let started = match rx.recv_timeout(std::time::Duration::from_secs(120)) {
+        Ok(result) => result,
+        Err(_) => panic!("start() did not return within 120s (teardown hang)"),
+    };
+    match started {
+        Err(Error::OpenDecoder(_)) => {}
+        other => panic!("expected the decoder-open failure from start(), got {other:?}"),
+    }
+
+    // The sink never reached delivery: per the documented callback coverage
+    // it stays completely silent — no stream info, no packets, no End, no
+    // delivery error.
+    let events = log.lock().unwrap().clone();
+    assert!(
+        events.is_empty(),
+        "a sink whose delivery never began must fire no callback, got {events:?}"
+    );
 }
