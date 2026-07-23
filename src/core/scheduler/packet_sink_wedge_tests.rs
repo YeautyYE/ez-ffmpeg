@@ -40,8 +40,10 @@ use std::time::{Duration, Instant};
 /// not returned, with both counters FROZEN across six consecutive 250 ms
 /// samples. A healthy writer cycles the pair between samples; a starved
 /// muxer (parked in its packet queue) and an exited one sit at
-/// entered == returned. `returned` is loaded before `entered` so a racing
-/// completion can never fake an in-flight call. Returns the parked call's
+/// entered == returned. Loading `returned` before `entered` narrows the
+/// torn-read window to a completion landing between the two loads, and
+/// the confirm reload after the stability run DETECTS exactly that race
+/// before the generation is handed out. Returns the parked call's
 /// generation — the value of `ENTERED` with that call in flight — so the
 /// caller can later tie the stop() cut back to THIS write and no other.
 fn require_write_parked(deadline: Instant) -> Result<u64, String> {
@@ -588,12 +590,23 @@ fn blocked_sibling_stays_interruptible_while_sink_finalizes() {
             stop_worker.join().expect("the stop worker panicked");
             result
         }
-        Err(_) => {
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            // The worker dropped the sender without sending: it panicked
+            // inside stop(). Surface ITS panic, not a fictitious hang.
+            match stop_worker.join() {
+                Err(payload) => std::panic::resume_unwind(payload),
+                Ok(()) => panic!("the stop worker exited without reporting a result"),
+            }
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             // A hung stop() must not outlive the serialization guard: left
             // detached, its muxer would keep driving the process-wide
             // probe counters under the next test's samples. Close the
             // unread peer to cut the wedged write loose, join the worker,
-            // then fail.
+            // then fail. The join itself has no bound: if stop() is wedged
+            // on something the peer close cannot release, this run is
+            // already failing and waiting keeps the counters quiescent for
+            // the other tests.
             drop(stream);
             let _ = stop_worker.join();
             panic!("stop() hung: the sink held the finalize exemption over a blocked sibling");
@@ -627,6 +640,20 @@ fn blocked_sibling_stays_interruptible_while_sink_finalizes() {
     assert_eq!(
         err_gen, parked_gen,
         "the write that returned the error is not the parked one"
+    );
+    // CAUSALITY: the same negative return with the same generation could
+    // in principle come from the write failing on its own in the window
+    // between the pre-stop checks and the worker's stop() call (a peer
+    // reset, say). Only a stop-driven cut passes through an ELECTING
+    // output-interrupt callback, which runs on the muxer thread inside
+    // the blocked call and records the in-flight generation — so this is
+    // the link that proves stop() caused the failure the links above
+    // attribute.
+    let cut_gen = tcp_write_probe::CUT_GEN.load(Ordering::Acquire);
+    assert_eq!(
+        cut_gen, parked_gen,
+        "no output-interrupt election happened inside the parked write: \
+         its failure was not stop()'s cut"
     );
     // The cut must also be VISIBLE downstream, in its exact shape: the
     // write loop records a failed PACKET write as an interleaved-write

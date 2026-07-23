@@ -1835,10 +1835,14 @@ mod tests {
         // The two loads CAN tear — a fallback exit between them shows
         // fresh enters against stale exits — but that exit records
         // `gate_wait_timed_out` before bumping exits, so the loop fails
-        // fast on the flag with the specific diagnosis, and a tear that
-        // slips past it is caught by the same flag right below before any
-        // inspection runs. Only with a read provably parked has the
-        // pre-start holder served its purpose and goes back.
+        // fast on the flag with the specific diagnosis and the post-loop
+        // check catches most of the rest early. Neither is the soundness
+        // argument: a fallback can fire at ANY later point (even
+        // mid-inspection, where an unrelated assertion may trip first),
+        // and the end-of-test assertion on the same flag is what keeps
+        // every such run from going green. Only with a read provably
+        // parked has the pre-start holder served its purpose and goes
+        // back.
         let handshake_deadline = std::time::Instant::now() + Duration::from_secs(10);
         while gate_wait_enters.load(Ordering::Acquire) <= gate_wait_exits.load(Ordering::Acquire)
         {

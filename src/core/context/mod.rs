@@ -136,7 +136,15 @@ pub(crate) unsafe extern "C" fn input_interrupt_cb(opaque: *mut c_void) -> libc:
 /// Same contract as [`input_interrupt_cb`].
 pub(crate) unsafe extern "C" fn output_interrupt_cb(opaque: *mut c_void) -> libc::c_int {
     let state = &*(opaque as *const InterruptState);
-    state.should_interrupt_output() as libc::c_int
+    let interrupt = state.should_interrupt_output();
+    // This callback runs on the muxer's own thread, inside the retry loop
+    // of whatever blocking I/O it is cutting, so an election here is the
+    // one place that can attribute the cut to the exact write in flight.
+    #[cfg(test)]
+    if interrupt {
+        crate::core::scheduler::tcp_write_probe::note_cut_election();
+    }
+    interrupt as libc::c_int
 }
 
 /// Gate for the muxer's deferred start. fftools: `SchMux.mux_started` +
