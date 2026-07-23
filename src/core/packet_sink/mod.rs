@@ -812,10 +812,13 @@ impl PacketSink {
     /// terminates even with a full, undrained channel. Dropping the receiver
     /// cancels the job with [`PacketSinkError::ChannelDisconnected`].
     ///
-    /// Terminal `End`/`Error` events are delivered best-effort: when the
-    /// channel is full and the consumer never drains, they are dropped —
-    /// sender disconnection (`Disconnected` on the receiver) is the
-    /// authoritative end-of-events signal either way.
+    /// Terminal `End`/`Error` events are delivered best-effort ON THE RAW
+    /// CHANNEL: the send behind them must not block teardown, so a consumer
+    /// that is full at that instant — stalled forever or merely a few events
+    /// behind — loses them, and sender disconnection (`Disconnected` on the
+    /// receiver) is the authoritative end-of-events signal.
+    /// [`PacketSinkReceiver::into_events`] restores the deterministic ending
+    /// on top: a stream without a terminal `Err` always ends with `End`.
     pub fn channel(capacity: NonZeroUsize) -> (PacketSink, PacketSinkReceiver) {
         let (tx, rx) = crossbeam_channel::bounded::<PacketSinkEvent>(capacity.get());
         let cancellation: CancellationSlot = Arc::new(OnceLock::new());
@@ -1400,6 +1403,15 @@ impl PacketSinkReceiver {
     /// Dropping the iterator mid-run releases the receiver FIRST (unblocking
     /// a worker parked in the channel send), then aborts the job.
     ///
+    /// Unlike the raw channel — whose terminal events are best-effort — the
+    /// iterator's ending is deterministic: a stream that ends without `Err`
+    /// always ends with exactly one [`PacketSinkEvent::End`]. The channel
+    /// send behind `on_end` cannot block teardown, so a consumer that is
+    /// merely a few events behind at that instant loses the queued `End`;
+    /// the iterator re-synthesizes it after the clean join, where "clean"
+    /// is `wait()` returning `Ok` — the same authority the completion
+    /// contract pins to a delivered `on_end`.
+    ///
     /// # Errors
     ///
     /// [`PacketEventsPairingError`] when `scheduler` is not the one running
@@ -1425,6 +1437,8 @@ impl PacketSinkReceiver {
         }
         Ok(PacketEventIter {
             inner: OwnedRunIter::new(self.inner, scheduler, std::convert::identity),
+            saw_end: false,
+            saw_error: false,
         })
     }
 }
@@ -1433,6 +1447,11 @@ impl PacketSinkReceiver {
 /// [`PacketSinkReceiver::into_events`].
 pub struct PacketEventIter {
     inner: OwnedRunIter<PacketSinkEvent>,
+    /// An `End` already streamed through the channel — nothing to add.
+    saw_end: bool,
+    /// A terminal `Err` was yielded — an `End` after it would claim a clean
+    /// finish the join just denied.
+    saw_error: bool,
 }
 
 impl std::fmt::Debug for PacketEventIter {
@@ -1445,7 +1464,31 @@ impl Iterator for PacketEventIter {
     type Item = Result<PacketSinkEvent, crate::error::Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next()
+        match self.inner.next() {
+            Some(Ok(event)) => {
+                if matches!(event, PacketSinkEvent::End) {
+                    self.saw_end = true;
+                }
+                Some(Ok(event))
+            }
+            Some(Err(e)) => {
+                self.saw_error = true;
+                Some(Err(e))
+            }
+            // The channel disconnected and the join was clean. `on_end`
+            // pushes `End` with a non-blocking send (teardown must not wait
+            // on a lagging consumer), so a consumer a few events behind at
+            // that instant loses it; restore the invariant that a stream
+            // without `Err` ends with `End`, exactly once.
+            None => {
+                if !self.saw_end && !self.saw_error {
+                    self.saw_end = true;
+                    Some(Ok(PacketSinkEvent::End))
+                } else {
+                    None
+                }
+            }
+        }
     }
 }
 
