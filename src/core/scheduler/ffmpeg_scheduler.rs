@@ -1592,17 +1592,28 @@ mod tests {
         // test.mp4 through read/seek callbacks whose post-build reads are
         // held by a gate: while the gate is closed the demux worker cannot
         // reach EOF, so the job provably cannot settle and admit the parked
-        // waiter through worker-slot releases. The io buffer is shrunk to
-        // 4 KiB so the 34 KB file cannot be swallowed whole by build-time
-        // probing plus one buffered window — draining it REQUIRES reads that
-        // land after the gate closes. The wait is bounded so a failing test
-        // run cannot wedge the worker forever.
+        // waiter through worker-slot releases. Shrinking the io buffer to
+        // 4 KiB and capping probesize at 4 KiB starves build-time probing,
+        // but no byte budget can PROVE a post-gate read happens (probing
+        // reads and demuxer seeks are unbounded in count) — so the callback
+        // additionally records whether a read ever entered while the gate
+        // was closed, and the test refuses to proceed until one provably
+        // did. The wait is bounded so a failing test run cannot wedge the
+        // worker forever.
         let file = Arc::new(Mutex::new(
             File::open("test.mp4").expect("test input must exist"),
         ));
         let gate = Arc::new(AtomicBool::new(false));
-        let (gate_r, file_r) = (gate.clone(), file.clone());
+        let entered_while_gated = Arc::new(AtomicBool::new(false));
+        let (gate_r, file_r, entered_r) = (
+            gate.clone(),
+            file.clone(),
+            entered_while_gated.clone(),
+        );
         let read_callback: Box<dyn FnMut(&mut [u8]) -> i32 + Send> = Box::new(move |buf| {
+            if gate_r.load(Ordering::Acquire) {
+                entered_r.store(true, Ordering::Release);
+            }
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
             while gate_r.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(1));
@@ -1638,6 +1649,7 @@ mod tests {
         let mut input: Input = read_callback.into();
         input.seek_callback = Some(seek_callback);
         input.io_buffer_size = 4096;
+        let input = input.set_format_opt("probesize", "4096");
 
         // Build probes the input, so the gate closes only afterwards.
         let context = FfmpegContext::builder()
@@ -1706,10 +1718,12 @@ mod tests {
         // The holder slot exists only in this test, so a failing start()
         // would deadlock on it: StartFailGuard::drop waits for every slot,
         // and the test thread that would release the holder is inside
-        // start(). The failsafe returns the holder on a bound in that case,
-        // letting start() surface its error as a failed expect instead of a
-        // suite hang. The swap makes the release exactly-once whichever
-        // side gets there.
+        // start(). The failsafe returns the holder on a bound in that case
+        // — opening the gate first, so the failure's own joins drain
+        // instead of stalling each gated read to its fallback — letting
+        // start() surface its error as a failed expect instead of a suite
+        // hang. The swap makes the release exactly-once whichever side
+        // gets there.
         let holder_released = Arc::new(AtomicBool::new(false));
         let release_holder = {
             let (sync, flag) = (sync.clone(), holder_released.clone());
@@ -1722,33 +1736,68 @@ mod tests {
         let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
         let holder_failsafe = {
             let release_holder = release_holder.clone();
+            let gate = gate.clone();
             std::thread::spawn(move || {
                 if started_rx.recv_timeout(Duration::from_secs(30)).is_err() {
+                    gate.store(false, Ordering::Release);
                     release_holder();
                 }
             })
         };
 
+        // Reopen the gate on EVERY exit path, in two phases around the
+        // fallible start(): the pre-start guard covers a start() that
+        // returns an error — the failed expect's unwind opens the gate at
+        // once (the joins INSIDE a failing start() are already bounded by
+        // the read fallback and the failsafe above) — and is disarmed when
+        // the post-start guards take over in the drop order that matters
+        // there.
+        struct OpenOnExit(Option<Arc<AtomicBool>>);
+        impl OpenOnExit {
+            fn disarm(&mut self) {
+                self.0 = None;
+            }
+        }
+        impl Drop for OpenOnExit {
+            fn drop(&mut self) {
+                if let Some(gate) = self.0.take() {
+                    gate.store(false, Ordering::Release);
+                }
+            }
+        }
+        let mut pre_start_gate = OpenOnExit(Some(gate.clone()));
         let running = scheduler.start().expect("the minimal copy job must start");
         let _ = started_tx.send(());
         holder_failsafe.join().unwrap();
-        // The gated workers pin the barrier from here on; the pre-start
-        // holder slot has served its purpose and goes back first — before
-        // any assertion, so a failing assertion cannot strand a slot no
-        // thread would ever release.
-        release_holder();
-        // Reopen the gate on EVERY exit path from here on: a failing
-        // assertion below must surface as that failure, not as a wedged
-        // teardown. Declared AFTER `running` so it drops FIRST on unwind —
-        // the RunningGuard's join then drains its workers through an open
-        // gate instead of stalling each gated read to its fallback.
-        struct OpenOnExit(Arc<AtomicBool>);
-        impl Drop for OpenOnExit {
+        // Post-start unwind, in reverse declaration order: the gate opens
+        // FIRST (declared last), then the holder goes back, and only then
+        // does `running`'s guard join — its workers drain through an open
+        // gate with no artificial slot left to wait on.
+        struct ReleaseOnExit<F: FnMut()>(F);
+        impl<F: FnMut()> Drop for ReleaseOnExit<F> {
             fn drop(&mut self) {
-                self.0.store(false, Ordering::Release);
+                (self.0)();
             }
         }
-        let _open_gate = OpenOnExit(gate.clone());
+        let _holder_guard = ReleaseOnExit(release_holder.clone());
+        let _open_gate = OpenOnExit(Some(gate.clone()));
+        pre_start_gate.disarm();
+
+        // The handshake the gate's premise rests on: a demux read provably
+        // ENTERED while the gate was closed, so EOF was not reachable from
+        // build-time buffering alone and the barrier is held by a genuinely
+        // gated worker — no byte-budget arithmetic can show that. Only then
+        // has the pre-start holder served its purpose and goes back.
+        let handshake_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !entered_while_gated.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < handshake_deadline,
+                "no read entered while the gate was closed: build-time \
+                 probing consumed the input and the gate holds nothing"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        release_holder();
 
         // (3) The gated demux worker still holds its slot, so the sentinel
         // release cannot have admitted the waiter.
