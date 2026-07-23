@@ -391,9 +391,12 @@ type AvccExtensionTail = (Option<(u8, u8, u8)>, Vec<Vec<u8>>);
 /// part of the delivered configuration, so the S8 fingerprint must see
 /// them — an announcement that adds, drops or edits one is a
 /// configuration change, while one that only rewrites an entry's
-/// `nal_ref_idc` is not: the header byte is framing the reader consumes
-/// before the body is stored (`h264_parse_nal_header`,
-/// libavcodec/h2645_parse.c), the same rule the SPS and PPS maps key by.
+/// `nal_ref_idc` is not. Keying by the payload behind the header byte is
+/// THIS crate's identity policy — the rule the SPS and PPS maps already
+/// apply — not a mirrored FFmpeg behavior: FFmpeg's extradata readers
+/// never parse SPS-EXT at all (`ff_h264_decode_extradata`,
+/// libavcodec/h264_parse.c, walks the avcC SPS and PPS arrays and stops,
+/// and its Annex-B path ignores NAL type 13 in `decode_extradata_ps`).
 fn parse_avcc_extension(
     avcc: &[u8],
     mut pos: usize,
@@ -454,9 +457,11 @@ fn parse_avcc_extension(
 /// The avcC header and the record's own first SPS must describe one
 /// stream: `ff_isom_write_avcc` derives bytes 1..4 (profile /
 /// compatibility / level) and the profile-extension fields all from the
-/// first SPS, so a record that disagrees with its SPS hands consumers two
-/// conflicting descriptions and is rejected — at initial construction and,
-/// via the shared parse, for every `NEW_EXTRADATA` announcement.
+/// first SPS — the extension triple through its own reader's dispatch
+/// ([`writer_extension_triple`]), not the raw SPS syntax — so a record
+/// that disagrees with that derivation hands consumers two conflicting
+/// descriptions and is rejected — at initial construction and, via the
+/// shared parse, for every `NEW_EXTRADATA` announcement.
 fn check_avcc_consistency(record: &AvccRecord) -> Result<(), String> {
     let derived = CodecProjection::from_ordered_sets(&record.sets)?;
     if record.header != derived {
@@ -473,13 +478,13 @@ fn check_avcc_consistency(record: &AvccRecord) -> Result<(), String> {
     }
     if let Some((chroma, luma, chroma_depth)) = record.extension {
         let first_sps = record.sets.sps.first().ok_or("no SPS")?;
-        let sps_fields = parse_sps(first_sps)?.chroma_info();
-        if (chroma, luma, chroma_depth) != sps_fields {
-            let (sps_chroma, sps_luma, sps_chroma_depth) = sps_fields;
+        let derived_fields = writer_extension_triple(first_sps[1], &parse_sps(first_sps)?);
+        if (chroma, luma, chroma_depth) != derived_fields {
+            let (want_chroma, want_luma, want_chroma_depth) = derived_fields;
             return Err(format!(
                 "avcC extension declares chroma_format_idc {chroma} and bit depths \
-                 {luma}/{chroma_depth} but the first SPS carries {sps_chroma} and \
-                 {sps_luma}/{sps_chroma_depth}"
+                 {luma}/{chroma_depth} but the first SPS derives {want_chroma} and \
+                 {want_luma}/{want_chroma_depth}"
             ));
         }
     }
@@ -503,20 +508,44 @@ fn read_u16_prefixed(data: &[u8], pos: &mut usize) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// The extension triple `ff_isom_write_avcc` derives from one SPS. The
+/// writer's own SPS reader (`ff_avc_decode_sps`, libavformat/avc.c)
+/// parses the chroma-format/bit-depth block only for profile_idc 100,
+/// 110, 122, 244, 44, 83, 86, 118, 128, 138, 139 and 134, and its else
+/// branch pins every other profile to 4:2:0 / 8-bit. That dispatch is
+/// narrower than BOTH syntax lists this file tracks: [`parse_sps`] must
+/// still read the chroma block for 135 and 144 (H.264 7.3.2.1.1 puts the
+/// bits in the payload, so skipping them would misalign everything
+/// behind), and the decoder's list (`ff_h264_decode_seq_parameter_set`,
+/// libavcodec/h264_ps.c) carries 144 but not 139/134. The record
+/// identity mirrors what the writer PRODUCES: for a profile outside the
+/// writer's list the triple is its (1, 8, 8) default no matter what the
+/// SPS codes — an FFmpeg-written record for a profile-144 4:4:4 stream
+/// says (1, 8, 8), so synthesis and the consistency check must too.
+fn writer_extension_triple(profile_idc: u8, summary: &SpsSummary) -> (u8, u8, u8) {
+    match profile_idc {
+        100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 => {
+            summary.chroma_info()
+        }
+        _ => (1, 8, 8),
+    }
+}
+
 /// The avcC profile-extension triple these parameter sets are delivered
 /// with, `None` when no block is defined for them. Mirrors
 /// `ff_isom_write_avcc` (libavformat/avc.c): the chroma-format/bit-depth
 /// block is appended only when the FIRST SPS's profile_idc is none of
 /// Baseline (66), Main (77) or Extended (88) — its
 /// `sps[3] != 66 && sps[3] != 77 && sps[3] != 88` gate reads the first
-/// entry of the SPS array it just wrote — and the three values come from
-/// that same first SPS (`ff_avc_decode_sps(&seq, sps + 3, ...)`).
-/// Synthesis ([`build_avcc`]) and the Annex-B fingerprint share this one
+/// entry of the SPS array it just wrote — and the three values are what
+/// its own SPS reader decodes from that same first SPS
+/// ([`writer_extension_triple`]). Synthesis ([`build_avcc`]), the
+/// Annex-B fingerprint and the record consistency check share this one
 /// derivation so the synthesize-reparse gate compares like with like.
 fn derived_extension(first_sps: &[u8], first_summary: &SpsSummary) -> Option<(u8, u8, u8)> {
     match first_sps[1] {
         66 | 77 | 88 => None,
-        _ => Some(first_summary.chroma_info()),
+        profile => Some(writer_extension_triple(profile, first_summary)),
     }
 }
 
@@ -1698,6 +1727,20 @@ mod tests {
     const PROFILE_144_SPS: &[u8] = &[
         0x67, 0x90, 0x00, 0x1E, 0xAC, 0xD9, 0x41, 0x41, 0xFB, 0x01, 0x10, 0x00, 0x00, 0x03,
         0x00, 0x10, 0x00, 0x00, 0x03, 0x03, 0x20, 0xF1, 0x62, 0xD9, 0x60,
+    ];
+    // `CHROMA3_SCALING_SPS` with profile_idc patched to 144 (a one-byte
+    // u(8) field, no bit shifts): the payload still codes chroma_format_idc
+    // 3, but 144 is outside the avcC writer's chroma dispatch
+    // (ff_avc_decode_sps, libavformat/avc.c), so the record for this
+    // stream carries the writer's (1, 8, 8) default, not the coded 4:4:4.
+    const PROFILE_144_CHROMA3_SPS: &[u8] = &[
+        0x67, 0x90, 0x00, 0x1E, 0x91, 0xB0, 0x88, 0x00, 0xB4, 0x0A, 0x0F, 0xC8,
+    ];
+    // `TEN_BIT_SPS` with profile_idc patched to 135: the same
+    // writer-default class from the depth side — coded 10-bit, recorded
+    // 8-bit.
+    const PROFILE_135_TEN_BIT_SPS: &[u8] = &[
+        0x67, 0x87, 0x00, 0x1E, 0xA6, 0xCB, 0x40, 0xA0, 0xFC, 0x80,
     ];
 
     // Hand-assembled 7.3.2.1.1 bit streams (High or Constrained Baseline
@@ -2910,6 +2953,72 @@ mod tests {
         };
         let avcc = build_avcc(&sets).unwrap();
         assert!(AvcRuntime::from_extradata(&avcc, 0).is_ok());
+    }
+
+    /// profile_idc 144 and 135 sit in the SYNTAX dispatch — the chroma
+    /// block is present in the bits and must be parsed past — but not in
+    /// the avcC writer's: `ff_avc_decode_sps` (libavformat/avc.c) lists
+    /// 100/110/122/244/44/83/86/118/128/138/139/134 and defaults every
+    /// other profile to (1, 8, 8), so the record FFmpeg writes for these
+    /// streams carries the default triple no matter what the SPS codes.
+    /// The delivered identity must be the writer's, not the raw syntax:
+    /// deriving (3, 8, 8) here would fingerprint a record no FFmpeg mux
+    /// ever produces for the same stream.
+    #[test]
+    fn synthesizes_the_writer_default_triple_outside_the_writer_dispatch() {
+        // The syntax parse still sees the coded values...
+        assert_eq!(
+            parse_sps(PROFILE_144_CHROMA3_SPS).unwrap().chroma_info(),
+            (3, 8, 8)
+        );
+        assert_eq!(
+            parse_sps(PROFILE_135_TEN_BIT_SPS).unwrap().chroma_info(),
+            (1, 10, 10)
+        );
+        // ...while the delivered triple is the writer's default, the
+        // synthesized tail is the default block, and the record
+        // round-trips through the synthesis-fidelity gate.
+        for sps in [PROFILE_144_CHROMA3_SPS, PROFILE_135_TEN_BIT_SPS] {
+            assert_eq!(
+                derived_extension(sps, &parse_sps(sps).unwrap()),
+                Some((1, 8, 8))
+            );
+            let sets = ParameterSets {
+                sps: vec![sps.to_vec()],
+                pps: vec![MINIMAL_PPS.to_vec()],
+            };
+            let avcc = build_avcc(&sets).unwrap();
+            assert_eq!(avcc[avcc.len() - 4..], [0xFD, 0xF8, 0xF8, 0x00]);
+            let (_, delivered, _) =
+                AvcRuntime::from_extradata(&annexb_with(sps, MINIMAL_PPS), 0).unwrap();
+            assert_eq!(delivered, avcc);
+        }
+    }
+
+    /// An avcC shaped like `ff_isom_write_avcc`'s own output for the
+    /// 4:4:4-syntax profile-144 stream — extension (1, 8, 8) — must be
+    /// accepted, initially and as an announcement over the equivalent
+    /// Annex-B baseline; one carrying the raw syntax values instead
+    /// declares a triple the writer never emits for this profile and is
+    /// two disagreeing stream descriptions.
+    #[test]
+    fn accepts_ffmpeg_shaped_records_outside_the_writer_dispatch() {
+        let mut avcc = raw_avcc(144, 0x00, 0x1E, PROFILE_144_CHROMA3_SPS, MINIMAL_PPS);
+        avcc.extend_from_slice(&[0xFD, 0xF8, 0xF8, 0x00]);
+        let record = parse_avcc_record(&avcc).unwrap();
+        assert_eq!(record.extension, Some((1, 8, 8)));
+        assert!(AvcRuntime::from_extradata(&avcc, 0).is_ok());
+        let annexb = annexb_with(PROFILE_144_CHROMA3_SPS, MINIMAL_PPS);
+        let (runtime, _, _) = AvcRuntime::from_extradata(&annexb, 0).unwrap();
+        runtime.check_new_extradata(&avcc, 0).unwrap();
+        // chroma_format_idc 3 in the extension — the parsed syntax value.
+        let ext = avcc.len() - 4;
+        avcc[ext] = 0xFC | 3;
+        let err = parse_avcc_parameter_sets(&avcc).unwrap_err();
+        assert!(
+            err.contains("chroma_format_idc 3") && err.contains("derives 1"),
+            "unexpected error: {err}"
+        );
     }
 
     /// The encoder-produced PPS bodies parse to their trailing bits against
