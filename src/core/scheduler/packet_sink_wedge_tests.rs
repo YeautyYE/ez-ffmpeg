@@ -347,6 +347,35 @@ fn peer_socket_stats(_stream: &std::net::TcpStream) -> (i32, i32) {
     (-1, -1)
 }
 
+/// True when xnu may regrow an unread receive window past the pinned size.
+/// An explicit `SO_RCVBUF` does not disarm receive autotuning there (the CI
+/// lanes observed 16384 at accept regrown past 500k by the park), so with
+/// `net.inet.tcp.autorcvbufmax` above the pin the never-reading peer cannot
+/// keep the sender blocked and the wedge's cut acknowledgment is vacuous.
+/// The macOS CI lanes cap the sysctl; default machines do not.
+#[cfg(target_os = "macos")]
+fn receive_autotune_uncapped() -> bool {
+    let name = std::ffi::CString::new("net.inet.tcp.autorcvbufmax").unwrap();
+    let mut val: libc::c_int = 0;
+    let mut len: libc::size_t = std::mem::size_of::<libc::c_int>();
+    // SAFETY: sysctlbyname with a correctly sized int output buffer.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            &mut val as *mut libc::c_int as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    rc != 0 || val > 16 * 1024
+}
+
+#[cfg(not(target_os = "macos"))]
+fn receive_autotune_uncapped() -> bool {
+    false
+}
+
 /// Pins stage 3 against the confounder it exists for: a writer that
 /// delivers a refill burst after the drain and then goes IDLE, its residue
 /// fully drained. Stages 1-2 accept that shape — the burst satisfies the
@@ -726,6 +755,20 @@ fn blocked_sibling_stays_interruptible_while_sink_finalizes() {
         "wedge peer at park: rcvbuf={rcvbuf_at_park} unread={unread_at_park}; \
          settled: rcvbuf={rcvbuf_settled} unread={unread_settled}"
     );
+    // Without the autotune cap the parked write can drain on its own (the
+    // window regrows), so everything below — which write returned, with
+    // what error, and which terminal event the sink delivered — is
+    // undefined rather than wrong. Skip it loudly instead of flaking; the
+    // macOS CI lanes cap the sysctl and run the full acknowledgment.
+    if receive_autotune_uncapped() {
+        eprintln!(
+            "wedge: skipping the cut acknowledgment: net.inet.tcp.autorcvbufmax \
+             exceeds the 16384 peer pin, the unread window regrows and the \
+             parked write can drain on its own (cap the sysctl to exercise \
+             the full property)"
+        );
+        return;
+    }
     let entered = tcp_write_probe::ENTERED.load(Ordering::Acquire);
     let returned = tcp_write_probe::RETURNED.load(Ordering::Acquire);
     assert_eq!(
