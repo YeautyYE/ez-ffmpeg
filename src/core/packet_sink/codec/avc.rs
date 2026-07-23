@@ -75,13 +75,15 @@ pub(crate) struct ConfigFingerprint {
     /// ascending by id.
     pps: Vec<(u32, PpsSlot)>,
     /// The profile-extension triple (`chroma_format_idc`,
-    /// `bit_depth_luma`, `bit_depth_chroma`) of the delivered record: the
-    /// validated declared block for avcC input (`None` when the record
-    /// legally ends at the PPS array), the [`derived_extension`] triple
-    /// synthesis will write for Annex-B input. Two first SPS can share
-    /// all three projection bytes yet differ here (chroma format and bit
-    /// depth are not header bytes), so the id maps alone would miss the
-    /// change.
+    /// `bit_depth_luma`, `bit_depth_chroma`) in its writer-canonical form
+    /// — the [`derived_extension`] triple — whichever accepted shape the
+    /// validated bytes carried: a record may legally declare the writer
+    /// default or the raw SPS syntax (both reach real files), and both
+    /// canonicalize here so a shape switch between announcements is not a
+    /// configuration change (`None` when the record legally ends at the
+    /// PPS array). Two first SPS can share all three projection bytes yet
+    /// differ here (chroma format and bit depth are not header bytes), so
+    /// the id maps alone would miss the change.
     extension: Option<(u8, u8, u8)>,
     /// Post-header payloads of the SPS-EXT entries in record order (an
     /// Annex-B configuration carries none — that path admits only SPS
@@ -404,10 +406,12 @@ type AvccExtensionTail = (Option<(u8, u8, u8)>, Vec<Vec<u8>>);
 /// configuration change, while one that only rewrites an entry's
 /// `nal_ref_idc` is not. Keying by the payload behind the header byte is
 /// THIS crate's identity policy — the rule the SPS and PPS maps already
-/// apply — not a mirrored FFmpeg behavior: FFmpeg's extradata readers
-/// never parse SPS-EXT at all (`ff_h264_decode_extradata`,
+/// apply — not a mirrored FFmpeg behavior: the decoder's own extradata
+/// readers never parse SPS-EXT (`ff_h264_decode_extradata`,
 /// libavcodec/h264_parse.c, walks the avcC SPS and PPS arrays and stops,
-/// and its Annex-B path ignores NAL type 13 in `decode_extradata_ps`).
+/// and its Annex-B path ignores NAL type 13 in `decode_extradata_ps`),
+/// and CBS (`ff_cbs_read_extradata`) parses it as a full syntax tree, not
+/// a stored-bytes identity.
 fn parse_avcc_extension(
     avcc: &[u8],
     mut pos: usize,
@@ -566,8 +570,11 @@ fn writer_extension_triple(profile_idc: u8, summary: &SpsSummary) -> (u8, u8, u8
 /// entry of the SPS array it just wrote — and the three values are what
 /// its own SPS reader decodes from that same first SPS
 /// ([`writer_extension_triple`]). Synthesis ([`build_avcc`]), the
-/// Annex-B fingerprint and the record consistency check share this one
-/// derivation so the synthesize-reparse gate compares like with like.
+/// Annex-B fingerprint and the record-side fingerprint all canonicalize
+/// to this derivation, so the synthesize-reparse gate compares like with
+/// like; the record consistency check is wider — it also admits the raw
+/// SPS-coded triple, which survives the writer's verbatim copy of a
+/// non-Annex-B extradata.
 fn derived_extension(first_sps: &[u8], first_summary: &SpsSummary) -> Option<(u8, u8, u8)> {
     match first_sps[1] {
         66 | 77 | 88 => None,
@@ -1757,14 +1764,15 @@ mod tests {
     // `CHROMA3_SCALING_SPS` with profile_idc patched to 144 (a one-byte
     // u(8) field, no bit shifts): the payload still codes chroma_format_idc
     // 3, but 144 is outside the avcC writer's chroma dispatch
-    // (ff_avc_decode_sps, libavformat/avc.c), so the record for this
-    // stream carries the writer's (1, 8, 8) default, not the coded 4:4:4.
+    // (ff_avc_decode_sps, libavformat/avc.c), so the record FFmpeg
+    // synthesizes from Annex-B carries the writer's (1, 8, 8) default —
+    // while a remux copies an existing record's coded 4:4:4 verbatim.
     const PROFILE_144_CHROMA3_SPS: &[u8] = &[
         0x67, 0x90, 0x00, 0x1E, 0x91, 0xB0, 0x88, 0x00, 0xB4, 0x0A, 0x0F, 0xC8,
     ];
     // `TEN_BIT_SPS` with profile_idc patched to 135: the same
-    // writer-default class from the depth side — coded 10-bit, recorded
-    // 8-bit.
+    // writer-default class from the depth side — coded 10-bit,
+    // synthesized 8-bit.
     const PROFILE_135_TEN_BIT_SPS: &[u8] = &[
         0x67, 0x87, 0x00, 0x1E, 0xA6, 0xCB, 0x40, 0xA0, 0xFC, 0x80,
     ];
@@ -2780,10 +2788,11 @@ mod tests {
 
     /// The SPS-EXT NAL header is framing like every other parameter
     /// set's: this crate keys the entry by its post-header payload, the
-    /// same identity policy the SPS/PPS maps use. (There is no FFmpeg
-    /// storage behavior to mirror — its extradata readers never parse
-    /// type 13: `ff_h264_decode_extradata` stops after the PPS array and
-    /// `decode_extradata_ps` ignores the type.) An entry re-sent with a
+    /// same identity policy the SPS/PPS maps use. (The decoder's own
+    /// extradata readers give nothing to mirror — `ff_h264_decode_extradata`
+    /// stops after the PPS array and `decode_extradata_ps` ignores type
+    /// 13 — and CBS's `ff_cbs_read_extradata` parses SPS-EXT as a full
+    /// syntax tree, not a stored-bytes identity.) An entry re-sent with a
     /// different legal `nal_ref_idc` (0x6D -> 0x4D, both type 13) lands
     /// in identical stored state and must stay redundant, while a payload
     /// difference behind the same header is still a configuration change.
@@ -2987,11 +2996,13 @@ mod tests {
     /// block is present in the bits and must be parsed past — but not in
     /// the avcC writer's: `ff_avc_decode_sps` (libavformat/avc.c) lists
     /// 100/110/122/244/44/83/86/118/128/138/139/134 and defaults every
-    /// other profile to (1, 8, 8), so the record FFmpeg writes for these
-    /// streams carries the default triple no matter what the SPS codes.
-    /// The delivered identity must be the writer's, not the raw syntax:
-    /// deriving (3, 8, 8) here would fingerprint a record no FFmpeg mux
-    /// ever produces for the same stream.
+    /// other profile to (1, 8, 8), so the record FFmpeg SYNTHESIZES from
+    /// Annex-B for these streams carries the default triple no matter
+    /// what the SPS codes (a remux can still carry a syntax-shaped record
+    /// verbatim — the parse side accepts both). Synthesis and the
+    /// canonical identity must be the writer's: deriving (3, 8, 8) here
+    /// would emit a tail FFmpeg's own synthesis never writes for the same
+    /// stream.
     #[test]
     fn synthesizes_the_writer_default_triple_outside_the_writer_dispatch() {
         // The syntax parse still sees the coded values...
