@@ -1750,10 +1750,13 @@ fn _mux_init(
 }
 
 /// Releases a muxer's pre-counted thread slot, publishing STATUS_END if this
-/// was the last live thread (mirroring the normal mux-worker exit). Used on
-/// every path where the slot was counted at scheduler start but no (further)
-/// worker will release it: streamless output, write_header failure, worker
-/// spawn failure. Without this the slot leaks and wait()/stop() hangs forever.
+/// was the last live thread (mirroring the normal mux-worker exit). Its one
+/// production caller is the scheduler's start-failure cleanup, for outputs
+/// whose slot was pre-counted but never handed to mux_init; the mux-side
+/// paths that die before a worker exists (streamless output, open or
+/// write_header or BSF failure, worker spawn failure) release through the
+/// consuming MuxSlotGuard::release() instead. Without a release the slot
+/// leaks and wait()/stop() hangs forever.
 pub(crate) fn release_mux_slot(
     scheduler_status: &Arc<AtomicUsize>,
     thread_sync: &ThreadSynchronizer,
@@ -3083,8 +3086,10 @@ mod tests {
         assert!(is_stopping(scheduler_status.load(Ordering::Acquire)));
     }
 
-    /// The zero-stream (AVFMT_NOSTREAMS) early return must release the
-    /// pre-counted slot WITHOUT recording an error — a streamless output is
+    /// A pre-counted slot returned with no worker and no error — the
+    /// accounting shared by the streamless early return (MuxSlotGuard) and
+    /// the scheduler's unhanded-slot cleanup (release_mux_slot) — must
+    /// unblock wait() without recording anything: such outputs are
     /// legitimate, but leaving the slot counted hangs wait()/stop().
     #[test]
     fn release_mux_slot_unblocks_wait_without_error() {
@@ -3226,15 +3231,17 @@ mod tests {
     // Slot-leak regression: the mux worker releases its pre-counted thread slot
     // via a MANUAL thread_done_with (not ThreadDoneGuard) so the release lands
     // only after the output's teardown — the trailer where a container writes
-    // one (packet-sink workers write none; streamless and header-failure
-    // paths release inside the worker via MuxSlotGuard::release() after their
-    // own teardown, while release_mux_slot covers scheduler-start slots that
-    // were never handed to a worker at all), then the encoder join — while mux
+    // one (packet-sink workers write none), then the encoder join — while mux
     // completion itself (STATUS_END via MuxDoneGuard) is deliberately
-    // published BEFORE the encoder join. A panic before that manual call
-    // would leak the slot and hang wait_for_all_threads.
-    // MuxSlotGuard is the panic-only net: an ARMED drop (the unwind path) must
-    // release the slot.
+    // published BEFORE the encoder join. Slots that never get a worker
+    // release elsewhere: streamless outputs and mux-init failures (open,
+    // write_header, BSF, worker spawn) release inside mux_init itself,
+    // before any worker exists, via the consuming MuxSlotGuard::release();
+    // the scheduler's start-failure cleanup calls release_mux_slot for
+    // outputs never handed to mux_init at all. A panic before the worker's
+    // manual call would leak the slot and hang wait_for_all_threads.
+    // MuxSlotGuard is the panic-only net: an ARMED drop (the unwind path)
+    // must release the slot.
     #[test]
     fn mux_slot_guard_releases_slot_on_armed_drop() {
         let thread_sync = ThreadSynchronizer::new();
