@@ -290,6 +290,13 @@ fn is_ga_object_type(aot: u32) -> bool {
 /// for them the flag-conditional reading is Table 4.1 syntax kept
 /// consistent with 17/23, not mirrored decoder behavior.
 ///
+/// The resilience-flag VALUES obey the same reachability boundary: a
+/// 17/23 configuration whose extensionFlag carries a nonzero
+/// aacSection/aacScalefactor/aacSpectralDataResilienceFlag is rejected —
+/// decode_ga_specific_config refuses every nonzero flag word as
+/// unimplemented, so no such stream decodes — while for the unreachable
+/// AOTs 19-22 the values pass unchecked, parser-only permissive.
+///
 /// One departure from decode_ga_specific_config, following the ISO text
 /// where the two disagree: FFmpeg reads layerNr BEFORE the
 /// program_config_element; Table 4.1 places it after. The orders only
@@ -329,9 +336,29 @@ fn read_ga_specific_config(
             bits.read(11, "layer_length")?;
         }
         if matches!(aot, 17 | 19 | 20 | 23) {
-            bits.read(1, "aacSectionDataResilienceFlag")?;
-            bits.read(1, "aacScalefactorDataResilienceFlag")?;
-            bits.read(1, "aacSpectralDataResilienceFlag")?;
+            let section = bits.read(1, "aacSectionDataResilienceFlag")?;
+            let scalefactor = bits.read(1, "aacScalefactorDataResilienceFlag")?;
+            let spectral = bits.read(1, "aacSpectralDataResilienceFlag")?;
+            // FFmpeg's decode_ga_specific_config reads these three flags
+            // as one word and refuses any nonzero value as unimplemented
+            // ("AAC data resilience (flags %x)", libavcodec/aac/aacdec.c),
+            // so a set flag leaves the configuration undecodable for the
+            // ER types that reach the function — ER AAC LC (17) and ER
+            // AAC LD (23) — and the rejection cannot cost an
+            // FFmpeg-decodable stream. AOTs 19-22 never reach it (the
+            // decode_audio_specific_config_gb switch refuses them as
+            // unsupported object types before any GASpecificConfig field
+            // is read), so their flag values stay parser-only permissive
+            // like the flag-conditional reading itself.
+            let res_flags = (section << 2) | (scalefactor << 1) | spectral;
+            if matches!(aot, 17 | 23) && res_flags != 0 {
+                return Err(format!(
+                    "data resilience flags {res_flags:#x} select \
+                     error-resilient payload syntax FFmpeg's decoder \
+                     refuses as unimplemented (decode_ga_specific_config, \
+                     libavcodec/aac/aacdec.c)"
+                ));
+            }
         }
         bits.read(1, "extensionFlag3")?;
     }
@@ -1000,6 +1027,58 @@ mod tests {
             Err(other) => panic!("expected InvalidExtradata, got {other:?}"),
             Ok(_) => panic!("expected InvalidExtradata, got a valid runtime"),
         }
+    }
+
+    #[test]
+    fn nonzero_resilience_flags_are_rejected_for_decodable_er_types() {
+        // ER AAC LC (AOT 17, 44.1 kHz, mono) with extensionFlag SET and
+        // all three resilience flags CLEAR stays accepted — 22 bits,
+        // 10001 0100 0001 0 0 1 000 0 00: audioObjectType 17,
+        // samplingFrequencyIndex 4, channelConfiguration 1, the
+        // GASpecificConfig head (frameLengthFlag 0, dependsOnCoreCoder 0,
+        // extensionFlag 1), the three flags, extensionFlag3, epConfig 0.
+        let runtime = AacRuntime::from_extradata(&[0x8A, 0x09, 0x00], 0).unwrap();
+        assert_eq!(runtime.codec_string(), "mp4a.40.17");
+        // ER AAC LD (AOT 23) in the same shape — 10111 0100 0001 001
+        // followed by the zero extension block (index 4 also sits inside
+        // the 3-7 window FFmpeg demands of an LD sampling index).
+        let runtime = AacRuntime::from_extradata(&[0xBA, 0x09, 0x00], 0).unwrap();
+        assert_eq!(runtime.codec_string(), "mp4a.40.23");
+        // Any set flag is a configuration FFmpeg's decoder refuses
+        // (decode_ga_specific_config, libavcodec/aac/aacdec.c): bit 16 is
+        // aacSectionDataResilienceFlag (third byte 0x80, flag word 0x4),
+        // bit 17 the scalefactor flag (0x40 -> 0x2), bit 18 the spectral
+        // flag (0x20 -> 0x1), 0xE0 sets all three (0x7); the 0xBA form is
+        // the ER AAC LD counterpart.
+        let rejected: [(&[u8], &str); 5] = [
+            (&[0x8A, 0x09, 0x80], "0x4"),
+            (&[0x8A, 0x09, 0x40], "0x2"),
+            (&[0x8A, 0x09, 0x20], "0x1"),
+            (&[0x8A, 0x09, 0xE0], "0x7"),
+            (&[0xBA, 0x09, 0x20], "0x1"),
+        ];
+        for (bad, flags) in rejected {
+            match AacRuntime::from_extradata(bad, 3) {
+                Err(PacketSinkError::InvalidExtradata {
+                    stream_index: 3,
+                    reason,
+                }) => {
+                    assert!(
+                        reason.contains(&format!("data resilience flags {flags}"))
+                            && reason.contains("aacdec.c"),
+                        "{bad:02X?}: got {reason:?}"
+                    );
+                }
+                Err(other) => panic!("{bad:02X?}: expected InvalidExtradata, got {other:?}"),
+                Ok(_) => panic!("{bad:02X?}: expected InvalidExtradata, got a valid runtime"),
+            }
+        }
+        // The rejection stops at the decoder's reach: ER AAC LTP (AOT 19,
+        // 10011) never dispatches into decode_ga_specific_config, so its
+        // flags have no decoder precedent and the all-set values pass —
+        // 10011 0100 0001 0 0 1 111 0 00.
+        let runtime = AacRuntime::from_extradata(&[0x9A, 0x09, 0xE0], 0).unwrap();
+        assert_eq!(runtime.codec_string(), "mp4a.40.19");
     }
 
     #[test]
