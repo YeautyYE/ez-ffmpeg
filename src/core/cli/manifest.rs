@@ -671,8 +671,10 @@ mod tests {
     #[test]
     fn module_docs_equal_the_generated_manifest_block() {
         // Exact equality, not containment: the docs between the markers must
-        // BE the manifest rendering, byte for byte.
-        let source = include_str!("mod.rs");
+        // BE the manifest rendering, byte for byte. `include_str!` embeds the
+        // file as checked out, so a CRLF working tree (Windows autocrlf)
+        // would hide the `\n`-anchored markers; normalize before searching.
+        let source = include_str!("mod.rs").replace("\r\n", "\n");
         let begin = "//! <!-- manifest:begin -->\n";
         let end = "//! <!-- manifest:end -->";
         let start = source
