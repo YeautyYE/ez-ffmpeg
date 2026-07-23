@@ -1051,13 +1051,12 @@ fn hw_device_setup_for_decode(
                 if dp.hwaccel_id == HWAccelID::HwaccelAuto {
                     dp.hwaccel_device_type = dev.device_type;
                 } else if dp.hwaccel_device_type != dev.device_type {
-                    if let (Some(dev_device_name), Some(dp_device_name)) = (
-                        hw_device_type_name(dev.device_type),
-                        hw_device_type_name(dp.hwaccel_device_type),
-                    ) {
-                        error!("Invalid hwaccel device specified for decoder: device {} of type {} is not usable with hwaccel {}.",
-                        dev.name, dp_device_name, dev_device_name);
-                    }
+                    let dev_device_name =
+                        hw_device_type_name(dev.device_type).unwrap_or("unknown");
+                    let dp_device_name =
+                        hw_device_type_name(dp.hwaccel_device_type).unwrap_or("unknown");
+                    error!("Invalid hwaccel device specified for decoder: device {} of type {} is not usable with hwaccel {}.",
+                        dev.name, dev_device_name, dp_device_name);
 
                     return AVERROR(EINVAL);
                 }

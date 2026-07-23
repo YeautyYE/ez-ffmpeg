@@ -26,13 +26,9 @@ pub fn get_hwaccels() -> Vec<HWAccelInfo> {
             break;
         }
 
-        let name = unsafe {
-            let name = av_hwdevice_get_type_name(device_type);
-            match CStr::from_ptr(name).to_str() {
-                Ok(name) => name.to_string(),
-                Err(_) => "unknown name".to_string(),
-            }
-        };
+        let name = hw_device_type_name(device_type)
+            .unwrap_or("unknown name")
+            .to_string();
 
         hwaccels.push(HWAccelInfo {
             name,
@@ -379,7 +375,8 @@ pub(crate) fn hw_device_init_from_string(arg: &str) -> (i32, Option<HWDevice>) {
     // AVBufferRef shared safely across jobs; the list is still freed once at
     // process cleanup, so no per-job free can dangle a shared ref). Reuse moves the
     // entry to the BACK of the list so it stays the "last-initialized" default
-    // filter device (hw_device_for_filter picks `devices.last()`).
+    // filter device (hw_device_for_filter picks the newest concretely-typed
+    // entry).
     //
     // The check deliberately sits AFTER the type-name validation above: a spec
     // that registers always starts with a valid device type name, so a malformed
@@ -706,8 +703,9 @@ fn reuse_by_init_arg_move_to_back(arg: &str) -> Option<HWDevice> {
 /// recorded reuse key equals `arg` exactly — a from_string spec string or a
 /// from_type canonical key; the two schemes cannot collide (see `type_init_arg`)
 /// and devices with `init_arg == None` never match. On a hit the entry is moved
-/// to the BACK of the list — `hw_device_for_filter` picks `devices.last()`, so
-/// reuse must preserve the "last-initialized wins" default-filter semantics.
+/// to the BACK of the list — `hw_device_for_filter` picks the newest
+/// concretely-typed entry, so reuse must preserve the "last-initialized
+/// wins" default-filter semantics.
 /// Split out so the reuse behavior is unit-testable without the process-global
 /// list.
 fn reuse_move_to_back(devices: &mut Vec<HWDevice>, arg: &str) -> Option<HWDevice> {
@@ -1051,7 +1049,8 @@ mod tests {
     }
 
     // Reuse must keep the reused device as the LAST entry, because
-    // hw_device_for_filter picks devices.last() as the default filter device.
+    // hw_device_for_filter picks the newest concretely-typed entry as the
+    // default filter device.
     // Sequence A -> B -> A: after reusing A it must be last again (not B).
     #[test]
     fn reuse_moves_the_device_to_the_back_for_default_filter_selection() {
