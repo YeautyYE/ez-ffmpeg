@@ -213,3 +213,73 @@ pub fn rational_eq(t1: i64, tb1: AVRational, t2: i64, tb2: AVRational) -> bool {
     (t1 as i128) * (tb1.num as i128) * (tb2.den as i128)
         == (t2 as i128) * (tb2.num as i128) * (tb1.den as i128)
 }
+
+// ---- WARN/ERROR capture logger (shared by log-asserting test binaries) ----
+
+use log::{Level, LevelFilter, Metadata, Record};
+use std::sync::OnceLock;
+
+/// A process-global `log::Log` that records every WARN/ERROR message, for
+/// tests that assert a specific warning IS emitted (the inverse of the
+/// no-noise net in `log_noise.rs`). `log::set_logger` is once-per-process,
+/// so a test binary using this must not install any other logger.
+struct CaptureLogger {
+    entries: Mutex<Vec<(Level, String)>>,
+}
+
+impl log::Log for CaptureLogger {
+    fn enabled(&self, metadata: &Metadata) -> bool {
+        metadata.level() <= Level::Warn
+    }
+
+    fn log(&self, record: &Record) {
+        if record.level() <= Level::Warn {
+            self.entries
+                .lock()
+                .unwrap()
+                .push((record.level(), record.args().to_string()));
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+static CAPTURE: CaptureLogger = CaptureLogger {
+    entries: Mutex::new(Vec::new()),
+};
+
+/// Installs the capture logger (idempotent). Call at the top of every test
+/// in the binary; the first call wins and the rest are no-ops.
+pub fn init_capture_logger() {
+    static INIT: OnceLock<()> = OnceLock::new();
+    INIT.get_or_init(|| {
+        log::set_logger(&CAPTURE).expect("set capture logger");
+        log::set_max_level(LevelFilter::Warn);
+    });
+}
+
+/// Every WARN/ERROR recorded so far, in emission order.
+pub fn captured_warnings() -> Vec<(Level, String)> {
+    CAPTURE.entries.lock().unwrap().clone()
+}
+
+/// Asserts that some message recorded at exactly WARN level contains
+/// `needle` — an ERROR entry with the same text does not satisfy it, so a
+/// documented warning silently escalating to an error still fails here.
+/// Tests sharing the process should assert on unique substrings, so
+/// parallel scenarios cannot satisfy each other's expectations.
+pub fn assert_warning_containing(needle: &str) {
+    let entries = captured_warnings();
+    assert!(
+        entries
+            .iter()
+            .any(|(lvl, msg)| *lvl == Level::Warn && msg.contains(needle)),
+        "no captured WARN contains {needle:?}; captured {} entr(ies):\n{}",
+        entries.len(),
+        entries
+            .iter()
+            .map(|(lvl, msg)| format!("  [{lvl}] {msg}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}

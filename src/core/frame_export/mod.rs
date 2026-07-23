@@ -58,6 +58,14 @@
 //! changes color interpretation — matrix and range handling are identical in
 //! both tiers.
 //!
+//! Migrating from v0.14.0: that release ran the conversion with the
+//! High-equivalent flags (`accurate_rnd+full_chroma_int`) unconditionally —
+//! there was no precision knob — so the `Standard` default produces
+//! different bytes than v0.14.0 on chroma edges and rounded values. Select
+//! [`ConversionPrecision::High`] to reproduce v0.14.0 output (byte-identical
+//! when linked against the same libswscale build); `Standard` instead
+//! matches the ffmpeg CLI's default conversion path.
+//!
 //! # Audio (PCM) export
 //!
 //! [`SampleExtractor`] is the audio sibling: it decodes one input's audio into

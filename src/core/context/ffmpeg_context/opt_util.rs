@@ -1513,8 +1513,8 @@ fn validate_simple_video_filter(desc: &str, expected: AVMediaType) -> Result<()>
         if pad_type != expected {
             return Err(OpenOutputError::SimpleFilterMediaTypeMismatch {
                 desc: desc.to_string(),
-                found: media_type_name(pad_type).to_string(),
-                expected: media_type_name(expected).to_string(),
+                found: media_type_name(pad_type),
+                expected: media_type_name(expected),
             }
             .into());
         }

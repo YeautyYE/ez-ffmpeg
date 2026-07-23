@@ -243,7 +243,7 @@ jobs:
           key: ${{ runner.os }}-cargo-sources-v1-${{ hashFiles('**/Cargo.toml') }}
 
       - name: Test
-        run: cargo test --lib --test build_probe --test builder_option_validation --test frame_export_test --test frame_export_uniform_test --test frame_export_audio_test --test hls_fmp4 --test video_writer --test rawvideo_seek_gating --test per_output_video_filter --test packet_sink --test packet_sink_negative --test packet_sink_teardown --test packet_sink_unwind --test cli_emit_hardening --features async,rtmp,flv,subtitle,wgpu,cli ${{ matrix.ffmpeg-features }}
+        run: cargo test --lib --test avoption_warnings --test build_probe --test builder_option_validation --test frame_export_test --test frame_export_uniform_test --test frame_export_audio_test --test hls_fmp4 --test video_writer --test rawvideo_seek_gating --test per_output_video_filter --test packet_sink --test packet_sink_negative --test packet_sink_teardown --test packet_sink_unwind --test cli_emit_hardening --features async,rtmp,flv,subtitle,wgpu,cli ${{ matrix.ffmpeg-features }}
 
       # The packet-sink examples are API surface: keep them compiling on the
       # runtime lane (native-AAC cases in the suites above do real work even
@@ -516,7 +516,7 @@ jobs:
       # hardware-encoder tests stay compile-only. The remaining suite exercises
       # the platform scheduler, device, socket, RTMP, subtitle, and async paths.
       - name: Run CPU-only library tests
-        run: cargo test --lib --test build_probe --test builder_option_validation --test frame_export_test --test frame_export_uniform_test --test frame_export_audio_test --test hls_fmp4 --test video_writer --test rawvideo_seek_gating --test per_output_video_filter --test packet_sink --test packet_sink_negative --test packet_sink_teardown --test packet_sink_unwind --features "${{ matrix.test_features }}" ${{ matrix.test_args }}
+        run: cargo test --lib --test avoption_warnings --test build_probe --test builder_option_validation --test frame_export_test --test frame_export_uniform_test --test frame_export_audio_test --test hls_fmp4 --test video_writer --test rawvideo_seek_gating --test per_output_video_filter --test packet_sink --test packet_sink_negative --test packet_sink_teardown --test packet_sink_unwind --features "${{ matrix.test_features }}" ${{ matrix.test_args }}
 
       - name: Check packet-sink examples
         run: cargo check --example packet_sink_avc --example packet_sink_aac_channel --example packet_sink_av_transport --features "${{ matrix.test_features }}"

@@ -215,6 +215,20 @@ pub enum Error {
     UnconsumedCliOption { site: String, option: String },
 }
 
+// `Error` rides in every hot-path `Result` — the per-frame encoder and filter
+// calls return `Result<(), Error>` / `Result<bool, Error>` — so its size is a
+// layout contract, not an implementation detail: one oversized payload grows
+// every such `Result` crate-wide. 64 bytes is the long-standing layout; keep
+// new payloads inside it (use static labels for fixed vocabulary, or box a
+// genuinely large variant). A const assertion rather than a #[test] so that
+// merely compiling the crate enforces the bound for whichever feature-gated
+// variants that build carries — including feature combinations whose tests
+// are compiled but never run.
+const _: () = assert!(
+    std::mem::size_of::<Error>() <= 64,
+    "Error grew past its 64-byte layout: shrink the new payload (static labels) or box the variant"
+);
+
 /// Builder/open-time validation errors for [`crate::VideoWriter`]. Exported here
 /// (not from the crate root) to mirror the existing `OpenInputError` /
 /// `OpenOutputError` organization; the root surface stays the three settled
@@ -1082,14 +1096,22 @@ pub enum OpenOutputError {
     /// type (fftools fg_create_simple: "Filtergraph has a %s output, cannot
     /// connect it to %s output stream") — e.g. an audio chain like `anull`
     /// cannot be attached as a video filter.
+    ///
+    /// The media-type labels are static (`"video"`, `"audio"`, ... — the
+    /// strings fftools prints), which keeps this variant inside `Error`'s
+    /// 64-byte layout; three owned `String`s would grow every hot-path
+    /// `Result` in the crate.
     #[error(
         "Simple filtergraph '{desc}' has a {found} pad, cannot connect it to \
          the {expected} stream of this output"
     )]
     SimpleFilterMediaTypeMismatch {
+        /// The offending filtergraph description, as configured.
         desc: String,
-        found: String,
-        expected: String,
+        /// The media type of the mismatched pad.
+        found: &'static str,
+        /// The media type the output stream requires.
+        expected: &'static str,
     },
 }
 
