@@ -56,12 +56,14 @@
 //!      when it interrupts delivery: a `stop()` that lands after this sink
 //!      fully drained still delivers `on_end`. Cancellation also takes
 //!      precedence over a failure it races with: a sink that observes the
-//!      termination `stop()`/`abort()` published and cancels its delivery
-//!      cooperatively before a sibling's error is recorded stays silent —
-//!      no `on_delivery_error`. The late error is still recorded
-//!      first-error-wins as the job result, and the `stop()` call that
-//!      drove the race returns it once every worker has settled; after
-//!      `abort()`, which returns nothing, it goes unobserved.
+//!      published termination — `stop()`, `abort()`, or dropping the
+//!      running scheduler (its guard publishes the same status) — and
+//!      cancels its delivery cooperatively before a sibling's error is
+//!      recorded stays silent — no `on_delivery_error`. The late error is
+//!      still recorded first-error-wins as the job result, and the `stop()`
+//!      call that drove the race returns it once every worker has settled;
+//!      after `abort()`, which returns nothing, or a drop, which discards
+//!      the result with the scheduler, it goes unobserved.
 //!
 //! # Timestamp and ordering
 //!
