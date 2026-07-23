@@ -49,8 +49,13 @@ impl AacRuntime {
     /// stereo ([`AacRuntime::ps_doubles_mono_core`]). Reserved
     /// sampling-frequency indexes (13/14) are rejected, and so are the
     /// reserved channel configurations 8-10 and the out-of-table value 15
-    /// (for the primary and extension fields alike). Truncation inside any
-    /// field is a typed error — zero bits are never silently substituted.
+    /// (for the primary and extension fields alike). Truncation inside
+    /// any required field is a typed error — zero bits are never
+    /// silently substituted for the fields the validated prefix depends
+    /// on. The sync-extension scan is the one deliberate exception:
+    /// FFmpeg reads a matched candidate with no remaining-bits guard, so
+    /// the scan mirrors its zero-padded semantics and never fails, and
+    /// the reserved indexes 13/14 inside it pass as frequency 0.
     pub(crate) fn from_extradata(
         extradata: &[u8],
         stream_index: usize,
@@ -141,14 +146,19 @@ impl<'a> AscBits<'a> {
         self.data.len() as u64 * 8
     }
 
-    /// Unread bits left in the config.
-    fn remaining(&self) -> u64 {
-        self.bit_len() - self.pos as u64
+    /// Unread bits left in the config, signed: the zero-padded scan reads
+    /// can move the cursor past the end, and the sync-extension guards
+    /// then see a negative count — FFmpeg's get_bits_left after an
+    /// over-read — rather than an underflow.
+    fn remaining(&self) -> i64 {
+        self.bit_len() as i64 - self.pos as i64
     }
 
     /// Peeks `count` bits (<= 32) without consuming, zero-padded past the
     /// end of the config — mirroring FFmpeg's `show_bits` semantics for the
     /// W6132 Annex look-ahead, where the guard must not itself demand bits.
+    /// [`AscBits::read_padded`] consumes through the same zero-padded
+    /// window.
     fn peek(&self, count: usize) -> u32 {
         let mut value = 0u32;
         for offset in 0..count {
@@ -183,6 +193,20 @@ impl<'a> AscBits<'a> {
         }
         Ok(value)
     }
+
+    /// Reads `count` bits (<= 32) with zero-padded semantics: positions
+    /// past the end of the config contribute zeros and the cursor
+    /// advances regardless. FFmpeg's checked bit reader behaves this way
+    /// over extradata, whose buffer contract appends
+    /// AV_INPUT_BUFFER_PADDING_SIZE zeroed bytes — the sync-extension
+    /// scan reads a matched candidate through exactly that window and
+    /// must never fail (see [`read_tail_sync_extension`]).
+    fn read_padded(&mut self, count: usize) -> u32 {
+        debug_assert!(count <= 32);
+        let value = self.peek(count);
+        self.pos += count;
+        value
+    }
 }
 
 /// One ISO/IEC 14496-3 GetAudioObjectType(): 5 bits, escape value 31
@@ -195,22 +219,32 @@ fn read_object_type(bits: &mut AscBits<'_>, field: &str, ext_field: &str) -> Res
     Ok(aot)
 }
 
-/// One sampling-frequency field: a 4-bit index whose value 15 is followed
-/// by a 24-bit explicit frequency. Indexes 13 and 14 are reserved
-/// (FFmpeg's decoder rejects them via its `sampling_index > 12` check).
-/// Returns the index and the frequency it stands for — the
-/// program_config_element cross-check compares indexes, and the sync
-/// extension compares frequencies.
+/// The ISO/IEC 14496-3 samplingFrequencyIndex table, sized and
+/// zero-filled like FFmpeg's ff_mpeg4audio_sample_rates
+/// (libavcodec/mpeg4audio_sample_rates.h): rows 0-12 hold the assigned
+/// frequencies and the trailing rows stay 0, so a lookup with the
+/// reserved indexes 13/14 yields frequency 0 rather than a table miss
+/// (index 15 never looks up a row — it signals an explicit 24-bit
+/// frequency in every reader).
+const SAMPLE_RATES: [u32; 16] = [
+    96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350, 0, 0,
+    0,
+];
+
+/// One sampling-frequency field of the required prefix: a 4-bit index
+/// whose value 15 is followed by a 24-bit explicit frequency. Indexes 13
+/// and 14 are reserved and rejected here (FFmpeg's decoder refuses a
+/// configuration whose core `sampling_index > 12`); the sync-extension
+/// scan instead resolves them through the table's zero rows (see
+/// [`read_padded_sampling_frequency`]). Returns the index and the
+/// frequency it stands for — the program_config_element cross-check
+/// compares indexes, and the sync-extension scan compares the core
+/// frequency returned here against the extension's.
 fn read_sampling_frequency(
     bits: &mut AscBits<'_>,
     field: &str,
     explicit_field: &str,
 ) -> Result<(u32, u32), String> {
-    /// The ISO/IEC 14496-3 samplingFrequencyIndex table (FFmpeg's
-    /// ff_mpeg4audio_sample_rates, libavcodec/mpeg4audio_sample_rates.h).
-    const SAMPLE_RATES: [u32; 13] = [
-        96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350,
-    ];
     let index = bits.read(4, field)?;
     if index == 13 || index == 14 {
         return Err(format!("reserved {field} {index}"));
@@ -249,7 +283,12 @@ fn is_ga_object_type(aot: u32) -> bool {
 /// `if (extension_flag)` branch and reads epConfig afterwards either
 /// way, so an ER configuration with the flag clear decodes — this parser
 /// follows that reachable behavior and parses the fields exactly when
-/// the flag is set.
+/// the flag is set. That decoder precedent exists for ER AAC LC (17) and
+/// ER AAC LD (23) only, the two ER types the
+/// decode_audio_specific_config_gb switch routes into that function;
+/// AOTs 19-22 take its default arm (unsupported — they never decode), so
+/// for them the flag-conditional reading is Table 4.1 syntax kept
+/// consistent with 17/23, not mirrored decoder behavior.
 ///
 /// One departure from decode_ga_specific_config, following the ISO text
 /// where the two disagree: FFmpeg reads layerNr BEFORE the
@@ -430,6 +469,35 @@ struct AscPrefix {
     ps_doubles_mono_core: bool,
 }
 
+/// GetAudioObjectType() under the scan's zero-padded semantics: 5 bits,
+/// escape value 31 followed by 6 extension bits — get_object_type as the
+/// sync-extension loop of ff_mpeg4audio_get_config_gb (FFmpeg
+/// libavcodec/mpeg4audio.c) calls it, where a read past the data end
+/// returns zeros instead of failing.
+fn read_padded_object_type(bits: &mut AscBits<'_>) -> u32 {
+    let aot = bits.read_padded(5);
+    if aot == 31 {
+        return 32 + bits.read_padded(6);
+    }
+    aot
+}
+
+/// The extension sampling frequency exactly as the sync-extension scan
+/// reads it (get_sample_rate in FFmpeg's libavcodec/mpeg4audio.c): a
+/// 4-bit index — value 15 followed by a 24-bit explicit frequency,
+/// anything else a straight table row, so the reserved indexes 13/14
+/// resolve through [`SAMPLE_RATES`]' zero rows to frequency 0 instead of
+/// being rejected. Zero-padded and infallible like every read inside a
+/// matched scan candidate.
+fn read_padded_sampling_frequency(bits: &mut AscBits<'_>) -> u32 {
+    let index = bits.read_padded(4);
+    if index == 15 {
+        bits.read_padded(24)
+    } else {
+        SAMPLE_RATES[index as usize]
+    }
+}
+
 /// Scans the AudioSpecificConfig for the backward-compatible SBR/PS
 /// sync extension, updating the three-state `sbr`/`ps` flags — mirroring
 /// the sync-extension loop of ff_mpeg4audio_get_config_gb (FFmpeg
@@ -441,6 +509,19 @@ struct AscPrefix {
 /// equality with the core frequency returns SBR to the unknown state —
 /// then, when more than 11 bits remain, a second 11-bit
 /// syncExtensionType whose value 0x548 carries the 1-bit psPresentFlag.
+///
+/// The scan cannot fail. FFmpeg guards only the two probes (the loop's
+/// more-than-15-bit window and the more-than-11-bit check before the
+/// 0x548 word); every read inside a matched candidate is unguarded and
+/// relies on the bit reader returning zeros past the data end — the
+/// extradata buffer contract appends AV_INPUT_BUFFER_PADDING_SIZE zeroed
+/// bytes — so a candidate near the end reads zero-padded values instead
+/// of failing, and [`AscBits::read_padded`] reproduces that. A reserved
+/// extension sampling-frequency index (13/14) resolves to frequency 0
+/// through the table's zero rows and is accepted; the strict
+/// reserved-index rejection belongs to the required prefix, never to the
+/// scan.
+///
 /// The caller anchors `bits` where ff_mpeg4audio_get_config_gb's reader
 /// stands when its loop starts: that function parses nothing of the
 /// GASpecificConfig beyond the frameLengthFlag, so everything after
@@ -453,37 +534,28 @@ fn read_tail_sync_extension(
     sample_rate: u32,
     sbr: &mut Option<bool>,
     ps: &mut Option<bool>,
-) -> Result<(), String> {
+) {
     while bits.remaining() > 15 {
         if bits.peek(11) != 0x2b7 {
-            bits.read(1, "syncExtension scan")?;
+            bits.read_padded(1);
             continue;
         }
-        bits.read(11, "syncExtensionType")?;
-        let extension_aot = read_object_type(
-            bits,
-            "sync-extension audioObjectType",
-            "sync-extension audioObjectTypeExt",
-        )?;
+        bits.read_padded(11);
+        let extension_aot = read_padded_object_type(bits);
         if extension_aot == 5 {
-            *sbr = Some(bits.read(1, "sbrPresentFlag")? == 1);
+            *sbr = Some(bits.read_padded(1) == 1);
             if *sbr == Some(true) {
-                let (_, extension_rate) = read_sampling_frequency(
-                    bits,
-                    "sync-extension extensionSamplingFrequencyIndex",
-                    "explicit sync-extension extensionSamplingFrequency",
-                )?;
+                let extension_rate = read_padded_sampling_frequency(bits);
                 if extension_rate == sample_rate {
                     *sbr = None;
                 }
             }
         }
-        if bits.remaining() > 11 && bits.read(11, "syncExtensionType")? == 0x548 {
-            *ps = Some(bits.read(1, "psPresentFlag")? == 1);
+        if bits.remaining() > 11 && bits.read_padded(11) == 0x548 {
+            *ps = Some(bits.read_padded(1) == 1);
         }
         break;
     }
-    Ok(())
 }
 
 /// Rejects the channel-configuration values no layout table row backs:
@@ -632,7 +704,7 @@ fn parse_required_asc_prefix(asc: &[u8]) -> Result<AscPrefix, String> {
         };
         let mut scan_bits = AscBits::new(asc);
         scan_bits.pos = ga_config_start + frame_length_flag_bits;
-        read_tail_sync_extension(&mut scan_bits, sample_rate, &mut sbr, &mut ps)?;
+        read_tail_sync_extension(&mut scan_bits, sample_rate, &mut sbr, &mut ps);
     }
     // The ff_mpeg4audio_get_config_gb clamps: "PS requires SBR" (an
     // explicitly-absent SBR clears PS) and "Limit implicit PS to the
@@ -1111,6 +1183,45 @@ mod tests {
         assert_eq!(runtime.codec_string(), "mp4a.40.29");
         assert_eq!(runtime.pce_channel_count(), Some(1));
         assert!(!runtime.ps_doubles_mono_core());
+    }
+
+    #[test]
+    fn sync_extension_scan_reads_zero_padded_and_never_fails() {
+        // ff_mpeg4audio_get_config_gb guards only its probes (the
+        // more-than-15-bit scan window, the more-than-11-bit 0x548
+        // check); a MATCHED candidate's fields read past the data end as
+        // zeros from the padded extradata tail. Core: AAC-LC at 24 kHz
+        // (index 6), one-SCE PCE, 3-byte comment carrying the extension.
+        // The sole 0x2b7 window lands at bit 64 of 88 — 24 bits remain:
+        // syncExtensionType (11), audioObjectType 5 (5), sbrPresentFlag
+        // set (1) leave 7, the frequency index reads 15, and the 24-bit
+        // explicit frequency finds 3 real bits — value 0. Frequency 0
+        // differs from the 24 kHz core so SBR stays present, the
+        // depleted reader fails the 0x548 guard, and the unsignaled PS
+        // state upgrades on the mono-SCE core exactly as FFmpeg's
+        // decode_ga_specific_config one-channel path does: the
+        // configuration opens as HE-AACv2 stereo, never as an error.
+        let explicit_frequency_past_end: [u8; 11] = [
+            0x13, 0x00, 0x05, 0x84, 0x00, 0x00, 0x00, 0x03, 0x56, 0xE5, 0xF8,
+        ];
+        let runtime = AacRuntime::from_extradata(&explicit_frequency_past_end, 0).unwrap();
+        assert_eq!(runtime.codec_string(), "mp4a.40.2");
+        assert_eq!(runtime.pce_channel_count(), Some(1));
+        assert!(runtime.ps_doubles_mono_core());
+        // The reserved frequency index 13 inside a matched candidate —
+        // here complete within the comment bytes, the candidate's 21
+        // bits ending 3 bits before the config does — resolves through
+        // ff_mpeg4audio_sample_rates' zero row to frequency 0 and is
+        // ACCEPTED: the reserved-index rejection belongs to the required
+        // prefix, never to the scan. Frequency 0 again keeps SBR
+        // present, and the mono-SCE core upgrades exactly as above.
+        let reserved_extension_index: [u8; 11] = [
+            0x13, 0x00, 0x05, 0x84, 0x00, 0x00, 0x00, 0x03, 0x56, 0xE5, 0xE8,
+        ];
+        let runtime = AacRuntime::from_extradata(&reserved_extension_index, 0).unwrap();
+        assert_eq!(runtime.codec_string(), "mp4a.40.2");
+        assert_eq!(runtime.pce_channel_count(), Some(1));
+        assert!(runtime.ps_doubles_mono_core());
     }
 
     #[test]
