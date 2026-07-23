@@ -579,6 +579,11 @@ mod tests {
                 "cli_emitted_hls" => include_str!("../../../examples/cli_emitted_hls.rs"),
                 other => panic!("shape {} names an unpinned example {other}", shape.id),
             };
+            // The emitter writes `\n`; `include_str!` embeds the example as
+            // checked out, which is CRLF under Windows autocrlf. Normalize
+            // the pinned side so the comparison is about content, not the
+            // checkout's line-ending policy.
+            let pinned = pinned.replace("\r\n", "\n");
             assert_eq!(
                 code, pinned,
                 "examples/{}.rs drifted from the emitter; regenerate it",
