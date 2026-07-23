@@ -15,6 +15,7 @@ mod common;
 
 use common::{tmp_path_in, wait_with_watchdog};
 use ez_ffmpeg::error::{Error, OpenOutputError};
+use ez_ffmpeg::frame_export::{FrameExtractor, PixelLayout, VideoFrame};
 use ez_ffmpeg::stream_info::{find_audio_stream_info, find_video_stream_info, StreamInfo};
 use ez_ffmpeg::{FfmpegContext, Input, Output};
 
@@ -48,6 +49,26 @@ fn video_fixture(name: &str) -> String {
             .build()
             .unwrap(),
         "video fixture",
+    )
+    .unwrap();
+    path
+}
+
+/// 0.5s 320x240 solid-`color` video-only fixture, for tests that must tell
+/// WHICH feed produced the encoded frames by looking at their content.
+fn solid_video_fixture(name: &str, color: &str) -> String {
+    let path = tmp_path(name);
+    run(
+        FfmpegContext::builder()
+            .input(Input::from(format!("color=c={color}:s=320x240:r=30")).set_format("lavfi"))
+            .output(
+                Output::from(path.as_str())
+                    .set_video_codec("mpeg4")
+                    .set_recording_time_us(500_000),
+            )
+            .build()
+            .unwrap(),
+        "solid color fixture",
     )
     .unwrap();
     path
@@ -98,6 +119,20 @@ fn video_dimensions(path: &str) -> (i32, i32) {
         Some(StreamInfo::Video { width, height, .. }) => (width, height),
         other => panic!("expected a video stream in {path}, got {other:?}"),
     }
+}
+
+/// Mean red and blue channel values of a packed RGB24 frame, for telling a
+/// solid-red feed from a solid-blue one after a lossy encode round-trip.
+fn mean_red_blue(frame: &VideoFrame) -> (f64, f64) {
+    assert_eq!(frame.layout(), PixelLayout::Rgb24);
+    let bytes = frame.as_bytes();
+    let (mut red, mut blue) = (0u64, 0u64);
+    for px in bytes.chunks_exact(3) {
+        red += u64::from(px[0]);
+        blue += u64::from(px[2]);
+    }
+    let pixels = (bytes.len() / 3) as f64;
+    (red as f64 / pixels, blue as f64 / pixels)
 }
 
 // ---------------------------------------------------------------------------
@@ -487,9 +522,9 @@ fn unknown_filter_name_fails_build() {
 }
 
 // ---------------------------------------------------------------------------
-// Mapping spellings must not bypass the simple/complex
-// conflict (fftools binds unlabeled graph outputs before manual/automatic
-// mapping and then errors in ost_get_filters).
+// Mapping spellings must not bypass the simple/complex conflict (fftools
+// binds unlabeled graph outputs before manual/automatic mapping and then
+// errors in ost_get_filters).
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -570,8 +605,8 @@ fn multi_output_complex_conflict_hits_the_filtered_output() {
 }
 
 // ---------------------------------------------------------------------------
-// A configured filter no video stream consumed is a typed
-// error, never a silent drop.
+// A configured filter with no video stream consumed is a typed error,
+// never a silent drop.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -714,6 +749,192 @@ fn connected_but_unreachable_graph_is_rejected() {
 }
 
 #[test]
+fn streamselect_dropping_the_input_is_accepted_like_cli() {
+    // The applied map=0 relays only the color feed and currently drops [in],
+    // yet the graph must be ACCEPTED: streamselect's map is a runtime
+    // command (sendcmd / the send-command API can reroute [in] to the output
+    // mid-stream), so the applied selection proves nothing about where the
+    // input can flow — and ffmpeg (verified against 7.1.3) accepts and runs
+    // this exact description, encoding the generator feed. The reachability
+    // gate is structural (is [in] wired into the graph that feeds the
+    // output?), not a promise that filters keep the frames. The unselected
+    // input is 320x240 while the selected color feed is 64x64 — the output
+    // dimensions prove the encoder consumed the generator, like the CLI.
+    let input = video_fixture("sselect_drop_in.mp4");
+    let out = tmp_path("sselect_drop_out.mp4");
+    run(
+        FfmpegContext::builder()
+            .input(input.as_str())
+            .output(
+                Output::from(out.as_str())
+                    .set_video_codec("mpeg4")
+                    .set_video_filter(
+                        "color=c=red:s=64x64:r=30:d=0.5[bg];\
+                         [bg][in]streamselect=inputs=2:map=0",
+                    ),
+            )
+            .build()
+            .unwrap(),
+        "streamselect dropping the input",
+    )
+    .unwrap();
+    assert_eq!(video_dimensions(&out), (64, 64));
+}
+
+#[test]
+fn sendcmd_commanded_streamselect_switches_content() {
+    // The runtime-commandable case the structural gate exists for: the graph
+    // starts on map=0 (the red generator feed) and a sendcmd entry rewrites
+    // the map to 1 at t=0.2s, after which streamselect relays the decoded
+    // input — ffmpeg 7.1.3 runs this with a "Success" command reply and
+    // switches the encoded content. A probe that pruned routing by the
+    // applied map=0 would reject this description even though the input
+    // demonstrably reaches the encoder at runtime. Both feeds share one size
+    // on purpose (the output link's dimensions are negotiated once and a
+    // mid-stream switch must not change them), so the feeds are told apart
+    // by content instead: the decoded input is solid blue, the generator
+    // solid red, and the decoded output must show red frames before the
+    // command and blue frames after it — a dropped or ignored command would
+    // leave every frame red.
+    let input = solid_video_fixture("sselect_cmd_in.mp4", "blue");
+    let out = tmp_path("sselect_cmd_out.mp4");
+    run(
+        FfmpegContext::builder()
+            .input(input.as_str())
+            .output(
+                Output::from(out.as_str())
+                    .set_video_codec("mpeg4")
+                    .set_video_filter(
+                        "sendcmd=c='0.2 streamselect@sel map 1'[cmd];\
+                         color=c=red:s=320x240:r=30:d=0.5[bg];\
+                         [bg][cmd]streamselect@sel=inputs=2:map=0",
+                    ),
+            )
+            .build()
+            .unwrap(),
+        "sendcmd-commanded streamselect",
+    )
+    .unwrap();
+    assert_eq!(video_dimensions(&out), (320, 240));
+
+    // Decode the encoded output and classify frames on both sides of the
+    // command. sendcmd fires on the first frame with pts >= 0.2s and the
+    // remap takes effect on the following framesync event, so the exact
+    // boundary frame's side is scheduler detail — classify only frames
+    // safely clear of it (<= 0.1s and >= 0.3s at 30fps).
+    let frames = FrameExtractor::new(out.as_str())
+        .pixel(PixelLayout::Rgb24)
+        .collect_frames()
+        .unwrap();
+    let (mut red_before, mut blue_after) = (0usize, 0usize);
+    for frame in &frames {
+        let pts = frame.pts_us().expect("exported frame has a pts");
+        let (r, b) = mean_red_blue(frame);
+        if pts <= 100_000 {
+            assert!(
+                r > b + 64.0,
+                "frame at {pts}us predates the command and must come from \
+                 the red generator feed, got mean r={r:.0} b={b:.0}"
+            );
+            red_before += 1;
+        } else if pts >= 300_000 {
+            assert!(
+                b > r + 64.0,
+                "frame at {pts}us postdates the command and must come from \
+                 the blue decoded input, got mean r={r:.0} b={b:.0}"
+            );
+            blue_after += 1;
+        }
+    }
+    assert!(
+        red_before >= 2,
+        "output must cover frames before the 0.2s command, saw {red_before}"
+    );
+    assert!(
+        blue_after >= 2,
+        "output must extend past the 0.2s command, saw {blue_after}"
+    );
+}
+
+#[test]
+fn streamselect_relaying_the_input_is_accepted() {
+    // Positive control for the pad-granular walk: map=1 selects the open
+    // input pad, so the decoded stream IS the output. The unselected color
+    // feed is 64x64 while the input is 320x240 — the output dimensions prove
+    // which input pad the encoder consumed.
+    let input = video_fixture("sselect_relay_in.mp4");
+    let out = tmp_path("sselect_relay_out.mp4");
+    run(
+        FfmpegContext::builder()
+            .input(input.as_str())
+            .output(
+                Output::from(out.as_str())
+                    .set_video_codec("mpeg4")
+                    .set_video_filter(
+                        "color=c=red:s=64x64:r=30:d=0.5[alt];\
+                         [alt][in]streamselect=inputs=2:map=1",
+                    ),
+            )
+            .build()
+            .unwrap(),
+        "streamselect relaying the input",
+    )
+    .unwrap();
+    assert_eq!(video_dimensions(&out), (320, 240));
+}
+
+#[test]
+fn overlay_merging_the_input_is_accepted() {
+    // A multi-input filter that MERGES its inputs must keep passing when the
+    // open input is a secondary pad: frames entering overlay's pad 1 are
+    // composited into the output, so the input genuinely influences it.
+    let input = video_fixture("overlay_merge_in.mp4");
+    let out = tmp_path("overlay_merge_out.mp4");
+    run(
+        FfmpegContext::builder()
+            .input(input.as_str())
+            .output(
+                Output::from(out.as_str())
+                    .set_video_codec("mpeg4")
+                    .set_video_filter(
+                        "color=c=black:s=320x240:r=30:d=0.5[bg];\
+                         [bg][in]overlay=shortest=1",
+                    ),
+            )
+            .build()
+            .unwrap(),
+        "overlay merging the input",
+    )
+    .unwrap();
+    assert_eq!(video_dimensions(&out), (320, 240));
+}
+
+#[test]
+fn concat_appending_the_input_is_accepted() {
+    // concat splices every input into the output timeline, so the open input
+    // on pad 1 influences the output even though pad 0 is generator-fed.
+    let input = video_fixture("concat_append_in.mp4");
+    let out = tmp_path("concat_append_out.mp4");
+    run(
+        FfmpegContext::builder()
+            .input(input.as_str())
+            .output(
+                Output::from(out.as_str())
+                    .set_video_codec("mpeg4")
+                    .set_video_filter(
+                        "color=c=blue:s=320x240:r=30:d=0.2[pre];\
+                         [pre][in]concat=n=2:v=1:a=0",
+                    ),
+            )
+            .build()
+            .unwrap(),
+        "concat appending the input",
+    )
+    .unwrap();
+    assert_eq!(video_dimensions(&out), (320, 240));
+}
+
+#[test]
 fn zero_input_graph_is_rejected() {
     let input = video_fixture("shape_zero_in_in.mp4");
     let reason = shape_reason(&input, "color=c=red:s=64x64");
@@ -779,10 +1000,10 @@ fn video_writer_rejects_conflicting_filter_descriptions() {
 }
 
 // ---------------------------------------------------------------------------
-// Per-output assignment semantics of the
-// simple/complex conflict — an output the unlabeled graph does NOT land on
-// keeps its simple filter, exactly like FFmpeg 7.1; the output that receives
-// the graph still conflicts. Both orders covered.
+// Per-output assignment semantics of the simple/complex conflict — an
+// output the unlabeled graph does NOT land on keeps its simple filter,
+// exactly like FFmpeg 7.1; the output that receives the graph still
+// conflicts. Both orders covered.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -856,10 +1077,75 @@ fn filtered_output_receiving_the_graph_still_conflicts() {
 }
 
 // ---------------------------------------------------------------------------
-// Disable flags must not derail fftools-order
-// assignment — FFmpeg 7.1 puts an unlabeled graph on a -vn output and still
-// filters the next output. Legacy (no set_video_filter) ordering stays
-// pinned bit for bit.
+// Streamcopy on the fftools-order candidate output: FFmpeg 7.1 fails at the
+// FIRST output the unlabeled graph binds to (ffmpeg_mux_init.c ost_add,
+// "Filtering and streamcopy cannot be used together") — the graph must never
+// slide past a copy output onto a later encoding output.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn copy_first_output_cannot_defer_the_graph_to_a_later_encoder() {
+    // Output #0 is -c:v copy, so binding the unlabeled graph there is the
+    // CLI's fatal filtering/streamcopy conflict. Skipping the copy output
+    // and binding the graph to output #1 instead would build a job the CLI
+    // rejects (and hand output #2 its simple filter as if the layout were
+    // legal).
+    let input = video_fixture("copy_candidate_in.mp4");
+    let err = build_err(
+        FfmpegContext::builder()
+            .input(input.as_str())
+            .filter_desc("hue=s=0")
+            .output(
+                Output::from(tmp_path("copy_candidate_a.mp4").as_str()).set_video_codec("copy"),
+            )
+            .output(
+                Output::from(tmp_path("copy_candidate_b.mp4").as_str()).set_video_codec("mpeg4"),
+            )
+            .output(
+                Output::from(tmp_path("copy_candidate_c.mp4").as_str())
+                    .set_video_codec("mpeg4")
+                    .set_video_filter("scale=160:120"),
+            )
+            .build(),
+    );
+    assert!(
+        matches!(&err, Error::OpenOutput(OpenOutputError::InvalidArgument)),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn copy_candidate_error_precedes_the_filtered_output_conflict() {
+    // With -c:v copy on output #0 and the simple filter on output #1, the
+    // CLI still dies at output #0 (create_streams handles output files in
+    // order): the streamcopy conflict wins, not the simple/complex conflict
+    // the graph would hit on the later filtered output.
+    let input = video_fixture("copy_candidate_order_in.mp4");
+    let err = build_err(
+        FfmpegContext::builder()
+            .input(input.as_str())
+            .filter_desc("hue=s=0")
+            .output(
+                Output::from(tmp_path("copy_candidate_order_a.mp4").as_str())
+                    .set_video_codec("copy"),
+            )
+            .output(
+                Output::from(tmp_path("copy_candidate_order_b.mp4").as_str())
+                    .set_video_codec("mpeg4")
+                    .set_video_filter("scale=160:120"),
+            )
+            .build(),
+    );
+    assert!(
+        matches!(&err, Error::OpenOutput(OpenOutputError::InvalidArgument)),
+        "unexpected error: {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Disable flags must not derail fftools-order assignment — FFmpeg 7.1 puts
+// an unlabeled graph on a -vn output and still filters the next output.
+// Legacy (no set_video_filter) ordering stays pinned bit for bit.
 // ---------------------------------------------------------------------------
 
 #[test]

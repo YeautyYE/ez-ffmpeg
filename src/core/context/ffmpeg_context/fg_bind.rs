@@ -595,16 +595,26 @@ pub(super) struct WriterFilterShape {
     /// reports type mismatches from these; the writer keeps using the counts.
     pub(super) input_pad_types: Vec<AVMediaType>,
     pub(super) output_pad_types: Vec<AVMediaType>,
-    /// Whether the open OUTPUT pad's filter is reachable from the open INPUT
-    /// pad's filter following the DIRECTED (producer -> consumer) links.
-    /// Weak connectivity is not enough: in
+    /// Whether the open OUTPUT pad is reachable from the open INPUT pad
+    /// following the DIRECTED pad-level data flow: the (producer -> consumer)
+    /// links between filters plus each filter's in-filter routing (a full
+    /// crossbar — see [`fg_probe::ProbedTopology::edges`]). Weak connectivity
+    /// is not enough: in
     /// `"color,split[out][aux];[aux][in]overlay,nullsink"` everything is one
     /// weak component with one open input and one open output, yet frames
     /// entering `[in]` flow only into the sink while an independent source
-    /// feeds `[out]` — the pushed frames cannot influence the encoded output
-    /// and an unbounded side source keeps the job from finishing. Meaningful
-    /// only when there is exactly one input pad and one output pad; `false`
-    /// otherwise.
+    /// feeds `[out]` — the pushed frames cannot influence the encoded output,
+    /// and the unbounded side source keeps the job from finishing.
+    ///
+    /// The check is STRUCTURAL, not semantic: a filter whose applied options
+    /// would currently discard the input still counts as forwarding it. In
+    /// `"color[bg];[bg][in]streamselect=inputs=2:map=0"` the applied map
+    /// relays only the color feed, yet the graph is accepted — `map` is a
+    /// runtime command (`sendcmd` can reroute `[in]` to the output
+    /// mid-stream) and ffmpeg accepts and runs the same description, so
+    /// pruning by the applied selection would reject valid graphs.
+    /// Meaningful only when there is exactly one input pad and one output
+    /// pad; `false` otherwise.
     pub(super) output_reachable: bool,
 }
 
@@ -657,7 +667,7 @@ pub(super) fn probe_writer_filter_shape(filter_desc: &str) -> Result<WriterFilte
         let types =
             |pads: &[fg_probe::ProbedPad]| pads.iter().map(|p| p.media_type).collect::<Vec<_>>();
         let output_reachable = match (&topology.inputs[..], &topology.outputs[..]) {
-            ([input], [output]) => node_reaches(input.node, output.node, &topology.edges),
+            ([input], [output]) => pad_reaches(input.pad_ref, output.pad_ref, &topology.edges),
             _ => false,
         };
         Ok(WriterFilterShape {
@@ -673,25 +683,28 @@ pub(super) fn probe_writer_filter_shape(filter_desc: &str) -> Result<WriterFilte
     }
 }
 
-/// Directed reachability over the probe's (producer -> consumer) link edges:
-/// can frames entering `from`'s filter flow into `to`'s filter? `from == to`
-/// is trivially reachable (a single-filter graph like `"null"` carries both
-/// open pads).
+/// Directed reachability over the probe's pad-level data-flow edges (links
+/// between filters plus each filter's crossbar routing): is the `from` input
+/// pad wired into the flow that feeds the `to` output pad? For a
+/// single-filter graph like `"null"` the input pad reaches the output pad
+/// through the filter's own routing edge; for
+/// `"color,split[out][aux];[aux][in]overlay,nullsink"` the walk from `[in]`
+/// dead-ends in the sink and never reaches `[out]`. Structural only: a
+/// filter that may drop the frames at runtime (`streamselect` whose current
+/// `map` selects another input) still forwards in this walk, because such
+/// routing is commandable mid-stream and ffmpeg accepts those descriptions.
 #[cfg(not(docsrs))]
-fn node_reaches(from: (usize, usize), to: (usize, usize), edges: &[fg_probe::NodeEdge]) -> bool {
-    if from == to {
-        return true;
-    }
+fn pad_reaches(from: fg_probe::PadRef, to: fg_probe::PadRef, edges: &[fg_probe::PadEdge]) -> bool {
     let mut visited = std::collections::HashSet::new();
     let mut stack = vec![from];
     visited.insert(from);
-    while let Some(node) = stack.pop() {
-        for &(producer, consumer) in edges {
-            if producer == node && visited.insert(consumer) {
-                if consumer == to {
-                    return true;
-                }
-                stack.push(consumer);
+    while let Some(pad) = stack.pop() {
+        if pad == to {
+            return true;
+        }
+        for &(src, dst) in edges {
+            if src == pad && visited.insert(dst) {
+                stack.push(dst);
             }
         }
     }

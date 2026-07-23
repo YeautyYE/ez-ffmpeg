@@ -114,6 +114,33 @@ pub(crate) fn emit(job: &LoweredJob, command: &[String], status: &ShapeStatus) -
             ),
         );
     }
+    // Output-side trims come right here — before the disable/codec calls —
+    // because that is where `LoweredJob::into_context` applies them; the
+    // emitted call order mirrors the runtime apply order setter for setter.
+    if let Some(us) = o.start_time_us {
+        line(
+            &mut out,
+            4,
+            &format!(
+                ".set_start_time_us({}) // -ss (output side: decode, then discard)",
+                num(us)
+            ),
+        );
+    }
+    if let Some(us) = o.recording_time_us {
+        line(
+            &mut out,
+            4,
+            &format!(".set_recording_time_us({}) // -t", num(us)),
+        );
+    }
+    if let Some(us) = o.stop_time_us {
+        line(
+            &mut out,
+            4,
+            &format!(".set_stop_time_us({}) // -to", num(us)),
+        );
+    }
     if o.video_disable {
         line(&mut out, 4, ".disable_video() // -vn");
     }
@@ -256,30 +283,6 @@ pub(crate) fn emit(job: &LoweredJob, command: &[String], status: &ShapeStatus) -
             );
         }
     }
-    if let Some(us) = o.start_time_us {
-        line(
-            &mut out,
-            4,
-            &format!(
-                ".set_start_time_us({}) // -ss (output side: decode, then discard)",
-                num(us)
-            ),
-        );
-    }
-    if let Some(us) = o.recording_time_us {
-        line(
-            &mut out,
-            4,
-            &format!(".set_recording_time_us({}) // -t", num(us)),
-        );
-    }
-    if let Some(us) = o.stop_time_us {
-        line(
-            &mut out,
-            4,
-            &format!(".set_stop_time_us({}) // -to", num(us)),
-        );
-    }
     line(&mut out, 2, ")");
     line(&mut out, 2, ".build()?");
     line(&mut out, 2, ".start()?");
@@ -370,11 +373,15 @@ fn lit(s: &str) -> String {
 /// User text rendered inside a generated `//` comment. Control characters
 /// (newlines above all) are escape-rendered so no token can break out of the
 /// comment and inject source — a quoted newline in an argv token must never
-/// become a real newline in generated code.
+/// become a real newline in generated code. U+2028/U+2029 (LINE/PARAGRAPH
+/// SEPARATOR) are not Unicode controls and rustc itself only ends `//`
+/// comments at `\n`, but JavaScript-family tooling and some editors treat
+/// them as line terminators — they are escaped on the same principle,
+/// matching the `{:?}` treatment string literals already get.
 fn comment_text(s: &str) -> String {
     s.chars()
         .flat_map(|c| {
-            if c.is_control() {
+            if c.is_control() || c == '\u{2028}' || c == '\u{2029}' {
                 c.escape_debug().collect::<Vec<_>>()
             } else {
                 vec![c]
@@ -450,6 +457,16 @@ mod tests {
     }
 
     #[test]
+    fn comment_text_escapes_controls_and_unicode_line_separators() {
+        assert_eq!(comment_text("a\nb\0c"), r"a\nb\0c");
+        // U+2028/U+2029 are category Zl/Zp, not controls, and must still be
+        // escape-rendered: some tooling treats them as line terminators.
+        assert_eq!(comment_text("a\u{2028}b\u{2029}c"), r"a\u{2028}b\u{2029}c");
+        // Ordinary unicode passes through untouched.
+        assert_eq!(comment_text("视频 ok"), "视频 ok");
+    }
+
+    #[test]
     fn requote_quotes_tokens_with_spaces() {
         let args = vec!["-i".to_string(), "my movie.mp4".to_string()];
         assert_eq!(requote(&args), "-i 'my movie.mp4'");
@@ -461,7 +478,7 @@ mod tests {
             emit_cmd("ffmpeg -i in.mkv -c:v libx264 -crf 23 -preset fast -c:a aac -y out.mp4");
         assert!(code.contains("// status: verified shape V1"));
         assert!(code.contains("dialect: ffmpeg 7.1 command line"));
-        assert!(code.contains("manifest: r3"));
+        assert!(code.contains("manifest: r4"));
         assert!(code.contains(".set_video_codec(\"libx264\") // -c:v libx264"));
         assert!(code.contains(".set_video_codec_opt(\"crf\", \"23\") // -crf 23"));
         assert!(code.contains(".set_video_codec_opt(\"preset\", \"fast\") // -preset fast"));
@@ -567,6 +584,43 @@ mod tests {
                 "examples/{}.rs drifted from the emitter; regenerate it",
                 shape.emitted_example
             );
+        }
+    }
+
+    /// The emitted OUTPUT builder calls must appear in exactly the order
+    /// `LoweredJob::into_context` applies them — the facade documents the
+    /// generated program and the runtime path as "same builder calls, same
+    /// values, same order". U11 (output-side seek transcode) is the
+    /// discriminating shape: its output trims must be emitted BEFORE the
+    /// codec calls, where the runtime applies them, not appended after the
+    /// maps. The setters commute, so this is a source-fidelity pin, not a
+    /// behavior test.
+    #[test]
+    fn emitted_output_calls_follow_the_runtime_apply_order() {
+        let code = emit_cmd(
+            "ffmpeg -i in.mp4 -ss 3 -t 4 -c:v libx264 -crf 23 -preset fast -c:a aac -y out.mp4",
+        );
+        let runtime_order = [
+            ".set_start_time_us(3_000_000)",
+            ".set_recording_time_us(4_000_000)",
+            ".set_video_codec(\"libx264\")",
+            ".set_audio_codec(\"aac\")",
+            ".set_video_codec_opt(\"crf\", \"23\")",
+            ".set_video_codec_opt(\"preset\", \"fast\")",
+        ];
+        let mut previous: Option<(usize, &str)> = None;
+        for call in runtime_order {
+            let at = code
+                .find(call)
+                .unwrap_or_else(|| panic!("emitted code lost {call}:\n{code}"));
+            if let Some((prev_at, prev_call)) = previous {
+                assert!(
+                    at > prev_at,
+                    "emitted {call} before {prev_call}, diverging from the runtime apply \
+                     order:\n{code}"
+                );
+            }
+            previous = Some((at, call));
         }
     }
 

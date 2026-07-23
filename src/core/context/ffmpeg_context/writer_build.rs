@@ -120,11 +120,13 @@ pub(crate) fn build_writer_context(
     // frames, and with no source duration the graph never reaches EOF — a
     // healthy finish() would hang unboundedly.
     //
-    // Known granularity limit: the walk follows links BETWEEN filters, so a
-    // filter that internally routes distinct streams between pad pairs
-    // (multi-stream concat) can satisfy it while steering the pushed stream
-    // into a sink leg. libavfilter exposes no static per-pad dataflow to
-    // close that; such a description is deliberate and runs as declared
+    // The walk is STRUCTURAL: it follows the links between filters, and
+    // inside each filter every input pad counts as influencing every output
+    // pad (a crossbar). No applied option prunes that routing — a selector
+    // like "[bg][in]streamselect=inputs=2:map=0" currently relays only the
+    // generator feed, but `map` is a runtime command (sendcmd can reroute
+    // the pushed stream to the encoder mid-job) and ffmpeg accepts and runs
+    // the same description, so it is accepted here and runs as declared
     // (documented on WriterError::UnreachableFilterOutput and filter_desc).
     if !shape.output_reachable {
         return Err(WriterError::UnreachableFilterOutput.into());

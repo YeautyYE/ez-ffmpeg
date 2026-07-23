@@ -21,6 +21,14 @@
 //! # }
 //! ```
 //!
+//! The layer is optional; enable it in `Cargo.toml`:
+//!
+//! ```toml
+//! [dependencies.ez-ffmpeg]
+//! version = "*"
+//! features = ["cli"]
+//! ```
+//!
 //! # The contract: classify everything, approximate nothing
 //!
 //! **Broad CLI compatibility is a non-goal.** The ffmpeg CLI is ~14k lines
@@ -52,7 +60,7 @@
 //! # The manifest (generated; revision-pinned by an exact-equality test)
 //!
 //! <!-- manifest:begin -->
-//! Manifest revision 3; dialect: ffmpeg 7.1 command line.
+//! Manifest revision 4; dialect: ffmpeg 7.1 command line.
 //!
 //! | option | scope | selector | repeat | notes | maps to |
 //! |---|---|---|---|---|---|
@@ -61,31 +69,37 @@
 //! | `-nostdin` | global | no-op | repeatable | accepted, no in-process effect | none (documented no-op) |
 //! | `-stats` | global | no-op | repeatable | accepted, no in-process effect | none (documented no-op) |
 //! | `-nostats` | global | no-op | repeatable | accepted, no in-process effect | none (documented no-op) |
-//! | `-loglevel` | global | no-op | repeatable | accepted, no in-process effect | none (documented no-op) |
-//! | `-v` | global | no-op | repeatable | accepted, no in-process effect | none (documented no-op) |
-//! | `-ss` | input or output (position-scoped) | container | once | takes a value | Input::set_start_time_us / Output::set_start_time_us |
-//! | `-t` | input or output (position-scoped) | container | once | takes a value | Input::set_recording_time_us / Output::set_recording_time_us |
-//! | `-to` | input or output (position-scoped) | container | once | takes a value | Input::set_stop_time_us / Output::set_stop_time_us |
-//! | `-f` | input or output (position-scoped) | container | once | takes a value | Input::set_format / Output::set_format |
+//! | `-loglevel` | global | no-op | repeatable | no in-process effect; value: `[repeat+][level+]LEVEL` | none (documented no-op) |
+//! | `-v` | global | no-op | repeatable | no in-process effect; value: `[repeat+][level+]LEVEL` | none (documented no-op) |
+//! | `-ss` | input or output (position-scoped) | container | once | decimal seconds only (`10`, `2.5`) | Input::set_start_time_us / Output::set_start_time_us |
+//! | `-t` | input or output (position-scoped) | container | once | decimal seconds only (`10`, `2.5`) | Input::set_recording_time_us / Output::set_recording_time_us |
+//! | `-to` | input or output (position-scoped) | container | once | decimal seconds only (`10`, `2.5`) | Input::set_stop_time_us / Output::set_stop_time_us |
+//! | `-f` | input or output (position-scoped) | container | once | container/demuxer name (`[a-z0-9_]+`) | Input::set_format / Output::set_format |
 //! | `-vn` | output | video | repeatable | flag | Output::disable_video |
 //! | `-an` | output | audio | repeatable | flag | Output::disable_audio |
-//! | `-c:v` | output | video | once | takes a value | Output::set_video_codec |
-//! | `-c:a` | output | audio | once | takes a value | Output::set_audio_codec |
-//! | `-b:v` | output | video | once | takes a value | Output::set_video_bitrate |
-//! | `-b:a` | output | audio | once | takes a value | Output::set_audio_bitrate |
-//! | `-crf` | output | video | once | takes a value | Output::set_video_codec_opt("crf", …), libx264 only |
-//! | `-preset` | output | video | once | takes a value | Output::set_video_codec_opt("preset", …), libx264 only |
-//! | `-pix_fmt` | output | video | once | takes a value | Output::set_pix_fmt |
-//! | `-ar` | output | audio | once | takes a value | Output::set_audio_sample_rate |
-//! | `-ac` | output | audio | once | takes a value | Output::set_audio_channels |
-//! | `-frames:v` | output | video | once | takes a value | Output::set_max_video_frames(1) |
-//! | `-vf` | output | video | once | takes a value | Output::set_video_filter |
-//! | `-map` | output | stream map | accumulates | takes a value | Output::add_stream_map / add_stream_map_with_copy |
-//! | `-movflags` | output | container | once | takes a value | Output::set_format_opt("movflags", "+faststart") |
-//! | `-hls_time` | output | container | once | takes a value | Output::set_format_opt("hls_time", …) |
-//! | `-hls_playlist_type` | output | container | once | takes a value | Output::set_format_opt("hls_playlist_type", "vod") |
-//! | `-hls_list_size` | output | container | once | takes a value | Output::set_format_opt("hls_list_size", "0") |
-//! | `-hls_segment_filename` | output | container | once | takes a value | Output::set_format_opt("hls_segment_filename", …) |
+//! | `-c:v` | output | video | once | codec name or `copy` (`[A-Za-z0-9_-]+`) | Output::set_video_codec |
+//! | `-c:a` | output | audio | once | codec name or `copy` (`[A-Za-z0-9_-]+`) | Output::set_audio_codec |
+//! | `-b:v` | output | video | once | `NNN` with optional `k`/`K`/`m`/`M` suffix | Output::set_video_bitrate |
+//! | `-b:a` | output | audio | once | `NNN` with optional `k`/`K`/`m`/`M` suffix | Output::set_audio_bitrate |
+//! | `-crf` | output | video | once | integer 0..=51 | Output::set_video_codec_opt("crf", …), libx264 only |
+//! | `-preset` | output | video | once | x264 preset name | Output::set_video_codec_opt("preset", …), libx264 only |
+//! | `-pix_fmt` | output | video | once | pixel format name (`[a-z0-9_]+`) | Output::set_pix_fmt |
+//! | `-ar` | output | audio | once | positive integer | Output::set_audio_sample_rate |
+//! | `-ac` | output | audio | once | positive integer | Output::set_audio_channels |
+//! | `-frames:v` | output | video | once | exactly `1` | Output::set_max_video_frames(1) |
+//! | `-vf` | output | video | once | single `scale=…` chain only | Output::set_video_filter |
+//! | `-map` | output | stream map | accumulates | basic index maps only (`0`, `0:v`, `0:a:1`, `0:1`, …) | Output::add_stream_map / add_stream_map_with_copy |
+//! | `-movflags` | output | container | once | exactly `+faststart` | Output::set_format_opt("movflags", "+faststart") |
+//! | `-hls_time` | output | container | once | decimal seconds > 0 | Output::set_format_opt("hls_time", …) |
+//! | `-hls_playlist_type` | output | container | once | exactly `vod` | Output::set_format_opt("hls_playlist_type", "vod") |
+//! | `-hls_list_size` | output | container | once | exactly `0` | Output::set_format_opt("hls_list_size", "0") |
+//! | `-hls_segment_filename` | output | container | once | non-empty path; `-`-leading values rejected | Output::set_format_opt("hls_segment_filename", …) |
+//!
+//! Command layout is fixed: exactly one `-i` input and exactly one output
+//! path, in the canonical `[global/input options] -i INPUT [output options]
+//! OUTPUT [global options]` order — after the output path only GLOBAL options
+//! are accepted (e.g. a trailing `-y`). The `-` stdin/stdout pseudo-paths are
+//! excluded — pipe I/O is process wiring, not part of the in-process subset.
 //!
 //! Verified shapes (may execute; each is backed by a semantic golden and a
 //! compile-pinned emitted example):
@@ -199,8 +213,24 @@ pub fn from_cli(command: &str) -> Result<FfmpegContext, CliError> {
 /// Emission works for verified shapes and for the manifest's enumerated
 /// unverified entries — including shapes that are
 /// not verified for execution, whose output is prominently labeled
-/// "unverified scaffolding". The generated code and [`from_cli_args`]
-/// consume the same lowered plan, so what you read is what would run.
+/// "unverified scaffolding".
+///
+/// The generated program and [`from_cli_args`] consume the same lowered
+/// plan — same builder calls, same values, same order — but they are not
+/// policy-identical. The runtime path layers three checks on top that the
+/// emitted program deliberately does not carry:
+///
+/// - **runtime-profile gate**: [`from_cli_args`] refuses to execute on a
+///   non-verified linked FFmpeg ([`CliError::UnverifiedRuntimeProfile`]);
+///   the emitted program runs against whatever FFmpeg it is built with;
+/// - **strict AVOption handling**: an in-process run fails on an option no
+///   component consumed (fftools `check_avoptions` parity, set through a
+///   crate-private flag); the emitted builder program only logs the
+///   default warning;
+/// - **unique-video-source prerequisite**: an in-process `-vf` run fails
+///   unless the opened input has exactly one video stream
+///   ([`CliError::AmbiguousFilterSource`]); the emitted program uses the
+///   builder default, which score-selects a stream like the ffmpeg CLI.
 pub fn emit_rust_code_from_args<S: AsRef<str>>(args: &[S]) -> Result<String, CliError> {
     let args: Vec<String> = args.iter().map(|s| s.as_ref().to_string()).collect();
     let args = tokenize::strip_program_token(args);
@@ -255,34 +285,35 @@ fn emit_from_tokens(args: &[String]) -> Result<String, CliError> {
     Ok(emit::emit(&lower::lower(&ir), args, &status))
 }
 
-/// Runtime-profile gate: in-process execution is allowed only on linked
-/// FFmpeg builds whose libavcodec/libavformat major.minor pairs match a
-/// verified profile. Purely a version check — it runs before any I/O.
+/// Major.minor of the linked libavcodec and libavformat (in that order),
+/// extracted from FFmpeg's packed version words.
+fn linked_version_pairs() -> ((u32, u32), (u32, u32)) {
+    let pair = |v: u32| (v >> 16, (v >> 8) & 0xff);
+    (
+        pair(unsafe { ffmpeg_sys_next::avcodec_version() }),
+        pair(unsafe { ffmpeg_sys_next::avformat_version() }),
+    )
+}
+
 /// Whether the LINKED libavcodec/libavformat pair matches a verified runtime
 /// profile. Tests use this to stay honest on non-verified lanes: on a linked
 /// 8.x build the correct expectation is the typed `UnverifiedRuntimeProfile`
 /// failure, not runtime success.
 pub(crate) fn linked_profile_verified() -> bool {
-    let avcodec = unsafe { ffmpeg_sys_next::avcodec_version() };
-    let avformat = unsafe { ffmpeg_sys_next::avformat_version() };
-    let pair = |v: u32| (v >> 16, (v >> 8) & 0xff);
-    let (ac_major, ac_minor) = pair(avcodec);
-    let (af_major, af_minor) = pair(avformat);
-    VERIFIED_PROFILES.iter().any(|profile| {
-        (ac_major, ac_minor) == profile.avcodec && (af_major, af_minor) == profile.avformat
-    })
+    let (avcodec, avformat) = linked_version_pairs();
+    VERIFIED_PROFILES
+        .iter()
+        .any(|profile| avcodec == profile.avcodec && avformat == profile.avformat)
 }
 
+/// Runtime-profile gate: in-process execution is allowed only on linked
+/// FFmpeg builds whose libavcodec/libavformat major.minor pairs match a
+/// verified profile. Purely a version check — it runs before any I/O.
 fn check_runtime_profile() -> Result<(), CliError> {
-    let avcodec = unsafe { ffmpeg_sys_next::avcodec_version() };
-    let avformat = unsafe { ffmpeg_sys_next::avformat_version() };
-    let pair = |v: u32| (v >> 16, (v >> 8) & 0xff);
-    let (ac_major, ac_minor) = pair(avcodec);
-    let (af_major, af_minor) = pair(avformat);
-
     if linked_profile_verified() {
         return Ok(());
     }
+    let ((ac_major, ac_minor), (af_major, af_minor)) = linked_version_pairs();
     Err(CliError::UnverifiedRuntimeProfile {
         linked_avcodec: format!("{ac_major}.{ac_minor}"),
         linked_avformat: format!("{af_major}.{af_minor}"),
@@ -325,6 +356,49 @@ mod facade_tests {
         }
     }
 
+    /// Fail-closed pin with LITERAL version pairs. `VERIFIED_PROFILES` is
+    /// deliberately not consulted: the test above derives its expectation
+    /// from the same table the gate reads, so a table edit that silently
+    /// widened the gate (say, adding an unproven 8.x row) would satisfy
+    /// both sides. FFmpeg 7.1 is the only verified line — libavcodec 61.19
+    /// / libavformat 61.7 — and those numbers are hardcoded here: on any
+    /// other linked pair, `from_cli_args` on a verified-shape command must
+    /// return the typed profile refusal before any I/O.
+    #[test]
+    fn non_71_linked_pair_fails_closed_by_literal_version() {
+        let pair = |v: u32| (v >> 16, (v >> 8) & 0xff);
+        let linked_is_71 = pair(unsafe { ffmpeg_sys_next::avcodec_version() }) == (61, 19)
+            && pair(unsafe { ffmpeg_sys_next::avformat_version() }) == (61, 7);
+        let args = [
+            "-i",
+            "no_such_fixture.mkv",
+            "-c:v",
+            "libx264",
+            "-crf",
+            "23",
+            "-preset",
+            "fast",
+            "-c:a",
+            "aac",
+            "-y",
+            "out.mp4",
+        ];
+        match from_cli_args(&args) {
+            Err(CliError::UnverifiedRuntimeProfile { .. }) => assert!(
+                !linked_is_71,
+                "profile refusal on the literal 7.1 pair (61.19/61.7)"
+            ),
+            Ok(_) => assert!(
+                linked_is_71,
+                "a non-7.1 linked pair must fail closed with UnverifiedRuntimeProfile"
+            ),
+            Err(other) => assert!(
+                linked_is_71,
+                "a non-7.1 linked pair must fail closed with UnverifiedRuntimeProfile, got: {other}"
+            ),
+        }
+    }
+
     #[test]
     fn unverified_shape_is_refused_at_run_but_emitted() {
         let args = ["-i", "in.mp4", "-c:v", "mpeg4", "-y", "out.avi"];
@@ -361,10 +435,11 @@ mod facade_tests {
 
     #[test]
     fn loglevel_grammar_is_wired_to_the_facade() {
-        // End-to-end pin of the R7-5 probe: the flag-prefix grammar must be
-        // reachable through from_cli itself, anchored at the VALUE token —
-        // disconnecting -loglevel from its rule would fail here even if the
-        // rule's own unit tests stayed green.
+        // End-to-end pin of the -loglevel value-grammar wiring: the
+        // flag-prefix grammar must be reachable through from_cli itself,
+        // anchored at the VALUE token — disconnecting -loglevel from its
+        // rule would fail here even if the rule's own unit tests stayed
+        // green.
         let err = from_cli(
             "ffmpeg -hide_banner -loglevel banana+error -i in.mkv -c:v libx264 -crf 23 -preset fast -c:a aac -y out.mp4",
         )

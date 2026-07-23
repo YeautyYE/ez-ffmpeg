@@ -1,5 +1,14 @@
 ### CLI-to-API mapping
 
+**Scope:** the rows below are *manual builder* recipes — each shows how to
+express a CLI behavior with the regular [`Input`](crate::Input) /
+[`Output`](crate::Output) / builder API, which accepts whatever the linked
+FFmpeg accepts. This is distinct from the strict `ez_ffmpeg::cli` facade
+(feature `cli`), which runs or translates a small, verified ffmpeg command
+subset under a deliberately narrow grammar of its own; its exact surface is
+enumerated in that module's documentation. Notes below marked *cli facade*
+call out rows where the two surfaces differ.
+
 The table below maps common `ffmpeg` command-line flags and patterns to their
 ez-ffmpeg equivalents. The **Kind** column tells you *how* the mapping works:
 
@@ -26,7 +35,7 @@ One global convention: CLI *seconds* become *microseconds* in `_us` methods
 | `-stream_loop N` | typed | [`Input::set_stream_loop`](crate::Input::set_stream_loop) | `-1` loops forever. |
 | `-re` | typed | [`Input::set_readrate`](crate::Input::set_readrate) | `1.0` reads at native speed. |
 | `-shortest` | typed | [`Output::set_shortest`](crate::Output::set_shortest) | Frame-accurate for encoded streams; bound the buffering window with [`set_shortest_buf_duration_us`](crate::Output::set_shortest_buf_duration_us). See anchor below. |
-| `-map <spec>` | typed | [`Output::add_stream_map`](crate::Output::add_stream_map) (re-encode), [`add_stream_map_with_copy`](crate::Output::add_stream_map_with_copy) (streamcopy) | Accepts `"0:v"`-style input specs or filtergraph link labels like `"[vout]"`. |
+| `-map <spec>` | typed | [`Output::add_stream_map`](crate::Output::add_stream_map) (re-encode), [`add_stream_map_with_copy`](crate::Output::add_stream_map_with_copy) (streamcopy) | Accepts `"0:v"`-style input specs or filtergraph link labels like `"[vout]"`. *cli facade*: basic index maps only (`0`, `0:v`, `0:a:1`, `0:1`), no labels. |
 | `-vn` / `-an` / `-sn` / `-dn` | typed | [`Output::disable_video`](crate::Output::disable_video) / [`disable_audio`](crate::Output::disable_audio) / [`disable_subtitle`](crate::Output::disable_subtitle) / [`disable_data`](crate::Output::disable_data) | Per-output stream suppression. |
 | `-frames:v` / `-frames:a` / `-frames:s` | typed | [`Output::set_max_video_frames`](crate::Output::set_max_video_frames) / [`set_max_audio_frames`](crate::Output::set_max_audio_frames) / [`set_max_subtitle_frames`](crate::Output::set_max_subtitle_frames) | Stop after N frames. |
 | `-c:v` / `-c:a` / `-c:s <enc>` | typed | [`Output::set_video_codec`](crate::Output::set_video_codec) / [`set_audio_codec`](crate::Output::set_audio_codec) / [`set_subtitle_codec`](crate::Output::set_subtitle_codec) | Encoder by FFmpeg name (`"libx264"`, `"aac"`, ...). |
@@ -36,26 +45,26 @@ One global convention: CLI *seconds* become *microseconds* in `_us` methods
 | `-b:v` / `-b:a` | typed | [`Output::set_video_bitrate`](crate::Output::set_video_bitrate) / [`set_audio_bitrate`](crate::Output::set_audio_bitrate) | FFmpeg size syntax: `"2500k"`, `"5M"`. |
 | `-q:v` / `-q:a` | typed | [`Output::set_video_qscale`](crate::Output::set_video_qscale) / [`set_audio_qscale`](crate::Output::set_audio_qscale) | Fixed quality scale. |
 | `-r` / `-fpsmax` (output) | typed | [`Output::set_framerate`](crate::Output::set_framerate) / [`set_framerate_max`](crate::Output::set_framerate_max) | Rational `num, den` (`30, 1`; `24000, 1001`). |
-| `-fps_mode` / `-vsync` | typed | [`Output::set_vsync_method`](crate::Output::set_vsync_method) | [`VSyncMethod`](crate::core::context::output::VSyncMethod) enum (auto / CFR / VFR / passthrough / vscfr). |
+| `-fps_mode` / `-vsync` | typed | [`Output::set_vsync_method`](crate::Output::set_vsync_method) | [`VSyncMethod`](crate::core::context::output::VSyncMethod) enum (auto / CFR / VFR / passthrough / vscfr). *cli facade*: rejected (vsync is modeled per output, not per stream). |
 | `-pix_fmt` | typed | [`Output::set_pix_fmt`](crate::Output::set_pix_fmt) | By name, e.g. `"yuv420p"`. |
 | `-ar` / `-ac` / `-sample_fmt` | typed | [`Output::set_audio_sample_rate`](crate::Output::set_audio_sample_rate) / [`set_audio_channels`](crate::Output::set_audio_channels) / [`set_audio_sample_fmt`](crate::Output::set_audio_sample_fmt) | Audio resample/layout parameters. |
-| `-force_key_frames 0,5,10` | typed | [`Output::set_force_key_frames`](crate::Output::set_force_key_frames) | Comma-separated absolute times in **seconds** only; the `expr:` / `HH:MM:SS` / `source` forms are rejected. |
+| `-force_key_frames 0,5,10` | typed | [`Output::set_force_key_frames`](crate::Output::set_force_key_frames) | Comma-separated absolute times in **seconds** only; the `expr:` / `HH:MM:SS` / `source` forms are rejected. *cli facade*: rejected entirely (builder-only). |
 | `-bsf:v` / `-bsf:a` / `-bsf:s` | typed | [`Output::set_video_bsf`](crate::Output::set_video_bsf) / [`set_audio_bsf`](crate::Output::set_audio_bsf) / [`set_subtitle_bsf`](crate::Output::set_subtitle_bsf) | Single filter or comma-separated chain (`"h264_mp4toannexb"`). |
 | `-tag:v hvc1` (FourCC / codec tag) | gap | — | Not exposed. Setting `("tag", ...)` as a codec option does not reach `codec_tag`; re-tag with an external remux for now. |
 | `-movflags +faststart` | option | [`Output::set_format_opt`](crate::Output::set_format_opt)`("movflags", "faststart")` | Muxer option. See anchor below. |
 | muxer options (`-hls_time`, `-segment_time`, `-hls_list_size`, ...) | option | [`Output::set_format_opt`](crate::Output::set_format_opt) / [`set_format_opts`](crate::Output::set_format_opts) | Container-level `AVOption`s for the selected muxer. |
 | demuxer/protocol options (`-rtsp_transport tcp`, `-headers`, `-loop 1`, `-probesize`) | option | [`Input::set_format_opt`](crate::Input::set_format_opt) / [`set_format_opts`](crate::Input::set_format_opts) | Applied at `avformat_open_input` time; covers protocol, demuxer and device options. |
 | `-metadata`, `-metadata:s:v`, `-map_metadata` | typed | [`Output::add_metadata`](crate::Output::add_metadata), [`add_stream_metadata`](crate::Output::add_stream_metadata), [`map_metadata_from_input`](crate::Output::map_metadata_from_input) | Global, per-stream, chapter and program metadata; note `add_stream_metadata` returns `Result`. |
-| `-vf` / `-filter:v` (simple per-output chain) | filter | [`Output::set_video_filter`](crate::Output::set_video_filter) | One linear video chain per output, applied to that output's re-encoded video stream; conflicts with stream copy and complex graphs are typed build errors. |
+| `-vf` / `-filter:v` (simple per-output chain) | filter | [`Output::set_video_filter`](crate::Output::set_video_filter) | One linear video chain per output, applied to that output's re-encoded video stream; conflicts with stream copy and complex graphs are typed build errors. *cli facade*: `-vf` takes a single `scale=…` chain only, and the `-filter:v` alias is rejected. |
 | `-af` (per-output audio chain) | gap | — | No per-output audio filter API yet; a context-level graph via `filter_desc` is the workaround. |
-| `-filter_complex` | filter | builder [`filter_desc`](crate::core::context::ffmpeg_context_builder::FfmpegContextBuilder::filter_desc) | Full filtergraph syntax including labels and multiple inputs. |
-| `-vf scale=1280:-2` (resize) | filter | `Output::from("out.mp4").set_video_filter("scale=1280:-2")` | Any scale expression works verbatim. |
-| watermark (`overlay`) | filter | `.filter_desc("[1:v]scale=100:-1[wm];[0:v][wm]overlay=10:10")` | Second input is the watermark; see `examples/watermarking`. |
-| concat several files | filter | multiple `.input(...)` + `.filter_desc("concat=n=3:v=1:a=1")` | Re-encodes; see `examples/video_merging`. |
+| `-filter_complex` | filter | builder [`filter_desc`](crate::core::context::ffmpeg_context_builder::FfmpegContextBuilder::filter_desc) | Full filtergraph syntax including labels and multiple inputs. *cli facade*: rejected (complex graphs are planned there). |
+| `-vf scale=1280:-2` (resize) | filter | `Output::from("out.mp4").set_video_filter("scale=1280:-2")` | Through the builder, any scale expression the linked FFmpeg accepts works verbatim. *cli facade*: a single simple `scale=…` chain only — no chains, labels, parentheses or quoting. |
+| watermark (`overlay`) | filter | `.filter_desc("[1:v]scale=100:-1[wm];[0:v][wm]overlay=10:10")` | Second input is the watermark; see `examples/watermarking`. *cli facade*: multi-input commands are rejected (single-input subset). |
+| concat several files | filter | multiple `.input(...)` + `.filter_desc("concat=n=3:v=1:a=1")` | Re-encodes; see `examples/video_merging`. *cli facade*: multi-input commands are rejected (single-input subset). |
 | `-hwaccel`, `-hwaccel_device`, `-hwaccel_output_format` | typed | [`Input::set_hwaccel`](crate::Input::set_hwaccel) / [`set_hwaccel_device`](crate::Input::set_hwaccel_device) / [`set_hwaccel_output_format`](crate::Input::set_hwaccel_output_format) | `"cuda"`, `"vaapi"`, `"videotoolbox"`, ... or `"auto"`; see the [`hwaccel`](crate::hwaccel) module. |
 | `silencedetect` → parsed output | recipe | [`Analysis`](crate::analysis::runner::Analysis) + [`AudioDetector::Silence`](crate::analysis::detector::AudioDetector) | Typed silence ranges instead of scraping logs. See anchor below. |
 | `blackdetect` / `scdet` / `cropdetect` / `ebur128` | recipe | [`VideoDetector`](crate::analysis::detector::VideoDetector) / [`AudioDetector`](crate::analysis::detector::AudioDetector) variants | One decode pass, folded [`AnalysisReport`](crate::analysis::report::AnalysisReport). |
-| `-f null -` (discard output) | typed | `Output::from("-").set_format("null")` | Run a pipeline for its side effects only. |
+| `-f null -` (discard output) | typed | `Output::from("-").set_format("null")` | Run a pipeline for its side effects only. *cli facade*: the `-` stdin/stdout pseudo-paths are excluded there. |
 | `ffprobe` streams / duration | typed | [`stream_info::find_all_stream_infos`](crate::stream_info::find_all_stream_infos), [`container_info::get_duration_us`](crate::container_info::get_duration_us) | Includes per-stream metadata (title, language, rotation, ...). |
 | `ffprobe -show_packets` | typed | [`packet_scanner`](crate::packet_scanner) | Iterate packet pts/dts/size/keyframe flags without decoding. |
 | single thumbnail / sprite sheet | recipe | [`thumbnail`](crate::recipes::thumbnail::thumbnail), [`sprite_sheet`](crate::recipes::thumbnail::sprite_sheet) | Owns seek + scale + select + tile. See anchor below. |
@@ -68,7 +77,7 @@ One global convention: CLI *seconds* become *microseconds* in `_us` methods
 | burn in subtitles (`-vf subtitles=subs.srt`) | recipe | `SubtitleFilter` frame pipeline (feature `subtitle`) | Pure-Rust renderer, works without libass; `filter_desc("subtitles=...")` also works if your FFmpeg links libass. See anchor below. |
 | capture camera/mic (`-f avfoundation -i "0:0"`) | typed | [`Input::set_format`](crate::Input::set_format) + [`device`](crate::device) queries | Platform device demuxers (`avfoundation`/`dshow`/`v4l2`, ...); see `examples/capture_camera_mic`. |
 | `q` keypress (stop early, finalize container) | typed | [`FfmpegScheduler`](crate::FfmpegScheduler)`::stop()` | Prompt teardown: the normal path attempts the trailer (usually a valid container), but in-flight and queued frames may be dropped, so the tail can be truncated — not a full drain. `pause()`/`resume()`/`abort()` also available. |
-| `-loglevel` / reading FFmpeg's own messages | typed | [`set_ffmpeg_log_level`](crate::set_ffmpeg_log_level), [`Input::set_log_level_offset`](crate::Input::set_log_level_offset) | Forwarded to the Rust `log` facade; see the Logging section below. |
+| `-loglevel` / reading FFmpeg's own messages | typed | [`set_ffmpeg_log_level`](crate::set_ffmpeg_log_level), [`Input::set_log_level_offset`](crate::Input::set_log_level_offset) | Forwarded to the Rust `log` facade; see the Logging section below. *cli facade*: `-loglevel` is accepted as a documented no-op — nothing is forwarded; call `set_ffmpeg_log_level` yourself. |
 | `-progress` / `-stats` | gap | — | No stats reporting. Workaround: a `FrameFilter` observing frame timestamps against total duration (`examples/processing_progress`) — it sees decoded frames, not the CLI's encoder statistics. |
 | two-pass encoding (`-pass 1/2`) | gap | — | No built-in orchestration for stats files across runs. |
 | sub2video, `-fix_sub_duration` | gap | — | Not implemented; such pipelines fail with explicit errors. |
@@ -114,7 +123,9 @@ FfmpegContext::builder()
 ```
 
 Remux for instant web playback —
-`ffmpeg -i input.mp4 -c copy -movflags faststart output.mp4`:
+`ffmpeg -i input.mp4 -c:v copy -c:a copy -movflags +faststart -y output.mp4`
+(this spelling is also what the `cli` facade accepts: split per-media `-c:v`/`-c:a`,
+the exact `+faststart` value, and an explicit `-y`):
 
 ```rust,no_run
 use ez_ffmpeg::{FfmpegContext, Output};
@@ -124,7 +135,7 @@ FfmpegContext::builder()
     .output(Output::from("output.mp4")
         .set_video_codec("copy")
         .set_audio_codec("copy")
-        .set_format_opt("movflags", "faststart"))
+        .set_format_opt("movflags", "+faststart"))
     .build()?
     .start()?
     .wait()?;

@@ -1635,6 +1635,15 @@ impl Output {
     ///   [`OpenOutputError::SimpleFilterInvalidShape`]; non-video chains (e.g.
     ///   `anull`) fail with [`OpenOutputError::SimpleFilterMediaTypeMismatch`].
     ///   Use [`FfmpegContextBuilder::filter_desc`] for complex graphs.
+    /// - **Connected, structurally**: the input pad must be wired into the
+    ///   flow that feeds the output pad — disconnected sub-graphs and
+    ///   descriptions that drain the stream into a sink while an unrelated
+    ///   branch feeds the encoder fail with
+    ///   [`OpenOutputError::SimpleFilterInvalidShape`]. The check does not
+    ///   second-guess runtime routing: a filter that may discard the stream
+    ///   while it runs (e.g. `streamselect` whose `map` currently selects an
+    ///   embedded generator — a selection `sendcmd` can rewrite mid-stream)
+    ///   is accepted and runs as declared, exactly like the CLI.
     /// - **Re-encode only**: combining this with `set_video_codec("copy")` or
     ///   a copy stream map covering a video stream fails the build with
     ///   [`OpenOutputError::FilterWithStreamCopy`], matching the CLI's

@@ -1,6 +1,6 @@
 // Generated from an ffmpeg command by the ez-ffmpeg CLI-compat emitter.
 // command: ffmpeg -i in.mp4 -vn -c:a aac -b:a 192k -y out.m4a
-// dialect: ffmpeg 7.1 command line; manifest: r3; crate: ez-ffmpeg 0.14.0; cargo features: none required
+// dialect: ffmpeg 7.1 command line; manifest: r4; crate: ez-ffmpeg 0.14.0; cargo features: none required
 // status: verified shape V3 (audio extract (-vn, AAC)) — verified by the manifest-driven semantic golden suite (oracle: AudioExtract) against the ffmpeg CLI; canonical emission compile-pinned as examples/cli_emitted_audio_extract.rs
 
 use ez_ffmpeg::{FfmpegContext, Output};

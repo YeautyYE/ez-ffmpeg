@@ -4,9 +4,10 @@
 //! (execution) and `emit_rust_code` (code generation) lower the SAME value
 //! through [`super::lower`], so the two can never drift apart.
 //!
-//! Round 1 is single-input/single-output by construction, so the IR holds one
-//! `InputIr` and one `OutputIr` instead of vectors — a second `-i` or output
-//! path is rejected during parsing, before an IR exists.
+//! The supported subset is single-input/single-output by construction, so
+//! the IR holds one `InputIr` and one `OutputIr` instead of vectors — a
+//! second `-i` or output path is rejected during parsing, before an IR
+//! exists.
 
 /// Which of `-t` / `-to` produced a duration bound. The two are distinct in
 /// the CLI (`-t` = duration, `-to` = absolute end position) and lower to
@@ -83,9 +84,9 @@ pub(crate) struct OutputIr {
     pub(crate) audio_sample_rate: Option<i32>,
     /// `-ac`.
     pub(crate) audio_channels: Option<i32>,
-    /// `-frames:v` (Round 1 accepts only the value 1).
+    /// `-frames:v` (only the value 1 is accepted).
     pub(crate) frames_v: Option<i64>,
-    /// `-vf` (Round 1: a single scale filter).
+    /// `-vf` (a single simple scale filter).
     pub(crate) video_filter: Option<String>,
     /// `-map` values, basic index form only (`0`, `0:v`, `0:a:1`, …).
     pub(crate) maps: Vec<String>,
@@ -97,9 +98,9 @@ pub(crate) struct OutputIr {
     pub(crate) movflags_faststart: bool,
     /// `-hls_time`, seconds as spelled.
     pub(crate) hls_time: Option<String>,
-    /// `-hls_playlist_type` (Round 1: exactly `vod`).
+    /// `-hls_playlist_type` (exactly `vod`).
     pub(crate) hls_playlist_type: Option<String>,
-    /// `-hls_list_size` (Round 1: exactly `0`).
+    /// `-hls_list_size` (exactly `0`).
     pub(crate) hls_list_size: Option<String>,
     /// `-hls_segment_filename`.
     pub(crate) hls_segment_filename: Option<String>,

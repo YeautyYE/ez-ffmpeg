@@ -94,7 +94,7 @@ fn rejected(cmd: &str, expect: &str, fragment: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// The six verified commands (R6 slice) — the exact spellings of the goldens.
+// The six verified commands — the exact spellings of the goldens.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -174,7 +174,8 @@ fn corpus_cookbook_3_unsplit_c_copy() {
 #[test]
 fn corpus_cookbook_3_respelled_faststart_remux() {
     // The manifest-admitted spelling: explicit per-media copy. Emit-only —
-    // faststart left the verified six (R6), and stays a Round-1 candidate.
+    // faststart is not one of the six verified shapes, so the command is
+    // accepted by the grammar but has no golden.
     emit_only("ffmpeg -i input.mp4 -c:v copy -c:a copy -movflags +faststart -y faststart.mp4");
 }
 
@@ -218,7 +219,7 @@ fn corpus_cookbook_8b_segment_muxer() {
     rejected(
         "ffmpeg -i input.mp4 -f segment -segment_time 10 -y chunk_%03d.wav",
         "UnsupportedOption",
-        "segment muxer is planned for Round 2",
+        "segment muxer is planned for a future release",
     );
 }
 
@@ -259,7 +260,7 @@ fn corpus_cookbook_13_rtmp_readrate() {
     rejected(
         "ffmpeg -re -i input.mp4 -c:v libx264 -c:a aac -f flv -y rtmp://localhost/live/stream",
         "UnsupportedOption",
-        "readrate streaming is planned for Round 2",
+        "readrate streaming is planned for a future release",
     );
 }
 
@@ -319,7 +320,7 @@ fn corpus_map_metadata() {
     rejected(
         "ffmpeg -i input.mp4 -map_metadata 0 -y out.mp4",
         "UnsupportedOption",
-        "metadata mapping is planned for Round 2",
+        "metadata mapping is planned for a future release",
     );
 }
 
@@ -347,7 +348,7 @@ fn corpus_hardware_accel() {
     rejected(
         "ffmpeg -hwaccel cuda -i input.mp4 -y out.mp4",
         "UnsupportedOption",
-        "Round 2",
+        "hardware acceleration is planned for a future release",
     );
 }
 
@@ -356,7 +357,7 @@ fn corpus_frame_rate_and_size() {
     rejected(
         "ffmpeg -i input.mp4 -r 30 -y out.mp4",
         "UnsupportedOption",
-        "Round-1",
+        "not in the current supported subset",
     );
     rejected(
         "ffmpeg -i input.mp4 -s 1280x720 -y out.mp4",
@@ -557,7 +558,7 @@ fn corpus_filter_complex_single_input() {
     rejected(
         "ffmpeg -i in.mp4 -filter_complex '[0:v]hue=s=0[v]' -map '[v]' -y out.mp4",
         "UnsupportedOption",
-        "Round 2",
+        "complex filtergraphs are planned for a future release",
     );
 }
 
@@ -666,6 +667,18 @@ fn corpus_hls_pins() {
         "ffmpeg -i in.mp4 -c:v libx264 -crf 23 -c:a aac -f hls -hls_time 6 -hls_playlist_type vod -hls_list_size 0 -hls_flags delete_segments -hls_segment_filename s_%03d.ts -y out.m3u8",
         "UnsupportedOption",
         "single-rendition VOD HLS",
+    );
+}
+
+#[test]
+fn corpus_hls_segment_filename_swallows_next_option() {
+    // An omitted segment path makes the parser take the next token as the
+    // value; `-hls_flags` must fail path validation instead of being
+    // accepted as a filename on an otherwise verified HLS command.
+    rejected(
+        "ffmpeg -i in.mp4 -c:v libx264 -crf 23 -c:a aac -f hls -hls_time 6 -hls_playlist_type vod -hls_list_size 0 -hls_segment_filename -hls_flags -y out.m3u8",
+        "UnsupportedValue",
+        "./-name",
     );
 }
 
@@ -932,7 +945,7 @@ fn corpus_collective_conflict_names_anchor_the_earliest_occurrence() {
 
 #[test]
 fn corpus_copy_side_anchor_is_value_aware_and_maps_anchor_their_occurrence() {
-    // Reviewer command 1: tokens 2=-map 3=0 4=-c:v 5=libx264 6=-c:a 7=copy —
+    // Command 1: tokens 2=-map 3=0 4=-c:v 5=libx264 6=-c:a 7=copy —
     // the conflicting copy is the -c:a occurrence at #6, NOT the earlier
     // non-copy -c:v at #4.
     let err = from_cli("ffmpeg -i in.mp4 -map 0 -c:v libx264 -c:a copy -y out.mp4")
@@ -957,7 +970,7 @@ fn corpus_copy_side_anchor_is_value_aware_and_maps_anchor_their_occurrence() {
         other => panic!("expected ConflictingOptions, got {other}"),
     }
 
-    // Reviewer command 2: tokens 2=-map 3=0:v 4=-map 5=0 6=-c:a 7=copy —
+    // Command 2: tokens 2=-map 3=0:v 4=-map 5=0 6=-c:a 7=copy —
     // the OFFENDING unqualified map is the second occurrence at #4; the
     // legal first map at #2 must not be blamed.
     let err = from_cli("ffmpeg -i in.mp4 -map 0:v -map 0 -c:a copy -y out.mp4")
@@ -1090,7 +1103,7 @@ fn corpus_empty_command() {
 }
 
 // ---------------------------------------------------------------------------
-// Additional accepted-but-unverified spellings (Round-1 surface).
+// Additional accepted-but-unverified spellings of the accept surface.
 // ---------------------------------------------------------------------------
 
 #[test]

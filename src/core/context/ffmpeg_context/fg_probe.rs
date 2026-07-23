@@ -52,21 +52,25 @@ pub(super) struct ProbedPad {
     /// Display name (`filter` or `filter:pad`), mirroring the naming the
     /// AVFilterInOut-based probe produced.
     pub(super) name: String,
-    /// (chain, filter) coordinates of the filter owning this pad, keyed like
-    /// [`ProbedTopology::edges`] endpoints — lets consumers run reachability
-    /// over the mirrored links.
-    pub(super) node: (usize, usize),
+    /// The pad itself, keyed like [`ProbedTopology::edges`] endpoints — lets
+    /// consumers run reachability over the mirrored data flow.
+    pub(super) pad_ref: PadRef,
 }
 
 pub(super) struct ProbedTopology {
     pub(super) inputs: Vec<ProbedPad>,
     pub(super) outputs: Vec<ProbedPad>,
-    /// The mirrored links, directed producer -> consumer, over the same
-    /// (chain, filter) coordinates as [`ProbedPad::node`]. Lets consumers
-    /// check directed reachability (can frames entering an open input pad
-    /// influence an open output pad?), which weak component counting cannot
-    /// answer.
-    pub(super) edges: Vec<NodeEdge>,
+    /// The mirrored data flow at PAD granularity, directed source ->
+    /// destination: output-pad -> input-pad edges are the would-be links
+    /// between filters, input-pad -> output-pad edges are in-filter routing
+    /// (a full crossbar: every input pad of a filter counts as influencing
+    /// every output pad, because libavfilter routing is not static — a
+    /// selector's `map` can be rewritten mid-stream by `sendcmd`, so no
+    /// applied option proves an input can never reach an output). Lets
+    /// consumers check directed STRUCTURAL reachability (is an open input
+    /// pad wired into the flow that feeds an open output pad?), which weak
+    /// component counting cannot answer.
+    pub(super) edges: Vec<PadEdge>,
     /// Number of weakly-connected components over the created filters, where
     /// the edges are the links the mirror pass established (labeled and
     /// implicit alike). `1` for every ordinary chain; a `;`-separated
@@ -181,10 +185,37 @@ pub(super) unsafe fn init_topology_filters(seg: *mut AVFilterGraphSegment) -> i3
     0
 }
 
-/// A would-be link between two created filters, in (chain, filter) node
-/// coordinates, DIRECTED as (producer, consumer): frames flow from the first
-/// node into the second.
-pub(super) type NodeEdge = ((usize, usize), (usize, usize));
+/// One pad endpoint of the mirrored data-flow graph: pad index `pad` on the
+/// input or output side of the filter at `node` (chain, filter) coordinates.
+/// The side matters — input pad 0 and output pad 0 of the same filter are
+/// distinct endpoints, connected only by that filter's in-filter routing.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(super) struct PadRef {
+    pub(super) node: (usize, usize),
+    pub(super) is_output: bool,
+    pub(super) pad: usize,
+}
+
+/// A directed data-flow edge between two pad endpoints: frames flow from the
+/// first pad into the second. See [`ProbedTopology::edges`] for the two edge
+/// kinds (between-filter links and in-filter routing).
+pub(super) type PadEdge = (PadRef, PadRef);
+
+fn in_pad(ci: usize, fi: usize, pad: usize) -> PadRef {
+    PadRef {
+        node: (ci, fi),
+        is_output: false,
+        pad,
+    }
+}
+
+fn out_pad(ci: usize, fi: usize, pad: usize) -> PadRef {
+    PadRef {
+        node: (ci, fi),
+        is_output: true,
+        pad,
+    }
+}
 
 /// Link-table mirror of one created filter.
 struct NodeState {
@@ -414,7 +445,11 @@ unsafe fn describe_pad(
         linklabel: label.unwrap_or_default(),
         media_type,
         name,
-        node,
+        pad_ref: PadRef {
+            node,
+            is_output,
+            pad: pad_idx,
+        },
     })
 }
 
@@ -423,7 +458,7 @@ fn link_inputs_mirror(
     ci: usize,
     fi: usize,
     open: &mut Vec<ProbedPad>,
-    edges: &mut Vec<NodeEdge>,
+    edges: &mut Vec<PadEdge>,
 ) -> Result<()> {
     let (eff, exact, nb_labels) = {
         let n = &nodes[ci][fi];
@@ -447,7 +482,7 @@ fn link_inputs_mirror(
                 unsafe { check_link_media_types(nodes, (cj, fj, pj), (ci, fi, pi)) }?;
                 nodes[cj][fj].out_linked[pj] = true;
                 nodes[ci][fi].in_linked[pi] = true;
-                edges.push(((cj, fj), (ci, fi)));
+                edges.push((out_pad(cj, fj, pj), in_pad(ci, fi, pi)));
                 continue;
             }
         }
@@ -461,7 +496,7 @@ fn link_outputs_mirror(
     ci: usize,
     fi: usize,
     open: &mut Vec<ProbedPad>,
-    edges: &mut Vec<NodeEdge>,
+    edges: &mut Vec<PadEdge>,
 ) -> Result<()> {
     let (eff, exact, nb_labels) = {
         let n = &nodes[ci][fi];
@@ -485,7 +520,7 @@ fn link_outputs_mirror(
                 unsafe { check_link_media_types(nodes, (ci, fi, pi), (cj, fj, pj)) }?;
                 nodes[cj][fj].in_linked[pj] = true;
                 nodes[ci][fi].out_linked[pi] = true;
-                edges.push(((ci, fi), (cj, fj)));
+                edges.push((out_pad(ci, fi, pi), in_pad(cj, fj, pj)));
                 continue 'pads;
             }
         } else {
@@ -509,7 +544,7 @@ fn link_outputs_mirror(
                     unsafe { check_link_media_types(nodes, (ci, fi, pi), (ci, nfi, pj)) }?;
                     nodes[ci][nfi].in_linked[pj] = true;
                     nodes[ci][fi].out_linked[pi] = true;
-                    edges.push(((ci, fi), (ci, nfi)));
+                    edges.push((out_pad(ci, fi, pi), in_pad(ci, nfi, pj)));
                     continue 'pads;
                 }
                 break;
@@ -542,6 +577,32 @@ pub(super) unsafe fn probe_open_pads(seg: *mut AVFilterGraphSegment) -> Result<P
             link_outputs_mirror(&mut nodes, ci, fi, &mut outputs, &mut edges)?;
         }
     }
+    // In-filter routing edges, added after the links so `edges` describes the
+    // complete pad-level data flow: every input pad of a filter is treated as
+    // influencing every output pad (a full crossbar). This deliberately
+    // includes filters whose CURRENT options would drop an input: a
+    // `streamselect=map=0` graph relays only pad 0 today, but `map` is a
+    // runtime command (`sendcmd`/`avfilter_graph_send_command` rewrite it
+    // mid-stream, after which the other pad feeds the output) and ffmpeg
+    // accepts such descriptions as-is — verified against ffmpeg 7.1.3, which
+    // encodes "color[bg];[bg][in]streamselect=inputs=2:map=0" without
+    // complaint and honors a later `map 1` command. Pruning by the applied
+    // map would therefore reject valid graphs whose dropped input can still
+    // reach the output at runtime. The crossbar keeps the walk structural: it
+    // answers "is the pad wired into the flow that feeds the output?", never
+    // "will frames survive the trip?".
+    for (ci, chain) in nodes.iter().enumerate() {
+        for (fi, n) in chain.iter().enumerate() {
+            if n.ctx.is_null() {
+                continue;
+            }
+            for pj in 0..n.out_linked.len() {
+                for pi in 0..n.in_linked.len() {
+                    edges.push((in_pad(ci, fi, pi), out_pad(ci, fi, pj)));
+                }
+            }
+        }
+    }
     let filter_components = count_components(&nodes, &edges);
     Ok(ProbedTopology {
         inputs,
@@ -553,8 +614,10 @@ pub(super) unsafe fn probe_open_pads(seg: *mut AVFilterGraphSegment) -> Result<P
 
 /// Weakly-connected components of the created filters under the mirrored
 /// links, via a plain union-find over dense node ids. Skipped (null-ctx)
-/// entries are not nodes.
-fn count_components(nodes: &[Vec<NodeState>], edges: &[NodeEdge]) -> usize {
+/// entries are not nodes. In-filter routing edges connect two pads of the
+/// same node, so under the node-granular union they are no-ops and the count
+/// stays the pure link-connectivity the field documents.
+fn count_components(nodes: &[Vec<NodeState>], edges: &[PadEdge]) -> usize {
     // Dense id per created filter.
     let mut id = std::collections::HashMap::new();
     for (ci, chain) in nodes.iter().enumerate() {
@@ -574,7 +637,7 @@ fn count_components(nodes: &[Vec<NodeState>], edges: &[NodeEdge]) -> usize {
         x
     }
     for (a, b) in edges {
-        let (Some(&ia), Some(&ib)) = (id.get(a), id.get(b)) else {
+        let (Some(&ia), Some(&ib)) = (id.get(&a.node), id.get(&b.node)) else {
             continue;
         };
         let (ra, rb) = (find(&mut parent, ia), find(&mut parent, ib));
