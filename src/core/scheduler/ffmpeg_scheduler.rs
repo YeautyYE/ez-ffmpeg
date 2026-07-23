@@ -1584,10 +1584,10 @@ mod tests {
     /// reach and must keep the disarm adjacent.
     #[test]
     fn start_tail_releases_the_sentinel_only_after_the_running_guard_is_installed() {
-        use super::{start_tail_probe, STATUS_ABORT, STATUS_END};
+        use super::{is_stopping, start_tail_probe, STATUS_ABORT, STATUS_END};
         use std::fs::File;
         use std::io::{Read, Seek, SeekFrom};
-        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
 
         // test.mp4 through read/seek callbacks whose post-build reads are
         // held by a gate: while the gate is closed the demux worker cannot
@@ -1596,27 +1596,36 @@ mod tests {
         // 4 KiB and capping probesize at 4 KiB starves build-time probing,
         // but no byte budget can PROVE a post-gate read happens (probing
         // reads and demuxer seeks are unbounded in count) — so the callback
-        // additionally records whether a read ever entered while the gate
-        // was closed, and the test refuses to proceed until one provably
-        // did. The wait is bounded so a failing test run cannot wedge the
-        // worker forever.
+        // counts reads entering and leaving the closed gate, and the test
+        // refuses to proceed until one is provably parked there and then.
+        // Each wait is bounded so a failing run cannot wedge the worker
+        // forever, but a fallback that fires with the gate still closed is
+        // recorded and fails the test at the end: every inspection below
+        // assumes the gate held its worker throughout.
         let file = Arc::new(Mutex::new(
             File::open("test.mp4").expect("test input must exist"),
         ));
         let gate = Arc::new(AtomicBool::new(false));
-        let entered_while_gated = Arc::new(AtomicBool::new(false));
-        let (gate_r, file_r, entered_r) = (
-            gate.clone(),
-            file.clone(),
-            entered_while_gated.clone(),
+        let gate_wait_enters = Arc::new(AtomicUsize::new(0));
+        let gate_wait_exits = Arc::new(AtomicUsize::new(0));
+        let gate_wait_timed_out = Arc::new(AtomicBool::new(false));
+        let (gate_r, file_r) = (gate.clone(), file.clone());
+        let (enters_r, exits_r, timed_out_r) = (
+            gate_wait_enters.clone(),
+            gate_wait_exits.clone(),
+            gate_wait_timed_out.clone(),
         );
         let read_callback: Box<dyn FnMut(&mut [u8]) -> i32 + Send> = Box::new(move |buf| {
             if gate_r.load(Ordering::Acquire) {
-                entered_r.store(true, Ordering::Release);
-            }
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            while gate_r.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(1));
+                enters_r.fetch_add(1, Ordering::AcqRel);
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while gate_r.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                if gate_r.load(Ordering::Acquire) {
+                    timed_out_r.store(true, Ordering::Release);
+                }
+                exits_r.fetch_add(1, Ordering::AcqRel);
             }
             let mut file = file_r.lock().unwrap();
             match file.read(buf) {
@@ -1718,12 +1727,13 @@ mod tests {
         // The holder slot exists only in this test, so a failing start()
         // would deadlock on it: StartFailGuard::drop waits for every slot,
         // and the test thread that would release the holder is inside
-        // start(). The failsafe returns the holder on a bound in that case
-        // — opening the gate first, so the failure's own joins drain
-        // instead of stalling each gated read to its fallback — letting
-        // start() surface its error as a failed expect instead of a suite
-        // hang. The swap makes the release exactly-once whichever side
-        // gets there.
+        // start(). Two rescuers cover that, each opening the gate BEFORE
+        // returning the holder so the failure's own joins drain instead of
+        // stalling every gated read to its fallback: a status watcher that
+        // reacts the moment the failure guard publishes the terminal status
+        // (which it does before its joins), and a 30 s failsafe for a
+        // start() that hangs without ever publishing one. The swap makes
+        // the release exactly-once whichever side gets there.
         let holder_released = Arc::new(AtomicBool::new(false));
         let release_holder = {
             let (sync, flag) = (sync.clone(), holder_released.clone());
@@ -1733,12 +1743,34 @@ mod tests {
                 }
             }
         };
+        let watcher_done = Arc::new(AtomicBool::new(false));
+        let start_fail_watcher = {
+            let (status, gate, release_holder, done) = (
+                status.clone(),
+                gate.clone(),
+                release_holder.clone(),
+                watcher_done.clone(),
+            );
+            std::thread::spawn(move || {
+                while !done.load(Ordering::Acquire) {
+                    if is_stopping(status.load(Ordering::Acquire)) {
+                        gate.store(false, Ordering::Release);
+                        release_holder();
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            })
+        };
+        let failsafe_fired = Arc::new(AtomicBool::new(false));
         let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
         let holder_failsafe = {
             let release_holder = release_holder.clone();
             let gate = gate.clone();
+            let fired = failsafe_fired.clone();
             std::thread::spawn(move || {
                 if started_rx.recv_timeout(Duration::from_secs(30)).is_err() {
+                    fired.store(true, Ordering::Release);
                     gate.store(false, Ordering::Release);
                     release_holder();
                 }
@@ -1748,10 +1780,10 @@ mod tests {
         // Reopen the gate on EVERY exit path, in two phases around the
         // fallible start(): the pre-start guard covers a start() that
         // returns an error — the failed expect's unwind opens the gate at
-        // once (the joins INSIDE a failing start() are already bounded by
-        // the read fallback and the failsafe above) — and is disarmed when
-        // the post-start guards take over in the drop order that matters
-        // there.
+        // once (the joins INSIDE a failing start() are unwedged by the
+        // status watcher above, with the read fallback and the failsafe as
+        // last resorts) — and is disarmed when the post-start guards take
+        // over in the drop order that matters there.
         struct OpenOnExit(Option<Arc<AtomicBool>>);
         impl OpenOnExit {
             fn disarm(&mut self) {
@@ -1767,6 +1799,8 @@ mod tests {
         }
         let mut pre_start_gate = OpenOnExit(Some(gate.clone()));
         let running = scheduler.start().expect("the minimal copy job must start");
+        watcher_done.store(true, Ordering::Release);
+        start_fail_watcher.join().unwrap();
         let _ = started_tx.send(());
         holder_failsafe.join().unwrap();
         // Post-start unwind, in reverse declaration order: the gate opens
@@ -1783,17 +1817,23 @@ mod tests {
         let _open_gate = OpenOnExit(Some(gate.clone()));
         pre_start_gate.disarm();
 
-        // The handshake the gate's premise rests on: a demux read provably
-        // ENTERED while the gate was closed, so EOF was not reachable from
-        // build-time buffering alone and the barrier is held by a genuinely
-        // gated worker — no byte-budget arithmetic can show that. Only then
-        // has the pre-start holder served its purpose and goes back.
+        // The handshake the gate's premise rests on: a demux read is parked
+        // in the closed gate RIGHT NOW (enters > exits), so EOF was not
+        // reachable from build-time buffering alone and the barrier is held
+        // by a genuinely gated worker — no byte-budget arithmetic can show
+        // that, and a set-once "entered" flag could not either: it stays
+        // true after its read burns the fallback and finishes the file.
+        // While the gate is closed a counted read can leave ONLY through
+        // the (recorded, test-failing) fallback, so the two loads cannot
+        // tear into a false positive. Only then has the pre-start holder
+        // served its purpose and goes back.
         let handshake_deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !entered_while_gated.load(Ordering::Acquire) {
+        while gate_wait_enters.load(Ordering::Acquire) <= gate_wait_exits.load(Ordering::Acquire)
+        {
             assert!(
                 std::time::Instant::now() < handshake_deadline,
-                "no read entered while the gate was closed: build-time \
-                 probing consumed the input and the gate holds nothing"
+                "no read is parked in the closed gate: build-time probing \
+                 consumed the input and the gate holds nothing"
             );
             std::thread::sleep(Duration::from_millis(2));
         }
@@ -1834,6 +1874,18 @@ mod tests {
         assert!(
             result.lock().unwrap().is_none(),
             "no failure may be recorded after the success tail admitted the waiter"
+        );
+        // Gate health, checked LAST: if any gated read burned its fallback
+        // or the failsafe fired, some window above ran against a job the
+        // gate was no longer holding and every conclusion is vacuous.
+        assert!(
+            !gate_wait_timed_out.load(Ordering::Acquire),
+            "a gated read burned its 10 s fallback with the gate still closed"
+        );
+        assert!(
+            !failsafe_fired.load(Ordering::Acquire),
+            "the 30 s failsafe fired: start() never handed control back \
+             within the inspection budget"
         );
     }
 
