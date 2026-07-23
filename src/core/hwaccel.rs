@@ -214,6 +214,24 @@ pub(crate) unsafe fn hw_device_free_all() {
     }
 }
 
+/// Name of a hardware device type, `None` when the linked FFmpeg has no
+/// name for it — `av_hwdevice_get_type_name` returns NULL then, notably
+/// for `AV_HWDEVICE_TYPE_NONE` — so log paths never hand a NULL to
+/// `CStr::from_ptr`.
+pub(crate) fn hw_device_type_name(device_type: AVHWDeviceType) -> Option<&'static str> {
+    // SAFETY: av_hwdevice_get_type_name returns NULL or a pointer into a
+    // static name table in libavutil, so a non-NULL result is a valid C
+    // string with static lifetime.
+    unsafe {
+        let name = av_hwdevice_get_type_name(device_type);
+        if name.is_null() {
+            None
+        } else {
+            CStr::from_ptr(name).to_str().ok()
+        }
+    }
+}
+
 pub(crate) fn hw_device_for_filter() -> Option<HWDevice> {
     if let Some(slot) = FILTER_HW_DEVICE.get() {
         let slot = slot.lock().unwrap();
@@ -226,27 +244,25 @@ pub(crate) fn hw_device_for_filter() -> Option<HWDevice> {
     let devices = HW_DEVICES.get_or_init(new_hw_devices);
 
     let devices = devices.lock().unwrap();
-    if !devices.is_empty() {
-        let dev = devices.last();
-
-        match dev {
-            None => {}
-            Some(dev) => {
-                if devices.len() > 1 {
-                    unsafe {
-                        let type_name = av_hwdevice_get_type_name(dev.device_type);
-                        let type_name = CStr::from_ptr(type_name).to_str();
-                        if let Ok(type_name) = type_name {
-                            warn!("There are {} hardware devices. device {} of type {type_name} is picked for filters by default. Set hardware device explicitly with the filter_hw_device option if device {} is not usable for filters.",
-                            devices.len(),dev.name,
-                            dev.name,);
-                        }
-                    }
-                }
-
-                return Some(dev.clone());
-            }
+    // Only a device with a concrete type can back a filter, so the default
+    // skips AV_HWDEVICE_TYPE_NONE entries — the by-type and by-codec lookups
+    // match on a real type and never see them, and a NONE entry's type has
+    // no name, which would send NULL through the advisory warn below. The
+    // newest concretely-typed registration wins, matching the previous
+    // last() pick.
+    if let Some(dev) = devices
+        .iter()
+        .rev()
+        .find(|dev| dev.device_type != AVHWDeviceType::AV_HWDEVICE_TYPE_NONE)
+    {
+        if devices.len() > 1 {
+            let type_name = hw_device_type_name(dev.device_type).unwrap_or("unknown");
+            warn!("There are {} hardware devices. device {} of type {type_name} is picked for filters by default. Set hardware device explicitly with the filter_hw_device option if device {} is not usable for filters.",
+            devices.len(),dev.name,
+            dev.name,);
         }
+
+        return Some(dev.clone());
     }
 
     None
@@ -977,6 +993,16 @@ mod tests {
         )
     }
 
+    /// `dev_with_ref` with a concrete device type, for pinning selection
+    /// rules that must distinguish typed entries from TYPE_NONE sentinels.
+    fn typed_dev_with_ref(
+        name: &str,
+        device_type: AVHWDeviceType,
+        device_ref: *mut AVBufferRef,
+    ) -> HWDevice {
+        HWDevice::new(name.to_string(), device_type, device_ref, None)
+    }
+
     /// Allocates a real 1-byte refcounted buffer as a context stand-in.
     fn sentinel_buffer() -> *mut AVBufferRef {
         // SAFETY: av_buffer_alloc returns an owned refcounted buffer.
@@ -1393,5 +1419,55 @@ mod tests {
             names.iter().any(|n| n == "fresh"),
             "the new entry must be registered"
         );
+    }
+
+    // hw_device_for_filter must never pick a TYPE_NONE entry: no filter can
+    // bind such a device, and its type has no name — selecting one sent
+    // av_hwdevice_get_type_name's NULL straight into CStr::from_ptr inside
+    // the multi-device advisory warn, taking the whole process down whenever
+    // a concurrently running job configured a filtergraph while this
+    // registry held sentinel entries.
+    #[test]
+    fn filter_default_skips_typeless_devices() {
+        let _registry = HW_REGISTRY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = RegistrySnapshot::take();
+
+        add_hw_device(dev_with_ref("s0", None, sentinel_buffer()));
+        add_hw_device(dev_with_ref("s1", None, sentinel_buffer()));
+
+        assert!(
+            hw_device_for_filter().is_none(),
+            "a TYPE_NONE device must never be the filter default"
+        );
+    }
+
+    // With typed and typeless entries mixed, the newest concretely-typed one
+    // wins — the previous blind last() pick would have handed the sentinel
+    // to the filtergraph — and the multi-device warn resolves a real type
+    // name on the way out.
+    #[test]
+    fn filter_default_picks_the_newest_concretely_typed_device() {
+        let _registry = HW_REGISTRY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = RegistrySnapshot::take();
+
+        add_hw_device(typed_dev_with_ref(
+            "older-cuda",
+            AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA,
+            sentinel_buffer(),
+        ));
+        add_hw_device(typed_dev_with_ref(
+            "newer-vaapi",
+            AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+            sentinel_buffer(),
+        ));
+        add_hw_device(dev_with_ref("sentinel", None, sentinel_buffer()));
+
+        let picked = hw_device_for_filter()
+            .expect("a concretely typed device must be picked over sentinels");
+        assert_eq!(picked.name, "newer-vaapi");
     }
 }
