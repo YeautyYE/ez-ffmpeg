@@ -3190,11 +3190,12 @@ mod tests {
     // via a MANUAL thread_done_with (not ThreadDoneGuard) so the release lands
     // only after the output's teardown — the trailer where a container writes
     // one (packet-sink workers write none; streamless and header-failure
-    // outputs release the same pre-counted slot without a worker at all, via
-    // release_mux_slot), then the encoder join — while mux completion itself
-    // (STATUS_END via MuxDoneGuard) is deliberately published BEFORE the
-    // encoder join. A panic before that manual call would leak the slot and
-    // hang wait_for_all_threads.
+    // paths release inside the worker via MuxSlotGuard::release() after their
+    // own teardown, while release_mux_slot covers scheduler-start slots that
+    // were never handed to a worker at all), then the encoder join — while mux
+    // completion itself (STATUS_END via MuxDoneGuard) is deliberately
+    // published BEFORE the encoder join. A panic before that manual call
+    // would leak the slot and hang wait_for_all_threads.
     // MuxSlotGuard is the panic-only net: an ARMED drop (the unwind path) must
     // release the slot.
     #[test]
