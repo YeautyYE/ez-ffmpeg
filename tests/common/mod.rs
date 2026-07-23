@@ -146,7 +146,10 @@ pub enum SinkEv {
     End {
         thread: std::thread::ThreadId,
     },
-    Error(String),
+    Error {
+        message: String,
+        thread: std::thread::ThreadId,
+    },
 }
 
 pub type SinkLog = Arc<Mutex<Vec<SinkEv>>>;
@@ -172,7 +175,12 @@ pub fn recording_sink() -> (PacketSink, SinkLog) {
             thread: std::thread::current().id(),
         })
     })
-    .on_delivery_error(move |e| err_log.lock().unwrap().push(SinkEv::Error(e.to_string())))
+    .on_delivery_error(move |e| {
+        err_log.lock().unwrap().push(SinkEv::Error {
+            message: e.to_string(),
+            thread: std::thread::current().id(),
+        })
+    })
     .build();
     (sink, log)
 }
@@ -282,4 +290,94 @@ pub fn assert_warning_containing(needle: &str) {
             .collect::<Vec<_>>()
             .join("\n")
     );
+}
+
+// ---- backpressure listener helpers (tests/lifecycle.rs, tests/packet_sink.rs) ----
+
+/// A loopback TCP listener whose `SO_RCVBUF` is fixed BEFORE `listen(2)`, so
+/// accepted connections inherit the small receive buffer. Linux only applies a
+/// receive-buffer size to CHILD sockets when it is set before listen; shrinking
+/// an already-listening `std::net::TcpListener` does not propagate to accepted
+/// connections. Returns `None` if the raw socket setup fails (the caller then
+/// falls back to a default listener and the weaker assertion). Linux-only.
+#[cfg(target_os = "linux")]
+fn listener_with_small_rcvbuf(rcvbuf: libc::c_int) -> Option<std::net::TcpListener> {
+    use std::os::unix::io::FromRawFd;
+    // SAFETY: the standard socket(2)/setsockopt(2)/bind(2)/listen(2) sequence on
+    // a fresh AF_INET stream socket. The fd is closed on every early return and
+    // adopted by TcpListener only on the success path.
+    unsafe {
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+        if fd < 0 {
+            return None;
+        }
+        let set = |opt: libc::c_int, val: libc::c_int| -> bool {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                opt,
+                &val as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            ) == 0
+        };
+        // SO_RCVBUF before listen so children inherit it; SO_REUSEADDR for a
+        // clean re-bind of the ephemeral port.
+        if !set(libc::SO_RCVBUF, rcvbuf) || !set(libc::SO_REUSEADDR, 1) {
+            libc::close(fd);
+            return None;
+        }
+        let addr = libc::sockaddr_in {
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: 0, // ephemeral port
+            sin_addr: libc::in_addr {
+                s_addr: u32::from(std::net::Ipv4Addr::LOCALHOST).to_be(),
+            },
+            sin_zero: [0; 8],
+        };
+        let bound = libc::bind(
+            fd,
+            &addr as *const libc::sockaddr_in as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        ) == 0;
+        if !bound || libc::listen(fd, 1) != 0 {
+            libc::close(fd);
+            return None;
+        }
+        Some(std::net::TcpListener::from_raw_fd(fd))
+    }
+}
+
+/// Whether `fd`'s effective `SO_RCVBUF` is confirmed small (< 1 MiB). Linux
+/// reports ~2x the requested size (kernel bookkeeping doubling); anything well
+/// under a MiB forces backpressure within the test window. Must be read on the
+/// ACCEPTED child socket — the listener's value is not proof it reached the child.
+#[cfg(target_os = "linux")]
+pub fn rcvbuf_is_small(fd: std::os::unix::io::RawFd) -> bool {
+    // SAFETY: getsockopt on a valid fd with SOL_SOCKET/SO_RCVBUF into a c_int.
+    unsafe {
+        let mut got: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let ret = libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &mut got as *mut libc::c_int as *mut libc::c_void,
+            &mut len,
+        );
+        ret == 0 && got < 1024 * 1024
+    }
+}
+
+/// Build the backpressure listener and report whether its receive buffer could be
+/// provably shrunk before `listen(2)`. On non-Linux (or on raw-socket failure) a
+/// default listener is used and backpressure is not claimed here; callers needing
+/// proof verify the accepted child socket separately before a strong assertion.
+pub fn make_backpressure_listener() -> (std::net::TcpListener, bool) {
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(l) = listener_with_small_rcvbuf(16 * 1024) {
+            return (l, true);
+        }
+    }
+    (std::net::TcpListener::bind("127.0.0.1:0").unwrap(), false)
 }

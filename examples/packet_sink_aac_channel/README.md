@@ -9,7 +9,10 @@ packet events on a separate thread while the job runs:
   `AudioSpecificConfig`, sample rate and channel layout;
 - each `Packet` is an owned `EncodedPacket` (raw AAC frame plus tick and
   microsecond timing);
-- `End` closes the stream of events.
+- `End` reports terminal success, but only best-effort: it is a `try_send`
+  that is dropped when the channel is full. Sender disconnection is the
+  authoritative closure signal — it ends the consumer's `iter()` loop even
+  when the `End` event was dropped.
 
 The channel is bounded: when it fills, the delivery thread blocks until the
 consumer catches up — which is why the consumer drains **concurrently** and

@@ -2,6 +2,7 @@ use crate::core::context::muxer::{Muxer, SqMuxPlan, StreamBsfChains};
 use crate::core::context::obj_pool::ObjPool;
 use crate::core::context::pre_mux_queue::PreMuxQueueReceiver;
 use crate::core::context::{PacketBox, PacketData};
+use crate::core::packet_sink::dispose_panic_payload;
 use crate::core::scheduler::ffmpeg_scheduler::{
     is_stopping, packet_is_null, set_scheduler_error, wait_until_not_paused, STATUS_ABORT,
     STATUS_END,
@@ -418,23 +419,15 @@ fn mux_task_start(
     mux_done: MuxDoneGuard,
 ) -> crate::error::Result<()> {
     let Some(queue_sender) = queue_sender else {
-        // A packet sink with zero streams has nothing to deliver and no
-        // file to create: fail typed (before the callbacks could ever fire)
-        // instead of running the streamless open below against a context
-        // that has no URL.
-        if packet_sink.is_some() {
-            let error = crate::error::Error::PacketSink(crate::error::PacketSinkError::NoStreams);
-            fail_mux_init(
-                &scheduler_status,
-                &scheduler_result,
-                MuxInitQueues::NONE,
-                guard,
-                slot_guard,
-                crate::error::Error::PacketSink(crate::error::PacketSinkError::NoStreams),
-                packet_sink,
-            );
-            return Err(error);
-        }
+        // No queue means no mapped stream (`Muxer::new_stream` creates the
+        // queue with the first stream). A packet sink cannot reach this task
+        // stream-less: build()'s `check_output_streams` already rejected it
+        // with the typed `PacketSinkError::NoStreams` before any scheduler
+        // thread spawned, so the streamless-open path below is container-only.
+        debug_assert!(
+            packet_sink.is_none(),
+            "zero-stream packet sink must fail typed at build()"
+        );
         // Zero-stream output (e.g. an AVFMT_NOSTREAMS muxer like ffmetadata): no mux
         // worker thread is spawned, so this branch — not `_mux_init` — is the only
         // place a file-backed streamless output gets opened. Open it here (deferred
@@ -552,7 +545,6 @@ fn mux_task_start(
     Ok(())
 }
 
-#[cfg_attr(not(feature = "cli"), allow(unused_variables))]
 fn _mux_init(
     mux_idx: usize,
     guard: MuxTeardownGuard,
@@ -561,7 +553,8 @@ fn _mux_init(
     recording_time_us: Option<i64>,
     stream_count: usize,
     format_opts: Option<HashMap<CString, CString>>,
-    strict_avoptions: bool,
+    // Consumed only by the cli-gated unconsumed-option check below.
+    #[cfg_attr(not(feature = "cli"), allow(unused_variables))] strict_avoptions: bool,
     bsf_chains: StreamBsfChains,
     packet_sink: Option<crate::core::packet_sink::PacketSink>,
     interrupt_state: Arc<crate::core::context::InterruptState>,
@@ -935,8 +928,10 @@ fn _mux_init(
             .take_pkt_receiver()
             .expect("mux worker without a packet queue");
         // Borrow of the guard-owned output context for the FFI calls below;
-        // NLL ends this borrow at its last use (the trailer), before the
-        // explicit drop(guard) in the teardown block.
+        // NLL ends this borrow at its last use — the trailer write on a
+        // container path that attempts one; earlier for a packet-sink
+        // worker (no trailer exists) or an abort (the trailer is skipped) —
+        // before the explicit drop(guard) in the teardown block.
         let out_fmt_ctx: &FormatContext = guard.ctx();
         // Per-output-stream BSF chains (None for streams without one), or an
         // empty vec when no output set a BSF at all. Owned by the worker; each
@@ -1368,10 +1363,7 @@ fn _mux_init(
                     && (*packet_box.packet.as_ptr()).stream_index >= 0
                 {
                     if let Some(sink) = sink_worker.as_mut() {
-                        ret = sink.process_and_deliver(
-                            out_fmt_ctx.as_ptr(),
-                            &mut packet_box,
-                        );
+                        ret = sink.process_and_deliver(&mut packet_box);
                     } else if has_bsf {
                         // Snapshot this stream's packet metadata so a later EOF
                         // flush can stamp the BSF's trailing packets correctly.
@@ -1398,7 +1390,18 @@ fn _mux_init(
                         trace!("Muxer returned EOF");
                         break;
                     } else if ret < 0 {
-                        error!("Error muxing a packet: stream_index={stream_index}, ret={ret}");
+                        // A sink delivery that bailed out because its channel
+                        // observed the job stopping records nothing and is
+                        // settled below as a clean stop, not a failure; keep
+                        // that exit quiet and every real error loud.
+                        if sink_worker
+                            .as_ref()
+                            .is_some_and(|sink| sink.cancelled_cleanly())
+                        {
+                            trace!("Sink delivery stopped cooperatively: stream_index={stream_index}");
+                        } else {
+                            error!("Error muxing a packet: stream_index={stream_index}, ret={ret}");
+                        }
                         break;
                     }
                 }
@@ -1456,12 +1459,32 @@ fn _mux_init(
             .then(|| interrupt_state.begin_output_finalize());
 
         // ---- Packet-sink terminal path (returns; containers continue below).
-        if let Some(mut sink) = sink_worker.take() {
-            debug!("Packet sink muxer finished.");
+        if let Some(sink) = sink_worker.take() {
+            // Region-wide ownership rule: from here to the slot release the
+            // worker (whose callback boxes hold user captures with arbitrary
+            // Drop code) is held by a disposal guard. EVERY exit — the
+            // explicit consumption at the terminal below, or any unwind
+            // crossing this frame — destroys those boxes one-per-catch, so
+            // a capture destructor's panic can never compose with an
+            // in-flight unwind into a panic-during-unwind process abort.
+            let mut sink = SinkDisposal::new(sink);
+            // The entry log runs under its own containment: a user-installed
+            // logger can panic on any record, and an uncontained unwind here
+            // would skip the terminal dispatch — no on_end for a healthy,
+            // fully drained job — while repainting the settled result as a
+            // worker panic. Contained, the panic changes nothing the settled
+            // result promised. The payload is disposed, not dropped raw: a
+            // panic_any payload's own destructor may panic again.
+            if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                debug!("Packet sink muxer finished.");
+            })) {
+                dispose_panic_payload(payload);
+            }
             // Sequence EVERY crate-side failure source BEFORE the terminal
-            // decision, so a delivered on_end implies wait() == Ok (the one
-            // carve-out — user-capture Drop panics AFTER the terminal — is
-            // contained below and cannot change the settled result):
+            // decision, so a delivered on_end implies wait() == Ok (the
+            // carve-outs — panics at or after the terminal, from the terminal
+            // callback itself or from user-capture Drops — are contained
+            // below and cannot change the settled result):
             // 1. close the live queue (wakes any sender);
             drop(pkt_receiver);
             // 2. stream bookkeeping, own-completion report and the input-
@@ -1544,18 +1567,10 @@ fn _mux_init(
             // status caused by a failure always has the error visible here),
             // while a clean stop() records nothing and stays silent.
             let aborted = scheduler_status.load(Ordering::Acquire) == STATUS_ABORT;
-            let job_error = if !aborted {
-                scheduler_result
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .as_ref()
-                    .and_then(|result| result.as_ref().err())
-                    .map(|e| e.to_string())
-            } else {
-                None
-            };
             // 6. POST-SETTLEMENT REGION, all of it under ONE panic
-            // containment boundary: the terminal dispatch (finish() runs the
+            // containment boundary: the job-error formatting (Display of a
+            // recorded error can run user code — frame-filter variants wrap
+            // user error types), the terminal dispatch (finish() runs the
             // user's on_end/on_delivery_error), the capture drops AND the
             // failure logging (a user-installed logger can itself panic).
             // After the barrier the only code left on this thread is user
@@ -1564,25 +1579,80 @@ fn _mux_init(
             // panic publisher or change the settled result another sink's
             // delivered on_end already promised. Still this worker thread
             // (S9); before the slot release, so stop() cannot return while a
-            // blocking terminal callback or destructor runs.
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    sink.finish(nb_done == stream_count, ret, aborted, job_error)
-                }))
-                .is_err()
-                {
+            // blocking terminal callback or destructor runs. Every catch in
+            // the region — inner and outer — disposes its caught payload
+            // through the bounded helper instead of discarding it: a
+            // panic_any payload's own destructor may panic, and a raw
+            // discard would start that new unwind exactly where the
+            // containment believed the panic was over.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Formatting sits in its own inner catch so a panicking
+                // Display cannot skip the terminal dispatch. Only the
+                // `e.to_string()` call can panic here (the lock handles
+                // poison, the Option/Result adapters cannot), so a caught
+                // panic proves an error IS recorded: substitute a fixed
+                // message rather than repaint the failed job as success.
+                let job_error = if !aborted {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        scheduler_result
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .as_ref()
+                            .and_then(|result| result.as_ref().err())
+                            .map(|e| e.to_string())
+                    }))
+                    .unwrap_or_else(|payload| {
+                        dispose_panic_payload(payload);
+                        Some(String::from(
+                            "job error message unavailable: formatting the recorded error panicked",
+                        ))
+                    })
+                } else {
+                    None
+                };
+                let finish_panicked = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || sink.finish(nb_done == stream_count, ret, aborted, job_error),
+                )) {
+                    Ok(()) => false,
+                    Err(payload) => {
+                        dispose_panic_payload(payload);
+                        true
+                    }
+                };
+                // Consume the sink BEFORE any failure logging: a log call
+                // that panics unwinds to the outer boundary, and if the sink
+                // were still owned that unwind would run the capture
+                // destructors — a destructor panic at that point would be a
+                // panic-during-unwind abort. The disposal destroys each
+                // callback box under its own catch (one catch around the
+                // whole aggregate would contain only the FIRST panicking
+                // capture; the unwind would then destroy the remaining boxes
+                // uncontained, where a second bomb aborts). With the sink
+                // already consumed, the log calls below are the last code on
+                // this path and their unwind crosses only plain locals.
+                let teardown_panicked = sink.dispose();
+                if finish_panicked {
                     // Best-effort: a panic from this log call is swallowed by
-                    // the outer boundary.
+                    // the outer boundary (possibly skipping the next log).
                     error!(
                         "packet sink terminal callback panicked; the settled job result is preserved"
                     );
                 }
-                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(sink))).is_err() {
+                if teardown_panicked {
                     error!(
                         "packet sink consumer state panicked during teardown; the settled job result is preserved"
                     );
                 }
             }));
+            if let Err(payload) = outcome {
+                // The boundary's own payload is disposed BEFORE the slot
+                // release: dropped raw, a panicking payload destructor would
+                // start a fresh unwind that skips the release — the settled
+                // job would then terminate through the unwind guards as a
+                // worker panic, repainting a result the delivered terminal
+                // already promised.
+                dispose_panic_payload(payload);
+            }
             slot_guard.release();
             return;
         }
@@ -1680,10 +1750,13 @@ fn _mux_init(
 }
 
 /// Releases a muxer's pre-counted thread slot, publishing STATUS_END if this
-/// was the last live thread (mirroring the normal mux-worker exit). Used on
-/// every path where the slot was counted at scheduler start but no (further)
-/// worker will release it: streamless output, write_header failure, worker
-/// spawn failure. Without this the slot leaks and wait()/stop() hangs forever.
+/// was the last live thread (mirroring the normal mux-worker exit). Its one
+/// production caller is the scheduler's start-failure cleanup, for outputs
+/// whose slot was pre-counted but never handed to mux_init; the mux-side
+/// paths that die before a worker exists (streamless output, open or
+/// write_header or BSF failure, worker spawn failure) release through the
+/// consuming MuxSlotGuard::release() instead. Without a release the slot
+/// leaks and wait()/stop() hangs forever.
 pub(crate) fn release_mux_slot(
     scheduler_status: &Arc<AtomicUsize>,
     thread_sync: &ThreadSynchronizer,
@@ -1871,7 +1944,6 @@ impl MuxDoneGuard {
             scheduler_status,
         }
     }
-
 }
 
 impl Drop for MuxDoneGuard {
@@ -1904,13 +1976,19 @@ impl Drop for MuxDoneGuard {
 
 /// Panic-only release net for the mux worker's pre-counted thread slot.
 ///
-/// The mux worker uses a MANUAL `thread_done_with` (not `ThreadDoneGuard`) so it
-/// can publish STATUS_END only AFTER writing the trailer and joining its
-/// encoders (the ordered terminal publish). That manual call is skipped if the
-/// worker unwinds (panics) partway through, leaking the slot — then
-/// `wait_for_all_threads` (`RunningGuard::Drop`) hangs forever. This guard
-/// releases the slot on unwind; the normal path calls `disarm()` immediately
-/// after its manual release so the slot is freed exactly once.
+/// The mux worker uses a MANUAL `thread_done_with` (not `ThreadDoneGuard`) so
+/// the slot is released only AFTER the output's teardown — writing the
+/// trailer where a container is written (a packet sink has none), joining its
+/// encoders and freeing the output context — wait()/stop() must not return
+/// while that teardown still runs. (Mux completion is published separately
+/// and EARLIER: the last muxer's `MuxDoneGuard` deliberately stores
+/// STATUS_END BEFORE the encoder join, so a parked encoder observes it and
+/// exits joinably.) That
+/// manual call is skipped if the worker unwinds (panics) partway through,
+/// leaking the slot — then `wait_for_all_threads` (`RunningGuard::Drop`) hangs
+/// forever. This guard releases the slot on unwind; the normal path goes
+/// through the consuming `release()` (disarm first, then the same release
+/// closure), so the slot is freed exactly once.
 struct MuxSlotGuard {
     armed: bool,
     thread_sync: ThreadSynchronizer,
@@ -1984,6 +2062,52 @@ impl Drop for MuxSlotGuard {
             .thread_done_with_settled(self.settled_registered.get(), move || {
                 status.store(STATUS_END, Ordering::Release);
         });
+    }
+}
+
+/// Terminal-region custody of the taken packet-sink worker.
+///
+/// The worker's callback boxes hold user captures whose `Drop` code is
+/// arbitrary. Holding the worker as a plain local would let ANY unwind
+/// crossing the terminal region run those destructors as ordinary drop
+/// glue — mid-unwind, uncontained, where one panicking capture aborts the
+/// process. Through this guard every exit path destroys the worker via its
+/// per-callback contained disposal instead: the explicit `dispose()` at the
+/// terminal on the normal path, or the guard's own Drop on unwind (each
+/// per-box catch stops the second panic INSIDE the destructor frame, which
+/// is exactly what keeps a panic-during-unwind from escalating).
+struct SinkDisposal(Option<crate::core::packet_sink::strict::PacketSinkWorker>);
+
+impl SinkDisposal {
+    fn new(worker: crate::core::packet_sink::strict::PacketSinkWorker) -> Self {
+        Self(Some(worker))
+    }
+
+    /// Forwards to the worker (`None` after disposal — no panic path).
+    fn pending_error_cloned(&self) -> Option<crate::error::PacketSinkError> {
+        self.0.as_ref().and_then(|worker| worker.pending_error_cloned())
+    }
+
+    /// Forwards the terminal dispatch to the worker (no-op after disposal).
+    fn finish(&mut self, all_streams_terminal: bool, ret: i32, aborted: bool, job_error: Option<String>) {
+        if let Some(worker) = self.0.as_mut() {
+            worker.finish(all_streams_terminal, ret, aborted, job_error);
+        }
+    }
+
+    /// Consumes the worker through its per-callback contained disposal;
+    /// true when any user destructor panicked. Idempotent — the Drop (and
+    /// any second call) then no-ops.
+    fn dispose(&mut self) -> bool {
+        self.0
+            .take()
+            .is_some_and(|worker| worker.dispose_contained())
+    }
+}
+
+impl Drop for SinkDisposal {
+    fn drop(&mut self) {
+        self.dispose();
     }
 }
 
@@ -2297,6 +2421,80 @@ struct MuxWriteState<'a> {
     nb_done: &'a mut usize,
 }
 
+/// In-flight probe for container writes to `tcp://` outputs. Every
+/// interleaved PACKET write funnels through [`write_packet`]
+/// (`avformat_write_header` and `av_write_trailer` are issued elsewhere and
+/// bypass it), so `ENTERED - RETURNED` is the number of
+/// `av_interleaved_write_frame` calls currently executing for a tcp output:
+/// a value of 1 frozen across a sampling window means one muxer thread is
+/// parked INSIDE the write (blocked by socket flow control), which no
+/// socket-side observation can distinguish from a producer that went idle.
+/// Gated on the `tcp://` prefix because the library's unit tests share one
+/// process: file-, null- and sink-backed outputs in concurrently running
+/// tests must never move these counters.
+#[cfg(test)]
+pub(crate) mod tcp_write_probe {
+    use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+    use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
+
+    /// `av_interleaved_write_frame` calls entered for a `tcp://` output.
+    pub(crate) static ENTERED: AtomicU64 = AtomicU64::new(0);
+    /// The subset of those calls that has returned.
+    pub(crate) static RETURNED: AtomicU64 = AtomicU64::new(0);
+    /// Return code of the most recently returned tcp write, stored BEFORE
+    /// `RETURNED` is bumped. Meaningful to a sampler only at WRITER
+    /// QUIESCENCE (after stop() has joined the workers): even a single
+    /// writer can bump `RETURNED` for generation g, enter g+1 and store
+    /// its return code before bumping again, so a live sampler seeing
+    /// `RETURNED == g` can read g+1's code. `exclusive()` serializes
+    /// TESTS, not writers within one test, and does not close that race —
+    /// which is why the cut acknowledgment pins the erroring call through
+    /// `LAST_ERR_GEN` and the electing interrupt through `CUT_GEN` rather
+    /// than leaning on this slot alone.
+    pub(crate) static LAST_RET: AtomicI32 = AtomicI32::new(0);
+    /// Generation — the post-increment `ENTERED` value — of the most
+    /// recent tcp write that returned a NEGATIVE code (0 = none yet).
+    /// Ties an observed failure to one specific call: asserting this
+    /// equals a previously captured parked generation proves THAT write,
+    /// not a later one or another output's, is the call that errored.
+    pub(crate) static LAST_ERR_GEN: AtomicU64 = AtomicU64::new(0);
+    /// Generation of the tcp write that an output-interrupt ELECTION cut
+    /// (0 = no election ever fired while a tcp write was in flight on the
+    /// electing thread). The callback runs on the muxer's own thread,
+    /// inside the blocked call's retry loop, so a recorded value proves
+    /// the interrupt chose to cut while THAT write was executing — a
+    /// write that failed on its own (peer reset, kernel error) never
+    /// passes through an electing callback and leaves this untouched.
+    pub(crate) static CUT_GEN: AtomicU64 = AtomicU64::new(0);
+    thread_local! {
+        /// Generation of the tcp write executing on THIS thread, set by
+        /// [`write_packet`](super::write_packet) around the FFI call so
+        /// the interrupt callback can attribute its election.
+        pub(crate) static IN_FLIGHT: std::cell::Cell<Option<u64>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// Called by the output interrupt callback when it elects to
+    /// interrupt: records the generation of the tcp write this thread is
+    /// currently inside, if any.
+    pub(crate) fn note_cut_election() {
+        if let Some(generation) = IN_FLIGHT.with(std::cell::Cell::get) {
+            CUT_GEN.store(generation, Ordering::Release);
+        }
+    }
+
+    /// Serializes every test that drives or samples these process-wide
+    /// counters. A muxer parked in a write by one test would satisfy — or
+    /// starve — another test's sampling window, so any test that opens a
+    /// `tcp://` output must hold this guard for its whole run.
+    pub(crate) fn exclusive() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 /// # Safety
 /// - `cfg.out_fmt_ctx` must reference the live output context (its pointer is
 ///   passed to `av_interleaved_write_frame`).
@@ -2315,7 +2513,33 @@ unsafe fn write_packet(
     (*sq_packet_box.packet.as_mut_ptr()).stream_index =
         sq_packet_box.packet_data.output_stream_index;
 
-    av_interleaved_write_frame(cfg.out_fmt_ctx.as_ptr(), sq_packet_box.packet.as_mut_ptr())
+    #[cfg(test)]
+    let counted = {
+        let url = (*cfg.out_fmt_ctx.as_ptr()).url;
+        let tcp = !url.is_null()
+            && std::ffi::CStr::from_ptr(url)
+                .to_bytes()
+                .starts_with(b"tcp://");
+        // The captured value is this call's generation: ENTERED after the
+        // increment.
+        tcp.then(|| tcp_write_probe::ENTERED.fetch_add(1, Ordering::Release) + 1)
+    };
+    #[cfg(test)]
+    if let Some(generation) = counted {
+        tcp_write_probe::IN_FLIGHT.with(|slot| slot.set(Some(generation)));
+    }
+    let ret =
+        av_interleaved_write_frame(cfg.out_fmt_ctx.as_ptr(), sq_packet_box.packet.as_mut_ptr());
+    #[cfg(test)]
+    if let Some(generation) = counted {
+        tcp_write_probe::IN_FLIGHT.with(|slot| slot.set(None));
+        tcp_write_probe::LAST_RET.store(ret, Ordering::Release);
+        if ret < 0 {
+            tcp_write_probe::LAST_ERR_GEN.store(generation, Ordering::Release);
+        }
+        tcp_write_probe::RETURNED.fetch_add(1, Ordering::Release);
+    }
+    ret
 }
 
 /// Write one packet the `sq_mux` released, via the per-stream BSF (or the direct
@@ -2837,9 +3061,8 @@ mod tests {
 
     /// The delayed-mux failure paths (write_header error, worker spawn
     /// failure) must release the pre-counted mux thread slot AFTER recording
-    /// the error — otherwise wait()/stop() hangs forever on the leaked slot
-    /// (the thread-slot leak found by review), or wait() returns success
-    /// without the error.
+    /// the error — otherwise wait()/stop() hangs forever on the leaked slot,
+    /// or wait() returns success without the error.
     #[test]
     fn fail_mux_init_releases_slot_and_records_error() {
         let thread_sync = ThreadSynchronizer::new();
@@ -2926,10 +3149,11 @@ mod tests {
         assert!(is_stopping(scheduler_status.load(Ordering::Acquire)));
     }
 
-    /// The zero-stream (AVFMT_NOSTREAMS) early return must release the
-    /// pre-counted slot WITHOUT recording an error — a streamless output is
-    /// legitimate, but leaving the slot counted hangs wait()/stop() (the
-    /// pre-existing leak surfaced by the slot-leak review).
+    /// A pre-counted slot returned with no worker and no error — the
+    /// accounting shared by the streamless early return (MuxSlotGuard) and
+    /// the scheduler's unhanded-slot cleanup (release_mux_slot) — must
+    /// unblock wait() without recording anything: such outputs are
+    /// legitimate, but leaving the slot counted hangs wait()/stop().
     #[test]
     fn release_mux_slot_unblocks_wait_without_error() {
         let thread_sync = ThreadSynchronizer::new();
@@ -2952,11 +3176,11 @@ mod tests {
         assert!(is_stopping(scheduler_status.load(Ordering::Acquire)));
     }
 
-    // Regression for the premature-STATUS_END truncation (found by the SHIP
-    // review): a streamless (AVFMT_NOSTREAMS) output releases its thread slot
-    // synchronously via `release_mux_slot`. The scheduler now pre-counts EVERY
-    // muxer's slot before any `mux_init`, so an early streamless release cannot
-    // drive the thread counter to zero and stop later, still-pending outputs.
+    // Regression for the premature-STATUS_END truncation: a streamless
+    // (AVFMT_NOSTREAMS) output releases its thread slot synchronously via
+    // `release_mux_slot`. The scheduler pre-counts EVERY muxer's slot before
+    // any `mux_init`, so an early streamless release cannot drive the thread
+    // counter to zero and stop later, still-pending outputs.
     // Here both slots are pre-counted (as the scheduler does): releasing the
     // first must NOT publish a terminal status.
     #[test]
@@ -3067,11 +3291,20 @@ mod tests {
             .expect("the choked demuxer must be released when the last muxer finishes");
     }
 
-    // BUG A regression: the mux worker releases its pre-counted thread slot via a
-    // MANUAL thread_done_with (not ThreadDoneGuard, so it can publish STATUS_END
-    // only after the trailer/join). A panic before that call would leak the slot
-    // and hang wait_for_all_threads. MuxSlotGuard is the panic-only net: an ARMED
-    // drop (the unwind path) must release the slot.
+    // Slot-leak regression: the mux worker releases its pre-counted thread slot
+    // via a MANUAL thread_done_with (not ThreadDoneGuard) so the release lands
+    // only after the output's teardown — the trailer where a container writes
+    // one (packet-sink workers write none), then the encoder join — while mux
+    // completion itself (STATUS_END via MuxDoneGuard) is deliberately
+    // published BEFORE the encoder join. Slots that never get a worker
+    // release elsewhere: streamless outputs and mux-init failures (open,
+    // write_header, BSF, worker spawn) release inside mux_init itself,
+    // before any worker exists, via the consuming MuxSlotGuard::release();
+    // the scheduler's start-failure cleanup calls release_mux_slot for
+    // outputs never handed to mux_init at all. A panic before the worker's
+    // manual call would leak the slot and hang wait_for_all_threads.
+    // MuxSlotGuard is the panic-only net: an ARMED drop (the unwind path)
+    // must release the slot.
     #[test]
     fn mux_slot_guard_releases_slot_on_armed_drop() {
         let thread_sync = ThreadSynchronizer::new();

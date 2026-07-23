@@ -562,19 +562,30 @@ impl Output {
     /// muxing them into container bytes.
     ///
     /// No container is written and no I/O happens: `on_stream_info` fires
-    /// once with the finalized stream configuration (valid avcC for H.264,
-    /// AudioSpecificConfig for AAC), then each encoded packet is handed to
-    /// `on_packet` as a borrowed [`PacketView`](crate::packet_sink::PacketView).
+    /// at most once with the finalized stream configuration (valid avcC for
+    /// H.264, AudioSpecificConfig for AAC) — collecting that configuration
+    /// can itself fail, failing the job before any callback runs — then each
+    /// encoded packet is handed to `on_packet` as a borrowed
+    /// [`PacketView`](crate::packet_sink::PacketView).
     /// See the [`packet_sink`](crate::packet_sink) module docs for the strict
     /// tier contract, the callback order, and the **blocking backpressure**
     /// behavior (a slow callback stalls the pipeline; nothing is dropped).
     ///
-    /// Muxer-only options are rejected when the context is built:
-    /// `set_format`, `set_seek_callback`, `set_io_buffer_size`,
-    /// `set_format_opt(s)`, bitstream filters (`set_*_bsf`), attachments and
-    /// stream copy all fail with a typed
-    /// [`PacketSinkError`](crate::error::PacketSinkError). The v1 strict tier
-    /// accepts only whitelisted encoders (video: `libx264`; audio: AAC).
+    /// Options a packet sink cannot honor are rejected when the context is
+    /// built, with a typed
+    /// [`PacketSinkError`](crate::error::PacketSinkError). Container-only
+    /// options are rejected because no container is written: `set_format`,
+    /// `set_seek_callback`, `set_io_buffer_size`, `set_format_opt(s)`,
+    /// attachments, and the metadata setters (`add_metadata`,
+    /// `add_stream_metadata`, `add_chapter_metadata`, `add_program_metadata`,
+    /// `map_metadata_from_input`, `disable_auto_copy_metadata`). Pipeline
+    /// features outside the strict tier's delivery contract are rejected as
+    /// policy, not for lack of a container: `set_video_filter`, bitstream
+    /// filters (`set_*_bsf`), `set_subtitle_codec`, stream copy, and the
+    /// `flags` codec option (it could clear the `global_header` flag behind
+    /// the out-of-band configuration). The set tracks the validator and may
+    /// grow. The v1 strict tier accepts only whitelisted encoders (video:
+    /// `libx264`; audio: AAC).
     ///
     /// `Output::from(sink)` is the equivalent, crate-conventional spelling
     /// and the one used throughout the documentation.
@@ -599,8 +610,11 @@ impl Output {
     ///
     /// FFmpeg hands one buffer-sized chunk per callback, so a larger buffer means
     /// fewer Rust↔FFmpeg round-trips for sequential or network sinks. Only applies
-    /// when the output is a callback (no URL); ignored otherwise. The default is
-    /// 64 KiB, which keeps first-packet latency low for live use.
+    /// when the output is a `write_callback`; ignored for URL outputs, and
+    /// **rejected** on packet-sink outputs (no I/O exists there): building the
+    /// context fails with
+    /// [`PacketSinkError::UnsupportedOption`](crate::error::PacketSinkError::UnsupportedOption).
+    /// The default is 64 KiB, which keeps first-packet latency low for live use.
     ///
     /// # Errors
     /// The value is validated when the context is built:

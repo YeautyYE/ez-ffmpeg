@@ -8,12 +8,65 @@ mod common;
 use common::{have_encoder, recording_sink, SinkEv};
 use ez_ffmpeg::core::scheduler::ffmpeg_scheduler::Running;
 use ez_ffmpeg::{FfmpegContext, FfmpegScheduler, Input, Output};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
 /// The sweep delays are only meaningful when the scenarios do not compete for
 /// CPU inside the shared test binary: serialize them.
 static PROCESS_LOCK: Mutex<()> = Mutex::new(());
+
+/// Abort-store observation latch. While `WATCH_ARMED`, a container muxer's
+/// abort-specific records set `ABORT_OBSERVED`: "Muxer detected abort" and
+/// "Muxer skipping trailer due to abort" are each logged strictly after an
+/// acquire load of the scheduler status returned the ABORT value on that
+/// worker's thread (the trailer gate logs the latter on every abort-path
+/// container-mux teardown, and abort is never downgraded). The store being
+/// waited for therefore happens-before the latch, so a release chained
+/// through it is ordered after the store — an observed handshake, not a
+/// timing guess. A packet sink's terminal path returns before the trailer
+/// gate, so only a container output can emit the records.
+static WATCH_ARMED: AtomicBool = AtomicBool::new(false);
+static ABORT_OBSERVED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the held packet was released by the acknowledged handshake (the
+/// controller's `abort_done` send, which happens only after `ABORT_OBSERVED`
+/// latched) rather than by the callback's failsafe timer. A timer release
+/// proves nothing about ordering — the packet would go free while the abort
+/// store might still be unpublished — so the test asserts this flag instead
+/// of trusting the timeout arithmetic.
+static RELEASED_BY_HANDSHAKE: AtomicBool = AtomicBool::new(false);
+
+struct MuxAbortWatchLogger;
+
+impl log::Log for MuxAbortWatchLogger {
+    fn enabled(&self, _: &log::Metadata) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record) {
+        if !WATCH_ARMED.load(Ordering::Acquire) {
+            return;
+        }
+        let msg = record.args().to_string();
+        if msg.contains("Muxer detected abort")
+            || msg.contains("Muxer skipping trailer due to abort")
+        {
+            ABORT_OBSERVED.store(true, Ordering::Release);
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+fn install_watch_logger_once() {
+    static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        log::set_boxed_logger(Box::new(MuxAbortWatchLogger)).expect("logger installs once");
+        // The muxer abort records are debug level.
+        log::set_max_level(log::LevelFilter::Debug);
+    });
+}
 
 /// Paced video so packets are still in flight whenever the stop lands.
 fn paced_input() -> Input {
@@ -62,7 +115,7 @@ fn assert_no_terminal_event(log: &common::SinkLog, scenario: &str) {
         "{scenario}: stop() with packets in flight must not produce on_end"
     );
     assert!(
-        !events.iter().any(|e| matches!(e, SinkEv::Error(_))),
+        !events.iter().any(|e| matches!(e, SinkEv::Error { .. })),
         "{scenario}: cancellation is not a delivery error"
     );
 }
@@ -235,13 +288,17 @@ fn stop_terminates_with_full_undrained_channel() {
 /// being delivered must never let a terminal callback fire — the terminal
 /// decision reads the status fresh, after the job settled, not from a
 /// pre-wait snapshot. An ARBITRARY mid-stream packet (the 10th of ~40) is
-/// held until the abort store has had a generous grace to land — a timing
-/// heuristic, not a happens-before acknowledgement; the deterministic
-/// linearization-window pin is the held-logger probe in the unwind suite.
-/// Native AAC.
+/// held until a sibling container muxer (fed by a second, infinite input)
+/// OBSERVES the abort store — its abort-specific teardown record latches
+/// `ABORT_OBSERVED` — so the store happens-before the packet's release: an
+/// acknowledged handshake. Native AAC.
 #[test]
 fn abort_during_final_delivery_fires_no_terminal_callback() {
     let _lock = PROCESS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    install_watch_logger_once();
+    WATCH_ARMED.store(false, Ordering::Release);
+    ABORT_OBSERVED.store(false, Ordering::Release);
+    RELEASED_BY_HANDSHAKE.store(false, Ordering::Release);
     let (abort_request_tx, abort_request_rx) = std::sync::mpsc::channel::<()>();
     let (abort_done_tx, abort_done_rx) = std::sync::mpsc::channel::<()>();
 
@@ -253,9 +310,20 @@ fn abort_during_final_delivery_fires_no_terminal_callback() {
         if delivered == 10 {
             // Ask the controller to abort, and hold this packet until the
             // abort status has been stored — the terminal region then must
-            // observe it.
+            // observe it. The release is GATED on the controller's signal
+            // (sent only after `ABORT_OBSERVED` latched); the timeout is a
+            // failsafe for a wrecked run and sits deliberately far above the
+            // controller's 30s observation deadline. A failsafe below that
+            // deadline would let this packet go free on the timer while the
+            // controller still polls, silently voiding the happens-before
+            // edge under test. The failsafe also never delays a failing run:
+            // the observation poll's panic drops `abort_done_tx`, which
+            // releases this recv immediately (Disconnected).
             let _ = abort_request_tx.send(());
-            let _ = abort_done_rx.recv_timeout(Duration::from_secs(10));
+            let released_by_signal = abort_done_rx
+                .recv_timeout(Duration::from_secs(90))
+                .is_ok();
+            RELEASED_BY_HANDSHAKE.store(released_by_signal, Ordering::Release);
         }
         Ok(())
     })
@@ -264,12 +332,35 @@ fn abort_during_final_delivery_fires_no_terminal_callback() {
             thread: std::thread::current().id(),
         })
     })
-    .on_delivery_error(move |e| err_log.lock().unwrap().push(SinkEv::Error(e.to_string())))
+    .on_delivery_error(move |e| {
+        err_log.lock().unwrap().push(SinkEv::Error {
+            message: e.to_string(),
+            thread: std::thread::current().id(),
+        })
+    })
     .build();
 
+    // The second chain is INFINITE and realtime-paced: its container muxer
+    // is guaranteed alive whenever the abort lands, and its teardown always
+    // crosses the trailer gate, whose abort branch acknowledges the store.
     let scheduler = FfmpegContext::builder()
         .input(Input::from("sine=frequency=440:duration=1").set_format("lavfi"))
-        .output(Output::from(sink).set_audio_codec("aac"))
+        .input(
+            Input::from("sine=frequency=330")
+                .set_format("lavfi")
+                .set_readrate(1.0),
+        )
+        .output(
+            Output::from(sink)
+                .set_audio_codec("aac")
+                .add_stream_map("0:a"),
+        )
+        .output(
+            Output::from("abort-probe.null")
+                .set_format("null")
+                .set_audio_codec("pcm_s16le")
+                .add_stream_map("1:a"),
+        )
         .build()
         .unwrap()
         .start()
@@ -281,14 +372,44 @@ fn abort_during_final_delivery_fires_no_terminal_callback() {
     // abort() consumes the scheduler and BLOCKS until every worker exits
     // (RunningGuard's drop) — the held callback would deadlock it on this
     // thread, so it runs on a helper. Its ABORT store is its first action;
-    // the grace below dwarfs the helper's spawn+store latency, so the store
-    // has landed before the held packet is released.
-    let abort_thread = std::thread::spawn(move || scheduler.abort());
-    std::thread::sleep(Duration::from_millis(500));
+    // the held packet is released only after the sibling muxer's abort
+    // record proves that store is published (see the latch's doc comment),
+    // so the terminal region's fresh load is ordered after it.
+    WATCH_ARMED.store(true, Ordering::Release);
+    // abort() returns () — the channel carries completion, giving join a
+    // bound: a teardown regression after the observation record must FAIL
+    // the recv_timeout below, not hang the suite in an unbounded join.
+    let (abort_completed_tx, abort_completed_rx) = std::sync::mpsc::channel();
+    let abort_thread = std::thread::spawn(move || {
+        scheduler.abort();
+        let _ = abort_completed_tx.send(());
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !ABORT_OBSERVED.load(Ordering::Acquire) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no worker ever observed the abort store"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    WATCH_ARMED.store(false, Ordering::Release);
     let _ = abort_done_tx.send(());
+    // 120 s sits comfortably above the callback's own 90 s failsafe, so a
+    // hang detected here is a real teardown wedge, not the failsafe firing.
+    abort_completed_rx
+        .recv_timeout(Duration::from_secs(120))
+        .expect("abort() never returned after the held packet was released");
     abort_thread
         .join()
         .expect("abort() must return once the job tears down");
+    // abort() returns only after the delivering worker exited, so the
+    // callback's store is visible here: the release must have come from the
+    // handshake, or the ordering the assertions below rely on never held.
+    assert!(
+        RELEASED_BY_HANDSHAKE.load(Ordering::Acquire),
+        "the held packet was released by the failsafe timer, not by the \
+         observed-abort handshake"
+    );
     assert_no_terminal_event(&log, "abort_during_final_delivery");
 }
 

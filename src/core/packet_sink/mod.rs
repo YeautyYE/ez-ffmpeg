@@ -41,15 +41,29 @@
 //!      terminal state (natural encoder EOF, or configured truncation such as
 //!      `set_recording_time_us` / `set_shortest`), everything was delivered,
 //!      and the whole job settled without an error: the delivery thread
-//!      first waits for every other job worker to finish (including sibling
-//!      outputs' teardown), then decides on one fresh status/result read —
-//!      the linearization point. An `abort()` that lands after that read is
-//!      indistinguishable from one after the callback.
+//!      first waits for every other job worker to finish (including
+//!      container outputs' teardown), then decides on one fresh
+//!      status/result read — the linearization point. Sibling packet-sink
+//!      workers are the one exception to that wait: they are only
+//!      guaranteed settled by then (errors recorded, encoders joined,
+//!      contexts freed) — their terminal callbacks and capture drops may
+//!      still be running concurrently. An `abort()` that lands after the
+//!      status read is indistinguishable from one after the callback.
 //!    * `on_delivery_error` fires when delivery stopped because of a
 //!      strict-tier violation or a failing callback, or when the job failed
 //!      elsewhere — whether that failure landed after this sink delivered
-//!      everything or truncated its delivery. Clean cancellation stays
-//!      silent.
+//!      everything or truncated its delivery. Cancellation is silent only
+//!      when it interrupts delivery: a `stop()` that lands after this sink
+//!      fully drained still delivers `on_end`. Cancellation also takes
+//!      precedence over a failure it races with: a sink that observes the
+//!      published termination — `stop()`, `abort()`, or dropping the
+//!      running scheduler (its guard publishes the same status) — and
+//!      cancels its delivery cooperatively before a sibling's error is
+//!      recorded stays silent — no `on_delivery_error`. The late error is
+//!      still recorded first-error-wins as the job result, and the `stop()`
+//!      call that drove the race returns it once every worker has settled;
+//!      after `abort()`, which returns nothing, or a drop, which discards
+//!      the result with the scheduler, it goes unobserved.
 //!
 //! # Timestamp and ordering
 //!
@@ -82,6 +96,22 @@
 //! capture's `Drop` — is caught, logged at error level, and does NOT change
 //! the already-settled job result (a delivered or decided `on_end` still
 //! yields `wait() == Ok`, and a failing job keeps its original error).
+//!
+//! That containment is **per callback box** (per handler box for
+//! [`PacketSinkHandler`](crate::packet_sink::PacketSinkHandler)). A panic
+//! thrown by a callback, or by ONE
+//! destructor — a captured value's, a stashed error source's, or a
+//! `panic_any` payload's — is contained, and the crate keeps every such
+//! unwind single: each box is destroyed under its own catch, and the
+//! stashed delivery error stays in the worker's custody while
+//! `on_delivery_error` borrows it. The boundary is Rust's own unwind
+//! semantics: when one capture's destructor panics, the remaining captures
+//! OF THAT SAME BOX are dropped by the unwind itself — an erased box
+//! destroys its captures as one indivisible drop-glue call that nothing
+//! outside the box can decompose — so a SECOND panicking destructor there
+//! is a panic-during-unwind process abort, exactly as in any Rust struct
+//! whose field destructors both panic. Keep the destructors of values
+//! captured together panic-free relative to one another.
 //!
 //! # Backpressure: callbacks block the pipeline
 //!
@@ -126,6 +156,7 @@
 
 pub use crate::error::PacketSinkError;
 use crate::core::scheduler::ffmpeg_scheduler::{is_stopping, FfmpegScheduler, Running};
+use crate::core::scheduler::owned_run_iter::OwnedRunIter;
 use ffmpeg_sys_next::{AVCodecID, AVMediaType, AVRational};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -254,6 +285,12 @@ pub type PacketCallbackResult = Result<(), PacketCallbackError>;
 /// delivery thread (never concurrently, never reentrantly), so `&mut self`
 /// state needs no locking. This is the strict-tier handler shape; see the
 /// [module docs](self) for the callback order and backpressure contract.
+///
+/// Teardown panic containment is per handler box: a panic from a method,
+/// or from ONE of the handler's fields' destructors, is contained; two
+/// fields whose destructors both panic compose into a panic-during-unwind
+/// process abort, as in any Rust struct — see "Failure and panic" in the
+/// [module docs](self).
 pub trait PacketSinkHandler: Send + 'static {
     /// One-time stream configuration, before any packet.
     fn on_stream_info(&mut self, _streams: &[PacketStreamInfo]) -> PacketCallbackResult {
@@ -435,7 +472,11 @@ impl AudioPacketConfig {
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum PacketStreamInfo {
+    /// H.264 stream configuration: avcC record, RFC 6381 codec string,
+    /// profile/level, dimensions, time base, frame rate.
     Video(VideoPacketConfig),
+    /// AAC stream configuration: AudioSpecificConfig, RFC 6381 codec string,
+    /// time base, sample rate, channel layout.
     Audio(AudioPacketConfig),
 }
 
@@ -663,7 +704,11 @@ pub(crate) struct JobStopObservables {
 }
 
 /// Slot the owned-channel adapter uses to observe job cancellation: see
-/// [`JobStopObservables`].
+/// [`JobStopObservables`]. One slot is allocated per [`PacketSink::channel`]
+/// call and shared by the sink's callbacks and its receiver, so the Arc's
+/// pointer identity doubles as the pair's run token: the muxer keeps a clone
+/// and [`PacketSinkReceiver::into_events`] matches its own clone against the
+/// scheduler's job to reject a cross-wired scheduler.
 pub(crate) type CancellationSlot = Arc<OnceLock<JobStopObservables>>;
 
 /// The consumer bundle handed to `Output::from(sink)` /
@@ -691,12 +736,28 @@ impl std::fmt::Debug for PacketSink {
 }
 
 impl PacketSink {
+    /// The delivery tier this sink was built for.
+    ///
+    /// Every v1 construction path produces [`PacketSinkTier::Strict`], so
+    /// today this always returns `Strict`; the accessor exists so consumers
+    /// that route or log sinks can branch on the tier once additional tiers
+    /// land, instead of inferring it from which constructor was used.
+    pub fn tier(&self) -> PacketSinkTier {
+        self.tier
+    }
+
     /// Starts building a strict-tier sink around the required packet
     /// consumer. `on_stream_info`, `on_end` and `on_delivery_error` are
     /// optional extras on the returned builder — but a sink cannot exist
     /// without a packet consumer (a job that encodes into nothing is a
     /// configuration mistake, not a default; use [`PacketSink::discard`]
     /// when discarding is genuinely intended).
+    ///
+    /// Teardown panic containment is per callback box: a panic from the
+    /// closure, or from ONE captured value's destructor, is contained; two
+    /// captures of this same closure whose destructors both panic compose
+    /// into a panic-during-unwind process abort, as in any Rust struct —
+    /// see "Failure and panic" in the [module docs](self).
     pub fn builder<F>(on_packet: F) -> PacketSinkBuilder
     where
         F: for<'a> FnMut(&PacketView<'a>) -> PacketCallbackResult + Send + 'static,
@@ -721,6 +782,12 @@ impl PacketSink {
     /// the natural shape for consumers whose stream-info/packet/terminal
     /// handling shares state (packagers, senders); callbacks are serial, so
     /// the handler needs no locking.
+    ///
+    /// Teardown panic containment is per handler box: a panic from a
+    /// handler method, or from ONE of the handler's fields' destructors, is
+    /// contained; two fields of this same handler whose destructors both
+    /// panic compose into a panic-during-unwind process abort, as in any
+    /// Rust struct — see "Failure and panic" in the [module docs](self).
     pub fn from_handler<H: PacketSinkHandler>(handler: H) -> PacketSink {
         PacketSink {
             tier: PacketSinkTier::Strict,
@@ -783,8 +850,14 @@ impl PacketSink {
             let _ = err_tx.try_send(PacketSinkEvent::Error(e.clone()));
         })
         .build();
-        sink.cancellation = Some(cancellation);
-        (sink, PacketSinkReceiver { inner: rx })
+        sink.cancellation = Some(cancellation.clone());
+        (
+            sink,
+            PacketSinkReceiver {
+                inner: rx,
+                token: cancellation,
+            },
+        )
     }
 
     // ---- crate-internal dispatch (serial, delivery thread only) ----
@@ -832,6 +905,103 @@ impl PacketSink {
             SinkDispatch::Handler(h) => h.on_delivery_error(error),
         }
     }
+
+    /// Consumes the sink, dropping every user callback box under its OWN
+    /// panic containment. The derived drop glue runs the boxes as one
+    /// chain: after a first capture destructor panics, the REMAINING boxes
+    /// are destroyed by that unwind itself, where a second panicking
+    /// destructor aborts the process — so one `catch_unwind` around a plain
+    /// `drop` of the whole aggregate contains only the first bomb. Dropping
+    /// each box under its own catch keeps every unwind single. Returns true
+    /// when any destructor panicked (each caught payload is disposed
+    /// through [`dispose_panic_payload`], never re-dropped raw).
+    pub(crate) fn dispose_contained(self) -> bool {
+        let Self {
+            tier: _,
+            dispatch,
+            cancellation,
+        } = self;
+        let mut panicked = false;
+        match dispatch {
+            SinkDispatch::Closures {
+                on_stream_info,
+                on_packet,
+                on_end,
+                on_delivery_error,
+            } => {
+                // Field declaration order — the order the derived drop glue
+                // would have used.
+                if let Some(f) = on_stream_info {
+                    panicked |= drop_contained(f);
+                }
+                panicked |= drop_contained(on_packet);
+                if let Some(f) = on_end {
+                    panicked |= drop_contained(f);
+                }
+                if let Some(f) = on_delivery_error {
+                    panicked |= drop_contained(f);
+                }
+            }
+            SinkDispatch::Handler(handler) => {
+                panicked |= drop_contained(handler);
+            }
+        }
+        // The cancellation slot is crate data, but the shared job result
+        // behind it can hold arbitrary error types; the (normally non-final)
+        // Arc release is contained for the same price as the boxes.
+        if let Some(slot) = cancellation {
+            panicked |= drop_contained(slot);
+        }
+        panicked
+    }
+}
+
+/// Drops `value` under its own panic containment. Returns true when the
+/// destructor panicked; the caught payload is disposed, not re-dropped raw.
+fn drop_contained<T>(value: T) -> bool {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(value))) {
+        Ok(()) => false,
+        Err(payload) => {
+            dispose_panic_payload(payload);
+            true
+        }
+    }
+}
+
+/// Disposes a caught panic payload without letting the payload's own
+/// destructor start a second, uncontained unwind at the discard site.
+///
+/// `panic_any` lets panicking user code throw an ARBITRARY payload, and
+/// nothing forbids one whose `Drop` panics again — with yet another such
+/// payload. Discarding a `catch_unwind` error via `.is_err()` / `let _` /
+/// a wildcard therefore runs an uncontained user destructor exactly where
+/// the containment believed the panic was over. Each drop attempt here runs
+/// under its own catch, following replacement payloads a bounded number of
+/// times; a chain still panicking after the last attempt is deliberately
+/// LEAKED via `mem::forget`. That trade is intentional: a bounded leak on
+/// an adversarial path is recoverable, while re-throwing would unwind
+/// frames that may still own user state — and a destructor panic during
+/// that unwind escalates to a process abort.
+///
+/// The containment boundary, here and in every catch this module owns, is
+/// per BOX: a panic thrown by a callback, or by ONE destructor (a
+/// capture's, a stashed error source's, or this payload's), is contained.
+/// A box whose own captured fields' destructors panic DURING that unwind —
+/// two bombs inside one erased `Box<dyn ..>` — aborts the process by
+/// Rust's panic-during-unwind rule before any catch regains control: the
+/// box destroys its captures as one indivisible drop-glue call that no
+/// code outside the box can decompose. That is identical to any Rust code
+/// path (a plain struct with two panicking field destructors aborts the
+/// same way), so it is documented as the boundary, not worked around.
+pub(crate) fn dispose_panic_payload(payload: Box<dyn std::any::Any + Send>) {
+    let mut payload = payload;
+    for _ in 0..4 {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(payload))) {
+            Ok(()) => return,
+            Err(next) => payload = next,
+        }
+    }
+    std::mem::forget(payload);
 }
 
 /// Cancellation-aware bounded send: blocks (in bounded slices) while the
@@ -844,7 +1014,16 @@ fn send_with_cancellation(
     cancellation: &CancellationSlot,
     event: PacketSinkEvent,
 ) -> PacketCallbackResult {
-    let mut event = event;
+    // Fast path: `send_timeout` computes a wall-clock deadline up front on
+    // every call — pure overhead while the channel has capacity (the common
+    // case). Only a full channel proceeds to the deadline-based slices.
+    let mut event = match tx.try_send(event) {
+        Ok(()) => return Ok(()),
+        Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+            return Err(PacketCallbackError::disconnected());
+        }
+        Err(crossbeam_channel::TrySendError::Full(back)) => back,
+    };
     loop {
         match tx.send_timeout(event, Duration::from_millis(50)) {
             Ok(()) => return Ok(()),
@@ -896,7 +1075,8 @@ pub struct PacketSinkBuilder {
 impl PacketSinkBuilder {
     /// One-time stream configuration callback, invoked before any packet.
     /// Return `Ok(())` to accept; an error fails the job before any packet is
-    /// delivered.
+    /// delivered. Teardown panic containment is per callback box — see
+    /// "Failure and panic" in the [module docs](self).
     pub fn on_stream_info<F>(mut self, f: F) -> Self
     where
         F: FnMut(&[PacketStreamInfo]) -> PacketCallbackResult + Send + 'static,
@@ -906,7 +1086,12 @@ impl PacketSinkBuilder {
     }
 
     /// Terminal success callback; see the [module docs](self) for the exact
-    /// gate. Never invoked after an error, a cancelled job, or lost packets.
+    /// gate. Never invoked after an error or lost packets. Cancellation
+    /// suppresses it only when it interrupts delivery: a `stop()` that lands
+    /// after this sink fully drained still delivers `on_end`. A panic here
+    /// is contained per callback box and cannot change the settled job
+    /// result — see "Failure and panic" in the [module docs](self) for the
+    /// exact boundary.
     pub fn on_end<F>(mut self, f: F) -> Self
     where
         F: FnMut() + Send + 'static,
@@ -923,6 +1108,11 @@ impl PacketSinkBuilder {
     /// while the job keeps its original error. Not invoked for cancellation
     /// or initial configuration failures — see "Failure and panic" in the
     /// [module docs](self).
+    ///
+    /// The borrowed error stays in the worker's custody for the whole call
+    /// (a panic here cannot run the error source's destructor mid-unwind),
+    /// and the panic is contained per callback box — see "Failure and
+    /// panic" in the [module docs](self) for the exact boundary.
     pub fn on_delivery_error<F>(mut self, f: F) -> Self
     where
         F: FnMut(&PacketSinkError) + Send + 'static,
@@ -1047,13 +1237,15 @@ impl EncodedPacket {
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum PacketSinkEvent {
-    /// The one-time stream configuration.
+    /// The one-time stream configuration, one entry per output stream.
     StreamInfo(Vec<PacketStreamInfo>),
-    /// One delivered packet.
+    /// One delivered packet, copied into an owned payload.
     Packet(EncodedPacket),
-    /// Terminal success.
+    /// Terminal success (best-effort; see the enum docs).
     End,
-    /// Terminal delivery-path failure.
+    /// A delivery-path error, or [`PacketSinkError::JobFailed`] when the job
+    /// failed elsewhere (`wait()` keeps the original error). Best-effort like
+    /// [`End`](Self::End).
     Error(PacketSinkError),
 }
 
@@ -1120,6 +1312,39 @@ impl std::fmt::Display for PacketRecvTimeoutError {
 
 impl std::error::Error for PacketRecvTimeoutError {}
 
+/// Error from [`PacketSinkReceiver::into_events`]: the scheduler passed in
+/// is not the one running this receiver's sink.
+///
+/// Each [`PacketSink::channel`] call shares an identity token between the
+/// sink and its receiver, and `into_events` requires the scheduler whose job
+/// contains that sink. Accepting an arbitrary scheduler would silently
+/// cross-wire two runs: iterate receiver A's events while joining — and, on
+/// early drop, aborting — job B. Both handles are returned unchanged so the
+/// caller can pair them correctly (the scheduler's job keeps running).
+pub struct PacketEventsPairingError {
+    /// The receiver, returned unchanged.
+    pub receiver: PacketSinkReceiver,
+    /// The scheduler, returned unchanged; its job is unaffected.
+    pub scheduler: FfmpegScheduler<Running>,
+}
+
+impl std::fmt::Debug for PacketEventsPairingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PacketEventsPairingError")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Display for PacketEventsPairingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "packet-sink receiver paired with a scheduler that is not running its sink",
+        )
+    }
+}
+
+impl std::error::Error for PacketEventsPairingError {}
+
 /// Receiving side of a [`PacketSink::channel`] adapter.
 ///
 /// Drain it concurrently with the running job (its own thread, or
@@ -1127,6 +1352,11 @@ impl std::error::Error for PacketRecvTimeoutError {}
 /// job — the next delivery fails typed instead of blocking forever.
 pub struct PacketSinkReceiver {
     inner: crossbeam_channel::Receiver<PacketSinkEvent>,
+    /// Identity of the `PacketSink::channel` call that produced this
+    /// receiver: the same `CancellationSlot` Arc the paired sink carries.
+    /// [`into_events`](Self::into_events) matches it by pointer identity
+    /// against the scheduler's job.
+    token: CancellationSlot,
 }
 
 impl PacketSinkReceiver {
@@ -1169,37 +1399,45 @@ impl PacketSinkReceiver {
     /// channel drains, and a job error surfaces as one terminal `Err`.
     /// Dropping the iterator mid-run releases the receiver FIRST (unblocking
     /// a worker parked in the channel send), then aborts the job.
-    pub fn into_events(self, scheduler: FfmpegScheduler<Running>) -> PacketEventIter {
-        PacketEventIter {
-            rx: Some(self.inner),
-            scheduler: Some(scheduler),
-            terminated: false,
+    ///
+    /// # Errors
+    ///
+    /// [`PacketEventsPairingError`] when `scheduler` is not the one running
+    /// this receiver's sink. The pairing is checked by identity — the token
+    /// shared by the sink/receiver pair from [`PacketSink::channel`] must
+    /// belong to the scheduler's job — because a cross-wired iterator would
+    /// silently stream one run's events while reporting (and, on drop,
+    /// aborting) another run's outcome. The error returns both handles
+    /// unchanged so they can be re-paired.
+    // The Err variant carries the scheduler back to the caller, so it is as
+    // large as the Ok variant (which owns the same scheduler inside the
+    // iterator); boxing it would not shrink the Result.
+    #[allow(clippy::result_large_err)]
+    pub fn into_events(
+        self,
+        scheduler: FfmpegScheduler<Running>,
+    ) -> Result<PacketEventIter, PacketEventsPairingError> {
+        if !scheduler.runs_packet_sink(&self.token) {
+            return Err(PacketEventsPairingError {
+                receiver: self,
+                scheduler,
+            });
         }
+        Ok(PacketEventIter {
+            inner: OwnedRunIter::new(self.inner, scheduler, std::convert::identity),
+        })
     }
 }
 
 /// An owned-run iterator over [`PacketSinkEvent`]s; see
 /// [`PacketSinkReceiver::into_events`].
 pub struct PacketEventIter {
-    rx: Option<crossbeam_channel::Receiver<PacketSinkEvent>>,
-    scheduler: Option<FfmpegScheduler<Running>>,
-    terminated: bool,
+    inner: OwnedRunIter<PacketSinkEvent>,
 }
 
-impl PacketEventIter {
-    /// Joins the scheduler exactly once and maps its result to at most one
-    /// terminal error. Called when the channel disconnects.
-    fn finish(&mut self) -> Option<Result<PacketSinkEvent, crate::error::Error>> {
-        self.terminated = true;
-        // Drop the receiver before joining so a parked sender is released.
-        self.rx = None;
-        match self.scheduler.take() {
-            Some(scheduler) => match scheduler.wait() {
-                Ok(()) => None,
-                Err(e) => Some(Err(e)),
-            },
-            None => None,
-        }
+impl std::fmt::Debug for PacketEventIter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PacketEventIter").finish_non_exhaustive()
     }
 }
 
@@ -1207,35 +1445,11 @@ impl Iterator for PacketEventIter {
     type Item = Result<PacketSinkEvent, crate::error::Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.terminated {
-            return None;
-        }
-        let recv = match self.rx.as_ref() {
-            Some(rx) => rx.recv(),
-            None => return self.finish(),
-        };
-        match recv {
-            Ok(event) => Some(Ok(event)),
-            // Channel closed: the pipeline finished or died. Join once.
-            Err(_) => self.finish(),
-        }
+        self.inner.next()
     }
 }
 
 impl std::iter::FusedIterator for PacketEventIter {}
-
-impl Drop for PacketEventIter {
-    fn drop(&mut self) {
-        // Drop the receiver FIRST (unblocks a worker parked in the channel
-        // send), THEN abort the scheduler (which joins the workers). Reversed
-        // order can deadlock: the worker only observes the abort between
-        // callbacks, but it is blocked inside one.
-        self.rx = None;
-        if let Some(scheduler) = self.scheduler.take() {
-            scheduler.abort();
-        }
-    }
-}
 
 /// Explicit muxing policy a packet-sink output pins for encoder setup.
 ///
@@ -1318,6 +1532,33 @@ mod tests {
         assert!(discard.dispatch_packet(&test_view(&payload)).is_ok());
     }
 
+    /// The public tier accessor is the only way consumers can observe a
+    /// sink's tier; every v1 construction path must report `Strict`, and the
+    /// enum default must agree so builders can rely on it.
+    #[test]
+    fn every_construction_path_reports_the_strict_tier() {
+        assert_eq!(PacketSinkTier::default(), PacketSinkTier::Strict);
+        assert_eq!(
+            PacketSink::builder(|_| Ok(())).build().tier(),
+            PacketSinkTier::Strict
+        );
+        assert_eq!(PacketSink::discard().tier(), PacketSinkTier::Strict);
+
+        struct Accepting;
+        impl PacketSinkHandler for Accepting {
+            fn on_packet(&mut self, _packet: &PacketView<'_>) -> PacketCallbackResult {
+                Ok(())
+            }
+        }
+        assert_eq!(
+            PacketSink::from_handler(Accepting).tier(),
+            PacketSinkTier::Strict
+        );
+
+        let (sink, _receiver) = PacketSink::channel(NonZeroUsize::new(1).unwrap());
+        assert_eq!(sink.tier(), PacketSinkTier::Strict);
+    }
+
     #[test]
     fn handler_receives_serial_callbacks_with_shared_state() {
         struct Counting {
@@ -1341,6 +1582,92 @@ mod tests {
             .expect_err("handler state must persist across calls");
         assert_eq!(err.kind, CallbackFailureKind::Failure);
         assert_eq!(err.to_string(), "enough");
+    }
+
+    /// A `panic_any` payload whose own `Drop` panics (with another such
+    /// payload) must be consumed without the disposal itself throwing —
+    /// both for chains within the attempt bound and for chains beyond it
+    /// (the remainder is leaked by design, never re-thrown).
+    #[test]
+    fn panic_payload_chains_are_disposed_without_escaping() {
+        struct ChainBomb(u32);
+        impl Drop for ChainBomb {
+            fn drop(&mut self) {
+                if self.0 > 0 {
+                    std::panic::panic_any(ChainBomb(self.0 - 1));
+                }
+            }
+        }
+        // Depth 3: attempts 1-3 each panic with the next link, attempt 4
+        // drops the final link cleanly.
+        dispose_panic_payload(Box::new(ChainBomb(3)));
+        // Deeper than the attempt bound: the helper must still return.
+        dispose_panic_payload(Box::new(ChainBomb(64)));
+    }
+
+    /// Every callback box must be destroyed even when SEVERAL capture
+    /// destructors panic. One catch around a plain drop of the aggregate
+    /// contains only the first bomb — the remaining boxes are then
+    /// destroyed by the unwind itself, where the second bomb aborts the
+    /// process. Reaching the assertions at all is the point.
+    #[test]
+    fn dispose_contained_destroys_every_box_across_multiple_drop_panics() {
+        use std::sync::atomic::AtomicBool;
+
+        struct DropBomb(Arc<AtomicBool>);
+        impl Drop for DropBomb {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+                panic!("injected capture-destructor panic");
+            }
+        }
+
+        let flags: Vec<Arc<AtomicBool>> = (0..3).map(|_| Arc::new(AtomicBool::new(false))).collect();
+        let (b0, b1, b2) = (
+            DropBomb(flags[0].clone()),
+            DropBomb(flags[1].clone()),
+            DropBomb(flags[2].clone()),
+        );
+        let sink = PacketSink::builder(move |_pkt| {
+            let _hold = &b0;
+            Ok(())
+        })
+        .on_end(move || {
+            let _hold = &b1;
+        })
+        .on_delivery_error(move |_e| {
+            let _hold = &b2;
+        })
+        .build();
+        assert!(
+            sink.dispose_contained(),
+            "three panicking capture destructors must be reported"
+        );
+        for (i, flag) in flags.iter().enumerate() {
+            assert!(
+                flag.load(Ordering::Acquire),
+                "callback box {i} was never destroyed"
+            );
+        }
+
+        struct BombHandler(Arc<AtomicBool>);
+        impl Drop for BombHandler {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+                panic!("injected handler-destructor panic");
+            }
+        }
+        impl PacketSinkHandler for BombHandler {
+            fn on_packet(&mut self, _packet: &PacketView<'_>) -> PacketCallbackResult {
+                Ok(())
+            }
+        }
+        let destroyed = Arc::new(AtomicBool::new(false));
+        assert!(PacketSink::from_handler(BombHandler(destroyed.clone())).dispose_contained());
+        assert!(destroyed.load(Ordering::Acquire));
+
+        // Benign sinks report no panic.
+        assert!(!PacketSink::builder(|_pkt| Ok(())).build().dispose_contained());
     }
 
     #[test]
