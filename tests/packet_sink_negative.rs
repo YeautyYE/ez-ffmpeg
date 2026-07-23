@@ -121,8 +121,8 @@ fn sink_validation_runs_before_generic_validation() {
 }
 
 /// The strict tier owns AV_CODEC_FLAG_GLOBAL_HEADER; a user `flags` codec
-/// option (such as `flags=-global_header`, the review probe) is applied after
-/// the policy flag and could clear it, so it is rejected typed at build time.
+/// option (such as `flags=-global_header`) is applied after the policy flag
+/// and could clear it, so it is rejected typed at build time.
 #[test]
 fn build_rejects_codec_flags_that_could_clear_global_header() {
     match build_err(

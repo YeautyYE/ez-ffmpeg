@@ -178,7 +178,7 @@ fn stop_returns_only_after_callback_captures_are_destroyed() {
     );
 }
 
-/// The channel review probe: capacity 1, a LIVE receiver that never drains,
+/// The channel wedge case: capacity 1, a LIVE receiver that never drains,
 /// packets in flight — stop() must still terminate (the blocked bounded send
 /// observes cancellation), cleanly and without fabricating an error.
 #[test]
@@ -231,7 +231,7 @@ fn stop_terminates_with_full_undrained_channel() {
     );
 }
 
-/// The round-7 abort-window probe: abort() landing while packets are still
+/// The abort-window case: abort() landing while packets are still
 /// being delivered must never let a terminal callback fire — the terminal
 /// decision reads the status fresh, after the job settled, not from a
 /// pre-wait snapshot. An ARBITRARY mid-stream packet (the 10th of ~40) is

@@ -974,7 +974,7 @@ fn blocked_sibling_stays_interruptible_while_sink_finalizes() {
     drop(accept_thread);
 }
 
-/// The round-7 correctness probe: a delivered on_end must imply wait() ==
+/// Result-identity pin: a delivered on_end must imply wait() ==
 /// Ok. The single documented carve-out is user code failing AFTER the fact —
 /// here a callback capture whose Drop panics during teardown: the panic is
 /// caught at the worker's defined destruction point, logged, and must NOT
