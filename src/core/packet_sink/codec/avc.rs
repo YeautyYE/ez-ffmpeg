@@ -337,7 +337,18 @@ fn parse_avcc_record(avcc: &[u8]) -> Result<AvccRecord, String> {
         fingerprint.put_pps(pps_id, pps, &sets.sps[bound]);
     }
     let (extension, sps_ext) = parse_avcc_extension(avcc, pos, header.profile)?;
-    fingerprint.extension = extension;
+    // The identity canonicalizes the extension: a record may legally carry
+    // either the writer-derived triple (`ff_isom_write_avcc` synthesizing
+    // from Annex-B) or the raw SPS-coded triple (the same function copies
+    // an existing record VERBATIM when the input is not Annex-B, so a
+    // remux preserves that shape). Both describe one stream, so the
+    // fingerprint stores the writer-canonical form and a shape switch
+    // between announcements is not a configuration change. The literal
+    // bytes still face `check_avcc_consistency` below.
+    fingerprint.extension = match extension {
+        Some(_) => derived_extension(&sets.sps[0], &summaries[0]),
+        None => None,
+    };
     fingerprint.sps_ext = sps_ext;
     let record = AvccRecord {
         header,
@@ -456,12 +467,14 @@ fn parse_avcc_extension(
 
 /// The avcC header and the record's own first SPS must describe one
 /// stream: `ff_isom_write_avcc` derives bytes 1..4 (profile /
-/// compatibility / level) and the profile-extension fields all from the
-/// first SPS — the extension triple through its own reader's dispatch
-/// ([`writer_extension_triple`]), not the raw SPS syntax — so a record
-/// that disagrees with that derivation hands consumers two conflicting
-/// descriptions and is rejected — at initial construction and, via the
-/// shared parse, for every `NEW_EXTRADATA` announcement.
+/// compatibility / level) from the first SPS, and the profile-extension
+/// triple may carry either of the two derivations that reach real files —
+/// the writer's own reader dispatch ([`writer_extension_triple`], what
+/// FFmpeg synthesizes from Annex-B input) or the raw SPS syntax (the same
+/// function writes a non-Annex-B extradata verbatim, so a remux preserves
+/// a syntax-derived tail). A record matching neither hands consumers two
+/// conflicting descriptions and is rejected — at initial construction
+/// and, via the shared parse, for every `NEW_EXTRADATA` announcement.
 fn check_avcc_consistency(record: &AvccRecord) -> Result<(), String> {
     let derived = CodecProjection::from_ordered_sets(&record.sets)?;
     if record.header != derived {
@@ -478,13 +491,24 @@ fn check_avcc_consistency(record: &AvccRecord) -> Result<(), String> {
     }
     if let Some((chroma, luma, chroma_depth)) = record.extension {
         let first_sps = record.sets.sps.first().ok_or("no SPS")?;
-        let derived_fields = writer_extension_triple(first_sps[1], &parse_sps(first_sps)?);
-        if (chroma, luma, chroma_depth) != derived_fields {
-            let (want_chroma, want_luma, want_chroma_depth) = derived_fields;
+        let summary = parse_sps(first_sps)?;
+        let writer_fields = writer_extension_triple(first_sps[1], &summary);
+        let syntax_fields = summary.chroma_info();
+        if (chroma, luma, chroma_depth) != writer_fields
+            && (chroma, luma, chroma_depth) != syntax_fields
+        {
+            let (want_chroma, want_luma, want_chroma_depth) = writer_fields;
+            let mut accepted = format!("{want_chroma} and {want_luma}/{want_chroma_depth}");
+            if syntax_fields != writer_fields {
+                let (syn_chroma, syn_luma, syn_chroma_depth) = syntax_fields;
+                accepted = format!(
+                    "{accepted} (writer default) or {syn_chroma} and \
+                     {syn_luma}/{syn_chroma_depth} (SPS syntax)"
+                );
+            }
             return Err(format!(
                 "avcC extension declares chroma_format_idc {chroma} and bit depths \
-                 {luma}/{chroma_depth} but the first SPS derives {want_chroma} and \
-                 {want_luma}/{want_chroma_depth}"
+                 {luma}/{chroma_depth} but the first SPS derives {accepted}"
             ));
         }
     }
@@ -517,11 +541,13 @@ fn read_u16_prefixed(data: &[u8], pos: &mut usize) -> Result<Vec<u8>, String> {
 /// still read the chroma block for 135 and 144 (H.264 7.3.2.1.1 puts the
 /// bits in the payload, so skipping them would misalign everything
 /// behind), and the decoder's list (`ff_h264_decode_seq_parameter_set`,
-/// libavcodec/h264_ps.c) carries 144 but not 139/134. The record
-/// identity mirrors what the writer PRODUCES: for a profile outside the
-/// writer's list the triple is its (1, 8, 8) default no matter what the
-/// SPS codes — an FFmpeg-written record for a profile-144 4:4:4 stream
-/// says (1, 8, 8), so synthesis and the consistency check must too.
+/// libavcodec/h264_ps.c) carries 144 but not 139/134. For a profile
+/// outside the writer's list the triple is its (1, 8, 8) default no
+/// matter what the SPS codes — an avcC FFmpeg synthesizes from Annex-B
+/// for a profile-144 4:4:4 stream says (1, 8, 8) — so synthesis emits
+/// this triple and record identities canonicalize to it. The consistency
+/// check additionally admits the raw-syntax triple, which survives
+/// FFmpeg's verbatim extradata copy on remux.
 fn writer_extension_triple(profile_idc: u8, summary: &SpsSummary) -> (u8, u8, u8) {
     match profile_idc {
         100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 => {
@@ -2753,12 +2779,14 @@ mod tests {
     }
 
     /// The SPS-EXT NAL header is framing like every other parameter
-    /// set's: the reader consumes it before the body is stored
-    /// (h264_parse_nal_header, libavcodec/h2645_parse.c), so an entry
-    /// re-sent with a different legal `nal_ref_idc` (0x6D -> 0x4D, both
-    /// type 13) lands in identical stored state and must stay redundant,
-    /// while a payload difference behind the same header is still a
-    /// configuration change.
+    /// set's: this crate keys the entry by its post-header payload, the
+    /// same identity policy the SPS/PPS maps use. (There is no FFmpeg
+    /// storage behavior to mirror — its extradata readers never parse
+    /// type 13: `ff_h264_decode_extradata` stops after the PPS array and
+    /// `decode_extradata_ps` ignores the type.) An entry re-sent with a
+    /// different legal `nal_ref_idc` (0x6D -> 0x4D, both type 13) lands
+    /// in identical stored state and must stay redundant, while a payload
+    /// difference behind the same header is still a configuration change.
     #[test]
     fn s8_keys_sps_ext_by_post_header_payload() {
         let with_ext = |header: u8, body: u8| {
@@ -2995,12 +3023,15 @@ mod tests {
         }
     }
 
-    /// An avcC shaped like `ff_isom_write_avcc`'s own output for the
-    /// 4:4:4-syntax profile-144 stream — extension (1, 8, 8) — must be
+    /// An avcC shaped like `ff_isom_write_avcc`'s own SYNTHESIS output for
+    /// the 4:4:4-syntax profile-144 stream — extension (1, 8, 8) — must be
     /// accepted, initially and as an announcement over the equivalent
-    /// Annex-B baseline; one carrying the raw syntax values instead
-    /// declares a triple the writer never emits for this profile and is
-    /// two disagreeing stream descriptions.
+    /// Annex-B baseline. So must one carrying the raw SPS-coded values:
+    /// the same function writes a non-Annex-B extradata VERBATIM
+    /// (`mov_write_avcc_tag` hands the track extradata straight through),
+    /// so an FFmpeg remux preserves a syntax-derived tail unchanged. Both
+    /// shapes describe one stream and canonicalize to one identity; a
+    /// triple matching neither derivation is rejected.
     #[test]
     fn accepts_ffmpeg_shaped_records_outside_the_writer_dispatch() {
         let mut avcc = raw_avcc(144, 0x00, 0x1E, PROFILE_144_CHROMA3_SPS, MINIMAL_PPS);
@@ -3011,12 +3042,41 @@ mod tests {
         let annexb = annexb_with(PROFILE_144_CHROMA3_SPS, MINIMAL_PPS);
         let (runtime, _, _) = AvcRuntime::from_extradata(&annexb, 0).unwrap();
         runtime.check_new_extradata(&avcc, 0).unwrap();
-        // chroma_format_idc 3 in the extension — the parsed syntax value.
+        // The verbatim-copy shape: chroma_format_idc 3 — the SPS-coded
+        // value — in the extension. Same stream, same canonical identity:
+        // accepted initially, over the Annex-B baseline, and over the
+        // synthesis-shaped record.
         let ext = avcc.len() - 4;
-        avcc[ext] = 0xFC | 3;
-        let err = parse_avcc_parameter_sets(&avcc).unwrap_err();
+        let mut passthrough = avcc.clone();
+        passthrough[ext] = 0xFC | 3;
+        let passthrough_record = parse_avcc_record(&passthrough).unwrap();
+        assert_eq!(passthrough_record.extension, Some((3, 8, 8)));
+        assert_eq!(passthrough_record.fingerprint, record.fingerprint);
+        assert!(AvcRuntime::from_extradata(&passthrough, 0).is_ok());
+        runtime.check_new_extradata(&passthrough, 0).unwrap();
+        let (from_synthesis, _, _) = AvcRuntime::from_extradata(&avcc, 0).unwrap();
+        from_synthesis.check_new_extradata(&passthrough, 0).unwrap();
+        // Depth-differing passthrough, profile 135: writer default
+        // (1, 8, 8) vs SPS-coded (1, 10, 10) — both shapes, one identity.
+        let mut avcc135 = raw_avcc(135, 0x00, 0x1E, PROFILE_135_TEN_BIT_SPS, MINIMAL_PPS);
+        avcc135.extend_from_slice(&[0xFD, 0xF8, 0xF8, 0x00]);
+        let writer_shaped = parse_avcc_record(&avcc135).unwrap();
+        let ext135 = avcc135.len() - 4;
+        let mut passthrough135 = avcc135.clone();
+        passthrough135[ext135 + 1] = 0xF8 | 2;
+        passthrough135[ext135 + 2] = 0xF8 | 2;
+        let syntax_shaped = parse_avcc_record(&passthrough135).unwrap();
+        assert_eq!(syntax_shaped.extension, Some((1, 10, 10)));
+        assert_eq!(syntax_shaped.fingerprint, writer_shaped.fingerprint);
+        // A triple matching NEITHER derivation (chroma_format_idc 2) is
+        // still two disagreeing stream descriptions.
+        let mut neither = avcc.clone();
+        neither[ext] = 0xFC | 2;
+        let err = parse_avcc_parameter_sets(&neither).unwrap_err();
         assert!(
-            err.contains("chroma_format_idc 3") && err.contains("derives 1"),
+            err.contains("chroma_format_idc 2")
+                && err.contains("(writer default)")
+                && err.contains("(SPS syntax)"),
             "unexpected error: {err}"
         );
     }
