@@ -42,8 +42,11 @@ use std::time::{Duration, Instant};
 /// muxer (parked in its packet queue) and an exited one sit at
 /// entered == returned. Loading `returned` before `entered` narrows the
 /// torn-read window to a completion landing between the two loads, and
-/// the confirm reload after the stability run DETECTS exactly that race
-/// before the generation is handed out. Returns the parked call's
+/// the confirm reload after the stability run rechecks for exactly that
+/// race before the generation is handed out — a completion landing after
+/// the reload still slips through, and the post-stop counter
+/// acknowledgment, taken at writer quiescence, is what finally rejects
+/// it. Returns the parked call's
 /// generation — the value of `ENTERED` with that call in flight — so the
 /// caller can later tie the stop() cut back to THIS write and no other.
 fn require_write_parked(deadline: Instant) -> Result<u64, String> {
@@ -644,11 +647,15 @@ fn blocked_sibling_stays_interruptible_while_sink_finalizes() {
     // CAUSALITY: the same negative return with the same generation could
     // in principle come from the write failing on its own in the window
     // between the pre-stop checks and the worker's stop() call (a peer
-    // reset, say). Only a stop-driven cut passes through an ELECTING
-    // output-interrupt callback, which runs on the muxer thread inside
-    // the blocked call and records the in-flight generation — so this is
-    // the link that proves stop() caused the failure the links above
-    // attribute.
+    // reset, say). A spontaneous socket failure never passes through an
+    // ELECTING output-interrupt callback — the callback runs on the muxer
+    // thread inside the blocked call and records the in-flight generation
+    // only when it elects — so this link proves an interrupt election cut
+    // THIS write. The election keys on the scheduler status (an abort, or
+    // an end status past its grace) whoever published it; naming stop()
+    // as the publisher is the job of the assertions around this one: no
+    // abort ran, the pre-stop checks saw the job alive with zero terminal
+    // events, and stop() itself returned the recorded write error.
     let cut_gen = tcp_write_probe::CUT_GEN.load(Ordering::Acquire);
     assert_eq!(
         cut_gen, parked_gen,
