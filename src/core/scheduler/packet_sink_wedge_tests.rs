@@ -686,9 +686,48 @@ fn blocked_sibling_stays_interruptible_while_sink_finalizes() {
         Instant::now() + Duration::from_secs(20),
     )
     .expect("stage 3");
-    let parked_gen = require_write_parked(Instant::now() + Duration::from_secs(20))
-        .expect("stage 4: the sibling must be parked inside a tcp write");
-    let (rcvbuf_at_park, unread_at_park) = peer_socket_stats(&stream);
+    // Stage 4 acceptance: a frozen entered == returned + 1 alone admits a
+    // TRANSIENT park — a receiver still owing the sender a window update
+    // can complete it later (observed on macOS: 6716 bytes of headroom at
+    // park, withheld below one MSS, granted by a persist probe seconds
+    // after the counters had sat still; the "parked" write finished and
+    // the counters moved past the recorded generation). Accept a parked
+    // generation only once no future grant can complete it: either the
+    // unread queue already meets the socket's receive budget (nothing is
+    // ever granted again — the queue only fills), or the counters AND the
+    // queue sit frozen across a full persist-probe horizon. Where peer
+    // stats are unavailable (non-unix, or a failed getsockopt reporting
+    // -1) the counter park stands alone, as before.
+    let stage4_deadline = Instant::now() + Duration::from_secs(60);
+    let (parked_gen, rcvbuf_at_park, unread_at_park) = loop {
+        let candidate = require_write_parked(stage4_deadline)
+            .expect("stage 4: the sibling must be parked inside a tcp write");
+        let (rcvbuf, unread) = peer_socket_stats(&stream);
+        if rcvbuf < 0 || unread >= rcvbuf {
+            break (candidate, rcvbuf, unread);
+        }
+        let horizon = Instant::now() + Duration::from_secs(8);
+        let frozen = loop {
+            std::thread::sleep(Duration::from_millis(500));
+            let returned = tcp_write_probe::RETURNED.load(Ordering::Acquire);
+            let entered = tcp_write_probe::ENTERED.load(Ordering::Acquire);
+            let (_, unread_now) = peer_socket_stats(&stream);
+            if (entered, returned) != (candidate, candidate - 1) || unread_now != unread {
+                break false;
+            }
+            if Instant::now() >= horizon {
+                break true;
+            }
+        };
+        if frozen {
+            break (candidate, rcvbuf, unread);
+        }
+        assert!(
+            Instant::now() < stage4_deadline,
+            "stage 4: every parked write kept absorbing window grants \
+             before the deadline (rcvbuf={rcvbuf} unread={unread})"
+        );
+    };
     // The liveness half of the contract: a parked write on an ENDED job
     // would be teardown noise, not the running wedge stop() must cut.
     assert!(
