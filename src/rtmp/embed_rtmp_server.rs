@@ -1,5 +1,4 @@
 use crate::core::context::output::Output;
-use crate::core::packet_sink::dispose_panic_payload;
 use crate::error::Error::{
     RtmpCreateStream, RtmpRegistrationQueueFull, RtmpServerAlreadyStarted, RtmpStreamAlreadyExists,
 };
@@ -154,19 +153,24 @@ fn close_intake_and_publish_end(
 /// unwind mid-drain would detach the remaining handles and poison the
 /// registry into a state indistinguishable from settled (empty), turning a
 /// later `stop()` into a false barrier. That discipline includes the panic
-/// PAYLOADS of joined threads: a payload is an arbitrary `Box<dyn Any>`
-/// whose destructor can itself panic — with yet another such payload — so
-/// `Err` payloads are moved aside untouched during the drain and, once the
-/// lock is released, disposed of FIRST, each through the bounded
-/// chain-following containment of
-/// [`dispose_panic_payload`](crate::core::packet_sink::dispose_panic_payload).
-/// Only then does the report run, itself under containment: with the
-/// payloads already gone, a logger that panics during the report can
-/// neither raw-drop retained bombs mid-unwind (a double panic aborts the
-/// process) nor unwind a completed settlement out of `stop()` carrying a
-/// possibly-bomb payload of its own. Riding over poisoning is safe under
-/// that discipline: a poisoned registry still holds exactly the handles no
-/// settlement consumed, and the drain below joins them as usual.
+/// PAYLOADS of joined threads: a payload is an arbitrary `Box<dyn Any>`,
+/// and settlement never runs its drop glue at all — payloads are moved
+/// aside untouched during the drain and deliberately LEAKED
+/// (`mem::forget`) once the lock is released. Running their destructors
+/// here, however contained, is unwinnable in principle: a payload whose
+/// two field destructors both panic aborts the process inside its own
+/// drop glue before any catch regains control, and a destructor is
+/// equally free to BLOCK forever on a lock the `stop()` caller holds —
+/// either outcome inside a blocking public API is strictly worse than
+/// leaking a few bytes per crashed thread, an already-broken, bounded
+/// path. (Contrast `dispose_panic_payload` in packet_sink, which runs
+/// destructors bounded-chain-contained on paths where a caller is not
+/// blocked behind them.) The report afterwards runs under containment,
+/// and its own panic payload — a logger's — is forgotten the same way, so
+/// nothing can unwind a completed settlement out of `stop()`. Riding over
+/// poisoning is safe under that discipline: a poisoned registry still
+/// holds exactly the handles no settlement consumed, and the drain below
+/// joins them as usual.
 fn settle_server_threads(
     server_thread_ids: &Mutex<Vec<std::thread::ThreadId>>,
     threads: &Mutex<Vec<JoinHandle<()>>>,
@@ -206,14 +210,13 @@ fn settle_server_threads(
             }
         }
     }
-    // Dispose of the retained payloads BEFORE any reporting, while nothing
-    // else is in flight: each goes through the bounded chain-following
-    // containment (a destructor that panics with a replacement bomb is
-    // followed a few generations, then deliberately leaked), so no payload
-    // can unwind out of here or survive to be raw-dropped by a later
-    // unwind.
+    // Leak the retained payloads BEFORE any reporting: no drop glue of an
+    // arbitrary payload may run inside a blocking stop() — a two-bomb
+    // payload aborts inside its own drop glue before any catch regains
+    // control, and a destructor can just as well block on a lock the
+    // stop() caller holds. See the unwind-safety note above.
     for payload in payloads {
-        dispose_panic_payload(payload);
+        std::mem::forget(payload);
     }
     if !panicked.is_empty() {
         // The threads died to uncontained panics (e.g. a user-installed
@@ -222,15 +225,15 @@ fn settle_server_threads(
         // rethrow. The report itself runs contained: settlement is already
         // complete and this is purely informational, so a logger panicking
         // HERE must not unwind a finished settlement out of stop() — and
-        // whatever payload that panic carries gets the same bounded
-        // disposal.
+        // whatever payload that panic carries is forgotten like the join
+        // payloads above.
         let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             for name in &panicked {
                 error!("Thread[{name}] terminated by an uncontained panic");
             }
         }));
         if let Err(payload) = report {
-            dispose_panic_payload(payload);
+            std::mem::forget(payload);
         }
     }
 }
@@ -2376,11 +2379,12 @@ mod tests {
         );
     }
 
-    // A payload whose destructor panics with ANOTHER bomb payload: the
-    // disposal must follow the chain inside its containment. Dropping a
-    // replacement payload outside its catch would unwind out of stop() and
-    // raw-drop the sibling payloads still retained — a second bomb there
-    // is a panic-during-unwind process abort.
+    // Settlement never runs a payload's drop glue at all: a payload whose
+    // destructor re-panics with another bomb, and even one whose TWO field
+    // destructors both panic (an abort inside its own drop glue that no
+    // catch can regain control from), must be leaked untouched — the
+    // barrier completes, every handle behind the bombs is joined, and
+    // nothing unwinds or aborts.
     #[test]
     fn settlement_contains_a_chained_panic_payload() {
         struct ChainBomb(u32);
@@ -2397,19 +2401,31 @@ mod tests {
                 panic!("plain payload bomb");
             }
         }
+        // Two panicking field destructors in one box: dropping this ANYWHERE
+        // is a guaranteed process abort (panic during panic-unwind).
+        struct TwoBomb {
+            _a: PlainBomb,
+            _b: PlainBomb,
+        }
 
         let server_thread_ids: Arc<Mutex<Vec<std::thread::ThreadId>>> = Default::default();
         let threads: Arc<Mutex<Vec<JoinHandle<()>>>> = Default::default();
         let survivor_joined = Arc::new(AtomicBool::new(false));
 
-        // Chain bomb first, plain bomb second, live survivor last: the
-        // chain's disposal must not skip the plain bomb's, and the survivor
-        // behind both must still be joined.
+        // Chain bomb, plain bomb, the unabortable two-bomb, then a live
+        // survivor: none of the payloads may be dropped, and the survivor
+        // behind all of them must still be joined.
         threads.lock().unwrap().push(std::thread::spawn(|| {
             std::panic::panic_any(ChainBomb(2));
         }));
         threads.lock().unwrap().push(std::thread::spawn(|| {
             std::panic::panic_any(PlainBomb);
+        }));
+        threads.lock().unwrap().push(std::thread::spawn(|| {
+            std::panic::panic_any(TwoBomb {
+                _a: PlainBomb,
+                _b: PlainBomb,
+            });
         }));
         let survivor_flag = survivor_joined.clone();
         threads.lock().unwrap().push(std::thread::spawn(move || {
@@ -2419,11 +2435,11 @@ mod tests {
         settle_server_threads(&server_thread_ids, &threads);
         assert!(
             survivor_joined.load(Ordering::Acquire),
-            "the survivor behind both bombs must still be joined"
+            "the survivor behind the bombs must still be joined"
         );
         assert!(
             threads.lock().unwrap().is_empty(),
-            "settlement must consume every handle despite the chained payloads"
+            "settlement must consume every handle despite the bomb payloads"
         );
     }
 
