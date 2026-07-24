@@ -67,12 +67,16 @@ pub struct EmbedRtmpServer<S> {
     /// never across a join — to detect the reentrant case above without
     /// going anywhere near the registry lock.
     server_thread_ids: Arc<Mutex<Vec<std::thread::ThreadId>>>,
-    /// Set (before the terminal funnel runs) by every deliberate stop —
-    /// `stop()`, a handle/guard drop — and left `false` by the fatal paths
-    /// (a contained reactor panic, the worker dying). In-process publisher
-    /// write callbacks read it when their feed send fails, to report a
-    /// deliberate server stop calmly instead of as an opaque send error.
-    stopped_deliberately: Arc<AtomicBool>,
+    /// WHY the family reached its terminal state — `CAUSE_DELIBERATE` for
+    /// the user-initiated paths (`stop()`, a handle/guard drop), or
+    /// `CAUSE_FATAL` for the failure paths (a contained reactor panic, the
+    /// worker dying). First writer wins: the cause is claimed with a
+    /// compare-exchange from `CAUSE_NONE` by whichever terminal transition
+    /// lands first, so a `stop()` arriving after a crash cannot relabel the
+    /// crash as deliberate. In-process publisher write callbacks read it
+    /// when their feed send fails, to report a deliberate server stop
+    /// calmly instead of as an opaque send error.
+    terminal_cause: Arc<AtomicUsize>,
     gop_limit: usize,
     max_connections: Option<usize>,
     state: PhantomData<S>,
@@ -81,6 +85,15 @@ pub struct EmbedRtmpServer<S> {
 const STATUS_INIT: usize = 0;
 const STATUS_RUN: usize = 1;
 const STATUS_END: usize = 2;
+
+/// `terminal_cause` values. Kept separate from the status flag: the status
+/// answers "is the family stopped" (three states, compared all over the
+/// reactor and accept loops), the cause answers "who stopped it" (write-once,
+/// read only by failure classification). Folding the cause into the status
+/// would turn every `== STATUS_END` comparison into a range check.
+const CAUSE_NONE: usize = 0;
+const CAUSE_DELIBERATE: usize = 1;
+const CAUSE_FATAL: usize = 2;
 
 /// The one funnel for the server's terminal transition: close the
 /// registration intake FIRST, then release-store `STATUS_END`.
@@ -94,7 +107,23 @@ const STATUS_END: usize = 2;
 /// idempotent, so racing terminal paths (a stop signal against a worker
 /// panic, or the accept loop noticing the worker died) may each run this
 /// with no ordering between them.
-fn close_intake_and_publish_end(registrations: &RegistrationHandoff, status: &AtomicUsize) {
+/// Every direct caller of this funnel is a FAILURE path (worker death,
+/// reactor panic, start() unwind), so the funnel claims `CAUSE_FATAL` for
+/// them; the deliberate paths all run through `signal_stop`, which claims
+/// `CAUSE_DELIBERATE` BEFORE delegating here, making this claim a no-op.
+/// The compare-exchange makes the cause first-writer-wins under races
+/// between a crash and a late `stop()`.
+fn close_intake_and_publish_end(
+    registrations: &RegistrationHandoff,
+    status: &AtomicUsize,
+    terminal_cause: &AtomicUsize,
+) {
+    let _ = terminal_cause.compare_exchange(
+        CAUSE_NONE,
+        CAUSE_FATAL,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
     registrations.close();
     status.store(STATUS_END, Ordering::Release);
 }
@@ -191,6 +220,7 @@ struct StartFailGuard {
     wake_handle: Option<WakeHandle>,
     threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
     server_thread_ids: Arc<Mutex<Vec<std::thread::ThreadId>>>,
+    terminal_cause: Arc<AtomicUsize>,
 }
 
 impl Drop for StartFailGuard {
@@ -198,7 +228,7 @@ impl Drop for StartFailGuard {
         if !self.armed {
             return;
         }
-        close_intake_and_publish_end(&self.registrations, &self.status);
+        close_intake_and_publish_end(&self.registrations, &self.status, &self.terminal_cause);
         if let Some(wake_handle) = &self.wake_handle {
             wake_handle.wake();
         }
@@ -225,7 +255,7 @@ impl<S: 'static> EmbedRtmpServer<S> {
             wake_handle: self.wake_handle,
             threads: self.threads,
             server_thread_ids: self.server_thread_ids,
-            stopped_deliberately: self.stopped_deliberately,
+            terminal_cause: self.terminal_cause,
             gop_limit: self.gop_limit,
             max_connections: self.max_connections,
             state: Default::default(),
@@ -267,22 +297,29 @@ impl<S: 'static> EmbedRtmpServer<S> {
     /// for types with a `Drop` impl (E0509). Shared owners that only hold a
     /// reference (e.g. [`StreamHandle`]) stop the server through this instead.
     fn signal_stop(&self) {
-        // Record the deliberate stop BEFORE the funnel: the funnel's
-        // release-store of `STATUS_END` orders this store ahead of any
-        // acquire-load of the status, and the reactor's teardown (which is
-        // what makes publisher feed sends start failing) happens after it
-        // observed that status — so a write callback that sees its send fail
-        // because of this stop also sees the flag. The fatal paths (worker
-        // death, contained reactor panic) never set it: a send failing under
-        // a `false` flag keeps its loud error classification.
-        self.stopped_deliberately.store(true, Ordering::Release);
+        // Claim the terminal cause BEFORE the funnel, first-writer-wins: if
+        // a fatal transition (worker death, contained panic) already claimed
+        // `CAUSE_FATAL`, this exchange fails and the crash keeps its loud
+        // classification — a late deliberate stop() must not relabel it.
+        // Ordering: the funnel's release-store of `STATUS_END` orders this
+        // claim ahead of any acquire-load of the status, and the reactor
+        // tears publishers down only after observing that status, so the
+        // cause is in place before any teardown a callback could witness.
+        let _ = self.terminal_cause.compare_exchange(
+            CAUSE_NONE,
+            CAUSE_DELIBERATE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
         // Close-then-publish through the shared funnel (see
         // `close_intake_and_publish_end` for the ordering argument).
         // Registrations already queued keep their owners — the reactor's
         // remaining rounds, with the worker's kill-switch drain as the
         // backstop.
         match &self.registrations {
-            Some(registrations) => close_intake_and_publish_end(registrations, &self.status),
+            Some(registrations) => {
+                close_intake_and_publish_end(registrations, &self.status, &self.terminal_cause)
+            }
             // Defensive arm, unreachable today: every caller reaches this
             // with the handoff installed (`stop()`, the RAII guards and
             // `start()`'s failure paths all run after `start()` stored
@@ -345,7 +382,7 @@ impl EmbedRtmpServer<Initialization> {
             wake_handle: None,
             threads: Default::default(),
             server_thread_ids: Default::default(),
-            stopped_deliberately: Default::default(),
+            terminal_cause: Default::default(),
             gop_limit,
             max_connections: None,
             state: Default::default(),
@@ -485,11 +522,13 @@ impl EmbedRtmpServer<Initialization> {
             wake_handle: self.wake_handle.clone(),
             threads: self.threads.clone(),
             server_thread_ids: self.server_thread_ids.clone(),
+            terminal_cause: self.terminal_cause.clone(),
         };
 
         let status = self.status.clone();
         let max_connections = self.max_connections;
         let worker_registrations = registrations.clone();
+        let worker_terminal_cause = self.terminal_cause.clone();
         let result = std::thread::Builder::new()
             .name("rtmp-server-worker".to_string())
             .spawn(move || {
@@ -499,6 +538,7 @@ impl EmbedRtmpServer<Initialization> {
                     self.gop_limit,
                     max_connections,
                     status,
+                    worker_terminal_cause,
                     waker,
                 )
             });
@@ -546,7 +586,9 @@ impl EmbedRtmpServer<Initialization> {
         // The accept loop owns one terminal transition of its own (the
         // worker's connection channel disconnecting below) and needs the
         // intake to run it through the funnel: it takes the handoff Arc
-        // still held from the setup above.
+        // still held from the setup above. That transition is a worker
+        // death — a fatal cause, which the funnel claims.
+        let terminal_cause = self.terminal_cause.clone();
         let result = std::thread::Builder::new()
             .name("rtmp-server-io".to_string())
             .spawn(move || {
@@ -583,7 +625,11 @@ impl EmbedRtmpServer<Initialization> {
                                     // well, so STATUS_END is never
                                     // observable over an open intake no
                                     // matter whose store lands first.
-                                    close_intake_and_publish_end(&registrations, &status);
+                                    close_intake_and_publish_end(
+                                        &registrations,
+                                        &status,
+                                        &terminal_cause,
+                                    );
                                     return;
                                 }
                             }
@@ -781,9 +827,21 @@ impl EmbedRtmpServer<Running> {
         // such instead of logging the send error a genuine failure gets.
         // The callback must still fail the write (the FFmpeg job has to
         // end), so the classification changes the reporting, not the flow.
-        let stopped_deliberately = self.stopped_deliberately.clone();
+        //
+        // The classification is best-effort by construction, and its error
+        // is one-sided. First-writer-wins on `terminal_cause` means a crash
+        // that beat a late stop() stays CAUSE_FATAL — never relabeled calm.
+        // In the other direction the load below can, in principle, still
+        // read a stale CAUSE_NONE during a deliberate stop: the send-failure
+        // observation travels through the channel's disconnect flag, whose
+        // sender-side fast path is a relaxed read, so it carries no
+        // happens-before edge for this unrelated atomic. A stale read only
+        // ever shows the OLDER value (CAUSE_NONE -> the loud error branch),
+        // so the worst case is the pre-classification behavior for one
+        // racing write, never a crash reported as deliberate.
+        let terminal_cause = self.terminal_cause.clone();
         let classify_feed_send_failure = move |what: &str, e: &dyn std::fmt::Debug| {
-            if stopped_deliberately.load(Ordering::Acquire) {
+            if terminal_cause.load(Ordering::Acquire) == CAUSE_DELIBERATE {
                 info!("The rtmp server was deliberately stopped; ending the in-process publisher (failing its {what} write)");
             } else {
                 error!("Failed to send in-process {what}: {e:?}");
@@ -1105,6 +1163,7 @@ fn is_fd_exhaustion(e: &std::io::Error) -> bool {
 fn contain_reactor_panic(
     registrations: &RegistrationHandoff,
     status: &AtomicUsize,
+    terminal_cause: &AtomicUsize,
     run_reactor: impl FnOnce(),
 ) {
     // AssertUnwindSafe: the closure borrows the caller's reactor slot mutably,
@@ -1118,7 +1177,7 @@ fn contain_reactor_panic(
         // funnel closes the intake ahead of the store, so no create path
         // can observe the stopped status and still be told Ok; the worker's
         // kill switch re-closes it during its terminal drain — a no-op.
-        close_intake_and_publish_end(registrations, status);
+        close_intake_and_publish_end(registrations, status, terminal_cause);
         let msg = payload
             .downcast_ref::<&str>()
             .copied()
@@ -1134,6 +1193,7 @@ fn handle_connections(
     gop_limit: usize,
     max_connections: Option<usize>,
     status: Arc<AtomicUsize>,
+    terminal_cause: Arc<AtomicUsize>,
     waker: Option<Waker>,
 ) {
     // FIRST statement of the worker, before the fallible reactor
@@ -1153,7 +1213,7 @@ fn handle_connections(
     // publishers still accepted when the worker dies: each claim lives in
     // its `PublisherState`, torn down with the reactor's publisher slab.
     let mut reactor_slot: Option<Reactor> = None;
-    contain_reactor_panic(kill_switch.handoff(), &status, || {
+    contain_reactor_panic(kill_switch.handoff(), &status, &terminal_cause, || {
         let reactor = match Reactor::new(gop_limit, max_connections, status.clone()) {
             Ok(r) => r,
             Err(e) => {
@@ -1164,7 +1224,7 @@ fn handle_connections(
                 // loop parked forever. The funnel closes the intake ahead
                 // of the store; the kill switch re-closes it on the way
                 // out — a no-op.
-                close_intake_and_publish_end(kill_switch.handoff(), &status);
+                close_intake_and_publish_end(kill_switch.handoff(), &status, &terminal_cause);
                 error!("Failed to create Reactor: {:?}", e);
                 return;
             }
@@ -2186,13 +2246,17 @@ mod tests {
         );
     }
 
-    // The deliberate-stop state drives the publisher write callbacks'
-    // failure classification: every user-initiated stop funnels through
-    // signal_stop and must publish it, while the fatal paths (worker death,
-    // contained reactor panic) run the bare terminal funnel and must not —
-    // a crash keeps its loud error classification.
+    // The terminal cause drives the publisher write callbacks' failure
+    // classification, first-writer-wins: signal_stop (every user-initiated
+    // path) claims CAUSE_DELIBERATE, the bare terminal funnel (worker
+    // death, contained reactor panic) claims CAUSE_FATAL, and whichever
+    // transition lands first keeps the label — in particular, a stop()
+    // arriving AFTER a crash must not relabel the crash as deliberate.
     #[test]
-    fn only_deliberate_stops_publish_the_deliberate_state() {
+    fn terminal_cause_is_first_writer_wins() {
+        // Deliberate first: the cause is claimed as deliberate and a later
+        // fatal funnel (the worker noticing the stop and winding down) must
+        // not overwrite it.
         let server = EmbedRtmpServer::<Running> {
             address: String::new(),
             bound_addr: None,
@@ -2202,21 +2266,30 @@ mod tests {
             wake_handle: None,
             threads: Default::default(),
             server_thread_ids: Default::default(),
-            stopped_deliberately: Default::default(),
+            terminal_cause: Default::default(),
             gop_limit: 1,
             max_connections: None,
             state: PhantomData,
         };
-        assert!(!server.stopped_deliberately.load(Ordering::Acquire));
+        assert_eq!(server.terminal_cause.load(Ordering::Acquire), CAUSE_NONE);
         server.signal_stop();
         assert!(server.is_stopped());
-        assert!(
-            server.stopped_deliberately.load(Ordering::Acquire),
-            "signal_stop must record the stop as deliberate"
+        assert_eq!(
+            server.terminal_cause.load(Ordering::Acquire),
+            CAUSE_DELIBERATE,
+            "signal_stop must claim the deliberate cause"
+        );
+        let registrations = server.registrations.clone().expect("handoff installed");
+        close_intake_and_publish_end(&registrations, &server.status, &server.terminal_cause);
+        assert_eq!(
+            server.terminal_cause.load(Ordering::Acquire),
+            CAUSE_DELIBERATE,
+            "a fatal funnel after a deliberate stop must not relabel it"
         );
 
-        // The fatal shape on a fresh family: the bare funnel, exactly as the
-        // panic containment and the worker's own fatal paths run it.
+        // Fatal first: the crash claims the cause, and a LATE stop() on a
+        // surviving clone must not repaint it as deliberate — the racing
+        // publisher's failing write keeps its loud classification.
         let crashed = EmbedRtmpServer::<Running> {
             address: String::new(),
             bound_addr: None,
@@ -2226,17 +2299,24 @@ mod tests {
             wake_handle: None,
             threads: Default::default(),
             server_thread_ids: Default::default(),
-            stopped_deliberately: Default::default(),
+            terminal_cause: Default::default(),
             gop_limit: 1,
             max_connections: None,
             state: PhantomData,
         };
         let registrations = crashed.registrations.clone().expect("handoff installed");
-        close_intake_and_publish_end(&registrations, &crashed.status);
+        close_intake_and_publish_end(&registrations, &crashed.status, &crashed.terminal_cause);
         assert!(crashed.is_stopped());
-        assert!(
-            !crashed.stopped_deliberately.load(Ordering::Acquire),
-            "a fatal terminal transition must not claim the stop was deliberate"
+        assert_eq!(
+            crashed.terminal_cause.load(Ordering::Acquire),
+            CAUSE_FATAL,
+            "a fatal terminal transition must claim the fatal cause"
+        );
+        crashed.signal_stop();
+        assert_eq!(
+            crashed.terminal_cause.load(Ordering::Acquire),
+            CAUSE_FATAL,
+            "a stop() after the crash must not relabel the crash as deliberate"
         );
     }
 
@@ -2258,7 +2338,7 @@ mod tests {
             wake_handle: None,
             threads: Default::default(),
             server_thread_ids: Default::default(),
-            stopped_deliberately: Default::default(),
+            terminal_cause: Default::default(),
             gop_limit: 1,
             max_connections: None,
             state: PhantomData,
@@ -2304,7 +2384,7 @@ mod tests {
             wake_handle: None,
             threads: Default::default(),
             server_thread_ids: Default::default(),
-            stopped_deliberately: Default::default(),
+            terminal_cause: Default::default(),
             gop_limit: 1,
             max_connections: None,
             state: PhantomData,
@@ -2319,7 +2399,15 @@ mod tests {
             std::thread::Builder::new()
                 .name("rtmp-server-worker".to_string())
                 .spawn(move || {
-                    handle_connections(connection_receiver, registrations, 1, None, status, None)
+                    handle_connections(
+                        connection_receiver,
+                        registrations,
+                        1,
+                        None,
+                        status,
+                        Default::default(),
+                        None,
+                    )
                 })
                 .expect("spawn the worker thread")
         };
@@ -2408,8 +2496,16 @@ mod tests {
     fn reactor_panic_publishes_terminal_status() {
         let registrations = RegistrationHandoff::new();
         let status = AtomicUsize::new(STATUS_RUN);
-        contain_reactor_panic(&registrations, &status, || panic!("injected reactor panic"));
+        let terminal_cause = AtomicUsize::new(CAUSE_NONE);
+        contain_reactor_panic(&registrations, &status, &terminal_cause, || {
+            panic!("injected reactor panic")
+        });
         assert_eq!(status.load(Ordering::Acquire), STATUS_END);
+        assert_eq!(
+            terminal_cause.load(Ordering::Acquire),
+            CAUSE_FATAL,
+            "a contained panic is a fatal cause"
+        );
         assert!(
             matches!(
                 registrations.enqueue(probe_registration("panicked")),
@@ -2427,8 +2523,14 @@ mod tests {
     fn reactor_clean_return_leaves_status_untouched() {
         let registrations = RegistrationHandoff::new();
         let status = AtomicUsize::new(STATUS_RUN);
-        contain_reactor_panic(&registrations, &status, || {});
+        let terminal_cause = AtomicUsize::new(CAUSE_NONE);
+        contain_reactor_panic(&registrations, &status, &terminal_cause, || {});
         assert_eq!(status.load(Ordering::Acquire), STATUS_RUN);
+        assert_eq!(
+            terminal_cause.load(Ordering::Acquire),
+            CAUSE_NONE,
+            "a clean return must not claim any terminal cause"
+        );
         assert!(
             registrations
                 .enqueue(probe_registration("still-open"))
@@ -2458,7 +2560,7 @@ mod tests {
             wake_handle: None,
             threads: Default::default(),
             server_thread_ids: Default::default(),
-            stopped_deliberately: Default::default(),
+            terminal_cause: Default::default(),
             gop_limit: 1,
             max_connections: None,
             state: PhantomData,
@@ -2468,7 +2570,9 @@ mod tests {
             .create_rtmp_input("app", "before-panic")
             .expect("create while running must succeed");
 
-        contain_reactor_panic(&registrations, &status, || panic!("injected reactor panic"));
+        contain_reactor_panic(&registrations, &status, &server.terminal_cause, || {
+            panic!("injected reactor panic")
+        });
 
         assert!(
             server.is_stopped(),
@@ -2503,6 +2607,7 @@ mod tests {
             wake_handle: None,
             threads: Default::default(),
             server_thread_ids: Default::default(),
+            terminal_cause: Default::default(),
         };
 
         let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
@@ -2534,6 +2639,7 @@ mod tests {
             wake_handle: None,
             threads: Default::default(),
             server_thread_ids: Default::default(),
+            terminal_cause: Default::default(),
         };
         guard.armed = false;
         drop(guard);
@@ -2564,7 +2670,7 @@ mod tests {
             wake_handle: None,
             threads: Default::default(),
             server_thread_ids: Default::default(),
-            stopped_deliberately: Default::default(),
+            terminal_cause: Default::default(),
             gop_limit: 1,
             max_connections: None,
             state: PhantomData,
