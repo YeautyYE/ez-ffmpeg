@@ -847,17 +847,25 @@ impl EmbedRtmpServer<Running> {
         // The callback must still fail the write (the FFmpeg job has to
         // end), so the classification changes the reporting, not the flow.
         //
-        // The classification is best-effort by construction, and its error
-        // is one-sided. First-writer-wins on `terminal_cause` means a crash
-        // that beat a late stop() stays CAUSE_FATAL — never relabeled calm.
-        // In the other direction the load below can, in principle, still
-        // read a stale CAUSE_NONE during a deliberate stop: the send-failure
-        // observation travels through the channel's disconnect flag, whose
-        // sender-side fast path is a relaxed read, so it carries no
-        // happens-before edge for this unrelated atomic. A stale read only
-        // ever shows the OLDER value (CAUSE_NONE -> the loud error branch),
-        // so the worst case is the pre-classification behavior for one
-        // racing write, never a crash reported as deliberate.
+        // Scope: this classifies the SERVER lifecycle, not this feed's own
+        // history. A feed torn down for its own fatal protocol error is
+        // reported loudly at its removal site (the reactor warns when it
+        // rejects the publisher), independent of what this classification
+        // says later — a deliberate stop landing between that removal and
+        // this send failure makes the calm line below true of the server
+        // while the earlier warn still records why the feed itself died.
+        //
+        // The classification is best-effort by construction. First-writer-
+        // wins on `terminal_cause` means a server crash that beat a late
+        // stop() stays CAUSE_FATAL — never relabeled calm. In the other
+        // direction the load below can, in principle, still read a stale
+        // CAUSE_NONE during a deliberate stop: the send-failure observation
+        // travels through the channel's disconnect flag, whose sender-side
+        // fast path is a relaxed read, so it carries no happens-before edge
+        // for this unrelated atomic. A stale read only ever shows the OLDER
+        // value (CAUSE_NONE -> the loud error branch), so the worst case is
+        // the pre-classification behavior for one racing write, never a
+        // server crash reported as deliberate.
         let terminal_cause = self.terminal_cause.clone();
         let classify_feed_send_failure = move |what: &str, e: &dyn std::fmt::Debug| {
             if terminal_cause.load(Ordering::Acquire) == CAUSE_DELIBERATE {
@@ -1121,9 +1129,12 @@ impl EmbedRtmpServer<Running> {
     ///
     /// An FFmpeg job still pushing to this server (via
     /// [`create_rtmp_input`](Self::create_rtmp_input)) loses its feed and
-    /// fails its next write; the server reports that calmly as a deliberate
-    /// stop rather than as an opaque send error. Stop such jobs first if
-    /// their clean completion matters.
+    /// fails its next write; the server classifies that failure — best
+    /// effort, by the server's terminal cause — as a deliberate stop
+    /// rather than as an opaque send error. A feed that already died for
+    /// its own protocol error before the stop keeps the warning it got at
+    /// removal time. Stop such jobs first if their clean completion
+    /// matters.
     ///
     /// # Example
     /// ```rust,ignore
