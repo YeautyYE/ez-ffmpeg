@@ -78,13 +78,17 @@ impl WriteEntry {
     }
 }
 
-/// Backpressure level
+/// Backpressure level. The shedding policies below apply to DROPPABLE
+/// entries only (drop-tolerantly serialized media); non-droppable entries —
+/// session control responses, handshake bytes, pings, sequence headers —
+/// are always kept in every band short of Critical (see
+/// `WriteEntry::droppable`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackpressureLevel {
     Normal,   // < 1MB: enqueue all
-    Warning,  // 1-2MB: drop non-keyframes, keep audio + keyframes
-    High,     // 2-4MB: only keep keyframes and sequence headers
-    Critical, // >= 4MB: should disconnect
+    Warning,  // 1-2MB: shed droppable non-keyframe video; keep droppable audio, keyframes and every non-droppable entry
+    High,     // 2-4MB: shed all droppable non-keyframes; keep keyframes and every non-droppable entry
+    Critical, // >= 4MB: should disconnect (refuses droppable and non-droppable alike)
 }
 
 /// Flush result
