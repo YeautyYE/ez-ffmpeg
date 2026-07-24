@@ -6,9 +6,9 @@
 //! 1. the reference ffmpeg CLI,
 //! 2. `from_cli_args` (in-process),
 //! 3. the compile-pinned EMITTED PROGRAM for the shape
-//!    (`examples/cli_emitted_*`, byte-for-byte `emit(canonical_argv)`),
-//!    executed in a scratch working directory whose canonical file names
-//!    point at the same fixture.
+//!    (`examples/cli_emitted_*`, byte-for-byte `emit(canonical_argv)` up to
+//!    the header's crate-version stamp), executed in a scratch working
+//!    directory whose canonical file names point at the same fixture.
 //!
 //! All three outputs must agree semantically: stream count and identity,
 //! codec names, geometry, sample rate and channel layout, duration within
