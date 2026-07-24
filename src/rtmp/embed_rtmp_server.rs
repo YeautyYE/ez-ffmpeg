@@ -19,7 +19,7 @@ use rml_rtmp::time::RtmpTimestamp;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 
@@ -1832,6 +1832,7 @@ mod tests {
     use crate::core::context::output::Output;
     use crate::core::scheduler::ffmpeg_scheduler::FfmpegScheduler;
     use ffmpeg_next::time::current;
+    use std::sync::atomic::AtomicBool;
     use std::thread::sleep;
     use std::time::Duration;
 
