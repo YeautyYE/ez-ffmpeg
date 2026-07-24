@@ -5,7 +5,8 @@
 //! order — so generated code and in-process execution cannot drift. Every
 //! emitted call exists in the crate's public API; a checked-in emitted
 //! program is compiled as a real example (`examples/cli_emitted_transcode.rs`)
-//! and pinned byte-for-byte by a unit test below.
+//! and pinned byte-for-byte by a unit test below (only the header's
+//! crate-version stamp is masked, so a version bump alone never repins).
 
 use super::lower::LoweredJob;
 use super::manifest::{ShapeStatus, DIALECT, MANIFEST_REVISION};
@@ -553,13 +554,57 @@ mod tests {
         assert!(code.contains("// command: ffmpeg -i '我的 视频.mp4'"));
     }
 
+    /// Replaces the header's crate-version stamp with a placeholder so the
+    /// emission pins survive version bumps without repinning the examples.
+    /// Deliberately strict: the marker must appear exactly once and the
+    /// stamp must LOOK like a version (leading digit, then the semver
+    /// charset), so the mask can never swallow non-version drift.
+    fn mask_crate_version(code: &str) -> String {
+        const MARKER: &str = "crate: ez-ffmpeg ";
+        assert_eq!(
+            code.matches(MARKER).count(),
+            1,
+            "expected exactly one crate-version stamp:\n{code}"
+        );
+        let (head, rest) = code.split_once(MARKER).unwrap();
+        let stamp_len = rest
+            .bytes()
+            .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
+            .count();
+        // The stamp is an ASCII prefix, so `stamp_len` is a char boundary.
+        let (stamp, tail) = rest.split_at(stamp_len);
+        assert!(
+            stamp.as_bytes().first().is_some_and(u8::is_ascii_digit),
+            "crate-version stamp is not a version: {rest:?}"
+        );
+        format!("{head}{MARKER}<crate version>{tail}")
+    }
+
+    #[test]
+    fn mask_crate_version_masks_only_the_version_stamp() {
+        let header = "// dialect: d; manifest: r4; crate: ez-ffmpeg 0.15.0-rc.1+meta; \
+                      cargo features: none required\n";
+        assert_eq!(
+            mask_crate_version(header),
+            "// dialect: d; manifest: r4; crate: ez-ffmpeg <crate version>; \
+             cargo features: none required\n"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "not a version")]
+    fn mask_crate_version_rejects_a_non_version_stamp() {
+        mask_crate_version("crate: ez-ffmpeg vandalized; cargo features: none required");
+    }
+
     #[test]
     fn every_verified_shape_emission_is_pinned_and_compiled() {
         // Each examples/cli_emitted_* file is the EXACT emission of its
         // shape's canonical argv, checked in and built by cargo (examples
         // compile as real targets), so every emitted call is proven against
-        // the real crate API byte for byte — and the golden runner executes
-        // these same binaries as its third lane.
+        // the real crate API byte for byte, the header's crate-version stamp
+        // aside — and the golden runner executes these same binaries as its
+        // third lane.
         use crate::core::cli::manifest::VERIFIED_SHAPES;
         for shape in VERIFIED_SHAPES {
             let code = crate::core::cli::emit_rust_code_from_args(shape.canonical_argv)
@@ -584,8 +629,13 @@ mod tests {
             // the pinned side so the comparison is about content, not the
             // checkout's line-ending policy.
             let pinned = pinned.replace("\r\n", "\n");
+            // The header stamps the version of the crate that emitted the
+            // file; a plain version bump must not repin all six examples.
+            // Exactly that stamp is masked on BOTH sides — every other byte
+            // still has to match.
             assert_eq!(
-                code, pinned,
+                mask_crate_version(&code),
+                mask_crate_version(&pinned),
                 "examples/{}.rs drifted from the emitter; regenerate it",
                 shape.emitted_example
             );
