@@ -2,7 +2,7 @@ use crate::core::context::muxer::{Muxer, SqMuxPlan, StreamBsfChains};
 use crate::core::context::obj_pool::ObjPool;
 use crate::core::context::pre_mux_queue::PreMuxQueueReceiver;
 use crate::core::context::{PacketBox, PacketData};
-use crate::core::packet_sink::dispose_panic_payload;
+use crate::core::packet_sink::{dispose_panic_payload, JobFailureSummary};
 use crate::core::scheduler::ffmpeg_scheduler::{
     is_stopping, packet_is_null, set_scheduler_error, wait_until_not_paused, STATUS_ABORT,
     STATUS_END,
@@ -1586,12 +1586,14 @@ fn _mux_init(
             // discard would start that new unwind exactly where the
             // containment believed the panic was over.
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                // Formatting sits in its own inner catch so a panicking
-                // Display cannot skip the terminal dispatch. Only the
-                // `e.to_string()` call can panic here (the lock handles
-                // poison, the Option/Result adapters cannot), so a caught
-                // panic proves an error IS recorded: substitute a fixed
-                // message rather than repaint the failed job as success.
+                // Summary construction sits in its own inner catch so a
+                // panicking Display cannot skip the terminal dispatch. Only
+                // the recorded error's Display formatting inside
+                // `from_error` can panic here (the variant classification is
+                // pure matching, the lock handles poison, the Option/Result
+                // adapters cannot), so a caught panic proves an error IS
+                // recorded: substitute the fixed-message summary rather than
+                // repaint the failed job as success.
                 let job_error = if !aborted {
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         scheduler_result
@@ -1599,13 +1601,11 @@ fn _mux_init(
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .as_ref()
                             .and_then(|result| result.as_ref().err())
-                            .map(|e| e.to_string())
+                            .map(JobFailureSummary::from_error)
                     }))
                     .unwrap_or_else(|payload| {
                         dispose_panic_payload(payload);
-                        Some(String::from(
-                            "job error message unavailable: formatting the recorded error panicked",
-                        ))
+                        Some(JobFailureSummary::formatting_panicked())
                     })
                 } else {
                     None
@@ -2089,7 +2089,13 @@ impl SinkDisposal {
     }
 
     /// Forwards the terminal dispatch to the worker (no-op after disposal).
-    fn finish(&mut self, all_streams_terminal: bool, ret: i32, aborted: bool, job_error: Option<String>) {
+    fn finish(
+        &mut self,
+        all_streams_terminal: bool,
+        ret: i32,
+        aborted: bool,
+        job_error: Option<JobFailureSummary>,
+    ) {
         if let Some(worker) = self.0.as_mut() {
             worker.finish(all_streams_terminal, ret, aborted, job_error);
         }
