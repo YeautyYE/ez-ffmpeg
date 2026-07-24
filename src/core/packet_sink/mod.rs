@@ -822,13 +822,15 @@ impl PacketSink {
     /// terminates even with a full, undrained channel. Dropping the receiver
     /// cancels the job with [`PacketSinkError::ChannelDisconnected`].
     ///
-    /// Terminal `End`/`Error` events are delivered best-effort ON THE RAW
-    /// CHANNEL: the send behind them must not block teardown, so a consumer
-    /// that is full at that instant — stalled forever or merely a few events
-    /// behind — loses them, and sender disconnection (`Disconnected` on the
-    /// receiver) is the authoritative end-of-events signal.
-    /// [`PacketSinkReceiver::into_events`] restores the deterministic ending
-    /// on top: a stream without a terminal `Err` always ends with `End`.
+    /// Terminal `End`/`Error` events — and the `JobFailure` summary queued
+    /// immediately before a job-failure `Error` — are delivered best-effort
+    /// ON THE RAW CHANNEL: the send behind them must not block teardown, so
+    /// a consumer that is full at that instant — stalled forever or merely a
+    /// few events behind — loses them, and sender disconnection
+    /// (`Disconnected` on the receiver) is the authoritative end-of-events
+    /// signal. [`PacketSinkReceiver::into_events`] restores the
+    /// deterministic ending on top: a stream without a terminal `Err` always
+    /// ends with `End`.
     pub fn channel(capacity: NonZeroUsize) -> (PacketSink, PacketSinkReceiver) {
         let (tx, rx) = crossbeam_channel::bounded::<PacketSinkEvent>(capacity.get());
         let cancellation: CancellationSlot = Arc::new(OnceLock::new());
@@ -837,6 +839,7 @@ impl PacketSink {
         let pkt_tx = tx.clone();
         let pkt_cancel = cancellation.clone();
         let end_tx = tx.clone();
+        let job_failed_tx = tx.clone();
         let err_tx = tx;
         let mut sink = PacketSink::builder(move |packet: &PacketView<'_>| {
             send_with_cancellation(
@@ -858,6 +861,25 @@ impl PacketSink {
             // indistinguishable from try_send), and sender disconnection is
             // the authoritative signal.
             let _ = end_tx.try_send(PacketSinkEvent::End);
+        })
+        .on_job_failed(move |summary: &JobFailureSummary| {
+            // Best-effort like the terminal events it precedes, with one
+            // extra guard: the summary must never consume the LAST free
+            // slot — the Error(JobFailed) event behind it has first claim
+            // on that capacity. A consumer that drained the channel before
+            // the terminal (the documented way to catch the best-effort
+            // terminal on a small adapter) was guaranteed the Error event
+            // before the summary existed and must stay guaranteed it. Only
+            // this thread sends, and the consumer can only FREE slots, so
+            // a two-free-slots check here cannot be raced into starving
+            // the Error send that follows.
+            let free = job_failed_tx
+                .capacity()
+                .unwrap_or(usize::MAX)
+                .saturating_sub(job_failed_tx.len());
+            if free >= 2 {
+                let _ = job_failed_tx.try_send(PacketSinkEvent::JobFailure(summary.clone()));
+            }
         })
         .on_delivery_error(move |e: &PacketSinkError| {
             let _ = err_tx.try_send(PacketSinkEvent::Error(e.clone()));
@@ -1317,6 +1339,15 @@ pub enum PacketSinkEvent {
     Packet(EncodedPacket),
     /// Terminal success (best-effort; see the enum docs).
     End,
+    /// A structured summary of a job failure recorded OUTSIDE this sink's
+    /// delivery path, queued immediately before the matching
+    /// [`Error`](Self::Error) event carrying
+    /// [`PacketSinkError::JobFailed`]. Emitted only on that synthesis path —
+    /// a delivery-path error produces just the `Error` event. Best-effort
+    /// like [`End`](Self::End), and one notch behind the `Error` event it
+    /// precedes: the summary is dropped rather than ever taking the last
+    /// free slot the terminal `Error` would have used.
+    JobFailure(JobFailureSummary),
     /// A delivery-path error, or [`PacketSinkError::JobFailed`] when the job
     /// failed elsewhere (`wait()` keeps the original error). Best-effort like
     /// [`End`](Self::End).

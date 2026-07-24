@@ -2098,6 +2098,78 @@ mod tests {
         }
     }
 
+    /// (e) Channel adapter: the job-failure path queues a structured
+    /// `JobFailure` event immediately before the `Error(JobFailed)` event,
+    /// both carrying the same message.
+    #[test]
+    fn channel_emits_job_failure_before_error_on_the_failure_path() {
+        let ctx = video_ctx();
+        let (sink, rx) = PacketSink::channel(std::num::NonZeroUsize::new(8).unwrap());
+        let mut worker = collect(&ctx, sink).unwrap();
+        assert_eq!(worker.deliver_stream_info(), 0);
+        let recorded = crate::error::Error::WorkerPanicked("muxer1:mpegts".to_string());
+        worker.finish(
+            false,
+            AVERROR_EXTERNAL,
+            false,
+            Some(JobFailureSummary::from_error(&recorded)),
+        );
+        drop(worker);
+        assert!(matches!(
+            rx.recv().unwrap(),
+            PacketSinkEvent::StreamInfo(_)
+        ));
+        match rx.recv().unwrap() {
+            PacketSinkEvent::JobFailure(summary) => {
+                assert_eq!(summary.kind(), JobFailureKind::Other);
+                assert_eq!(summary.message(), recorded.to_string());
+            }
+            other => panic!("expected the JobFailure event first, got {other:?}"),
+        }
+        match rx.recv().unwrap() {
+            PacketSinkEvent::Error(PacketSinkError::JobFailed { message }) => {
+                assert_eq!(message, recorded.to_string());
+            }
+            other => panic!("expected the Error(JobFailed) event second, got {other:?}"),
+        }
+        // Nothing else follows; the sender side is gone.
+        assert!(rx.recv().is_err());
+    }
+
+    /// (e) Channel adapter, capacity-1 regression: the JobFailure summary
+    /// must never consume the LAST free slot — a consumer that drained a
+    /// capacity-1 channel before the terminal was guaranteed the
+    /// Error(JobFailed) event before the summary existed and must stay
+    /// guaranteed it; the summary is dropped instead.
+    #[test]
+    fn job_failure_event_never_starves_the_terminal_error_slot() {
+        let ctx = video_ctx();
+        let (sink, rx) = PacketSink::channel(std::num::NonZeroUsize::new(1).unwrap());
+        let mut worker = collect(&ctx, sink).unwrap();
+        assert_eq!(worker.deliver_stream_info(), 0);
+        // Drain the stream-info event: exactly ONE slot is free at the
+        // terminal — the pre-summary guarantee for the Error event.
+        assert!(matches!(
+            rx.recv().unwrap(),
+            PacketSinkEvent::StreamInfo(_)
+        ));
+        let recorded = crate::error::Error::WorkerPanicked("muxer1:mpegts".to_string());
+        worker.finish(
+            false,
+            AVERROR_EXTERNAL,
+            false,
+            Some(JobFailureSummary::from_error(&recorded)),
+        );
+        drop(worker);
+        match rx.recv().unwrap() {
+            PacketSinkEvent::Error(PacketSinkError::JobFailed { message }) => {
+                assert_eq!(message, recorded.to_string());
+            }
+            other => panic!("the lone slot belongs to Error(JobFailed), got {other:?}"),
+        }
+        assert!(rx.recv().is_err(), "nothing else may be queued");
+    }
+
     /// Cancellation precedence when a sibling failure races the shutdown:
     /// this sink observes a stopping status that carries NO recorded error
     /// (an explicit stop()) and cancels its blocked send cooperatively; a
