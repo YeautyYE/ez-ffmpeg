@@ -55,11 +55,18 @@ pub struct EmbedRtmpServer<S> {
     /// `start()` and shared by every clone of the family. `stop()` drains
     /// this registry and joins them — its settlement barrier — holding the
     /// lock across the joins so a racing `stop()` on a clone blocks on the
-    /// lock and also returns only after teardown finished. The joined
-    /// threads never touch this registry (they receive only the status,
-    /// the handoff and the connection channel), so holding the lock while
-    /// joining cannot deadlock against them.
+    /// lock and also returns only after teardown finished. The server
+    /// threads themselves never reach this lock: the only way user code
+    /// (which could hold a clone and call `stop()`) runs on them is through
+    /// a user-installed global logger, and `settle_server_threads` bails out
+    /// on a server thread BEFORE touching the registry (see its reentrancy
+    /// notes) — so holding the lock across the joins cannot deadlock.
     threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    /// The `ThreadId`s of the threads whose handles live in `threads`,
+    /// recorded at spawn. `settle_server_threads` probes this list — briefly,
+    /// never across a join — to detect the reentrant case above without
+    /// going anywhere near the registry lock.
+    server_thread_ids: Arc<Mutex<Vec<std::thread::ThreadId>>>,
     /// Set (before the terminal funnel runs) by every deliberate stop —
     /// `stop()`, a handle/guard drop — and left `false` by the fatal paths
     /// (a contained reactor panic, the worker dying). In-process publisher
@@ -92,37 +99,74 @@ fn close_intake_and_publish_end(registrations: &RegistrationHandoff, status: &At
     status.store(STATUS_END, Ordering::Release);
 }
 
-/// `stop()`'s settlement barrier: drain the family's thread registry and
-/// join every server thread, holding the lock across the joins so racing
-/// `stop()` calls on clones serialize behind it and each returns only once
-/// teardown finished. The caller must have signaled the stop first, or the
-/// joins would wait on threads with no reason to exit.
+/// `stop()`'s settlement barrier: join every server thread in the family's
+/// registry, holding the registry lock across the joins so racing `stop()`
+/// calls on clones serialize behind it and each returns only once teardown
+/// finished. The caller must have signaled the stop first, or the joins
+/// would wait on threads with no reason to exit.
 ///
-/// Riding over poisoning is safe here: the registry is a plain list with no
-/// cross-statement invariant, and a caller panicking mid-settlement must not
-/// leave later stops unable to join at all.
+/// Reentrancy guard — FIRST, before any lock. The server threads do run
+/// user code: every `log` macro they execute dispatches to a user-installed
+/// global logger, which may hold a server clone and call `stop()`. Such a
+/// call must neither block on the registry lock (an outer settlement holds
+/// it while joining the very thread the logger runs on — deadlock) nor
+/// consume handles (its own would be dropped, detaching a thread a later
+/// user-thread `stop()` could still settle). A server thread therefore gets
+/// signal-only semantics: warn and return with the registry untouched. The
+/// id list's lock is held only for this membership probe — never across a
+/// join — so the probe itself cannot deadlock.
 ///
-/// A registered thread calling this would self-join and deadlock, so any
-/// handle owned by the calling thread is skipped (dropped, detaching the
-/// thread) instead of joined. No in-tree path runs `stop()` on a server
-/// thread — the reactor and accept loops never execute user code — so the
-/// guard is a backstop, not a supported pattern.
-fn settle_server_threads(threads: &Mutex<Vec<JoinHandle<()>>>) {
-    let mut registry = threads.lock().unwrap_or_else(PoisonError::into_inner);
+/// The join loop performs no logging and nothing else that can unwind: an
+/// unwind mid-drain would detach the remaining handles and poison the
+/// registry into a state indistinguishable from settled (empty), turning a
+/// later `stop()` into a false barrier. All reporting happens after the
+/// registry lock is released, when settlement has already completed. Riding
+/// over poisoning is safe under that discipline: a poisoned registry still
+/// holds exactly the handles no settlement consumed, and the drain below
+/// joins them as usual.
+fn settle_server_threads(
+    server_thread_ids: &Mutex<Vec<std::thread::ThreadId>>,
+    threads: &Mutex<Vec<JoinHandle<()>>>,
+) {
     let current = std::thread::current().id();
-    for handle in registry.drain(..) {
-        if handle.thread().id() == current {
-            warn!("stop() called from a server thread; skipping the self-join");
-            continue;
+    let is_server_thread = server_thread_ids
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .contains(&current);
+    if is_server_thread {
+        warn!(
+            "stop() called on a server thread (user code reached through the \
+             global logger); stopping is signal-only here — the threads still \
+             exit on the signal, and a stop() from any other thread settles"
+        );
+        return;
+    }
+
+    let mut panicked: Vec<String> = Vec::new();
+    {
+        let mut registry = threads.lock().unwrap_or_else(PoisonError::into_inner);
+        for handle in registry.drain(..) {
+            // Defensive second line for a handle the id list missed (only
+            // reachable from hand-assembled registries in tests): detaching
+            // beats self-joining forever. No logging in this loop — see the
+            // unwind-safety note above.
+            if handle.thread().id() == current {
+                continue;
+            }
+            let name = handle.thread().name().unwrap_or("rtmp-server").to_string();
+            if handle.join().is_err() {
+                panicked.push(name);
+            }
         }
-        let name = handle.thread().name().unwrap_or("rtmp-server").to_string();
-        if handle.join().is_err() {
-            // The thread died to an uncontained panic (e.g. a user-installed
-            // logger panicking outside the reactor's unwind boundary). It is
-            // just as terminated — the barrier holds — so report rather than
-            // rethrow the payload out of stop().
-            error!("Thread[{name}] terminated by an uncontained panic");
-        }
+    }
+    for name in panicked {
+        // The thread died to an uncontained panic (e.g. a user-installed
+        // logger panicking outside the reactor's unwind boundary). It is
+        // just as terminated — the barrier holds — so report rather than
+        // rethrow the payload out of stop(). Logged only now, with the
+        // registry lock released and every join already done, so even a
+        // panicking logger cannot damage the settlement it reports on.
+        error!("Thread[{name}] terminated by an uncontained panic");
     }
 }
 
@@ -145,6 +189,8 @@ struct StartFailGuard {
     registrations: Arc<RegistrationHandoff>,
     status: Arc<AtomicUsize>,
     wake_handle: Option<WakeHandle>,
+    threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    server_thread_ids: Arc<Mutex<Vec<std::thread::ThreadId>>>,
 }
 
 impl Drop for StartFailGuard {
@@ -156,6 +202,15 @@ impl Drop for StartFailGuard {
         if let Some(wake_handle) = &self.wake_handle {
             wake_handle.wake();
         }
+        // Settle whatever did spawn before the unwind: the signal above
+        // makes those threads exit promptly, and joining them here keeps
+        // the failed start from leaving live threads (and their registry
+        // handles) behind for a family no `stop()` can ever reach —
+        // `start()` consumed the one lifecycle claim, so no `Running`
+        // value will exist to settle them later. Runs on `start()`'s
+        // caller thread, never a server thread, so the reentrancy bail-out
+        // inside cannot fire.
+        settle_server_threads(&self.server_thread_ids, &self.threads);
     }
 }
 
@@ -169,6 +224,7 @@ impl<S: 'static> EmbedRtmpServer<S> {
             registrations: self.registrations,
             wake_handle: self.wake_handle,
             threads: self.threads,
+            server_thread_ids: self.server_thread_ids,
             stopped_deliberately: self.stopped_deliberately,
             gop_limit: self.gop_limit,
             max_connections: self.max_connections,
@@ -185,7 +241,8 @@ impl<S: 'static> EmbedRtmpServer<S> {
     /// wakeup, the accept thread within its ~100ms accept cycle). The one
     /// place both coincide is [`stop`](EmbedRtmpServer<Running>::stop), which
     /// joins the server threads before returning — after a `stop()` call has
-    /// returned, teardown is complete as well.
+    /// returned, teardown is complete as well (except for `stop()`'s
+    /// reentrant logger edge, documented there, which is signal-only).
     ///
     /// # Returns
     ///
@@ -287,6 +344,7 @@ impl EmbedRtmpServer<Initialization> {
             registrations: None,
             wake_handle: None,
             threads: Default::default(),
+            server_thread_ids: Default::default(),
             stopped_deliberately: Default::default(),
             gop_limit,
             max_connections: None,
@@ -425,6 +483,8 @@ impl EmbedRtmpServer<Initialization> {
             registrations: registrations.clone(),
             status: self.status.clone(),
             wake_handle: self.wake_handle.clone(),
+            threads: self.threads.clone(),
+            server_thread_ids: self.server_thread_ids.clone(),
         };
 
         let status = self.status.clone();
@@ -446,12 +506,20 @@ impl EmbedRtmpServer<Initialization> {
             // The worker's handle joins the family registry: it is what
             // stop()'s settlement barrier joins. Registered before the
             // accept thread spawns, so no exit below can leave a running
-            // thread the registry does not know about.
-            Ok(handle) => self
-                .threads
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(handle),
+            // thread the registry does not know about. Its ThreadId goes
+            // into the reentrancy list first — both writes happen before
+            // any Running value (and thus any stop()) can exist, so the
+            // two locks never race a settlement.
+            Ok(handle) => {
+                self.server_thread_ids
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(handle.thread().id());
+                self.threads
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(handle);
+            }
             Err(e) => {
                 // Nothing has spawned yet: no worker observes STATUS_RUN, and the
                 // listener is still owned here (moved into the io closure only
@@ -537,11 +605,16 @@ impl EmbedRtmpServer<Initialization> {
                 }
             });
         match result {
-            Ok(handle) => self
-                .threads
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(handle),
+            Ok(handle) => {
+                self.server_thread_ids
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(handle.thread().id());
+                self.threads
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(handle);
+            }
             Err(e) => {
                 // The worker thread spawned successfully above and is now polling
                 // `status` (still STATUS_RUN); without this it would run forever.
@@ -549,8 +622,15 @@ impl EmbedRtmpServer<Initialization> {
                 // BEFORE logging: `error!` can run a user-installed logger that
                 // itself panics, and that unwind must not strand the already
                 // running worker. The listener was moved into the failed io
-                // closure and drops with it, releasing the port.
+                // closure and drops with it, releasing the port. Then settle
+                // the worker: this failed start() consumed the family's one
+                // lifecycle claim, so no Running value will ever exist to
+                // join it later — its registry handle would otherwise pin a
+                // live thread until the last clone drops. Settling before
+                // the log keeps the usual discipline: a panicking logger
+                // cannot skip it.
                 self.signal_stop();
+                settle_server_threads(&self.server_thread_ids, &self.threads);
                 error!("Thread[rtmp-server-io] exited with error: {e}");
                 return Err(crate::error::Error::RtmpThreadExited);
             }
@@ -946,11 +1026,19 @@ impl EmbedRtmpServer<Running> {
     /// stream key freed. A caller can rebind the address or reuse a stream
     /// key immediately after this returns, without polling.
     ///
-    /// Blocking is bounded: the reactor exits on its next wakeup and drains
-    /// still-queued tails for at most its graceful-shutdown window (a few
-    /// seconds, and only when a peer stopped reading); the accept thread
-    /// notices within its ~100ms accept cycle. Concurrent stops on clones
-    /// serialize behind one settlement and each returns only after it.
+    /// Blocking is bounded but not hard-real-time: the reactor finishes the
+    /// loop turn it is in, then drains still-queued tails for roughly its
+    /// graceful-shutdown window (a few seconds, re-checked between drain
+    /// passes, and only spent when a peer stopped reading); the accept
+    /// thread notices within its ~100ms accept cycle. Concurrent stops on
+    /// clones serialize behind one settlement and each returns only after
+    /// it.
+    ///
+    /// One reentrant edge degrades to signal-only: user code reached
+    /// through a user-installed global logger runs ON the server threads,
+    /// and if such code calls `stop()`, joining from there would deadlock —
+    /// that call warns, skips the joins (leaving them available to any
+    /// other caller), and returns with only the signal sent.
     ///
     /// An FFmpeg job still pushing to this server (via
     /// [`create_rtmp_input`](Self::create_rtmp_input)) loses its feed and
@@ -967,7 +1055,7 @@ impl EmbedRtmpServer<Running> {
     /// ```
     pub fn stop(self) -> EmbedRtmpServer<Ended> {
         self.signal_stop();
-        settle_server_threads(&self.threads);
+        settle_server_threads(&self.server_thread_ids, &self.threads);
         self.into_state()
     }
 }
@@ -1933,43 +2021,169 @@ mod tests {
         );
     }
 
-    // The settlement barrier must never self-deadlock. No in-tree path can
-    // run stop() on a server thread (the reactor and accept loops never
-    // execute user code), but settle_server_threads carries a backstop for
-    // that ever becoming false: a thread finding its OWN handle in the
-    // registry must skip it (detaching the thread) instead of joining
-    // itself forever.
+    // The settlement barrier must never deadlock on reentrancy: user code
+    // reached through the global logger runs ON the server threads and may
+    // call stop(). Such a call must return promptly WITHOUT touching the
+    // registry — the handles stay available, so a later stop() from any
+    // other thread still settles for real.
     #[test]
-    fn settlement_skips_a_self_join_instead_of_deadlocking() {
+    fn settlement_from_a_server_thread_is_signal_only_and_preserves_handles() {
+        let server_thread_ids: Arc<Mutex<Vec<std::thread::ThreadId>>> = Default::default();
         let threads: Arc<Mutex<Vec<JoinHandle<()>>>> = Default::default();
         let (registered_tx, registered_rx) = std::sync::mpsc::channel::<()>();
         let (settled_tx, settled_rx) = std::sync::mpsc::channel::<()>();
 
-        let thread_registry = threads.clone();
+        let ids_probe = server_thread_ids.clone();
+        let threads_probe = threads.clone();
         let handle = std::thread::Builder::new()
-            .name("self-join-probe".to_string())
+            .name("reentrancy-probe".to_string())
             .spawn(move || {
-                // Hold until the spawner has registered this thread's own
-                // handle, then run the settlement from inside that thread.
+                // Hold until the spawner registered this thread's id and
+                // handle, then run the settlement from inside that thread —
+                // the shape of a logger-held clone calling stop().
                 registered_rx
                     .recv()
                     .expect("the registration signal must arrive");
-                settle_server_threads(&thread_registry);
+                settle_server_threads(&ids_probe, &threads_probe);
                 settled_tx
                     .send(())
                     .expect("report that the settlement returned");
             })
             .expect("spawn the probe thread");
 
+        server_thread_ids.lock().unwrap().push(handle.thread().id());
         threads.lock().unwrap().push(handle);
         registered_tx.send(()).expect("signal the registration");
 
-        // Deadline-bounded receive, not synchronization: with the guard the
-        // settlement returns at once; a self-join would hang forever and
-        // only this bound turns that hang into a test failure.
+        // Deadline-bounded receive, not synchronization: the reentrant call
+        // returns at once; a self-join would hang forever and only this
+        // bound turns that hang into a test failure.
         settled_rx
             .recv_timeout(Duration::from_secs(5))
-            .expect("settlement run from a registered thread must skip the self-join and return");
+            .expect("settlement on a server thread must be signal-only, not a deadlock");
+        assert_eq!(
+            threads.lock().unwrap().len(),
+            1,
+            "the reentrant call must leave the registry untouched"
+        );
+
+        // Any other thread can still run the real settlement afterwards.
+        settle_server_threads(&server_thread_ids, &threads);
+        assert!(
+            threads.lock().unwrap().is_empty(),
+            "a later settlement from a non-server thread must consume and join the handle"
+        );
+    }
+
+    // Racing stops on clones must EACH return only after the server threads
+    // exited: the second caller serializes behind the first's joins on the
+    // registry lock. Each settler asserts the exit flag the moment its
+    // settlement returns — an implementation that returned early would trip
+    // it.
+    #[test]
+    fn concurrent_settlements_both_wait_for_the_thread_exit() {
+        let server_thread_ids: Arc<Mutex<Vec<std::thread::ThreadId>>> = Default::default();
+        let threads: Arc<Mutex<Vec<JoinHandle<()>>>> = Default::default();
+        let exited = Arc::new(AtomicBool::new(false));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+        let exited_worker = exited.clone();
+        let worker = std::thread::Builder::new()
+            .name("held-worker".to_string())
+            .spawn(move || {
+                // Parks until released — stands in for a server thread that
+                // is still settling when the stops arrive.
+                release_rx.recv().expect("the release signal must arrive");
+                exited_worker.store(true, Ordering::Release);
+            })
+            .expect("spawn the held worker");
+        server_thread_ids.lock().unwrap().push(worker.thread().id());
+        threads.lock().unwrap().push(worker);
+
+        let settler = |ids: Arc<Mutex<Vec<std::thread::ThreadId>>>,
+                       threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
+                       exited: Arc<AtomicBool>| {
+            std::thread::spawn(move || {
+                settle_server_threads(&ids, &threads);
+                assert!(
+                    exited.load(Ordering::Acquire),
+                    "settlement returned before the registered thread exited"
+                );
+            })
+        };
+        let first = settler(
+            server_thread_ids.clone(),
+            threads.clone(),
+            exited.clone(),
+        );
+        let second = settler(server_thread_ids, threads, exited);
+
+        release_tx.send(()).expect("release the held worker");
+        first
+            .join()
+            .expect("the first settler must observe the exit");
+        second
+            .join()
+            .expect("the second settler must observe the exit");
+    }
+
+    // A poisoned registry is NOT a settled registry: settlement must ride
+    // over the poison and still join whatever handles remain, or a panic in
+    // one caller would turn every later stop() into a false barrier.
+    #[test]
+    fn settlement_joins_handles_out_of_a_poisoned_registry() {
+        let server_thread_ids: Arc<Mutex<Vec<std::thread::ThreadId>>> = Default::default();
+        let threads: Arc<Mutex<Vec<JoinHandle<()>>>> = Default::default();
+        let exited = Arc::new(AtomicBool::new(false));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+        let exited_worker = exited.clone();
+        let worker = std::thread::spawn(move || {
+            release_rx.recv().expect("the release signal must arrive");
+            exited_worker.store(true, Ordering::Release);
+        });
+        threads.lock().unwrap().push(worker);
+
+        // Poison the registry the way a panicking holder would.
+        let poisoner = threads.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison the registry");
+        })
+        .join();
+        assert!(threads.lock().is_err(), "the registry must be poisoned");
+
+        release_tx.send(()).expect("release the worker");
+        settle_server_threads(&server_thread_ids, &threads);
+        assert!(
+            exited.load(Ordering::Acquire),
+            "settlement must still join the handle held by the poisoned registry"
+        );
+        assert!(
+            threads
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "the poisoned registry must be drained by the settlement"
+        );
+    }
+
+    // A registered thread that died to an uncontained panic is just as
+    // terminated: settlement must report it and return normally instead of
+    // rethrowing the payload out of stop().
+    #[test]
+    fn settlement_contains_a_panicked_thread_join() {
+        let server_thread_ids: Arc<Mutex<Vec<std::thread::ThreadId>>> = Default::default();
+        let threads: Arc<Mutex<Vec<JoinHandle<()>>>> = Default::default();
+        threads.lock().unwrap().push(std::thread::spawn(|| {
+            panic!("uncontained thread panic");
+        }));
+
+        settle_server_threads(&server_thread_ids, &threads);
+        assert!(
+            threads.lock().unwrap().is_empty(),
+            "the panicked thread's handle must still be consumed"
+        );
     }
 
     // The deliberate-stop state drives the publisher write callbacks'
@@ -1987,6 +2201,7 @@ mod tests {
             registrations: Some(Arc::new(RegistrationHandoff::new())),
             wake_handle: None,
             threads: Default::default(),
+            server_thread_ids: Default::default(),
             stopped_deliberately: Default::default(),
             gop_limit: 1,
             max_connections: None,
@@ -2010,6 +2225,7 @@ mod tests {
             registrations: Some(Arc::new(RegistrationHandoff::new())),
             wake_handle: None,
             threads: Default::default(),
+            server_thread_ids: Default::default(),
             stopped_deliberately: Default::default(),
             gop_limit: 1,
             max_connections: None,
@@ -2041,6 +2257,7 @@ mod tests {
             registrations: Some(Arc::new(RegistrationHandoff::new())),
             wake_handle: None,
             threads: Default::default(),
+            server_thread_ids: Default::default(),
             stopped_deliberately: Default::default(),
             gop_limit: 1,
             max_connections: None,
@@ -2086,6 +2303,7 @@ mod tests {
             registrations: Some(registrations.clone()),
             wake_handle: None,
             threads: Default::default(),
+            server_thread_ids: Default::default(),
             stopped_deliberately: Default::default(),
             gop_limit: 1,
             max_connections: None,
@@ -2239,6 +2457,7 @@ mod tests {
             registrations: Some(registrations.clone()),
             wake_handle: None,
             threads: Default::default(),
+            server_thread_ids: Default::default(),
             stopped_deliberately: Default::default(),
             gop_limit: 1,
             max_connections: None,
@@ -2282,6 +2501,8 @@ mod tests {
             registrations: registrations.clone(),
             status: status.clone(),
             wake_handle: None,
+            threads: Default::default(),
+            server_thread_ids: Default::default(),
         };
 
         let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
@@ -2311,6 +2532,8 @@ mod tests {
             registrations: registrations.clone(),
             status: status.clone(),
             wake_handle: None,
+            threads: Default::default(),
+            server_thread_ids: Default::default(),
         };
         guard.armed = false;
         drop(guard);
@@ -2340,6 +2563,7 @@ mod tests {
             registrations: None,
             wake_handle: None,
             threads: Default::default(),
+            server_thread_ids: Default::default(),
             stopped_deliberately: Default::default(),
             gop_limit: 1,
             max_connections: None,
