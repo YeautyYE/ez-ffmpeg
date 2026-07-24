@@ -12,7 +12,7 @@ use crate::rtmp::poller::{Interest, Poller, RawHandle, Waker, WAKER_TOKEN};
 use crate::rtmp::rtmp_scheduler::{RtmpScheduler, ServerResult};
 use crate::rtmp::write_queue::{BackpressureLevel, FlushResult, WriteQueue};
 use bytes::Bytes;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use rml_rtmp::chunk_io::ChunkSerializer;
 use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
 use rml_rtmp::messages::RtmpMessage;
@@ -1582,7 +1582,17 @@ impl Reactor {
                 true
             }
             Err(e) => {
-                debug!("Publisher {} scheduler error: {}", pub_id, e);
+                // This error is fatal for the publisher — the caller removes
+                // it and its feed sender starts failing. Report it loudly at
+                // THIS moment of truth: the write callback's later failure
+                // classification is about the SERVER lifecycle (a deliberate
+                // stop may land in between), and must not be the only
+                // visible record of a feed that actually died right here,
+                // for its own protocol error.
+                warn!(
+                    "Publisher {} rejected with a fatal session error and will be removed: {}",
+                    pub_id, e
+                );
                 false
             }
         }
