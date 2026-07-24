@@ -1144,6 +1144,16 @@ impl EmbedRtmpServer<Running> {
     /// leaves them available to any other caller, and returns with only
     /// the signal sent.
     ///
+    /// More generally: do not call `stop()` from inside a logger
+    /// implementation on ANY thread. The joined threads log through the
+    /// global logger while they wind down, so a `log()` that blocks in
+    /// `stop()` while holding the logger's own internal lock inverts
+    /// against those threads' log calls and deadlocks. This is a
+    /// restriction on logger implementations (which the `log` contract
+    /// already expects to be reentrancy-conscious), not on ordinary
+    /// callers; the server-thread case above is the only shape the crate
+    /// can detect cheaply, and it is guarded.
+    ///
     /// An FFmpeg job still pushing to this server (via
     /// [`create_rtmp_input`](Self::create_rtmp_input)) loses its feed and
     /// fails its next write; the server classifies that failure — best
