@@ -1191,6 +1191,9 @@ fn fisheye_zero_strength_matches_identity() {
 }
 
 #[test]
+// The corner probes keep the y[row * 64 + col] coordinate notation even
+// where a factor is 0 or an addend is 0, so all three reads line up.
+#[allow(clippy::erasing_op, clippy::identity_op)]
 fn fisheye_bulges_the_center_and_pins_the_corners() {
     let mut filter = fisheye(FisheyeParams::with_strength(1.0))
         .build()
