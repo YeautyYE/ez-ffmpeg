@@ -2253,6 +2253,21 @@ mod tests {
         }
         let second = settler(server_thread_ids, threads, exited);
 
+        // One-sided guard on the second settler: while the worker is still
+        // parked, the first settler holds the registry lock inside its
+        // join, so a correct second settlement CANNOT return — it is either
+        // not yet scheduled or blocked on the lock. An early-returning
+        // implementation finishes here and fails; a correct one can never
+        // trip this, so the bounded window adds no flake risk (slow
+        // scheduling only makes the check vacuous, never wrong).
+        for _ in 0..50 {
+            assert!(
+                !second.is_finished(),
+                "the second settlement returned while the worker was still parked"
+            );
+            sleep(Duration::from_millis(1));
+        }
+
         release_tx.send(()).expect("release the held worker");
         first
             .join()
