@@ -141,9 +141,13 @@ fn close_intake_and_publish_end(
 /// it while joining the very thread the logger runs on — deadlock) nor
 /// consume handles (its own would be dropped, detaching a thread a later
 /// user-thread `stop()` could still settle). A server thread therefore gets
-/// signal-only semantics: warn and return with the registry untouched. The
-/// id list's lock is held only for this membership probe — never across a
-/// join — so the probe itself cannot deadlock.
+/// signal-only semantics: return SILENTLY with the registry untouched —
+/// silently, because this thread may be inside the logger's own log()
+/// frame, above a non-reentrant lock the logger holds, and any log macro
+/// here would re-enter the logger and deadlock on it: the exact failure
+/// this branch exists to prevent. The id list's lock is held only for this
+/// membership probe — never across a join — so the probe itself cannot
+/// deadlock.
 ///
 /// The join loop performs no logging and nothing else that can unwind: an
 /// unwind mid-drain would detach the remaining handles and poison the
@@ -163,11 +167,9 @@ fn settle_server_threads(
         .unwrap_or_else(PoisonError::into_inner)
         .contains(&current);
     if is_server_thread {
-        warn!(
-            "stop() called on a server thread (user code reached through the \
-             global logger); stopping is signal-only here — the threads still \
-             exit on the signal, and a stop() from any other thread settles"
-        );
+        // No logging here — not even a warn. See the reentrancy note above:
+        // this frame may sit inside the user logger itself, and dispatching
+        // to it again would deadlock on the logger's own lock.
         return;
     }
 
@@ -1095,8 +1097,10 @@ impl EmbedRtmpServer<Running> {
     /// One reentrant edge degrades to signal-only: user code reached
     /// through a user-installed global logger runs ON the server threads,
     /// and if such code calls `stop()`, joining from there would deadlock —
-    /// that call warns, skips the joins (leaving them available to any
-    /// other caller), and returns with only the signal sent.
+    /// that call silently skips the joins (silently, because logging from
+    /// inside the logger's own frame could deadlock on the logger's lock),
+    /// leaves them available to any other caller, and returns with only
+    /// the signal sent.
     ///
     /// An FFmpeg job still pushing to this server (via
     /// [`create_rtmp_input`](Self::create_rtmp_input)) loses its feed and
