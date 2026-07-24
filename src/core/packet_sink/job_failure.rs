@@ -14,7 +14,7 @@
 use crate::error::{
     DecodingOperationError, DemuxingOperationError, EncodingOperationError, Error,
     FilterGraphOperationError, MuxingOperationError, OpenDecoderOperationError,
-    OpenEncoderOperationError, PacketSinkError,
+    OpenEncoderOperationError, OpenOutputError, PacketSinkError,
 };
 
 /// Coarse classification of a job failure reported to a packet sink via
@@ -170,6 +170,7 @@ macro_rules! unknown_code_fn {
 unknown_code_fn!(muxing_leaf_code, MuxingError);
 unknown_code_fn!(write_header_code, WriteHeaderError);
 unknown_code_fn!(encoding_leaf_code, EncodingError);
+unknown_code_fn!(encode_subtitle_code, EncodeSubtitleError);
 unknown_code_fn!(open_encoder_leaf_code, OpenEncoderError);
 unknown_code_fn!(decoding_leaf_code, DecodingError);
 unknown_code_fn!(open_decoder_leaf_code, OpenDecoderError);
@@ -223,6 +224,13 @@ fn classify(error: &Error) -> (JobFailureKind, Option<usize>, Option<i32>) {
         // ---- Io: input open/probe, demux reads, raw I/O. ----
         Error::OpenInputStream(e) => (JobFailureKind::Io, None, open_input_code(e)),
         Error::FindStream(e) => (JobFailureKind::Io, None, find_stream_code(e)),
+        // OpenOutput is an open-time grab-bag with ONE runtime escapee: the
+        // encoder task records UnknownFrameFormat while lazily opening the
+        // encoder on the first frame (malformed init frame) — an
+        // encode-stage failure, not transport.
+        Error::OpenOutput(OpenOutputError::UnknownFrameFormat) => {
+            (JobFailureKind::Encode, None, None)
+        }
         Error::OpenOutput(e) => (JobFailureKind::Io, None, open_output_code(e)),
         Error::Demuxing(e) => (JobFailureKind::Io, None, demuxing_code(e)),
         Error::IO(_) => (JobFailureKind::Io, None, None),
@@ -279,6 +287,10 @@ fn encoding_code(e: &EncodingOperationError) -> Option<i32> {
         EncodingOperationError::SendFrameError(x)
         | EncodingOperationError::ReceivePacketError(x)
         | EncodingOperationError::ReceiveAudioError(x) => encoding_leaf_code(x),
+        // Subtitle encoding records a live avcodec_encode_subtitle return
+        // through its own leaf type — a literal raw code the extraction
+        // rule covers like every other UnknownError leaf.
+        EncodingOperationError::EncodeSubtitle(s) => encode_subtitle_code(s),
         _ => None,
     }
 }
@@ -354,10 +366,10 @@ mod tests {
     use crate::core::packet_sink::PacketCallbackError;
     use crate::error::{
         AllocOutputContextError, DecoderError, DecodingError, DecodingOperationError,
-        DemuxingError, DemuxingOperationError, EncodingError, EncodingOperationError, Error,
-        FilterGraphOperationError, FilterGraphParseError, MuxingError, MuxingOperationError,
-        OpenDecoderOperationError, OpenEncoderOperationError, OpenInputError, PacketSinkError,
-        WriteHeaderError,
+        DemuxingError, DemuxingOperationError, EncodeSubtitleError, EncodingError,
+        EncodingOperationError, Error, FilterGraphOperationError, FilterGraphParseError,
+        MuxingError, MuxingOperationError, OpenDecoderOperationError, OpenEncoderOperationError,
+        OpenInputError, OpenOutputError, PacketSinkError, WriteHeaderError,
     };
 
     fn classified(e: &Error) -> (JobFailureKind, Option<usize>, Option<i32>) {
@@ -556,6 +568,37 @@ mod tests {
             )))
             .2,
             None
+        );
+    }
+
+    /// A malformed init frame fails the ENCODER's lazy open with
+    /// `OpenOutputError::UnknownFrameFormat`, recorded as the job error by
+    /// the encoder task — an encode-stage failure that must not classify as
+    /// transport I/O (a retry router treating Io as transient would retry
+    /// deterministic malformed input). The rest of the open-time grab-bag
+    /// stays Io.
+    #[test]
+    fn runtime_encoder_open_failure_classifies_as_encode_not_io() {
+        assert_eq!(
+            classified(&Error::OpenOutput(OpenOutputError::UnknownFrameFormat)).0,
+            JobFailureKind::Encode
+        );
+        assert_eq!(
+            classified(&Error::OpenOutput(OpenOutputError::Timeout)).0,
+            JobFailureKind::Io
+        );
+    }
+
+    /// Subtitle encoding records a LIVE raw code from
+    /// `avcodec_encode_subtitle` through `EncodeSubtitleError::UnknownError`
+    /// — a literal leaf the extraction rule promises to surface.
+    #[test]
+    fn subtitle_encode_unknown_code_is_extracted() {
+        assert_eq!(
+            classified(&Error::Encoding(EncodingOperationError::EncodeSubtitle(
+                EncodeSubtitleError::UnknownError(-77)
+            ))),
+            (JobFailureKind::Encode, None, Some(-77))
         );
     }
 
