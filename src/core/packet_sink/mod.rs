@@ -168,6 +168,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+#[cfg(test)]
+mod bench_nal_scan;
 pub(crate) mod codec;
 mod job_failure;
 pub(crate) mod nal_framing;
