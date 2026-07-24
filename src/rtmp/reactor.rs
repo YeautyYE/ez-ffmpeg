@@ -429,11 +429,29 @@ impl ReactorConnection {
         true
     }
 
+    /// Restore `Active` once a slow client's backlog is back in the Normal
+    /// band. `enqueue_data` applies the same rule when new data arrives, but
+    /// a watcher whose publisher went quiet gets no further enqueues:
+    /// without this flush-side twin of that rule it would stay `SlowClient`
+    /// forever after draining — permanently invisible to the idle-watcher
+    /// ping, and eventually reaped as idle despite being healthy and fully
+    /// caught up.
+    fn recover_from_slow_client(&mut self) {
+        if self.state == ConnectionState::SlowClient
+            && self.write_queue.backpressure_level() == BackpressureLevel::Normal
+        {
+            self.state = ConnectionState::Active;
+        }
+    }
+
     /// Try to flush write queue (drain until WouldBlock)
     ///
     /// Returns whether connection should be disconnected
     pub fn try_flush(&mut self) -> io::Result<bool> {
         if self.write_queue.is_empty() {
+            // An empty queue also means no backpressure: repair a stale
+            // SlowClient before returning (see recover_from_slow_client).
+            self.recover_from_slow_client();
             return Ok(false);
         }
 
@@ -442,12 +460,16 @@ impl ReactorConnection {
                 if bytes_written > 0 {
                     self.last_write_activity = Instant::now();
                 }
+                self.recover_from_slow_client();
                 Ok(false)
             }
             Ok(FlushResult::WouldBlock { bytes_written }) => {
                 if bytes_written > 0 {
                     self.last_write_activity = Instant::now();
                 }
+                // A partial drain can still have dropped the backlog back
+                // into the Normal band.
+                self.recover_from_slow_client();
                 Ok(false)
             }
             Ok(FlushResult::Closed) => Ok(true),
@@ -2421,6 +2443,51 @@ mod tests {
         // A condemned connection is on its way out: never probed.
         conn.condemn(base + idle * 3);
         assert!(!conn.is_ping_due_at(base + idle * 2, idle));
+    }
+
+    // A slow client that has fully caught up must become Active again even
+    // when no further fanout enqueue arrives (its publisher went quiet):
+    // enqueue_data's Normal-band recovery never runs then, and a connection
+    // stuck in SlowClient is invisible to the idle-watcher ping — the 60s
+    // reaper would kill a healthy, fully-drained watcher.
+    #[test]
+    fn drained_slow_client_recovers_active_state_on_flush() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to get address");
+        let _client = TcpStream::connect(addr).expect("Failed to connect");
+        let (server, _) = listener.accept().expect("Failed to accept");
+        let mut conn = ReactorConnection::new(ConnectionToken::new(0, 1), server)
+            .expect("Failed to create connection");
+
+        // Already-drained shape: the queue emptied on an earlier flush and
+        // nothing was enqueued since. The next flush attempt alone must
+        // repair the state.
+        conn.state = ConnectionState::SlowClient;
+        assert!(!conn.has_pending_writes());
+        conn.try_flush().expect("flush on an empty queue");
+        assert_eq!(
+            conn.state,
+            ConnectionState::Active,
+            "an empty queue means no backpressure; the state must recover"
+        );
+
+        // Draining shape: a queued tail (via enqueue_raw, which performs no
+        // state recovery of its own) is flushed into the socket buffer and
+        // the Normal backlog must flip the state back.
+        conn.state = ConnectionState::SlowClient;
+        assert!(conn.enqueue_raw(vec![0u8; 64]));
+        assert_eq!(
+            conn.state,
+            ConnectionState::SlowClient,
+            "sanity: enqueue_raw must not repair the state by itself"
+        );
+        conn.try_flush().expect("flush the queued tail");
+        assert!(!conn.has_pending_writes(), "64 bytes must flush in one go");
+        assert_eq!(
+            conn.state,
+            ConnectionState::Active,
+            "draining back to the Normal band must restore Active"
+        );
     }
 
     // R-B: a quiet watcher on a channel with no publisher used to be reaped
