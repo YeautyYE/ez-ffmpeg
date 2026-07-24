@@ -5,7 +5,8 @@ use crate::rtmp::gop::{FrameData, Gops};
 use crate::rtmp::write_queue::QUEUE_WARN_BYTES;
 use bytes::Bytes;
 use log::{debug, warn};
-use rml_rtmp::chunk_io::Packet;
+use rml_rtmp::chunk_io::{ChunkSerializationError, ChunkSerializer, Packet};
+use rml_rtmp::messages::{MessageSerializationError, RtmpMessage};
 use rml_rtmp::sessions::StreamMetadata;
 use rml_rtmp::sessions::{
     ServerSession, ServerSessionConfig, ServerSessionError, ServerSessionEvent, ServerSessionResult,
@@ -142,6 +143,23 @@ struct MediaChannel {
     audio_sequence_header: Option<Bytes>,
     audio_timestamp: RtmpTimestamp,
     gops: Gops,
+    /// The channel's shared live-media serializer: each fanned-out A/V
+    /// message is serialized ONCE per (channel, `message_stream_id`) group
+    /// here and the wire bytes are refcount-cloned per watcher, instead of
+    /// re-running `ChunkSerializer::serialize` per watcher (an O(W x bytes)
+    /// alloc+memcpy on the reactor thread).
+    ///
+    /// Wire-level soundness: everything through this serializer is media
+    /// with `can_be_dropped = true`, and rml forces the chunk AFTER a
+    /// droppable packet back to type 0 (serializer.rs, droppable branch of
+    /// `add_chunk`), so every chunk it ever emits carries a full
+    /// self-contained header — a first chunk (no previous header) is
+    /// equally type 0. Video owns csid 4 and audio csid 5 exclusively
+    /// (`get_csid_for_message_type`), and the per-session serializers no
+    /// longer emit those csids once media is shared (the join burst uses a
+    /// per-burst throwaway, see `build_join_burst`), so no header-
+    /// compression chain ever spans two serializers.
+    fanout_serializer: ChunkSerializer,
 }
 
 impl MediaChannel {
@@ -155,6 +173,7 @@ impl MediaChannel {
             audio_sequence_header: None,
             audio_timestamp: RtmpTimestamp { value: 0 },
             gops: Gops::new(gop_limit),
+            fanout_serializer: new_media_serializer(),
         }
     }
 
@@ -171,11 +190,91 @@ pub(super) enum ServerResult {
     },
     OutboundPacket {
         target_connection_id: usize,
-        packet: Packet,
+        /// Serialized RTMP chunk bytes. `Bytes` end-to-end so the shared
+        /// fanout path hands every watcher a refcount clone of ONE
+        /// serialization; per-session packets convert their `Vec` with the
+        /// zero-copy `Bytes::from`.
+        bytes: Bytes,
+        /// rml's `Packet::can_be_dropped`, forwarded to the write queue's
+        /// shedding policy.
+        can_be_dropped: bool,
         is_keyframe: bool,
         is_sequence_header: bool,
         is_video: bool,
     },
+}
+
+impl ServerResult {
+    /// An `OutboundPacket` from a per-session rml [`Packet`] (control
+    /// responses, burst frames): moves the packet's `Vec` into `Bytes`
+    /// without copying.
+    fn outbound(
+        target_connection_id: usize,
+        packet: Packet,
+        is_keyframe: bool,
+        is_sequence_header: bool,
+        is_video: bool,
+    ) -> ServerResult {
+        ServerResult::OutboundPacket {
+            target_connection_id,
+            bytes: Bytes::from(packet.bytes),
+            can_be_dropped: packet.can_be_dropped,
+            is_keyframe,
+            is_sequence_header,
+            is_video,
+        }
+    }
+}
+
+/// A media-path `ChunkSerializer` pinned to the server's outbound chunk
+/// size: the shared per-channel live serializer and the per-burst throwaway
+/// both use this. `ServerSession::new` already announced 4096 to every peer
+/// (its construction-time SetChunkSize), and the outbound size is never
+/// renegotiated, so the announcement packet this pinning produces is
+/// redundant on the wire and deliberately discarded — the serializer only
+/// needs the internal split size to match what peers were told.
+fn new_media_serializer() -> ChunkSerializer {
+    let mut serializer = ChunkSerializer::new();
+    // Failure is impossible for the constant 4096 (the only error is a size
+    // over i32::MAX); a silent fallback to the 128-byte default would split
+    // chunks at a size the peers were never told, so refuse to continue.
+    serializer
+        .set_max_chunk_size(OUTBOUND_CHUNK_SIZE as u32, RtmpTimestamp { value: 0 })
+        .expect("4096 is a valid outbound chunk size");
+    serializer
+}
+
+/// Why a media serialize failed: the payload -> message conversion (cannot
+/// happen for A/V data, which converts by identity) or the chunk
+/// serialization itself (payload over the 16 MiB message cap).
+#[derive(Debug)]
+enum MediaSerializeError {
+    Message(#[allow(dead_code)] MessageSerializationError),
+    Chunk(#[allow(dead_code)] ChunkSerializationError),
+}
+
+/// Serialize one A/V message the way rml's `send_video_data` /
+/// `send_audio_data` do, but on a caller-supplied serializer: the shared
+/// channel serializer for the live fanout (droppable), or a per-burst
+/// throwaway for the join replay (non-droppable).
+fn serialize_media(
+    serializer: &mut ChunkSerializer,
+    data_type: ReceivedDataType,
+    stream_id: u32,
+    data: Bytes,
+    timestamp: RtmpTimestamp,
+    can_be_dropped: bool,
+) -> Result<Packet, MediaSerializeError> {
+    let message = match data_type {
+        ReceivedDataType::Audio => RtmpMessage::AudioData { data },
+        ReceivedDataType::Video => RtmpMessage::VideoData { data },
+    };
+    let payload = message
+        .into_message_payload(timestamp, stream_id)
+        .map_err(MediaSerializeError::Message)?;
+    serializer
+        .serialize(&payload, false, can_be_dropped)
+        .map_err(MediaSerializeError::Chunk)
 }
 
 pub(super) struct RtmpScheduler {
@@ -639,13 +738,13 @@ impl RtmpScheduler {
             match result {
                 ServerSessionResult::OutboundResponse(packet) => {
                     // Control message, not audio/video data
-                    server_results.push(ServerResult::OutboundPacket {
-                        target_connection_id: executed_connection_id,
+                    server_results.push(ServerResult::outbound(
+                        executed_connection_id,
                         packet,
-                        is_keyframe: false,
-                        is_sequence_header: false,
-                        is_video: false,
-                    })
+                        false,
+                        false,
+                        false,
+                    ))
                 }
 
                 ServerSessionResult::RaisedEvent(event) => {
@@ -874,13 +973,13 @@ impl RtmpScheduler {
             match client.session.finish_playing(active_stream_id) {
                 Ok(packet) => {
                     // Control message, not audio/video data
-                    server_results.push(ServerResult::OutboundPacket {
-                        target_connection_id: client.connection_id,
+                    server_results.push(ServerResult::outbound(
+                        client.connection_id,
                         packet,
-                        is_keyframe: false,
-                        is_sequence_header: false,
-                        is_video: false,
-                    });
+                        false,
+                        false,
+                        false,
+                    ));
                 }
                 Err(error) => {
                     warn!(
@@ -905,13 +1004,13 @@ impl RtmpScheduler {
         while self.serving_prefix_scan_pos < server_results.len() {
             if let ServerResult::OutboundPacket {
                 target_connection_id,
-                packet,
+                bytes,
                 ..
             } = &server_results[self.serving_prefix_scan_pos]
             {
                 if *target_connection_id == target {
                     self.serving_prefix_bytes =
-                        self.serving_prefix_bytes.saturating_add(packet.bytes.len());
+                        self.serving_prefix_bytes.saturating_add(bytes.len());
                 }
             }
             self.serving_prefix_scan_pos += 1;
@@ -1132,13 +1231,13 @@ impl RtmpScheduler {
             match client.session.send_metadata(active_stream_id, &metadata) {
                 Ok(packet) => {
                     // Metadata message, not audio/video frame data
-                    server_results.push(ServerResult::OutboundPacket {
-                        target_connection_id: client.connection_id,
+                    server_results.push(ServerResult::outbound(
+                        client.connection_id,
                         packet,
-                        is_keyframe: false,
-                        is_sequence_header: false,
-                        is_video: false,
-                    });
+                        false,
+                        false,
+                        false,
+                    ));
                 }
 
                 Err(error) => {
@@ -1234,17 +1333,34 @@ impl RtmpScheduler {
             }
         }
 
+        // Disjoint field borrows: the watcher set is iterated while the
+        // shared serializer is driven mutably below.
+        let MediaChannel {
+            watching_client_ids,
+            metadata,
+            fanout_serializer,
+            ..
+        } = channel;
+
         // Detect an audio-only stream from the publisher's metadata: it declares
         // an audio codec but no video codec. Computed once per received packet so
         // the per-watcher gate can deliver audio for such streams instead of
         // waiting for a video keyframe that never comes (see
         // `should_send_to_watcher`).
-        let channel_is_audio_only = channel
-            .metadata
+        let channel_is_audio_only = metadata
             .as_ref()
             .is_some_and(|m| m.audio_codec_id.is_some() && m.video_codec_id.is_none());
 
-        for client_id in &channel.watching_client_ids {
+        // Shared fanout serialization: this message's wire bytes per
+        // `message_stream_id` group, serialized on the channel serializer
+        // the FIRST time a watcher of that group passes the gate; every
+        // other watcher of the group gets a `Bytes` refcount clone. The
+        // type-0 header embeds the stream id (the only per-watcher-variable
+        // field), hence the grouping; in practice every connection's first
+        // play stream is 1, so this is one entry.
+        let mut serialized_groups: Vec<(u32, Bytes)> = Vec::new();
+
+        for client_id in watching_client_ids.iter() {
             let client = match self.clients.get_mut(*client_id) {
                 Some(client) => client,
                 None => continue,
@@ -1283,54 +1399,63 @@ impl RtmpScheduler {
                 continue;
             }
 
-            let send_result = match data_type {
-                ReceivedDataType::Audio => {
-                    client
-                        .session
-                        .send_audio_data(active_stream_id, data.clone(), timestamp, true)
-                }
-                ReceivedDataType::Video => {
-                    // The keyframe gate trusts the container flag: is_keyframe
-                    // means the encoder flagged this packet as a keyframe (FLV
-                    // frame type 1, AVC NALU packet type 0x01). The NAL payload
-                    // is not inspected, so a mis-flagged packet passes the
-                    // gate. FFmpeg's flvdec (libavformat/flvdec.c derives
-                    // AV_PKT_FLAG_KEY from the same frame-type nibble) and
-                    // mainstream RTMP servers place the same trust in the
-                    // container flag, which keeps this per-packet path free of
-                    // NAL parsing.
-                    if is_keyframe {
-                        client.has_received_video_keyframe = true;
-                    }
+            // The keyframe gate trusts the container flag: is_keyframe
+            // means the encoder flagged this packet as a keyframe (FLV
+            // frame type 1, AVC NALU packet type 0x01). The NAL payload
+            // is not inspected, so a mis-flagged packet passes the
+            // gate. FFmpeg's flvdec (libavformat/flvdec.c derives
+            // AV_PKT_FLAG_KEY from the same frame-type nibble) and
+            // mainstream RTMP servers place the same trust in the
+            // container flag, which keeps this per-packet path free of
+            // NAL parsing.
+            if is_video && is_keyframe {
+                client.has_received_video_keyframe = true;
+            }
 
-                    client
-                        .session
-                        .send_video_data(active_stream_id, data.clone(), timestamp, true)
-                }
+            let wire_bytes = match serialized_groups
+                .iter()
+                .find(|(stream_id, _)| *stream_id == active_stream_id)
+            {
+                Some((_, bytes)) => bytes.clone(),
+                None => match serialize_media(
+                    fanout_serializer,
+                    data_type,
+                    active_stream_id,
+                    data.clone(),
+                    timestamp,
+                    true,
+                ) {
+                    Ok(packet) => {
+                        let bytes = Bytes::from(packet.bytes);
+                        serialized_groups.push((active_stream_id, bytes.clone()));
+                        bytes
+                    }
+                    Err(error) => {
+                        // Deterministic for the (message, group) pair, so
+                        // every watcher of the group lands here — the same
+                        // per-watcher disconnect the per-session path
+                        // produced when its send failed.
+                        let data_type_str = if is_video { "video" } else { "audio" };
+                        debug!(
+                            "Rtmp error serializing {} data for client on connection id {}: {:?}",
+                            data_type_str, client.connection_id, error
+                        );
+                        server_results.push(ServerResult::DisconnectConnection {
+                            connection_id: client.connection_id,
+                        });
+                        continue;
+                    }
+                },
             };
 
-            match send_result {
-                Ok(packet) => {
-                    server_results.push(ServerResult::OutboundPacket {
-                        target_connection_id: client.connection_id,
-                        packet,
-                        is_keyframe,
-                        is_sequence_header,
-                        is_video,
-                    });
-                }
-
-                Err(error) => {
-                    let data_type_str = if is_video { "video" } else { "audio" };
-                    debug!(
-                        "Rtmp error sending {} data to client on connection id {}: {:?}",
-                        data_type_str, client.connection_id, error
-                    );
-                    server_results.push(ServerResult::DisconnectConnection {
-                        connection_id: client.connection_id,
-                    });
-                }
-            }
+            server_results.push(ServerResult::OutboundPacket {
+                target_connection_id: client.connection_id,
+                bytes: wire_bytes,
+                can_be_dropped: true,
+                is_keyframe,
+                is_sequence_header,
+                is_video,
+            });
         }
     }
 
@@ -1354,6 +1479,16 @@ impl RtmpScheduler {
             channel.video_timestamp = RtmpTimestamp { value: 0 };
             channel.audio_timestamp = RtmpTimestamp { value: 0 };
             channel.gops.clear();
+            // The shared serializer is publisher-scoped state too: a channel
+            // that outlives its publisher (lingering watchers) can be
+            // reclaimed by a NEW publisher under the same key, and the next
+            // generation must not inherit the previous generation's per-csid
+            // header history. Today that history is provably inert (every
+            // entry is droppable, forcing type 0 forever), but a fresh
+            // serializer per publisher generation removes the entire class
+            // of cross-generation leakage rather than leaning on that
+            // invariant.
+            channel.fanout_serializer = new_media_serializer();
             channel.should_remove()
         } else {
             return;
@@ -1517,6 +1652,27 @@ fn build_join_burst(
     accept_prefix_bytes: usize,
     out: &mut Vec<ServerResult>,
 ) {
+    // Every media frame of THIS burst is serialized on a one-shot throwaway
+    // serializer, not the client's session serializer. The burst frames are
+    // non-droppable, and serializing them on the session serializer would
+    // leave compressible (non-droppable) entries in its csid 4/5 header
+    // history — history the shared live path then never advances. A later
+    // `play` on the same connection would serialize its second burst
+    // against that stale history and could emit delta headers relative to
+    // a frame sent an entire live session ago, while the peer's csid state
+    // has long been replaced by the shared type-0 stream: wire-level
+    // timestamp corruption. A fresh serializer per burst starts its csid
+    // 4/5 chains with full type-0 headers, and any compression WITHIN the
+    // burst resolves against frames the peer consumes in order right
+    // before — self-contained by construction, for every play of this
+    // connection, forever.
+    //
+    // The metadata packet stays on the session serializer: metadata rides
+    // csid 3 (Amf0Data), a chunk stream the shared media path never emits,
+    // so its header-compression chain lives entirely inside the session
+    // serializer and stays consistent at the peer.
+    let mut burst_serializer = new_media_serializer();
+
     // Real serialized wire bytes of everything enqueued to the joiner's queue
     // ahead of the replayed GOPs. `accept_prefix_bytes` is the play-accept
     // control burst already enqueued before this call (F1); the metadata and
@@ -1535,13 +1691,13 @@ fn build_join_burst(
         match client.session.send_metadata(stream_id, metadata) {
             Ok(packet) => {
                 prefix_wire_bytes = prefix_wire_bytes.saturating_add(packet.bytes.len());
-                out.push(ServerResult::OutboundPacket {
-                    target_connection_id: connection_id,
+                out.push(ServerResult::outbound(
+                    connection_id,
                     packet,
-                    is_keyframe: false,
-                    is_sequence_header: false,
-                    is_video: false,
-                });
+                    false,
+                    false,
+                    false,
+                ));
             }
             Err(error) => {
                 debug!(
@@ -1555,7 +1711,9 @@ fn build_join_burst(
     }
 
     if let Some(ref data) = channel.video_sequence_header {
-        match client.session.send_video_data(
+        match serialize_media(
+            &mut burst_serializer,
+            ReceivedDataType::Video,
             stream_id,
             data.clone(),
             channel.video_timestamp,
@@ -1563,13 +1721,13 @@ fn build_join_burst(
         ) {
             Ok(packet) => {
                 prefix_wire_bytes = prefix_wire_bytes.saturating_add(packet.bytes.len());
-                out.push(ServerResult::OutboundPacket {
-                    target_connection_id: connection_id,
+                out.push(ServerResult::outbound(
+                    connection_id,
                     packet,
-                    is_keyframe: false,
-                    is_sequence_header: true,
-                    is_video: true,
-                });
+                    false,
+                    true,
+                    true,
+                ));
             }
             Err(error) => {
                 debug!(
@@ -1583,7 +1741,9 @@ fn build_join_burst(
     }
 
     if let Some(ref data) = channel.audio_sequence_header {
-        match client.session.send_audio_data(
+        match serialize_media(
+            &mut burst_serializer,
+            ReceivedDataType::Audio,
             stream_id,
             data.clone(),
             channel.audio_timestamp,
@@ -1591,13 +1751,13 @@ fn build_join_burst(
         ) {
             Ok(packet) => {
                 prefix_wire_bytes = prefix_wire_bytes.saturating_add(packet.bytes.len());
-                out.push(ServerResult::OutboundPacket {
-                    target_connection_id: connection_id,
+                out.push(ServerResult::outbound(
+                    connection_id,
                     packet,
-                    is_keyframe: false,
-                    is_sequence_header: true,
-                    is_video: false,
-                });
+                    false,
+                    true,
+                    false,
+                ));
             }
             Err(error) => {
                 debug!(
@@ -1652,17 +1812,21 @@ fn build_join_burst(
                     }
                     let is_keyframe = is_video_keyframe(data);
                     let is_sequence_header = is_video_sequence_header(data);
-                    match client
-                        .session
-                        .send_video_data(stream_id, data.clone(), *timestamp, false)
-                    {
-                        Ok(packet) => out.push(ServerResult::OutboundPacket {
-                            target_connection_id: connection_id,
+                    match serialize_media(
+                        &mut burst_serializer,
+                        ReceivedDataType::Video,
+                        stream_id,
+                        data.clone(),
+                        *timestamp,
+                        false,
+                    ) {
+                        Ok(packet) => out.push(ServerResult::outbound(
+                            connection_id,
                             packet,
                             is_keyframe,
                             is_sequence_header,
-                            is_video: true,
-                        }),
+                            true,
+                        )),
                         Err(error) => {
                             debug!(
                                 "Rtmp client error occurred sending video data to new client: {:?}",
@@ -1675,17 +1839,21 @@ fn build_join_burst(
                 }
                 FrameData::Audio { timestamp, data } => {
                     let is_sequence_header = is_audio_sequence_header(data);
-                    match client
-                        .session
-                        .send_audio_data(stream_id, data.clone(), *timestamp, false)
-                    {
-                        Ok(packet) => out.push(ServerResult::OutboundPacket {
-                            target_connection_id: connection_id,
+                    match serialize_media(
+                        &mut burst_serializer,
+                        ReceivedDataType::Audio,
+                        stream_id,
+                        data.clone(),
+                        *timestamp,
+                        false,
+                    ) {
+                        Ok(packet) => out.push(ServerResult::outbound(
+                            connection_id,
                             packet,
-                            is_keyframe: false,
+                            false,
                             is_sequence_header,
-                            is_video: false,
-                        }),
+                            false,
+                        )),
                         Err(error) => {
                             debug!(
                                 "Rtmp client error occurred sending audio data to new client: {:?}",
@@ -1829,12 +1997,12 @@ mod tests {
         for result in prior.into_iter().chain(results) {
             if let ServerResult::OutboundPacket {
                 target_connection_id,
-                packet,
+                bytes,
                 ..
             } = result
             {
                 if target_connection_id == watcher_connection_id {
-                    drain_messages(&mut deserializer, &packet.bytes);
+                    drain_messages(&mut deserializer, &bytes);
                 }
             }
         }
@@ -3463,8 +3631,8 @@ mod tests {
     /// in a frame's opening bytes is contiguous in the packet.
     fn packet_contains(result: &ServerResult, needle: &[u8]) -> bool {
         match result {
-            ServerResult::OutboundPacket { packet, .. } => {
-                packet.bytes.windows(needle.len()).any(|w| w == needle)
+            ServerResult::OutboundPacket { bytes, .. } => {
+                bytes.windows(needle.len()).any(|w| w == needle)
             }
             _ => false,
         }
@@ -3475,7 +3643,7 @@ mod tests {
     fn serialized_burst_len(out: &[ServerResult]) -> usize {
         out.iter()
             .map(|result| match result {
-                ServerResult::OutboundPacket { packet, .. } => packet.bytes.len(),
+                ServerResult::OutboundPacket { bytes, .. } => bytes.len(),
                 _ => 0,
             })
             .sum()
@@ -4012,10 +4180,8 @@ mod tests {
         let other = 9usize;
         let outbound = |conn: usize, n: usize| ServerResult::OutboundPacket {
             target_connection_id: conn,
-            packet: Packet {
-                bytes: vec![0u8; n],
-                can_be_dropped: false,
-            },
+            bytes: Bytes::from(vec![0u8; n]),
+            can_be_dropped: false,
             is_keyframe: false,
             is_sequence_header: false,
             is_video: false,
