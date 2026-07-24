@@ -35,6 +35,14 @@ struct WriteEntry {
     #[allow(dead_code)]
     is_keyframe: bool,
     is_sequence_header: bool, // SPS/PPS/AudioConfig prioritized (never dropped by policy, but rejected at critical)
+    /// A liveness ping queued by the reactor's timeout sweep. Flushes report
+    /// these bytes separately (`FlushResult::*::ping_bytes_written`) so the
+    /// connection can exclude a ping's own delivery from its write-activity
+    /// stamp — only the peer's ANSWER may count as liveness. Tagging the
+    /// entry (instead of keeping a side counter) keeps every removal path
+    /// honest for free: an entry evicted by the age policy simply never
+    /// reports its bytes as written.
+    is_ping: bool,
 }
 
 impl WriteEntry {
@@ -68,9 +76,19 @@ pub enum BackpressureLevel {
 #[derive(Debug)]
 pub enum FlushResult {
     /// QueueAll flushed
-    Complete { bytes_written: usize },
+    Complete {
+        bytes_written: usize,
+        /// The portion of `bytes_written` consumed from ping-tagged entries
+        /// (see `WriteEntry::is_ping`); exact per entry, partial writes
+        /// included.
+        ping_bytes_written: usize,
+    },
     /// WouldBlock encountered, partial write
-    WouldBlock { bytes_written: usize },
+    WouldBlock {
+        bytes_written: usize,
+        /// See `Complete::ping_bytes_written`.
+        ping_bytes_written: usize,
+    },
     /// Connection closed
     Closed,
 }
@@ -174,6 +192,16 @@ impl WriteQueue {
     }
 
     fn push_entry(&mut self, data: Bytes, is_keyframe: bool, is_sequence_header: bool) {
+        self.push_entry_tagged(data, is_keyframe, is_sequence_header, false);
+    }
+
+    fn push_entry_tagged(
+        &mut self,
+        data: Bytes,
+        is_keyframe: bool,
+        is_sequence_header: bool,
+        is_ping: bool,
+    ) {
         let len = data.len();
         self.queue.push_back(WriteEntry {
             data,
@@ -181,8 +209,21 @@ impl WriteQueue {
             timestamp: Instant::now(),
             is_keyframe,
             is_sequence_header,
+            is_ping,
         });
         self.total_bytes += len;
+    }
+
+    /// Enqueue a liveness ping (see `WriteEntry::is_ping`). Queued by the
+    /// reactor's timeout sweep, and only onto a drained queue (the sweep's
+    /// predicate refuses to probe while writes are pending), so it takes
+    /// the plain Normal-band path; the critical cap stays as a guard.
+    pub fn enqueue_ping(&mut self, data: Bytes) -> bool {
+        if self.total_bytes.saturating_add(data.len()) >= QUEUE_MAX_BYTES {
+            return false;
+        }
+        self.push_entry_tagged(data, false, false, true);
+        true
     }
 
     /// Time-based eviction - Remove stale data
@@ -230,6 +271,7 @@ impl WriteQueue {
     /// instead of burning a guaranteed-EAGAIN syscall.
     pub fn try_flush<W: Write>(&mut self, writer: &mut W) -> io::Result<FlushResult> {
         let mut bytes_written = 0;
+        let mut ping_bytes_written = 0;
 
         loop {
             // Drop any fully-consumed entries at the front (e.g. an entry that
@@ -237,7 +279,10 @@ impl WriteQueue {
             self.pop_completed_front();
 
             if self.queue.is_empty() {
-                return Ok(FlushResult::Complete { bytes_written });
+                return Ok(FlushResult::Complete {
+                    bytes_written,
+                    ping_bytes_written,
+                });
             }
 
             // Gather up to MAX_IOV slices from the front of the queue and issue
@@ -271,16 +316,22 @@ impl WriteQueue {
                 Ok(0) => return Ok(FlushResult::Closed),
                 Ok(n) => {
                     bytes_written += n;
-                    self.advance_front(n);
+                    ping_bytes_written += self.advance_front(n);
                     if n < gathered {
                         // Short write: send buffer full, stop and wait for the
                         // writable event rather than retry into EAGAIN.
-                        return Ok(FlushResult::WouldBlock { bytes_written });
+                        return Ok(FlushResult::WouldBlock {
+                            bytes_written,
+                            ping_bytes_written,
+                        });
                     }
                     // Whole batch drained; loop to gather the next one.
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    return Ok(FlushResult::WouldBlock { bytes_written });
+                    return Ok(FlushResult::WouldBlock {
+                        bytes_written,
+                        ping_bytes_written,
+                    });
                 }
                 Err(e) => return Err(e),
             }
@@ -305,7 +356,12 @@ impl WriteQueue {
     /// the walk never runs past the queue. `total_bytes` tracks the sum of full
     /// entry lengths, so it is decremented by an entry's full length exactly
     /// once, when that entry completes (matching `enqueue`/`evict`).
-    fn advance_front(&mut self, mut n: usize) {
+    ///
+    /// Returns how many of the `n` bytes were consumed from ping-tagged
+    /// entries — exact per entry and per partial write, so the caller's
+    /// activity accounting never credits a ping's delivery as liveness.
+    fn advance_front(&mut self, mut n: usize) -> usize {
+        let mut ping_bytes = 0;
         while n > 0 {
             let Some(front) = self.queue.front_mut() else {
                 break;
@@ -320,15 +376,22 @@ impl WriteQueue {
             }
             if n >= rem {
                 // Entry fully sent this call: account for its full length once.
+                if front.is_ping {
+                    ping_bytes += rem;
+                }
                 let full = front.data.len();
                 self.total_bytes = self.total_bytes.saturating_sub(full);
                 self.queue.pop_front();
                 n -= rem;
             } else {
+                if front.is_ping {
+                    ping_bytes += n;
+                }
                 front.advance(n);
                 n = 0;
             }
         }
+        ping_bytes
     }
 
     /// Is queue empty
@@ -588,7 +651,7 @@ mod tests {
         let result = queue.try_flush(&mut writer).unwrap();
         assert!(matches!(
             result,
-            FlushResult::WouldBlock { bytes_written: 7 }
+            FlushResult::WouldBlock { bytes_written: 7, .. }
         ));
         assert_eq!(writer.inner, b"hellowo");
         assert_eq!(queue.pending_entries(), 1);
@@ -600,7 +663,7 @@ mod tests {
         // stream must never restart from the beginning of the tag.
         writer.capacity = 100;
         let result = queue.try_flush(&mut writer).unwrap();
-        assert!(matches!(result, FlushResult::Complete { bytes_written: 3 }));
+        assert!(matches!(result, FlushResult::Complete { bytes_written: 3, .. }));
         assert_eq!(writer.inner, b"helloworld");
         assert!(queue.is_empty());
         assert_eq!(queue.pending_bytes(), 0);
@@ -620,7 +683,7 @@ mod tests {
         let result = queue.try_flush(&mut writer).unwrap();
         assert!(matches!(
             result,
-            FlushResult::WouldBlock { bytes_written: 3 }
+            FlushResult::WouldBlock { bytes_written: 3, .. }
         ));
         assert_eq!(writer.inner, b"hel");
         assert!(!queue.is_empty());
@@ -631,9 +694,81 @@ mod tests {
         let result = queue.try_flush(&mut writer).unwrap();
         assert!(matches!(
             result,
-            FlushResult::WouldBlock { bytes_written: 0 }
+            FlushResult::WouldBlock { bytes_written: 0, .. }
         ));
         assert_eq!(queue.front_offset(), Some(3));
+    }
+
+    // Ping-tagged bytes are reported separately by the flush, exact across
+    // entry boundaries, so the connection can refuse to count a ping's own
+    // delivery as liveness while still crediting ordinary bytes behind it.
+    #[test]
+    fn flush_reports_ping_bytes_separately() {
+        let mut queue = WriteQueue::new();
+        assert!(queue.enqueue_ping(Bytes::from_static(b"ping-bytes-payload")));
+        queue.enqueue(Bytes::from_static(b"ordinary-data"), false, false, false);
+
+        let mut writer: Vec<u8> = Vec::new();
+        let result = queue.try_flush(&mut writer).unwrap();
+        match result {
+            FlushResult::Complete {
+                bytes_written,
+                ping_bytes_written,
+            } => {
+                assert_eq!(bytes_written, 18 + 13);
+                assert_eq!(
+                    ping_bytes_written, 18,
+                    "exactly the ping entry's bytes must be attributed to the ping"
+                );
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
+        assert!(queue.is_empty());
+    }
+
+    // An aged-out ping evicted by the backpressure policy must simply never
+    // be reported as written: entry tagging keeps every removal path honest
+    // with no side counter to desynchronize.
+    #[test]
+    fn evicted_ping_is_never_reported_written() {
+        let mut queue = WriteQueue::new();
+        assert!(queue.enqueue_ping(Bytes::from_static(b"ping-bytes-payload")));
+        // Age the ping past the audio-only eviction horizon (no video was
+        // ever enqueued here); it sits unwritten at the front, so it is
+        // eligible for eviction.
+        queue.queue.front_mut().unwrap().timestamp = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(AUDIO_ONLY_MAX_AGE_SECS + 1))
+            .expect("monotonic clock should be past the eviction horizon");
+
+        // Fill into the Warning band with audio, then one more enqueue runs
+        // the age eviction and removes the stale ping.
+        let audio_chunk = Bytes::from(vec![0u8; QUEUE_WARN_BYTES / 2]);
+        queue.enqueue(audio_chunk.clone(), false, false, false);
+        queue.enqueue(audio_chunk, false, false, false);
+        queue.enqueue(Bytes::from_static(b"tail"), false, false, false);
+
+        let expected_ordinary = QUEUE_WARN_BYTES / 2 * 2 + 4;
+        assert_eq!(
+            queue.pending_bytes(),
+            expected_ordinary,
+            "the aged ping must have been evicted by the Warning-band enqueue"
+        );
+
+        let mut writer: Vec<u8> = Vec::new();
+        let result = queue.try_flush(&mut writer).unwrap();
+        match result {
+            FlushResult::Complete {
+                bytes_written,
+                ping_bytes_written,
+            } => {
+                assert_eq!(bytes_written, expected_ordinary);
+                assert_eq!(
+                    ping_bytes_written, 0,
+                    "an evicted ping was never written and must not be reported as such"
+                );
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
     }
 
     #[test]

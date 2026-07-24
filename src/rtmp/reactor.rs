@@ -279,19 +279,6 @@ pub struct ReactorConnection {
     /// may not be draining — while the connection stays idle awaiting the
     /// peer's answer.
     last_ping_at: Option<Instant>,
-    /// Bytes of queued liveness pings not yet discounted from a flush.
-    /// `try_flush` subtracts these from a flush's write-activity credit so
-    /// the ping's own delivery never counts as peer liveness: only bytes
-    /// the PEER sends (its ping response — a read) can keep a quiet
-    /// connection alive, and a peer that never answers ages toward the
-    /// timeout exactly as if the server had sent nothing. Attribution is
-    /// FIFO from the queue front and EXACT by construction:
-    /// `is_ping_due_at` refuses to ping while any write is pending, so a
-    /// ping is only ever queued onto an empty queue — the first
-    /// `pending_ping_bytes` bytes any subsequent flush moves are the
-    /// ping's, and everything beyond them is ordinary data queued behind
-    /// it.
-    pending_ping_bytes: usize,
 }
 
 impl ReactorConnection {
@@ -343,7 +330,6 @@ impl ReactorConnection {
             current_interest: Interest::READABLE,
             close_deadline: None,
             last_ping_at: None,
-            pending_ping_bytes: 0,
         })
     }
 
@@ -383,15 +369,11 @@ impl ReactorConnection {
         if self.state != ConnectionState::Active || self.close_deadline.is_some() {
             return false;
         }
-        // A queued tail suppresses the probe, for two reasons. Pointless:
-        // that tail's own delivery or failure will resolve the peer's
-        // liveness. Load-bearing: the ping-byte discount in
-        // `credit_non_ping_write` attributes flushed bytes FIFO from the
-        // queue front, which is exact only when the ping is the front of an
-        // initially empty queue — ordinary bytes sitting AHEAD of a ping
-        // would eat the discount first (suppressing a real write's stamp)
-        // and leave the ping's own bytes to be credited later as ordinary
-        // activity, inflating liveness for a peer that never answered.
+        // A queued tail suppresses the probe: its own delivery or failure
+        // will resolve the peer's liveness, so a ping adds nothing there.
+        // (Attribution correctness does NOT hinge on this gate — ping
+        // entries are tagged in the write queue and their bytes reported
+        // separately by every flush, whatever sits around them.)
         if self.has_pending_writes() {
             return false;
         }
@@ -404,15 +386,15 @@ impl ReactorConnection {
         }
     }
 
-    /// Record that a liveness ping of `bytes` length was queued at `now`.
-    /// Deliberately not an activity stamp — and `try_flush` discounts these
-    /// bytes from its write-activity credit — so neither queueing nor even
-    /// DELIVERING a ping counts as peer liveness. Only the peer's answer (a
-    /// read) resets the idle clock; a peer that never answers ages toward
-    /// the timeout exactly as if the server had sent nothing.
-    pub fn note_ping_queued(&mut self, now: Instant, bytes: usize) {
+    /// Record that a liveness ping was queued at `now`. Deliberately not an
+    /// activity stamp — and the queue's ping-tagged entries keep the ping's
+    /// eventual delivery out of `try_flush`'s write-activity credit — so
+    /// neither queueing nor even DELIVERING a ping counts as peer liveness.
+    /// Only the peer's answer (a read) resets the idle clock; a peer that
+    /// never answers ages toward the timeout exactly as if the server had
+    /// sent nothing.
+    pub fn note_ping_queued(&mut self, now: Instant) {
         self.last_ping_at = Some(now);
-        self.pending_ping_bytes = self.pending_ping_bytes.saturating_add(bytes);
     }
 
     /// Enqueue data
@@ -461,15 +443,18 @@ impl ReactorConnection {
         true
     }
 
-    /// Discount queued liveness-ping bytes from a flush's write-activity
-    /// credit and report whether anything beyond them was written (see
-    /// `pending_ping_bytes` for why a ping's own delivery must not count
-    /// as liveness, and for the queue-front invariant that makes this FIFO
-    /// discount exact).
-    fn credit_non_ping_write(&mut self, bytes_written: usize) -> bool {
-        let ping_part = self.pending_ping_bytes.min(bytes_written);
-        self.pending_ping_bytes -= ping_part;
-        bytes_written > ping_part
+    /// Enqueue a liveness ping. Tagged in the write queue so every flush
+    /// reports the ping's bytes separately (they earn no write-activity
+    /// credit) and any removal path — age eviction included — stays honest
+    /// by construction: an entry that is never written never reports bytes.
+    /// Returns false if the queue refused it (critical cap; the connection
+    /// is then closing anyway).
+    pub fn enqueue_ping(&mut self, data: Vec<u8>) -> bool {
+        if !self.write_queue.enqueue_ping(Bytes::from(data)) {
+            self.state = ConnectionState::Closing;
+            return false;
+        }
+        true
     }
 
     /// Restore `Active` once a slow client's backlog is back in the Normal
@@ -499,15 +484,23 @@ impl ReactorConnection {
         }
 
         match self.write_queue.try_flush(&mut self.socket) {
-            Ok(FlushResult::Complete { bytes_written }) => {
-                if self.credit_non_ping_write(bytes_written) {
+            Ok(FlushResult::Complete {
+                bytes_written,
+                ping_bytes_written,
+            }) => {
+                // Only bytes beyond the ping-tagged ones earn the activity
+                // stamp: a ping's own delivery is not peer liveness.
+                if bytes_written > ping_bytes_written {
                     self.last_write_activity = Instant::now();
                 }
                 self.recover_from_slow_client();
                 Ok(false)
             }
-            Ok(FlushResult::WouldBlock { bytes_written }) => {
-                if self.credit_non_ping_write(bytes_written) {
+            Ok(FlushResult::WouldBlock {
+                bytes_written,
+                ping_bytes_written,
+            }) => {
+                if bytes_written > ping_bytes_written {
                     self.last_write_activity = Instant::now();
                 }
                 // A partial drain can still have dropped the backlog back
@@ -1936,14 +1929,13 @@ impl Reactor {
             let Some(conn) = self.connections.get_mut(id) else {
                 continue;
             };
-            let ping_bytes = packet.bytes.len();
-            if conn.enqueue_raw(packet.bytes) {
+            if conn.enqueue_ping(packet.bytes) {
                 debug!("Connection {} idle for {WATCHER_PING_IDLE_SECS}s; ping queued", id);
-                conn.note_ping_queued(now, ping_bytes);
+                conn.note_ping_queued(now);
                 self.pending_flush.insert(id);
                 self.interest_dirty.insert(id);
             } else {
-                // enqueue_raw refused (queue at cap) and marked the
+                // enqueue_ping refused (queue at cap) and marked the
                 // connection Closing; route it to the same close path every
                 // other refused enqueue takes.
                 timed_out.push(id);
@@ -2486,7 +2478,7 @@ mod tests {
 
         // A queued ping opens a fresh window of the same length, without
         // touching the activity clock (is_timed_out_at still sees `base`).
-        conn.note_ping_queued(base + idle, 18);
+        conn.note_ping_queued(base + idle);
         assert!(!conn.is_ping_due_at(base + idle, idle));
         assert!(!conn.is_ping_due_at(base + idle * 2 - Duration::from_millis(1), idle));
         assert!(conn.is_ping_due_at(base + idle * 2, idle));
@@ -2570,8 +2562,8 @@ mod tests {
 
         // Queue a ping the way the sweep does, then flush it into the
         // socket buffer: the write succeeds, but earns no activity credit.
-        assert!(conn.enqueue_raw(vec![2u8; 18]));
-        conn.note_ping_queued(Instant::now(), 18);
+        assert!(conn.enqueue_ping(vec![2u8; 18]));
+        conn.note_ping_queued(Instant::now());
         conn.try_flush().expect("flush the ping");
         assert!(!conn.has_pending_writes(), "the ping must flush in one go");
         assert_eq!(
@@ -2598,8 +2590,8 @@ mod tests {
         conn.last_read_activity = stale;
         conn.last_write_activity = stale;
         let before = conn.last_activity();
-        assert!(conn.enqueue_raw(vec![2u8; 18]));
-        conn.note_ping_queued(Instant::now(), 18);
+        assert!(conn.enqueue_ping(vec![2u8; 18]));
+        conn.note_ping_queued(Instant::now());
         assert!(conn.enqueue_data(Bytes::from(vec![3u8; 32]), false, false, false));
         conn.try_flush().expect("flush the ping plus the tail behind it");
         assert!(!conn.has_pending_writes(), "both entries must flush");
