@@ -35,11 +35,14 @@ const CONNECTION_TIMEOUT_SECS: u64 = 60; // Connection timeout
 /// Idle time after which an Active watcher is sent a liveness ping (RTMP
 /// User Control PingRequest) by the timeout sweep. Half the connection
 /// timeout, so a quiet-but-live watcher — typically one on a channel whose
-/// publisher has not started — is probed well before the reaper fires:
-/// either the delivered ping write or the client's ping response refreshes
-/// the activity clock. Only watchers are pinged (see
-/// `RtmpScheduler::ping_watcher`); an idle publisher still times out and
-/// releases its stream key.
+/// publisher has not started — is probed well before the reaper fires and
+/// its ANSWER (any bytes read from the peer) refreshes the activity clock.
+/// The ping's own write deliberately earns no activity credit (see
+/// `ReactorConnection::note_ping_queued`): a peer that never answers ages
+/// toward the timeout exactly as if the server had sent nothing, so the
+/// probe can only save clients that prove they are alive. Only watchers are
+/// pinged (see `RtmpScheduler::ping_watcher`); an idle publisher still
+/// times out and releases its stream key.
 const WATCHER_PING_IDLE_SECS: u64 = CONNECTION_TIMEOUT_SECS / 2;
 /// Minimum interval between full connection-timeout sweeps (PERF-10 throttle).
 /// A 60s timeout tolerates being detected up to this much late.
@@ -271,12 +274,22 @@ pub struct ReactorConnection {
     /// so lingering is bounded (see [`Self::condemn`]).
     close_deadline: Option<Instant>,
     /// When the timeout sweep last queued a liveness ping on this connection
-    /// (`None` until the first one). Gates re-pinging: a delivered ping
-    /// refreshes `last_write_activity` and restarts the idle clock on its
-    /// own, but a ping stuck in the queue (peer not reading) refreshes
-    /// nothing, and without this stamp every ~1s sweep would append another
-    /// ping to a queue that is already not draining.
+    /// (`None` until the first one). Bounds the probe rate: without this
+    /// stamp every ~1s sweep would queue another ping — onto a queue that
+    /// may not be draining — while the connection stays idle awaiting the
+    /// peer's answer.
     last_ping_at: Option<Instant>,
+    /// Bytes of queued liveness pings not yet discounted from a flush.
+    /// `try_flush` subtracts these from a flush's write-activity credit so
+    /// the ping's own delivery never counts as peer liveness: only bytes
+    /// the PEER sends (its ping response — a read) can keep a quiet
+    /// connection alive, and a peer that never answers ages toward the
+    /// timeout exactly as if the server had sent nothing. Attribution is
+    /// FIFO and conservative: a ping is queued only after 30s of idleness
+    /// (in practice onto an empty queue), and when an unflushed tail does
+    /// sit ahead of it the discount can only under-credit a flush by the
+    /// ping's few bytes — never inflate liveness.
+    pending_ping_bytes: usize,
 }
 
 impl ReactorConnection {
@@ -328,6 +341,7 @@ impl ReactorConnection {
             current_interest: Interest::READABLE,
             close_deadline: None,
             last_ping_at: None,
+            pending_ping_bytes: 0,
         })
     }
 
@@ -376,11 +390,15 @@ impl ReactorConnection {
         }
     }
 
-    /// Record that a liveness ping was queued at `now`. Deliberately not an
-    /// activity stamp: those move only on real socket IO, so an undeliverable
-    /// ping cannot shield a wedged connection from the timeout.
-    pub fn note_ping_sent(&mut self, now: Instant) {
+    /// Record that a liveness ping of `bytes` length was queued at `now`.
+    /// Deliberately not an activity stamp — and `try_flush` discounts these
+    /// bytes from its write-activity credit — so neither queueing nor even
+    /// DELIVERING a ping counts as peer liveness. Only the peer's answer (a
+    /// read) resets the idle clock; a peer that never answers ages toward
+    /// the timeout exactly as if the server had sent nothing.
+    pub fn note_ping_queued(&mut self, now: Instant, bytes: usize) {
         self.last_ping_at = Some(now);
+        self.pending_ping_bytes = self.pending_ping_bytes.saturating_add(bytes);
     }
 
     /// Enqueue data
@@ -429,6 +447,16 @@ impl ReactorConnection {
         true
     }
 
+    /// Discount queued liveness-ping bytes from a flush's write-activity
+    /// credit and report whether anything beyond them was written (see
+    /// `pending_ping_bytes` for why a ping's own delivery must not count as
+    /// liveness).
+    fn credit_non_ping_write(&mut self, bytes_written: usize) -> bool {
+        let ping_part = self.pending_ping_bytes.min(bytes_written);
+        self.pending_ping_bytes -= ping_part;
+        bytes_written > ping_part
+    }
+
     /// Restore `Active` once a slow client's backlog is back in the Normal
     /// band. `enqueue_data` applies the same rule when new data arrives, but
     /// a watcher whose publisher went quiet gets no further enqueues:
@@ -457,14 +485,14 @@ impl ReactorConnection {
 
         match self.write_queue.try_flush(&mut self.socket) {
             Ok(FlushResult::Complete { bytes_written }) => {
-                if bytes_written > 0 {
+                if self.credit_non_ping_write(bytes_written) {
                     self.last_write_activity = Instant::now();
                 }
                 self.recover_from_slow_client();
                 Ok(false)
             }
             Ok(FlushResult::WouldBlock { bytes_written }) => {
-                if bytes_written > 0 {
+                if self.credit_non_ping_write(bytes_written) {
                     self.last_write_activity = Instant::now();
                 }
                 // A partial drain can still have dropped the backlog back
@@ -1868,13 +1896,14 @@ impl Reactor {
 
         // Probe idle watchers instead of letting them idle into the reaper:
         // a watcher on a channel with no publisher is written nothing and
-        // has nothing left to say, so only a server-side ping (or its
-        // response) can keep the activity clock honest about the peer being
-        // alive. The scheduler decides who is a watcher — it owns both the
-        // role classification and the per-session serializer a control
-        // message must run through; every other idle role falls through and,
-        // if it stays idle, times out above. The queued ping rides the
-        // normal flush machinery on the next loop turn.
+        // has nothing left to say, so only the peer's ANSWER to a
+        // server-side ping can keep the activity clock honest about it
+        // being alive — the ping's own delivery earns no credit (see
+        // note_ping_queued). The scheduler decides who is a watcher — it
+        // owns both the role classification and the per-session serializer
+        // a control message must run through; every other idle role falls
+        // through and, if it stays idle, times out above. The queued ping
+        // rides the normal flush machinery on the next loop turn.
         for id in ping_due {
             let Some(packet) = self.scheduler.ping_watcher(id) else {
                 continue;
@@ -1882,9 +1911,10 @@ impl Reactor {
             let Some(conn) = self.connections.get_mut(id) else {
                 continue;
             };
+            let ping_bytes = packet.bytes.len();
             if conn.enqueue_raw(packet.bytes) {
                 debug!("Connection {} idle for {WATCHER_PING_IDLE_SECS}s; ping queued", id);
-                conn.note_ping_sent(now);
+                conn.note_ping_queued(now, ping_bytes);
                 self.pending_flush.insert(id);
                 self.interest_dirty.insert(id);
             } else {
@@ -2431,7 +2461,7 @@ mod tests {
 
         // A queued ping opens a fresh window of the same length, without
         // touching the activity clock (is_timed_out_at still sees `base`).
-        conn.note_ping_sent(base + idle);
+        conn.note_ping_queued(base + idle, 18);
         assert!(!conn.is_ping_due_at(base + idle, idle));
         assert!(!conn.is_ping_due_at(base + idle * 2 - Duration::from_millis(1), idle));
         assert!(conn.is_ping_due_at(base + idle * 2, idle));
@@ -2490,12 +2520,56 @@ mod tests {
         );
     }
 
+    // The ping's own delivery must not register as connection activity: a
+    // peer whose TCP stack ACKs bytes but whose application never answers
+    // would otherwise be kept alive forever by the server's own 30s probes,
+    // never reaching the 60s reaper. Only bytes beyond the queued ping
+    // (real media/control) earn the write-activity stamp; the peer proves
+    // liveness by ANSWERING (a read).
+    #[test]
+    fn flushed_ping_bytes_do_not_stamp_write_activity() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to get address");
+        let _client = TcpStream::connect(addr).expect("Failed to connect");
+        let (server, _) = listener.accept().expect("Failed to accept");
+        let mut conn = ReactorConnection::new(ConnectionToken::new(0, 1), server)
+            .expect("Failed to create connection");
+        conn.state = ConnectionState::Active;
+
+        let stale = Instant::now()
+            .checked_sub(Duration::from_secs(CONNECTION_TIMEOUT_SECS + 1))
+            .expect("monotonic clock should be well past 61s after a full build");
+        conn.last_read_activity = stale;
+        conn.last_write_activity = stale;
+        let before = conn.last_activity();
+
+        // Queue a ping the way the sweep does, then flush it into the
+        // socket buffer: the write succeeds, but earns no activity credit.
+        assert!(conn.enqueue_raw(vec![2u8; 18]));
+        conn.note_ping_queued(Instant::now(), 18);
+        conn.try_flush().expect("flush the ping");
+        assert!(!conn.has_pending_writes(), "the ping must flush in one go");
+        assert_eq!(
+            conn.last_activity(),
+            before,
+            "a delivered ping must not stamp write activity"
+        );
+
+        // Real (non-ping) bytes still stamp activity exactly as before.
+        assert!(conn.enqueue_raw(vec![3u8; 32]));
+        conn.try_flush().expect("flush the non-ping tail");
+        assert!(
+            conn.last_activity() > before,
+            "non-ping writes must stamp write activity"
+        );
+    }
+
     // R-B: a quiet watcher on a channel with no publisher used to be reaped
     // by the 60s idle sweep — the server never sent anything, the client had
     // nothing left to say after `play`, and last_activity never moved. The
     // sweep must instead ping an Active watcher once it sits idle for half
-    // the timeout: a live client's ping response (or the delivered ping
-    // write itself) then refreshes the activity clock, while a wedged peer
+    // the timeout: a live client's ANSWER to that ping (a read) refreshes
+    // the activity clock, while a peer that never answers — wedged or not —
     // still hits the full-timeout reaper below.
     #[test]
     fn sweep_pings_an_idle_watcher_instead_of_only_reaping_it() {
@@ -2542,17 +2616,42 @@ mod tests {
             reaped.is_empty(),
             "a watcher idle for half the timeout must not be reaped"
         );
-        let conn = reactor
-            .connections
-            .get(token.id)
-            .expect("connection exists");
-        assert!(
-            conn.has_pending_writes(),
-            "the sweep must queue a liveness ping for the idle watcher"
-        );
+        let (queued_bytes, activity_after_sweep) = {
+            let conn = reactor
+                .connections
+                .get(token.id)
+                .expect("connection exists");
+            assert!(
+                conn.has_pending_writes(),
+                "the sweep must queue a liveness ping for the idle watcher"
+            );
+            (conn.pending_bytes(), conn.last_activity())
+        };
         assert!(
             reactor.is_pending_flush(token.id),
             "the queued ping must be scheduled for the next flush pass"
+        );
+        assert_eq!(
+            activity_after_sweep, idle,
+            "queueing a ping must not count as connection activity"
+        );
+
+        // A second sweep inside the same ping window must not queue another
+        // ping: last_ping_at gates the probe rate even while the first ping
+        // sits unflushed and the connection stays idle.
+        reactor.last_timeout_check = idle;
+        assert!(
+            reactor.check_timeouts().is_empty(),
+            "the watcher is still short of the timeout on the second sweep"
+        );
+        assert_eq!(
+            reactor
+                .connections
+                .get(token.id)
+                .expect("connection exists")
+                .pending_bytes(),
+            queued_bytes,
+            "a sweep within the ping window must not re-queue the ping"
         );
 
         // Honest accounting: queueing the ping is not activity. If it never
