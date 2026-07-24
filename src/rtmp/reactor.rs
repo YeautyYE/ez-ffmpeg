@@ -961,10 +961,15 @@ pub struct PublisherState {
     pub source: PublisherSource,
 }
 
+/// One fanout packet bound for a connection's write queue: (target
+/// connection id, serialized bytes, is_keyframe, is_sequence_header,
+/// is_video, droppable — rml's `Packet::can_be_dropped`).
+type OutboundWrite = (usize, Vec<u8>, bool, bool, bool, bool);
+
 /// Route a batch of [`ServerResult`]s into the reactor's write / close buffers.
 fn collect_server_results(
     server_results: Vec<ServerResult>,
-    packets_to_write: &mut Vec<(usize, Vec<u8>, bool, bool, bool, bool)>,
+    packets_to_write: &mut Vec<OutboundWrite>,
     ids_to_close: &mut Vec<usize>,
 ) {
     for result in server_results {
@@ -1038,7 +1043,7 @@ pub struct Reactor {
     /// `write_pending_packets` pass (avoids a Vec allocation per fanout)
     conn_ids_buffer: Vec<usize>,
     /// Reusable buffer for packets to write (avoids allocation in handle_readable)
-    packets_buffer: Vec<(usize, Vec<u8>, bool, bool, bool, bool)>,
+    packets_buffer: Vec<OutboundWrite>,
     /// Reusable buffer for IDs to close (avoids allocation in handle_readable)
     ids_to_close_buffer: Vec<usize>,
     /// Reusable buffer for handle results (avoids allocation in handle_readable)
@@ -1572,7 +1577,7 @@ impl Reactor {
         &mut self,
         pub_id: usize,
         bytes: Vec<u8>,
-        packets_to_write: &mut Vec<(usize, Vec<u8>, bool, bool, bool, bool)>,
+        packets_to_write: &mut Vec<OutboundWrite>,
         ids_to_close: &mut Vec<usize>,
     ) -> bool {
         match self.scheduler.publish_bytes_received(pub_id, bytes) {
@@ -1776,7 +1781,7 @@ impl Reactor {
     fn send_delete_stream(
         &mut self,
         pub_id: usize,
-        packets: &mut Vec<(usize, Vec<u8>, bool, bool, bool, bool)>,
+        packets: &mut Vec<OutboundWrite>,
         ids_to_close: &mut Vec<usize>,
     ) {
         let mut arguments = Vec::new();
