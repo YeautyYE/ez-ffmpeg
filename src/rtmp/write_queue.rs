@@ -34,7 +34,11 @@ struct WriteEntry {
     timestamp: Instant,
     #[allow(dead_code)]
     is_keyframe: bool,
-    is_sequence_header: bool, // SPS/PPS/AudioConfig prioritized (never dropped by policy, but rejected at critical)
+    // SPS/PPS/AudioConfig provenance. The policy role folded into
+    // `droppable` (sequence headers are always non-droppable); kept, like
+    // `is_keyframe`, as entry provenance.
+    #[allow(dead_code)]
+    is_sequence_header: bool,
     /// A liveness ping queued by the reactor's timeout sweep. Flushes report
     /// these bytes separately (`FlushResult::*::ping_bytes_written`) so the
     /// connection can exclude a ping's own delivery from its write-activity
