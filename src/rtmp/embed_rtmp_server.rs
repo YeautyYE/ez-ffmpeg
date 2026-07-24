@@ -152,11 +152,16 @@ fn close_intake_and_publish_end(
 /// The join loop performs no logging and nothing else that can unwind: an
 /// unwind mid-drain would detach the remaining handles and poison the
 /// registry into a state indistinguishable from settled (empty), turning a
-/// later `stop()` into a false barrier. All reporting happens after the
-/// registry lock is released, when settlement has already completed. Riding
-/// over poisoning is safe under that discipline: a poisoned registry still
-/// holds exactly the handles no settlement consumed, and the drain below
-/// joins them as usual.
+/// later `stop()` into a false barrier. That discipline includes the panic
+/// PAYLOADS of joined threads: a payload is an arbitrary `Box<dyn Any>`
+/// whose destructor can itself panic (`panic_any` with a drop-bomb), so
+/// `Err` payloads are moved aside untouched during the drain and disposed
+/// of only after the lock is released, each drop wrapped in its own
+/// containment. All reporting happens after the registry lock is released
+/// too, when settlement has already completed. Riding over poisoning is
+/// safe under that discipline: a poisoned registry still holds exactly the
+/// handles no settlement consumed, and the drain below joins them as
+/// usual.
 fn settle_server_threads(
     server_thread_ids: &Mutex<Vec<std::thread::ThreadId>>,
     threads: &Mutex<Vec<JoinHandle<()>>>,
@@ -174,6 +179,7 @@ fn settle_server_threads(
     }
 
     let mut panicked: Vec<String> = Vec::new();
+    let mut payloads: Vec<Box<dyn std::any::Any + Send>> = Vec::new();
     {
         let mut registry = threads.lock().unwrap_or_else(PoisonError::into_inner);
         for handle in registry.drain(..) {
@@ -185,7 +191,12 @@ fn settle_server_threads(
                 continue;
             }
             let name = handle.thread().name().unwrap_or("rtmp-server").to_string();
-            if handle.join().is_err() {
+            if let Err(payload) = handle.join() {
+                // Move the payload aside WITHOUT dropping it: its
+                // destructor is arbitrary user code that may panic, and no
+                // unwind is allowed while the drain and the registry guard
+                // are live (see the unwind-safety note above).
+                payloads.push(payload);
                 panicked.push(name);
             }
         }
@@ -198,6 +209,12 @@ fn settle_server_threads(
         // registry lock released and every join already done, so even a
         // panicking logger cannot damage the settlement it reports on.
         error!("Thread[{name}] terminated by an uncontained panic");
+    }
+    for payload in payloads {
+        // Dispose of each retained payload under its own containment: a
+        // drop-bomb payload must neither unwind out of stop() nor skip the
+        // disposal of its siblings.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(payload)));
     }
 }
 
@@ -2248,6 +2265,46 @@ mod tests {
         assert!(
             threads.lock().unwrap().is_empty(),
             "the panicked thread's handle must still be consumed"
+        );
+    }
+
+    // A panic PAYLOAD is arbitrary user data whose destructor can itself
+    // panic (panic_any with a drop bomb). Disposing of it mid-drain would
+    // unwind with the registry guard live: the remaining handles would be
+    // detached and the registry poisoned into a state that reads as
+    // settled. Settlement must join EVERY handle — including those behind
+    // the bomb — and return normally.
+    #[test]
+    fn settlement_contains_a_panicking_join_payload() {
+        struct PayloadBomb;
+        impl Drop for PayloadBomb {
+            fn drop(&mut self) {
+                panic!("panic payload drop bomb");
+            }
+        }
+
+        let server_thread_ids: Arc<Mutex<Vec<std::thread::ThreadId>>> = Default::default();
+        let threads: Arc<Mutex<Vec<JoinHandle<()>>>> = Default::default();
+        let survivor_joined = Arc::new(AtomicBool::new(false));
+
+        // The bomb thread is registered FIRST so its payload is handled
+        // while another handle still sits behind it in the drain.
+        threads.lock().unwrap().push(std::thread::spawn(|| {
+            std::panic::panic_any(PayloadBomb);
+        }));
+        let survivor_flag = survivor_joined.clone();
+        threads.lock().unwrap().push(std::thread::spawn(move || {
+            survivor_flag.store(true, Ordering::Release);
+        }));
+
+        settle_server_threads(&server_thread_ids, &threads);
+        assert!(
+            survivor_joined.load(Ordering::Acquire),
+            "the handle behind the bomb payload must still be joined"
+        );
+        assert!(
+            threads.lock().unwrap().is_empty(),
+            "settlement must consume every handle despite the bomb payload"
         );
     }
 
