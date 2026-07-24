@@ -14,6 +14,12 @@
 //! It abstracts the complexity of the raw C API, allowing you to configure media pipelines,
 //! perform transcoding and filtering, and inspect streams with ease.
 //!
+//! The FFmpeg 7.1–8.x system libraries must be installed before this crate
+//! builds; the
+//! [installation guide](https://github.com/YeautyYE/ez-ffmpeg/blob/main/docs/INSTALL.md)
+//! covers platform prerequisites, static linking, building FFmpeg from
+//! source, and troubleshooting.
+//!
 //! ## Crate Layout
 //!
 //! - **`core`**: The foundational module that contains the main building blocks for configuring
