@@ -519,6 +519,54 @@ impl RtmpScheduler {
         Ok(server_results)
     }
 
+    /// Build a liveness ping (RTMP User Control `PingRequest`) for
+    /// `connection_id` if it is a client currently watching a channel.
+    ///
+    /// Watchers are the only role that can sit legitimately idle on a
+    /// healthy connection: with no publisher on their channel nothing is
+    /// ever written to them, and after `play` they have nothing left to
+    /// say, so without a server-side ping the reactor's idle sweep reaps
+    /// them. Every other classification returns `None` — a publisher idle
+    /// for the full timeout is dead weight pinning a stream key and must
+    /// still be reaped — as do unknown connections and a session that
+    /// fails to serialize the request. The packet must come from the
+    /// client's own session: it owns the serializer whose chunk-stream
+    /// state the peer is tracking.
+    pub(super) fn ping_watcher(&mut self, connection_id: usize) -> Option<Packet> {
+        let client_id = self.connection_to_client_map.get(&connection_id)?;
+        let client = self.clients.get_mut(*client_id)?;
+        if !matches!(client.current_action, ClientAction::Watching { .. }) {
+            return None;
+        }
+        match client.session.send_ping_request() {
+            Ok((packet, _sent_at)) => Some(packet),
+            Err(e) => {
+                warn!("Failed to build a ping request for connection {connection_id}: {e:?}");
+                None
+            }
+        }
+    }
+
+    /// Test-only staging: register `connection_id` as a client watching
+    /// `stream_key`, through the same registration path a real `play` runs
+    /// (client creation plus `handle_play_requested`; the session's accept
+    /// round-trip would need a full client byte exchange, which watcher-
+    /// classification tests do not require). Exists because reactor-level
+    /// tests cannot reach this module's private handlers.
+    #[cfg(test)]
+    pub(super) fn register_watcher_for_test(&mut self, connection_id: usize, stream_key: &str) {
+        let _ = self.bytes_received(connection_id, &[]);
+        let mut server_results = Vec::new();
+        self.handle_play_requested(
+            connection_id,
+            1,
+            "test-app".to_string(),
+            stream_key.to_string(),
+            1,
+            &mut server_results,
+        );
+    }
+
     pub(super) fn notify_connection_closed(&mut self, connection_id: usize) {
         match self.connection_to_client_map.remove(&connection_id) {
             None => (),
@@ -1706,6 +1754,113 @@ fn oversized_sequence_header_error(event: &ServerSessionEvent) -> Option<Schedul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // R-B: the liveness ping must target exactly the Watching role — every
+    // other classification stays reapable by the idle sweep — and the built
+    // packet must decode as a UserControl PingRequest from the client's own
+    // session serializer.
+    #[test]
+    fn ping_watcher_builds_a_ping_request_only_for_watching_clients() {
+        use rml_rtmp::chunk_io::ChunkDeserializer;
+        use rml_rtmp::messages::{MessagePayload, RtmpMessage, UserControlEventType};
+
+        let mut scheduler = RtmpScheduler::new(1);
+
+        // Unknown connection: nothing to ping.
+        assert!(scheduler.ping_watcher(9).is_none());
+
+        // A client that only connected (Waiting) is not probed.
+        let waiting_connection_id = 5;
+        let _ = scheduler.bytes_received(waiting_connection_id, &[]);
+        assert!(scheduler.ping_watcher(waiting_connection_id).is_none());
+
+        // A network publisher is never probed: one idle for the full
+        // timeout is dead weight pinning a stream key and must be reaped.
+        let publisher_connection_id = 6;
+        let _ = scheduler.bytes_received(publisher_connection_id, &[]);
+        let publisher_client_id = *scheduler
+            .connection_to_client_map
+            .get(&publisher_connection_id)
+            .unwrap();
+        scheduler
+            .clients
+            .get_mut(publisher_client_id)
+            .unwrap()
+            .current_action = ClientAction::Publishing(Rc::from("ping_stream"));
+        assert!(scheduler.ping_watcher(publisher_connection_id).is_none());
+
+        // A watcher gets a ping, built by its own session. The session's
+        // serializer may compress headers against chunks it sent earlier on
+        // the same control chunk stream, so the decoder must replay the
+        // session's prior output before the ping — which is the point: the
+        // packet has to come from the client's own session, not a fresh
+        // serializer.
+        fn drain_messages(
+            deserializer: &mut ChunkDeserializer,
+            bytes: &[u8],
+        ) -> Vec<MessagePayload> {
+            let mut messages = Vec::new();
+            let mut next = deserializer
+                .get_next_message(bytes)
+                .expect("valid chunk bytes");
+            while let Some(payload) = next {
+                messages.push(payload);
+                next = deserializer
+                    .get_next_message(&[])
+                    .expect("valid buffered continuation");
+            }
+            messages
+        }
+
+        let watcher_connection_id = 7;
+        let mut deserializer = ChunkDeserializer::new();
+        let prior = scheduler
+            .bytes_received(watcher_connection_id, &[])
+            .expect("create the watcher client");
+        let mut results = Vec::new();
+        scheduler.handle_play_requested(
+            watcher_connection_id,
+            1,
+            "app".to_string(),
+            "ping_stream".to_string(),
+            1,
+            &mut results,
+        );
+        for result in prior.into_iter().chain(results) {
+            if let ServerResult::OutboundPacket {
+                target_connection_id,
+                packet,
+                ..
+            } = result
+            {
+                if target_connection_id == watcher_connection_id {
+                    drain_messages(&mut deserializer, &packet.bytes);
+                }
+            }
+        }
+
+        let packet = scheduler
+            .ping_watcher(watcher_connection_id)
+            .expect("a watching client must be pingable");
+        let messages = drain_messages(&mut deserializer, &packet.bytes);
+        assert_eq!(messages.len(), 1, "the ping packet is one message");
+        let message = messages
+            .into_iter()
+            .next()
+            .expect("length asserted above")
+            .to_rtmp_message()
+            .expect("decode the ping payload");
+        assert!(
+            matches!(
+                message,
+                RtmpMessage::UserControl {
+                    event_type: UserControlEventType::PingRequest,
+                    ..
+                }
+            ),
+            "the built packet must be a UserControl PingRequest, got {message:?}"
+        );
+    }
 
     // GitHub: audio-only RTMP streams were silent for subscribers because audio
     // delivery was gated on a video keyframe that never arrives.
