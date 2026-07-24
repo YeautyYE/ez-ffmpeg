@@ -36,8 +36,8 @@ use super::codec::{aac::AacRuntime, avc::AvcRuntime, CodecRuntime};
 use super::side_data;
 use super::timeline::{StreamTimeline, Timeline};
 use super::{
-    AudioPacketConfig, CallbackFailureKind, PacketCallbackError, PacketSink, PacketStreamInfo,
-    PacketView, VideoPacketConfig,
+    AudioPacketConfig, CallbackFailureKind, JobFailureSummary, PacketCallbackError, PacketSink,
+    PacketStreamInfo, PacketView, VideoPacketConfig,
 };
 use crate::core::context::PacketBox;
 use crate::error::PacketSinkError;
@@ -605,6 +605,12 @@ impl PacketSinkWorker {
     /// [`PacketSinkError::JobFailed`] when the job failed elsewhere (whether
     /// or not that failure truncated this sink's delivery — `wait()` keeps
     /// the original error); stays silent for aborts and clean cancellation.
+    /// On that JobFailed path only, a registered `on_job_failed` observer
+    /// receives the structured summary first, under its own containment, so
+    /// a panicking observer can never skip the terminal dispatch — its
+    /// caught payload is parked and disposed only AFTER the terminal
+    /// (payload destructors are user code too, and disposing one is
+    /// abort-capable under the two-bomb boundary).
     ///
     /// The stashed error reaches the callback BY REFERENCE — custody stays
     /// with the worker. Its `error.source` can be the last `Arc` to a
@@ -615,13 +621,16 @@ impl PacketSinkWorker {
     /// source destructor is a panic-during-unwind process abort BEFORE the
     /// terminal containment regains control. Borrowed, the unwind crosses
     /// only a plain reference; the original is destroyed later inside
-    /// [`Self::dispose_contained`], under its own catch.
+    /// [`Self::dispose_contained`], under its own catch. (The job-failure
+    /// summary needs no such custody care: its fields are plain crate data —
+    /// no user destructors — and it stays owned by this frame while the
+    /// observer borrows it.)
     pub(crate) fn finish(
         &mut self,
         all_streams_terminal: bool,
         ret: i32,
         aborted: bool,
-        job_error: Option<String>,
+        job_error: Option<JobFailureSummary>,
     ) {
         if matches!(self.phase, Phase::Finished) {
             return;
@@ -640,13 +649,54 @@ impl PacketSinkWorker {
             // worker recorded an error for the same shutdown.
             return;
         }
-        if let Some(message) = job_error {
+        if let Some(summary) = job_error {
             // The JOB failed (a sibling output, an upstream task) — whether
             // this sink had drained fully or the failure truncated its
             // delivery: success must not be promised, and the consumer
             // learns why. wait() keeps the original error.
-            self.sink
-                .dispatch_delivery_error(&PacketSinkError::JobFailed { message });
+            //
+            // The structured observer runs first, under its OWN catch: the
+            // terminal on_delivery_error below must fire even when a
+            // registered on_job_failed panics. The caught payload is PARKED
+            // here, not disposed: dropping a `panic_any` payload runs
+            // arbitrary user destructors, which under the crate's two-bomb
+            // boundary is an abort-capable operation — nothing abort-capable
+            // may sit between the observer and the terminal.
+            let observer_payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || self.sink.dispatch_job_failed(&summary),
+            ))
+            .err();
+            // Byte-identity by construction: the JobFailed message is MOVED
+            // out of the summary, never re-formatted. The dispatch runs
+            // under a local catch ONLY so this frame's unwind cannot drop
+            // the parked payload (a panicking payload destructor mid-unwind
+            // would escalate to an abort); the terminal's own panic is
+            // re-thrown below, payload intact, so the mux worker's
+            // terminal-region containment observes exactly what it observed
+            // before the observer existed.
+            let terminal_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.sink.dispatch_delivery_error(&PacketSinkError::JobFailed {
+                    message: summary.into_message(),
+                })
+            }));
+            let observer_panicked = observer_payload.is_some();
+            if let Some(payload) = observer_payload {
+                // Bounded disposal AFTER the terminal: a two-bomb payload
+                // still aborts (the documented per-box boundary), but it can
+                // no longer abort BETWEEN the observer and the terminal.
+                super::dispose_panic_payload(payload);
+            }
+            if let Err(terminal_payload) = terminal_outcome {
+                // Re-thrown before any logging, exactly like the
+                // pre-observer path: a panicking terminal skips the observer
+                // log and reaches the outer containment first.
+                std::panic::resume_unwind(terminal_payload);
+            }
+            if observer_panicked {
+                log::error!(
+                    "packet sink on_job_failed observer panicked; the JobFailed terminal was still dispatched"
+                );
+            }
             return;
         }
         if ret >= 0 && all_streams_terminal {
@@ -814,7 +864,9 @@ fn check_param_change(
 mod tests {
     use super::*;
     use crate::core::context::PacketData;
-    use crate::core::packet_sink::{EncodedPacket, PacketSink, PacketSinkEvent};
+    use crate::core::packet_sink::{
+        EncodedPacket, JobFailureKind, JobFailureSummary, PacketSink, PacketSinkEvent,
+    };
     use ffmpeg_next::packet::Mut;
     use ffmpeg_sys_next::{
         av_guess_format, av_mallocz, av_packet_new_side_data, avformat_alloc_output_context2,
@@ -1889,7 +1941,7 @@ mod tests {
     #[test]
     fn finish_gate_matrix() {
         let ctx = video_ctx();
-        let run = |all_done: bool, ret: i32, aborted: bool, job_error: Option<String>| {
+        let run = |all_done: bool, ret: i32, aborted: bool, job_error: Option<JobFailureSummary>| {
             let (sink, events) = recording_sink();
             let mut worker = collect(&ctx, sink).unwrap();
         assert_eq!(worker.deliver_stream_info(), 0);
@@ -1908,14 +1960,270 @@ mod tests {
                 .count();
             (ends, errors)
         };
+        let sibling_failed = || {
+            Some(JobFailureSummary::from_error(
+                &crate::error::Error::WorkerPanicked("muxer1:mpegts".to_string()),
+            ))
+        };
         assert_eq!(run(true, 0, false, None), (1, 0), "healthy completion");
         assert_eq!(run(false, 0, false, None), (0, 0), "streams not terminal");
         assert_eq!(run(true, -5, false, None), (0, 0), "delivery error");
         assert_eq!(run(true, 0, true, None), (0, 0), "abort");
         assert_eq!(
-            run(true, 0, false, Some("sibling failed".to_string())),
+            run(true, 0, false, sibling_failed()),
             (0, 1),
             "a job error after clean drain reports on_delivery_error, never on_end"
+        );
+    }
+
+    /// The JobFailed synthesis path with a registered structured observer:
+    /// `on_job_failed` receives the classified summary exactly once,
+    /// immediately BEFORE `on_delivery_error(JobFailed)`, and the JobFailed
+    /// message is the summary's message — which is the recorded error's
+    /// Display output, byte for byte.
+    #[test]
+    fn job_failure_summary_reaches_on_job_failed_before_on_delivery_error() {
+        let ctx = video_ctx();
+        let log: Arc<Mutex<Vec<(&'static str, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen: Arc<Mutex<Option<(JobFailureKind, Option<i32>, Option<usize>)>>> =
+            Arc::new(Mutex::new(None));
+        let (jf_log, jf_seen, end_log, err_log) =
+            (log.clone(), seen.clone(), log.clone(), log.clone());
+        let sink = PacketSink::builder(|_: &PacketView<'_>| Ok(()))
+            .on_job_failed(move |summary: &JobFailureSummary| {
+                *jf_seen.lock().unwrap() = Some((
+                    summary.kind(),
+                    summary.ffmpeg_code(),
+                    summary.stream_index(),
+                ));
+                jf_log
+                    .lock()
+                    .unwrap()
+                    .push(("job_failed", summary.message().to_string()));
+            })
+            .on_end(move || end_log.lock().unwrap().push(("end", String::new())))
+            .on_delivery_error(move |e| {
+                let message = match e {
+                    PacketSinkError::JobFailed { message } => message.clone(),
+                    other => format!("unexpected terminal: {other}"),
+                };
+                err_log.lock().unwrap().push(("delivery_error", message));
+            })
+            .build();
+        let mut worker = collect(&ctx, sink).unwrap();
+        assert_eq!(worker.deliver_stream_info(), 0);
+        let recorded = crate::error::Error::Muxing(
+            crate::error::MuxingOperationError::InterleavedWriteError(
+                crate::error::MuxingError::UnknownError(AVERROR_EXTERNAL),
+            ),
+        );
+        worker.finish(
+            false,
+            AVERROR_EXTERNAL,
+            false,
+            Some(JobFailureSummary::from_error(&recorded)),
+        );
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 2, "exactly one observer + one terminal: {log:?}");
+        assert_eq!(log[0].0, "job_failed", "the observer fires first");
+        assert_eq!(log[1].0, "delivery_error", "then the terminal");
+        // Byte identity through both callbacks: summary message == JobFailed
+        // message == the recorded error's Display output.
+        assert_eq!(log[0].1, recorded.to_string());
+        assert_eq!(log[1].1, recorded.to_string());
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some((JobFailureKind::Mux, Some(AVERROR_EXTERNAL), None)),
+            "a sibling muxing failure classifies as Mux and keeps the raw code"
+        );
+    }
+
+    /// (c) Message byte-identity across representative failures: the string
+    /// inside `JobFailed` is exactly the recorded error's `to_string()`
+    /// output — what the pre-summary plumbing shipped.
+    #[test]
+    fn job_failed_message_is_byte_identical_to_the_recorded_error_display() {
+        let ctx = video_ctx();
+        let cases: Vec<crate::error::Error> = vec![
+            crate::error::Error::WorkerPanicked("muxer1:mpegts".to_string()),
+            crate::error::Error::Muxing(crate::error::MuxingOperationError::ThreadExited),
+            crate::error::Error::Decoding(crate::error::DecodingOperationError::CorruptFrame),
+        ];
+        for recorded in cases {
+            let (sink, events) = recording_sink();
+            let mut worker = collect(&ctx, sink).unwrap();
+            assert_eq!(worker.deliver_stream_info(), 0);
+            worker.finish(
+                false,
+                AVERROR_EXTERNAL,
+                false,
+                Some(JobFailureSummary::from_error(&recorded)),
+            );
+            let events = events.lock().unwrap();
+            let terminal = events
+                .iter()
+                .find_map(|e| match e {
+                    PacketSinkEvent::Error(PacketSinkError::JobFailed { message }) => {
+                        Some(message.clone())
+                    }
+                    _ => None,
+                })
+                .expect("the job failure must surface as JobFailed");
+            assert_eq!(terminal, recorded.to_string());
+        }
+    }
+
+    /// (d) A panicking `on_job_failed` observer is contained and the
+    /// terminal `on_delivery_error(JobFailed)` STILL fires — the terminal
+    /// can never be skipped by the observer.
+    #[test]
+    fn on_job_failed_panic_is_contained_and_terminal_still_fires() {
+        let ctx = video_ctx();
+        let events: Arc<Mutex<Vec<PacketSinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let (end_log, err_log) = (events.clone(), events.clone());
+        let sink = PacketSink::builder(|_: &PacketView<'_>| Ok(()))
+            .on_job_failed(|_summary: &JobFailureSummary| {
+                panic!("injected on_job_failed panic");
+            })
+            .on_end(move || end_log.lock().unwrap().push(PacketSinkEvent::End))
+            .on_delivery_error(move |e| {
+                err_log
+                    .lock()
+                    .unwrap()
+                    .push(PacketSinkEvent::Error(e.clone()))
+            })
+            .build();
+        let mut worker = collect(&ctx, sink).unwrap();
+        assert_eq!(worker.deliver_stream_info(), 0);
+        let recorded = crate::error::Error::WorkerPanicked("muxer1:mpegts".to_string());
+        worker.finish(
+            false,
+            AVERROR_EXTERNAL,
+            false,
+            Some(JobFailureSummary::from_error(&recorded)),
+        );
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly the terminal event despite the observer panic: {events:?}"
+        );
+        match &events[0] {
+            PacketSinkEvent::Error(PacketSinkError::JobFailed { message }) => {
+                assert_eq!(message, &recorded.to_string());
+            }
+            other => panic!("expected the JobFailed terminal, got {other:?}"),
+        }
+    }
+
+    /// (e) Channel adapter: the job-failure path queues a structured
+    /// `JobFailure` event immediately before the `Error(JobFailed)` event,
+    /// both carrying the same message.
+    #[test]
+    fn channel_emits_job_failure_before_error_on_the_failure_path() {
+        let ctx = video_ctx();
+        let (sink, rx) = PacketSink::channel(std::num::NonZeroUsize::new(8).unwrap());
+        let mut worker = collect(&ctx, sink).unwrap();
+        assert_eq!(worker.deliver_stream_info(), 0);
+        let recorded = crate::error::Error::WorkerPanicked("muxer1:mpegts".to_string());
+        worker.finish(
+            false,
+            AVERROR_EXTERNAL,
+            false,
+            Some(JobFailureSummary::from_error(&recorded)),
+        );
+        drop(worker);
+        assert!(matches!(
+            rx.recv().unwrap(),
+            PacketSinkEvent::StreamInfo(_)
+        ));
+        match rx.recv().unwrap() {
+            PacketSinkEvent::JobFailure(summary) => {
+                assert_eq!(summary.kind(), JobFailureKind::Other);
+                assert_eq!(summary.message(), recorded.to_string());
+            }
+            other => panic!("expected the JobFailure event first, got {other:?}"),
+        }
+        match rx.recv().unwrap() {
+            PacketSinkEvent::Error(PacketSinkError::JobFailed { message }) => {
+                assert_eq!(message, recorded.to_string());
+            }
+            other => panic!("expected the Error(JobFailed) event second, got {other:?}"),
+        }
+        // Nothing else follows; the sender side is gone.
+        assert!(rx.recv().is_err());
+    }
+
+    /// (e) Channel adapter, capacity-1 regression: the JobFailure summary
+    /// must never consume the LAST free slot — a consumer that drained a
+    /// capacity-1 channel before the terminal was guaranteed the
+    /// Error(JobFailed) event before the summary existed and must stay
+    /// guaranteed it; the summary is dropped instead.
+    #[test]
+    fn job_failure_event_never_starves_the_terminal_error_slot() {
+        let ctx = video_ctx();
+        let (sink, rx) = PacketSink::channel(std::num::NonZeroUsize::new(1).unwrap());
+        let mut worker = collect(&ctx, sink).unwrap();
+        assert_eq!(worker.deliver_stream_info(), 0);
+        // Drain the stream-info event: exactly ONE slot is free at the
+        // terminal — the pre-summary guarantee for the Error event.
+        assert!(matches!(
+            rx.recv().unwrap(),
+            PacketSinkEvent::StreamInfo(_)
+        ));
+        let recorded = crate::error::Error::WorkerPanicked("muxer1:mpegts".to_string());
+        worker.finish(
+            false,
+            AVERROR_EXTERNAL,
+            false,
+            Some(JobFailureSummary::from_error(&recorded)),
+        );
+        drop(worker);
+        match rx.recv().unwrap() {
+            PacketSinkEvent::Error(PacketSinkError::JobFailed { message }) => {
+                assert_eq!(message, recorded.to_string());
+            }
+            other => panic!("the lone slot belongs to Error(JobFailed), got {other:?}"),
+        }
+        assert!(rx.recv().is_err(), "nothing else may be queued");
+    }
+
+    /// The observer's caught panic payload may run arbitrary user
+    /// destructors when dropped (`panic_any`), so its disposal is an
+    /// abort-capable operation under the crate's two-bomb boundary — it must
+    /// happen only AFTER the terminal dispatch, never between the observer
+    /// and the terminal. Pinned with a benign payload whose Drop records its
+    /// position in the event order.
+    #[test]
+    fn observer_panic_payload_is_disposed_only_after_the_terminal_dispatch() {
+        struct OrderProbe(Arc<Mutex<Vec<&'static str>>>);
+        impl Drop for OrderProbe {
+            fn drop(&mut self) {
+                self.0.lock().unwrap().push("payload_disposed");
+            }
+        }
+        let ctx = video_ctx();
+        let order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let (probe_log, err_log) = (order.clone(), order.clone());
+        let sink = PacketSink::builder(|_: &PacketView<'_>| Ok(()))
+            .on_job_failed(move |_summary: &JobFailureSummary| {
+                std::panic::panic_any(OrderProbe(probe_log.clone()));
+            })
+            .on_delivery_error(move |_e| err_log.lock().unwrap().push("delivery_error"))
+            .build();
+        let mut worker = collect(&ctx, sink).unwrap();
+        assert_eq!(worker.deliver_stream_info(), 0);
+        let recorded = crate::error::Error::WorkerPanicked("muxer1:mpegts".to_string());
+        worker.finish(
+            false,
+            AVERROR_EXTERNAL,
+            false,
+            Some(JobFailureSummary::from_error(&recorded)),
+        );
+        assert_eq!(
+            order.lock().unwrap().as_slice(),
+            ["delivery_error", "payload_disposed"],
+            "the terminal must fire before the observer's payload is dropped"
         );
     }
 
@@ -1968,7 +2276,14 @@ mod tests {
         )));
         // Terminal with the job error visible (what the mux worker reads
         // after full settlement): cancellation still wins.
-        worker.finish(false, AVERROR_EXTERNAL, false, Some("muxer1:mpegts".to_string()));
+        worker.finish(
+            false,
+            AVERROR_EXTERNAL,
+            false,
+            Some(JobFailureSummary::from_error(
+                &crate::error::Error::WorkerPanicked("muxer1:mpegts".to_string()),
+            )),
+        );
         drop(worker);
         let (mut ends, mut errors) = (0, 0);
         while let Ok(event) = rx.try_recv() {

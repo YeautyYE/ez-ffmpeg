@@ -63,7 +63,12 @@
 //!      still recorded first-error-wins as the job result, and the `stop()`
 //!      call that drove the race returns it once every worker has settled;
 //!      after `abort()`, which returns nothing, or a drop, which discards
-//!      the result with the scheduler, it goes unobserved.
+//!      the result with the scheduler, it goes unobserved. When the failure
+//!      was recorded OUTSIDE this sink's delivery path, an optional
+//!      [`on_job_failed`](crate::packet_sink::PacketSinkBuilder::on_job_failed)
+//!      observer receives a structured
+//!      [`JobFailureSummary`](crate::packet_sink::JobFailureSummary)
+//!      immediately before that synthesized `JobFailed` dispatch.
 //!
 //! # Timestamp and ordering
 //!
@@ -164,10 +169,13 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 pub(crate) mod codec;
+mod job_failure;
 pub(crate) mod nal_framing;
 pub(crate) mod side_data;
 pub(crate) mod strict;
 pub(crate) mod timeline;
+
+pub use job_failure::{JobFailureKind, JobFailureSummary};
 
 /// Delivery tier of a packet sink. Only [`Strict`](PacketSinkTier::Strict)
 /// exists in v1; the enum is `#[non_exhaustive]` so later tiers (generic
@@ -679,16 +687,17 @@ pub(crate) type StreamInfoFn =
 pub(crate) type PacketFn =
     Box<dyn for<'a> FnMut(&PacketView<'a>) -> PacketCallbackResult + Send>;
 pub(crate) type EndFn = Box<dyn FnMut() + Send>;
+pub(crate) type JobFailedFn = Box<dyn FnMut(&JobFailureSummary) + Send>;
 pub(crate) type DeliveryErrorFn = Box<dyn FnMut(&PacketSinkError) + Send>;
 
-/// How the sink dispatches callbacks: four independent closures, or one
-/// stateful handler. Either way every call runs serially on the delivery
-/// thread.
+/// How the sink dispatches callbacks: independent closures, or one stateful
+/// handler. Either way every call runs serially on the delivery thread.
 enum SinkDispatch {
     Closures {
         on_stream_info: Option<StreamInfoFn>,
         on_packet: PacketFn,
         on_end: Option<EndFn>,
+        on_job_failed: Option<JobFailedFn>,
         on_delivery_error: Option<DeliveryErrorFn>,
     },
     Handler(Box<dyn PacketSinkHandler>),
@@ -767,6 +776,7 @@ impl PacketSink {
             on_stream_info: None,
             on_packet: Box::new(on_packet),
             on_end: None,
+            on_job_failed: None,
             on_delivery_error: None,
         }
     }
@@ -812,13 +822,15 @@ impl PacketSink {
     /// terminates even with a full, undrained channel. Dropping the receiver
     /// cancels the job with [`PacketSinkError::ChannelDisconnected`].
     ///
-    /// Terminal `End`/`Error` events are delivered best-effort ON THE RAW
-    /// CHANNEL: the send behind them must not block teardown, so a consumer
-    /// that is full at that instant — stalled forever or merely a few events
-    /// behind — loses them, and sender disconnection (`Disconnected` on the
-    /// receiver) is the authoritative end-of-events signal.
-    /// [`PacketSinkReceiver::into_events`] restores the deterministic ending
-    /// on top: a stream without a terminal `Err` always ends with `End`.
+    /// Terminal `End`/`Error` events — and the `JobFailure` summary queued
+    /// immediately before a job-failure `Error` — are delivered best-effort
+    /// ON THE RAW CHANNEL: the send behind them must not block teardown, so
+    /// a consumer that is full at that instant — stalled forever or merely a
+    /// few events behind — loses them, and sender disconnection
+    /// (`Disconnected` on the receiver) is the authoritative end-of-events
+    /// signal. [`PacketSinkReceiver::into_events`] restores the
+    /// deterministic ending on top: a stream without a terminal `Err` always
+    /// ends with `End`.
     pub fn channel(capacity: NonZeroUsize) -> (PacketSink, PacketSinkReceiver) {
         let (tx, rx) = crossbeam_channel::bounded::<PacketSinkEvent>(capacity.get());
         let cancellation: CancellationSlot = Arc::new(OnceLock::new());
@@ -827,6 +839,7 @@ impl PacketSink {
         let pkt_tx = tx.clone();
         let pkt_cancel = cancellation.clone();
         let end_tx = tx.clone();
+        let job_failed_tx = tx.clone();
         let err_tx = tx;
         let mut sink = PacketSink::builder(move |packet: &PacketView<'_>| {
             send_with_cancellation(
@@ -848,6 +861,25 @@ impl PacketSink {
             // indistinguishable from try_send), and sender disconnection is
             // the authoritative signal.
             let _ = end_tx.try_send(PacketSinkEvent::End);
+        })
+        .on_job_failed(move |summary: &JobFailureSummary| {
+            // Best-effort like the terminal events it precedes, with one
+            // extra guard: the summary must never consume the LAST free
+            // slot — the Error(JobFailed) event behind it has first claim
+            // on that capacity. A consumer that drained the channel before
+            // the terminal (the documented way to catch the best-effort
+            // terminal on a small adapter) was guaranteed the Error event
+            // before the summary existed and must stay guaranteed it. Only
+            // this thread sends, and the consumer can only FREE slots, so
+            // a two-free-slots check here cannot be raced into starving
+            // the Error send that follows.
+            let free = job_failed_tx
+                .capacity()
+                .unwrap_or(usize::MAX)
+                .saturating_sub(job_failed_tx.len());
+            if free >= 2 {
+                let _ = job_failed_tx.try_send(PacketSinkEvent::JobFailure(summary.clone()));
+            }
         })
         .on_delivery_error(move |e: &PacketSinkError| {
             let _ = err_tx.try_send(PacketSinkEvent::Error(e.clone()));
@@ -896,6 +928,23 @@ impl PacketSink {
         }
     }
 
+    /// Dispatches the structured job-failure summary to a registered
+    /// `on_job_failed` observer. Builder sinks only — the handler trait has
+    /// no such hook today, so handler sinks keep the `JobFailed`-only
+    /// terminal. The caller (the worker's terminal slot) wraps this call in
+    /// its own panic containment so a panicking observer can never skip the
+    /// `on_delivery_error` dispatch that follows it.
+    pub(crate) fn dispatch_job_failed(&mut self, summary: &JobFailureSummary) {
+        match &mut self.dispatch {
+            SinkDispatch::Closures { on_job_failed, .. } => {
+                if let Some(f) = on_job_failed {
+                    f(summary)
+                }
+            }
+            SinkDispatch::Handler(_) => {}
+        }
+    }
+
     pub(crate) fn dispatch_delivery_error(&mut self, error: &PacketSinkError) {
         match &mut self.dispatch {
             SinkDispatch::Closures {
@@ -930,6 +979,7 @@ impl PacketSink {
                 on_stream_info,
                 on_packet,
                 on_end,
+                on_job_failed,
                 on_delivery_error,
             } => {
                 // Field declaration order — the order the derived drop glue
@@ -939,6 +989,9 @@ impl PacketSink {
                 }
                 panicked |= drop_contained(on_packet);
                 if let Some(f) = on_end {
+                    panicked |= drop_contained(f);
+                }
+                if let Some(f) = on_job_failed {
                     panicked |= drop_contained(f);
                 }
                 if let Some(f) = on_delivery_error {
@@ -1072,6 +1125,7 @@ pub struct PacketSinkBuilder {
     on_stream_info: Option<StreamInfoFn>,
     on_packet: PacketFn,
     on_end: Option<EndFn>,
+    on_job_failed: Option<JobFailedFn>,
     on_delivery_error: Option<DeliveryErrorFn>,
 }
 
@@ -1103,14 +1157,52 @@ impl PacketSinkBuilder {
         self
     }
 
+    /// Optional structured observer for a job that failed OUTSIDE this
+    /// sink's delivery path.
+    ///
+    /// Scope — this fires ONLY on the synthesized-JobFailed path: the job
+    /// failed elsewhere (a sibling output, an upstream demuxer, decoder,
+    /// filter or encoder) while this sink's own delivery was clean, whether
+    /// that failure landed after this sink drained or truncated its
+    /// delivery. It does NOT fire for this sink's own delivery-path errors
+    /// (strict-tier violations, failing callbacks) — those already deliver
+    /// the full typed [`PacketSinkError`] by reference to
+    /// `on_delivery_error`, and no summary is synthesized for them. Like
+    /// the terminal callbacks, it never fires for cancellation, aborts, or
+    /// initial configuration failures.
+    ///
+    /// When it fires, it fires exactly once, immediately BEFORE the
+    /// matching `on_delivery_error(&PacketSinkError::JobFailed { .. })` —
+    /// same delivery thread, same terminal slot. The summary's
+    /// [`message`](JobFailureSummary::message) is byte-identical to that
+    /// `JobFailed` message; the summary adds a coarse [`JobFailureKind`]
+    /// and, where the recorded error visibly carries them, the raw FFmpeg
+    /// error code and the output stream index. `wait()`/`stop()` keep
+    /// returning the original job error exactly as without this callback.
+    ///
+    /// A panic here is contained per callback box and cannot skip the
+    /// `on_delivery_error` dispatch that follows, nor change the settled
+    /// job result — see "Failure and panic" in the [module docs](self).
+    /// Leaving this unregistered (the default) changes no behavior
+    /// anywhere.
+    pub fn on_job_failed<F>(mut self, f: F) -> Self
+    where
+        F: FnMut(&JobFailureSummary) + Send + 'static,
+    {
+        self.on_job_failed = Some(Box::new(f));
+        self
+    }
+
     /// Terminal failure callback. For delivery-path errors (strict-tier
     /// violations, failing callbacks) the same error is also returned by
     /// `wait()`/`stop()`; when the JOB failed elsewhere (after this sink
     /// drained or truncating its delivery), the callback receives a
     /// synthesized [`PacketSinkError::JobFailed`] summarizing that failure
-    /// while the job keeps its original error. Not invoked for cancellation
-    /// or initial configuration failures — see "Failure and panic" in the
-    /// [module docs](self).
+    /// while the job keeps its original error (a registered
+    /// [`on_job_failed`](Self::on_job_failed) observer receives the
+    /// structured summary immediately before this dispatch). Not invoked
+    /// for cancellation or initial configuration failures — see "Failure
+    /// and panic" in the [module docs](self).
     ///
     /// The borrowed error stays in the worker's custody for the whole call
     /// (a panic here cannot run the error source's destructor mid-unwind),
@@ -1132,6 +1224,7 @@ impl PacketSinkBuilder {
                 on_stream_info: self.on_stream_info,
                 on_packet: self.on_packet,
                 on_end: self.on_end,
+                on_job_failed: self.on_job_failed,
                 on_delivery_error: self.on_delivery_error,
             },
             cancellation: None,
@@ -1246,6 +1339,15 @@ pub enum PacketSinkEvent {
     Packet(EncodedPacket),
     /// Terminal success (best-effort; see the enum docs).
     End,
+    /// A structured summary of a job failure recorded OUTSIDE this sink's
+    /// delivery path, queued immediately before the matching
+    /// [`Error`](Self::Error) event carrying
+    /// [`PacketSinkError::JobFailed`]. Emitted only on that synthesis path —
+    /// a delivery-path error produces just the `Error` event. Best-effort
+    /// like [`End`](Self::End), and one notch behind the `Error` event it
+    /// precedes: the summary is dropped rather than ever taking the last
+    /// free slot the terminal `Error` would have used.
+    JobFailure(JobFailureSummary),
     /// A delivery-path error, or [`PacketSinkError::JobFailed`] when the job
     /// failed elsewhere (`wait()` keeps the original error). Best-effort like
     /// [`End`](Self::End).
@@ -1665,11 +1767,12 @@ mod tests {
             }
         }
 
-        let flags: Vec<Arc<AtomicBool>> = (0..3).map(|_| Arc::new(AtomicBool::new(false))).collect();
-        let (b0, b1, b2) = (
+        let flags: Vec<Arc<AtomicBool>> = (0..4).map(|_| Arc::new(AtomicBool::new(false))).collect();
+        let (b0, b1, b2, b3) = (
             DropBomb(flags[0].clone()),
             DropBomb(flags[1].clone()),
             DropBomb(flags[2].clone()),
+            DropBomb(flags[3].clone()),
         );
         let sink = PacketSink::builder(move |_pkt| {
             let _hold = &b0;
@@ -1678,13 +1781,16 @@ mod tests {
         .on_end(move || {
             let _hold = &b1;
         })
-        .on_delivery_error(move |_e| {
+        .on_job_failed(move |_summary| {
             let _hold = &b2;
+        })
+        .on_delivery_error(move |_e| {
+            let _hold = &b3;
         })
         .build();
         assert!(
             sink.dispose_contained(),
-            "three panicking capture destructors must be reported"
+            "four panicking capture destructors must be reported"
         );
         for (i, flag) in flags.iter().enumerate() {
             assert!(
