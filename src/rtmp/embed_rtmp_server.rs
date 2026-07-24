@@ -19,8 +19,9 @@ use rml_rtmp::time::RtmpTimestamp;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::thread::JoinHandle;
 
 #[derive(Clone)]
 pub struct Initialization;
@@ -50,6 +51,21 @@ pub struct EmbedRtmpServer<S> {
     registrations: Option<Arc<RegistrationHandoff>>,
     /// Producer-side wakeup for the reactor (PERF-3), set in `start()`.
     wake_handle: Option<WakeHandle>,
+    /// Join handles of the two server threads (worker, accept), pushed by
+    /// `start()` and shared by every clone of the family. `stop()` drains
+    /// this registry and joins them — its settlement barrier — holding the
+    /// lock across the joins so a racing `stop()` on a clone blocks on the
+    /// lock and also returns only after teardown finished. The joined
+    /// threads never touch this registry (they receive only the status,
+    /// the handoff and the connection channel), so holding the lock while
+    /// joining cannot deadlock against them.
+    threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    /// Set (before the terminal funnel runs) by every deliberate stop —
+    /// `stop()`, a handle/guard drop — and left `false` by the fatal paths
+    /// (a contained reactor panic, the worker dying). In-process publisher
+    /// write callbacks read it when their feed send fails, to report a
+    /// deliberate server stop calmly instead of as an opaque send error.
+    stopped_deliberately: Arc<AtomicBool>,
     gop_limit: usize,
     max_connections: Option<usize>,
     state: PhantomData<S>,
@@ -74,6 +90,40 @@ const STATUS_END: usize = 2;
 fn close_intake_and_publish_end(registrations: &RegistrationHandoff, status: &AtomicUsize) {
     registrations.close();
     status.store(STATUS_END, Ordering::Release);
+}
+
+/// `stop()`'s settlement barrier: drain the family's thread registry and
+/// join every server thread, holding the lock across the joins so racing
+/// `stop()` calls on clones serialize behind it and each returns only once
+/// teardown finished. The caller must have signaled the stop first, or the
+/// joins would wait on threads with no reason to exit.
+///
+/// Riding over poisoning is safe here: the registry is a plain list with no
+/// cross-statement invariant, and a caller panicking mid-settlement must not
+/// leave later stops unable to join at all.
+///
+/// A registered thread calling this would self-join and deadlock, so any
+/// handle owned by the calling thread is skipped (dropped, detaching the
+/// thread) instead of joined. No in-tree path runs `stop()` on a server
+/// thread — the reactor and accept loops never execute user code — so the
+/// guard is a backstop, not a supported pattern.
+fn settle_server_threads(threads: &Mutex<Vec<JoinHandle<()>>>) {
+    let mut registry = threads.lock().unwrap_or_else(PoisonError::into_inner);
+    let current = std::thread::current().id();
+    for handle in registry.drain(..) {
+        if handle.thread().id() == current {
+            warn!("stop() called from a server thread; skipping the self-join");
+            continue;
+        }
+        let name = handle.thread().name().unwrap_or("rtmp-server").to_string();
+        if handle.join().is_err() {
+            // The thread died to an uncontained panic (e.g. a user-installed
+            // logger panicking outside the reactor's unwind boundary). It is
+            // just as terminated — the barrier holds — so report rather than
+            // rethrow the payload out of stop().
+            error!("Thread[{name}] terminated by an uncontained panic");
+        }
+    }
 }
 
 /// Unwind backstop for `start()`'s window between the lifecycle claim (the
@@ -118,6 +168,8 @@ impl<S: 'static> EmbedRtmpServer<S> {
             stream_keys: self.stream_keys,
             registrations: self.registrations,
             wake_handle: self.wake_handle,
+            threads: self.threads,
+            stopped_deliberately: self.stopped_deliberately,
             gop_limit: self.gop_limit,
             max_connections: self.max_connections,
             state: Default::default(),
@@ -130,7 +182,10 @@ impl<S: 'static> EmbedRtmpServer<S> {
     ///
     /// Note this reports the *signal*, not thread teardown: the worker threads
     /// observe the flag and exit shortly after (the reactor on its next
-    /// wakeup, the accept thread within its ~100ms accept cycle).
+    /// wakeup, the accept thread within its ~100ms accept cycle). The one
+    /// place both coincide is [`stop`](EmbedRtmpServer<Running>::stop), which
+    /// joins the server threads before returning — after a `stop()` call has
+    /// returned, teardown is complete as well.
     ///
     /// # Returns
     ///
@@ -155,6 +210,15 @@ impl<S: 'static> EmbedRtmpServer<S> {
     /// for types with a `Drop` impl (E0509). Shared owners that only hold a
     /// reference (e.g. [`StreamHandle`]) stop the server through this instead.
     fn signal_stop(&self) {
+        // Record the deliberate stop BEFORE the funnel: the funnel's
+        // release-store of `STATUS_END` orders this store ahead of any
+        // acquire-load of the status, and the reactor's teardown (which is
+        // what makes publisher feed sends start failing) happens after it
+        // observed that status — so a write callback that sees its send fail
+        // because of this stop also sees the flag. The fatal paths (worker
+        // death, contained reactor panic) never set it: a send failing under
+        // a `false` flag keeps its loud error classification.
+        self.stopped_deliberately.store(true, Ordering::Release);
         // Close-then-publish through the shared funnel (see
         // `close_intake_and_publish_end` for the ordering argument).
         // Registrations already queued keep their owners — the reactor's
@@ -222,6 +286,8 @@ impl EmbedRtmpServer<Initialization> {
             stream_keys: Default::default(),
             registrations: None,
             wake_handle: None,
+            threads: Default::default(),
+            stopped_deliberately: Default::default(),
             gop_limit,
             max_connections: None,
             state: Default::default(),
@@ -376,20 +442,31 @@ impl EmbedRtmpServer<Initialization> {
                     waker,
                 )
             });
-        if let Err(e) = result {
-            // Nothing has spawned yet: no worker observes STATUS_RUN, and the
-            // listener is still owned here (moved into the io closure only
-            // below), so it drops on return and releases the port. The
-            // family's one start has been consumed by the gate above,
-            // though, so the status must not stay at STATUS_RUN — every
-            // clone would report a running server forever. Publish the
-            // terminal state BEFORE logging, intake closed first as on
-            // every terminal path: `error!` can run a user-installed
-            // logger that itself panics, and that unwind must not skip
-            // the publication.
-            self.signal_stop();
-            error!("Thread[rtmp-server-worker] exited with error: {e}");
-            return Err(crate::error::Error::RtmpThreadExited);
+        match result {
+            // The worker's handle joins the family registry: it is what
+            // stop()'s settlement barrier joins. Registered before the
+            // accept thread spawns, so no exit below can leave a running
+            // thread the registry does not know about.
+            Ok(handle) => self
+                .threads
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(handle),
+            Err(e) => {
+                // Nothing has spawned yet: no worker observes STATUS_RUN, and the
+                // listener is still owned here (moved into the io closure only
+                // below), so it drops on return and releases the port. The
+                // family's one start has been consumed by the gate above,
+                // though, so the status must not stay at STATUS_RUN — every
+                // clone would report a running server forever. Publish the
+                // terminal state BEFORE logging, intake closed first as on
+                // every terminal path: `error!` can run a user-installed
+                // logger that itself panics, and that unwind must not skip
+                // the publication.
+                self.signal_stop();
+                error!("Thread[rtmp-server-worker] exited with error: {e}");
+                return Err(crate::error::Error::RtmpThreadExited);
+            }
         }
 
         info!(
@@ -459,17 +536,24 @@ impl EmbedRtmpServer<Initialization> {
                     }
                 }
             });
-        if let Err(e) = result {
-            // The worker thread spawned successfully above and is now polling
-            // `status` (still STATUS_RUN); without this it would run forever.
-            // Signal STATUS_END (and wake the reactor) so it exits, and do it
-            // BEFORE logging: `error!` can run a user-installed logger that
-            // itself panics, and that unwind must not strand the already
-            // running worker. The listener was moved into the failed io
-            // closure and drops with it, releasing the port.
-            self.signal_stop();
-            error!("Thread[rtmp-server-io] exited with error: {e}");
-            return Err(crate::error::Error::RtmpThreadExited);
+        match result {
+            Ok(handle) => self
+                .threads
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(handle),
+            Err(e) => {
+                // The worker thread spawned successfully above and is now polling
+                // `status` (still STATUS_RUN); without this it would run forever.
+                // Signal STATUS_END (and wake the reactor) so it exits, and do it
+                // BEFORE logging: `error!` can run a user-installed logger that
+                // itself panics, and that unwind must not strand the already
+                // running worker. The listener was moved into the failed io
+                // closure and drops with it, releasing the port.
+                self.signal_stop();
+                error!("Thread[rtmp-server-io] exited with error: {e}");
+                return Err(crate::error::Error::RtmpThreadExited);
+            }
         }
 
         // Handoff complete: the accept thread owns the listener, and every
@@ -612,6 +696,19 @@ impl EmbedRtmpServer<Running> {
 
         let mut flv_buffer = FlvBuffer::new();
         let mut serializer = ChunkSerializer::new();
+        // A feed send fails only once the receiver died. Under a deliberate
+        // stop that is the expected end of this publisher — classify it as
+        // such instead of logging the send error a genuine failure gets.
+        // The callback must still fail the write (the FFmpeg job has to
+        // end), so the classification changes the reporting, not the flow.
+        let stopped_deliberately = self.stopped_deliberately.clone();
+        let classify_feed_send_failure = move |what: &str, e: &dyn std::fmt::Debug| {
+            if stopped_deliberately.load(Ordering::Acquire) {
+                info!("The rtmp server was deliberately stopped; ending the in-process publisher (failing its {what} write)");
+            } else {
+                error!("Failed to send in-process {what}: {e:?}");
+            }
+        };
         let write_callback: Box<dyn FnMut(&[u8]) -> i32 + Send> =
             Box::new(move |buf: &[u8]| -> i32 {
                 flv_buffer.write_data(buf);
@@ -636,7 +733,7 @@ impl EmbedRtmpServer<Running> {
                             data: flv_tag.data,
                         };
                         if let Err(e) = feed_sender.send(feed) {
-                            error!("Failed to send in-process media tag: {:?}", e);
+                            classify_feed_send_failure("media tag", &e);
                             return -1;
                         }
                         // PERF-3: wake the reactor for each bypassed media tag, the
@@ -655,7 +752,7 @@ impl EmbedRtmpServer<Running> {
                     match serializer.serialize(&flv_tag_to_message_payload(flv_tag), false, true) {
                         Ok(packet) => {
                             if let Err(e) = feed_sender.send(PublisherFeed::Raw(packet.bytes)) {
-                                error!("Failed to send RTMP packet: {:?}", e);
+                                classify_feed_send_failure("RTMP packet", &e);
                                 return -1;
                             }
                             // Wake the reactor for each enqueued packet. Unconditional
@@ -842,9 +939,24 @@ impl EmbedRtmpServer<Running> {
         }
     }
 
-    /// Stops the RTMP server by signaling the listening and connection-handling threads
-    /// to terminate. Once called, new incoming connections will be ignored, and existing
-    /// threads will exit gracefully.
+    /// Stops the RTMP server: signals the listening and connection-handling
+    /// threads to terminate, then joins them, so this returns only once
+    /// teardown has settled — the listener socket is released, every
+    /// connection is closed, and every publisher is torn down with its
+    /// stream key freed. A caller can rebind the address or reuse a stream
+    /// key immediately after this returns, without polling.
+    ///
+    /// Blocking is bounded: the reactor exits on its next wakeup and drains
+    /// still-queued tails for at most its graceful-shutdown window (a few
+    /// seconds, and only when a peer stopped reading); the accept thread
+    /// notices within its ~100ms accept cycle. Concurrent stops on clones
+    /// serialize behind one settlement and each returns only after it.
+    ///
+    /// An FFmpeg job still pushing to this server (via
+    /// [`create_rtmp_input`](Self::create_rtmp_input)) loses its feed and
+    /// fails its next write; the server reports that calmly as a deliberate
+    /// stop rather than as an opaque send error. Stop such jobs first if
+    /// their clean completion matters.
     ///
     /// # Example
     /// ```rust,ignore
@@ -855,6 +967,7 @@ impl EmbedRtmpServer<Running> {
     /// ```
     pub fn stop(self) -> EmbedRtmpServer<Ended> {
         self.signal_stop();
+        settle_server_threads(&self.threads);
         self.into_state()
     }
 }
@@ -1786,6 +1899,131 @@ mod tests {
         assert!(wait_for_port_release(addr));
     }
 
+    // R-A2: stop() is a settlement barrier, not just a signal. When it
+    // returns, both server threads must have exited: the listener is
+    // released (a bind succeeds on the FIRST attempt, no retry loop) and
+    // every in-process publisher torn down with its key claim freed (no
+    // polling for the reactor to "get around to it").
+    #[test]
+    fn stop_settles_the_server_threads_before_returning() {
+        let server = EmbedRtmpServer::new("127.0.0.1:0").start().expect("start");
+        let addr = server.local_addr().expect("bound address");
+        let observer = server.clone();
+
+        // A live in-process publisher whose claim only the worker's teardown
+        // can release. Kept alive across stop(): the release must come from
+        // the joined reactor, not from this Output dropping.
+        let _live = server
+            .create_rtmp_input("app", "settlement-key")
+            .expect("create while running must succeed");
+        assert!(observer.stream_keys.contains("settlement-key"));
+
+        let ended = server.stop();
+        assert!(ended.is_stopped());
+
+        // No wait_for_port_release here — that helper exists for signal-only
+        // paths. A settled stop has already torn everything down.
+        assert!(
+            !observer.stream_keys.contains("settlement-key"),
+            "stop() must not return before the worker released the key claims"
+        );
+        assert!(
+            std::net::TcpListener::bind(addr).is_ok(),
+            "stop() must not return before the accept thread released the listener"
+        );
+    }
+
+    // The settlement barrier must never self-deadlock. No in-tree path can
+    // run stop() on a server thread (the reactor and accept loops never
+    // execute user code), but settle_server_threads carries a backstop for
+    // that ever becoming false: a thread finding its OWN handle in the
+    // registry must skip it (detaching the thread) instead of joining
+    // itself forever.
+    #[test]
+    fn settlement_skips_a_self_join_instead_of_deadlocking() {
+        let threads: Arc<Mutex<Vec<JoinHandle<()>>>> = Default::default();
+        let (registered_tx, registered_rx) = std::sync::mpsc::channel::<()>();
+        let (settled_tx, settled_rx) = std::sync::mpsc::channel::<()>();
+
+        let thread_registry = threads.clone();
+        let handle = std::thread::Builder::new()
+            .name("self-join-probe".to_string())
+            .spawn(move || {
+                // Hold until the spawner has registered this thread's own
+                // handle, then run the settlement from inside that thread.
+                registered_rx
+                    .recv()
+                    .expect("the registration signal must arrive");
+                settle_server_threads(&thread_registry);
+                settled_tx
+                    .send(())
+                    .expect("report that the settlement returned");
+            })
+            .expect("spawn the probe thread");
+
+        threads.lock().unwrap().push(handle);
+        registered_tx.send(()).expect("signal the registration");
+
+        // Deadline-bounded receive, not synchronization: with the guard the
+        // settlement returns at once; a self-join would hang forever and
+        // only this bound turns that hang into a test failure.
+        settled_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("settlement run from a registered thread must skip the self-join and return");
+    }
+
+    // The deliberate-stop state drives the publisher write callbacks'
+    // failure classification: every user-initiated stop funnels through
+    // signal_stop and must publish it, while the fatal paths (worker death,
+    // contained reactor panic) run the bare terminal funnel and must not —
+    // a crash keeps its loud error classification.
+    #[test]
+    fn only_deliberate_stops_publish_the_deliberate_state() {
+        let server = EmbedRtmpServer::<Running> {
+            address: String::new(),
+            bound_addr: None,
+            status: Arc::new(AtomicUsize::new(STATUS_RUN)),
+            stream_keys: Default::default(),
+            registrations: Some(Arc::new(RegistrationHandoff::new())),
+            wake_handle: None,
+            threads: Default::default(),
+            stopped_deliberately: Default::default(),
+            gop_limit: 1,
+            max_connections: None,
+            state: PhantomData,
+        };
+        assert!(!server.stopped_deliberately.load(Ordering::Acquire));
+        server.signal_stop();
+        assert!(server.is_stopped());
+        assert!(
+            server.stopped_deliberately.load(Ordering::Acquire),
+            "signal_stop must record the stop as deliberate"
+        );
+
+        // The fatal shape on a fresh family: the bare funnel, exactly as the
+        // panic containment and the worker's own fatal paths run it.
+        let crashed = EmbedRtmpServer::<Running> {
+            address: String::new(),
+            bound_addr: None,
+            status: Arc::new(AtomicUsize::new(STATUS_RUN)),
+            stream_keys: Default::default(),
+            registrations: Some(Arc::new(RegistrationHandoff::new())),
+            wake_handle: None,
+            threads: Default::default(),
+            stopped_deliberately: Default::default(),
+            gop_limit: 1,
+            max_connections: None,
+            state: PhantomData,
+        };
+        let registrations = crashed.registrations.clone().expect("handoff installed");
+        close_intake_and_publish_end(&registrations, &crashed.status);
+        assert!(crashed.is_stopped());
+        assert!(
+            !crashed.stopped_deliberately.load(Ordering::Acquire),
+            "a fatal terminal transition must not claim the stop was deliberate"
+        );
+    }
+
     // signal_stop must close the registration intake in the same breath as
     // publishing the stopped status. Without that, a server clone could
     // observe is_stopped() == true, still enqueue a registration, and be
@@ -1802,6 +2040,8 @@ mod tests {
             stream_keys: Default::default(),
             registrations: Some(Arc::new(RegistrationHandoff::new())),
             wake_handle: None,
+            threads: Default::default(),
+            stopped_deliberately: Default::default(),
             gop_limit: 1,
             max_connections: None,
             state: PhantomData,
@@ -1845,6 +2085,8 @@ mod tests {
             stream_keys: Default::default(),
             registrations: Some(registrations.clone()),
             wake_handle: None,
+            threads: Default::default(),
+            stopped_deliberately: Default::default(),
             gop_limit: 1,
             max_connections: None,
             state: PhantomData,
@@ -1996,6 +2238,8 @@ mod tests {
             stream_keys: Default::default(),
             registrations: Some(registrations.clone()),
             wake_handle: None,
+            threads: Default::default(),
+            stopped_deliberately: Default::default(),
             gop_limit: 1,
             max_connections: None,
             state: PhantomData,
@@ -2095,6 +2339,8 @@ mod tests {
             stream_keys: family.stream_keys.clone(),
             registrations: None,
             wake_handle: None,
+            threads: Default::default(),
+            stopped_deliberately: Default::default(),
             gop_limit: 1,
             max_connections: None,
             state: PhantomData,
