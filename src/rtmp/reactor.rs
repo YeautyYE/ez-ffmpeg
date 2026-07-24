@@ -12,7 +12,7 @@ use crate::rtmp::poller::{Interest, Poller, RawHandle, Waker, WAKER_TOKEN};
 use crate::rtmp::rtmp_scheduler::{RtmpScheduler, ServerResult};
 use crate::rtmp::write_queue::{BackpressureLevel, FlushResult, WriteQueue};
 use bytes::Bytes;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use rml_rtmp::chunk_io::ChunkSerializer;
 use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
 use rml_rtmp::messages::RtmpMessage;
@@ -32,6 +32,18 @@ use std::time::{Duration, Instant};
 const READ_BUFFER_SIZE: usize = 8192;
 const POLL_TIMEOUT_MS: u64 = 100;
 const CONNECTION_TIMEOUT_SECS: u64 = 60; // Connection timeout
+/// Idle time after which an Active watcher is sent a liveness ping (RTMP
+/// User Control PingRequest) by the timeout sweep. Half the connection
+/// timeout, so a quiet-but-live watcher — typically one on a channel whose
+/// publisher has not started — is probed well before the reaper fires and
+/// its ANSWER (any bytes read from the peer) refreshes the activity clock.
+/// The ping's own write deliberately earns no activity credit (see
+/// `ReactorConnection::note_ping_queued`): a peer that never answers ages
+/// toward the timeout exactly as if the server had sent nothing, so the
+/// probe can only save clients that prove they are alive. Only watchers are
+/// pinged (see `RtmpScheduler::ping_watcher`); an idle publisher still
+/// times out and releases its stream key.
+const WATCHER_PING_IDLE_SECS: u64 = CONNECTION_TIMEOUT_SECS / 2;
 /// Minimum interval between full connection-timeout sweeps (PERF-10 throttle).
 /// A 60s timeout tolerates being detected up to this much late.
 const TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
@@ -261,6 +273,12 @@ pub struct ReactorConnection {
     /// is force-removed once this deadline passes even if the peer never reads,
     /// so lingering is bounded (see [`Self::condemn`]).
     close_deadline: Option<Instant>,
+    /// When the timeout sweep last queued a liveness ping on this connection
+    /// (`None` until the first one). Bounds the probe rate: without this
+    /// stamp every ~1s sweep would queue another ping — onto a queue that
+    /// may not be draining — while the connection stays idle awaiting the
+    /// peer's answer.
+    last_ping_at: Option<Instant>,
 }
 
 impl ReactorConnection {
@@ -311,6 +329,7 @@ impl ReactorConnection {
             last_write_activity: now,
             current_interest: Interest::READABLE,
             close_deadline: None,
+            last_ping_at: None,
         })
     }
 
@@ -339,6 +358,45 @@ impl ReactorConnection {
         now.saturating_duration_since(self.last_activity()) > timeout
     }
 
+    /// Whether the timeout sweep should queue a liveness ping at `now`: the
+    /// connection is established (`Active` — a mid-handshake session cannot
+    /// carry control messages yet, and closing/slow ones are being written
+    /// to or torn down already), not condemned, idle for at least `idle`,
+    /// and not already pinged within that same window (see `last_ping_at`).
+    /// Hoisted-`now` shape like `is_timed_out_at` (PERF-10), which also
+    /// keeps the predicate deterministic under test.
+    pub fn is_ping_due_at(&self, now: Instant, idle: Duration) -> bool {
+        if self.state != ConnectionState::Active || self.close_deadline.is_some() {
+            return false;
+        }
+        // A queued tail suppresses the probe: its own delivery or failure
+        // will resolve the peer's liveness, so a ping adds nothing there.
+        // (Attribution correctness does NOT hinge on this gate — ping
+        // entries are tagged in the write queue and their bytes reported
+        // separately by every flush, whatever sits around them.)
+        if self.has_pending_writes() {
+            return false;
+        }
+        if now.saturating_duration_since(self.last_activity()) < idle {
+            return false;
+        }
+        match self.last_ping_at {
+            Some(pinged_at) => now.saturating_duration_since(pinged_at) >= idle,
+            None => true,
+        }
+    }
+
+    /// Record that a liveness ping was queued at `now`. Deliberately not an
+    /// activity stamp — and the queue's ping-tagged entries keep the ping's
+    /// eventual delivery out of `try_flush`'s write-activity credit — so
+    /// neither queueing nor even DELIVERING a ping counts as peer liveness.
+    /// Only the peer's answer (a read) resets the idle clock; a peer that
+    /// never answers ages toward the timeout exactly as if the server had
+    /// sent nothing.
+    pub fn note_ping_queued(&mut self, now: Instant) {
+        self.last_ping_at = Some(now);
+    }
+
     /// Enqueue data
     pub fn enqueue_data(
         &mut self,
@@ -346,10 +404,11 @@ impl ReactorConnection {
         is_keyframe: bool,
         is_sequence_header: bool,
         is_video: bool,
+        droppable: bool,
     ) -> bool {
         let result = self
             .write_queue
-            .enqueue(data, is_keyframe, is_sequence_header, is_video);
+            .enqueue(data, is_keyframe, is_sequence_header, is_video, droppable);
 
         // Update state based on backpressure level
         match self.write_queue.backpressure_level() {
@@ -377,7 +436,7 @@ impl ReactorConnection {
     pub fn enqueue_raw(&mut self, data: Vec<u8>) -> bool {
         if !self
             .write_queue
-            .enqueue(Bytes::from(data), false, false, false)
+            .enqueue(Bytes::from(data), false, false, false, false)
         {
             self.state = ConnectionState::Closing;
             return false;
@@ -385,25 +444,71 @@ impl ReactorConnection {
         true
     }
 
+    /// Enqueue a liveness ping. Tagged in the write queue so every flush
+    /// reports the ping's bytes separately (typed accounting: a delivered
+    /// ping earns no write-activity credit), and pinned as non-droppable —
+    /// the session serializer already committed csid-2 header history for
+    /// it, so the shedding policy and the age-eviction sweep never remove
+    /// it (see WriteEntry::droppable in write_queue). Returns false if the
+    /// queue refused it (critical cap; the connection is then closing
+    /// anyway).
+    pub fn enqueue_ping(&mut self, data: Vec<u8>) -> bool {
+        if !self.write_queue.enqueue_ping(Bytes::from(data)) {
+            self.state = ConnectionState::Closing;
+            return false;
+        }
+        true
+    }
+
+    /// Restore `Active` once a slow client's backlog is back in the Normal
+    /// band. `enqueue_data` applies the same rule when new data arrives, but
+    /// a watcher whose publisher went quiet gets no further enqueues:
+    /// without this flush-side twin of that rule it would stay `SlowClient`
+    /// forever after draining — permanently invisible to the idle-watcher
+    /// ping, and eventually reaped as idle despite being healthy and fully
+    /// caught up.
+    fn recover_from_slow_client(&mut self) {
+        if self.state == ConnectionState::SlowClient
+            && self.write_queue.backpressure_level() == BackpressureLevel::Normal
+        {
+            self.state = ConnectionState::Active;
+        }
+    }
+
     /// Try to flush write queue (drain until WouldBlock)
     ///
     /// Returns whether connection should be disconnected
     pub fn try_flush(&mut self) -> io::Result<bool> {
         if self.write_queue.is_empty() {
+            // An empty queue also means no backpressure: repair a stale
+            // SlowClient before returning (see recover_from_slow_client).
+            self.recover_from_slow_client();
             return Ok(false);
         }
 
         match self.write_queue.try_flush(&mut self.socket) {
-            Ok(FlushResult::Complete { bytes_written }) => {
-                if bytes_written > 0 {
+            Ok(FlushResult::Complete {
+                bytes_written,
+                ping_bytes_written,
+            }) => {
+                // Only bytes beyond the ping-tagged ones earn the activity
+                // stamp: a ping's own delivery is not peer liveness.
+                if bytes_written > ping_bytes_written {
                     self.last_write_activity = Instant::now();
                 }
+                self.recover_from_slow_client();
                 Ok(false)
             }
-            Ok(FlushResult::WouldBlock { bytes_written }) => {
-                if bytes_written > 0 {
+            Ok(FlushResult::WouldBlock {
+                bytes_written,
+                ping_bytes_written,
+            }) => {
+                if bytes_written > ping_bytes_written {
                     self.last_write_activity = Instant::now();
                 }
+                // A partial drain can still have dropped the backlog back
+                // into the Normal band.
+                self.recover_from_slow_client();
                 Ok(false)
             }
             Ok(FlushResult::Closed) => Ok(true),
@@ -856,10 +961,15 @@ pub struct PublisherState {
     pub source: PublisherSource,
 }
 
+/// One fanout packet bound for a connection's write queue: (target
+/// connection id, serialized bytes, is_keyframe, is_sequence_header,
+/// is_video, droppable — rml's `Packet::can_be_dropped`).
+type OutboundWrite = (usize, Vec<u8>, bool, bool, bool, bool);
+
 /// Route a batch of [`ServerResult`]s into the reactor's write / close buffers.
 fn collect_server_results(
     server_results: Vec<ServerResult>,
-    packets_to_write: &mut Vec<(usize, Vec<u8>, bool, bool, bool)>,
+    packets_to_write: &mut Vec<OutboundWrite>,
     ids_to_close: &mut Vec<usize>,
 ) {
     for result in server_results {
@@ -877,6 +987,7 @@ fn collect_server_results(
                     is_keyframe,
                     is_sequence_header,
                     is_video,
+                    packet.can_be_dropped,
                 ));
             }
             ServerResult::DisconnectConnection {
@@ -932,7 +1043,7 @@ pub struct Reactor {
     /// `write_pending_packets` pass (avoids a Vec allocation per fanout)
     conn_ids_buffer: Vec<usize>,
     /// Reusable buffer for packets to write (avoids allocation in handle_readable)
-    packets_buffer: Vec<(usize, Vec<u8>, bool, bool, bool)>,
+    packets_buffer: Vec<OutboundWrite>,
     /// Reusable buffer for IDs to close (avoids allocation in handle_readable)
     ids_to_close_buffer: Vec<usize>,
     /// Reusable buffer for handle results (avoids allocation in handle_readable)
@@ -1365,6 +1476,7 @@ impl Reactor {
                                 is_keyframe,
                                 is_sequence_header,
                                 is_video,
+                                packet.can_be_dropped,
                             ));
                         }
                         ServerResult::DisconnectConnection {
@@ -1394,7 +1506,7 @@ impl Reactor {
         // (clear + reuse the scratch buffer; this runs per fanout round).
         self.conn_ids_buffer.clear();
 
-        for (target_id, data, is_keyframe, is_sequence_header, is_video) in
+        for (target_id, data, is_keyframe, is_sequence_header, is_video, droppable) in
             self.packets_buffer.drain(..)
         {
             if let Some(target_conn) = self.connections.get_mut(target_id) {
@@ -1413,6 +1525,7 @@ impl Reactor {
                     is_keyframe,
                     is_sequence_header,
                     is_video,
+                    droppable,
                 );
                 if enqueued {
                     self.conn_ids_buffer.push(target_id);
@@ -1464,7 +1577,7 @@ impl Reactor {
         &mut self,
         pub_id: usize,
         bytes: Vec<u8>,
-        packets_to_write: &mut Vec<(usize, Vec<u8>, bool, bool, bool)>,
+        packets_to_write: &mut Vec<OutboundWrite>,
         ids_to_close: &mut Vec<usize>,
     ) -> bool {
         match self.scheduler.publish_bytes_received(pub_id, bytes) {
@@ -1473,7 +1586,17 @@ impl Reactor {
                 true
             }
             Err(e) => {
-                debug!("Publisher {} scheduler error: {}", pub_id, e);
+                // This error is fatal for the publisher — the caller removes
+                // it and its feed sender starts failing. Report it loudly at
+                // THIS moment of truth: the write callback's later failure
+                // classification is about the SERVER lifecycle (a deliberate
+                // stop may land in between), and must not be the only
+                // visible record of a feed that actually died right here,
+                // for its own protocol error.
+                warn!(
+                    "Publisher {} rejected with a fatal session error and will be removed: {}",
+                    pub_id, e
+                );
                 false
             }
         }
@@ -1658,7 +1781,7 @@ impl Reactor {
     fn send_delete_stream(
         &mut self,
         pub_id: usize,
-        packets: &mut Vec<(usize, Vec<u8>, bool, bool, bool)>,
+        packets: &mut Vec<OutboundWrite>,
         ids_to_close: &mut Vec<usize>,
     ) {
         let mut arguments = Vec::new();
@@ -1691,6 +1814,7 @@ impl Reactor {
                                         is_keyframe,
                                         is_sequence_header,
                                         is_video,
+                                        packet.can_be_dropped,
                                     ));
                                 }
                                 ServerResult::DisconnectConnection {
@@ -1762,12 +1886,15 @@ impl Reactor {
         ids_to_close
     }
 
-    /// Check timed out connections
+    /// Check timed out connections, and queue liveness pings for idle
+    /// watchers that would otherwise coast into that timeout.
     ///
     /// PERF-10: a 60s idle timeout does not need re-evaluating on every poll
     /// wakeup (the loop can wake thousands of times per second under load or
     /// ~10x/sec idle). Throttle the full slab scan to at most ~1/sec and read
-    /// the clock once per sweep instead of once per connection.
+    /// the clock once per sweep instead of once per connection. The watcher
+    /// ping clock shares this sweep — second-level granularity is just as
+    /// harmless against its 30s threshold.
     fn check_timeouts(&mut self) -> Vec<usize> {
         let now = Instant::now();
         if now.saturating_duration_since(self.last_timeout_check) < TIMEOUT_CHECK_INTERVAL {
@@ -1776,7 +1903,11 @@ impl Reactor {
         self.last_timeout_check = now;
 
         let timeout = Duration::from_secs(CONNECTION_TIMEOUT_SECS);
+        let ping_idle = Duration::from_secs(WATCHER_PING_IDLE_SECS);
         let mut timed_out = Vec::new();
+        // Ids due a liveness probe this sweep, resolved to watchers below,
+        // after the iteration borrow ends.
+        let mut ping_due = Vec::new();
 
         for (id, conn) in self.connections.iter() {
             if conn.is_timed_out_at(now, timeout) {
@@ -1787,6 +1918,38 @@ impl Reactor {
                 // remove it once the bounded drain window elapses. The ~1/sec
                 // sweep granularity is fine given the multi-second deadline.
                 debug!("Connection {} close-drain deadline expired", id);
+                timed_out.push(id);
+            } else if conn.is_ping_due_at(now, ping_idle) {
+                ping_due.push(id);
+            }
+        }
+
+        // Probe idle watchers instead of letting them idle into the reaper:
+        // a watcher on a channel with no publisher is written nothing and
+        // has nothing left to say, so only the peer's ANSWER to a
+        // server-side ping can keep the activity clock honest about it
+        // being alive — the ping's own delivery earns no credit (see
+        // note_ping_queued). The scheduler decides who is a watcher — it
+        // owns both the role classification and the per-session serializer
+        // a control message must run through; every other idle role falls
+        // through and, if it stays idle, times out above. The queued ping
+        // rides the normal flush machinery on the next loop turn.
+        for id in ping_due {
+            let Some(packet) = self.scheduler.ping_watcher(id) else {
+                continue;
+            };
+            let Some(conn) = self.connections.get_mut(id) else {
+                continue;
+            };
+            if conn.enqueue_ping(packet.bytes) {
+                debug!("Connection {} idle for {WATCHER_PING_IDLE_SECS}s; ping queued", id);
+                conn.note_ping_queued(now);
+                self.pending_flush.insert(id);
+                self.interest_dirty.insert(id);
+            } else {
+                // enqueue_ping refused (queue at cap) and marked the
+                // connection Closing; route it to the same close path every
+                // other refused enqueue takes.
                 timed_out.push(id);
             }
         }
@@ -2156,7 +2319,7 @@ mod tests {
 
         // Enqueue some test data
         let test_data = b"Hello, World!";
-        conn.enqueue_data(Bytes::from_static(test_data), false, false, false);
+        conn.enqueue_data(Bytes::from_static(test_data), false, false, false, true);
 
         assert!(conn.has_pending_writes());
 
@@ -2295,6 +2458,470 @@ mod tests {
         assert!(
             reactor.check_timeouts().is_empty(),
             "the sweep must restamp the throttle and skip an immediate re-run"
+        );
+
+        reactor.remove_connection(token.id);
+    }
+
+    // The ping predicate in isolation, on synthetic clocks: it must gate on
+    // connection state, on the idle threshold, and on the window since the
+    // previous queued ping (an undeliverable ping must not be re-queued
+    // every sweep, nor may it masquerade as activity).
+    #[test]
+    fn ping_due_predicate_gates_on_state_idle_and_prior_ping() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to get address");
+        let _client = TcpStream::connect(addr).expect("Failed to connect");
+        let (server, _) = listener.accept().expect("Failed to accept");
+        let mut conn = ReactorConnection::new(ConnectionToken::new(0, 1), server)
+            .expect("Failed to create connection");
+
+        let idle = Duration::from_secs(WATCHER_PING_IDLE_SECS);
+        let base = conn.last_activity();
+
+        // Mid-handshake connections are never probed, however idle.
+        assert!(!conn.is_ping_due_at(base + idle, idle));
+
+        conn.state = ConnectionState::Active;
+        // Below the idle threshold nothing is due; from it on, a ping is.
+        assert!(!conn.is_ping_due_at(base, idle));
+        assert!(!conn.is_ping_due_at(base + idle - Duration::from_millis(1), idle));
+        assert!(conn.is_ping_due_at(base + idle, idle));
+
+        // A queued ping opens a fresh window of the same length, without
+        // touching the activity clock (is_timed_out_at still sees `base`).
+        conn.note_ping_queued(base + idle);
+        assert!(!conn.is_ping_due_at(base + idle, idle));
+        assert!(!conn.is_ping_due_at(base + idle * 2 - Duration::from_millis(1), idle));
+        assert!(conn.is_ping_due_at(base + idle * 2, idle));
+        assert!(conn.is_timed_out_at(
+            base + Duration::from_secs(CONNECTION_TIMEOUT_SECS) + Duration::from_millis(1),
+            Duration::from_secs(CONNECTION_TIMEOUT_SECS)
+        ));
+
+        // A condemned connection is on its way out: never probed.
+        conn.condemn(base + idle * 3);
+        assert!(!conn.is_ping_due_at(base + idle * 2, idle));
+    }
+
+    // A slow client that has fully caught up must become Active again even
+    // when no further fanout enqueue arrives (its publisher went quiet):
+    // enqueue_data's Normal-band recovery never runs then, and a connection
+    // stuck in SlowClient is invisible to the idle-watcher ping — the 60s
+    // reaper would kill a healthy, fully-drained watcher.
+    #[test]
+    fn drained_slow_client_recovers_active_state_on_flush() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to get address");
+        let _client = TcpStream::connect(addr).expect("Failed to connect");
+        let (server, _) = listener.accept().expect("Failed to accept");
+        let mut conn = ReactorConnection::new(ConnectionToken::new(0, 1), server)
+            .expect("Failed to create connection");
+
+        // Already-drained shape: the queue emptied on an earlier flush and
+        // nothing was enqueued since. The next flush attempt alone must
+        // repair the state.
+        conn.state = ConnectionState::SlowClient;
+        assert!(!conn.has_pending_writes());
+        conn.try_flush().expect("flush on an empty queue");
+        assert_eq!(
+            conn.state,
+            ConnectionState::Active,
+            "an empty queue means no backpressure; the state must recover"
+        );
+
+        // Draining shape: a queued tail (via enqueue_raw, which performs no
+        // state recovery of its own) is flushed into the socket buffer and
+        // the Normal backlog must flip the state back.
+        conn.state = ConnectionState::SlowClient;
+        assert!(conn.enqueue_raw(vec![0u8; 64]));
+        assert_eq!(
+            conn.state,
+            ConnectionState::SlowClient,
+            "sanity: enqueue_raw must not repair the state by itself"
+        );
+        conn.try_flush().expect("flush the queued tail");
+        assert!(!conn.has_pending_writes(), "64 bytes must flush in one go");
+        assert_eq!(
+            conn.state,
+            ConnectionState::Active,
+            "draining back to the Normal band must restore Active"
+        );
+    }
+
+    // The ping's own delivery must not register as connection activity: a
+    // peer whose TCP stack ACKs bytes but whose application never answers
+    // would otherwise be kept alive forever by the server's own 30s probes,
+    // never reaching the 60s reaper. Only bytes beyond the queued ping
+    // (real media/control) earn the write-activity stamp; the peer proves
+    // liveness by ANSWERING (a read).
+    #[test]
+    fn flushed_ping_bytes_do_not_stamp_write_activity() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to get address");
+        let _client = TcpStream::connect(addr).expect("Failed to connect");
+        let (server, _) = listener.accept().expect("Failed to accept");
+        let mut conn = ReactorConnection::new(ConnectionToken::new(0, 1), server)
+            .expect("Failed to create connection");
+        conn.state = ConnectionState::Active;
+
+        let stale = Instant::now()
+            .checked_sub(Duration::from_secs(CONNECTION_TIMEOUT_SECS + 1))
+            .expect("monotonic clock should be well past 61s after a full build");
+        conn.last_read_activity = stale;
+        conn.last_write_activity = stale;
+        let before = conn.last_activity();
+
+        // Queue a ping the way the sweep does, then flush it into the
+        // socket buffer: the write succeeds, but earns no activity credit.
+        assert!(conn.enqueue_ping(vec![2u8; 18]));
+        conn.note_ping_queued(Instant::now());
+        conn.try_flush().expect("flush the ping");
+        assert!(!conn.has_pending_writes(), "the ping must flush in one go");
+        assert_eq!(
+            conn.last_activity(),
+            before,
+            "a delivered ping must not stamp write activity"
+        );
+
+        // Real (non-ping) bytes still stamp activity exactly as before.
+        assert!(conn.enqueue_raw(vec![3u8; 32]));
+        conn.try_flush().expect("flush the non-ping tail");
+        assert!(
+            conn.last_activity() > before,
+            "non-ping writes must stamp write activity"
+        );
+
+        // Mixed flush, ping plus ordinary data in one write: the entry
+        // tags in the write queue attribute each entry's bytes exactly, so
+        // the ordinary bytes behind the ping must stamp activity while the
+        // ping's own bytes earn nothing.
+        let stale = Instant::now()
+            .checked_sub(Duration::from_secs(CONNECTION_TIMEOUT_SECS + 1))
+            .expect("monotonic clock should be well past 61s after a full build");
+        conn.last_read_activity = stale;
+        conn.last_write_activity = stale;
+        let before = conn.last_activity();
+        assert!(conn.enqueue_ping(vec![2u8; 18]));
+        conn.note_ping_queued(Instant::now());
+        assert!(conn.enqueue_data(Bytes::from(vec![3u8; 32]), false, false, false, true));
+        conn.try_flush().expect("flush the ping plus the tail behind it");
+        assert!(!conn.has_pending_writes(), "both entries must flush");
+        assert!(
+            conn.last_activity() > before,
+            "ordinary bytes flushed behind the ping must stamp activity"
+        );
+    }
+
+    // Pings are only for drained connections: a queued tail's own delivery
+    // or failure already resolves the peer's liveness, so probing it adds
+    // nothing. (Byte attribution does not depend on this gate — ping
+    // entries are tagged in the write queue itself.)
+    #[test]
+    fn ping_is_not_due_while_writes_are_pending() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to get address");
+        let _client = TcpStream::connect(addr).expect("Failed to connect");
+        let (server, _) = listener.accept().expect("Failed to accept");
+        let mut conn = ReactorConnection::new(ConnectionToken::new(0, 1), server)
+            .expect("Failed to create connection");
+        conn.state = ConnectionState::Active;
+
+        let idle = Duration::from_secs(WATCHER_PING_IDLE_SECS);
+        assert!(conn.enqueue_raw(vec![0u8; 8]));
+        assert!(
+            !conn.is_ping_due_at(conn.last_activity() + idle * 3, idle),
+            "a queued tail must suppress the probe however idle the clock looks"
+        );
+
+        conn.try_flush().expect("drain the tail");
+        assert!(!conn.has_pending_writes());
+        // Re-anchor after the flush stamped activity: once drained, the
+        // probe becomes due again past the idle window.
+        let base = conn.last_activity();
+        assert!(conn.is_ping_due_at(base + idle, idle));
+    }
+
+    // End-to-end chain regression at the wire level: a csid-2 control
+    // sequence — acknowledgement, ping, acknowledgement, acknowledgement —
+    // serialized by ONE stateful serializer must survive High-band
+    // shedding and decode against a deserializer that sees exactly the
+    // delivered bytes. Before non-droppable entries bypassed the shedding
+    // policy, the High band silently shed the middle acknowledgement while
+    // the serializer had already committed its csid-2 header history; the
+    // following acknowledgement then header-compressed against a packet
+    // the peer never received and decoding lost RTMP framing. Droppable
+    // video is shed around the chain to prove media drops stay safe (rml
+    // serializes droppable packets drop-tolerantly on their own csid).
+    #[test]
+    fn high_band_control_chain_survives_and_decodes() {
+        use rml_rtmp::chunk_io::ChunkDeserializer;
+        use rml_rtmp::messages::UserControlEventType;
+
+        let ts0 = RtmpTimestamp { value: 0 };
+        let ack_payload = |n: u32| {
+            RtmpMessage::Acknowledgement {
+                sequence_number: n,
+            }
+            .into_message_payload(ts0, 0)
+            .expect("build acknowledgement")
+        };
+        let a0 = ack_payload(1);
+        let ping = RtmpMessage::UserControl {
+            event_type: UserControlEventType::PingRequest,
+            stream_id: None,
+            buffer_length: None,
+            timestamp: Some(RtmpTimestamp { value: 7 }),
+        }
+        .into_message_payload(ts0, 0)
+        .expect("build ping");
+        // Large enough to push the queue into the High band (2MB) once
+        // enqueued, small enough to stay clear of the Critical cap (4MB).
+        let v1 = RtmpMessage::VideoData {
+            data: Bytes::from(vec![0x17u8; 2 * 1024 * 1024 + 64 * 1024]),
+        }
+        .into_message_payload(ts0, 1)
+        .expect("build large video");
+        let a1 = ack_payload(2);
+        let v2 = RtmpMessage::VideoData {
+            data: Bytes::from(vec![0x27u8; 512]),
+        }
+        .into_message_payload(ts0, 1)
+        .expect("build sheddable video");
+        let a2 = ack_payload(3);
+        let v3 = RtmpMessage::VideoData {
+            data: Bytes::from(vec![0x17u8; 256]),
+        }
+        .into_message_payload(ts0, 1)
+        .expect("build trailing video");
+
+        // What the peer must end up decoding, in wire order (v2 is shed).
+        let expected: Vec<(u8, Bytes)> = vec![
+            (3, a0.data.clone()),
+            (4, ping.data.clone()),
+            (9, v1.data.clone()),
+            (3, a1.data.clone()),
+            (3, a2.data.clone()),
+            (9, v3.data.clone()),
+        ];
+
+        // ONE stateful serializer, serialization order == enqueue order —
+        // exactly the session's situation. Control is non-droppable, media
+        // is serialized drop-tolerantly; pin the rml contract the queue
+        // policy relies on.
+        let mut serializer = ChunkSerializer::new();
+        let p_a0 = serializer.serialize(&a0, false, false).expect("ser a0");
+        let p_ping = serializer.serialize(&ping, false, false).expect("ser ping");
+        let p_v1 = serializer.serialize(&v1, false, true).expect("ser v1");
+        let p_a1 = serializer.serialize(&a1, false, false).expect("ser a1");
+        let p_v2 = serializer.serialize(&v2, false, true).expect("ser v2");
+        let p_a2 = serializer.serialize(&a2, false, false).expect("ser a2");
+        let p_v3 = serializer.serialize(&v3, false, true).expect("ser v3");
+        assert!(!p_a1.can_be_dropped, "rml must mark control non-droppable");
+        assert!(p_v1.can_be_dropped, "rml must mark tolerant media droppable");
+
+        let mut queue = WriteQueue::new();
+        let mut wire: Vec<u8> = Vec::new();
+
+        // Normal band: the acknowledgement and the ping go out.
+        assert!(queue.enqueue(
+            Bytes::from(p_a0.bytes),
+            false,
+            false,
+            false,
+            p_a0.can_be_dropped
+        ));
+        assert!(queue.enqueue_ping(Bytes::from(p_ping.bytes)));
+        queue.try_flush(&mut wire).expect("flush the opening pair");
+
+        // The large keyframe pushes the backlog into the High band.
+        assert!(queue.enqueue(
+            Bytes::from(p_v1.bytes),
+            true,
+            false,
+            true,
+            p_v1.can_be_dropped
+        ));
+        assert_eq!(queue.backpressure_level(), BackpressureLevel::High);
+        // The acknowledgement behind it must be RETAINED (the old policy
+        // shed it right here), while a droppable non-keyframe is shed.
+        assert!(queue.enqueue(
+            Bytes::from(p_a1.bytes),
+            false,
+            false,
+            false,
+            p_a1.can_be_dropped
+        ));
+        let before_shed = queue.pending_bytes();
+        assert!(queue.enqueue(
+            Bytes::from(p_v2.bytes),
+            false,
+            false,
+            true,
+            p_v2.can_be_dropped
+        ));
+        assert_eq!(
+            queue.pending_bytes(),
+            before_shed,
+            "the droppable non-keyframe must be shed in the High band"
+        );
+        queue.try_flush(&mut wire).expect("flush the pressured batch");
+        assert!(queue.is_empty(), "the pressured batch must drain fully");
+
+        // Drained again: the trailing control and media go out normally.
+        assert!(queue.enqueue(
+            Bytes::from(p_a2.bytes),
+            false,
+            false,
+            false,
+            p_a2.can_be_dropped
+        ));
+        assert!(queue.enqueue(
+            Bytes::from(p_v3.bytes),
+            true,
+            false,
+            true,
+            p_v3.can_be_dropped
+        ));
+        queue.try_flush(&mut wire).expect("flush the tail");
+
+        // The peer's view: decode the ENTIRE delivered wire with one
+        // deserializer. Every message must come back with its own type and
+        // payload — a mis-compressed csid-2 header would corrupt types,
+        // lengths or framing from the middle acknowledgement onwards.
+        let mut deserializer = ChunkDeserializer::new();
+        let mut decoded: Vec<(u8, Bytes)> = Vec::new();
+        let mut next = deserializer
+            .get_next_message(&wire)
+            .expect("the delivered wire must stay decodable");
+        while let Some(payload) = next {
+            decoded.push((payload.type_id, payload.data));
+            next = deserializer
+                .get_next_message(&[])
+                .expect("valid buffered continuation");
+        }
+        assert_eq!(
+            decoded.len(),
+            expected.len(),
+            "exactly the delivered messages must decode"
+        );
+        for (i, ((got_type, got_data), (want_type, want_data))) in
+            decoded.iter().zip(expected.iter()).enumerate()
+        {
+            assert_eq!(got_type, want_type, "message {i} type");
+            assert_eq!(got_data, want_data, "message {i} payload");
+        }
+    }
+
+    // R-B: a quiet watcher on a channel with no publisher used to be reaped
+    // by the 60s idle sweep — the server never sent anything, the client had
+    // nothing left to say after `play`, and last_activity never moved. The
+    // sweep must instead ping an Active watcher once it sits idle for half
+    // the timeout: a live client's ANSWER to that ping (a read) refreshes
+    // the activity clock, while a peer that never answers — wedged or not —
+    // still hits the full-timeout reaper below.
+    #[test]
+    fn sweep_pings_an_idle_watcher_instead_of_only_reaping_it() {
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let mut reactor = Reactor::new(1, None, status).expect("Failed to create reactor");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to get address");
+        let _client = TcpStream::connect(addr).expect("Failed to connect");
+        let (server, _) = listener.accept().expect("Failed to accept");
+        let token = reactor
+            .add_connection(server)
+            .expect("Failed to add connection");
+
+        // Stage an established watcher: reactor state Active, scheduler
+        // classification Watching.
+        reactor
+            .scheduler
+            .register_watcher_for_test(token.id, "quiet-stream");
+        reactor
+            .connections
+            .get_mut(token.id)
+            .expect("connection exists")
+            .state = ConnectionState::Active;
+
+        // Backdate the connection past the ping threshold but short of the
+        // reaper, and let the throttle window lapse (the synthetic-clock
+        // idiom of the timeout tests; no sleeps).
+        let idle = Instant::now()
+            .checked_sub(Duration::from_secs(WATCHER_PING_IDLE_SECS + 1))
+            .expect("monotonic clock should be well past 31s after a full build");
+        {
+            let conn = reactor
+                .connections
+                .get_mut(token.id)
+                .expect("connection exists");
+            conn.last_read_activity = idle;
+            conn.last_write_activity = idle;
+        }
+        reactor.last_timeout_check = idle;
+
+        let reaped = reactor.check_timeouts();
+        assert!(
+            reaped.is_empty(),
+            "a watcher idle for half the timeout must not be reaped"
+        );
+        let (queued_bytes, activity_after_sweep) = {
+            let conn = reactor
+                .connections
+                .get(token.id)
+                .expect("connection exists");
+            assert!(
+                conn.has_pending_writes(),
+                "the sweep must queue a liveness ping for the idle watcher"
+            );
+            (conn.pending_bytes(), conn.last_activity())
+        };
+        assert!(
+            reactor.is_pending_flush(token.id),
+            "the queued ping must be scheduled for the next flush pass"
+        );
+        assert_eq!(
+            activity_after_sweep, idle,
+            "queueing a ping must not count as connection activity"
+        );
+
+        // A second sweep inside the same ping window must not queue another
+        // ping: last_ping_at gates the probe rate even while the first ping
+        // sits unflushed and the connection stays idle.
+        reactor.last_timeout_check = idle;
+        assert!(
+            reactor.check_timeouts().is_empty(),
+            "the watcher is still short of the timeout on the second sweep"
+        );
+        assert_eq!(
+            reactor
+                .connections
+                .get(token.id)
+                .expect("connection exists")
+                .pending_bytes(),
+            queued_bytes,
+            "a sweep within the ping window must not re-queue the ping"
+        );
+
+        // Honest accounting: queueing the ping is not activity. If it never
+        // reaches the wire (peer wedged, flush blocked with nothing written),
+        // the reaper must still fire at the full timeout.
+        let dead = Instant::now()
+            .checked_sub(Duration::from_secs(CONNECTION_TIMEOUT_SECS + 1))
+            .expect("monotonic clock should be well past 61s after a full build");
+        {
+            let conn = reactor
+                .connections
+                .get_mut(token.id)
+                .expect("connection exists");
+            conn.last_read_activity = dead;
+            conn.last_write_activity = dead;
+        }
+        reactor.last_timeout_check = dead;
+        assert_eq!(
+            reactor.check_timeouts(),
+            vec![token.id],
+            "an unflushed ping must not save a wedged watcher from the reaper"
         );
 
         reactor.remove_connection(token.id);
@@ -2641,7 +3268,7 @@ mod tests {
         // Enqueue small data that will be fully written in one flush
         let test_data = b"Hello";
         if let Some(conn) = reactor.connections.get_mut(token.id) {
-            conn.enqueue_data(Bytes::from_static(test_data), false, false, false);
+            conn.enqueue_data(Bytes::from_static(test_data), false, false, false, true);
             assert!(conn.has_pending_writes());
         }
 
@@ -2704,7 +3331,7 @@ mod tests {
         // Enqueue data and add to pending_flush set
         let test_data = b"World";
         if let Some(conn) = reactor.connections.get_mut(token.id) {
-            conn.enqueue_data(Bytes::from_static(test_data), false, false, false);
+            conn.enqueue_data(Bytes::from_static(test_data), false, false, false, true);
         }
         reactor.pending_flush.insert(token.id);
 
@@ -2783,7 +3410,7 @@ mod tests {
             // ~1MB single sequence-header entry: far larger than the shrunk
             // buffers, under the 4MB critical threshold, never dropped.
             let big = Bytes::from(vec![0u8; 1024 * 1024]);
-            assert!(conn.enqueue_data(big, false, true, true));
+            assert!(conn.enqueue_data(big, false, true, true, true));
             assert!(conn.has_pending_writes());
         }
 
@@ -3474,7 +4101,7 @@ mod tests {
         // for a watcher after its publisher finished.
         if let Some(conn) = reactor.connections.get_mut(token.id) {
             conn.state = ConnectionState::Active;
-            assert!(conn.enqueue_data(Bytes::from_static(b"final status"), false, false, false));
+            assert!(conn.enqueue_data(Bytes::from_static(b"final status"), false, false, false, true));
         }
         reactor.close_connection_after_flush(token.id);
         assert!(
@@ -3534,7 +4161,7 @@ mod tests {
         let payload = vec![0xABu8; 64 * 1024];
         if let Some(conn) = reactor.connections.get_mut(token.id) {
             conn.state = ConnectionState::Active;
-            assert!(conn.enqueue_data(Bytes::from(payload.clone()), false, true, true));
+            assert!(conn.enqueue_data(Bytes::from(payload.clone()), false, true, true, true));
         }
 
         reactor.close_connection_after_flush(token.id);
@@ -3613,7 +4240,7 @@ mod tests {
         let payload = vec![0u8; 1024 * 1024];
         if let Some(conn) = reactor.connections.get_mut(token.id) {
             conn.state = ConnectionState::Active;
-            assert!(conn.enqueue_data(Bytes::from(payload), false, true, true));
+            assert!(conn.enqueue_data(Bytes::from(payload), false, true, true, true));
         }
         reactor.close_connection_after_flush(token.id);
         assert!(
@@ -3675,7 +4302,7 @@ mod tests {
         let tail = 4096usize;
         if let Some(conn) = reactor.connections.get_mut(token.id) {
             conn.state = ConnectionState::Active;
-            assert!(conn.enqueue_data(Bytes::from(vec![0xABu8; tail]), false, true, true));
+            assert!(conn.enqueue_data(Bytes::from(vec![0xABu8; tail]), false, true, true, true));
             conn.condemn(Instant::now() + Duration::from_secs(30));
             assert!(conn.is_condemned());
         }
@@ -3684,7 +4311,7 @@ mod tests {
         // packet. It must be skipped, so the queue stays at the pre-condemn tail.
         reactor
             .packets_buffer
-            .push((token.id, vec![0xCDu8; 1024 * 1024], true, false, true));
+            .push((token.id, vec![0xCDu8; 1024 * 1024], true, false, true, true));
         reactor.write_pending_packets();
 
         let conn = reactor.connections.get(token.id).expect("still present");
