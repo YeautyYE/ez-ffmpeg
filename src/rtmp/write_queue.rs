@@ -34,7 +34,30 @@ struct WriteEntry {
     timestamp: Instant,
     #[allow(dead_code)]
     is_keyframe: bool,
-    is_sequence_header: bool, // SPS/PPS/AudioConfig prioritized (never dropped by policy, but rejected at critical)
+    // SPS/PPS/AudioConfig provenance. The policy role folded into
+    // `droppable` (sequence headers are always non-droppable); kept, like
+    // `is_keyframe`, as entry provenance.
+    #[allow(dead_code)]
+    is_sequence_header: bool,
+    /// A liveness ping queued by the reactor's timeout sweep. Flushes report
+    /// these bytes separately (`FlushResult::*::ping_bytes_written`) so the
+    /// connection can exclude a ping's own delivery from its write-activity
+    /// stamp — only the peer's ANSWER may count as liveness. Tagging the
+    /// entry (instead of keeping a side counter) keeps the accounting exact
+    /// per entry and per partial write.
+    is_ping: bool,
+    /// Whether the shedding policy may drop this entry (Warning/High frame
+    /// drops, age eviction). Carried from rml's `Packet::can_be_dropped`:
+    /// only media serialized drop-tolerantly (forced full headers) is
+    /// `true`. Everything else — session control responses, handshake
+    /// bytes, pings, sequence headers — was serialized against the
+    /// session's stateful per-csid header history, and silently dropping
+    /// such an entry would make the NEXT message on that chunk stream
+    /// header-compress against a packet the peer never received,
+    /// corrupting the stream. Non-droppable entries bypass the shedding
+    /// policy and pin the age-eviction sweep; the Critical cap still
+    /// refuses them (a disconnect, never a silent drop).
+    droppable: bool,
 }
 
 impl WriteEntry {
@@ -55,22 +78,36 @@ impl WriteEntry {
     }
 }
 
-/// Backpressure level
+/// Backpressure level. The shedding policies below apply to DROPPABLE
+/// entries only (drop-tolerantly serialized media); non-droppable entries —
+/// session control responses, handshake bytes, pings, sequence headers —
+/// are always kept in every band short of Critical (see
+/// `WriteEntry::droppable`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackpressureLevel {
     Normal,   // < 1MB: enqueue all
-    Warning,  // 1-2MB: drop non-keyframes, keep audio + keyframes
-    High,     // 2-4MB: only keep keyframes and sequence headers
-    Critical, // >= 4MB: should disconnect
+    Warning,  // 1-2MB: shed droppable non-keyframe video; keep droppable audio, keyframes and every non-droppable entry
+    High,     // 2-4MB: shed all droppable non-keyframes; keep keyframes and every non-droppable entry
+    Critical, // >= 4MB: should disconnect (refuses droppable and non-droppable alike)
 }
 
 /// Flush result
 #[derive(Debug)]
 pub enum FlushResult {
     /// QueueAll flushed
-    Complete { bytes_written: usize },
+    Complete {
+        bytes_written: usize,
+        /// The portion of `bytes_written` consumed from ping-tagged entries
+        /// (see `WriteEntry::is_ping`); exact per entry, partial writes
+        /// included.
+        ping_bytes_written: usize,
+    },
     /// WouldBlock encountered, partial write
-    WouldBlock { bytes_written: usize },
+    WouldBlock {
+        bytes_written: usize,
+        /// See `Complete::ping_bytes_written`.
+        ping_bytes_written: usize,
+    },
     /// Connection closed
     Closed,
 }
@@ -115,6 +152,8 @@ impl WriteQueue {
     /// * `is_keyframe` - Whether it's a keyframe
     /// * `is_sequence_header` - Whether it's a sequence header (SPS/PPS/AudioConfig)
     /// * `is_video` - Whether it's video data
+    /// * `droppable` - rml's `Packet::can_be_dropped`: whether the shedding
+    ///   policy may discard this entry (see `WriteEntry::droppable`)
     ///
     /// # Returns
     /// * `true` - Successfully enqueued or dropped per policy
@@ -125,6 +164,7 @@ impl WriteQueue {
         is_keyframe: bool,
         is_sequence_header: bool,
         is_video: bool,
+        droppable: bool,
     ) -> bool {
         if is_video {
             self.has_video = true;
@@ -140,18 +180,37 @@ impl WriteQueue {
 
         // Sequence headers never dropped
         if is_sequence_header {
-            self.push_entry(data, is_keyframe, true);
+            self.push_entry(data, is_keyframe, true, false);
+            return true;
+        }
+
+        // Non-droppable entries (session control, handshake bytes) bypass
+        // the shedding policy entirely: the session serializer already
+        // committed per-csid header history for them, so a silent drop
+        // would desynchronize the peer's chunk-stream decoding (see
+        // `WriteEntry::droppable`). The Critical cap above still refused
+        // oversized additions — a disconnect, never a silent drop. The
+        // age-eviction sweep still runs under pressure so stale DROPPABLE
+        // entries around them keep being shed.
+        if !droppable {
+            self.push_entry(data, is_keyframe, false, false);
+            if matches!(
+                level,
+                BackpressureLevel::Warning | BackpressureLevel::High
+            ) {
+                self.evict_old_entries();
+            }
             return true;
         }
 
         match level {
             BackpressureLevel::Normal => {
-                self.push_entry(data, is_keyframe, false);
+                self.push_entry(data, is_keyframe, false, true);
             }
             BackpressureLevel::Warning => {
                 // Drop non-keyframe video, keep audio
                 if is_keyframe || !is_video {
-                    self.push_entry(data, is_keyframe, false);
+                    self.push_entry(data, is_keyframe, false, true);
                 } else {
                     self.dropped_frames += 1;
                 }
@@ -161,7 +220,7 @@ impl WriteQueue {
             BackpressureLevel::High => {
                 // Keep keyframes only
                 if is_keyframe {
-                    self.push_entry(data, is_keyframe, false);
+                    self.push_entry(data, is_keyframe, false, true);
                 } else {
                     self.dropped_frames += 1;
                 }
@@ -173,7 +232,24 @@ impl WriteQueue {
         true
     }
 
-    fn push_entry(&mut self, data: Bytes, is_keyframe: bool, is_sequence_header: bool) {
+    fn push_entry(
+        &mut self,
+        data: Bytes,
+        is_keyframe: bool,
+        is_sequence_header: bool,
+        droppable: bool,
+    ) {
+        self.push_entry_tagged(data, is_keyframe, is_sequence_header, false, droppable);
+    }
+
+    fn push_entry_tagged(
+        &mut self,
+        data: Bytes,
+        is_keyframe: bool,
+        is_sequence_header: bool,
+        is_ping: bool,
+        droppable: bool,
+    ) {
         let len = data.len();
         self.queue.push_back(WriteEntry {
             data,
@@ -181,8 +257,22 @@ impl WriteQueue {
             timestamp: Instant::now(),
             is_keyframe,
             is_sequence_header,
+            is_ping,
+            droppable,
         });
         self.total_bytes += len;
+    }
+
+    /// Enqueue a liveness ping (see `WriteEntry::is_ping`). Queued by the
+    /// reactor's timeout sweep, and only onto a drained queue (the sweep's
+    /// predicate refuses to probe while writes are pending), so it takes
+    /// the plain Normal-band path; the critical cap stays as a guard.
+    pub fn enqueue_ping(&mut self, data: Bytes) -> bool {
+        if self.total_bytes.saturating_add(data.len()) >= QUEUE_MAX_BYTES {
+            return false;
+        }
+        self.push_entry_tagged(data, false, false, true, false);
+        true
     }
 
     /// Time-based eviction - Remove stale data
@@ -194,8 +284,15 @@ impl WriteQueue {
         };
 
         while let Some(entry) = self.queue.front() {
-            // Sequence headers never evicted
-            if entry.is_sequence_header {
+            // Non-droppable entries pin the sweep: sequence headers, pings
+            // and session control were all serialized against the session's
+            // stateful per-csid header history, and evicting one unsent
+            // would make the NEXT message on its chunk stream
+            // header-compress against a packet the peer never received —
+            // corrupting the stream. Such entries are bytes-trivial; a peer
+            // too stalled to drain them still dies via the Critical cap or
+            // the connection timeout.
+            if !entry.droppable {
                 break;
             }
             // A partially written entry is pinned: evicting it mid-send
@@ -230,6 +327,7 @@ impl WriteQueue {
     /// instead of burning a guaranteed-EAGAIN syscall.
     pub fn try_flush<W: Write>(&mut self, writer: &mut W) -> io::Result<FlushResult> {
         let mut bytes_written = 0;
+        let mut ping_bytes_written = 0;
 
         loop {
             // Drop any fully-consumed entries at the front (e.g. an entry that
@@ -237,7 +335,10 @@ impl WriteQueue {
             self.pop_completed_front();
 
             if self.queue.is_empty() {
-                return Ok(FlushResult::Complete { bytes_written });
+                return Ok(FlushResult::Complete {
+                    bytes_written,
+                    ping_bytes_written,
+                });
             }
 
             // Gather up to MAX_IOV slices from the front of the queue and issue
@@ -271,16 +372,22 @@ impl WriteQueue {
                 Ok(0) => return Ok(FlushResult::Closed),
                 Ok(n) => {
                     bytes_written += n;
-                    self.advance_front(n);
+                    ping_bytes_written += self.advance_front(n);
                     if n < gathered {
                         // Short write: send buffer full, stop and wait for the
                         // writable event rather than retry into EAGAIN.
-                        return Ok(FlushResult::WouldBlock { bytes_written });
+                        return Ok(FlushResult::WouldBlock {
+                            bytes_written,
+                            ping_bytes_written,
+                        });
                     }
                     // Whole batch drained; loop to gather the next one.
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    return Ok(FlushResult::WouldBlock { bytes_written });
+                    return Ok(FlushResult::WouldBlock {
+                        bytes_written,
+                        ping_bytes_written,
+                    });
                 }
                 Err(e) => return Err(e),
             }
@@ -305,7 +412,12 @@ impl WriteQueue {
     /// the walk never runs past the queue. `total_bytes` tracks the sum of full
     /// entry lengths, so it is decremented by an entry's full length exactly
     /// once, when that entry completes (matching `enqueue`/`evict`).
-    fn advance_front(&mut self, mut n: usize) {
+    ///
+    /// Returns how many of the `n` bytes were consumed from ping-tagged
+    /// entries — exact per entry and per partial write, so the caller's
+    /// activity accounting never credits a ping's delivery as liveness.
+    fn advance_front(&mut self, mut n: usize) -> usize {
+        let mut ping_bytes = 0;
         while n > 0 {
             let Some(front) = self.queue.front_mut() else {
                 break;
@@ -320,15 +432,22 @@ impl WriteQueue {
             }
             if n >= rem {
                 // Entry fully sent this call: account for its full length once.
+                if front.is_ping {
+                    ping_bytes += rem;
+                }
                 let full = front.data.len();
                 self.total_bytes = self.total_bytes.saturating_sub(full);
                 self.queue.pop_front();
                 n -= rem;
             } else {
+                if front.is_ping {
+                    ping_bytes += n;
+                }
                 front.advance(n);
                 n = 0;
             }
         }
+        ping_bytes
     }
 
     /// Is queue empty
@@ -396,7 +515,7 @@ mod tests {
     fn test_basic_enqueue_dequeue() {
         let mut queue = WriteQueue::new();
 
-        queue.enqueue(make_data(100), false, false, true);
+        queue.enqueue(make_data(100), false, false, true, true);
         assert_eq!(queue.pending_bytes(), 100);
         assert_eq!(queue.pending_entries(), 1);
         assert_eq!(queue.backpressure_level(), BackpressureLevel::Normal);
@@ -409,21 +528,21 @@ mod tests {
         // Normal level (< 1MB)
         {
             let mut queue = WriteQueue::new();
-            queue.enqueue(make_data(512 * 1024), true, false, true); // use keyframe to avoid drops
+            queue.enqueue(make_data(512 * 1024), true, false, true, true); // use keyframe to avoid drops
             assert_eq!(queue.backpressure_level(), BackpressureLevel::Normal);
         }
 
         // Warning level (>= 1MB, < 2MB)
         {
             let mut queue = WriteQueue::new();
-            queue.enqueue(make_data(1500 * 1024), true, false, true); // use keyframe
+            queue.enqueue(make_data(1500 * 1024), true, false, true, true); // use keyframe
             assert_eq!(queue.backpressure_level(), BackpressureLevel::Warning);
         }
 
         // High level (>= 2MB, < 4MB)
         {
             let mut queue = WriteQueue::new();
-            queue.enqueue(make_data(3 * 1024 * 1024), true, false, true); // use keyframe
+            queue.enqueue(make_data(3 * 1024 * 1024), true, false, true, true); // use keyframe
             assert_eq!(queue.backpressure_level(), BackpressureLevel::High);
         }
 
@@ -431,12 +550,12 @@ mod tests {
         {
             let mut queue = WriteQueue::new();
             // First fill to just below critical (3.5MB)
-            queue.enqueue(make_data(3500 * 1024), true, false, true);
+            queue.enqueue(make_data(3500 * 1024), true, false, true, true);
             assert_eq!(queue.backpressure_level(), BackpressureLevel::High);
 
             // Try to add 600KB which would push total to 4.1MB >= 4MB (critical)
             // This should be rejected
-            let result = queue.enqueue(make_data(600 * 1024), true, false, true);
+            let result = queue.enqueue(make_data(600 * 1024), true, false, true, true);
             assert!(
                 !result,
                 "Enqueue should be rejected when it would reach Critical"
@@ -451,16 +570,16 @@ mod tests {
         let mut queue = WriteQueue::new();
 
         // Fill up to high level
-        queue.enqueue(make_data(3 * 1024 * 1024), false, false, true);
+        queue.enqueue(make_data(3 * 1024 * 1024), false, false, true, true);
         assert_eq!(queue.backpressure_level(), BackpressureLevel::High);
 
         // Sequence header should still be enqueued
-        let result = queue.enqueue(make_data(100), false, true, true);
+        let result = queue.enqueue(make_data(100), false, true, true, true);
         assert!(result);
 
         // Non-keyframe should be dropped at high level
         let _before = queue.pending_entries();
-        queue.enqueue(make_data(100), false, false, true);
+        queue.enqueue(make_data(100), false, false, true, true);
         // Entry count should not increase for non-keyframe
         assert!(queue.dropped_frames() > 0);
     }
@@ -470,13 +589,13 @@ mod tests {
         let mut queue = WriteQueue::new();
 
         // Fill up to high level
-        queue.enqueue(make_data(3 * 1024 * 1024), false, false, true);
+        queue.enqueue(make_data(3 * 1024 * 1024), false, false, true, true);
         assert_eq!(queue.backpressure_level(), BackpressureLevel::High);
 
         let before = queue.pending_entries();
 
         // Keyframe should be accepted
-        queue.enqueue(make_data(100), true, false, true);
+        queue.enqueue(make_data(100), true, false, true, true);
         assert_eq!(queue.pending_entries(), before + 1);
     }
 
@@ -485,18 +604,18 @@ mod tests {
         let mut queue = WriteQueue::new();
 
         // Fill up to warning level
-        queue.enqueue(make_data(1500 * 1024), false, false, true);
+        queue.enqueue(make_data(1500 * 1024), false, false, true, true);
         assert_eq!(queue.backpressure_level(), BackpressureLevel::Warning);
 
         let before = queue.pending_entries();
 
         // Audio should be accepted at warning level
-        queue.enqueue(make_data(100), false, false, false);
+        queue.enqueue(make_data(100), false, false, false, true);
         assert_eq!(queue.pending_entries(), before + 1);
 
         // Non-keyframe video should be dropped
         let dropped_before = queue.dropped_frames();
-        queue.enqueue(make_data(100), false, false, true);
+        queue.enqueue(make_data(100), false, false, true, true);
         assert!(queue.dropped_frames() > dropped_before);
     }
 
@@ -505,12 +624,12 @@ mod tests {
         let mut queue = WriteQueue::new();
 
         // Fill up to just below critical level (3.9MB)
-        queue.enqueue(make_data(3900 * 1024), true, false, true);
+        queue.enqueue(make_data(3900 * 1024), true, false, true, true);
         assert_eq!(queue.backpressure_level(), BackpressureLevel::High);
 
         // Try to add data that would exceed critical threshold
         // Even keyframes should be rejected
-        let result = queue.enqueue(make_data(200 * 1024), true, false, true);
+        let result = queue.enqueue(make_data(200 * 1024), true, false, true, true);
         assert!(
             !result,
             "Keyframe should be rejected when it would exceed Critical"
@@ -518,7 +637,7 @@ mod tests {
 
         // Even sequence headers should be rejected when threshold would be exceeded
         // (Note: sequence headers bypass drop policy but not critical threshold)
-        let result = queue.enqueue(make_data(200 * 1024), false, true, true);
+        let result = queue.enqueue(make_data(200 * 1024), false, true, true, true);
         assert!(
             !result,
             "Sequence header should be rejected when it would exceed Critical"
@@ -574,8 +693,8 @@ mod tests {
     #[test]
     fn test_partial_write_walks_across_entries() {
         let mut queue = WriteQueue::new();
-        queue.enqueue(Bytes::from_static(b"hello"), false, false, true);
-        queue.enqueue(Bytes::from_static(b"world"), false, false, true);
+        queue.enqueue(Bytes::from_static(b"hello"), false, false, true, true);
+        queue.enqueue(Bytes::from_static(b"world"), false, false, true, true);
         assert_eq!(queue.pending_bytes(), 10);
 
         // Capacity 7: one writev writes "hello" (5) then "wo" (2) and fills.
@@ -588,7 +707,7 @@ mod tests {
         let result = queue.try_flush(&mut writer).unwrap();
         assert!(matches!(
             result,
-            FlushResult::WouldBlock { bytes_written: 7 }
+            FlushResult::WouldBlock { bytes_written: 7, .. }
         ));
         assert_eq!(writer.inner, b"hellowo");
         assert_eq!(queue.pending_entries(), 1);
@@ -600,7 +719,7 @@ mod tests {
         // stream must never restart from the beginning of the tag.
         writer.capacity = 100;
         let result = queue.try_flush(&mut writer).unwrap();
-        assert!(matches!(result, FlushResult::Complete { bytes_written: 3 }));
+        assert!(matches!(result, FlushResult::Complete { bytes_written: 3, .. }));
         assert_eq!(writer.inner, b"helloworld");
         assert!(queue.is_empty());
         assert_eq!(queue.pending_bytes(), 0);
@@ -609,8 +728,8 @@ mod tests {
     #[test]
     fn test_would_block_returns_bytes_written() {
         let mut queue = WriteQueue::new();
-        queue.enqueue(Bytes::from_static(b"hello"), false, false, true);
-        queue.enqueue(Bytes::from_static(b"world"), false, false, true);
+        queue.enqueue(Bytes::from_static(b"hello"), false, false, true, true);
+        queue.enqueue(Bytes::from_static(b"world"), false, false, true, true);
 
         // Capacity 3: writev writes "hel" then fills mid first entry.
         let mut writer = CapWriter {
@@ -620,7 +739,7 @@ mod tests {
         let result = queue.try_flush(&mut writer).unwrap();
         assert!(matches!(
             result,
-            FlushResult::WouldBlock { bytes_written: 3 }
+            FlushResult::WouldBlock { bytes_written: 3, .. }
         ));
         assert_eq!(writer.inner, b"hel");
         assert!(!queue.is_empty());
@@ -631,9 +750,114 @@ mod tests {
         let result = queue.try_flush(&mut writer).unwrap();
         assert!(matches!(
             result,
-            FlushResult::WouldBlock { bytes_written: 0 }
+            FlushResult::WouldBlock { bytes_written: 0, .. }
         ));
         assert_eq!(queue.front_offset(), Some(3));
+    }
+
+    // Ping-tagged bytes are reported separately by the flush, exact across
+    // entry boundaries, so the connection can refuse to count a ping's own
+    // delivery as liveness while still crediting ordinary bytes behind it.
+    #[test]
+    fn flush_reports_ping_bytes_separately() {
+        let mut queue = WriteQueue::new();
+        assert!(queue.enqueue_ping(Bytes::from_static(b"ping-bytes-payload")));
+        queue.enqueue(Bytes::from_static(b"ordinary-data"), false, false, false, true);
+
+        let mut writer: Vec<u8> = Vec::new();
+        let result = queue.try_flush(&mut writer).unwrap();
+        match result {
+            FlushResult::Complete {
+                bytes_written,
+                ping_bytes_written,
+            } => {
+                assert_eq!(bytes_written, 18 + 13);
+                assert_eq!(
+                    ping_bytes_written, 18,
+                    "exactly the ping entry's bytes must be attributed to the ping"
+                );
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
+        assert!(queue.is_empty());
+    }
+
+    // A serialized ping is pinned against age eviction: the watcher
+    // session's serializer already committed csid-2 header history for it,
+    // so dropping it unsent would make the next control message
+    // header-compress against a packet the peer never received. However
+    // aged, the ping must survive the Warning-band eviction sweep and be
+    // delivered (and reported) as ping bytes.
+    #[test]
+    fn aged_ping_is_never_evicted() {
+        let mut queue = WriteQueue::new();
+        assert!(queue.enqueue_ping(Bytes::from_static(b"ping-bytes-payload")));
+        // Age the ping far past the audio-only eviction horizon (no video
+        // was ever enqueued here); it sits unwritten at the front, where
+        // the eviction sweep would otherwise reap it.
+        queue.queue.front_mut().unwrap().timestamp = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(AUDIO_ONLY_MAX_AGE_SECS + 1))
+            .expect("monotonic clock should be past the eviction horizon");
+
+        // Fill into the Warning band with audio; the next enqueue runs the
+        // age-eviction sweep, which must stop at the pinned ping.
+        let audio_chunk = Bytes::from(vec![0u8; QUEUE_WARN_BYTES / 2]);
+        queue.enqueue(audio_chunk.clone(), false, false, false, true);
+        queue.enqueue(audio_chunk, false, false, false, true);
+        queue.enqueue(Bytes::from_static(b"tail"), false, false, false, true);
+
+        let expected_total = 18 + QUEUE_WARN_BYTES / 2 * 2 + 4;
+        assert_eq!(
+            queue.pending_bytes(),
+            expected_total,
+            "the aged ping must survive the Warning-band eviction sweep"
+        );
+
+        let mut writer: Vec<u8> = Vec::new();
+        let result = queue.try_flush(&mut writer).unwrap();
+        match result {
+            FlushResult::Complete {
+                bytes_written,
+                ping_bytes_written,
+            } => {
+                assert_eq!(bytes_written, expected_total);
+                assert_eq!(
+                    ping_bytes_written, 18,
+                    "the delivered ping's bytes must still be reported as ping bytes"
+                );
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    // Non-droppable entries (session control, handshake bytes) must NEVER
+    // be shed by the backpressure policy: the session serializer already
+    // committed per-csid header history for them, and a silent drop would
+    // desynchronize the peer's chunk-stream decoding. Only the Critical cap
+    // may refuse them — a disconnect, never a silent drop.
+    #[test]
+    fn shedding_policy_never_drops_non_droppable_entries() {
+        let mut queue = WriteQueue::new();
+        // Push into the High band with droppable keyframe video.
+        queue.enqueue(make_data(QUEUE_HIGH_BYTES + 1024), true, false, true, true);
+        assert_eq!(queue.backpressure_level(), BackpressureLevel::High);
+
+        // A droppable non-keyframe is shed silently in the High band (the
+        // pre-existing media policy), while a non-droppable control entry
+        // of the same shape must be retained.
+        let before = queue.pending_bytes();
+        assert!(queue.enqueue(make_data(64), false, false, false, true));
+        assert_eq!(
+            queue.pending_bytes(),
+            before,
+            "droppable non-keyframe data is shed in the High band"
+        );
+        assert!(queue.enqueue(make_data(64), false, false, false, false));
+        assert_eq!(
+            queue.pending_bytes(),
+            before + 64,
+            "a non-droppable control entry must be retained in the High band"
+        );
     }
 
     #[test]
@@ -670,7 +894,7 @@ mod tests {
         for i in 0..count {
             let payload = vec![(i % 251) as u8; 3];
             flat.extend_from_slice(&payload);
-            queue.enqueue(Bytes::from(payload), false, false, true);
+            queue.enqueue(Bytes::from(payload), false, false, true, true);
         }
 
         let mut writer = CountingWriter {
@@ -715,7 +939,7 @@ mod tests {
         }
 
         let mut queue = WriteQueue::new();
-        queue.enqueue(Bytes::from_static(b"hello"), false, false, true);
+        queue.enqueue(Bytes::from_static(b"hello"), false, false, true, true);
 
         // Send the first 3 bytes: the peer now holds half an FLV tag.
         let mut writer = WouldBlockWriter {
@@ -729,8 +953,8 @@ mod tests {
         // Warning-level enqueue. Evicting a half-sent entry would resume the
         // byte stream in the middle of a different tag and corrupt it.
         queue.backdate_front(60);
-        queue.enqueue(make_data(QUEUE_WARN_BYTES), true, false, true);
-        queue.enqueue(make_data(10), true, false, true);
+        queue.enqueue(make_data(QUEUE_WARN_BYTES), true, false, true, true);
+        queue.enqueue(make_data(10), true, false, true, true);
 
         assert_eq!(
             queue.front_offset(),
@@ -742,7 +966,7 @@ mod tests {
     #[test]
     fn test_stats() {
         let mut queue = WriteQueue::new();
-        queue.enqueue(make_data(1000), false, false, true);
+        queue.enqueue(make_data(1000), false, false, true, true);
 
         assert_eq!(queue.pending_bytes(), 1000);
         assert_eq!(queue.pending_entries(), 1);
@@ -755,8 +979,8 @@ mod tests {
         let mut queue = WriteQueue::new();
 
         // Only enqueue audio
-        queue.enqueue(make_data(100), false, false, false);
-        queue.enqueue(make_data(100), false, false, false);
+        queue.enqueue(make_data(100), false, false, false, true);
+        queue.enqueue(make_data(100), false, false, false, true);
 
         assert!(!queue.has_video());
     }

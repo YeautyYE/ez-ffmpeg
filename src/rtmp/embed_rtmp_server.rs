@@ -20,7 +20,8 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::thread::JoinHandle;
 
 #[derive(Clone)]
 pub struct Initialization;
@@ -50,6 +51,32 @@ pub struct EmbedRtmpServer<S> {
     registrations: Option<Arc<RegistrationHandoff>>,
     /// Producer-side wakeup for the reactor (PERF-3), set in `start()`.
     wake_handle: Option<WakeHandle>,
+    /// Join handles of the two server threads (worker, accept), pushed by
+    /// `start()` and shared by every clone of the family. `stop()` drains
+    /// this registry and joins them — its settlement barrier — holding the
+    /// lock across the joins so a racing `stop()` on a clone blocks on the
+    /// lock and also returns only after teardown finished. The server
+    /// threads themselves never reach this lock: the only way user code
+    /// (which could hold a clone and call `stop()`) runs on them is through
+    /// a user-installed global logger, and `settle_server_threads` bails out
+    /// on a server thread BEFORE touching the registry (see its reentrancy
+    /// notes) — so holding the lock across the joins cannot deadlock.
+    threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    /// The `ThreadId`s of the threads whose handles live in `threads`,
+    /// recorded at spawn. `settle_server_threads` probes this list — briefly,
+    /// never across a join — to detect the reentrant case above without
+    /// going anywhere near the registry lock.
+    server_thread_ids: Arc<Mutex<Vec<std::thread::ThreadId>>>,
+    /// WHY the family reached its terminal state — `CAUSE_DELIBERATE` for
+    /// the user-initiated paths (`stop()`, a handle/guard drop), or
+    /// `CAUSE_FATAL` for the failure paths (a contained reactor panic, the
+    /// worker dying). First writer wins: the cause is claimed with a
+    /// compare-exchange from `CAUSE_NONE` by whichever terminal transition
+    /// lands first, so a `stop()` arriving after a crash cannot relabel the
+    /// crash as deliberate. In-process publisher write callbacks read it
+    /// when their feed send fails, to report a deliberate server stop
+    /// calmly instead of as an opaque send error.
+    terminal_cause: Arc<AtomicUsize>,
     gop_limit: usize,
     max_connections: Option<usize>,
     state: PhantomData<S>,
@@ -58,6 +85,15 @@ pub struct EmbedRtmpServer<S> {
 const STATUS_INIT: usize = 0;
 const STATUS_RUN: usize = 1;
 const STATUS_END: usize = 2;
+
+/// `terminal_cause` values. Kept separate from the status flag: the status
+/// answers "is the family stopped" (three states, compared all over the
+/// reactor and accept loops), the cause answers "who stopped it" (write-once,
+/// read only by failure classification). Folding the cause into the status
+/// would turn every `== STATUS_END` comparison into a range check.
+const CAUSE_NONE: usize = 0;
+const CAUSE_DELIBERATE: usize = 1;
+const CAUSE_FATAL: usize = 2;
 
 /// The one funnel for the server's terminal transition: close the
 /// registration intake FIRST, then release-store `STATUS_END`.
@@ -71,9 +107,135 @@ const STATUS_END: usize = 2;
 /// idempotent, so racing terminal paths (a stop signal against a worker
 /// panic, or the accept loop noticing the worker died) may each run this
 /// with no ordering between them.
-fn close_intake_and_publish_end(registrations: &RegistrationHandoff, status: &AtomicUsize) {
+/// Every direct caller of this funnel is a FAILURE path (worker death,
+/// reactor panic, start() unwind), so the funnel claims `CAUSE_FATAL` for
+/// them; the deliberate paths all run through `signal_stop`, which claims
+/// `CAUSE_DELIBERATE` BEFORE delegating here, making this claim a no-op.
+/// The compare-exchange makes the cause first-writer-wins under races
+/// between a crash and a late `stop()`.
+fn close_intake_and_publish_end(
+    registrations: &RegistrationHandoff,
+    status: &AtomicUsize,
+    terminal_cause: &AtomicUsize,
+) {
+    let _ = terminal_cause.compare_exchange(
+        CAUSE_NONE,
+        CAUSE_FATAL,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
     registrations.close();
     status.store(STATUS_END, Ordering::Release);
+}
+
+/// `stop()`'s settlement barrier: join every server thread in the family's
+/// registry, holding the registry lock across the joins so racing `stop()`
+/// calls on clones serialize behind it and each returns only once teardown
+/// finished. The caller must have signaled the stop first, or the joins
+/// would wait on threads with no reason to exit.
+///
+/// Reentrancy guard — FIRST, before any lock. The server threads do run
+/// user code: every `log` macro they execute dispatches to a user-installed
+/// global logger, which may hold a server clone and call `stop()`. Such a
+/// call must neither block on the registry lock (an outer settlement holds
+/// it while joining the very thread the logger runs on — deadlock) nor
+/// consume handles (its own would be dropped, detaching a thread a later
+/// user-thread `stop()` could still settle). A server thread therefore gets
+/// signal-only semantics: return SILENTLY with the registry untouched —
+/// silently, because this thread may be inside the logger's own log()
+/// frame, above a non-reentrant lock the logger holds, and any log macro
+/// here would re-enter the logger and deadlock on it: the exact failure
+/// this branch exists to prevent. The id list's lock is held only for this
+/// membership probe — never across a join — so the probe itself cannot
+/// deadlock.
+///
+/// The join loop performs no logging and nothing else that can unwind: an
+/// unwind mid-drain would detach the remaining handles and poison the
+/// registry into a state indistinguishable from settled (empty), turning a
+/// later `stop()` into a false barrier. That discipline includes the panic
+/// PAYLOADS of joined threads: a payload is an arbitrary `Box<dyn Any>`,
+/// and settlement never runs its drop glue at all — payloads are moved
+/// aside untouched during the drain and deliberately LEAKED
+/// (`mem::forget`) once the lock is released. Running their destructors
+/// here, however contained, is unwinnable in principle: a payload whose
+/// two field destructors both panic aborts the process inside its own
+/// drop glue before any catch regains control, and a destructor is
+/// equally free to BLOCK forever on a lock the `stop()` caller holds —
+/// either outcome inside a blocking public API is strictly worse than
+/// leaking a few bytes per crashed thread, an already-broken, bounded
+/// path. (Contrast `dispose_panic_payload` in packet_sink, which runs
+/// destructors bounded-chain-contained on paths where a caller is not
+/// blocked behind them.) The report afterwards runs under containment,
+/// and its own panic payload — a logger's — is forgotten the same way, so
+/// nothing can unwind a completed settlement out of `stop()`. Riding over
+/// poisoning is safe under that discipline: a poisoned registry still
+/// holds exactly the handles no settlement consumed, and the drain below
+/// joins them as usual.
+fn settle_server_threads(
+    server_thread_ids: &Mutex<Vec<std::thread::ThreadId>>,
+    threads: &Mutex<Vec<JoinHandle<()>>>,
+) {
+    let current = std::thread::current().id();
+    let is_server_thread = server_thread_ids
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .contains(&current);
+    if is_server_thread {
+        // No logging here — not even a warn. See the reentrancy note above:
+        // this frame may sit inside the user logger itself, and dispatching
+        // to it again would deadlock on the logger's own lock.
+        return;
+    }
+
+    let mut panicked: Vec<String> = Vec::new();
+    let mut payloads: Vec<Box<dyn std::any::Any + Send>> = Vec::new();
+    {
+        let mut registry = threads.lock().unwrap_or_else(PoisonError::into_inner);
+        for handle in registry.drain(..) {
+            // Defensive second line for a handle the id list missed (only
+            // reachable from hand-assembled registries in tests): detaching
+            // beats self-joining forever. No logging in this loop — see the
+            // unwind-safety note above.
+            if handle.thread().id() == current {
+                continue;
+            }
+            let name = handle.thread().name().unwrap_or("rtmp-server").to_string();
+            if let Err(payload) = handle.join() {
+                // Move the payload aside WITHOUT dropping it: its
+                // destructor is arbitrary user code that may panic, and no
+                // unwind is allowed while the drain and the registry guard
+                // are live (see the unwind-safety note above).
+                payloads.push(payload);
+                panicked.push(name);
+            }
+        }
+    }
+    // Leak the retained payloads BEFORE any reporting: no drop glue of an
+    // arbitrary payload may run inside a blocking stop() — a two-bomb
+    // payload aborts inside its own drop glue before any catch regains
+    // control, and a destructor can just as well block on a lock the
+    // stop() caller holds. See the unwind-safety note above.
+    for payload in payloads {
+        std::mem::forget(payload);
+    }
+    if !panicked.is_empty() {
+        // The threads died to uncontained panics (e.g. a user-installed
+        // logger panicking outside the reactor's unwind boundary). They are
+        // just as terminated — the barrier holds — so report rather than
+        // rethrow. The report itself runs contained: settlement is already
+        // complete and this is purely informational, so a logger panicking
+        // HERE must not unwind a finished settlement out of stop() — and
+        // whatever payload that panic carries is forgotten like the join
+        // payloads above.
+        let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for name in &panicked {
+                error!("Thread[{name}] terminated by an uncontained panic");
+            }
+        }));
+        if let Err(payload) = report {
+            std::mem::forget(payload);
+        }
+    }
 }
 
 /// Unwind backstop for `start()`'s window between the lifecycle claim (the
@@ -95,6 +257,9 @@ struct StartFailGuard {
     registrations: Arc<RegistrationHandoff>,
     status: Arc<AtomicUsize>,
     wake_handle: Option<WakeHandle>,
+    threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    server_thread_ids: Arc<Mutex<Vec<std::thread::ThreadId>>>,
+    terminal_cause: Arc<AtomicUsize>,
 }
 
 impl Drop for StartFailGuard {
@@ -102,10 +267,19 @@ impl Drop for StartFailGuard {
         if !self.armed {
             return;
         }
-        close_intake_and_publish_end(&self.registrations, &self.status);
+        close_intake_and_publish_end(&self.registrations, &self.status, &self.terminal_cause);
         if let Some(wake_handle) = &self.wake_handle {
             wake_handle.wake();
         }
+        // Settle whatever did spawn before the unwind: the signal above
+        // makes those threads exit promptly, and joining them here keeps
+        // the failed start from leaving live threads (and their registry
+        // handles) behind for a family no `stop()` can ever reach —
+        // `start()` consumed the one lifecycle claim, so no `Running`
+        // value will exist to settle them later. Runs on `start()`'s
+        // caller thread, never a server thread, so the reentrancy bail-out
+        // inside cannot fire.
+        settle_server_threads(&self.server_thread_ids, &self.threads);
     }
 }
 
@@ -118,6 +292,9 @@ impl<S: 'static> EmbedRtmpServer<S> {
             stream_keys: self.stream_keys,
             registrations: self.registrations,
             wake_handle: self.wake_handle,
+            threads: self.threads,
+            server_thread_ids: self.server_thread_ids,
+            terminal_cause: self.terminal_cause,
             gop_limit: self.gop_limit,
             max_connections: self.max_connections,
             state: Default::default(),
@@ -130,7 +307,11 @@ impl<S: 'static> EmbedRtmpServer<S> {
     ///
     /// Note this reports the *signal*, not thread teardown: the worker threads
     /// observe the flag and exit shortly after (the reactor on its next
-    /// wakeup, the accept thread within its ~100ms accept cycle).
+    /// wakeup, the accept thread within its ~100ms accept cycle). The one
+    /// place both coincide is [`stop`](EmbedRtmpServer<Running>::stop), which
+    /// joins the server threads before returning — after a `stop()` call has
+    /// returned, teardown is complete as well (except for `stop()`'s
+    /// reentrant logger edge, documented there, which is signal-only).
     ///
     /// # Returns
     ///
@@ -155,13 +336,29 @@ impl<S: 'static> EmbedRtmpServer<S> {
     /// for types with a `Drop` impl (E0509). Shared owners that only hold a
     /// reference (e.g. [`StreamHandle`]) stop the server through this instead.
     fn signal_stop(&self) {
+        // Claim the terminal cause BEFORE the funnel, first-writer-wins: if
+        // a fatal transition (worker death, contained panic) already claimed
+        // `CAUSE_FATAL`, this exchange fails and the crash keeps its loud
+        // classification — a late deliberate stop() must not relabel it.
+        // Ordering: the funnel's release-store of `STATUS_END` orders this
+        // claim ahead of any acquire-load of the status, and the reactor
+        // tears publishers down only after observing that status, so the
+        // cause is in place before any teardown a callback could witness.
+        let _ = self.terminal_cause.compare_exchange(
+            CAUSE_NONE,
+            CAUSE_DELIBERATE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
         // Close-then-publish through the shared funnel (see
         // `close_intake_and_publish_end` for the ordering argument).
         // Registrations already queued keep their owners — the reactor's
         // remaining rounds, with the worker's kill-switch drain as the
         // backstop.
         match &self.registrations {
-            Some(registrations) => close_intake_and_publish_end(registrations, &self.status),
+            Some(registrations) => {
+                close_intake_and_publish_end(registrations, &self.status, &self.terminal_cause)
+            }
             // Defensive arm, unreachable today: every caller reaches this
             // with the handoff installed (`stop()`, the RAII guards and
             // `start()`'s failure paths all run after `start()` stored
@@ -222,6 +419,9 @@ impl EmbedRtmpServer<Initialization> {
             stream_keys: Default::default(),
             registrations: None,
             wake_handle: None,
+            threads: Default::default(),
+            server_thread_ids: Default::default(),
+            terminal_cause: Default::default(),
             gop_limit,
             max_connections: None,
             state: Default::default(),
@@ -359,11 +559,15 @@ impl EmbedRtmpServer<Initialization> {
             registrations: registrations.clone(),
             status: self.status.clone(),
             wake_handle: self.wake_handle.clone(),
+            threads: self.threads.clone(),
+            server_thread_ids: self.server_thread_ids.clone(),
+            terminal_cause: self.terminal_cause.clone(),
         };
 
         let status = self.status.clone();
         let max_connections = self.max_connections;
         let worker_registrations = registrations.clone();
+        let worker_terminal_cause = self.terminal_cause.clone();
         let result = std::thread::Builder::new()
             .name("rtmp-server-worker".to_string())
             .spawn(move || {
@@ -373,23 +577,43 @@ impl EmbedRtmpServer<Initialization> {
                     self.gop_limit,
                     max_connections,
                     status,
+                    worker_terminal_cause,
                     waker,
                 )
             });
-        if let Err(e) = result {
-            // Nothing has spawned yet: no worker observes STATUS_RUN, and the
-            // listener is still owned here (moved into the io closure only
-            // below), so it drops on return and releases the port. The
-            // family's one start has been consumed by the gate above,
-            // though, so the status must not stay at STATUS_RUN — every
-            // clone would report a running server forever. Publish the
-            // terminal state BEFORE logging, intake closed first as on
-            // every terminal path: `error!` can run a user-installed
-            // logger that itself panics, and that unwind must not skip
-            // the publication.
-            self.signal_stop();
-            error!("Thread[rtmp-server-worker] exited with error: {e}");
-            return Err(crate::error::Error::RtmpThreadExited);
+        match result {
+            // The worker's handle joins the family registry: it is what
+            // stop()'s settlement barrier joins. Registered before the
+            // accept thread spawns, so no exit below can leave a running
+            // thread the registry does not know about. Its ThreadId goes
+            // into the reentrancy list first — both writes happen before
+            // any Running value (and thus any stop()) can exist, so the
+            // two locks never race a settlement.
+            Ok(handle) => {
+                self.server_thread_ids
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(handle.thread().id());
+                self.threads
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(handle);
+            }
+            Err(e) => {
+                // Nothing has spawned yet: no worker observes STATUS_RUN, and the
+                // listener is still owned here (moved into the io closure only
+                // below), so it drops on return and releases the port. The
+                // family's one start has been consumed by the gate above,
+                // though, so the status must not stay at STATUS_RUN — every
+                // clone would report a running server forever. Publish the
+                // terminal state BEFORE logging, intake closed first as on
+                // every terminal path: `error!` can run a user-installed
+                // logger that itself panics, and that unwind must not skip
+                // the publication.
+                self.signal_stop();
+                error!("Thread[rtmp-server-worker] exited with error: {e}");
+                return Err(crate::error::Error::RtmpThreadExited);
+            }
         }
 
         info!(
@@ -401,7 +625,9 @@ impl EmbedRtmpServer<Initialization> {
         // The accept loop owns one terminal transition of its own (the
         // worker's connection channel disconnecting below) and needs the
         // intake to run it through the funnel: it takes the handoff Arc
-        // still held from the setup above.
+        // still held from the setup above. That transition is a worker
+        // death — a fatal cause, which the funnel claims.
+        let terminal_cause = self.terminal_cause.clone();
         let result = std::thread::Builder::new()
             .name("rtmp-server-io".to_string())
             .spawn(move || {
@@ -438,7 +664,11 @@ impl EmbedRtmpServer<Initialization> {
                                     // well, so STATUS_END is never
                                     // observable over an open intake no
                                     // matter whose store lands first.
-                                    close_intake_and_publish_end(&registrations, &status);
+                                    close_intake_and_publish_end(
+                                        &registrations,
+                                        &status,
+                                        &terminal_cause,
+                                    );
                                     return;
                                 }
                             }
@@ -459,17 +689,36 @@ impl EmbedRtmpServer<Initialization> {
                     }
                 }
             });
-        if let Err(e) = result {
-            // The worker thread spawned successfully above and is now polling
-            // `status` (still STATUS_RUN); without this it would run forever.
-            // Signal STATUS_END (and wake the reactor) so it exits, and do it
-            // BEFORE logging: `error!` can run a user-installed logger that
-            // itself panics, and that unwind must not strand the already
-            // running worker. The listener was moved into the failed io
-            // closure and drops with it, releasing the port.
-            self.signal_stop();
-            error!("Thread[rtmp-server-io] exited with error: {e}");
-            return Err(crate::error::Error::RtmpThreadExited);
+        match result {
+            Ok(handle) => {
+                self.server_thread_ids
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(handle.thread().id());
+                self.threads
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(handle);
+            }
+            Err(e) => {
+                // The worker thread spawned successfully above and is now polling
+                // `status` (still STATUS_RUN); without this it would run forever.
+                // Signal STATUS_END (and wake the reactor) so it exits, and do it
+                // BEFORE logging: `error!` can run a user-installed logger that
+                // itself panics, and that unwind must not strand the already
+                // running worker. The listener was moved into the failed io
+                // closure and drops with it, releasing the port. Then settle
+                // the worker: this failed start() consumed the family's one
+                // lifecycle claim, so no Running value will ever exist to
+                // join it later — its registry handle would otherwise pin a
+                // live thread until the last clone drops. Settling before
+                // the log keeps the usual discipline: a panicking logger
+                // cannot skip it.
+                self.signal_stop();
+                settle_server_threads(&self.server_thread_ids, &self.threads);
+                error!("Thread[rtmp-server-io] exited with error: {e}");
+                return Err(crate::error::Error::RtmpThreadExited);
+            }
         }
 
         // Handoff complete: the accept thread owns the listener, and every
@@ -612,6 +861,39 @@ impl EmbedRtmpServer<Running> {
 
         let mut flv_buffer = FlvBuffer::new();
         let mut serializer = ChunkSerializer::new();
+        // A feed send fails only once the receiver died. Under a deliberate
+        // stop that is the expected end of this publisher — classify it as
+        // such instead of logging the send error a genuine failure gets.
+        // The callback must still fail the write (the FFmpeg job has to
+        // end), so the classification changes the reporting, not the flow.
+        //
+        // Scope: this classifies the SERVER lifecycle, not this feed's own
+        // history. A feed torn down for its own fatal protocol error is
+        // reported loudly at its removal site (the reactor warns when it
+        // rejects the publisher), independent of what this classification
+        // says later — a deliberate stop landing between that removal and
+        // this send failure makes the calm line below true of the server
+        // while the earlier warn still records why the feed itself died.
+        //
+        // The classification is best-effort by construction. First-writer-
+        // wins on `terminal_cause` means a server crash that beat a late
+        // stop() stays CAUSE_FATAL — never relabeled calm. In the other
+        // direction the load below can, in principle, still read a stale
+        // CAUSE_NONE during a deliberate stop: the send-failure observation
+        // travels through the channel's disconnect flag, whose sender-side
+        // fast path is a relaxed read, so it carries no happens-before edge
+        // for this unrelated atomic. A stale read only ever shows the OLDER
+        // value (CAUSE_NONE -> the loud error branch), so the worst case is
+        // the pre-classification behavior for one racing write, never a
+        // server crash reported as deliberate.
+        let terminal_cause = self.terminal_cause.clone();
+        let classify_feed_send_failure = move |what: &str, e: &dyn std::fmt::Debug| {
+            if terminal_cause.load(Ordering::Acquire) == CAUSE_DELIBERATE {
+                info!("The rtmp server was deliberately stopped; ending the in-process publisher (failing its {what} write)");
+            } else {
+                error!("Failed to send in-process {what}: {e:?}");
+            }
+        };
         let write_callback: Box<dyn FnMut(&[u8]) -> i32 + Send> =
             Box::new(move |buf: &[u8]| -> i32 {
                 flv_buffer.write_data(buf);
@@ -636,7 +918,7 @@ impl EmbedRtmpServer<Running> {
                             data: flv_tag.data,
                         };
                         if let Err(e) = feed_sender.send(feed) {
-                            error!("Failed to send in-process media tag: {:?}", e);
+                            classify_feed_send_failure("media tag", &e);
                             return -1;
                         }
                         // PERF-3: wake the reactor for each bypassed media tag, the
@@ -655,7 +937,7 @@ impl EmbedRtmpServer<Running> {
                     match serializer.serialize(&flv_tag_to_message_payload(flv_tag), false, true) {
                         Ok(packet) => {
                             if let Err(e) = feed_sender.send(PublisherFeed::Raw(packet.bytes)) {
-                                error!("Failed to send RTMP packet: {:?}", e);
+                                classify_feed_send_failure("RTMP packet", &e);
                                 return -1;
                             }
                             // Wake the reactor for each enqueued packet. Unconditional
@@ -842,9 +1124,54 @@ impl EmbedRtmpServer<Running> {
         }
     }
 
-    /// Stops the RTMP server by signaling the listening and connection-handling threads
-    /// to terminate. Once called, new incoming connections will be ignored, and existing
-    /// threads will exit gracefully.
+    /// Stops the RTMP server: signals the listening and connection-handling
+    /// threads to terminate, then joins them, so this returns only once
+    /// teardown has settled — the listener socket is released, every
+    /// connection is closed, and every publisher is torn down with its
+    /// stream key freed. A caller can rebind the address or reuse a stream
+    /// key immediately after this returns, without polling.
+    ///
+    /// Blocking is bounded but not hard-real-time: the reactor finishes the
+    /// loop turn it is in, then drains still-queued tails for roughly its
+    /// graceful-shutdown window (a few seconds, re-checked between drain
+    /// passes, and only spent when a peer stopped reading); the accept
+    /// thread notices within its ~100ms accept cycle. Concurrent stops on
+    /// clones serialize behind one settlement and each returns only after
+    /// it.
+    ///
+    /// One reentrant edge degrades to signal-only: user code reached
+    /// through a user-installed global logger runs ON the server threads,
+    /// and if such code calls `stop()`, joining from there would deadlock —
+    /// that call silently skips the joins (silently, because logging from
+    /// inside the logger's own frame could deadlock on the logger's lock),
+    /// leaves them available to any other caller, and returns with only
+    /// the signal sent.
+    ///
+    /// More generally: the joined threads log through the global logger
+    /// while they wind down, so blocking in `stop()` while holding ANY
+    /// resource that logger may acquire is a lock inversion. That has two
+    /// shapes, neither detectable from this crate:
+    /// - do not call `stop()` from inside a logger implementation (on any
+    ///   thread) — a `log()` blocking here while holding the logger's own
+    ///   internal lock deadlocks against the winding-down threads' log
+    ///   calls;
+    /// - do not call `stop()` while holding a lock your logger sink also
+    ///   takes (e.g. an `Arc<Mutex<_>>` shared between application code
+    ///   and a custom logger) — the server threads block on that lock in
+    ///   their shutdown logging while `stop()` blocks joining them.
+    ///
+    /// The same discipline applies to joining any thread that logs; the
+    /// server-thread reentrant shape above is the only one the crate can
+    /// detect cheaply, and it is guarded.
+    ///
+    /// An FFmpeg job still pushing to this server (via
+    /// [`create_rtmp_input`](Self::create_rtmp_input)) loses its feed and
+    /// fails its next write; the server classifies that failure — best
+    /// effort, by the server's terminal cause — as a deliberate stop
+    /// rather than as an opaque send error. A feed that already died for
+    /// its own protocol error before the stop keeps the warning it got at
+    /// removal time. Stop such jobs first if their clean completion
+    /// matters.
     ///
     /// # Example
     /// ```rust,ignore
@@ -855,6 +1182,7 @@ impl EmbedRtmpServer<Running> {
     /// ```
     pub fn stop(self) -> EmbedRtmpServer<Ended> {
         self.signal_stop();
+        settle_server_threads(&self.server_thread_ids, &self.threads);
         self.into_state()
     }
 }
@@ -904,6 +1232,7 @@ fn is_fd_exhaustion(e: &std::io::Error) -> bool {
 fn contain_reactor_panic(
     registrations: &RegistrationHandoff,
     status: &AtomicUsize,
+    terminal_cause: &AtomicUsize,
     run_reactor: impl FnOnce(),
 ) {
     // AssertUnwindSafe: the closure borrows the caller's reactor slot mutably,
@@ -917,7 +1246,7 @@ fn contain_reactor_panic(
         // funnel closes the intake ahead of the store, so no create path
         // can observe the stopped status and still be told Ok; the worker's
         // kill switch re-closes it during its terminal drain — a no-op.
-        close_intake_and_publish_end(registrations, status);
+        close_intake_and_publish_end(registrations, status, terminal_cause);
         let msg = payload
             .downcast_ref::<&str>()
             .copied()
@@ -933,6 +1262,7 @@ fn handle_connections(
     gop_limit: usize,
     max_connections: Option<usize>,
     status: Arc<AtomicUsize>,
+    terminal_cause: Arc<AtomicUsize>,
     waker: Option<Waker>,
 ) {
     // FIRST statement of the worker, before the fallible reactor
@@ -952,7 +1282,7 @@ fn handle_connections(
     // publishers still accepted when the worker dies: each claim lives in
     // its `PublisherState`, torn down with the reactor's publisher slab.
     let mut reactor_slot: Option<Reactor> = None;
-    contain_reactor_panic(kill_switch.handoff(), &status, || {
+    contain_reactor_panic(kill_switch.handoff(), &status, &terminal_cause, || {
         let reactor = match Reactor::new(gop_limit, max_connections, status.clone()) {
             Ok(r) => r,
             Err(e) => {
@@ -963,7 +1293,7 @@ fn handle_connections(
                 // loop parked forever. The funnel closes the intake ahead
                 // of the store; the kill switch re-closes it on the way
                 // out — a no-op.
-                close_intake_and_publish_end(kill_switch.handoff(), &status);
+                close_intake_and_publish_end(kill_switch.handoff(), &status, &terminal_cause);
                 error!("Failed to create Reactor: {:?}", e);
                 return;
             }
@@ -1571,6 +1901,7 @@ mod tests {
     use crate::core::context::output::Output;
     use crate::core::scheduler::ffmpeg_scheduler::FfmpegScheduler;
     use ffmpeg_next::time::current;
+    use std::sync::atomic::AtomicBool;
     use std::thread::sleep;
     use std::time::Duration;
 
@@ -1786,6 +2117,413 @@ mod tests {
         assert!(wait_for_port_release(addr));
     }
 
+    // R-A2: stop() is a settlement barrier, not just a signal. When it
+    // returns, both server threads must have exited: the listener is
+    // released (a bind succeeds on the FIRST attempt, no retry loop) and
+    // every in-process publisher torn down with its key claim freed (no
+    // polling for the reactor to "get around to it").
+    #[test]
+    fn stop_settles_the_server_threads_before_returning() {
+        let server = EmbedRtmpServer::new("127.0.0.1:0").start().expect("start");
+        let addr = server.local_addr().expect("bound address");
+        let observer = server.clone();
+
+        // A live in-process publisher whose claim only the worker's teardown
+        // can release. Kept alive across stop(): the release must come from
+        // the joined reactor, not from this Output dropping.
+        let _live = server
+            .create_rtmp_input("app", "settlement-key")
+            .expect("create while running must succeed");
+        assert!(observer.stream_keys.contains("settlement-key"));
+
+        let ended = server.stop();
+        assert!(ended.is_stopped());
+
+        // No wait_for_port_release here — that helper exists for signal-only
+        // paths. A settled stop has already torn everything down.
+        assert!(
+            !observer.stream_keys.contains("settlement-key"),
+            "stop() must not return before the worker released the key claims"
+        );
+        assert!(
+            std::net::TcpListener::bind(addr).is_ok(),
+            "stop() must not return before the accept thread released the listener"
+        );
+    }
+
+    // The settlement barrier must never deadlock on reentrancy: user code
+    // reached through the global logger runs ON the server threads and may
+    // call stop(). Such a call must return promptly WITHOUT touching the
+    // registry — the handles stay available, so a later stop() from any
+    // other thread still settles for real.
+    #[test]
+    fn settlement_from_a_server_thread_is_signal_only_and_preserves_handles() {
+        let server_thread_ids: Arc<Mutex<Vec<std::thread::ThreadId>>> = Default::default();
+        let threads: Arc<Mutex<Vec<JoinHandle<()>>>> = Default::default();
+        let (registered_tx, registered_rx) = std::sync::mpsc::channel::<()>();
+        let (settled_tx, settled_rx) = std::sync::mpsc::channel::<()>();
+
+        let ids_probe = server_thread_ids.clone();
+        let threads_probe = threads.clone();
+        let handle = std::thread::Builder::new()
+            .name("reentrancy-probe".to_string())
+            .spawn(move || {
+                // Hold until the spawner registered this thread's id and
+                // handle, then run the settlement from inside that thread —
+                // the shape of a logger-held clone calling stop().
+                registered_rx
+                    .recv()
+                    .expect("the registration signal must arrive");
+                settle_server_threads(&ids_probe, &threads_probe);
+                settled_tx
+                    .send(())
+                    .expect("report that the settlement returned");
+            })
+            .expect("spawn the probe thread");
+
+        server_thread_ids.lock().unwrap().push(handle.thread().id());
+        threads.lock().unwrap().push(handle);
+        registered_tx.send(()).expect("signal the registration");
+
+        // Deadline-bounded receive, not synchronization: the reentrant call
+        // returns at once; a self-join would hang forever and only this
+        // bound turns that hang into a test failure.
+        settled_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("settlement on a server thread must be signal-only, not a deadlock");
+        assert_eq!(
+            threads.lock().unwrap().len(),
+            1,
+            "the reentrant call must leave the registry untouched"
+        );
+
+        // Any other thread can still run the real settlement afterwards.
+        settle_server_threads(&server_thread_ids, &threads);
+        assert!(
+            threads.lock().unwrap().is_empty(),
+            "a later settlement from a non-server thread must consume and join the handle"
+        );
+    }
+
+    // Racing stops on clones must EACH return only after the server threads
+    // exited: the second caller serializes behind the first's joins on the
+    // registry lock. Each settler asserts the exit flag the moment its
+    // settlement returns — an implementation that returned early would trip
+    // it.
+    #[test]
+    fn concurrent_settlements_both_wait_for_the_thread_exit() {
+        let server_thread_ids: Arc<Mutex<Vec<std::thread::ThreadId>>> = Default::default();
+        let threads: Arc<Mutex<Vec<JoinHandle<()>>>> = Default::default();
+        let exited = Arc::new(AtomicBool::new(false));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+        let exited_worker = exited.clone();
+        let worker = std::thread::Builder::new()
+            .name("held-worker".to_string())
+            .spawn(move || {
+                // Parks until released — stands in for a server thread that
+                // is still settling when the stops arrive.
+                release_rx.recv().expect("the release signal must arrive");
+                exited_worker.store(true, Ordering::Release);
+            })
+            .expect("spawn the held worker");
+        server_thread_ids.lock().unwrap().push(worker.thread().id());
+        threads.lock().unwrap().push(worker);
+
+        let settler = |ids: Arc<Mutex<Vec<std::thread::ThreadId>>>,
+                       threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
+                       exited: Arc<AtomicBool>| {
+            std::thread::spawn(move || {
+                settle_server_threads(&ids, &threads);
+                assert!(
+                    exited.load(Ordering::Acquire),
+                    "settlement returned before the registered thread exited"
+                );
+            })
+        };
+        let first = settler(
+            server_thread_ids.clone(),
+            threads.clone(),
+            exited.clone(),
+        );
+
+        // Deadline-bounded entry probe, not synchronization: wait until the
+        // first settler demonstrably holds the registry lock while joining
+        // the still-parked worker. Only then is the second settler spawned,
+        // so it provably contends with a settlement in progress — and an
+        // implementation that never held the lock across the join would
+        // time this probe out.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while threads.try_lock().is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first settler must be inside the settlement (holding the registry lock) within 5s"
+            );
+            sleep(Duration::from_millis(1));
+        }
+        let second = settler(server_thread_ids, threads, exited);
+
+        // One-sided guard on the second settler: while the worker is still
+        // parked, the first settler holds the registry lock inside its
+        // join, so a correct second settlement CANNOT return — it is either
+        // not yet scheduled or blocked on the lock. An early-returning
+        // implementation finishes here and fails; a correct one can never
+        // trip this, so the bounded window adds no flake risk (slow
+        // scheduling only makes the check vacuous, never wrong).
+        for _ in 0..50 {
+            assert!(
+                !second.is_finished(),
+                "the second settlement returned while the worker was still parked"
+            );
+            sleep(Duration::from_millis(1));
+        }
+
+        release_tx.send(()).expect("release the held worker");
+        first
+            .join()
+            .expect("the first settler must observe the exit");
+        second
+            .join()
+            .expect("the second settler must observe the exit");
+    }
+
+    // A poisoned registry is NOT a settled registry: settlement must ride
+    // over the poison and still join whatever handles remain, or a panic in
+    // one caller would turn every later stop() into a false barrier.
+    #[test]
+    fn settlement_joins_handles_out_of_a_poisoned_registry() {
+        let server_thread_ids: Arc<Mutex<Vec<std::thread::ThreadId>>> = Default::default();
+        let threads: Arc<Mutex<Vec<JoinHandle<()>>>> = Default::default();
+        let exited = Arc::new(AtomicBool::new(false));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+        let exited_worker = exited.clone();
+        let worker = std::thread::spawn(move || {
+            release_rx.recv().expect("the release signal must arrive");
+            exited_worker.store(true, Ordering::Release);
+        });
+        threads.lock().unwrap().push(worker);
+
+        // Poison the registry the way a panicking holder would.
+        let poisoner = threads.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison the registry");
+        })
+        .join();
+        assert!(threads.lock().is_err(), "the registry must be poisoned");
+
+        release_tx.send(()).expect("release the worker");
+        settle_server_threads(&server_thread_ids, &threads);
+        assert!(
+            exited.load(Ordering::Acquire),
+            "settlement must still join the handle held by the poisoned registry"
+        );
+        assert!(
+            threads
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "the poisoned registry must be drained by the settlement"
+        );
+    }
+
+    // A registered thread that died to an uncontained panic is just as
+    // terminated: settlement must report it and return normally instead of
+    // rethrowing the payload out of stop().
+    #[test]
+    fn settlement_contains_a_panicked_thread_join() {
+        let server_thread_ids: Arc<Mutex<Vec<std::thread::ThreadId>>> = Default::default();
+        let threads: Arc<Mutex<Vec<JoinHandle<()>>>> = Default::default();
+        threads.lock().unwrap().push(std::thread::spawn(|| {
+            panic!("uncontained thread panic");
+        }));
+
+        settle_server_threads(&server_thread_ids, &threads);
+        assert!(
+            threads.lock().unwrap().is_empty(),
+            "the panicked thread's handle must still be consumed"
+        );
+    }
+
+    // A panic PAYLOAD is arbitrary user data whose destructor can itself
+    // panic (panic_any with a drop bomb). Disposing of it mid-drain would
+    // unwind with the registry guard live: the remaining handles would be
+    // detached and the registry poisoned into a state that reads as
+    // settled. Settlement must join EVERY handle — including those behind
+    // the bomb — and return normally.
+    #[test]
+    fn settlement_contains_a_panicking_join_payload() {
+        struct PayloadBomb;
+        impl Drop for PayloadBomb {
+            fn drop(&mut self) {
+                panic!("panic payload drop bomb");
+            }
+        }
+
+        let server_thread_ids: Arc<Mutex<Vec<std::thread::ThreadId>>> = Default::default();
+        let threads: Arc<Mutex<Vec<JoinHandle<()>>>> = Default::default();
+        let survivor_joined = Arc::new(AtomicBool::new(false));
+
+        // The bomb thread is registered FIRST so its payload is handled
+        // while another handle still sits behind it in the drain.
+        threads.lock().unwrap().push(std::thread::spawn(|| {
+            std::panic::panic_any(PayloadBomb);
+        }));
+        let survivor_flag = survivor_joined.clone();
+        threads.lock().unwrap().push(std::thread::spawn(move || {
+            survivor_flag.store(true, Ordering::Release);
+        }));
+
+        settle_server_threads(&server_thread_ids, &threads);
+        assert!(
+            survivor_joined.load(Ordering::Acquire),
+            "the handle behind the bomb payload must still be joined"
+        );
+        assert!(
+            threads.lock().unwrap().is_empty(),
+            "settlement must consume every handle despite the bomb payload"
+        );
+    }
+
+    // Settlement never runs a payload's drop glue at all: a payload whose
+    // destructor re-panics with another bomb, and even one whose TWO field
+    // destructors both panic (an abort inside its own drop glue that no
+    // catch can regain control from), must be leaked untouched — the
+    // barrier completes, every handle behind the bombs is joined, and
+    // nothing unwinds or aborts.
+    #[test]
+    fn settlement_contains_a_chained_panic_payload() {
+        struct ChainBomb(u32);
+        impl Drop for ChainBomb {
+            fn drop(&mut self) {
+                if self.0 > 0 {
+                    std::panic::panic_any(ChainBomb(self.0 - 1));
+                }
+            }
+        }
+        struct PlainBomb;
+        impl Drop for PlainBomb {
+            fn drop(&mut self) {
+                panic!("plain payload bomb");
+            }
+        }
+        // Two panicking field destructors in one box: dropping this ANYWHERE
+        // is a guaranteed process abort (panic during panic-unwind).
+        struct TwoBomb {
+            _a: PlainBomb,
+            _b: PlainBomb,
+        }
+
+        let server_thread_ids: Arc<Mutex<Vec<std::thread::ThreadId>>> = Default::default();
+        let threads: Arc<Mutex<Vec<JoinHandle<()>>>> = Default::default();
+        let survivor_joined = Arc::new(AtomicBool::new(false));
+
+        // Chain bomb, plain bomb, the unabortable two-bomb, then a live
+        // survivor: none of the payloads may be dropped, and the survivor
+        // behind all of them must still be joined.
+        threads.lock().unwrap().push(std::thread::spawn(|| {
+            std::panic::panic_any(ChainBomb(2));
+        }));
+        threads.lock().unwrap().push(std::thread::spawn(|| {
+            std::panic::panic_any(PlainBomb);
+        }));
+        threads.lock().unwrap().push(std::thread::spawn(|| {
+            std::panic::panic_any(TwoBomb {
+                _a: PlainBomb,
+                _b: PlainBomb,
+            });
+        }));
+        let survivor_flag = survivor_joined.clone();
+        threads.lock().unwrap().push(std::thread::spawn(move || {
+            survivor_flag.store(true, Ordering::Release);
+        }));
+
+        settle_server_threads(&server_thread_ids, &threads);
+        assert!(
+            survivor_joined.load(Ordering::Acquire),
+            "the survivor behind the bombs must still be joined"
+        );
+        assert!(
+            threads.lock().unwrap().is_empty(),
+            "settlement must consume every handle despite the bomb payloads"
+        );
+    }
+
+    // The terminal cause drives the publisher write callbacks' failure
+    // classification, first-writer-wins: signal_stop (every user-initiated
+    // path) claims CAUSE_DELIBERATE, the bare terminal funnel (worker
+    // death, contained reactor panic) claims CAUSE_FATAL, and whichever
+    // transition lands first keeps the label — in particular, a stop()
+    // arriving AFTER a crash must not relabel the crash as deliberate.
+    #[test]
+    fn terminal_cause_is_first_writer_wins() {
+        // Deliberate first: the cause is claimed as deliberate and a later
+        // fatal funnel (the worker noticing the stop and winding down) must
+        // not overwrite it.
+        let server = EmbedRtmpServer::<Running> {
+            address: String::new(),
+            bound_addr: None,
+            status: Arc::new(AtomicUsize::new(STATUS_RUN)),
+            stream_keys: Default::default(),
+            registrations: Some(Arc::new(RegistrationHandoff::new())),
+            wake_handle: None,
+            threads: Default::default(),
+            server_thread_ids: Default::default(),
+            terminal_cause: Default::default(),
+            gop_limit: 1,
+            max_connections: None,
+            state: PhantomData,
+        };
+        assert_eq!(server.terminal_cause.load(Ordering::Acquire), CAUSE_NONE);
+        server.signal_stop();
+        assert!(server.is_stopped());
+        assert_eq!(
+            server.terminal_cause.load(Ordering::Acquire),
+            CAUSE_DELIBERATE,
+            "signal_stop must claim the deliberate cause"
+        );
+        let registrations = server.registrations.clone().expect("handoff installed");
+        close_intake_and_publish_end(&registrations, &server.status, &server.terminal_cause);
+        assert_eq!(
+            server.terminal_cause.load(Ordering::Acquire),
+            CAUSE_DELIBERATE,
+            "a fatal funnel after a deliberate stop must not relabel it"
+        );
+
+        // Fatal first: the crash claims the cause, and a LATE stop() on a
+        // surviving clone must not repaint it as deliberate — the racing
+        // publisher's failing write keeps its loud classification.
+        let crashed = EmbedRtmpServer::<Running> {
+            address: String::new(),
+            bound_addr: None,
+            status: Arc::new(AtomicUsize::new(STATUS_RUN)),
+            stream_keys: Default::default(),
+            registrations: Some(Arc::new(RegistrationHandoff::new())),
+            wake_handle: None,
+            threads: Default::default(),
+            server_thread_ids: Default::default(),
+            terminal_cause: Default::default(),
+            gop_limit: 1,
+            max_connections: None,
+            state: PhantomData,
+        };
+        let registrations = crashed.registrations.clone().expect("handoff installed");
+        close_intake_and_publish_end(&registrations, &crashed.status, &crashed.terminal_cause);
+        assert!(crashed.is_stopped());
+        assert_eq!(
+            crashed.terminal_cause.load(Ordering::Acquire),
+            CAUSE_FATAL,
+            "a fatal terminal transition must claim the fatal cause"
+        );
+        crashed.signal_stop();
+        assert_eq!(
+            crashed.terminal_cause.load(Ordering::Acquire),
+            CAUSE_FATAL,
+            "a stop() after the crash must not relabel the crash as deliberate"
+        );
+    }
+
     // signal_stop must close the registration intake in the same breath as
     // publishing the stopped status. Without that, a server clone could
     // observe is_stopped() == true, still enqueue a registration, and be
@@ -1802,6 +2540,9 @@ mod tests {
             stream_keys: Default::default(),
             registrations: Some(Arc::new(RegistrationHandoff::new())),
             wake_handle: None,
+            threads: Default::default(),
+            server_thread_ids: Default::default(),
+            terminal_cause: Default::default(),
             gop_limit: 1,
             max_connections: None,
             state: PhantomData,
@@ -1845,6 +2586,9 @@ mod tests {
             stream_keys: Default::default(),
             registrations: Some(registrations.clone()),
             wake_handle: None,
+            threads: Default::default(),
+            server_thread_ids: Default::default(),
+            terminal_cause: Default::default(),
             gop_limit: 1,
             max_connections: None,
             state: PhantomData,
@@ -1859,7 +2603,15 @@ mod tests {
             std::thread::Builder::new()
                 .name("rtmp-server-worker".to_string())
                 .spawn(move || {
-                    handle_connections(connection_receiver, registrations, 1, None, status, None)
+                    handle_connections(
+                        connection_receiver,
+                        registrations,
+                        1,
+                        None,
+                        status,
+                        Default::default(),
+                        None,
+                    )
                 })
                 .expect("spawn the worker thread")
         };
@@ -1948,8 +2700,16 @@ mod tests {
     fn reactor_panic_publishes_terminal_status() {
         let registrations = RegistrationHandoff::new();
         let status = AtomicUsize::new(STATUS_RUN);
-        contain_reactor_panic(&registrations, &status, || panic!("injected reactor panic"));
+        let terminal_cause = AtomicUsize::new(CAUSE_NONE);
+        contain_reactor_panic(&registrations, &status, &terminal_cause, || {
+            panic!("injected reactor panic")
+        });
         assert_eq!(status.load(Ordering::Acquire), STATUS_END);
+        assert_eq!(
+            terminal_cause.load(Ordering::Acquire),
+            CAUSE_FATAL,
+            "a contained panic is a fatal cause"
+        );
         assert!(
             matches!(
                 registrations.enqueue(probe_registration("panicked")),
@@ -1967,8 +2727,14 @@ mod tests {
     fn reactor_clean_return_leaves_status_untouched() {
         let registrations = RegistrationHandoff::new();
         let status = AtomicUsize::new(STATUS_RUN);
-        contain_reactor_panic(&registrations, &status, || {});
+        let terminal_cause = AtomicUsize::new(CAUSE_NONE);
+        contain_reactor_panic(&registrations, &status, &terminal_cause, || {});
         assert_eq!(status.load(Ordering::Acquire), STATUS_RUN);
+        assert_eq!(
+            terminal_cause.load(Ordering::Acquire),
+            CAUSE_NONE,
+            "a clean return must not claim any terminal cause"
+        );
         assert!(
             registrations
                 .enqueue(probe_registration("still-open"))
@@ -1996,6 +2762,9 @@ mod tests {
             stream_keys: Default::default(),
             registrations: Some(registrations.clone()),
             wake_handle: None,
+            threads: Default::default(),
+            server_thread_ids: Default::default(),
+            terminal_cause: Default::default(),
             gop_limit: 1,
             max_connections: None,
             state: PhantomData,
@@ -2005,7 +2774,9 @@ mod tests {
             .create_rtmp_input("app", "before-panic")
             .expect("create while running must succeed");
 
-        contain_reactor_panic(&registrations, &status, || panic!("injected reactor panic"));
+        contain_reactor_panic(&registrations, &status, &server.terminal_cause, || {
+            panic!("injected reactor panic")
+        });
 
         assert!(
             server.is_stopped(),
@@ -2038,6 +2809,9 @@ mod tests {
             registrations: registrations.clone(),
             status: status.clone(),
             wake_handle: None,
+            threads: Default::default(),
+            server_thread_ids: Default::default(),
+            terminal_cause: Default::default(),
         };
 
         let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
@@ -2067,6 +2841,9 @@ mod tests {
             registrations: registrations.clone(),
             status: status.clone(),
             wake_handle: None,
+            threads: Default::default(),
+            server_thread_ids: Default::default(),
+            terminal_cause: Default::default(),
         };
         guard.armed = false;
         drop(guard);
@@ -2095,6 +2872,9 @@ mod tests {
             stream_keys: family.stream_keys.clone(),
             registrations: None,
             wake_handle: None,
+            threads: Default::default(),
+            server_thread_ids: Default::default(),
+            terminal_cause: Default::default(),
             gop_limit: 1,
             max_connections: None,
             state: PhantomData,
