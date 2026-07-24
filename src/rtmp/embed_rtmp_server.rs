@@ -2209,6 +2209,21 @@ mod tests {
             threads.clone(),
             exited.clone(),
         );
+
+        // Deadline-bounded entry probe, not synchronization: wait until the
+        // first settler demonstrably holds the registry lock while joining
+        // the still-parked worker. Only then is the second settler spawned,
+        // so it provably contends with a settlement in progress — and an
+        // implementation that never held the lock across the join would
+        // time this probe out.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while threads.try_lock().is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first settler must be inside the settlement (holding the registry lock) within 5s"
+            );
+            sleep(Duration::from_millis(1));
+        }
         let second = settler(server_thread_ids, threads, exited);
 
         release_tx.send(()).expect("release the held worker");
