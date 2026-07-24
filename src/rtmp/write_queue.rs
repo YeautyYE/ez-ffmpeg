@@ -39,9 +39,12 @@ struct WriteEntry {
     /// these bytes separately (`FlushResult::*::ping_bytes_written`) so the
     /// connection can exclude a ping's own delivery from its write-activity
     /// stamp — only the peer's ANSWER may count as liveness. Tagging the
-    /// entry (instead of keeping a side counter) keeps every removal path
-    /// honest for free: an entry evicted by the age policy simply never
-    /// reports its bytes as written.
+    /// entry (instead of keeping a side counter) keeps the accounting exact
+    /// per entry and per partial write. Ping entries are also exempt from
+    /// age eviction (see `evict_old_entries`): the session serializer has
+    /// already committed csid-2 header history for them, so dropping one
+    /// unsent would desynchronize every later control message's compressed
+    /// header against the peer.
     is_ping: bool,
 }
 
@@ -237,6 +240,17 @@ impl WriteQueue {
         while let Some(entry) = self.queue.front() {
             // Sequence headers never evicted
             if entry.is_sequence_header {
+                break;
+            }
+            // Serialized pings never evicted either: the watcher session's
+            // stateful serializer already committed csid-2 header history
+            // for this message, so dropping it unsent would make the NEXT
+            // control message header-compress against a packet the peer
+            // never received — corrupting the chunk stream. (Droppable
+            // media is serialized drop-tolerantly; control is not.) The
+            // ping is a few bytes; a peer too stalled to drain it still
+            // dies via the Critical cap or the connection timeout.
+            if entry.is_ping {
                 break;
             }
             // A partially written entry is pinned: evicting it mid-send
@@ -726,32 +740,35 @@ mod tests {
         assert!(queue.is_empty());
     }
 
-    // An aged-out ping evicted by the backpressure policy must simply never
-    // be reported as written: entry tagging keeps every removal path honest
-    // with no side counter to desynchronize.
+    // A serialized ping is pinned against age eviction: the watcher
+    // session's serializer already committed csid-2 header history for it,
+    // so dropping it unsent would make the next control message
+    // header-compress against a packet the peer never received. However
+    // aged, the ping must survive the Warning-band eviction sweep and be
+    // delivered (and reported) as ping bytes.
     #[test]
-    fn evicted_ping_is_never_reported_written() {
+    fn aged_ping_is_never_evicted() {
         let mut queue = WriteQueue::new();
         assert!(queue.enqueue_ping(Bytes::from_static(b"ping-bytes-payload")));
-        // Age the ping past the audio-only eviction horizon (no video was
-        // ever enqueued here); it sits unwritten at the front, so it is
-        // eligible for eviction.
+        // Age the ping far past the audio-only eviction horizon (no video
+        // was ever enqueued here); it sits unwritten at the front, where
+        // the eviction sweep would otherwise reap it.
         queue.queue.front_mut().unwrap().timestamp = Instant::now()
             .checked_sub(std::time::Duration::from_secs(AUDIO_ONLY_MAX_AGE_SECS + 1))
             .expect("monotonic clock should be past the eviction horizon");
 
-        // Fill into the Warning band with audio, then one more enqueue runs
-        // the age eviction and removes the stale ping.
+        // Fill into the Warning band with audio; the next enqueue runs the
+        // age-eviction sweep, which must stop at the pinned ping.
         let audio_chunk = Bytes::from(vec![0u8; QUEUE_WARN_BYTES / 2]);
         queue.enqueue(audio_chunk.clone(), false, false, false);
         queue.enqueue(audio_chunk, false, false, false);
         queue.enqueue(Bytes::from_static(b"tail"), false, false, false);
 
-        let expected_ordinary = QUEUE_WARN_BYTES / 2 * 2 + 4;
+        let expected_total = 18 + QUEUE_WARN_BYTES / 2 * 2 + 4;
         assert_eq!(
             queue.pending_bytes(),
-            expected_ordinary,
-            "the aged ping must have been evicted by the Warning-band enqueue"
+            expected_total,
+            "the aged ping must survive the Warning-band eviction sweep"
         );
 
         let mut writer: Vec<u8> = Vec::new();
@@ -761,10 +778,10 @@ mod tests {
                 bytes_written,
                 ping_bytes_written,
             } => {
-                assert_eq!(bytes_written, expected_ordinary);
+                assert_eq!(bytes_written, expected_total);
                 assert_eq!(
-                    ping_bytes_written, 0,
-                    "an evicted ping was never written and must not be reported as such"
+                    ping_bytes_written, 18,
+                    "the delivered ping's bytes must still be reported as ping bytes"
                 );
             }
             other => panic!("expected Complete, got {other:?}"),
