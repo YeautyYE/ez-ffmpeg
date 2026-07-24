@@ -21,6 +21,9 @@ pub fn get_hwaccels() -> Vec<HWAccelInfo> {
     let mut device_type = AVHWDeviceType::AV_HWDEVICE_TYPE_NONE;
 
     loop {
+        // SAFETY: pure FFI enumeration — takes the previous type by value
+        // and returns the next enum value (or TYPE_NONE at the end); no
+        // pointers are involved.
         device_type = unsafe { av_hwdevice_iterate_types(device_type) };
         if device_type == AVHWDeviceType::AV_HWDEVICE_TYPE_NONE {
             break;
@@ -210,22 +213,51 @@ pub(crate) unsafe fn hw_device_free_all() {
     }
 }
 
-/// Name of a hardware device type, `None` when the linked FFmpeg has no
-/// name for it — `av_hwdevice_get_type_name` returns NULL then, notably
-/// for `AV_HWDEVICE_TYPE_NONE` — so log paths never hand a NULL to
-/// `CStr::from_ptr`.
-pub(crate) fn hw_device_type_name(device_type: AVHWDeviceType) -> Option<&'static str> {
-    // SAFETY: av_hwdevice_get_type_name returns NULL or a pointer into a
-    // static name table in libavutil, so a non-NULL result is a valid C
-    // string with static lifetime.
-    unsafe {
-        let name = av_hwdevice_get_type_name(device_type);
-        if name.is_null() {
-            None
-        } else {
-            CStr::from_ptr(name).to_str().ok()
+/// Validated name of a hardware device type.
+///
+/// Wraps the string `av_hwdevice_get_type_name` returns, with the raw
+/// pointer checked exactly once, at construction in
+/// [`HwDeviceTypeName::lookup`]. Invariant held from then on: the inner
+/// `CStr` was built from a non-NULL result of that lookup, which points
+/// into libavutil's static, immutable name table — never freed or modified
+/// — so the reference is valid for `'static` and every accessor is safe.
+/// No use after construction needs `unsafe`.
+#[derive(Clone, Copy)]
+struct HwDeviceTypeName(&'static CStr);
+
+impl HwDeviceTypeName {
+    /// Resolves the name of `device_type`; `None` when the linked FFmpeg
+    /// has no name for it — `av_hwdevice_get_type_name` returns NULL then,
+    /// notably for `AV_HWDEVICE_TYPE_NONE` — so no NULL can ever reach
+    /// `CStr::from_ptr`.
+    fn lookup(device_type: AVHWDeviceType) -> Option<Self> {
+        // SAFETY: the ONE validity assertion behind this type's invariant.
+        // av_hwdevice_get_type_name takes the type by value (no
+        // preconditions) and returns either NULL — rejected here — or a
+        // pointer into libavutil's static NUL-terminated name table, which
+        // is never freed or modified, so the CStr is valid for 'static.
+        unsafe {
+            let name = av_hwdevice_get_type_name(device_type);
+            if name.is_null() {
+                None
+            } else {
+                Some(Self(CStr::from_ptr(name)))
+            }
         }
     }
+
+    /// UTF-8 view of the name; `None` for a non-UTF-8 table entry
+    /// (FFmpeg's type names are ASCII, so this is theoretical).
+    fn to_str(self) -> Option<&'static str> {
+        self.0.to_str().ok()
+    }
+}
+
+/// Name of a hardware device type, `None` when the linked FFmpeg has no
+/// name for it or the entry is not UTF-8 (see [`HwDeviceTypeName`], which
+/// owns the pointer validation).
+pub(crate) fn hw_device_type_name(device_type: AVHWDeviceType) -> Option<&'static str> {
+    HwDeviceTypeName::lookup(device_type)?.to_str()
 }
 
 pub(crate) fn hw_device_for_filter() -> Option<HWDevice> {
@@ -642,11 +674,7 @@ fn register_from_type_device(
 /// Returns `None` when the type has no name (unknown to the linked FFmpeg):
 /// such a device cannot be created, so nothing is ever registered for it.
 fn type_init_arg(device_type: AVHWDeviceType, device: Option<&str>) -> Option<String> {
-    let type_name = unsafe { av_hwdevice_get_type_name(device_type) };
-    if type_name.is_null() {
-        return None;
-    }
-    let type_name = unsafe { CStr::from_ptr(type_name) }.to_str().ok()?;
+    let type_name = hw_device_type_name(device_type)?;
     Some(match device {
         None => format!(":{type_name}"),
         Some(device) => format!(":{type_name}:{device}"),
@@ -655,12 +683,7 @@ fn type_init_arg(device_type: AVHWDeviceType, device: Option<&str>) -> Option<St
 
 pub(crate) fn hw_device_default_name(device_type: AVHWDeviceType) -> Option<String> {
     // Get the name of the hardware device type
-    let type_name = unsafe { av_hwdevice_get_type_name(device_type) };
-    if type_name.is_null() {
-        return None;
-    }
-
-    let type_name = unsafe { CStr::from_ptr(type_name) }.to_str().ok()?;
+    let type_name = hw_device_type_name(device_type)?;
     let index_limit = 1000;
 
     for index in 0..index_limit {
@@ -865,21 +888,20 @@ pub fn get_gpu_filter_backends() -> Vec<GpuFilterBackend> {
     let mut device_type = AVHWDeviceType::AV_HWDEVICE_TYPE_NONE;
 
     loop {
+        // SAFETY: pure FFI enumeration — takes the previous type by value
+        // and returns the next enum value (or TYPE_NONE at the end); no
+        // pointers are involved.
         device_type = unsafe { av_hwdevice_iterate_types(device_type) };
         if device_type == AVHWDeviceType::AV_HWDEVICE_TYPE_NONE {
             break;
         }
 
-        let name = unsafe {
-            let name = av_hwdevice_get_type_name(device_type);
-            if name.is_null() {
-                continue;
-            }
-            match CStr::from_ptr(name).to_str() {
-                Ok(name) => name.to_string(),
-                Err(_) => "unknown name".to_string(),
-            }
+        // A type the linked FFmpeg has no name for cannot be addressed in
+        // a filter chain; skip it (same guard as get_hwaccels).
+        let Some(type_name) = HwDeviceTypeName::lookup(device_type) else {
+            continue;
         };
+        let name = type_name.to_str().unwrap_or("unknown name").to_string();
 
         let (device_available, device_error) = probe_hw_device(device_type);
 
@@ -970,6 +992,29 @@ mod tests {
         assert!(is_filter_available("scale"));
         assert!(!is_filter_available("definitely_not_a_filter_xyz"));
         assert!(!is_filter_available("bad\0name"));
+    }
+
+    // The type-name newtype asserts pointer validity once at construction:
+    // a type the linked FFmpeg has no name for (notably TYPE_NONE, where
+    // av_hwdevice_get_type_name returns NULL) must yield None instead of
+    // reaching CStr::from_ptr, and a known type resolves to its entry in
+    // libavutil's static name table — no hardware needed.
+    #[test]
+    fn type_name_lookup_rejects_null_and_resolves_known_types() {
+        assert!(HwDeviceTypeName::lookup(AVHWDeviceType::AV_HWDEVICE_TYPE_NONE).is_none());
+        assert_eq!(
+            hw_device_type_name(AVHWDeviceType::AV_HWDEVICE_TYPE_NONE),
+            None
+        );
+
+        let name = HwDeviceTypeName::lookup(AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI)
+            .expect("vaapi is always in libavutil's static name table")
+            .to_str();
+        assert_eq!(name, Some("vaapi"));
+        assert_eq!(
+            hw_device_type_name(AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI),
+            Some("vaapi")
+        );
     }
 
     fn dev(name: &str, init_arg: Option<&str>) -> HWDevice {
