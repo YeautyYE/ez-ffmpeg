@@ -1147,15 +1147,22 @@ impl EmbedRtmpServer<Running> {
     /// leaves them available to any other caller, and returns with only
     /// the signal sent.
     ///
-    /// More generally: do not call `stop()` from inside a logger
-    /// implementation on ANY thread. The joined threads log through the
-    /// global logger while they wind down, so a `log()` that blocks in
-    /// `stop()` while holding the logger's own internal lock inverts
-    /// against those threads' log calls and deadlocks. This is a
-    /// restriction on logger implementations (which the `log` contract
-    /// already expects to be reentrancy-conscious), not on ordinary
-    /// callers; the server-thread case above is the only shape the crate
-    /// can detect cheaply, and it is guarded.
+    /// More generally: the joined threads log through the global logger
+    /// while they wind down, so blocking in `stop()` while holding ANY
+    /// resource that logger may acquire is a lock inversion. That has two
+    /// shapes, neither detectable from this crate:
+    /// - do not call `stop()` from inside a logger implementation (on any
+    ///   thread) — a `log()` blocking here while holding the logger's own
+    ///   internal lock deadlocks against the winding-down threads' log
+    ///   calls;
+    /// - do not call `stop()` while holding a lock your logger sink also
+    ///   takes (e.g. an `Arc<Mutex<_>>` shared between application code
+    ///   and a custom logger) — the server threads block on that lock in
+    ///   their shutdown logging while `stop()` blocks joining them.
+    ///
+    /// The same discipline applies to joining any thread that logs; the
+    /// server-thread reentrant shape above is the only one the crate can
+    /// detect cheaply, and it is guarded.
     ///
     /// An FFmpeg job still pushing to this server (via
     /// [`create_rtmp_input`](Self::create_rtmp_input)) loses its feed and
