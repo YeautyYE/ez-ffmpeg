@@ -2642,6 +2642,177 @@ mod tests {
         assert!(conn.is_ping_due_at(base + idle, idle));
     }
 
+    // End-to-end chain regression at the wire level: a csid-2 control
+    // sequence — acknowledgement, ping, acknowledgement, acknowledgement —
+    // serialized by ONE stateful serializer must survive High-band
+    // shedding and decode against a deserializer that sees exactly the
+    // delivered bytes. Before non-droppable entries bypassed the shedding
+    // policy, the High band silently shed the middle acknowledgement while
+    // the serializer had already committed its csid-2 header history; the
+    // following acknowledgement then header-compressed against a packet
+    // the peer never received and decoding lost RTMP framing. Droppable
+    // video is shed around the chain to prove media drops stay safe (rml
+    // serializes droppable packets drop-tolerantly on their own csid).
+    #[test]
+    fn high_band_control_chain_survives_and_decodes() {
+        use rml_rtmp::chunk_io::ChunkDeserializer;
+        use rml_rtmp::messages::UserControlEventType;
+
+        let ts0 = RtmpTimestamp { value: 0 };
+        let ack_payload = |n: u32| {
+            RtmpMessage::Acknowledgement {
+                sequence_number: n,
+            }
+            .into_message_payload(ts0, 0)
+            .expect("build acknowledgement")
+        };
+        let a0 = ack_payload(1);
+        let ping = RtmpMessage::UserControl {
+            event_type: UserControlEventType::PingRequest,
+            stream_id: None,
+            buffer_length: None,
+            timestamp: Some(RtmpTimestamp { value: 7 }),
+        }
+        .into_message_payload(ts0, 0)
+        .expect("build ping");
+        // Large enough to push the queue into the High band (2MB) once
+        // enqueued, small enough to stay clear of the Critical cap (4MB).
+        let v1 = RtmpMessage::VideoData {
+            data: Bytes::from(vec![0x17u8; 2 * 1024 * 1024 + 64 * 1024]),
+        }
+        .into_message_payload(ts0, 1)
+        .expect("build large video");
+        let a1 = ack_payload(2);
+        let v2 = RtmpMessage::VideoData {
+            data: Bytes::from(vec![0x27u8; 512]),
+        }
+        .into_message_payload(ts0, 1)
+        .expect("build sheddable video");
+        let a2 = ack_payload(3);
+        let v3 = RtmpMessage::VideoData {
+            data: Bytes::from(vec![0x17u8; 256]),
+        }
+        .into_message_payload(ts0, 1)
+        .expect("build trailing video");
+
+        // What the peer must end up decoding, in wire order (v2 is shed).
+        let expected: Vec<(u8, Bytes)> = vec![
+            (3, a0.data.clone()),
+            (4, ping.data.clone()),
+            (9, v1.data.clone()),
+            (3, a1.data.clone()),
+            (3, a2.data.clone()),
+            (9, v3.data.clone()),
+        ];
+
+        // ONE stateful serializer, serialization order == enqueue order —
+        // exactly the session's situation. Control is non-droppable, media
+        // is serialized drop-tolerantly; pin the rml contract the queue
+        // policy relies on.
+        let mut serializer = ChunkSerializer::new();
+        let p_a0 = serializer.serialize(&a0, false, false).expect("ser a0");
+        let p_ping = serializer.serialize(&ping, false, false).expect("ser ping");
+        let p_v1 = serializer.serialize(&v1, false, true).expect("ser v1");
+        let p_a1 = serializer.serialize(&a1, false, false).expect("ser a1");
+        let p_v2 = serializer.serialize(&v2, false, true).expect("ser v2");
+        let p_a2 = serializer.serialize(&a2, false, false).expect("ser a2");
+        let p_v3 = serializer.serialize(&v3, false, true).expect("ser v3");
+        assert!(!p_a1.can_be_dropped, "rml must mark control non-droppable");
+        assert!(p_v1.can_be_dropped, "rml must mark tolerant media droppable");
+
+        let mut queue = WriteQueue::new();
+        let mut wire: Vec<u8> = Vec::new();
+
+        // Normal band: the acknowledgement and the ping go out.
+        assert!(queue.enqueue(
+            Bytes::from(p_a0.bytes),
+            false,
+            false,
+            false,
+            p_a0.can_be_dropped
+        ));
+        assert!(queue.enqueue_ping(Bytes::from(p_ping.bytes)));
+        queue.try_flush(&mut wire).expect("flush the opening pair");
+
+        // The large keyframe pushes the backlog into the High band.
+        assert!(queue.enqueue(
+            Bytes::from(p_v1.bytes),
+            true,
+            false,
+            true,
+            p_v1.can_be_dropped
+        ));
+        assert_eq!(queue.backpressure_level(), BackpressureLevel::High);
+        // The acknowledgement behind it must be RETAINED (the old policy
+        // shed it right here), while a droppable non-keyframe is shed.
+        assert!(queue.enqueue(
+            Bytes::from(p_a1.bytes),
+            false,
+            false,
+            false,
+            p_a1.can_be_dropped
+        ));
+        let before_shed = queue.pending_bytes();
+        assert!(queue.enqueue(
+            Bytes::from(p_v2.bytes),
+            false,
+            false,
+            true,
+            p_v2.can_be_dropped
+        ));
+        assert_eq!(
+            queue.pending_bytes(),
+            before_shed,
+            "the droppable non-keyframe must be shed in the High band"
+        );
+        queue.try_flush(&mut wire).expect("flush the pressured batch");
+        assert!(queue.is_empty(), "the pressured batch must drain fully");
+
+        // Drained again: the trailing control and media go out normally.
+        assert!(queue.enqueue(
+            Bytes::from(p_a2.bytes),
+            false,
+            false,
+            false,
+            p_a2.can_be_dropped
+        ));
+        assert!(queue.enqueue(
+            Bytes::from(p_v3.bytes),
+            true,
+            false,
+            true,
+            p_v3.can_be_dropped
+        ));
+        queue.try_flush(&mut wire).expect("flush the tail");
+
+        // The peer's view: decode the ENTIRE delivered wire with one
+        // deserializer. Every message must come back with its own type and
+        // payload — a mis-compressed csid-2 header would corrupt types,
+        // lengths or framing from the middle acknowledgement onwards.
+        let mut deserializer = ChunkDeserializer::new();
+        let mut decoded: Vec<(u8, Bytes)> = Vec::new();
+        let mut next = deserializer
+            .get_next_message(&wire)
+            .expect("the delivered wire must stay decodable");
+        while let Some(payload) = next {
+            decoded.push((payload.type_id, payload.data));
+            next = deserializer
+                .get_next_message(&[])
+                .expect("valid buffered continuation");
+        }
+        assert_eq!(
+            decoded.len(),
+            expected.len(),
+            "exactly the delivered messages must decode"
+        );
+        for (i, ((got_type, got_data), (want_type, want_data))) in
+            decoded.iter().zip(expected.iter()).enumerate()
+        {
+            assert_eq!(got_type, want_type, "message {i} type");
+            assert_eq!(got_data, want_data, "message {i} payload");
+        }
+    }
+
     // R-B: a quiet watcher on a channel with no publisher used to be reaped
     // by the 60s idle sweep — the server never sent anything, the client had
     // nothing left to say after `play`, and last_activity never moved. The
