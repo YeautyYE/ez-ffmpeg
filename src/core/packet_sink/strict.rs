@@ -607,7 +607,10 @@ impl PacketSinkWorker {
     /// the original error); stays silent for aborts and clean cancellation.
     /// On that JobFailed path only, a registered `on_job_failed` observer
     /// receives the structured summary first, under its own containment, so
-    /// a panicking observer can never skip the terminal dispatch.
+    /// a panicking observer can never skip the terminal dispatch — its
+    /// caught payload is parked and disposed only AFTER the terminal
+    /// (payload destructors are user code too, and disposing one is
+    /// abort-capable under the two-bomb boundary).
     ///
     /// The stashed error reaches the callback BY REFERENCE — custody stays
     /// with the worker. Its `error.source` can be the last `Arc` to a
@@ -654,26 +657,41 @@ impl PacketSinkWorker {
             //
             // The structured observer runs first, under its OWN catch: the
             // terminal on_delivery_error below must fire even when a
-            // registered on_job_failed panics. The caught payload goes
-            // through the bounded disposal, and the failure log waits until
-            // AFTER the terminal dispatch so a panicking logger cannot skip
-            // it either (that late log panic unwinds into the mux worker's
-            // terminal-region containment, exactly like the logging that
-            // already follows finish()).
-            let observer_panicked = match std::panic::catch_unwind(
-                std::panic::AssertUnwindSafe(|| self.sink.dispatch_job_failed(&summary)),
-            ) {
-                Ok(()) => false,
-                Err(payload) => {
-                    super::dispose_panic_payload(payload);
-                    true
-                }
-            };
+            // registered on_job_failed panics. The caught payload is PARKED
+            // here, not disposed: dropping a `panic_any` payload runs
+            // arbitrary user destructors, which under the crate's two-bomb
+            // boundary is an abort-capable operation — nothing abort-capable
+            // may sit between the observer and the terminal.
+            let observer_payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || self.sink.dispatch_job_failed(&summary),
+            ))
+            .err();
             // Byte-identity by construction: the JobFailed message is MOVED
-            // out of the summary, never re-formatted.
-            self.sink.dispatch_delivery_error(&PacketSinkError::JobFailed {
-                message: summary.into_message(),
-            });
+            // out of the summary, never re-formatted. The dispatch runs
+            // under a local catch ONLY so this frame's unwind cannot drop
+            // the parked payload (a panicking payload destructor mid-unwind
+            // would escalate to an abort); the terminal's own panic is
+            // re-thrown below, payload intact, so the mux worker's
+            // terminal-region containment observes exactly what it observed
+            // before the observer existed.
+            let terminal_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.sink.dispatch_delivery_error(&PacketSinkError::JobFailed {
+                    message: summary.into_message(),
+                })
+            }));
+            let observer_panicked = observer_payload.is_some();
+            if let Some(payload) = observer_payload {
+                // Bounded disposal AFTER the terminal: a two-bomb payload
+                // still aborts (the documented per-box boundary), but it can
+                // no longer abort BETWEEN the observer and the terminal.
+                super::dispose_panic_payload(payload);
+            }
+            if let Err(terminal_payload) = terminal_outcome {
+                // Re-thrown before any logging, exactly like the
+                // pre-observer path: a panicking terminal skips the observer
+                // log and reaches the outer containment first.
+                std::panic::resume_unwind(terminal_payload);
+            }
             if observer_panicked {
                 log::error!(
                     "packet sink on_job_failed observer panicked; the JobFailed terminal was still dispatched"
@@ -2168,6 +2186,45 @@ mod tests {
             other => panic!("the lone slot belongs to Error(JobFailed), got {other:?}"),
         }
         assert!(rx.recv().is_err(), "nothing else may be queued");
+    }
+
+    /// The observer's caught panic payload may run arbitrary user
+    /// destructors when dropped (`panic_any`), so its disposal is an
+    /// abort-capable operation under the crate's two-bomb boundary — it must
+    /// happen only AFTER the terminal dispatch, never between the observer
+    /// and the terminal. Pinned with a benign payload whose Drop records its
+    /// position in the event order.
+    #[test]
+    fn observer_panic_payload_is_disposed_only_after_the_terminal_dispatch() {
+        struct OrderProbe(Arc<Mutex<Vec<&'static str>>>);
+        impl Drop for OrderProbe {
+            fn drop(&mut self) {
+                self.0.lock().unwrap().push("payload_disposed");
+            }
+        }
+        let ctx = video_ctx();
+        let order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let (probe_log, err_log) = (order.clone(), order.clone());
+        let sink = PacketSink::builder(|_: &PacketView<'_>| Ok(()))
+            .on_job_failed(move |_summary: &JobFailureSummary| {
+                std::panic::panic_any(OrderProbe(probe_log.clone()));
+            })
+            .on_delivery_error(move |_e| err_log.lock().unwrap().push("delivery_error"))
+            .build();
+        let mut worker = collect(&ctx, sink).unwrap();
+        assert_eq!(worker.deliver_stream_info(), 0);
+        let recorded = crate::error::Error::WorkerPanicked("muxer1:mpegts".to_string());
+        worker.finish(
+            false,
+            AVERROR_EXTERNAL,
+            false,
+            Some(JobFailureSummary::from_error(&recorded)),
+        );
+        assert_eq!(
+            order.lock().unwrap().as_slice(),
+            ["delivery_error", "payload_disposed"],
+            "the terminal must fire before the observer's payload is dropped"
+        );
     }
 
     /// Cancellation precedence when a sibling failure races the shutdown:
