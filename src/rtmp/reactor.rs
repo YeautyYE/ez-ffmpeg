@@ -285,10 +285,12 @@ pub struct ReactorConnection {
     /// the PEER sends (its ping response — a read) can keep a quiet
     /// connection alive, and a peer that never answers ages toward the
     /// timeout exactly as if the server had sent nothing. Attribution is
-    /// FIFO and conservative: a ping is queued only after 30s of idleness
-    /// (in practice onto an empty queue), and when an unflushed tail does
-    /// sit ahead of it the discount can only under-credit a flush by the
-    /// ping's few bytes — never inflate liveness.
+    /// FIFO from the queue front and EXACT by construction:
+    /// `is_ping_due_at` refuses to ping while any write is pending, so a
+    /// ping is only ever queued onto an empty queue — the first
+    /// `pending_ping_bytes` bytes any subsequent flush moves are the
+    /// ping's, and everything beyond them is ordinary data queued behind
+    /// it.
     pending_ping_bytes: usize,
 }
 
@@ -381,6 +383,18 @@ impl ReactorConnection {
         if self.state != ConnectionState::Active || self.close_deadline.is_some() {
             return false;
         }
+        // A queued tail suppresses the probe, for two reasons. Pointless:
+        // that tail's own delivery or failure will resolve the peer's
+        // liveness. Load-bearing: the ping-byte discount in
+        // `credit_non_ping_write` attributes flushed bytes FIFO from the
+        // queue front, which is exact only when the ping is the front of an
+        // initially empty queue — ordinary bytes sitting AHEAD of a ping
+        // would eat the discount first (suppressing a real write's stamp)
+        // and leave the ping's own bytes to be credited later as ordinary
+        // activity, inflating liveness for a peer that never answered.
+        if self.has_pending_writes() {
+            return false;
+        }
         if now.saturating_duration_since(self.last_activity()) < idle {
             return false;
         }
@@ -449,8 +463,9 @@ impl ReactorConnection {
 
     /// Discount queued liveness-ping bytes from a flush's write-activity
     /// credit and report whether anything beyond them was written (see
-    /// `pending_ping_bytes` for why a ping's own delivery must not count as
-    /// liveness).
+    /// `pending_ping_bytes` for why a ping's own delivery must not count
+    /// as liveness, and for the queue-front invariant that makes this FIFO
+    /// discount exact).
     fn credit_non_ping_write(&mut self, bytes_written: usize) -> bool {
         let ping_part = self.pending_ping_bytes.min(bytes_written);
         self.pending_ping_bytes -= ping_part;
@@ -2562,6 +2577,54 @@ mod tests {
             conn.last_activity() > before,
             "non-ping writes must stamp write activity"
         );
+
+        // Mixed flush with the ping at the FRONT — the only mix the sweep
+        // can produce, since pings are queued onto drained queues only:
+        // the ordinary bytes behind the ping must stamp, exactly, because
+        // the FIFO discount consumes the ping bytes first.
+        let stale = Instant::now()
+            .checked_sub(Duration::from_secs(CONNECTION_TIMEOUT_SECS + 1))
+            .expect("monotonic clock should be well past 61s after a full build");
+        conn.last_read_activity = stale;
+        conn.last_write_activity = stale;
+        let before = conn.last_activity();
+        assert!(conn.enqueue_raw(vec![2u8; 18]));
+        conn.note_ping_queued(Instant::now(), 18);
+        assert!(conn.enqueue_data(Bytes::from(vec![3u8; 32]), false, false, false));
+        conn.try_flush().expect("flush the ping plus the tail behind it");
+        assert!(!conn.has_pending_writes(), "both entries must flush");
+        assert!(
+            conn.last_activity() > before,
+            "ordinary bytes flushed behind the ping must stamp activity"
+        );
+    }
+
+    // Pings are only for drained connections: a queued tail suppresses the
+    // probe (its own delivery or failure resolves liveness), and the
+    // queue-front invariant is what keeps the ping-byte discount exact.
+    #[test]
+    fn ping_is_not_due_while_writes_are_pending() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to get address");
+        let _client = TcpStream::connect(addr).expect("Failed to connect");
+        let (server, _) = listener.accept().expect("Failed to accept");
+        let mut conn = ReactorConnection::new(ConnectionToken::new(0, 1), server)
+            .expect("Failed to create connection");
+        conn.state = ConnectionState::Active;
+
+        let idle = Duration::from_secs(WATCHER_PING_IDLE_SECS);
+        assert!(conn.enqueue_raw(vec![0u8; 8]));
+        assert!(
+            !conn.is_ping_due_at(conn.last_activity() + idle * 3, idle),
+            "a queued tail must suppress the probe however idle the clock looks"
+        );
+
+        conn.try_flush().expect("drain the tail");
+        assert!(!conn.has_pending_writes());
+        // Re-anchor after the flush stamped activity: once drained, the
+        // probe becomes due again past the idle window.
+        let base = conn.last_activity();
+        assert!(conn.is_ping_due_at(base + idle, idle));
     }
 
     // R-B: a quiet watcher on a channel with no publisher used to be reaped
