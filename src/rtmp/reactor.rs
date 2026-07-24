@@ -2580,10 +2580,10 @@ mod tests {
             "non-ping writes must stamp write activity"
         );
 
-        // Mixed flush with the ping at the FRONT — the only mix the sweep
-        // can produce, since pings are queued onto drained queues only:
-        // the ordinary bytes behind the ping must stamp, exactly, because
-        // the FIFO discount consumes the ping bytes first.
+        // Mixed flush, ping plus ordinary data in one write: the entry
+        // tags in the write queue attribute each entry's bytes exactly, so
+        // the ordinary bytes behind the ping must stamp activity while the
+        // ping's own bytes earn nothing.
         let stale = Instant::now()
             .checked_sub(Duration::from_secs(CONNECTION_TIMEOUT_SECS + 1))
             .expect("monotonic clock should be well past 61s after a full build");
@@ -2601,9 +2601,10 @@ mod tests {
         );
     }
 
-    // Pings are only for drained connections: a queued tail suppresses the
-    // probe (its own delivery or failure resolves liveness), and the
-    // queue-front invariant is what keeps the ping-byte discount exact.
+    // Pings are only for drained connections: a queued tail's own delivery
+    // or failure already resolves the peer's liveness, so probing it adds
+    // nothing. (Byte attribution does not depend on this gate — ping
+    // entries are tagged in the write queue itself.)
     #[test]
     fn ping_is_not_due_while_writes_are_pending() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
