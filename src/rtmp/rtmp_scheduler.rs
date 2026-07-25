@@ -5088,6 +5088,24 @@ mod tests {
         let k_gen1 = media_payload(0x17, 0x01, 0xF1, 64);
         feed(&mut scheduler, "aba", ReceivedDataType::Video, 500, &k_gen1);
 
+        // Give the test teeth: ordinary live history is all droppable and
+        // forces type 0 by itself, so a deleted swap would go unnoticed.
+        // Plant one NON-droppable csid-4 entry (same stream id) directly in
+        // the generation-1 shared serializer — compressible history that
+        // only a swapped-in fresh serializer cannot inherit. Without the
+        // swap, generation 2's first video below would delta-compress
+        // against this and the byte comparison fails.
+        let planted = media_payload(0x27, 0x01, 0xF9, 32);
+        serialize_media(
+            &mut scheduler.channels.get_mut("aba").unwrap().fanout_serializer,
+            ReceivedDataType::Video,
+            1,
+            planted,
+            RtmpTimestamp { value: 600 },
+            false,
+        )
+        .expect("plant non-droppable csid-4 history");
+
         // Publisher goes away; the lingering watcher keeps the channel.
         scheduler.publishing_ended("aba");
         assert!(scheduler.channels.contains_key("aba"));
