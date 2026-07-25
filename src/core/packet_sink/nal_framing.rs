@@ -122,26 +122,29 @@ pub(crate) fn walk_annexb<'a>(
 /// are ruled out at once. The probe tests are mask compares on one
 /// little-endian `u32` covering `data[i..i + 4]`, keeping the 0-vs-1
 /// disambiguation and the hit test branch-free: a branchy probe
-/// comparison chain pays a ~25% mispredicted branch per probe on
-/// 0x01-dense payloads and drops below the byte scan on the rewrite walk.
-/// The stride is preceded by an eight-position byte-wise prelude
-/// identical to the plain byte scan: when the hit sits right next to the
-/// scan origin — the rule, not the exception, in separator-dense streams
-/// of tiny NALs — the byte loop is already optimal there and any
-/// word-load stride only adds overhead, while for hits farther out the
-/// prelude's cost vanishes against the striding gain. Payload bytes come
-/// from remote senders, which makes the variant choice worst-corpus
+/// comparison chain would pay a ~25% mispredicted branch per probe on
+/// 0x01-dense payloads and drop below the byte scan on the rewrite walk.
+/// The single word load per position also replaces the byte scan's three
+/// dependent loads, so even the non-striding arms (a zero probe advancing
+/// one byte across long zero runs) stay ahead of it.
+///
+/// Marked `#[inline(always)]`, not split behind a call: the previous
+/// byte-by-byte finder was a small private fn that LLVM folded into
+/// [`walk_annexb`], so the walker paid no call per NAL. This wider finder
+/// is past the inliner's automatic size threshold (a plain `#[inline]`
+/// hint leaves an out-of-line copy that the walker still `call`s once per
+/// NAL — verified in release disassembly), which is exactly the
+/// separator-dense penalty a real deployment would hit: streams of tiny
+/// NALs invoke the finder once per NAL. Forcing the inline restores the
+/// parent's lowering — the finder folds into the walker, no boundary —
+/// and the benchmark's paired production rows confirm parity by timing
+/// this walker against the parent's own inlined composition. Payload bytes
+/// come from remote senders, which makes the variant choice worst-corpus
 /// driven (see `bench_nal_scan`): word-at-a-time zero skipping (SWAR) and
 /// memchr-style candidate search beat this scan on typical entropy but
-/// collapse below the plain byte-by-byte loop on zero-dense and
-/// 0x01-dense payloads respectively.
-///
-/// Split on purpose into an always-inlined prelude and an out-of-line
-/// stride body: separator-dense streams call this once per tiny NAL, and
-/// those calls hit inside the prelude, so the prelude must live at the
-/// call site with no function-call boundary at all; the stride body stays
-/// one canonical non-inlined copy whose call cost is paid only after
-/// eight missed positions and amortizes over the bytes it strides.
+/// collapse below the byte-by-byte loop on zero-dense and 0x01-dense
+/// payloads respectively; this shape stays at or above the byte scan on
+/// every measured corpus and both walks.
 #[inline(always)]
 pub(crate) fn find_startcode(data: &[u8], from: usize) -> Option<usize> {
     let n = data.len();
@@ -151,34 +154,6 @@ pub(crate) fn find_startcode(data: &[u8], from: usize) -> Option<usize> {
     // Last index where a `00 00 01` triple can still start.
     let end = n - 2;
     let mut i = from;
-    // Byte-wise prelude: identical to the plain byte scan over the first
-    // eight positions. A hit adjacent to the scan origin (tiny NALs
-    // between separators) is found at byte-compare cost, inline at the
-    // call site; the striding body only pays off once the hit is farther
-    // out.
-    let prelude_end = end.min(from.saturating_add(8));
-    while i < prelude_end {
-        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
-            return Some(attribute(data, from, i));
-        }
-        i += 1;
-    }
-    if i >= end {
-        return None;
-    }
-    find_startcode_strided(data, from, i)
-}
-
-/// Striding continuation of [`find_startcode`] past its inline prelude.
-/// Never inlined: the walker instantiates once per caller closure, and
-/// letting each instantiation re-derive its own copy of this loop makes
-/// throughput vary with the surrounding codegen; one canonical body keeps
-/// every caller on the same machine code.
-#[inline(never)]
-fn find_startcode_strided(data: &[u8], from: usize, start: usize) -> Option<usize> {
-    let n = data.len();
-    let end = n - 2;
-    let mut i = start;
     while i < end {
         if i + 4 <= n {
             let w = u32::from_le_bytes(data[i..i + 4].try_into().expect("4-byte chunk"));
