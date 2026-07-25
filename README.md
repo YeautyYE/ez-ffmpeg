@@ -25,6 +25,7 @@ This library:
 - Supports custom Rust filters and flexible input/output handling
 - Offers optional GPU-accelerated custom filters (wgpu) and a high-performance embedded RTMP server
 - Ships one-shot recipes (thumbnails, GIF, HLS), typed detection/measurement APIs (black/silence/scene/loudness), and experimental frame/sample/packet export and WHIP/SRT streaming outputs (experimental APIs may change between minor releases) — see the [crate documentation](https://docs.rs/ez-ffmpeg) for details
+- Documents an [HDR-to-SDR tone-mapping cookbook](https://docs.rs/ez-ffmpeg/latest/ez_ffmpeg/recipes/) (PQ/HLG detection, zscale/libplacebo chains that avoid the washed-out look) with a runnable `examples/hdr_to_sdr`
 
 By abstracting the complexity of the raw C API, `ez-ffmpeg` simplifies configuring media pipelines, performing transcoding and filtering, and inspecting media streams.
 
