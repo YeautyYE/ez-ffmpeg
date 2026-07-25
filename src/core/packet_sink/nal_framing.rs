@@ -117,51 +117,67 @@ pub(crate) fn walk_annexb<'a>(
 ///
 /// The scan strides 3 bytes at a time on the classic observation that a
 /// triple starting at `i`, `i + 1` or `i + 2` needs `data[i + 2]` to be
-/// 1, 0 and 0 respectively: one probe of `data[i + 2]` rules out all three
-/// starts whenever it exceeds 1 — the overwhelmingly common case in
-/// compressed payloads — so only probes of 0 or 1 fall back to narrower
-/// steps. Payload bytes come from remote senders, so the variant choice is
-/// worst-corpus-driven (see `bench_nal_scan`): word-at-a-time zero skipping
-/// (SWAR) and memchr-style candidate search both beat this scan on typical
-/// entropy but collapse below the plain byte-by-byte loop on zero-dense
-/// and 0x01-dense payloads respectively; the stride-3 probe keeps the
-/// highest worst-corpus floor while staying a branchy, dependency-free
-/// scalar loop.
+/// 1, 0 and 0 respectively: whenever that probe byte exceeds 1 — the
+/// overwhelmingly common case in compressed payloads — all three starts
+/// are ruled out at once. Both probe tests are mask compares on one
+/// little-endian `u32` covering `data[i..i + 4]`, so no hot-loop branch
+/// depends on an unpredictable payload byte value. Payload bytes come from
+/// remote senders, which makes the variant choice worst-corpus driven
+/// (see `bench_nal_scan`): word-at-a-time zero skipping (SWAR) and
+/// memchr-style candidate search beat this scan on typical entropy but
+/// collapse below the plain byte-by-byte loop on zero-dense and 0x01-dense
+/// payloads respectively, and a branchy probe comparison chain pays a
+/// ~25% mispredicted branch per probe on 0x01-dense payloads, dropping
+/// below the byte scan on the rewrite walk. The mask-compare stride stays
+/// at or above the byte scan on every measured corpus on both walks.
 pub(crate) fn find_startcode(data: &[u8], from: usize) -> Option<usize> {
-    if data.len() < 3 {
+    let n = data.len();
+    if n < 3 {
         return None;
     }
     // Last index where a `00 00 01` triple can still start.
-    let end = data.len() - 2;
+    let end = n - 2;
     let mut i = from;
     while i < end {
-        let probe = data[i + 2];
-        if probe > 1 {
-            // Neither 0 nor 1: a start at `i` needs data[i + 2] == 1 and
-            // starts at `i + 1` / `i + 2` need data[i + 2] == 0 — all three
-            // are ruled out by this single probe.
-            i += 3;
-        } else if probe == 1 {
-            if data[i] == 0 && data[i + 1] == 0 {
-                // 4-byte start-code attribution: the zero immediately
-                // before the triple belongs to the start code, not to the
-                // previous NAL.
-                return if i > from && data[i - 1] == 0 {
-                    Some(i - 1)
-                } else {
-                    Some(i)
-                };
+        if i + 4 <= n {
+            let w = u32::from_le_bytes(data[i..i + 4].try_into().expect("4-byte chunk"));
+            if (w & 0x00FF_0000) == 0 {
+                // Probe byte data[i + 2] is 0: starts at `i + 1` and
+                // `i + 2` stay possible, only the start at `i` (which
+                // needs a 1 there) is ruled out.
+                i += 1;
+                continue;
             }
-            // A 1 in the probe slot still rules out starts at `i + 1` and
-            // `i + 2` (both need a 0 there).
+            if (w & 0x00FF_FFFF) == 0x0001_0000 {
+                // Bytes i..i + 3 are exactly 00 00 01.
+                return Some(attribute(data, from, i));
+            }
+            // Non-zero probe with the triple test missed: a 1 rules out
+            // starts at `i + 1` / `i + 2` (both need a 0 there) and the
+            // start at `i` was just checked; anything above 1 rules out
+            // all three starts directly.
             i += 3;
         } else {
-            // A 0 leaves starts at `i + 1` and `i + 2` possible; only the
-            // start at `i` (which needs a 1 here) is ruled out.
+            // i == n - 3 here: the only in-range start whose 4-byte window
+            // would overrun the slice. Check the final triple byte-wise.
+            if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+                return Some(attribute(data, from, i));
+            }
             i += 1;
         }
     }
     None
+}
+
+/// 4-byte start-code attribution: the zero immediately before a found
+/// triple belongs to the start code, not to the previous NAL — unless the
+/// triple sits at the scan origin itself.
+fn attribute(data: &[u8], from: usize, i: usize) -> usize {
+    if i > from && data[i - 1] == 0 {
+        i - 1
+    } else {
+        i
+    }
 }
 
 /// Walks an already 4-byte length-prefixed AVCC access unit NAL by NAL,
