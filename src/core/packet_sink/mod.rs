@@ -91,7 +91,10 @@
 //! * cancellation (`stop()` with packets still in flight, `abort()`);
 //! * a panicking DELIVERY callback (`on_stream_info`, `on_packet`) — the job
 //!   fails with a worker-panic error and no further sink callback is
-//!   invoked.
+//!   invoked. The consumer's captures are still destroyed at the defined
+//!   teardown point, each callback box under its own containment, so a
+//!   panicking capture destructor cannot escalate the delivery-phase panic
+//!   into a process abort.
 //!
 //! Single carve-out — the post-settlement region: once the job has settled
 //! and the terminal decision is made, everything that remains on the
@@ -103,7 +106,10 @@
 //! yields `wait() == Ok`, and a failing job keeps its original error).
 //!
 //! That containment is **per callback box** (per handler box for
-//! [`PacketSinkHandler`](crate::packet_sink::PacketSinkHandler)). A panic
+//! [`PacketSinkHandler`](crate::packet_sink::PacketSinkHandler)), and once
+//! the stream configuration has been collected the same per-box boundary
+//! guards capture teardown along the whole delivery path — including a
+//! delivery-phase unwind. A panic
 //! thrown by a callback, or by ONE
 //! destructor — a captured value's, a stashed error source's, or a
 //! `panic_any` payload's — is contained, and the crate keeps every such
