@@ -40,9 +40,23 @@ use ffmpeg_next::Frame;
 use ffmpeg_sys_next::{av_frame_get_buffer, av_image_copy, av_image_fill_arrays, AVRational};
 use log::{debug, error};
 use std::ptr::null_mut;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+/// Marks this frame source as done producing on EVERY worker exit path
+/// (drained, stopped, filter gone, build error, panic): the progress API
+/// reports `Finishing` only once every input producer has retired, so the
+/// flag must never be leaked by an early return. Declared after the
+/// `ThreadDoneGuard` rebind in the worker, so it flips BEFORE the thread
+/// slot is released.
+struct MarkExitedOnDrop(Arc<AtomicBool>);
+
+impl Drop for MarkExitedOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
 
 /// Spawns the counted frame-source worker. Called by `start()` AFTER every
 /// consumer (filter/encoder/mux) exists, inside the `StartFailGuard` window:
@@ -55,6 +69,7 @@ pub(crate) fn frame_source_init(
     scheduler_status: Arc<AtomicUsize>,
     thread_sync: ThreadSynchronizer,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
+    producer_exited: Arc<AtomicBool>,
 ) -> crate::error::Result<()> {
     // Slot claimed before spawn; the guard releases it on any exit path.
     thread_sync.thread_start();
@@ -68,6 +83,10 @@ pub(crate) fn frame_source_init(
         .name(format!("framesource{index}"))
         .spawn(move || {
             let _thread_done = thread_done_guard;
+            // Progress producer-exit flag: body local declared AFTER the
+            // thread-done guard, so on every exit (including unwind) it
+            // flips BEFORE the slot release the guard performs.
+            let _producer_exited = MarkExitedOnDrop(producer_exited);
             // The channel endpoints and pool are `move`-closure captures, but
             // `_thread_done` is a body local. Rust drops body locals BEFORE
             // captures, so without this rebind the guard would release the
@@ -442,6 +461,7 @@ mod tests {
             status.clone(),
             thread_sync.clone(),
             result.clone(),
+            Arc::new(AtomicBool::new(false)),
         )
         .expect("spawn");
 

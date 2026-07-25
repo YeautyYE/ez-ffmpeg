@@ -13,6 +13,13 @@ pub struct ThreadSynchronizer {
 struct Inner {
     counter: Mutex<Counts>,
     condvar: Condvar,
+    /// Progress completion latch, installed once by `FfmpegScheduler::new`.
+    /// Sealed when the live count reaches zero — the exact edge
+    /// wait()/stop() unblock on — so `ProgressHandle` snapshots flip to
+    /// `Ended` (and freeze their elapsed clock) at real worker teardown,
+    /// not at the earlier stop/abort signal. Sealing is a pure timestamp
+    /// store (no user code), safe under the counter lock.
+    completion: std::sync::OnceLock<Arc<crate::core::scheduler::progress::ProgressTracker>>,
     #[cfg(feature = "async")]
     waker: Mutex<Option<std::task::Waker>>,
 }
@@ -62,6 +69,7 @@ impl ThreadSynchronizer {
                     parked_settlement_waiters: 0,
                 }),
                 condvar: Condvar::new(),
+                completion: std::sync::OnceLock::new(),
                 #[cfg(feature = "async")]
                 waker: Mutex::new(None),
             }),
@@ -75,6 +83,16 @@ impl ThreadSynchronizer {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         counts.live += 1;
+    }
+
+    /// Installs the progress completion latch this synchronizer seals when
+    /// its live count reaches zero. Called once, before any slot is claimed
+    /// (`FfmpegScheduler::new`); a second call is ignored.
+    pub(crate) fn install_completion_latch(
+        &self,
+        tracker: Arc<crate::core::scheduler::progress::ProgressTracker>,
+    ) {
+        let _ = self.inner.completion.set(tracker);
     }
 
     /// Decrements the counter; when this was the last thread, runs `on_last`
@@ -121,6 +139,13 @@ impl ThreadSynchronizer {
             );
 
             if counts.live == 0 {
+                // Seal the progress completion latch FIRST: it must be
+                // sealed by the time on_last publishes the terminal status,
+                // so a snapshot that observes STATUS_END through a woken
+                // wait() already reads Ended with the elapsed clock frozen.
+                if let Some(tracker) = self.inner.completion.get() {
+                    tracker.seal_completed();
+                }
                 on_last();
 
                 #[cfg(feature = "async")]
