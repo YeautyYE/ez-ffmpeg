@@ -65,8 +65,11 @@
 //!      after `abort()`, which returns nothing, or a drop, which discards
 //!      the result with the scheduler, it goes unobserved. When the failure
 //!      was recorded OUTSIDE this sink's delivery path, an optional
-//!      [`on_job_failed`](crate::packet_sink::PacketSinkBuilder::on_job_failed)
-//!      observer receives a structured
+//!      observer — the builder callback
+//!      [`PacketSinkBuilder::on_job_failed`](crate::packet_sink::PacketSinkBuilder::on_job_failed)
+//!      or the handler override
+//!      [`PacketSinkHandler::on_job_failed`](crate::packet_sink::PacketSinkHandler::on_job_failed)
+//!      — receives a structured
 //!      [`JobFailureSummary`](crate::packet_sink::JobFailureSummary)
 //!      immediately before that synthesized `JobFailed` dispatch.
 //!
@@ -320,12 +323,36 @@ pub trait PacketSinkHandler: Send + 'static {
     /// here is contained and cannot change the settled job result.
     fn on_end(&mut self) {}
 
+    /// Optional structured observer for a job that failed OUTSIDE this
+    /// sink's delivery path.
+    ///
+    /// Fires ONLY on the synthesized-JobFailed path: the job failed
+    /// elsewhere (a sibling output, an upstream demuxer, decoder, filter or
+    /// encoder) while this sink's own delivery was clean, whether that
+    /// failure landed after this sink drained or truncated its delivery. It
+    /// does NOT fire for this sink's own delivery-path errors (strict-tier
+    /// violations, failing callbacks), nor for cancellation, aborts, or
+    /// initial configuration failures.
+    ///
+    /// When it fires, it fires exactly once, immediately BEFORE the
+    /// matching `on_delivery_error(&PacketSinkError::JobFailed { .. })` —
+    /// same delivery thread, same terminal slot — and the summary's
+    /// [`message`](JobFailureSummary::message) is byte-identical to that
+    /// `JobFailed` message. `wait()`/`stop()` keep returning the original
+    /// job error. A panic here is contained per handler box and can neither
+    /// skip the terminal dispatch that follows nor change the settled job
+    /// result. The default implementation does nothing, so existing
+    /// handlers keep their exact behavior.
+    fn on_job_failed(&mut self, _summary: &JobFailureSummary) {}
+
     /// Terminal failure. For delivery-path errors (strict-tier violations,
     /// failing callbacks) the same error is also the job result. When the
     /// JOB failed elsewhere (after this sink drained or truncating its
     /// delivery), the callback receives a synthesized
     /// [`PacketSinkError::JobFailed`] summarizing that failure, while
-    /// `wait()`/`stop()` keep the original error.
+    /// `wait()`/`stop()` keep the original error (an overridden
+    /// [`on_job_failed`](Self::on_job_failed) receives the structured
+    /// summary immediately before this dispatch).
     fn on_delivery_error(&mut self, _error: &PacketSinkError) {}
 }
 
@@ -936,11 +963,11 @@ impl PacketSink {
         }
     }
 
-    /// Dispatches the structured job-failure summary to a registered
-    /// `on_job_failed` observer. Builder sinks only — the handler trait has
-    /// no such hook today, so handler sinks keep the `JobFailed`-only
-    /// terminal. The caller (the worker's terminal slot) wraps this call in
-    /// its own panic containment so a panicking observer can never skip the
+    /// Dispatches the structured job-failure summary to the registered
+    /// observer: the builder's `on_job_failed` callback, or the handler's
+    /// [`PacketSinkHandler::on_job_failed`] (default-empty). The caller
+    /// (the worker's terminal slot) wraps this call in its own panic
+    /// containment so a panicking observer can never skip the
     /// `on_delivery_error` dispatch that follows it.
     pub(crate) fn dispatch_job_failed(&mut self, summary: &JobFailureSummary) {
         match &mut self.dispatch {
@@ -949,7 +976,7 @@ impl PacketSink {
                     f(summary)
                 }
             }
-            SinkDispatch::Handler(_) => {}
+            SinkDispatch::Handler(h) => h.on_job_failed(summary),
         }
     }
 
@@ -1521,6 +1548,22 @@ impl PacketSinkReceiver {
     /// the iterator re-synthesizes it after the clean join, where "clean"
     /// is `wait()` returning `Ok` — the same authority the completion
     /// contract pins to a delivered `on_end`.
+    ///
+    /// # Failure path
+    ///
+    /// On a failed job the iterator may first yield the best-effort channel
+    /// events queued at the terminal —
+    /// `Ok(`[`PacketSinkEvent::JobFailure`]`(summary))`, then
+    /// `Ok(`[`PacketSinkEvent::Error`]`(PacketSinkError::JobFailed { .. }))`.
+    /// Both are best-effort: the `Error` event is dropped when the channel
+    /// is full at that instant, and the `JobFailure` summary is stricter
+    /// still — it requires two free slots, never taking the last slot the
+    /// terminal `Error` would use. Then follows the single deterministic
+    /// terminal `Err` carrying the original job error from the join. That
+    /// `Err` is authoritative (the same authority as `wait()`); the
+    /// `JobFailed`/summary message is byte-identical to that error's
+    /// `Display` output (or to the fixed substitute message when formatting
+    /// the recorded error panicked).
     ///
     /// # Errors
     ///
