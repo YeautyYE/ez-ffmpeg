@@ -397,7 +397,10 @@ impl ReactorConnection {
         self.last_ping_at = Some(now);
     }
 
-    /// Enqueue data
+    /// Enqueue data. `now` is the caller's hoisted clock read (PERF-10):
+    /// the fanout enqueues W entries per media message, and the entry
+    /// timestamp only feeds the seconds-granular age eviction, so one read
+    /// per fanout round serves every entry.
     pub fn enqueue_data(
         &mut self,
         data: Bytes,
@@ -405,10 +408,11 @@ impl ReactorConnection {
         is_sequence_header: bool,
         is_video: bool,
         droppable: bool,
+        now: Instant,
     ) -> bool {
-        let result = self
-            .write_queue
-            .enqueue(data, is_keyframe, is_sequence_header, is_video, droppable);
+        let result =
+            self.write_queue
+                .enqueue(data, is_keyframe, is_sequence_header, is_video, droppable, now);
 
         // Update state based on backpressure level
         match self.write_queue.backpressure_level() {
@@ -434,10 +438,14 @@ impl ReactorConnection {
     /// Enqueue raw data (for handshake responses, etc.)
     /// Returns false if queue is full and connection should be disconnected
     pub fn enqueue_raw(&mut self, data: Vec<u8>) -> bool {
-        if !self
-            .write_queue
-            .enqueue(Bytes::from(data), false, false, false, false)
-        {
+        if !self.write_queue.enqueue(
+            Bytes::from(data),
+            false,
+            false,
+            false,
+            false,
+            Instant::now(),
+        ) {
             self.state = ConnectionState::Closing;
             return false;
         }
@@ -963,8 +971,10 @@ pub struct PublisherState {
 
 /// One fanout packet bound for a connection's write queue: (target
 /// connection id, serialized bytes, is_keyframe, is_sequence_header,
-/// is_video, droppable — rml's `Packet::can_be_dropped`).
-type OutboundWrite = (usize, Vec<u8>, bool, bool, bool, bool);
+/// is_video, droppable — rml's `Packet::can_be_dropped`). The payload is
+/// `Bytes` end-to-end: the shared fanout hands every watcher a refcount
+/// clone of one serialization, so the buffer element must not copy.
+type OutboundWrite = (usize, Bytes, bool, bool, bool, bool);
 
 /// Route a batch of [`ServerResult`]s into the reactor's write / close buffers.
 fn collect_server_results(
@@ -976,18 +986,19 @@ fn collect_server_results(
         match result {
             ServerResult::OutboundPacket {
                 target_connection_id,
-                packet,
+                bytes,
+                can_be_dropped,
                 is_keyframe,
                 is_sequence_header,
                 is_video,
             } => {
                 packets_to_write.push((
                     target_connection_id,
-                    packet.bytes,
+                    bytes,
                     is_keyframe,
                     is_sequence_header,
                     is_video,
-                    packet.can_be_dropped,
+                    can_be_dropped,
                 ));
             }
             ServerResult::DisconnectConnection {
@@ -1465,18 +1476,19 @@ impl Reactor {
                     match result {
                         ServerResult::OutboundPacket {
                             target_connection_id,
-                            packet,
+                            bytes,
+                            can_be_dropped,
                             is_keyframe,
                             is_sequence_header,
                             is_video,
                         } => {
                             self.packets_buffer.push((
                                 target_connection_id,
-                                packet.bytes,
+                                bytes,
                                 is_keyframe,
                                 is_sequence_header,
                                 is_video,
-                                packet.can_be_dropped,
+                                can_be_dropped,
                             ));
                         }
                         ServerResult::DisconnectConnection {
@@ -1506,6 +1518,11 @@ impl Reactor {
         // (clear + reuse the scratch buffer; this runs per fanout round).
         self.conn_ids_buffer.clear();
 
+        // One clock read for the whole drain (PERF-10): the entry timestamp
+        // only feeds the seconds-granular age eviction, and at W watchers a
+        // per-entry `Instant::now` would be a fanout-scaling cost.
+        let now = Instant::now();
+
         for (target_id, data, is_keyframe, is_sequence_header, is_video, droppable) in
             self.packets_buffer.drain(..)
         {
@@ -1521,11 +1538,12 @@ impl Reactor {
                     continue;
                 }
                 let enqueued = target_conn.enqueue_data(
-                    Bytes::from(data),
+                    data,
                     is_keyframe,
                     is_sequence_header,
                     is_video,
                     droppable,
+                    now,
                 );
                 if enqueued {
                     self.conn_ids_buffer.push(target_id);
@@ -1799,31 +1817,7 @@ impl Reactor {
             if let Ok(packet) = serializer.serialize(&payload, false, true) {
                 match self.scheduler.publish_bytes_received(pub_id, packet.bytes) {
                     Ok(server_results) => {
-                        for result in server_results {
-                            match result {
-                                ServerResult::OutboundPacket {
-                                    target_connection_id,
-                                    packet,
-                                    is_keyframe,
-                                    is_sequence_header,
-                                    is_video,
-                                } => {
-                                    packets.push((
-                                        target_connection_id,
-                                        packet.bytes,
-                                        is_keyframe,
-                                        is_sequence_header,
-                                        is_video,
-                                        packet.can_be_dropped,
-                                    ));
-                                }
-                                ServerResult::DisconnectConnection {
-                                    connection_id: close_id,
-                                } => {
-                                    ids_to_close.push(close_id);
-                                }
-                            }
-                        }
+                        collect_server_results(server_results, packets, ids_to_close);
                     }
                     Err(e) => {
                         log::warn!(
@@ -2319,7 +2313,7 @@ mod tests {
 
         // Enqueue some test data
         let test_data = b"Hello, World!";
-        conn.enqueue_data(Bytes::from_static(test_data), false, false, false, true);
+        conn.enqueue_data(Bytes::from_static(test_data), false, false, false, true, Instant::now());
 
         assert!(conn.has_pending_writes());
 
@@ -2604,7 +2598,7 @@ mod tests {
         let before = conn.last_activity();
         assert!(conn.enqueue_ping(vec![2u8; 18]));
         conn.note_ping_queued(Instant::now());
-        assert!(conn.enqueue_data(Bytes::from(vec![3u8; 32]), false, false, false, true));
+        assert!(conn.enqueue_data(Bytes::from(vec![3u8; 32]), false, false, false, true, Instant::now()));
         conn.try_flush().expect("flush the ping plus the tail behind it");
         assert!(!conn.has_pending_writes(), "both entries must flush");
         assert!(
@@ -2729,7 +2723,8 @@ mod tests {
             false,
             false,
             false,
-            p_a0.can_be_dropped
+            p_a0.can_be_dropped,
+            Instant::now()
         ));
         assert!(queue.enqueue_ping(Bytes::from(p_ping.bytes)));
         queue.try_flush(&mut wire).expect("flush the opening pair");
@@ -2740,7 +2735,8 @@ mod tests {
             true,
             false,
             true,
-            p_v1.can_be_dropped
+            p_v1.can_be_dropped,
+            Instant::now()
         ));
         assert_eq!(queue.backpressure_level(), BackpressureLevel::High);
         // The acknowledgement behind it must be RETAINED (the old policy
@@ -2750,7 +2746,8 @@ mod tests {
             false,
             false,
             false,
-            p_a1.can_be_dropped
+            p_a1.can_be_dropped,
+            Instant::now()
         ));
         let before_shed = queue.pending_bytes();
         assert!(queue.enqueue(
@@ -2758,7 +2755,8 @@ mod tests {
             false,
             false,
             true,
-            p_v2.can_be_dropped
+            p_v2.can_be_dropped,
+            Instant::now()
         ));
         assert_eq!(
             queue.pending_bytes(),
@@ -2774,14 +2772,16 @@ mod tests {
             false,
             false,
             false,
-            p_a2.can_be_dropped
+            p_a2.can_be_dropped,
+            Instant::now()
         ));
         assert!(queue.enqueue(
             Bytes::from(p_v3.bytes),
             true,
             false,
             true,
-            p_v3.can_be_dropped
+            p_v3.can_be_dropped,
+            Instant::now()
         ));
         queue.try_flush(&mut wire).expect("flush the tail");
 
@@ -3268,7 +3268,7 @@ mod tests {
         // Enqueue small data that will be fully written in one flush
         let test_data = b"Hello";
         if let Some(conn) = reactor.connections.get_mut(token.id) {
-            conn.enqueue_data(Bytes::from_static(test_data), false, false, false, true);
+            conn.enqueue_data(Bytes::from_static(test_data), false, false, false, true, Instant::now());
             assert!(conn.has_pending_writes());
         }
 
@@ -3331,7 +3331,7 @@ mod tests {
         // Enqueue data and add to pending_flush set
         let test_data = b"World";
         if let Some(conn) = reactor.connections.get_mut(token.id) {
-            conn.enqueue_data(Bytes::from_static(test_data), false, false, false, true);
+            conn.enqueue_data(Bytes::from_static(test_data), false, false, false, true, Instant::now());
         }
         reactor.pending_flush.insert(token.id);
 
@@ -3410,7 +3410,7 @@ mod tests {
             // ~1MB single sequence-header entry: far larger than the shrunk
             // buffers, under the 4MB critical threshold, never dropped.
             let big = Bytes::from(vec![0u8; 1024 * 1024]);
-            assert!(conn.enqueue_data(big, false, true, true, true));
+            assert!(conn.enqueue_data(big, false, true, true, true, Instant::now()));
             assert!(conn.has_pending_writes());
         }
 
@@ -4101,7 +4101,7 @@ mod tests {
         // for a watcher after its publisher finished.
         if let Some(conn) = reactor.connections.get_mut(token.id) {
             conn.state = ConnectionState::Active;
-            assert!(conn.enqueue_data(Bytes::from_static(b"final status"), false, false, false, true));
+            assert!(conn.enqueue_data(Bytes::from_static(b"final status"), false, false, false, true, Instant::now()));
         }
         reactor.close_connection_after_flush(token.id);
         assert!(
@@ -4161,7 +4161,14 @@ mod tests {
         let payload = vec![0xABu8; 64 * 1024];
         if let Some(conn) = reactor.connections.get_mut(token.id) {
             conn.state = ConnectionState::Active;
-            assert!(conn.enqueue_data(Bytes::from(payload.clone()), false, true, true, true));
+            assert!(conn.enqueue_data(
+                Bytes::from(payload.clone()),
+                false,
+                true,
+                true,
+                true,
+                Instant::now(),
+            ));
         }
 
         reactor.close_connection_after_flush(token.id);
@@ -4240,7 +4247,7 @@ mod tests {
         let payload = vec![0u8; 1024 * 1024];
         if let Some(conn) = reactor.connections.get_mut(token.id) {
             conn.state = ConnectionState::Active;
-            assert!(conn.enqueue_data(Bytes::from(payload), false, true, true, true));
+            assert!(conn.enqueue_data(Bytes::from(payload), false, true, true, true, Instant::now()));
         }
         reactor.close_connection_after_flush(token.id);
         assert!(
@@ -4302,16 +4309,21 @@ mod tests {
         let tail = 4096usize;
         if let Some(conn) = reactor.connections.get_mut(token.id) {
             conn.state = ConnectionState::Active;
-            assert!(conn.enqueue_data(Bytes::from(vec![0xABu8; tail]), false, true, true, true));
+            assert!(conn.enqueue_data(Bytes::from(vec![0xABu8; tail]), false, true, true, true, Instant::now()));
             conn.condemn(Instant::now() + Duration::from_secs(30));
             assert!(conn.is_condemned());
         }
 
         // Live fanout targets the condemned connection with a large media
         // packet. It must be skipped, so the queue stays at the pre-condemn tail.
-        reactor
-            .packets_buffer
-            .push((token.id, vec![0xCDu8; 1024 * 1024], true, false, true, true));
+        reactor.packets_buffer.push((
+            token.id,
+            Bytes::from(vec![0xCDu8; 1024 * 1024]),
+            true,
+            false,
+            true,
+            true,
+        ));
         reactor.write_pending_packets();
 
         let conn = reactor.connections.get(token.id).expect("still present");
