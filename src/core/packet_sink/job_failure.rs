@@ -4,7 +4,8 @@
 //! terminal reports it as [`PacketSinkError::JobFailed`], which carries only
 //! a preformatted message. [`JobFailureSummary`] is the structured companion
 //! handed to the optional `on_job_failed` observer
-//! ([`PacketSinkBuilder::on_job_failed`](super::PacketSinkBuilder::on_job_failed)):
+//! ([`PacketSinkBuilder::on_job_failed`](super::PacketSinkBuilder::on_job_failed)
+//! or [`PacketSinkHandler::on_job_failed`](super::PacketSinkHandler::on_job_failed)):
 //! a coarse [`JobFailureKind`], the raw FFmpeg error code where the recorded
 //! error visibly carries one, the output stream index where the error names
 //! one, and the exact `JobFailed` message.
@@ -57,8 +58,9 @@ pub enum JobFailureKind {
 /// packet sink's delivery path — the typed companion of the
 /// [`PacketSinkError::JobFailed`] message.
 ///
-/// Handed by reference to the optional
-/// [`on_job_failed`](super::PacketSinkBuilder::on_job_failed) observer,
+/// Handed by reference to the optional `on_job_failed` observer
+/// ([`PacketSinkBuilder::on_job_failed`](super::PacketSinkBuilder::on_job_failed)
+/// or [`PacketSinkHandler::on_job_failed`](super::PacketSinkHandler::on_job_failed)),
 /// immediately before the matching `on_delivery_error(JobFailed)` dispatch.
 /// The summary is derived from the recorded job error at the terminal slot;
 /// `wait()`/`stop()` keep returning that original error unchanged, and
