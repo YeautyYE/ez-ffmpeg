@@ -307,6 +307,7 @@ pub(crate) fn demux_init(
                                 &demux_parameter,
                                 (*in_fmt_ctx.as_ptr()).nb_streams,
                                 readrate,
+                                &scheduler_status,
                             );
                         }
                     }
@@ -419,7 +420,12 @@ fn demux_done(
 }
 
 const READRATE_INITIAL_BURST: f32 = 0.5;
-unsafe fn readrate_sleep(demux_parameter: &DemuxerParameter, nb_streams: c_uint, readrate: f32) {
+unsafe fn readrate_sleep(
+    demux_parameter: &DemuxerParameter,
+    nb_streams: c_uint,
+    readrate: f32,
+    scheduler_status: &Arc<AtomicUsize>,
+) {
     let file_start = 0;
     let burst_until = (AV_TIME_BASE as f32 * READRATE_INITIAL_BURST) as i64;
 
@@ -437,9 +443,31 @@ unsafe fn readrate_sleep(demux_parameter: &DemuxerParameter, nb_streams: c_uint,
                 as i64
                 + stream_ts_offset;
             if pts - burst_until > now {
-                av_usleep((pts - burst_until - now) as u32);
+                interruptible_usleep(pts - burst_until - now, scheduler_status);
             }
         }
+    }
+}
+
+/// Sleep for `remaining_us` microseconds in slices, returning early once the
+/// scheduler enters a stopping state.
+///
+/// A single `av_usleep` is uninterruptible, so a readrate pacing wait spanning
+/// a timestamp jump (seek, `stream_loop`, discontinuity) would otherwise wedge
+/// `stop()`/`abort()` in `wait_for_all_threads` until the full delay elapsed —
+/// up to ~71 min, the u32 microsecond ceiling. Slicing bounds the stop latency
+/// to one slice and keeps each `av_usleep` argument within u32, so a
+/// multi-minute delay can no longer wrap the microsecond cast.
+unsafe fn interruptible_usleep(mut remaining_us: i64, scheduler_status: &Arc<AtomicUsize>) {
+    // 100 ms bounds stop-latency without turning the wait into a busy loop.
+    const SLICE_US: i64 = 100_000;
+    while remaining_us > 0 {
+        if is_stopping(scheduler_status.load(Ordering::Acquire)) {
+            return;
+        }
+        let slice = remaining_us.min(SLICE_US);
+        av_usleep(slice as u32);
+        remaining_us -= slice;
     }
 }
 
@@ -2007,5 +2035,42 @@ mod tests {
             &mut finished,
         );
         assert!(finished.is_empty());
+    }
+
+    /// A readrate pacing wait must yield to a stopping scheduler within one
+    /// slice. Regression guard for the uninterruptible `av_usleep`: reverting
+    /// `interruptible_usleep` to a single `av_usleep(delta)` hangs the worker
+    /// here for the full hour and trips the bounded `recv_timeout` below.
+    #[test]
+    fn interruptible_usleep_returns_promptly_once_stopping() {
+        use super::interruptible_usleep;
+        use crate::core::scheduler::ffmpeg_scheduler::{STATUS_END, STATUS_RUN};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let worker_status = status.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let start = Instant::now();
+        std::thread::spawn(move || {
+            // One hour: a single uninterruptible av_usleep would block here
+            // until the process is killed.
+            unsafe { interruptible_usleep(3_600_000_000, &worker_status) };
+            let _ = tx.send(());
+        });
+
+        // Let the worker enter the sleep, then signal stop.
+        std::thread::sleep(Duration::from_millis(150));
+        status.store(STATUS_END, Ordering::Release);
+
+        rx.recv_timeout(Duration::from_secs(3)).expect(
+            "interruptible_usleep must return within one 100ms slice after the \
+             scheduler enters a stopping state",
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "stop latency exceeded one slice"
+        );
     }
 }
