@@ -5,7 +5,7 @@ use crate::core::context::filter_graph::FilterGraph;
 use crate::core::context::input::Input;
 use crate::core::context::input_filter::{InputFilter, IFILTER_FLAG_AUTOROTATE};
 use crate::core::context::muxer::Muxer;
-use crate::core::context::output::{Output, StreamMap};
+use crate::core::context::output::{ExpandedStreamMap, Output};
 use crate::core::context::output_filter::{
     OutputFilter, OFILTER_FLAG_AUDIO_24BIT, OFILTER_FLAG_AUTOSCALE, OFILTER_FLAG_DISABLE_CONVERT,
 };
@@ -76,6 +76,8 @@ use std::ptr::{null, null_mut};
 use std::sync::Arc;
 
 mod fg_bind;
+#[cfg(all(test, not(docsrs)))]
+mod per_stream_encoder_tests;
 #[cfg(not(docsrs))]
 mod fg_probe;
 pub(crate) mod open_input;

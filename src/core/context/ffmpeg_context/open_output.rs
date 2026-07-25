@@ -478,6 +478,17 @@ fn validate_packet_sink_options(output: &Output) -> Result<()> {
             .into());
         }
     }
+    // Per-map codec options (StreamMap::codec_opt) merge over the per-type
+    // tables and reach the encoder context the same way, so a per-map
+    // `flags` is the same policy bypass — reject it through the same gate.
+    for spec in &output.stream_map_specs {
+        if spec.codec_opts.iter().any(|(key, _)| key == "flags") {
+            return Err(PacketSinkError::UnsupportedOption(
+                "the 'flags' codec option (it can clear the global_header policy)",
+            )
+            .into());
+        }
+    }
     Ok(())
 }
 
