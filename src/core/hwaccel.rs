@@ -135,6 +135,61 @@ pub(crate) struct HWDevice {
 #[derive(Debug)]
 struct OwnedDeviceRef(*mut AVBufferRef);
 
+impl OwnedDeviceRef {
+    /// Creates a device context via `av_hwdevice_ctx_create` and owns the
+    /// result immediately. This is the ONE validity assertion behind the
+    /// wrapped pointer: from here it is released exactly once, in Drop,
+    /// when the last handle goes — no call site touches a raw device
+    /// reference or an error-path cleanup again.
+    fn create(
+        device_type: AVHWDeviceType,
+        device: Option<&CStr>,
+        opts: Option<&DictGuard>,
+    ) -> Result<Self, i32> {
+        let mut device_ref = null_mut();
+        // SAFETY: the out-param is a fresh null pointer owned by this
+        // frame; `device` (when present) is a live NUL-terminated string
+        // borrowed for the call only; `opts` (when present) borrows a
+        // guard whose dict the call reads but never takes ownership of
+        // (the guard still frees it). On failure the historical defensive
+        // unref is preserved rather than relying on FFmpeg nulling the
+        // out-param (av_buffer_unref on a null out-param is a no-op).
+        unsafe {
+            let err = av_hwdevice_ctx_create(
+                &mut device_ref,
+                device_type,
+                device.map_or(null(), CStr::as_ptr),
+                opts.map_or(null_mut(), |guard| guard.0),
+                0,
+            );
+            if err < 0 {
+                av_buffer_unref(&mut device_ref);
+                return Err(err);
+            }
+        }
+        Ok(Self(device_ref))
+    }
+
+    /// Same ownership contract as [`OwnedDeviceRef::create`], for a
+    /// context derived from an existing device via
+    /// `av_hwdevice_ctx_create_derived`.
+    fn derive_from(device_type: AVHWDeviceType, src: &HWDevice) -> Result<Self, i32> {
+        let mut device_ref = null_mut();
+        // SAFETY: the out-param is a fresh null pointer owned by this
+        // frame, and the source reference stays valid for the whole call
+        // because `src` is an owning handle. Error path mirrors `create`.
+        unsafe {
+            let err =
+                av_hwdevice_ctx_create_derived(&mut device_ref, device_type, src.device_ref(), 0);
+            if err < 0 {
+                av_buffer_unref(&mut device_ref);
+                return Err(err);
+            }
+        }
+        Ok(Self(device_ref))
+    }
+}
+
 impl Drop for OwnedDeviceRef {
     fn drop(&mut self) {
         if !self.0.is_null() {
@@ -159,13 +214,13 @@ impl HWDevice {
     fn new(
         name: String,
         device_type: AVHWDeviceType,
-        device_ref: *mut AVBufferRef,
+        device: OwnedDeviceRef,
         init_arg: Option<String>,
     ) -> Self {
         HWDevice {
             name,
             device_type,
-            device: Arc::new(OwnedDeviceRef(device_ref)),
+            device: Arc::new(device),
             init_arg,
         }
     }
@@ -196,7 +251,7 @@ impl Clone for HWDevice {
 // explicit read-only `Sync`.)
 unsafe impl Send for HWDevice {}
 
-pub(crate) unsafe fn hw_device_free_all() {
+pub(crate) fn hw_device_free_all() {
     // Release the pinned filter-device handle (its context survives if a
     // consumer still holds a reference). Poison-tolerant so this atexit
     // cleanup still runs after a panicked holder.
@@ -389,6 +444,7 @@ fn split_device_and_options(p: &str) -> (Option<&str>, Option<&str>) {
 /// partially consume) the options dict but never takes ownership, so every caller
 /// must free it -- on success AND on every error path. The parsed options
 /// previously leaked on all paths; wrapping the pointer here closes that leak.
+#[derive(Debug)]
 struct DictGuard(*mut AVDictionary);
 
 impl Drop for DictGuard {
@@ -399,9 +455,55 @@ impl Drop for DictGuard {
     }
 }
 
+impl DictGuard {
+    /// Parses a `"key=value[,key=value...]"` options string into an owned
+    /// dictionary. The guard wraps the out-param BEFORE parsing, so even a
+    /// mid-string parse failure cannot leak the partially built dict.
+    ///
+    /// `arg` is the full device specification, used only in the deferred
+    /// failure messages; both failure kinds map to the exact historical
+    /// (code, message) pair for the unlocked wrapper to log (this runs
+    /// under INIT_LOCK, where no log macro may fire).
+    fn parse(arg: &str, options: &str) -> Result<DictGuard, InitFailure> {
+        let mut guard = DictGuard(null_mut());
+        let Ok(options_cstr) = CString::new(options) else {
+            return Err(InitFailure {
+                code: AVERROR(EINVAL),
+                log: Some(format!(
+                    "Device creation failed: option:{options} can't convert to CString"
+                )),
+            });
+        };
+        let eq_cstr = CString::new("=").unwrap();
+        let comma_cstr = CString::new(",").unwrap();
+        // SAFETY: the out-param lives in the guard this frame owns, and
+        // every other argument is a live NUL-terminated string borrowed
+        // for the call only.
+        let err = unsafe {
+            av_dict_parse_string(
+                &mut guard.0,
+                options_cstr.as_ptr(),
+                eq_cstr.as_ptr(),
+                comma_cstr.as_ptr(),
+                0,
+            )
+        };
+        if err < 0 {
+            return Err(InitFailure {
+                code: AVERROR(EINVAL),
+                log: Some(format!(
+                    "Invalid device specification \"{arg}\": failed to parse options"
+                )),
+            });
+        }
+        Ok(guard)
+    }
+}
+
 /// Failure of a locked device-init body: the error code to return and the
 /// message the UNLOCKED wrapper logs after releasing INIT_LOCK (None = fail
 /// silently, preserving the historical silent paths).
+#[derive(Debug)]
 struct InitFailure {
     code: i32,
     log: Option<String>,
@@ -446,8 +548,6 @@ pub(crate) fn hw_device_init_from_string(arg: &str) -> (i32, Option<HWDevice>) {
 /// call any log macro (see the wrapper); failures carry their message out
 /// via [`InitFailure`] instead.
 fn hw_device_init_from_string_locked(arg: &str) -> Result<HWDevice, InitFailure> {
-    let mut device_ref = null_mut();
-
     let (type_str, mut p) = split_device_type(arg);
 
     let Ok(type_name) = CString::new(type_str) else {
@@ -508,95 +608,46 @@ fn hw_device_init_from_string_locked(arg: &str) -> Result<HWDevice, InitFailure>
         hw_device_default_name(device_type)
     };
 
-    if p.is_empty() {
+    // Every arm resolves to one owned context; creation failures map to
+    // the historical (code, deferred message) pairs arm by arm.
+    let device = if p.is_empty() {
         // New device with no parameters.
-        let err =
-            unsafe { av_hwdevice_ctx_create(&mut device_ref, device_type, null(), null_mut(), 0) };
-        if err < 0 {
-            unsafe {
-                av_buffer_unref(&mut device_ref);
-            }
-            return Err(InitFailure {
-                code: err,
-                log: Some(format!("Device creation failed: {err}.")),
-            });
-        }
+        OwnedDeviceRef::create(device_type, None, None).map_err(|err| InitFailure {
+            code: err,
+            log: Some(format!("Device creation failed: {err}.")),
+        })?
     } else if p.starts_with(':') {
         // New device with some parameters.
         let (device_name, options_str) = split_device_and_options(p);
-        // Freed on every path below (parse error, create error, success).
-        let mut options = DictGuard(null_mut());
+        let options = match options_str {
+            Some(v) => Some(DictGuard::parse(arg, v)?),
+            None => None,
+        };
 
-        if let Some(v) = options_str {
-            unsafe {
-                let Ok(v_cstr) = CString::new(v) else {
-                    av_buffer_unref(&mut device_ref);
+        let device_name_cstr = match device_name {
+            None => None,
+            Some(device_name) => {
+                let Ok(device_name_cstr) = CString::new(device_name) else {
                     return Err(InitFailure {
                         code: AVERROR(EINVAL),
                         log: Some(format!(
-                            "Device creation failed: option:{v} can't convert to CString"
+                            "Device creation failed: device_name:{device_name} can't convert to CString"
                         )),
                     });
                 };
-                let eq_cstr = CString::new("=").unwrap();
-                let comma_cstr = CString::new(",").unwrap();
-                let err = av_dict_parse_string(
-                    &mut options.0,
-                    v_cstr.as_ptr(),
-                    eq_cstr.as_ptr(),
-                    comma_cstr.as_ptr(),
-                    0,
-                );
-                if err < 0 {
-                    av_buffer_unref(&mut device_ref);
-                    return Err(InitFailure {
-                        code: AVERROR(EINVAL),
-                        log: Some(format!(
-                            "Invalid device specification \"{arg}\": failed to parse options"
-                        )),
-                    });
-                }
-            }
-        }
-
-        let err = unsafe {
-            match device_name {
-                None => av_hwdevice_ctx_create(&mut device_ref, device_type, null(), options.0, 0),
-                Some(device_name) => {
-                    let Ok(device_name_cstr) = CString::new(device_name) else {
-                        av_buffer_unref(&mut device_ref);
-                        return Err(InitFailure {
-                            code: AVERROR(EINVAL),
-                            log: Some(format!(
-                                "Device creation failed: device_name:{device_name} can't convert to CString"
-                            )),
-                        });
-                    };
-                    av_hwdevice_ctx_create(
-                        &mut device_ref,
-                        device_type,
-                        device_name_cstr.as_ptr(),
-                        options.0,
-                        0,
-                    )
-                }
+                Some(device_name_cstr)
             }
         };
-        if err < 0 {
-            unsafe {
-                av_buffer_unref(&mut device_ref);
-            }
-            return Err(InitFailure {
+
+        OwnedDeviceRef::create(device_type, device_name_cstr.as_deref(), options.as_ref()).map_err(
+            |err| InitFailure {
                 code: err,
                 log: Some(format!("Device creation failed: {err}.")),
-            });
-        }
+            },
+        )?
     } else if let Some(src_name) = p.strip_prefix('@') {
         // Derive from existing device.
         let Some(src_device) = hw_device_get_by_name(src_name) else {
-            unsafe {
-                av_buffer_unref(&mut device_ref);
-            }
             return Err(InitFailure {
                 code: AVERROR(EINVAL),
                 log: Some(format!(
@@ -604,58 +655,17 @@ fn hw_device_init_from_string_locked(arg: &str) -> Result<HWDevice, InitFailure>
                 )),
             });
         };
-        let err = unsafe {
-            av_hwdevice_ctx_create_derived(&mut device_ref, device_type, src_device.device_ref(), 0)
-        };
-        if err < 0 {
-            unsafe {
-                av_buffer_unref(&mut device_ref);
-            }
-            return Err(InitFailure {
-                code: err,
-                log: Some(format!("Device creation failed: {err}.")),
-            });
-        }
+        OwnedDeviceRef::derive_from(device_type, &src_device).map_err(|err| InitFailure {
+            code: err,
+            log: Some(format!("Device creation failed: {err}.")),
+        })?
     } else if let Some(v) = p.strip_prefix(',') {
-        unsafe {
-            // Freed on every path below (parse error, create error, success).
-            let mut options = DictGuard(null_mut());
-            let Ok(v_cstr) = CString::new(v) else {
-                av_buffer_unref(&mut device_ref);
-                return Err(InitFailure {
-                    code: AVERROR(EINVAL),
-                    log: Some(format!(
-                        "Device creation failed: option:{v} can't convert to CString"
-                    )),
-                });
-            };
-            let eq_cstr = CString::new("=").unwrap();
-            let comma_cstr = CString::new(",").unwrap();
-            let mut err = av_dict_parse_string(
-                &mut options.0,
-                v_cstr.as_ptr(),
-                eq_cstr.as_ptr(),
-                comma_cstr.as_ptr(),
-                0,
-            );
-            if err < 0 {
-                av_buffer_unref(&mut device_ref);
-                return Err(InitFailure {
-                    code: AVERROR(EINVAL),
-                    log: Some(format!(
-                        "Invalid device specification \"{arg}\": failed to parse options"
-                    )),
-                });
-            }
-            err = av_hwdevice_ctx_create(&mut device_ref, device_type, null(), options.0, 0);
-            if err < 0 {
-                av_buffer_unref(&mut device_ref);
-                return Err(InitFailure {
-                    code: err,
-                    log: Some(format!("Device creation failed: {err}.")),
-                });
-            }
-        }
+        // New device with options only.
+        let options = DictGuard::parse(arg, v)?;
+        OwnedDeviceRef::create(device_type, None, Some(&options)).map_err(|err| InitFailure {
+            code: err,
+            log: Some(format!("Device creation failed: {err}.")),
+        })?
     } else {
         return Err(InitFailure {
             code: AVERROR(EINVAL),
@@ -663,14 +673,9 @@ fn hw_device_init_from_string_locked(arg: &str) -> Result<HWDevice, InitFailure>
                 "Invalid device specification \"{arg}\": parse error"
             )),
         });
-    }
+    };
 
-    let dev = HWDevice::new(
-        name.unwrap(),
-        device_type,
-        device_ref,
-        Some(arg.to_string()),
-    );
+    let dev = HWDevice::new(name.unwrap(), device_type, device, Some(arg.to_string()));
     add_hw_device(dev.clone());
 
     Ok(dev)
@@ -729,12 +734,8 @@ fn hw_device_init_from_type_locked(
         });
     }
 
-    let mut device_ref = null_mut();
-
-    let err = match device.as_deref() {
-        None => unsafe {
-            av_hwdevice_ctx_create(&mut device_ref, device_type, null(), null_mut(), 0)
-        },
+    let device_cstr = match device.as_deref() {
+        None => None,
         Some(device) => {
             let Ok(device_cstr) = CString::new(device) else {
                 // Historically silent; `log: None` preserves that.
@@ -743,33 +744,22 @@ fn hw_device_init_from_type_locked(
                     log: None,
                 });
             };
-
-            unsafe {
-                av_hwdevice_ctx_create(
-                    &mut device_ref,
-                    device_type,
-                    device_cstr.as_ptr(),
-                    null_mut(),
-                    0,
-                )
-            }
+            Some(device_cstr)
         }
     };
 
-    if err < 0 {
-        unsafe {
-            av_buffer_unref(&mut device_ref);
-        }
-        return Err(InitFailure {
-            code: err,
-            log: Some(format!("Device creation failed: {err}.")),
-        });
-    }
+    let owned =
+        OwnedDeviceRef::create(device_type, device_cstr.as_deref(), None).map_err(|err| {
+            InitFailure {
+                code: err,
+                log: Some(format!("Device creation failed: {err}.")),
+            }
+        })?;
 
     Ok(register_from_type_device(
         name.unwrap(),
         device_type,
-        device_ref,
+        owned,
         device.as_deref(),
     ))
 }
@@ -781,14 +771,14 @@ fn hw_device_init_from_type_locked(
 fn register_from_type_device(
     name: String,
     device_type: AVHWDeviceType,
-    device_ref: *mut AVBufferRef,
-    device: Option<&str>,
+    device: OwnedDeviceRef,
+    requested_device: Option<&str>,
 ) -> HWDevice {
     let dev = HWDevice::new(
         name,
         device_type,
-        device_ref,
-        type_init_arg(device_type, device),
+        device,
+        type_init_arg(device_type, requested_device),
     );
     add_hw_device(dev.clone());
     dev
@@ -1072,15 +1062,14 @@ pub fn get_gpu_filter_backends() -> Vec<GpuFilterBackend> {
 /// Deliberately does NOT register the device in `HW_DEVICES`: probing must not
 /// change which device `hw_device_for_filter()` later picks for real pipelines.
 fn probe_hw_device(device_type: AVHWDeviceType) -> (bool, Option<String>) {
-    let mut device_ref: *mut AVBufferRef = null_mut();
-    let err =
-        unsafe { av_hwdevice_ctx_create(&mut device_ref, device_type, null(), null_mut(), 0) };
-    if err < 0 {
-        unsafe { av_buffer_unref(&mut device_ref) };
-        (false, Some(av_err2str(err)))
-    } else {
-        unsafe { av_buffer_unref(&mut device_ref) };
-        (true, None)
+    match OwnedDeviceRef::create(device_type, None, None) {
+        Err(err) => (false, Some(av_err2str(err))),
+        Ok(owned) => {
+            // Dropping the probe's owning reference frees the context
+            // immediately.
+            drop(owned);
+            (true, None)
+        }
     }
 }
 
@@ -1174,7 +1163,7 @@ mod tests {
         HWDevice::new(
             name.to_string(),
             AVHWDeviceType::AV_HWDEVICE_TYPE_NONE,
-            device_ref,
+            OwnedDeviceRef(device_ref),
             init_arg.map(str::to_string),
         )
     }
@@ -1186,7 +1175,12 @@ mod tests {
         device_type: AVHWDeviceType,
         device_ref: *mut AVBufferRef,
     ) -> HWDevice {
-        HWDevice::new(name.to_string(), device_type, device_ref, None)
+        HWDevice::new(
+            name.to_string(),
+            device_type,
+            OwnedDeviceRef(device_ref),
+            None,
+        )
     }
 
     /// Allocates a real 1-byte refcounted buffer as a context stand-in.
@@ -1485,7 +1479,7 @@ mod tests {
         add_hw_device(HWDevice::new(
             "wiring-pin".to_string(),
             vaapi,
-            sentinel,
+            OwnedDeviceRef(sentinel),
             Some(key),
         ));
 
@@ -1533,7 +1527,7 @@ mod tests {
         let registered = register_from_type_device(
             "regkey-pin".to_string(),
             vaapi,
-            sentinel_buffer(),
+            OwnedDeviceRef(sentinel_buffer()),
             Some(dev_path),
         );
         let expected_key = type_init_arg(vaapi, Some(dev_path)).unwrap();
@@ -1783,5 +1777,31 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .len();
         assert_eq!(len, 0, "a failed init must not register a device");
+    }
+
+    // DictGuard::parse owns the dictionary from the out-param on (so a
+    // mid-string parse failure cannot leak a partially built dict) and
+    // maps each failure kind to the exact historical (code, message) pair
+    // the unlocked wrapper logs.
+    #[test]
+    fn dict_guard_parse_rejects_malformed_options_and_accepts_valid() {
+        let guard = DictGuard::parse("spec", "k=v,k2=v2").expect("well-formed options must parse");
+        assert!(!guard.0.is_null(), "a parsed non-empty dict is non-null");
+
+        let failure = DictGuard::parse("spec", "bad\0option")
+            .expect_err("an interior NUL cannot become a C string");
+        assert_eq!(failure.code, AVERROR(EINVAL));
+        assert_eq!(
+            failure.log.as_deref(),
+            Some("Device creation failed: option:bad\0option can't convert to CString")
+        );
+
+        let failure = DictGuard::parse("spec", "novalue")
+            .expect_err("an option without '=' must fail to parse");
+        assert_eq!(failure.code, AVERROR(EINVAL));
+        assert_eq!(
+            failure.log.as_deref(),
+            Some("Invalid device specification \"spec\": failed to parse options")
+        );
     }
 }

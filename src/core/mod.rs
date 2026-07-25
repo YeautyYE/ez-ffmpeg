@@ -530,8 +530,8 @@ static INIT_FFMPEG: std::sync::Once = std::sync::Once::new();
 
 extern "C" fn cleanup() {
     let _ = std::panic::catch_unwind(|| {
+        hwaccel::hw_device_free_all();
         unsafe {
-            hwaccel::hw_device_free_all();
             ffmpeg_sys_next::avformat_network_deinit();
         }
 
