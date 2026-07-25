@@ -390,6 +390,18 @@ jobs:
       - name: Emit-hardening integration tests
         run: cargo test --features cli --test cli_emit_hardening
 
+      # RTMP loopback suite: real-TCP rml_rtmp watchers against the embedded
+      # RTMP server (late-joiner GOP replay, EOF status delivery, StreamBuilder
+      # port release, AVCC parser hardening). The publish leg re-encodes
+      # test.mp4 to H.264 because create_rtmp_input pins h264/aac, so it needs
+      # an FFmpeg with a working H.264 encoder — this lane's libx264 build is
+      # the only one in the matrix that has one: the from-source and vcpkg
+      # lanes carry no H.264 encoder, and the runners expose no V4L2 device or
+      # VideoToolbox session for the hardware fallbacks. The load-harness
+      # measurements in the same file stay #[ignore]d.
+      - name: RTMP loopback tests
+        run: cargo test --features rtmp --test rtmp_loopback
+
   platform:
     name: Platform (${{ matrix.platform }}, FFmpeg ${{ matrix.ffmpeg }})
     runs-on: ${{ matrix.runner }}
