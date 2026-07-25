@@ -119,17 +119,29 @@ pub(crate) fn walk_annexb<'a>(
 /// triple starting at `i`, `i + 1` or `i + 2` needs `data[i + 2]` to be
 /// 1, 0 and 0 respectively: whenever that probe byte exceeds 1 — the
 /// overwhelmingly common case in compressed payloads — all three starts
-/// are ruled out at once. Both probe tests are mask compares on one
-/// little-endian `u32` covering `data[i..i + 4]`, so no hot-loop branch
-/// depends on an unpredictable payload byte value. Payload bytes come from
-/// remote senders, which makes the variant choice worst-corpus driven
-/// (see `bench_nal_scan`): word-at-a-time zero skipping (SWAR) and
+/// are ruled out at once. The probe tests are mask compares on one
+/// little-endian `u32` covering `data[i..i + 4]`, keeping the 0-vs-1
+/// disambiguation and the hit test branch-free: a branchy probe
+/// comparison chain pays a ~25% mispredicted branch per probe on
+/// 0x01-dense payloads and drops below the byte scan on the rewrite walk.
+/// The stride is preceded by an eight-position byte-wise prelude
+/// identical to the plain byte scan: when the hit sits right next to the
+/// scan origin — the rule, not the exception, in separator-dense streams
+/// of tiny NALs — the byte loop is already optimal there and any
+/// word-load stride only adds overhead, while for hits farther out the
+/// prelude's cost vanishes against the striding gain. Payload bytes come
+/// from remote senders, which makes the variant choice worst-corpus
+/// driven (see `bench_nal_scan`): word-at-a-time zero skipping (SWAR) and
 /// memchr-style candidate search beat this scan on typical entropy but
-/// collapse below the plain byte-by-byte loop on zero-dense and 0x01-dense
-/// payloads respectively, and a branchy probe comparison chain pays a
-/// ~25% mispredicted branch per probe on 0x01-dense payloads, dropping
-/// below the byte scan on the rewrite walk. The mask-compare stride stays
-/// at or above the byte scan on every measured corpus on both walks.
+/// collapse below the plain byte-by-byte loop on zero-dense and
+/// 0x01-dense payloads respectively.
+///
+/// Deliberately never inlined: the walker instantiates once per caller
+/// closure, and letting each instantiation re-derive its own copy of this
+/// scan makes throughput vary with the surrounding codegen; one canonical
+/// out-of-line body costs a call per scan — amortized over the scanned
+/// bytes — and keeps every caller on the same machine code.
+#[inline(never)]
 pub(crate) fn find_startcode(data: &[u8], from: usize) -> Option<usize> {
     let n = data.len();
     if n < 3 {
@@ -138,13 +150,25 @@ pub(crate) fn find_startcode(data: &[u8], from: usize) -> Option<usize> {
     // Last index where a `00 00 01` triple can still start.
     let end = n - 2;
     let mut i = from;
+    // Byte-wise prelude: identical to the plain byte scan over the first
+    // eight positions. A hit adjacent to the scan origin (tiny NALs
+    // between separators) is found at byte-compare cost; the striding
+    // scan below only pays off once the hit is farther out.
+    let prelude_end = end.min(from.saturating_add(8));
+    while i < prelude_end {
+        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            return Some(attribute(data, from, i));
+        }
+        i += 1;
+    }
     while i < end {
         if i + 4 <= n {
             let w = u32::from_le_bytes(data[i..i + 4].try_into().expect("4-byte chunk"));
             if (w & 0x00FF_0000) == 0 {
                 // Probe byte data[i + 2] is 0: starts at `i + 1` and
                 // `i + 2` stay possible, only the start at `i` (which
-                // needs a 1 there) is ruled out.
+                // needs a 1 there) is ruled out; the constant step keeps
+                // this arm a tight loop across long zero runs.
                 i += 1;
                 continue;
             }
