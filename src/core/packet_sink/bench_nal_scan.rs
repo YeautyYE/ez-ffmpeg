@@ -24,15 +24,19 @@
 //! a stride buys nothing and only its prelude keeps it at the byte scan's
 //! cost there.
 //!
-//! Measurement discipline: two row families, both sampled in interleaved
-//! rotated rounds keeping per-cell minima. The harness family drives every
-//! finder variant through the same injected walker copy (identical walker
-//! shape and call surface) for cross-variant screening. The
-//! production-grade family is the release gate: two CONCRETE walkers —
-//! the parent's composition with the byte scan compiled in, and the real
-//! `walk_annexb` — compared pairwise per benchmark invocation, because
-//! per-instantiation codegen scatter on boundary-bound corpora is larger
-//! than the effects under test.
+//! Measurement discipline: two row families. The screening family drives
+//! every finder variant (including the rejected SWAR) through one injected
+//! walker copy and reports per-cell minima — it only decides which variant
+//! to promote, it is NOT the gate. The gate family is two CONCRETE walkers,
+//! both closure-generic only exactly like the shipped code and both with
+//! their finder inlined (the shipped `find_startcode` is `#[inline(always)]`
+//! and the parent's byte finder folds into its walker; release disassembly
+//! captured in `artifacts/inline_disasm_evidence.txt`): the parent's own
+//! composition versus the real `walk_annexb`. Each round times the pair
+//! back to back and emits both with the round index, so the reviewer forms
+//! ratios from SAME-ROUND lines — per-instantiation codegen scatter on
+//! boundary-bound corpora exceeds the effect under test, so independently
+//! selected minima are not a valid pair.
 
 use super::nal_framing::{
     find_startcode, push_length_prefixed, walk_annexb, AuScan, NAL_LENGTH_SIZE,
@@ -155,56 +159,81 @@ where
     Ok(scan)
 }
 
-/// Concrete twin of `walk_annexb` with the byte-by-byte reference scan
-/// compiled in directly — the parent's production composition. Kept
-/// concrete (not finder-generic) so the paired production rows compare
-/// the two shipped forms on equal codegen footing: closure-generic only,
-/// exactly like the real walker. Keep in sync with the original — the
-/// parity tests fail on any behavioral drift.
-fn walk_annexb_reference<'a>(
-    data: &'a [u8],
-    mut on_nal: impl FnMut(&'a [u8]),
-) -> Result<AuScan, String> {
-    if data.len() < 4 {
-        return Err(format!("Annex-B payload too short ({} bytes)", data.len()));
-    }
-    let mut pos = 0;
-    while pos < data.len() && data[pos] == 0 {
-        pos += 1;
-    }
-    if pos < 2 || pos >= data.len() || data[pos] != 1 {
-        return Err("payload does not begin with an Annex-B start code".to_string());
-    }
-    pos += 1;
+/// The parent's Annex-B composition, verbatim from
+/// `3fc0257:src/core/packet_sink/nal_framing.rs` — the byte-by-byte
+/// `find_startcode` (lines 117-128 there) as a PRIVATE finder plus the
+/// parent's `walk_annexb` (lines 58-111, unchanged since). Because the
+/// finder is private with the walker its only caller, LLVM inlines it into
+/// the walker exactly as it did in the parent build, so the paired
+/// production rows time the parent's real compiled composition against the
+/// candidate's — closing the codegen-fidelity gap a hand-written twin left
+/// open. Do not add inline attributes or restructure: the point is to
+/// reproduce the parent's own lowering. `AuScan`/`push_length_prefixed`
+/// are unchanged from the parent, so they are reused from `super`. The
+/// walker parity test pins this against the injected reference.
+mod parent {
+    use super::AuScan;
 
-    let mut scan = AuScan::default();
-    loop {
-        let boundary = find_startcode_reference(data, pos).unwrap_or(data.len());
-        let mut end = boundary;
-        while end > pos && data[end - 1] == 0 {
-            end -= 1;
+    /// Verbatim parent `find_startcode` (3fc0257, byte-by-byte).
+    fn find_startcode(data: &[u8], from: usize) -> Option<usize> {
+        if data.len() < 3 {
+            return None;
         }
-        if end == pos {
-            return Err("empty NAL unit".to_string());
-        }
-        scan.note(data[pos]);
-        on_nal(&data[pos..end]);
-        if !data[boundary..].iter().any(|&b| b != 0) {
-            break;
-        }
-        let mut next = boundary;
-        while next < data.len() && data[next] == 0 {
-            next += 1;
-        }
-        if next >= data.len() || data[next] != 1 {
-            return Err("malformed start code between NAL units".to_string());
-        }
-        pos = next + 1;
-        if pos >= data.len() {
-            return Err("trailing start code without a NAL unit".to_string());
+        let i = (from..data.len() - 2)
+            .find(|&i| data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1)?;
+        if i > from && data[i - 1] == 0 {
+            Some(i - 1)
+        } else {
+            Some(i)
         }
     }
-    Ok(scan)
+
+    /// Verbatim parent `walk_annexb` (3fc0257), finder inlined as built.
+    pub(super) fn walk_annexb<'a>(
+        data: &'a [u8],
+        mut on_nal: impl FnMut(&'a [u8]),
+    ) -> Result<AuScan, String> {
+        if data.len() < 4 {
+            return Err(format!("Annex-B payload too short ({} bytes)", data.len()));
+        }
+        let mut pos = 0;
+        while pos < data.len() && data[pos] == 0 {
+            pos += 1;
+        }
+        if pos < 2 || pos >= data.len() || data[pos] != 1 {
+            return Err("payload does not begin with an Annex-B start code".to_string());
+        }
+        pos += 1;
+
+        let mut scan = AuScan::default();
+        loop {
+            let boundary = find_startcode(data, pos).unwrap_or(data.len());
+            let mut end = boundary;
+            while end > pos && data[end - 1] == 0 {
+                end -= 1;
+            }
+            if end == pos {
+                return Err("empty NAL unit".to_string());
+            }
+            scan.note(data[pos]);
+            on_nal(&data[pos..end]);
+            if !data[boundary..].iter().any(|&b| b != 0) {
+                break;
+            }
+            let mut next = boundary;
+            while next < data.len() && data[next] == 0 {
+                next += 1;
+            }
+            if next >= data.len() || data[next] != 1 {
+                return Err("malformed start code between NAL units".to_string());
+            }
+            pos = next + 1;
+            if pos >= data.len() {
+                return Err("trailing start code without a NAL unit".to_string());
+            }
+        }
+        Ok(scan)
+    }
 }
 
 /// Deterministic xorshift32 so every generated corpus is reproducible.
@@ -291,14 +320,30 @@ fn make_au(nals: &[Vec<u8>]) -> Vec<u8> {
 }
 
 /// Separator-dense AU: `count` copies of one tiny NAL (0x41 header padded
-/// with 0x80), so the scan spends nearly all its time at start-code
-/// boundaries and a stride gets no reduction over the byte scan between
-/// hits — the degradation face of stride variants (reviewer-supplied
-/// family: thousands of one/two-byte NALs).
+/// with 0x80), 3-byte separators between them, so the scan spends nearly
+/// all its time at start-code boundaries and a stride gets little
+/// reduction over the byte scan between hits — the degradation face of
+/// stride variants (reviewer-supplied family: thousands of tiny NALs).
 fn sepdense_au(nal_len: usize, count: usize) -> Vec<u8> {
     let mut nal = vec![0x80u8; nal_len];
     nal[0] = 0x41;
     make_au(&vec![nal; count])
+}
+
+/// Separator-dense AU with 4-byte separators (`00 00 00 01`): the extra
+/// leading zero before every internal start code exercises the one-byte
+/// attribution back-up on every boundary, and the byte the scan lands on
+/// before each hit differs from the 3-byte form.
+fn sepdense_au4(nal_len: usize, count: usize) -> Vec<u8> {
+    let mut au = vec![0u8, 0, 0, 1];
+    let mut nal = vec![0x80u8; nal_len];
+    nal[0] = 0x41;
+    for _ in 0..count {
+        au.extend_from_slice(&nal);
+        au.extend_from_slice(&[0, 0, 0, 1]);
+    }
+    au.truncate(au.len() - 4);
+    au
 }
 
 /// Small AUs of 8-512 total bytes: per-walk overhead dominates on these,
@@ -458,9 +503,12 @@ fn walker_parity_on_seeded_random_aus() {
         aus.push(make_au(&[gen_nal_zerorun(0x41, len)]));
     }
     aus.extend(small_au_batch(&mut rng));
-    // Separator-dense: hundreds of one/two-byte NALs per AU.
-    aus.push(sepdense_au(1, 512));
-    aus.push(sepdense_au(2, 512));
+    // Separator-dense: many tiny NALs per AU, both separator widths and the
+    // boundary net-lengths the benchmark times.
+    for len in [1usize, 2, 7, 8, 9, 10, 12, 16] {
+        aus.push(sepdense_au(len, 64));
+        aus.push(sepdense_au4(len, 64));
+    }
     // Malformed shapes must fail identically through both walkers.
     aus.push(vec![0x12, 0, 0, 1, 0x67]);
     aus.push(vec![0, 0, 1, 0, 0, 1, 0x41, 0x9A]);
@@ -490,7 +538,7 @@ fn walker_parity_on_seeded_random_aus() {
         // must agree byte-for-byte as well.
         let mut prod_spans = Vec::new();
         let mut prod_out = Vec::new();
-        let prod = walk_annexb_reference(au, |nal| {
+        let prod = parent::walk_annexb(au, |nal| {
             prod_spans.push((nal.as_ptr() as usize - base, nal.len()));
             push_length_prefixed(nal, &mut prod_out);
         });
@@ -581,7 +629,7 @@ fn time_pair_production_ref(aus: &[Vec<u8>]) -> (f64, f64) {
     let census = sample_median(|| {
         for au in aus {
             let mut exact = 0usize;
-            let scan = walk_annexb_reference(black_box(au.as_slice()), |nal| {
+            let scan = parent::walk_annexb(black_box(au.as_slice()), |nal| {
                 exact += NAL_LENGTH_SIZE + nal.len();
             })
             .expect("benchmark AU is valid");
@@ -593,12 +641,12 @@ fn time_pair_production_ref(aus: &[Vec<u8>]) -> (f64, f64) {
         for au in aus {
             scratch.clear();
             let mut exact = 0usize;
-            walk_annexb_reference(black_box(au.as_slice()), |nal| {
+            parent::walk_annexb(black_box(au.as_slice()), |nal| {
                 exact += NAL_LENGTH_SIZE + nal.len();
             })
             .expect("benchmark AU is valid");
             scratch.reserve(exact);
-            let scan = walk_annexb_reference(black_box(au.as_slice()), |nal| {
+            let scan = parent::walk_annexb(black_box(au.as_slice()), |nal| {
                 push_length_prefixed(nal, &mut scratch)
             })
             .expect("benchmark AU is valid");
@@ -686,68 +734,88 @@ fn bench_nal_startcode_scan() {
         ),
         ("sepdense_1b_4096", vec![sepdense_au(1, 4096)]),
         ("sepdense_2b_4096", vec![sepdense_au(2, 4096)]),
+        // Reviewer's theoretical worst point: NAL net lengths straddling the
+        // stride's per-hit amortization window, 3-byte separators.
+        ("sepdense_7b_2048", vec![sepdense_au(7, 2048)]),
+        ("sepdense_8b_2048", vec![sepdense_au(8, 2048)]),
+        ("sepdense_9b_2048", vec![sepdense_au(9, 2048)]),
+        ("sepdense_10b_2048", vec![sepdense_au(10, 2048)]),
+        ("sepdense_12b_2048", vec![sepdense_au(12, 2048)]),
+        ("sepdense_16b_2048", vec![sepdense_au(16, 2048)]),
+        // 4-byte-separator variants at the same boundary sizes.
+        ("sepdense4_8b_2048", vec![sepdense_au4(8, 2048)]),
+        ("sepdense4_16b_2048", vec![sepdense_au4(16, 2048)]),
         ("smallau_batch", small_au_batch(&mut rng)),
     ];
 
-    println!("corpus,bytes,variant,census_ns,census_gbps,normalize_ns,normalize_gbps");
+    // Provenance header (commented so CSV parsers skip it): the reviewer
+    // asked for pinning/commit/CPU context and same-round pairing rather
+    // than min-of-min. Commit and CPU are recorded alongside the run in
+    // artifacts/; the crate version is stamped here.
+    println!(
+        "# bench_nal_startcode_scan v{} | production rows are SAME-ROUND pairs (round column); \
+         pair reference_production vs stride3_production at equal round",
+        env!("CARGO_PKG_VERSION")
+    );
+    println!("corpus,bytes,variant,round,census_ns,census_gbps,normalize_ns,normalize_gbps");
+    const ROUNDS: usize = 5;
     for (name, aus) in &corpora {
         let bytes: usize = aus.iter().map(|au| au.len()).sum();
-        // Symmetric comparison rows: every variant runs through the same
-        // injected walker copy (identical walker shape, call surface and
-        // inline context), sampled in interleaved rounds with the per-cell
-        // minimum kept and the within-round order rotated every round, so
-        // neither implementation shape nor measurement order privileges
-        // any variant.
+        let gbps = |ns: f64| bytes as f64 / ns;
         type Timer = fn(&[Vec<u8>]) -> (f64, f64);
-        let timers: [Timer; 3] = [
-            |aus| time_pair(aus, find_startcode_reference),
-            |aus| time_pair(aus, find_startcode),
-            |aus| time_pair(aus, find_startcode_swar),
+
+        // Screening rows (cross-variant, incl. the rejected SWAR): every
+        // variant runs through the same injected walker copy. Per-cell
+        // minima across rotated rounds are adequate here — this family only
+        // screens which variant to promote, it is NOT the gate. Round -1
+        // marks the aggregated screening cell.
+        let screen: [(&str, Timer); 3] = [
+            ("reference_byte", |aus| time_pair(aus, find_startcode_reference)),
+            ("stride3_shipping", |aus| time_pair(aus, find_startcode)),
+            ("swar_rejected", |aus| time_pair(aus, find_startcode_swar)),
         ];
         let mut best = [(f64::INFINITY, f64::INFINITY); 3];
         for round in 0..3 {
-            for offset in 0..timers.len() {
-                let variant = (round + offset) % timers.len();
-                let sample = timers[variant](aus);
-                let cell = &mut best[variant];
-                cell.0 = cell.0.min(sample.0);
-                cell.1 = cell.1.min(sample.1);
+            for offset in 0..screen.len() {
+                let v = (round + offset) % screen.len();
+                let s = screen[v].1(aus);
+                best[v].0 = best[v].0.min(s.0);
+                best[v].1 = best[v].1.min(s.1);
             }
         }
-        let labels = ["reference_byte", "stride3_shipping", "swar_rejected"];
-        for (variant, (census, normalize)) in labels.iter().zip(best) {
-            let census_gbps = bytes as f64 / census;
-            let normalize_gbps = bytes as f64 / normalize;
+        for (v, (c, n)) in screen.iter().map(|(l, _)| *l).zip(best) {
             println!(
-                "{name},{bytes},{variant},{census:.0},{census_gbps:.2},{normalize:.0},{normalize_gbps:.2}"
+                "{name},{bytes},{v},-1,{c:.0},{:.2},{n:.0},{:.2}",
+                gbps(c),
+                gbps(n)
             );
         }
-        // Paired production-grade rows — the release gate. Both walkers
-        // are concrete (closure-generic only, like the shipped code): the
-        // parent's composition with the byte scan compiled in, and the
-        // real `walk_annexb`. Same interleaved rotation, per-cell minima;
-        // compare these two rows PAIRED per invocation of this benchmark.
-        let prod_timers: [Timer; 2] = [
-            |aus| time_pair_production_ref(aus),
-            |aus| time_pair_production(aus),
+
+        // Gate rows — the release decision. Two CONCRETE walkers, both
+        // closure-generic only exactly like the shipped code and both with
+        // their finder inlined (release disassembly in
+        // artifacts/inline_disasm_evidence.txt): the parent's composition
+        // (byte scan) and the real `walk_annexb`. Each ROUND times the two
+        // back to back in rotated order and prints BOTH with that round's
+        // index, so pairing is same-round — the reviewer forms the ratio
+        // from equal-round lines, never from independently selected minima.
+        let gate: [(&str, Timer); 2] = [
+            ("reference_production", |aus| time_pair_production_ref(aus)),
+            ("stride3_production", |aus| time_pair_production(aus)),
         ];
-        let mut prod_best = [(f64::INFINITY, f64::INFINITY); 2];
-        for round in 0..3 {
-            for offset in 0..prod_timers.len() {
-                let variant = (round + offset) % prod_timers.len();
-                let sample = prod_timers[variant](aus);
-                let cell = &mut prod_best[variant];
-                cell.0 = cell.0.min(sample.0);
-                cell.1 = cell.1.min(sample.1);
+        for round in 0..ROUNDS {
+            let mut cells = [(0.0, 0.0); 2];
+            for offset in 0..gate.len() {
+                let v = (round + offset) % gate.len();
+                cells[v] = gate[v].1(aus);
             }
-        }
-        let prod_labels = ["reference_production", "stride3_production"];
-        for (variant, (census, normalize)) in prod_labels.iter().zip(prod_best) {
-            let census_gbps = bytes as f64 / census;
-            let normalize_gbps = bytes as f64 / normalize;
-            println!(
-                "{name},{bytes},{variant},{census:.0},{census_gbps:.2},{normalize:.0},{normalize_gbps:.2}"
-            );
+            for (v, (c, n)) in gate.iter().map(|(l, _)| *l).zip(cells) {
+                println!(
+                    "{name},{bytes},{v},{round},{c:.0},{:.2},{n:.0},{:.2}",
+                    gbps(c),
+                    gbps(n)
+                );
+            }
         }
     }
 }
