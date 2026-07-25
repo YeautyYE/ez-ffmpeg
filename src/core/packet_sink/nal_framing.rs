@@ -136,12 +136,13 @@ pub(crate) fn walk_annexb<'a>(
 /// collapse below the plain byte-by-byte loop on zero-dense and
 /// 0x01-dense payloads respectively.
 ///
-/// Deliberately never inlined: the walker instantiates once per caller
-/// closure, and letting each instantiation re-derive its own copy of this
-/// scan makes throughput vary with the surrounding codegen; one canonical
-/// out-of-line body costs a call per scan — amortized over the scanned
-/// bytes — and keeps every caller on the same machine code.
-#[inline(never)]
+/// Split on purpose into an always-inlined prelude and an out-of-line
+/// stride body: separator-dense streams call this once per tiny NAL, and
+/// those calls hit inside the prelude, so the prelude must live at the
+/// call site with no function-call boundary at all; the stride body stays
+/// one canonical non-inlined copy whose call cost is paid only after
+/// eight missed positions and amortizes over the bytes it strides.
+#[inline(always)]
 pub(crate) fn find_startcode(data: &[u8], from: usize) -> Option<usize> {
     let n = data.len();
     if n < 3 {
@@ -152,8 +153,9 @@ pub(crate) fn find_startcode(data: &[u8], from: usize) -> Option<usize> {
     let mut i = from;
     // Byte-wise prelude: identical to the plain byte scan over the first
     // eight positions. A hit adjacent to the scan origin (tiny NALs
-    // between separators) is found at byte-compare cost; the striding
-    // scan below only pays off once the hit is farther out.
+    // between separators) is found at byte-compare cost, inline at the
+    // call site; the striding body only pays off once the hit is farther
+    // out.
     let prelude_end = end.min(from.saturating_add(8));
     while i < prelude_end {
         if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
@@ -161,6 +163,22 @@ pub(crate) fn find_startcode(data: &[u8], from: usize) -> Option<usize> {
         }
         i += 1;
     }
+    if i >= end {
+        return None;
+    }
+    find_startcode_strided(data, from, i)
+}
+
+/// Striding continuation of [`find_startcode`] past its inline prelude.
+/// Never inlined: the walker instantiates once per caller closure, and
+/// letting each instantiation re-derive its own copy of this loop makes
+/// throughput vary with the surrounding codegen; one canonical body keeps
+/// every caller on the same machine code.
+#[inline(never)]
+fn find_startcode_strided(data: &[u8], from: usize, start: usize) -> Option<usize> {
+    let n = data.len();
+    let end = n - 2;
+    let mut i = start;
     while i < end {
         if i + 4 <= n {
             let w = u32::from_le_bytes(data[i..i + 4].try_into().expect("4-byte chunk"));
