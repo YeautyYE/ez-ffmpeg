@@ -8,6 +8,7 @@ use crate::core::scheduler::ffmpeg_scheduler::{
     STATUS_END,
 };
 use crate::core::scheduler::input_controller::{InputController, SchNode};
+use crate::core::scheduler::progress::OutputTelemetry;
 use crate::core::scheduler::sync_queue::SyncQueue;
 use crate::error::Error::Muxing;
 use crate::error::{MuxingError, MuxingOperationError, OpenOutputError, WriteHeaderError};
@@ -21,10 +22,10 @@ use ffmpeg_sys_next::AVMediaType::{AVMEDIA_TYPE_AUDIO, AVMEDIA_TYPE_SUBTITLE, AV
 use ffmpeg_sys_next::{
     av_compare_ts, av_get_audio_frame_duration2, av_interleaved_write_frame, av_packet_move_ref,
     av_packet_rescale_ts, av_rescale_delta, av_rescale_q, av_write_trailer,
-    avcodec_parameters_copy, avformat_write_header, avio_open2, AVFormatContext, AVPacket,
-    AVRational, AVERROR, AVERROR_EOF, AVFMT_NOFILE, AVFMT_NOTIMESTAMPS, AVFMT_TS_NONSTRICT,
-    AVIO_FLAG_WRITE, AV_LOG_DEBUG, AV_LOG_WARNING, AV_NOPTS_VALUE, AV_PKT_FLAG_KEY, AV_TIME_BASE_Q,
-    EAGAIN, ENOMEM,
+    avcodec_parameters_copy, avformat_write_header, avio_open2, avio_seek, avio_size,
+    AVFormatContext, AVIOContext, AVPacket, AVRational, AVERROR, AVERROR_EOF, AVFMT_NOFILE,
+    AVFMT_NOTIMESTAMPS, AVFMT_TS_NONSTRICT, AVIO_FLAG_WRITE, AV_LOG_DEBUG, AV_LOG_WARNING,
+    AV_NOPTS_VALUE, AV_PKT_FLAG_KEY, AV_TIME_BASE_Q, EAGAIN, ENOMEM,
 };
 use log::{debug, error, info, trace, warn};
 use std::collections::HashMap;
@@ -108,6 +109,7 @@ pub(crate) fn mux_init(
     thread_sync: ThreadSynchronizer,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
     mux_done_remaining: Arc<AtomicUsize>,
+    progress: Arc<OutputTelemetry>,
 ) -> crate::error::Result<()> {
     // Compute the `-shortest` packet sync-queue plan while the output context is
     // still owned (it reads each stream's media type); `None` unless the gate
@@ -165,6 +167,7 @@ pub(crate) fn mux_init(
         scheduler_status,
         scheduler_result,
         mux_done,
+        progress,
     )
 }
 
@@ -177,6 +180,7 @@ pub(crate) fn ready_to_init_mux(
     thread_sync: ThreadSynchronizer,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
     mux_done_remaining: Arc<AtomicUsize>,
+    progress: Arc<OutputTelemetry>,
 ) -> crate::error::Result<Option<crossbeam_channel::Sender<i32>>> {
     if !mux.is_ready() {
         let (sender, receiver) = crossbeam_channel::bounded(1);
@@ -343,6 +347,7 @@ pub(crate) fn ready_to_init_mux(
                         scheduler_status.clone(),
                         scheduler_result,
                         mux_done,
+                        progress,
                     ) {
                         // mux_task_start already logged the root cause and
                         // recorded it via set_scheduler_error.
@@ -417,6 +422,7 @@ fn mux_task_start(
     scheduler_status: Arc<AtomicUsize>,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
     mux_done: MuxDoneGuard,
+    progress: Arc<OutputTelemetry>,
 ) -> crate::error::Result<()> {
     let Some(queue_sender) = queue_sender else {
         // No queue means no mapped stream (`Muxer::new_stream` creates the
@@ -491,6 +497,7 @@ fn mux_task_start(
         scheduler_status,
         scheduler_result,
         mux_done,
+        progress,
     )?;
 
     // Drain the pre-queues and open the gate atomically: an encoder that
@@ -565,6 +572,7 @@ fn _mux_init(
     scheduler_status: Arc<AtomicUsize>,
     scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
     mux_done: MuxDoneGuard,
+    progress: Arc<OutputTelemetry>,
 ) -> crate::error::Result<Vec<PreMuxQueueReceiver>> {
     // A panic anywhere below runs BEFORE the guards hand off to the worker at
     // `guard_slot` (the DictGuard alloc, the leftover-option `warn!`, any
@@ -809,6 +817,17 @@ fn _mux_init(
             }
             warn!("Option '{key}' was not recognized by output {mux_idx}");
         }
+
+        // Seed the progress byte counter with the freshly written header, so
+        // total_size reports a real value even before the first packet lands.
+        // AVFMT_NOFILE muxers manage their own I/O — no size to report.
+        // SAFETY: the output context is live for this whole frame; the pb
+        // pointer is null-checked inside the helper.
+        unsafe {
+            if ((*(*out_fmt_ctx_ptr).oformat).flags & AVFMT_NOFILE) == 0 {
+                progress.set_total_size(muxer_filesize((*out_fmt_ctx_ptr).pb));
+            }
+        }
     }
 
     let oformat_flags = unsafe {
@@ -957,6 +976,26 @@ fn _mux_init(
         let mut st_rescale_delta_last: Vec<i64> = vec![0; stream_count];
         let mut st_last_dts: Vec<i64> = vec![AV_NOPTS_VALUE; stream_count];
 
+        // Progress telemetry: resolve the selected video stream (lowest
+        // index, mirroring which stream the CLI's `frame=` counter follows)
+        // for the `video_packets` counter — container outputs only. A
+        // packet-sink output never reaches the muxer write path, so its
+        // telemetry deliberately stays untouched (every field reads None).
+        if sink_worker.is_none() {
+            // SAFETY: the guard-owned output context is live for this whole
+            // worker; `stream_count` bounds the streams array (the same
+            // invariant every write below relies on).
+            let selected_video = unsafe {
+                (0..stream_count).find(|&i| {
+                    let stream = *(*out_fmt_ctx.as_ptr()).streams.add(i);
+                    !stream.is_null()
+                        && !(*stream).codecpar.is_null()
+                        && (*(*stream).codecpar).codec_type == AVMEDIA_TYPE_VIDEO
+                })
+            };
+            progress.set_video_stream(selected_video);
+        }
+
         // `-shortest` packet sync queue (owned by this single worker; `None`
         // unless the gate fired). When present, the loop routes every packet
         // through it so copy/subtitle/data followers truncate to the shortest
@@ -993,6 +1032,7 @@ fn _mux_init(
             mux_stream_nodes: &mux_stream_nodes,
             input_controller: &input_controller,
             scheduler_status: &scheduler_status,
+            progress: &progress,
         };
         let mut state = MuxWriteState {
             stream_pkt_templates: &mut stream_pkt_templates,
@@ -1672,10 +1712,24 @@ fn _mux_init(
                         ))),
                     );
                 }
+                // Progress: fold the trailer bytes (an MP4 moov atom, MKV
+                // Cues, ...) into the final reported size, whatever the
+                // trailer returned — bytes already on disk are what they
+                // are. NOFILE muxers still have no observable size.
+                if (oformat_flags & AVFMT_NOFILE) == 0 {
+                    progress.set_total_size(muxer_filesize((*out_fmt_ctx.as_ptr()).pb));
+                }
             }
         } else {
             debug!("Muxer skipping trailer due to abort");
         }
+
+        // Progress: no stream of this output can receive another packet on
+        // any exit of the write loop (normal EOF, stop, abort, write error),
+        // so retire them all — out_time_us freezes at the output's true
+        // high-water mark instead of a stale min. Idempotent alongside the
+        // per-stream marks finish_output_stream already published.
+        progress.mark_all_streams_finished();
 
         debug!("Muxer finished.");
 
@@ -2416,6 +2470,10 @@ struct MuxWriteCfg<'a> {
     mux_stream_nodes: &'a [Arc<SchNode>],
     input_controller: &'a Arc<InputController>,
     scheduler_status: &'a Arc<AtomicUsize>,
+    /// Progress telemetry for this output; fed by [`write_packet`] after a
+    /// successful commit and by [`finish_output_stream`] when a stream
+    /// retires.
+    progress: &'a OutputTelemetry,
 }
 
 /// Mutable per-stream / progress state threaded through the sync-queue mux path.
@@ -2519,6 +2577,23 @@ unsafe fn write_packet(
     (*sq_packet_box.packet.as_mut_ptr()).stream_index =
         sq_packet_box.packet_data.output_stream_index;
 
+    // Progress: capture the POST-fixup timestamp before the write —
+    // av_interleaved_write_frame takes ownership of the packet's contents
+    // and returns it blank, so nothing can be read from it afterwards. The
+    // packet is in the output stream's time base here (mux_fixup_ts stamped
+    // pkt.time_base); PTS is the progress position, DTS the fallback when
+    // the muxer path left PTS unset.
+    let progress_stream_index = sq_packet_box.packet_data.output_stream_index as usize;
+    let progress_ts_us = {
+        let pkt = sq_packet_box.packet.as_ptr();
+        let ts = if (*pkt).pts != AV_NOPTS_VALUE {
+            (*pkt).pts
+        } else {
+            (*pkt).dts
+        };
+        (ts != AV_NOPTS_VALUE).then(|| av_rescale_q(ts, (*pkt).time_base, AV_TIME_BASE_Q))
+    };
+
     #[cfg(test)]
     let counted = {
         let url = (*cfg.out_fmt_ctx.as_ptr()).url;
@@ -2545,7 +2620,71 @@ unsafe fn write_packet(
         }
         tcp_write_probe::RETURNED.fetch_add(1, Ordering::Release);
     }
+    // Progress: only a SUCCESSFUL commit advances the post-fixup watermark
+    // (and the byte counter) — a failed write reported an optimistic
+    // position otherwise. The watermark/packet counters are always
+    // maintained (cheap atomics, the core progress semantics). The
+    // byte-position refresh is gated twice: skipped for AVFMT_NOFILE muxers
+    // (no observable size) AND for a job with no progress handle
+    // (`is_observed`), so an UNOBSERVED job pays nothing here. When it does
+    // run it uses the cheap logical write offset — never `avio_size`, so no
+    // custom-IO AVSEEK_SIZE callback fires on the hot path; the precise
+    // `avio_size` sampling is reserved for the once-per-job header and
+    // trailer points.
+    if ret >= 0 {
+        cfg.progress
+            .record_written(progress_stream_index, progress_ts_us);
+        if (cfg.oformat_flags & AVFMT_NOFILE) == 0 && cfg.progress.is_observed() {
+            // Test-only: count each per-packet probe so a test can prove the
+            // gate (observed jobs probe, unobserved jobs do not). Compiled
+            // out of every non-test build.
+            #[cfg(test)]
+            cfg.progress.note_perpacket_size_probe();
+            cfg.progress
+                .set_total_size(muxer_logical_pos((*cfg.out_fmt_ctx.as_ptr()).pb));
+        }
+    }
     ret
+}
+
+/// Precise muxer byte position for the once-per-job header/trailer progress
+/// samples, mirroring the CLI's `filesize()` helper (ffmpeg_mux.c):
+/// `avio_size`, falling back to the current write position for outputs whose
+/// size probe is unsupported. May issue an `AVSEEK_SIZE` to a custom-IO seek
+/// callback, so it is NOT used on the per-packet path. Returns a negative
+/// value when no position is available.
+///
+/// # Safety
+/// - `pb` must be null (returns -1) or point to the live `AVIOContext` of
+///   the output for the duration of the call.
+unsafe fn muxer_filesize(pb: *mut AVIOContext) -> i64 {
+    if pb.is_null() {
+        return -1;
+    }
+    let size = avio_size(pb);
+    if size > 0 {
+        size
+    } else {
+        avio_seek(pb, 0, ffmpeg_sys_next::SEEK_CUR)
+    }
+}
+
+/// Cheap logical write position for the per-packet progress probe: the
+/// muxer's current output offset via `avio_seek(pb, 0, SEEK_CUR)`. FFmpeg
+/// answers a zero-offset SEEK_CUR from the in-memory buffer state
+/// (`s->pos + (buf_ptr - buffer)`) WITHOUT issuing an `AVSEEK_SIZE` to a
+/// custom-IO seek callback, unlike `avio_size`. Returns a negative value
+/// when no position is available (null pb, or a non-seekable output whose
+/// `avio_seek` yields `ENOSYS`), which `set_total_size` then ignores.
+///
+/// # Safety
+/// - `pb` must be null (returns -1) or point to the live `AVIOContext` of
+///   the output for the duration of the call.
+unsafe fn muxer_logical_pos(pb: *mut AVIOContext) -> i64 {
+    if pb.is_null() {
+        return -1;
+    }
+    avio_seek(pb, 0, ffmpeg_sys_next::SEEK_CUR)
 }
 
 /// Write one packet the `sq_mux` released, via the per-stream BSF (or the direct
@@ -2606,6 +2745,10 @@ unsafe fn finish_output_stream(
         }
     }
     state.stream_eof[ost] = true;
+    // Progress: the stream leaves the active set consulted by out_time_us —
+    // a short/sparse stream that finished must not pin the output's
+    // reported position at its final timestamp.
+    cfg.progress.mark_stream_finished(ost);
     *state.nb_done += 1;
     if ost < cfg.mux_stream_nodes.len() {
         if let SchNode::MuxStream {

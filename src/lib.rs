@@ -141,10 +141,12 @@
 //! [`Output::set_video_bsf`](crate::core::context::output::Output::set_video_bsf)
 //! and its audio/subtitle siblings (single filter or comma-separated chain).
 //!
-//! Not every CLI feature is implemented. Notable gaps: progress/stats
-//! reporting (`-progress`), sub2video (rendering bitmap subtitles into
-//! video), `-fix_sub_duration`, and two-pass encoding. Unsupported paths
-//! fail with explicit errors rather than approximations.
+//! Not every CLI feature is implemented. Notable gaps: sub2video (rendering
+//! bitmap subtitles into video), `-fix_sub_duration`, and two-pass encoding.
+//! The `-progress`/`-stats` textual interface is likewise absent; running
+//! jobs instead expose typed per-output progress snapshots through
+//! `progress_handle()` (see [`ProgressHandle`]). Unsupported paths fail
+//! with explicit errors rather than approximations.
 //!
 #![doc = include_str!("../docs/cli_mapping.md")]
 //!
@@ -189,6 +191,7 @@ pub use self::core::packet_scanner;
 pub use self::core::packet_sink;
 pub use self::core::recipes;
 pub use self::core::scheduler::ffmpeg_scheduler::FfmpegScheduler;
+pub use self::core::scheduler::progress::{OutputProgress, Progress, ProgressHandle, ProgressState};
 pub use self::core::stream_info;
 pub use self::core::writer::{PushError, VideoWriter, VideoWriterBuilder};
 pub use self::core::{set_ffmpeg_log_level, FfmpegLogLevel, FFMPEG_LOG_TARGET};
