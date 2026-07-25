@@ -36,7 +36,7 @@ pub(crate) struct AuScan {
 }
 
 impl AuScan {
-    fn note(&mut self, header: u8) {
+    pub(crate) fn note(&mut self, header: u8) {
         let nal_type = header & 0x1F;
         self.nal_count += 1;
         if nal_type == NAL_IDR {
@@ -114,16 +114,86 @@ pub(crate) fn walk_annexb<'a>(
 /// `ff_nal_find_startcode`: locate the next `00 00 01` triple, then back up by
 /// exactly one byte when the preceding byte is zero (the leading zero of a
 /// 4-byte start code belongs to the start code, not to the previous NAL).
-fn find_startcode(data: &[u8], from: usize) -> Option<usize> {
-    if data.len() < 3 {
+///
+/// The scan strides 3 bytes at a time on the classic observation that a
+/// triple starting at `i`, `i + 1` or `i + 2` needs `data[i + 2]` to be
+/// 1, 0 and 0 respectively: whenever that probe byte exceeds 1 — the
+/// overwhelmingly common case in compressed payloads — all three starts
+/// are ruled out at once. The probe tests are mask compares on one
+/// little-endian `u32` covering `data[i..i + 4]`, keeping the 0-vs-1
+/// disambiguation and the hit test branch-free: a branchy probe
+/// comparison chain would pay a ~25% mispredicted branch per probe on
+/// 0x01-dense payloads and drop below the byte scan on the rewrite walk.
+/// The single word load per position also replaces the byte scan's three
+/// dependent loads, so even the non-striding arms (a zero probe advancing
+/// one byte across long zero runs) stay ahead of it.
+///
+/// Marked `#[inline(always)]`, not split behind a call: the previous
+/// byte-by-byte finder was a small private fn that LLVM folded into
+/// [`walk_annexb`], so the walker paid no call per NAL. This wider finder
+/// is past the inliner's automatic size threshold (a plain `#[inline]`
+/// hint leaves an out-of-line copy that the walker still `call`s once per
+/// NAL — verified in release disassembly), which is exactly the
+/// separator-dense penalty a real deployment would hit: streams of tiny
+/// NALs invoke the finder once per NAL. Forcing the inline restores the
+/// parent's lowering — the finder folds into the walker, no boundary —
+/// and the benchmark's paired production rows confirm parity by timing
+/// this walker against the parent's own inlined composition. Payload bytes
+/// come from remote senders, which makes the variant choice worst-corpus
+/// driven (see `bench_nal_scan`): word-at-a-time zero skipping (SWAR) and
+/// memchr-style candidate search beat this scan on typical entropy but
+/// collapse below the byte-by-byte loop on zero-dense and 0x01-dense
+/// payloads respectively; this shape stays at or above the byte scan on
+/// every measured corpus and both walks.
+#[inline(always)]
+pub(crate) fn find_startcode(data: &[u8], from: usize) -> Option<usize> {
+    let n = data.len();
+    if n < 3 {
         return None;
     }
-    let i = (from..data.len() - 2)
-        .find(|&i| data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1)?;
+    // Last index where a `00 00 01` triple can still start.
+    let end = n - 2;
+    let mut i = from;
+    while i < end {
+        if i + 4 <= n {
+            let w = u32::from_le_bytes(data[i..i + 4].try_into().expect("4-byte chunk"));
+            if (w & 0x00FF_0000) == 0 {
+                // Probe byte data[i + 2] is 0: starts at `i + 1` and
+                // `i + 2` stay possible, only the start at `i` (which
+                // needs a 1 there) is ruled out; the constant step keeps
+                // this arm a tight loop across long zero runs.
+                i += 1;
+                continue;
+            }
+            if (w & 0x00FF_FFFF) == 0x0001_0000 {
+                // Bytes i..i + 3 are exactly 00 00 01.
+                return Some(attribute(data, from, i));
+            }
+            // Non-zero probe with the triple test missed: a 1 rules out
+            // starts at `i + 1` / `i + 2` (both need a 0 there) and the
+            // start at `i` was just checked; anything above 1 rules out
+            // all three starts directly.
+            i += 3;
+        } else {
+            // i == n - 3 here: the only in-range start whose 4-byte window
+            // would overrun the slice. Check the final triple byte-wise.
+            if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+                return Some(attribute(data, from, i));
+            }
+            i += 1;
+        }
+    }
+    None
+}
+
+/// 4-byte start-code attribution: the zero immediately before a found
+/// triple belongs to the start code, not to the previous NAL — unless the
+/// triple sits at the scan origin itself.
+fn attribute(data: &[u8], from: usize, i: usize) -> usize {
     if i > from && data[i - 1] == 0 {
-        Some(i - 1)
+        i - 1
     } else {
-        Some(i)
+        i
     }
 }
 
