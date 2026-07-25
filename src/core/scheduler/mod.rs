@@ -71,6 +71,10 @@ pub(crate) use mux_task::tcp_write_probe;
 pub(crate) mod owned_run_iter;
 #[cfg(test)]
 mod packet_sink_wedge_tests;
+// Typed, pull-based progress reporting for running jobs; documented by its
+// own module-level docs (an outer doc comment here would merge with them
+// and break their intra-doc link resolution scope).
+pub mod progress;
 pub(crate) mod sync_queue;
 
 pub(crate) fn type_to_symbol(media_type: AVMediaType) -> String {

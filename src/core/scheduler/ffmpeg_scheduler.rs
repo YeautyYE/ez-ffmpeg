@@ -299,6 +299,12 @@ pub struct FfmpegScheduler<S> {
     pause_epoch: Arc<AtomicUsize>,
     thread_sync: ThreadSynchronizer,
     result: Arc<Mutex<Option<crate::error::Result<()>>>>,
+    /// Shared root of the typed progress state (`progress_handle()`): plain
+    /// std atomics/timestamps only, written by workers on their existing
+    /// paths and read by any number of handles. Created in `new()` so the
+    /// completion latch is installed in the thread synchronizer before any
+    /// slot is ever claimed.
+    progress: Arc<crate::core::scheduler::progress::ProgressTracker>,
     state: PhantomData<S>,
     // Guard for Running state - Some only when in Running state
     _guard: Option<RunningGuard>,
@@ -353,6 +359,7 @@ impl<S: 'static> FfmpegScheduler<S> {
             pause_epoch: self.pause_epoch,
             thread_sync: self.thread_sync,
             result: self.result,
+            progress: self.progress,
             state: Default::default(),
             _guard: self._guard, // Pass guard to maintain Drop protection across state transitions
         }
@@ -402,6 +409,18 @@ impl<S: 'static> FfmpegScheduler<S> {
     pub(crate) fn parked_settlement_waiters(&self) -> usize {
         self.thread_sync.parked_settlement_waiters()
     }
+
+    /// Test-only: the progress tracker WITHOUT arming observation. Lets a
+    /// test inspect an UNOBSERVED job's telemetry (e.g. assert its mux hot
+    /// path took zero per-packet size probes) — the public
+    /// `progress_handle()` cannot serve this, because obtaining a handle is
+    /// exactly what arms the probe.
+    #[cfg(test)]
+    pub(crate) fn progress_tracker_for_test(
+        &self,
+    ) -> Arc<crate::core::scheduler::progress::ProgressTracker> {
+        self.progress.clone()
+    }
 }
 
 impl FfmpegScheduler<Initialization> {
@@ -425,13 +444,49 @@ impl FfmpegScheduler<Initialization> {
         // installed at build time are bound to it, so stop()/abort() can
         // break blocking I/O on the already-opened contexts.
         let status = ffmpeg_context.scheduler_status.clone();
+        // Progress state root: per-output telemetry sized from the built
+        // context (stream counts are final at build), demuxer exit flags
+        // shared with the balancing nodes, and one fresh exit flag per
+        // frame source (handed out in start()).
+        let progress = Arc::new(crate::core::scheduler::progress::ProgressTracker::new(
+            ffmpeg_context
+                .muxs
+                .iter()
+                .map(|mux| {
+                    Arc::new(crate::core::scheduler::progress::OutputTelemetry::new(
+                        mux.stream_count(),
+                    ))
+                })
+                .collect(),
+            ffmpeg_context
+                .demuxs
+                .iter()
+                .filter_map(|demux| {
+                    let crate::core::scheduler::input_controller::SchNode::Demux {
+                        task_exited,
+                        ..
+                    } = demux.node.as_ref()
+                    else {
+                        return None;
+                    };
+                    Some(task_exited.clone())
+                })
+                .collect(),
+            ffmpeg_context.frame_sources.len(),
+        ));
+        let thread_sync = ThreadSynchronizer::new();
+        // Install before any slot is claimed: every later live-count-to-zero
+        // transition (job end, and only that — no slot exists before
+        // start()) seals the completion latch.
+        thread_sync.install_completion_latch(progress.clone());
         FfmpegScheduler {
             ffmpeg_context,
             state: Default::default(),
-            thread_sync: ThreadSynchronizer::new(),
+            thread_sync,
             status,
             pause_epoch: Arc::new(AtomicUsize::new(0)),
             result: Arc::new(Mutex::new(None)),
+            progress,
             _guard: None,
         }
     }
@@ -470,6 +525,9 @@ impl FfmpegScheduler<Initialization> {
         let scheduler_status = self.status.clone();
         let pause_epoch = self.pause_epoch.clone();
         scheduler_status.store(STATUS_RUN, Ordering::Release);
+        // Progress wall clock starts with the job (elapsed() measures from
+        // here; the completion latch freezes it at worker teardown).
+        self.progress.mark_started();
         let thread_sync = self.thread_sync.clone();
         let scheduler_result = self.result.clone();
 
@@ -581,6 +639,7 @@ impl FfmpegScheduler<Initialization> {
                     thread_sync.clone(),
                     scheduler_result.clone(),
                     mux_done_remaining.clone(),
+                    self.progress.output_telemetry(mux_idx),
                 )?;
             }
         }
@@ -624,6 +683,7 @@ impl FfmpegScheduler<Initialization> {
                 thread_sync.clone(),
                 scheduler_result.clone(),
                 mux_done_remaining.clone(),
+                self.progress.output_telemetry(mux_idx),
             ) {
                 Ok(sender) => {
                     // A not-ready muxer's slot is now owned by the spawned
@@ -820,6 +880,7 @@ impl FfmpegScheduler<Initialization> {
                 scheduler_status.clone(),
                 thread_sync.clone(),
                 scheduler_result.clone(),
+                self.progress.frame_source_exit_flag(i),
             )?;
         }
 
@@ -902,6 +963,44 @@ impl FfmpegScheduler<Running> {
                 .as_ref()
                 .is_some_and(|t| Arc::ptr_eq(t, token))
         })
+    }
+
+    /// Returns a cloneable, thread-safe, **read-only** progress handle for
+    /// this job.
+    ///
+    /// The handle is pull-based: call
+    /// [`snapshot()`](crate::core::scheduler::progress::ProgressHandle::snapshot)
+    /// at any cadence to obtain a typed
+    /// [`Progress`](crate::core::scheduler::progress::Progress) value — the
+    /// typed counterpart of the CLI `-progress` fields, reported per output.
+    /// It holds no FFmpeg pointers and stays safe (returning the final
+    /// frozen values) after the scheduler is consumed by
+    /// `wait()`/`stop()`/`abort()` or dropped.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let scheduler = FfmpegScheduler::new(context).start()?;
+    /// let progress = scheduler.progress_handle();
+    /// std::thread::spawn(move || {
+    ///     while !progress.is_ended() {
+    ///         let snapshot = progress.snapshot();
+    ///         for output in snapshot.outputs() {
+    ///             println!("output {}: out_time={:?}us", output.output_index(), output.out_time_us());
+    ///         }
+    ///         std::thread::sleep(std::time::Duration::from_millis(500));
+    ///     }
+    /// });
+    /// scheduler.wait()?;
+    /// ```
+    pub fn progress_handle(&self) -> crate::core::scheduler::progress::ProgressHandle {
+        // Arm the per-packet byte-position probe: only observed jobs pay for
+        // total_size sampling on the mux hot path.
+        self.progress.mark_observed();
+        crate::core::scheduler::progress::ProgressHandle::new(
+            self.status.clone(),
+            self.pause_epoch.clone(),
+            self.progress.clone(),
+        )
     }
 
     /// Pauses a running FFmpeg job, transitioning from `Running` to `Paused`.
@@ -1186,6 +1285,25 @@ impl std::future::Future for FfmpegScheduler<Running> {
 }
 
 impl FfmpegScheduler<Paused> {
+    /// Returns a cloneable, thread-safe, **read-only** progress handle for
+    /// this (currently paused) job. Identical to
+    /// [`FfmpegScheduler::<Running>::progress_handle`]: snapshots taken
+    /// while paused report [`ProgressState::Paused`] and keep accruing
+    /// wall-clock [`elapsed`](crate::core::scheduler::progress::Progress::elapsed).
+    ///
+    /// [`FfmpegScheduler::<Running>::progress_handle`]: FfmpegScheduler::progress_handle
+    /// [`ProgressState::Paused`]: crate::core::scheduler::progress::ProgressState::Paused
+    pub fn progress_handle(&self) -> crate::core::scheduler::progress::ProgressHandle {
+        // Arm the per-packet byte-position probe: only observed jobs pay for
+        // total_size sampling on the mux hot path.
+        self.progress.mark_observed();
+        crate::core::scheduler::progress::ProgressHandle::new(
+            self.status.clone(),
+            self.pause_epoch.clone(),
+            self.progress.clone(),
+        )
+    }
+
     /// Resumes a paused FFmpeg job, transitioning from `Paused` back to `Running`.
     ///
     /// If the scheduler is in an ended state, this has no effect. Otherwise,
