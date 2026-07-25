@@ -6,8 +6,10 @@ mod attachment;
 mod bsf;
 mod codec_opts;
 mod metadata;
+mod stream_map;
 
 pub(crate) use attachment::AttachmentSpec;
+pub use stream_map::StreamMap;
 
 // Note: Output is Send if all callback fields are Send.
 // We require `+ Send` on callback types to ensure this.
@@ -165,11 +167,11 @@ pub struct Output {
 
     /// Unparsed stream map specifications (user input stage)
     /// These get parsed and expanded into stream_maps during outputs_bind()
-    pub(crate) stream_map_specs: Vec<StreamMapSpec>,
+    pub(crate) stream_map_specs: Vec<StreamMap>,
 
     /// Expanded stream maps (FFmpeg-compatible, ready for use)
     /// Each entry maps exactly one input stream to one output stream
-    pub(crate) stream_maps: Vec<StreamMap>,
+    pub(crate) stream_maps: Vec<ExpandedStreamMap>,
 
     /// The output format for the container.
     ///
@@ -911,12 +913,29 @@ impl Output {
     /// - **`"1:a?"`** – audio from input #1, **ignore** if none present (due to `?`).
     /// - Other possibilities include `"0:s"`, `"0:d"`, etc. for subtitles/data, optionally with `?`.
     ///
-    /// By calling `add_stream_map`, **you force re-encoding** of the chosen stream(s).
-    /// If the user wants a bit-for-bit copy, see [`add_stream_map_with_copy`](Self::add_stream_map_with_copy).
+    /// A plain specifier **re-encodes** the chosen stream(s) with this
+    /// output's codec settings (unless the resolved codec is `"copy"`).
+    /// For a bit-for-bit copy, see
+    /// [`add_stream_map_with_copy`](Self::add_stream_map_with_copy) or
+    /// [`StreamMap::codec`] with `"copy"`.
+    ///
+    /// # Per-map encoder selection
+    ///
+    /// Passing a [`StreamMap`] instead of a plain string attaches a per-map
+    /// encoder and per-map encoder options to the mapped stream(s) — the
+    /// builder equivalent of FFmpeg's indexed `-c:v:0 libx264 -b:v:0 4M`.
+    /// A per-map codec overrides the per-type
+    /// [`set_video_codec`](Self::set_video_codec) /
+    /// [`set_audio_codec`](Self::set_audio_codec) /
+    /// [`set_subtitle_codec`](Self::set_subtitle_codec) value for exactly
+    /// the streams the map matches; per-map options merge key by key over
+    /// the per-type option tables. See [`StreamMap`] for the precedence and
+    /// granularity rules.
     ///
     /// # Parameters
-    /// - `linklabel`: An FFmpeg-style specifier referencing the desired input index and
-    ///   media type, like `"0:v"`, `"1:a?"`, etc.
+    /// - `map`: An FFmpeg-style specifier (`"0:v"`, `"1:a?"`, a filter
+    ///   output label like `"[v0]"`), or a [`StreamMap`] carrying per-map
+    ///   encoder settings.
     ///
     /// # Returns
     /// * `Self` - for chained method calls.
@@ -926,9 +945,15 @@ impl Output {
     /// // Re-encode the video stream from input #0 (fail if no video).
     /// let output = Output::from("output.mp4")
     ///     .add_stream_map("0:v");
+    ///
+    /// // Two audio tracks of the same input, each with its own encoder —
+    /// // FFmpeg: -map 0:a:0 -c:a:0 aac -b:a:0 128k -map 0:a:1 -c:a:1 libopus
+    /// let output = Output::from("output.mkv")
+    ///     .add_stream_map(StreamMap::new("0:a:0").codec("aac").codec_opt("b", "128k"))
+    ///     .add_stream_map(StreamMap::new("0:a:1").codec("libopus"));
     /// ```
-    pub fn add_stream_map(mut self, linklabel: impl Into<String>) -> Self {
-        self.stream_map_specs.push(linklabel.into().into());
+    pub fn add_stream_map(mut self, map: impl Into<StreamMap>) -> Self {
+        self.stream_map_specs.push(map.into());
         self
     }
 
@@ -951,8 +976,11 @@ impl Output {
     /// use [`add_stream_map`](Self::add_stream_map).
     ///
     /// # Parameters
-    /// - `linklabel`: An FFmpeg-style specifier referencing the desired input index and
-    ///   media type, like `"0:v?"`.
+    /// - `map`: An FFmpeg-style specifier referencing the desired input index and
+    ///   media type, like `"0:v?"`, or a [`StreamMap`]. The copy flag is
+    ///   forced on; combining it with [`StreamMap::codec`] /
+    ///   [`StreamMap::codec_opt`] is rejected at build time
+    ///   ([`OpenOutputError::StreamMapCopyConflict`](crate::error::OpenOutputError::StreamMapCopyConflict)).
     ///
     /// # Returns
     /// * `Self` - for chained method calls.
@@ -963,11 +991,10 @@ impl Output {
     /// let output = Output::from("output.mkv")
     ///     .add_stream_map_with_copy("0:a?");
     /// ```
-    pub fn add_stream_map_with_copy(mut self, linklabel: impl Into<String>) -> Self {
-        self.stream_map_specs.push(StreamMapSpec {
-            linklabel: linklabel.into(),
-            copy: true,
-        });
+    pub fn add_stream_map_with_copy(mut self, map: impl Into<StreamMap>) -> Self {
+        let mut map = map.into();
+        map.copy = true;
+        self.stream_map_specs.push(map);
         self
     }
 
@@ -1787,30 +1814,15 @@ impl From<&str> for Output {
     }
 }
 
-/// Temporary storage for unparsed stream map specifications (user input stage)
-/// Equivalent to FFmpeg's command-line parsing before opt_map() expansion
-#[derive(Debug, Clone)]
-pub(crate) struct StreamMapSpec {
-    /// Stream specifier string: "0:v", "1:a:0", "0:v?", "[label]", etc.
-    pub(crate) linklabel: String,
-    /// Stream copy flag (-c copy)
-    pub(crate) copy: bool,
-}
-
-impl<T: Into<String>> From<T> for StreamMapSpec {
-    fn from(linklabel: T) -> Self {
-        Self {
-            linklabel: linklabel.into(),
-            copy: false,
-        }
-    }
-}
-
 /// Final expanded stream map (matches FFmpeg's StreamMap structure)
 /// Created after parsing and expansion in outputs_bind()
 /// FFmpeg reference: fftools/ffmpeg.h:134-141
+///
+/// The user-input stage is the public [`StreamMap`] parameter object
+/// (`stream_map.rs`); one of those expands into N of these, each carrying
+/// the map's resolved per-map encoder request.
 #[derive(Debug, Clone)]
-pub(crate) struct StreamMap {
+pub(crate) struct ExpandedStreamMap {
     /// 1 if this mapping is disabled by a negative map (-map -0:v)
     pub(crate) disabled: bool,
     /// Input file index
@@ -1821,6 +1833,13 @@ pub(crate) struct StreamMap {
     pub(crate) linklabel: Option<String>,
     /// Stream copy flag (-c copy)
     pub(crate) copy: bool,
+    /// Per-map encoder request (FFmpeg `-c:<spec>`), already normalized:
+    /// never `"copy"` (that became the `copy` flag at resolve time).
+    pub(crate) codec: Option<String>,
+    /// Per-map encoder options (FFmpeg `-b:<spec>` etc.), converted for the
+    /// encoder layer. Merged key by key over the per-type tables in
+    /// `enc_task::set_encoder_opts`.
+    pub(crate) codec_opts: Option<HashMap<std::ffi::CString, std::ffi::CString>>,
 }
 
 /// Parse an FFmpeg `-force_key_frames` **list-form** spec (e.g. `"0,5,10.5"`) into a

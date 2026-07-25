@@ -290,9 +290,9 @@ impl Parser {
                 option: name.to_string(),
                 index,
                 scope: self.scope(),
-                reason: "per-stream indexed variants (like -b:v:1) are permanently excluded: \
-                         the crate models codec/bitrate/filter options per media type, not per \
-                         stream index"
+                reason: "per-stream indexed variants (like -b:v:1) are permanently excluded \
+                         from the CLI subset; use the builder per-map API instead \
+                         (Output::add_stream_map with StreamMap::codec / StreamMap::codec_opt)"
                     .to_string(),
                 hint: None,
             };

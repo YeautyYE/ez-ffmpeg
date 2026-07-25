@@ -183,6 +183,7 @@ pub use self::core::container_info;
 pub use self::core::context::ffmpeg_context::FfmpegContext;
 pub use self::core::context::input::Input;
 pub use self::core::context::output::Output;
+pub use self::core::context::output::StreamMap;
 pub use self::core::device;
 pub use self::core::filter;
 pub use self::core::frame_export;

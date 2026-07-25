@@ -1,5 +1,5 @@
 use crate::core::context::encoder_stream::EncoderStream;
-use crate::core::context::output::{AttachmentSpec, StreamMap, VSyncMethod};
+use crate::core::context::output::{AttachmentSpec, ExpandedStreamMap, StreamMap, VSyncMethod};
 use crate::core::context::pre_mux_queue::{
     self, PreMuxQueueConfig, PreMuxQueueReceiver, PreMuxQueueSender,
 };
@@ -137,8 +137,8 @@ pub(crate) struct Muxer {
     pub(crate) oformat_flags: i32,
     pub(crate) frame_pipelines: Option<Vec<FramePipeline>>,
 
-    pub(crate) stream_map_specs: Vec<crate::core::context::output::StreamMapSpec>,
-    pub(crate) stream_maps: Vec<StreamMap>,
+    pub(crate) stream_map_specs: Vec<StreamMap>,
+    pub(crate) stream_maps: Vec<ExpandedStreamMap>,
     pub(crate) video_codec: Option<String>,
     pub(crate) audio_codec: Option<String>,
     pub(crate) subtitle_codec: Option<String>,
@@ -309,8 +309,8 @@ impl Muxer {
         url: String,
         out_fmt_ctx: FormatContext,
         frame_pipelines: Option<Vec<FramePipeline>>,
-        stream_map_specs: Vec<crate::core::context::output::StreamMapSpec>,
-        stream_maps: Vec<StreamMap>,
+        stream_map_specs: Vec<StreamMap>,
+        stream_maps: Vec<ExpandedStreamMap>,
         video_codec: Option<String>,
         audio_codec: Option<String>,
         subtitle_codec: Option<String>,
@@ -469,6 +469,7 @@ impl Muxer {
         enc: *const AVCodec,
         src_node: Arc<SchNode>,
         single_stream_direct_input: bool,
+        per_map_codec_opts: Option<HashMap<CString, CString>>,
     ) -> crate::error::Result<(Sender<FrameBox>, usize)> {
         if self.is_packet_sink() {
             // Strict-tier whitelist (v1): the delivery contract assumes one
@@ -546,6 +547,7 @@ impl Muxer {
             pre_packet_sender,
             self.mux_start_gate.clone(),
             self.strict_avoptions,
+            per_map_codec_opts,
         );
         self.streams.push(stream);
         Ok((frame_sender, stream_index))
