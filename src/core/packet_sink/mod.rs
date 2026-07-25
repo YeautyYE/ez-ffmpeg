@@ -6,6 +6,14 @@
 //! Instead of muxing packets into container bytes, the job hands each encoded
 //! packet to a consumer, normalized for WebCodecs-style use.
 //!
+//! # Experimental
+//!
+//! This module is **experimental**: introduced in 0.15, its API surface may
+//! still be reshaped in minor releases while it settles; within a minor
+//! line, patch releases will not break it. Correctness defects (ordering
+//! violations, duplicated terminal callbacks, malformed configuration
+//! records) are **not** waived by this banner — they are release blockers.
+//!
 //! # Strict tier (v1)
 //!
 //! The construction paths on [`PacketSink`] build a **strict-tier** sink —
@@ -764,6 +772,8 @@ pub(crate) type CancellationSlot = Arc<OnceLock<JobStopObservables>>;
 /// construction paths produce a **strict-tier** sink; see the
 /// [module docs](self) for the callback order and the **blocking
 /// backpressure** contract.
+///
+/// **Experimental:** new in 0.15; the surface may still be refined.
 pub struct PacketSink {
     pub(crate) tier: PacketSinkTier,
     dispatch: SinkDispatch,
