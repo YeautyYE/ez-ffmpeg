@@ -84,3 +84,6 @@ mod poller;
 mod reactor;
 mod rtmp_scheduler;
 mod write_queue;
+
+#[cfg(test)]
+mod bench_kernels;
