@@ -24,11 +24,15 @@
 //! a stride buys nothing and only its prelude keeps it at the byte scan's
 //! cost there.
 //!
-//! Measurement discipline: the comparison rows all run through the same
-//! injected walker copy — identical walker shape, call surface and inline
-//! context for every variant — in interleaved rounds keeping per-cell
-//! minima; a separate `stride3_production` row cross-checks that the real
-//! `walk_annexb` composition reproduces the symmetric number.
+//! Measurement discipline: two row families, both sampled in interleaved
+//! rotated rounds keeping per-cell minima. The harness family drives every
+//! finder variant through the same injected walker copy (identical walker
+//! shape and call surface) for cross-variant screening. The
+//! production-grade family is the release gate: two CONCRETE walkers —
+//! the parent's composition with the byte scan compiled in, and the real
+//! `walk_annexb` — compared pairwise per benchmark invocation, because
+//! per-instantiation codegen scatter on boundary-bound corpora is larger
+//! than the effects under test.
 
 use super::nal_framing::{
     find_startcode, push_length_prefixed, walk_annexb, AuScan, NAL_LENGTH_SIZE,
@@ -124,6 +128,58 @@ where
     let mut scan = AuScan::default();
     loop {
         let boundary = find(data, pos).unwrap_or(data.len());
+        let mut end = boundary;
+        while end > pos && data[end - 1] == 0 {
+            end -= 1;
+        }
+        if end == pos {
+            return Err("empty NAL unit".to_string());
+        }
+        scan.note(data[pos]);
+        on_nal(&data[pos..end]);
+        if !data[boundary..].iter().any(|&b| b != 0) {
+            break;
+        }
+        let mut next = boundary;
+        while next < data.len() && data[next] == 0 {
+            next += 1;
+        }
+        if next >= data.len() || data[next] != 1 {
+            return Err("malformed start code between NAL units".to_string());
+        }
+        pos = next + 1;
+        if pos >= data.len() {
+            return Err("trailing start code without a NAL unit".to_string());
+        }
+    }
+    Ok(scan)
+}
+
+/// Concrete twin of `walk_annexb` with the byte-by-byte reference scan
+/// compiled in directly — the parent's production composition. Kept
+/// concrete (not finder-generic) so the paired production rows compare
+/// the two shipped forms on equal codegen footing: closure-generic only,
+/// exactly like the real walker. Keep in sync with the original — the
+/// parity tests fail on any behavioral drift.
+fn walk_annexb_reference<'a>(
+    data: &'a [u8],
+    mut on_nal: impl FnMut(&'a [u8]),
+) -> Result<AuScan, String> {
+    if data.len() < 4 {
+        return Err(format!("Annex-B payload too short ({} bytes)", data.len()));
+    }
+    let mut pos = 0;
+    while pos < data.len() && data[pos] == 0 {
+        pos += 1;
+    }
+    if pos < 2 || pos >= data.len() || data[pos] != 1 {
+        return Err("payload does not begin with an Annex-B start code".to_string());
+    }
+    pos += 1;
+
+    let mut scan = AuScan::default();
+    loop {
+        let boundary = find_startcode_reference(data, pos).unwrap_or(data.len());
         let mut end = boundary;
         while end > pos && data[end - 1] == 0 {
             end -= 1;
@@ -265,32 +321,41 @@ fn small_au_batch(rng: &mut Xorshift) -> Vec<Vec<u8>> {
 /// Exhaustive sweep: every buffer over the {0x00, 0x01, 0xAA} alphabet up
 /// to length 10 (all values above 1 are equivalent to every scan variant),
 /// with every scan origin in 0..=len+2 — including origins at and past the
-/// end of the buffer.
+/// end of the buffer. Because the shipping scan resolves its first eight
+/// positions in a byte-wise prelude, short buffers alone never reach the
+/// striding body: a second sweep prepends eight non-matching bytes so the
+/// stride entry faces every alphabet pattern too, again over every origin
+/// (origins inside the prefix shift the prelude/stride boundary through
+/// the pattern).
 #[test]
 fn scan_variants_match_reference_exhaustively() {
     let alphabet = [0u8, 1, 0xAA];
     let mut buf = Vec::new();
-    for len in 0usize..=10 {
-        let combos = 3usize.pow(len as u32);
-        for combo in 0..combos {
-            buf.clear();
-            let mut c = combo;
-            for _ in 0..len {
-                buf.push(alphabet[c % 3]);
-                c /= 3;
-            }
-            for from in 0..=len + 2 {
-                let want = find_startcode_reference(&buf, from);
-                assert_eq!(
-                    find_startcode(&buf, from),
-                    want,
-                    "stride3 vs reference on {buf:02X?} from={from}"
-                );
-                assert_eq!(
-                    find_startcode_swar(&buf, from),
-                    want,
-                    "swar vs reference on {buf:02X?} from={from}"
-                );
+    for prefix in [0usize, 8] {
+        let max_len = if prefix == 0 { 10 } else { 8 };
+        for len in 0usize..=max_len {
+            let combos = 3usize.pow(len as u32);
+            for combo in 0..combos {
+                buf.clear();
+                buf.resize(prefix, 0xAA);
+                let mut c = combo;
+                for _ in 0..len {
+                    buf.push(alphabet[c % 3]);
+                    c /= 3;
+                }
+                for from in 0..=buf.len() + 2 {
+                    let want = find_startcode_reference(&buf, from);
+                    assert_eq!(
+                        find_startcode(&buf, from),
+                        want,
+                        "stride3 vs reference on {buf:02X?} from={from}"
+                    );
+                    assert_eq!(
+                        find_startcode_swar(&buf, from),
+                        want,
+                        "swar vs reference on {buf:02X?} from={from}"
+                    );
+                }
             }
         }
     }
@@ -421,6 +486,17 @@ fn walker_parity_on_seeded_random_aus() {
         assert_eq!(got, want, "walk result on {} bytes", au.len());
         assert_eq!(got_spans, want_spans, "NAL spans on {} bytes", au.len());
         assert_eq!(got_out, want_out, "normalized bytes on {} bytes", au.len());
+        // The concrete reference walker (production-paired benchmark row)
+        // must agree byte-for-byte as well.
+        let mut prod_spans = Vec::new();
+        let mut prod_out = Vec::new();
+        let prod = walk_annexb_reference(au, |nal| {
+            prod_spans.push((nal.as_ptr() as usize - base, nal.len()));
+            push_length_prefixed(nal, &mut prod_out);
+        });
+        assert_eq!(prod, want, "reference walker result on {} bytes", au.len());
+        assert_eq!(prod_spans, want_spans, "reference walker spans");
+        assert_eq!(prod_out, want_out, "reference walker bytes");
         checked += 1;
     }
     for au in aus.iter().step_by(4) {
@@ -498,10 +574,42 @@ where
     (census, normalize)
 }
 
+/// Same two timings through the concrete reference walker — the parent's
+/// production composition. One half of the paired production-grade
+/// comparison.
+fn time_pair_production_ref(aus: &[Vec<u8>]) -> (f64, f64) {
+    let census = sample_median(|| {
+        for au in aus {
+            let mut exact = 0usize;
+            let scan = walk_annexb_reference(black_box(au.as_slice()), |nal| {
+                exact += NAL_LENGTH_SIZE + nal.len();
+            })
+            .expect("benchmark AU is valid");
+            black_box((scan, exact));
+        }
+    });
+    let mut scratch: Vec<u8> = Vec::new();
+    let normalize = sample_median(|| {
+        for au in aus {
+            scratch.clear();
+            let mut exact = 0usize;
+            walk_annexb_reference(black_box(au.as_slice()), |nal| {
+                exact += NAL_LENGTH_SIZE + nal.len();
+            })
+            .expect("benchmark AU is valid");
+            scratch.reserve(exact);
+            let scan = walk_annexb_reference(black_box(au.as_slice()), |nal| {
+                push_length_prefixed(nal, &mut scratch)
+            })
+            .expect("benchmark AU is valid");
+            black_box((scan, scratch.len()));
+        }
+    });
+    (census, normalize)
+}
+
 /// Same two timings through the real `walk_annexb` — the exact shipping
-/// composition. NOT a comparison row: it cross-checks that the injected
-/// walker copy used for the symmetric rows reproduces the production
-/// composition's throughput.
+/// composition, the other half of the paired production-grade comparison.
 fn time_pair_production(aus: &[Vec<u8>]) -> (f64, f64) {
     let census = sample_median(|| {
         for au in aus {
@@ -614,14 +722,32 @@ fn bench_nal_startcode_scan() {
                 "{name},{bytes},{variant},{census:.0},{census_gbps:.2},{normalize:.0},{normalize_gbps:.2}"
             );
         }
-        // Production cross-check (not a comparison row): the shipping
-        // `walk_annexb` composition must reproduce the symmetric
-        // stride3_shipping number above within noise.
-        let (census, normalize) = time_pair_production(aus);
-        let census_gbps = bytes as f64 / census;
-        let normalize_gbps = bytes as f64 / normalize;
-        println!(
-            "{name},{bytes},stride3_production,{census:.0},{census_gbps:.2},{normalize:.0},{normalize_gbps:.2}"
-        );
+        // Paired production-grade rows — the release gate. Both walkers
+        // are concrete (closure-generic only, like the shipped code): the
+        // parent's composition with the byte scan compiled in, and the
+        // real `walk_annexb`. Same interleaved rotation, per-cell minima;
+        // compare these two rows PAIRED per invocation of this benchmark.
+        let prod_timers: [Timer; 2] = [
+            |aus| time_pair_production_ref(aus),
+            |aus| time_pair_production(aus),
+        ];
+        let mut prod_best = [(f64::INFINITY, f64::INFINITY); 2];
+        for round in 0..3 {
+            for offset in 0..prod_timers.len() {
+                let variant = (round + offset) % prod_timers.len();
+                let sample = prod_timers[variant](aus);
+                let cell = &mut prod_best[variant];
+                cell.0 = cell.0.min(sample.0);
+                cell.1 = cell.1.min(sample.1);
+            }
+        }
+        let prod_labels = ["reference_production", "stride3_production"];
+        for (variant, (census, normalize)) in prod_labels.iter().zip(prod_best) {
+            let census_gbps = bytes as f64 / census;
+            let normalize_gbps = bytes as f64 / normalize;
+            println!(
+                "{name},{bytes},{variant},{census:.0},{census_gbps:.2},{normalize:.0},{normalize_gbps:.2}"
+            );
+        }
     }
 }
