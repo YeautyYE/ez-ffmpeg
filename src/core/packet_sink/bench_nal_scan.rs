@@ -16,9 +16,13 @@
 //! on realistic entropy. The corpora therefore include the degradation
 //! faces of the value-dependent variants: zero-dense payloads (25% zeros,
 //! ~50% isolated zeros, an unbroken zero run) collapse SWAR zero-byte
-//! skipping below the reference, and 0x01-dense payloads do the same to
+//! skipping below the reference, 0x01-dense payloads do the same to
 //! memchr-style candidate search (memchr is not vendored here; the SWAR
-//! candidate is kept so any architecture can reproduce the comparison).
+//! candidate is kept so any architecture can reproduce the comparison),
+//! and separator-dense streams of tiny NALs are the degradation face of
+//! striding itself — every hit sits a few bytes from the scan origin, so
+//! a stride buys nothing and only its prelude keeps it at the byte scan's
+//! cost there.
 //!
 //! Measurement discipline: the comparison rows all run through the same
 //! injected walker copy — identical walker shape, call surface and inline
@@ -94,9 +98,9 @@ fn find_startcode_swar(data: &[u8], from: usize) -> Option<usize> {
 }
 
 /// Byte-for-byte copy of `nal_framing::walk_annexb` with the start-code
-/// finder injected, so walker-level parity can drive any finder through the
-/// exact walker shape. Keep in sync with the original — the parity tests
-/// fail on any behavioral drift.
+/// finder injected, so walker-level parity and the benchmark drive any
+/// finder through the exact walker shape. Keep in sync with the original —
+/// the parity tests fail on any behavioral drift.
 fn walk_annexb_with<'a, F>(
     data: &'a [u8],
     find: F,
@@ -228,6 +232,17 @@ fn make_au(nals: &[Vec<u8>]) -> Vec<u8> {
         au.extend_from_slice(nal);
     }
     au
+}
+
+/// Separator-dense AU: `count` copies of one tiny NAL (0x41 header padded
+/// with 0x80), so the scan spends nearly all its time at start-code
+/// boundaries and a stride gets no reduction over the byte scan between
+/// hits — the degradation face of stride variants (reviewer-supplied
+/// family: thousands of one/two-byte NALs).
+fn sepdense_au(nal_len: usize, count: usize) -> Vec<u8> {
+    let mut nal = vec![0x80u8; nal_len];
+    nal[0] = 0x41;
+    make_au(&vec![nal; count])
 }
 
 /// Small AUs of 8-512 total bytes: per-walk overhead dominates on these,
@@ -378,6 +393,9 @@ fn walker_parity_on_seeded_random_aus() {
         aus.push(make_au(&[gen_nal_zerorun(0x41, len)]));
     }
     aus.extend(small_au_batch(&mut rng));
+    // Separator-dense: hundreds of one/two-byte NALs per AU.
+    aus.push(sepdense_au(1, 512));
+    aus.push(sepdense_au(2, 512));
     // Malformed shapes must fail identically through both walkers.
     aus.push(vec![0x12, 0, 0, 1, 0x67]);
     aus.push(vec![0, 0, 1, 0, 0, 1, 0x41, 0x9A]);
@@ -444,7 +462,8 @@ fn sample_median<F: FnMut()>(mut f: F) -> f64 {
 /// (census ns, census+rewrite ns) per pass over `aus` through the injected
 /// finder, mirroring the two-walk Annex-B shape of `normalize_au`. All
 /// benchmark comparison rows go through THIS one function so every variant
-/// shares the same walker shape, call surface and inline context.
+/// shares the same walker shape, call surface and inline opportunity —
+/// each finder in the form it ships (or shipped) in.
 fn time_pair<F>(aus: &[Vec<u8>], find: F) -> (f64, f64)
 where
     F: Fn(&[u8], usize) -> Option<usize> + Copy,
@@ -557,6 +576,8 @@ fn bench_nal_startcode_scan() {
             "zerorun_96k",
             vec![make_au(&[gen_nal_zerorun(0x65, 96 * 1024)])],
         ),
+        ("sepdense_1b_4096", vec![sepdense_au(1, 4096)]),
+        ("sepdense_2b_4096", vec![sepdense_au(2, 4096)]),
         ("smallau_batch", small_au_batch(&mut rng)),
     ];
 
@@ -566,16 +587,21 @@ fn bench_nal_startcode_scan() {
         // Symmetric comparison rows: every variant runs through the same
         // injected walker copy (identical walker shape, call surface and
         // inline context), sampled in interleaved rounds with the per-cell
-        // minimum kept, so neither implementation shape nor measurement
-        // order privileges any variant.
+        // minimum kept and the within-round order rotated every round, so
+        // neither implementation shape nor measurement order privileges
+        // any variant.
+        type Timer = fn(&[Vec<u8>]) -> (f64, f64);
+        let timers: [Timer; 3] = [
+            |aus| time_pair(aus, find_startcode_reference),
+            |aus| time_pair(aus, find_startcode),
+            |aus| time_pair(aus, find_startcode_swar),
+        ];
         let mut best = [(f64::INFINITY, f64::INFINITY); 3];
-        for _ in 0..3 {
-            let round: [(f64, f64); 3] = [
-                time_pair(aus, find_startcode_reference),
-                time_pair(aus, find_startcode),
-                time_pair(aus, find_startcode_swar),
-            ];
-            for (cell, sample) in best.iter_mut().zip(round) {
+        for round in 0..3 {
+            for offset in 0..timers.len() {
+                let variant = (round + offset) % timers.len();
+                let sample = timers[variant](aus);
+                let cell = &mut best[variant];
                 cell.0 = cell.0.min(sample.0);
                 cell.1 = cell.1.min(sample.1);
             }
