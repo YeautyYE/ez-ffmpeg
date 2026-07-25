@@ -73,8 +73,12 @@ impl WriteEntry {
         self.data.len().saturating_sub(self.offset)
     }
 
-    fn age_secs(&self) -> u64 {
-        self.timestamp.elapsed().as_secs()
+    /// Entry age against the caller's hoisted clock (PERF-10: eviction runs
+    /// per enqueue in the Warning/High bands, and `elapsed()` here would be
+    /// a fresh clock read per checked entry). Saturating, so an entry
+    /// stamped marginally after `now` reads as age zero.
+    fn age_secs_at(&self, now: Instant) -> u64 {
+        now.saturating_duration_since(self.timestamp).as_secs()
     }
 }
 
@@ -203,7 +207,7 @@ impl WriteQueue {
                 level,
                 BackpressureLevel::Warning | BackpressureLevel::High
             ) {
-                self.evict_old_entries();
+                self.evict_old_entries(now);
             }
             return true;
         }
@@ -220,7 +224,7 @@ impl WriteQueue {
                     self.dropped_frames += 1;
                 }
                 // Perform time-based eviction
-                self.evict_old_entries();
+                self.evict_old_entries(now);
             }
             BackpressureLevel::High => {
                 // Keep keyframes only
@@ -229,7 +233,7 @@ impl WriteQueue {
                 } else {
                     self.dropped_frames += 1;
                 }
-                self.evict_old_entries();
+                self.evict_old_entries(now);
             }
             BackpressureLevel::Critical => unreachable!(),
         }
@@ -282,8 +286,9 @@ impl WriteQueue {
         true
     }
 
-    /// Time-based eviction - Remove stale data
-    fn evict_old_entries(&mut self) {
+    /// Time-based eviction - Remove stale data. Ages are measured against
+    /// the caller's hoisted `now` (PERF-10), never a fresh clock read.
+    fn evict_old_entries(&mut self, now: Instant) {
         let max_age = if self.has_video {
             QUEUE_MAX_AGE_SECS
         } else {
@@ -308,7 +313,7 @@ impl WriteQueue {
             if entry.offset > 0 {
                 break;
             }
-            if entry.age_secs() > max_age {
+            if entry.age_secs_at(now) > max_age {
                 if let Some(removed) = self.queue.pop_front() {
                     self.total_bytes = self.total_bytes.saturating_sub(removed.remaining_bytes());
                     self.dropped_frames += 1;
@@ -968,6 +973,34 @@ mod tests {
             Some(3),
             "a partially written entry must never be evicted"
         );
+    }
+
+    // PERF-10: the eviction sweep must measure entry ages against the
+    // caller's hoisted clock, not read the clock itself. The front entry is
+    // stamped with a real `base`, and the eviction-triggering enqueue hands
+    // in a synthetic `now` a full eviction window later: only an
+    // implementation that uses the caller's clock sees the entry as
+    // expired (a fresh `elapsed()` read would see age ~0 and keep it).
+    #[test]
+    fn eviction_uses_the_callers_hoisted_clock() {
+        let mut queue = WriteQueue::new();
+        let base = Instant::now();
+        // Droppable, unstarted front entry big enough to put the NEXT
+        // enqueue in the Warning band.
+        queue.enqueue(make_data(QUEUE_WARN_BYTES), true, false, true, true, base);
+        assert_eq!(queue.backpressure_level(), BackpressureLevel::Warning);
+
+        let future = base + std::time::Duration::from_secs(QUEUE_MAX_AGE_SECS + 1);
+        // Keyframe is kept in the Warning band; its enqueue runs the sweep.
+        queue.enqueue(make_data(100), true, false, true, true, future);
+
+        assert_eq!(
+            queue.pending_bytes(),
+            100,
+            "the aged front entry must be evicted by the caller's clock"
+        );
+        assert_eq!(queue.pending_entries(), 1);
+        assert!(queue.dropped_frames() > 0);
     }
 
     #[test]
