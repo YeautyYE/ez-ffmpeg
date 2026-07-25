@@ -1069,6 +1069,7 @@ fn run_load_scenario(scenario: LoadScenario) {
     let mut fast_video_rx = 0u64;
     let mut fast_audio_rx = 0u64;
     let mut fast_video_drops = 0u64;
+    let mut fast_audio_drops = 0u64;
     let mut slow_video_rx = 0u64;
     let mut slow_audio_rx = 0u64;
     let mut slow_video_drops = 0u64;
@@ -1084,6 +1085,7 @@ fn run_load_scenario(scenario: LoadScenario) {
                 fast_video_rx += report.video.received;
                 fast_audio_rx += report.audio.received;
                 fast_video_drops += report.video.gap_drops();
+                fast_audio_drops += report.audio.gap_drops();
                 report.latencies.sort_unstable();
                 worst_fast_p99 = worst_fast_p99.max(percentile(&report.latencies, 0.99));
                 all_latencies.append(&mut report.latencies);
@@ -1099,7 +1101,7 @@ fn run_load_scenario(scenario: LoadScenario) {
     }
     all_latencies.sort_unstable();
     println!(
-        "load_report,{name},fast_readers,video_rx={fast_video_rx} audio_rx={fast_audio_rx} video_gap_drops={fast_video_drops}"
+        "load_report,{name},fast_readers,video_rx={fast_video_rx} audio_rx={fast_audio_rx} video_gap_drops={fast_video_drops} audio_gap_drops={fast_audio_drops}"
     );
     println!(
         "load_report,{name},slow_readers,video_rx={slow_video_rx} audio_rx={slow_audio_rx} video_gap_drops={slow_video_drops} audio_gap_drops={slow_audio_drops} peak_lag_ms={:.0}",
@@ -1124,6 +1126,18 @@ fn run_load_scenario(scenario: LoadScenario) {
         assert!(
             fast_video_rx > 0,
             "no video reached the fast readers — the harness itself is broken"
+        );
+        assert!(
+            fast_audio_rx > 0,
+            "no audio reached the fast readers — the harness itself is broken"
+        );
+        // A continuously draining reader never backs its queue up, so any
+        // gap in EITHER class means fast readers were shed — the invariant
+        // the fast-population latency numbers rest on.
+        assert_eq!(
+            (fast_video_drops, fast_audio_drops),
+            (0, 0),
+            "fast readers must not be shed (video/audio gap drops)"
         );
     }
     if scenario.slow_watchers > 0 {
