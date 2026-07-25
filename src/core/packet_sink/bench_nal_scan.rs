@@ -19,6 +19,12 @@
 //! skipping below the reference, and 0x01-dense payloads do the same to
 //! memchr-style candidate search (memchr is not vendored here; the SWAR
 //! candidate is kept so any architecture can reproduce the comparison).
+//!
+//! Measurement discipline: the comparison rows all run through the same
+//! injected walker copy — identical walker shape, call surface and inline
+//! context for every variant — in interleaved rounds keeping per-cell
+//! minima; a separate `stride3_production` row cross-checks that the real
+//! `walk_annexb` composition reproduces the symmetric number.
 
 use super::nal_framing::{
     find_startcode, push_length_prefixed, walk_annexb, AuScan, NAL_LENGTH_SIZE,
@@ -436,7 +442,9 @@ fn sample_median<F: FnMut()>(mut f: F) -> f64 {
 }
 
 /// (census ns, census+rewrite ns) per pass over `aus` through the injected
-/// finder, mirroring the two-walk Annex-B shape of `normalize_au`.
+/// finder, mirroring the two-walk Annex-B shape of `normalize_au`. All
+/// benchmark comparison rows go through THIS one function so every variant
+/// shares the same walker shape, call surface and inline context.
 fn time_pair<F>(aus: &[Vec<u8>], find: F) -> (f64, f64)
 where
     F: Fn(&[u8], usize) -> Option<usize> + Copy,
@@ -472,8 +480,10 @@ where
 }
 
 /// Same two timings through the real `walk_annexb` — the exact shipping
-/// composition, not the injected copy.
-fn time_pair_shipping(aus: &[Vec<u8>]) -> (f64, f64) {
+/// composition. NOT a comparison row: it cross-checks that the injected
+/// walker copy used for the symmetric rows reproduces the production
+/// composition's throughput.
+fn time_pair_production(aus: &[Vec<u8>]) -> (f64, f64) {
     let census = sample_median(|| {
         for au in aus {
             let mut exact = 0usize;
@@ -553,17 +563,39 @@ fn bench_nal_startcode_scan() {
     println!("corpus,bytes,variant,census_ns,census_gbps,normalize_ns,normalize_gbps");
     for (name, aus) in &corpora {
         let bytes: usize = aus.iter().map(|au| au.len()).sum();
-        let rows: [(&str, (f64, f64)); 3] = [
-            ("reference_byte", time_pair(aus, find_startcode_reference)),
-            ("stride3_shipping", time_pair_shipping(aus)),
-            ("swar_rejected", time_pair(aus, find_startcode_swar)),
-        ];
-        for (variant, (census, normalize)) in rows {
+        // Symmetric comparison rows: every variant runs through the same
+        // injected walker copy (identical walker shape, call surface and
+        // inline context), sampled in interleaved rounds with the per-cell
+        // minimum kept, so neither implementation shape nor measurement
+        // order privileges any variant.
+        let mut best = [(f64::INFINITY, f64::INFINITY); 3];
+        for _ in 0..3 {
+            let round: [(f64, f64); 3] = [
+                time_pair(aus, find_startcode_reference),
+                time_pair(aus, find_startcode),
+                time_pair(aus, find_startcode_swar),
+            ];
+            for (cell, sample) in best.iter_mut().zip(round) {
+                cell.0 = cell.0.min(sample.0);
+                cell.1 = cell.1.min(sample.1);
+            }
+        }
+        let labels = ["reference_byte", "stride3_shipping", "swar_rejected"];
+        for (variant, (census, normalize)) in labels.iter().zip(best) {
             let census_gbps = bytes as f64 / census;
             let normalize_gbps = bytes as f64 / normalize;
             println!(
                 "{name},{bytes},{variant},{census:.0},{census_gbps:.2},{normalize:.0},{normalize_gbps:.2}"
             );
         }
+        // Production cross-check (not a comparison row): the shipping
+        // `walk_annexb` composition must reproduce the symmetric
+        // stride3_shipping number above within noise.
+        let (census, normalize) = time_pair_production(aus);
+        let census_gbps = bytes as f64 / census;
+        let normalize_gbps = bytes as f64 / normalize;
+        println!(
+            "{name},{bytes},stride3_production,{census:.0},{census_gbps:.2},{normalize:.0},{normalize_gbps:.2}"
+        );
     }
 }
