@@ -70,10 +70,11 @@ impl Event {
 
 /// Reserved poller token for the reactor's [`Waker`] (PERF-3).
 ///
-/// Connection tokens encode `(generation << 32) | id`, so `usize::MAX` would
-/// only collide if a slot reached `generation == id == u32::MAX` (4 billion
-/// reuses of slot `0xFFFF_FFFF`). The reactor also matches this token before
-/// decoding it as a connection, so even a collision is harmless.
+/// Connection tokens pack `(generation << TOKEN_ID_BITS) | id` with each half
+/// sized to the pointer width, and `effective_max_connections` caps ids below
+/// `TOKEN_ID_MASK`, so a connection token can never equal `usize::MAX` even at
+/// the maximum generation. The reactor additionally matches this token before
+/// decoding it as a connection token.
 pub const WAKER_TOKEN: usize = usize::MAX;
 
 // ============================================================================
