@@ -4,6 +4,8 @@ use crate::core::context::{FrameBox, PacketBox, Stream};
 use crate::core::scheduler::sync_queue::SyncQueue;
 use crossbeam_channel::{Receiver, Sender};
 use ffmpeg_sys_next::{AVCodec, AVMediaType, AVStream};
+use std::collections::HashMap;
+use std::ffi::CString;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -54,6 +56,11 @@ pub(crate) struct EncoderStream {
     /// strict branch in enc_task.
     #[cfg_attr(not(feature = "cli"), allow(dead_code))]
     pub(crate) strict_avoptions: bool,
+    /// Per-map encoder options for THIS stream (`StreamMap::codec_opt`,
+    /// FFmpeg `-b:v:0` style). `None` for streams not created from a map
+    /// carrying options. Merged key by key over the muxer's per-type
+    /// tables in `enc_task::set_encoder_opts`.
+    pub(crate) per_map_codec_opts: Option<HashMap<CString, CString>>,
 }
 
 impl EncoderStream {
@@ -70,6 +77,7 @@ impl EncoderStream {
         dst_pre: PreMuxQueueSender,
         mux_start_gate: Arc<crate::core::context::MuxStartGate>,
         strict_avoptions: bool,
+        per_map_codec_opts: Option<HashMap<CString, CString>>,
     ) -> Self {
         Self {
             stream_index,
@@ -85,6 +93,7 @@ impl EncoderStream {
             mux_start_gate: Some(mux_start_gate),
             sync_queue: None,
             strict_avoptions,
+            per_map_codec_opts,
         }
     }
 
