@@ -454,6 +454,59 @@ fn terminal_entry_logger_panic_still_delivers_on_end() {
     );
 }
 
+/// The documented delivery-phase panic contract (pinned before AND after
+/// the worker-custody hardening): a panicking `on_packet` fails the job
+/// with `WorkerPanicked`, no terminal sink callback fires, and the
+/// consumer's captures are still destroyed before `wait()` returns.
+#[test]
+fn panicking_on_packet_fails_job_with_worker_panic_and_no_terminal() {
+    let _lock = PROCESS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    install_logger_once();
+    disarm_all();
+
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let destroyed_packet = Arc::new(AtomicBool::new(false));
+    let destroyed_end = Arc::new(AtomicBool::new(false));
+    let packet_capture = FlagOnDrop(destroyed_packet.clone());
+    let end_capture = FlagOnDrop(destroyed_end.clone());
+    let (ev_end, ev_err) = (events.clone(), events.clone());
+    let sink = PacketSink::builder(move |_pkt| {
+        let _hold = &packet_capture;
+        panic!("injected delivery-callback panic");
+    })
+    .on_end(move || {
+        let _hold = &end_capture;
+        ev_end.lock().unwrap().push("end".to_string());
+    })
+    .on_delivery_error(move |e| ev_err.lock().unwrap().push(format!("error: {e}")))
+    .build();
+
+    let scheduler = FfmpegContext::builder()
+        .input(Input::from("sine=frequency=440:duration=1").set_format("lavfi"))
+        .output(Output::from(sink).set_audio_codec("aac"))
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+    let result = wait_with_watchdog(scheduler, 60, "panicking_on_packet");
+    disarm_all();
+
+    match result {
+        Err(Error::WorkerPanicked(_)) => {}
+        other => panic!(
+            "a panicking on_packet must fail the job as WorkerPanicked, got {other:?}"
+        ),
+    }
+    assert!(
+        destroyed_packet.load(Ordering::Acquire) && destroyed_end.load(Ordering::Acquire),
+        "every callback box must still be destroyed before wait() returns"
+    );
+    assert!(
+        events.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+        "no terminal sink callback may fire after a delivery-callback panic"
+    );
+}
+
 /// Scenario selector for the child-process probes: inert without it, so the
 /// dispatcher test is a no-op in a normal full run of this binary.
 const CHILD_SCENARIO_ENV: &str = "EZ_FFMPEG_SINK_DISPOSAL_CHILD";
@@ -491,6 +544,12 @@ fn sink_disposal_child() {
         Some("two_destructor_bombs") => child_two_destructor_bombs(),
         Some("panicking_payload_bomb") => child_panicking_payload_bomb(),
         Some("delivery_error_source_bomb") => child_delivery_error_source_bomb(),
+        Some("delivery_callback_panic_with_capture_bomb") => {
+            child_delivery_callback_panic_with_capture_bomb()
+        }
+        Some("delivery_loop_logger_panic_with_capture_bomb") => {
+            child_delivery_loop_logger_panic_with_capture_bomb()
+        }
         Some(other) => panic!("unknown child scenario '{other}'"),
     }
 }
@@ -766,10 +825,115 @@ fn child_delivery_error_source_bomb() {
     );
 }
 
+/// A DELIVERY-phase callback panic (`on_packet`) unwinding across the
+/// worker frame while a SIBLING callback box holds an unconditional
+/// destructor bomb. With the worker held bare in scheduler custody through
+/// the delivery loop, that unwind ran the `on_end` box's capture destructor
+/// as plain drop glue — panic-during-unwind, process abort. Under
+/// worker-lifetime disposal custody each box is destroyed under its own
+/// catch: the child survives, keeps the documented `WorkerPanicked` result,
+/// and destroys the bomb.
+fn child_delivery_callback_panic_with_capture_bomb() {
+    let destroyed = Arc::new(AtomicBool::new(false));
+    let bomb = AlwaysPanicOnDrop(destroyed.clone());
+    let sink = PacketSink::builder(move |_pkt| {
+        panic!("injected delivery-callback panic");
+    })
+    .on_end(move || {
+        let _hold = &bomb;
+    })
+    .build();
+
+    let scheduler = FfmpegContext::builder()
+        .input(Input::from("sine=frequency=440:duration=1").set_format("lavfi"))
+        .output(Output::from(sink).set_audio_codec("aac"))
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+    let result = wait_with_watchdog(scheduler, 60, "delivery_callback_panic_with_capture_bomb");
+    assert!(
+        matches!(result, Err(Error::WorkerPanicked(_))),
+        "the delivery-callback panic must keep the documented WorkerPanicked result: {result:?}"
+    );
+    assert!(
+        destroyed.load(Ordering::Acquire),
+        "the on_end capture bomb must be destroyed (under containment) before wait() returns"
+    );
+}
+
+/// A user-installed logger panicking at the delivery loop's own
+/// packet-error record (`"Error muxing a packet"`), while the
+/// `on_delivery_error` box holds an unconditional destructor bomb. The
+/// unwind starts INSIDE the worker loop — not in a sink callback — so only
+/// custody-level containment covers it: pre-hardening the worker's boxes
+/// dropped as bare glue mid-unwind and the bomb aborted the process. The
+/// stashed callback error never reaches publication (the unwind skips the
+/// post-loop mapping), so the job settles as the recorded worker panic.
+fn child_delivery_loop_logger_panic_with_capture_bomb() {
+    install_logger_once();
+    disarm_all();
+
+    let destroyed = Arc::new(AtomicBool::new(false));
+    let bomb = AlwaysPanicOnDrop(destroyed.clone());
+    let sink = PacketSink::builder(|_pkt| {
+        Err(ez_ffmpeg::packet_sink::PacketCallbackError::new("stash"))
+    })
+    .on_delivery_error(move |_e| {
+        let _hold = &bomb;
+    })
+    .build();
+
+    *TRIGGER.lock().unwrap_or_else(|e| e.into_inner()) = Some("Error muxing a packet");
+    let scheduler = FfmpegContext::builder()
+        .input(Input::from("sine=frequency=440:duration=1").set_format("lavfi"))
+        .output(Output::from(sink).set_audio_codec("aac"))
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+    let result = wait_with_watchdog(scheduler, 60, "delivery_loop_logger_panic_with_capture_bomb");
+    // The needle must have been consumed — otherwise the scenario silently
+    // degraded to the plain callback-error path (no unwind, terminal-region
+    // disposal) and proves nothing about mid-loop custody.
+    assert!(
+        TRIGGER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none(),
+        "the packet-error log must have fired and hit the armed logger"
+    );
+    disarm_all();
+    assert!(
+        matches!(result, Err(Error::WorkerPanicked(_))),
+        "the loop unwind must settle as the recorded worker panic (the stashed error never \
+         reaches the post-loop mapping): {result:?}"
+    );
+    assert!(
+        destroyed.load(Ordering::Acquire),
+        "the on_delivery_error capture bomb must be destroyed (under containment) before \
+         wait() returns"
+    );
+}
+
 /// Parent probe: the two-bomb aggregate disposal (see the child fn).
 #[test]
 fn sibling_capture_bombs_do_not_abort_the_process() {
     run_child_scenario("two_destructor_bombs");
+}
+
+/// Parent probe: a delivery-callback panic composed with a hostile
+/// sibling-box capture destructor (see the child fn).
+#[test]
+fn delivery_callback_panic_with_capture_bomb_does_not_abort_the_process() {
+    run_child_scenario("delivery_callback_panic_with_capture_bomb");
+}
+
+/// Parent probe: a delivery-loop logger panic composed with a hostile
+/// capture destructor (see the child fn).
+#[test]
+fn delivery_loop_logger_panic_with_capture_bomb_does_not_abort_the_process() {
+    run_child_scenario("delivery_loop_logger_panic_with_capture_bomb");
 }
 
 /// Parent probe: the delivery-error custody composition (see the child fn).
