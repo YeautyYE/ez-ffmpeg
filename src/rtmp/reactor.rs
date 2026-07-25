@@ -129,6 +129,15 @@ fn get_fd_limit() -> Option<usize> {
 /// This function computes the actual maximum connections the server will allow:
 /// - Uses configured value or DEFAULT_MAX_CONNECTIONS (10000)
 /// - Caps at 80% of system FD limit to leave headroom for other operations
+/// - Caps at `TOKEN_ID_MASK` so slab ids stay encodable in a poller token
+///
+/// Connection ids are slab-dense, so capping max connections at
+/// `TOKEN_ID_MASK` guarantees every live id is strictly below the mask.
+/// That keeps the id half of the poller token lossless and makes a
+/// connection token equal to `WAKER_TOKEN` (`usize::MAX`) impossible even
+/// at the maximum generation. On 64-bit targets the cap is 4_294_967_295
+/// and never binds in practice; on 32-bit targets it is 65_535, far beyond
+/// what a 32-bit address space can host anyway.
 ///
 /// # Arguments
 /// * `config_max` - User-configured max connections, or None for auto-detect
@@ -144,13 +153,36 @@ pub fn effective_max_connections(config_max: Option<usize>) -> usize {
     } else {
         config_value
     };
-    // Ensure at least 1 connection is allowed
-    result.max(1)
+    // Ensure at least 1 connection is allowed, and keep ids below the
+    // encodable range of the poller token's id half.
+    result.clamp(1, TOKEN_ID_MASK)
 }
 
 // ============================================================================
 // Connection Token - Prevents ID reuse conflicts
 // ============================================================================
+
+/// Generation counter type, sized to the upper half of a poller token.
+///
+/// Poller tokens are `usize` on every backend (epoll's `u64` payload is
+/// truncated to `usize` on the way out, kqueue's `udata` is pointer-width,
+/// and the WSAPoll registry keys by `usize`), so the token splits the native
+/// word in half: upper half generation, lower half id. Making the generation
+/// counter's own type equal to its transport width keeps the encode/decode
+/// round-trip lossless by construction on every target.
+#[cfg(target_pointer_width = "64")]
+type Generation = u32;
+#[cfg(target_pointer_width = "32")]
+type Generation = u16;
+
+/// Number of low poller-token bits that carry the connection id.
+#[cfg(target_pointer_width = "64")]
+const TOKEN_ID_BITS: u32 = 32;
+#[cfg(target_pointer_width = "32")]
+const TOKEN_ID_BITS: u32 = 16;
+
+/// Mask covering the id half of a poller token.
+const TOKEN_ID_MASK: usize = (1usize << TOKEN_ID_BITS) - 1;
 
 /// Connection token - Contains ID and generation counter
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -158,43 +190,28 @@ pub struct ConnectionToken {
     /// Connection ID (slab index)
     pub id: usize,
     /// Generation counter - Incremented each time ID is reused
-    pub generation: u32,
+    pub generation: Generation,
 }
 
 impl ConnectionToken {
-    fn new(id: usize, generation: u32) -> Self {
+    fn new(id: usize, generation: Generation) -> Self {
         Self { id, generation }
     }
 
     /// Encode token for poller (combines id and generation)
     ///
-    /// Layout: [generation: 32 bits][id: 32 bits]
-    /// This allows validation of stale events from closed connections
-    #[cfg(target_pointer_width = "64")]
+    /// Layout: [generation: upper half][id: lower half]. On 64-bit targets
+    /// this is identical to the historical `(generation << 32) | id` layout.
+    /// This allows validation of stale events from closed connections.
     fn to_poller_token(&self) -> usize {
-        ((self.generation as usize) << 32) | (self.id & 0xFFFFFFFF)
+        ((self.generation as usize) << TOKEN_ID_BITS) | (self.id & TOKEN_ID_MASK)
     }
 
     /// Decode token from poller event
-    #[cfg(target_pointer_width = "64")]
-    fn from_poller_token(token: usize) -> Self {
-        let id = token & 0xFFFFFFFF;
-        let generation = (token >> 32) as u32;
-        Self { id, generation }
-    }
-
-    /// Fallback for 32-bit systems - no generation encoding possible
-    #[cfg(target_pointer_width = "32")]
-    fn to_poller_token(&self) -> usize {
-        self.id
-    }
-
-    /// Fallback for 32-bit systems
-    #[cfg(target_pointer_width = "32")]
     fn from_poller_token(token: usize) -> Self {
         Self {
-            id: token,
-            generation: 0,
+            id: token & TOKEN_ID_MASK,
+            generation: (token >> TOKEN_ID_BITS) as Generation,
         }
     }
 }
@@ -1027,7 +1044,7 @@ pub struct Reactor {
     /// Connection storage (using slab allocation)
     connections: slab::Slab<ReactorConnection>,
     /// Generation counter (for each slot)
-    generations: HashMap<usize, u32>,
+    generations: HashMap<usize, Generation>,
     /// Business scheduler
     scheduler: RtmpScheduler,
     /// Publishers. Each state owns its stream-key claim, so dropping this
@@ -1287,8 +1304,9 @@ impl Reactor {
     fn validate_connection(&self, poller_token: usize) -> Option<usize> {
         let token = ConnectionToken::from_poller_token(poller_token);
         if let Some(conn) = self.connections.get(token.id) {
-            // On 64-bit: validate generation matches
-            // On 32-bit: generation is always 0, so this check passes
+            // The generation round-trips losslessly through the poller token
+            // on every pointer width (see ConnectionToken), so exact equality
+            // is the correct check on all targets.
             if conn.token.generation == token.generation {
                 return Some(token.id);
             }
@@ -3006,7 +3024,6 @@ mod tests {
     /// Scenario: Connection A closes, new connection B reuses slot A's id,
     /// stale events for A should be rejected
     #[test]
-    #[cfg(target_pointer_width = "64")]
     fn test_generation_prevents_aba_problem() {
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
 
@@ -3049,6 +3066,50 @@ mod tests {
 
         reactor.remove_connection(token_b.id);
         drop(client_b);
+    }
+
+    /// Round-trip the poller-token encoding at the extremes of both halves.
+    #[test]
+    fn poller_token_roundtrip_at_width_extremes() {
+        let cases: [(usize, Generation); 3] = [
+            (0, 1),
+            (TOKEN_ID_MASK - 1, Generation::MAX),
+            (1234, 567),
+        ];
+        for (id, generation) in cases {
+            let token = ConnectionToken::new(id, generation);
+            let decoded = ConnectionToken::from_poller_token(token.to_poller_token());
+            assert_eq!(decoded, token);
+        }
+    }
+
+    /// A connection token must never alias the reserved waker token, even at
+    /// the largest encodable id and generation.
+    #[test]
+    fn connection_token_never_collides_with_waker_token() {
+        let extreme = ConnectionToken::new(TOKEN_ID_MASK - 1, Generation::MAX);
+        assert_ne!(extreme.to_poller_token(), WAKER_TOKEN);
+
+        // Ids are slab-dense, so capping max connections at TOKEN_ID_MASK
+        // keeps every live id strictly below the mask.
+        assert!(effective_max_connections(Some(usize::MAX)) <= TOKEN_ID_MASK);
+    }
+
+    /// Validate the 32-bit token layout arithmetic while running on 64-bit
+    /// CI: a u32 token word split into a u16 generation half and a u16 id
+    /// half must round-trip losslessly at the same extremes.
+    #[test]
+    fn simulated_32bit_packing_is_lossless() {
+        const SIM_ID_BITS: u32 = 16;
+        const SIM_ID_MASK: u32 = (1u32 << SIM_ID_BITS) - 1;
+        let cases: [(u32, u16); 3] = [(0, 1), (SIM_ID_MASK - 1, u16::MAX), (1234, 567)];
+        for (id, generation) in cases {
+            let word = ((generation as u32) << SIM_ID_BITS) | (id & SIM_ID_MASK);
+            let decoded_id = word & SIM_ID_MASK;
+            let decoded_generation = (word >> SIM_ID_BITS) as u16;
+            assert_eq!(decoded_id, id);
+            assert_eq!(decoded_generation, generation);
+        }
     }
 
     /// Stress test: verify reactor can handle many connections
