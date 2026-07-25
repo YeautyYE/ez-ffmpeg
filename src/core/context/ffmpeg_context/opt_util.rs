@@ -132,6 +132,32 @@ unsafe fn expand_stream_maps(mux: &mut Muxer, demuxs: &[Demuxer]) -> Result<()> 
             (spec.linklabel.as_str(), false)
         };
 
+        // A negative (disabling) map only turns OFF previously matched
+        // streams; a per-map encoder request on it is dead configuration.
+        // Check the ORIGINAL spec here — before resolve_for_bind normalizes
+        // `codec("copy")` into the copy flag (which would hide the request)
+        // and before the filter-label branch below returns early (which
+        // covers `-[v]` / `-label` forms too). Fail loud instead of
+        // silently discarding the codec intent.
+        if is_negative && (spec.codec.is_some() || !spec.codec_opts.is_empty()) {
+            warn!(target: LOG_TARGET,
+                "Stream map '{}' is a negative (disabling) map; it cannot carry \
+                 a per-map codec or codec options.",
+                spec.linklabel
+            );
+            return Err(Error::OpenOutput(OpenOutputError::InvalidOption(format!(
+                "stream map '{}': a negative (disabling) map cannot carry a \
+                 per-map codec or codec options",
+                spec.linklabel
+            ))));
+        }
+
+        // Normalize `codec("copy")` into the copy flag, reject copy ×
+        // re-encoding conflicts, and convert per-map options for the
+        // encoder layer — one typed-error funnel per map, before any
+        // expansion.
+        let resolved = spec.resolve_for_bind()?;
+
         // FFmpeg reference: opt_map line 493 - check if this mapping refers to lavfi output
         if is_filter_output_linklabel(linklabel) {
             // FFmpeg reference: opt_map line 494-507 - extract linklabel from brackets
@@ -154,12 +180,14 @@ unsafe fn expand_stream_maps(mux: &mut Muxer, demuxs: &[Demuxer]) -> Result<()> 
             }
 
             // Store pure linklabel (without brackets) for later matching in map_manual()
-            mux.stream_maps.push(StreamMap {
+            mux.stream_maps.push(ExpandedStreamMap {
                 file_index: 0,   // Not used for filter outputs
                 stream_index: 0, // Not used for filter outputs
                 linklabel: Some(pure_linklabel.to_string()),
-                copy: spec.copy,
+                copy: resolved.copy,
                 disabled: false,
+                codec: resolved.codec.clone(),
+                codec_opts: resolved.codec_opts.clone(),
             });
             continue;
         }
@@ -170,12 +198,14 @@ unsafe fn expand_stream_maps(mux: &mut Muxer, demuxs: &[Demuxer]) -> Result<()> 
         if parse_result.is_err() {
             // Failed to parse file index - treat as filter output linklabel
             // This allows bare filter output names like "my-out" (without brackets)
-            mux.stream_maps.push(StreamMap {
+            mux.stream_maps.push(ExpandedStreamMap {
                 file_index: 0,
                 stream_index: 0,
                 linklabel: Some(linklabel.to_string()),
-                copy: spec.copy,
+                copy: resolved.copy,
                 disabled: false,
+                codec: resolved.codec.clone(),
+                codec_opts: resolved.codec_opts.clone(),
             });
             continue;
         }
@@ -215,6 +245,7 @@ unsafe fn expand_stream_maps(mux: &mut Muxer, demuxs: &[Demuxer]) -> Result<()> 
         };
 
         // FFmpeg reference: opt_map line 543-553 - negative map: disable matching streams
+        // (its codec/opts intent was already rejected up front, before resolve).
         if is_negative {
             for existing_map in &mut mux.stream_maps {
                 // Only process file-based maps (not filter outputs)
@@ -243,12 +274,14 @@ unsafe fn expand_stream_maps(mux: &mut Muxer, demuxs: &[Demuxer]) -> Result<()> 
 
             // FFmpeg reference: opt_map line 556 - stream_specifier_match
             if stream_spec.matches(fmt_ctx, avstream) {
-                mux.stream_maps.push(StreamMap {
+                mux.stream_maps.push(ExpandedStreamMap {
                     file_index: file_idx,
                     stream_index: stream_idx,
                     linklabel: None,
-                    copy: spec.copy,
+                    copy: resolved.copy,
                     disabled: false,
+                    codec: resolved.codec.clone(),
+                    codec_opts: resolved.codec_opts.clone(),
                 });
                 matched_count += 1;
             }
@@ -400,10 +433,58 @@ pub(super) fn outputs_bind(
     Ok(())
 }
 
+/// Wire one input stream into a stream-copy output stream. Shared by the
+/// explicit-copy path (a copy stream map) and the implicit-copy path
+/// (`choose_encoder` returned `None`), so the two never drift. Mirrors the
+/// streamcopy wiring fftools performs in `ost_add` for a copy stream.
+fn bind_copy_stream(
+    mux: &mut Muxer,
+    demux: &mut Demuxer,
+    demux_idx: usize,
+    stream_index: usize,
+    demux_node: Arc<SchNode>,
+    input_stream_duration: i64,
+    input_stream_time_base: AVRational,
+) -> Result<()> {
+    let (packet_sender, pre_sender, gate, _st, output_stream_index) =
+        mux.new_copy_stream(demux_node)?;
+    demux.add_packet_dst(
+        packet_sender,
+        stream_index,
+        output_stream_index,
+        // Architecture Y': a `-shortest` copy follower carries its mux
+        // stream's `source_finished` so the demux can stop producing it
+        // once `sq_mux` cascade-finishes it. `None` otherwise.
+        if mux.shortest {
+            mux.stream_source_finished(output_stream_index)
+        } else {
+            None
+        },
+        CopyMuxHandle { pre_sender, gate },
+    );
+    mux.register_stream_source(output_stream_index, demux_idx, stream_index, false);
+
+    unsafe {
+        streamcopy_init(
+            mux,
+            *(*demux.in_fmt_ctx_ptr()).streams.add(stream_index),
+            *(*mux.out_fmt_ctx_ptr()).streams.add(output_stream_index),
+            demux.framerate,
+        )?;
+        rescale_duration(
+            input_stream_duration,
+            input_stream_time_base,
+            *(*mux.out_fmt_ctx_ptr()).streams.add(output_stream_index),
+        );
+        mux.stream_ready()
+    }
+    Ok(())
+}
+
 fn map_manual(
     index: usize,
     mux: &mut Muxer,
-    stream_map: &StreamMap,
+    stream_map: &ExpandedStreamMap,
     filter_graphs: &mut Vec<FilterGraph>,
     demuxs: &mut Vec<Demuxer>,
 ) -> Result<()> {
@@ -426,6 +507,20 @@ fn map_manual(
                         continue;
                     }
 
+                    // A filter-graph output carries no source packets to copy;
+                    // stream copy and filtering are mutually exclusive. An
+                    // explicit copy request on a labeled filter map (`codec("copy")`
+                    // or add_stream_map_with_copy) must fail loud here — otherwise
+                    // it would fall through to choose_encoder and be re-encoded,
+                    // silently ignoring the request.
+                    if stream_map.copy {
+                        return Err(OpenOutputError::StreamMapCopyConflict {
+                            spec: format!("[{linklabel}]"),
+                            what: "a filter-graph output (which has no source packets to copy)",
+                        }
+                        .into());
+                    }
+
                     // -vf + a video stream mapped from a complex graph: the
                     // per-output filter could not be applied anywhere, so
                     // refuse the pair like the CLI (ffmpeg_mux_init.c
@@ -439,7 +534,7 @@ fn map_manual(
                         }
                     }
 
-                    choose_encoder(mux, output_filter.media_type)?
+                    choose_encoder(mux, output_filter.media_type, stream_map.codec.as_deref())?
                 };
 
                 match option {
@@ -463,6 +558,7 @@ fn map_manual(
                             enc,
                             None,
                             false,
+                            stream_map.codec_opts.clone(),
                         )
                         .map(|_| ());
                     }
@@ -544,81 +640,52 @@ fn map_manual(
         }
     );
 
-    let option = choose_encoder(mux, media_type)?;
+    // A copy stream map takes the copy path WITHOUT consulting the encoder:
+    // its `codec("copy")` (or add_stream_map_with_copy) is the most specific
+    // request, so an unavailable per-type default encoder must not fail a map
+    // that only asks to be copied. Decided before choose_encoder for exactly
+    // that reason. (An explicit copy carrying per-map codec options was
+    // already rejected at resolve time; nothing to re-check here.)
+    if stream_map.copy {
+        return bind_copy_stream(
+            mux,
+            demux,
+            demux_idx,
+            stream_index,
+            demux_node,
+            input_stream_duration,
+            input_stream_time_base,
+        );
+    }
+
+    let option = choose_encoder(mux, media_type, stream_map.codec.as_deref())?;
 
     match option {
         None => {
-            // copy
-            let (packet_sender, pre_sender, gate, _st, output_stream_index) =
-                mux.new_copy_stream(demux_node)?;
-            demux.add_packet_dst(
-                packet_sender,
-                stream_index,
-                output_stream_index,
-                // Architecture Y': a `-shortest` copy follower carries its mux
-                // stream's `source_finished` so the demux can stop producing it
-                // once `sq_mux` cascade-finishes it. `None` otherwise.
-                if mux.shortest {
-                    mux.stream_source_finished(output_stream_index)
-                } else {
-                    None
-                },
-                CopyMuxHandle { pre_sender, gate },
-            );
-            mux.register_stream_source(output_stream_index, demux_idx, stream_index, false);
-
-            unsafe {
-                streamcopy_init(
-                    mux,
-                    *(*demux.in_fmt_ctx_ptr()).streams.add(stream_index),
-                    *(*mux.out_fmt_ctx_ptr()).streams.add(output_stream_index),
-                    demux.framerate,
-                )?;
-                rescale_duration(
-                    input_stream_duration,
-                    input_stream_time_base,
-                    *(*mux.out_fmt_ctx_ptr()).streams.add(output_stream_index),
-                );
-                mux.stream_ready()
+            // No encoder resolved: an implicit stream copy (per-type codec
+            // "copy", or a media type without an encoder). Per-map codec
+            // options would be silently dropped on the copy path — fail loud
+            // instead.
+            if stream_map.codec_opts.is_some() {
+                return Err(Error::OpenOutput(OpenOutputError::InvalidOption(format!(
+                    "stream map for input {demux_idx}:{stream_index} resolves to \
+                     stream copy but carries per-map codec options; per-map codec \
+                     options apply only to re-encoded streams"
+                ))));
             }
+            bind_copy_stream(
+                mux,
+                demux,
+                demux_idx,
+                stream_index,
+                demux_node,
+                input_stream_duration,
+                input_stream_time_base,
+            )?;
         }
         Some((codec_id, enc)) => {
-            // connect input_stream to output
-            if stream_map.copy {
-                // copy
-                let (packet_sender, pre_sender, gate, _st, output_stream_index) =
-                    mux.new_copy_stream(demux_node)?;
-                demux.add_packet_dst(
-                    packet_sender,
-                    stream_index,
-                    output_stream_index,
-                    // Architecture Y': a `-shortest` copy follower carries its mux
-                    // stream's `source_finished` so the demux can stop producing it
-                    // once `sq_mux` cascade-finishes it. `None` otherwise.
-                    if mux.shortest {
-                        mux.stream_source_finished(output_stream_index)
-                    } else {
-                        None
-                    },
-                    CopyMuxHandle { pre_sender, gate },
-                );
-                mux.register_stream_source(output_stream_index, demux_idx, stream_index, false);
-
-                unsafe {
-                    streamcopy_init(
-                        mux,
-                        *(*demux.in_fmt_ctx_ptr()).streams.add(stream_index),
-                        *(*mux.out_fmt_ctx_ptr()).streams.add(output_stream_index),
-                        demux.framerate,
-                    )?;
-                    rescale_duration(
-                        input_stream_duration,
-                        input_stream_time_base,
-                        *(*mux.out_fmt_ctx_ptr()).streams.add(output_stream_index),
-                    );
-                    mux.stream_ready()
-                }
-            } else if media_type == AVMEDIA_TYPE_VIDEO || media_type == AVMEDIA_TYPE_AUDIO {
+            // A re-encoding map (copy was already handled above).
+            if media_type == AVMEDIA_TYPE_VIDEO || media_type == AVMEDIA_TYPE_AUDIO {
                 init_simple_filtergraph(
                     demux,
                     stream_index,
@@ -628,10 +695,16 @@ fn map_manual(
                     mux,
                     filter_graphs,
                     demux_idx,
+                    stream_map.codec_opts.clone(),
                 )?;
             } else {
-                let (frame_sender, output_stream_index) =
-                    mux.add_enc_stream(media_type, enc, demux_node, false)?;
+                let (frame_sender, output_stream_index) = mux.add_enc_stream(
+                    media_type,
+                    enc,
+                    demux_node,
+                    false,
+                    stream_map.codec_opts.clone(),
+                )?;
                 let input_stream = demux.get_stream_mut(stream_index);
                 input_stream.add_dst(frame_sender);
                 demux.connect_stream(stream_index);
@@ -1099,10 +1172,15 @@ unsafe fn map_auto_subtitle(
 
             // choose_encoder returns None for "copy": take the streamcopy
             // path like map_auto_stream instead of failing.
-            let option = choose_encoder(mux, AVMEDIA_TYPE_SUBTITLE)?;
+            let option = choose_encoder(mux, AVMEDIA_TYPE_SUBTITLE, None)?;
             if let Some((_codec_id, enc)) = option {
-                let (frame_sender, output_stream_index) =
-                    mux.add_enc_stream(AVMEDIA_TYPE_SUBTITLE, enc, demux.node.clone(), false)?;
+                let (frame_sender, output_stream_index) = mux.add_enc_stream(
+                    AVMEDIA_TYPE_SUBTITLE,
+                    enc,
+                    demux.node.clone(),
+                    false,
+                    None,
+                )?;
                 demux.get_stream_mut(stream_index).add_dst(frame_sender);
                 demux.connect_stream(stream_index);
                 mux.register_stream_source(output_stream_index, demux_idx, stream_index, true);
@@ -1213,7 +1291,7 @@ unsafe fn map_auto_data(
         }
 
         let stream_index = option.unwrap();
-        let option = choose_encoder(mux, AVMEDIA_TYPE_DATA)?;
+        let option = choose_encoder(mux, AVMEDIA_TYPE_DATA, None)?;
 
         if option.is_some() {
             // FFmpeg reference: ffmpeg_mux_init.c:79-89
@@ -1325,7 +1403,7 @@ unsafe fn map_auto_stream(
 
     let demux = &mut demuxs[demux_idx];
     let input_file_idx = demux_idx;
-    let option = choose_encoder(mux, media_type)?;
+    let option = choose_encoder(mux, media_type, None)?;
 
     if let Some((codec_id, enc)) = option {
         if media_type == AVMEDIA_TYPE_VIDEO || media_type == AVMEDIA_TYPE_AUDIO {
@@ -1338,10 +1416,11 @@ unsafe fn map_auto_stream(
                 mux,
                 filter_graphs,
                 input_file_idx,
+                None,
             )?;
         } else {
             let (frame_sender, output_stream_index) =
-                mux.add_enc_stream(media_type, enc, demux.node.clone(), false)?;
+                mux.add_enc_stream(media_type, enc, demux.node.clone(), false, None)?;
             demux.get_stream_mut(stream_index).add_dst(frame_sender);
             demux.connect_stream(stream_index);
             mux.register_stream_source(output_stream_index, input_file_idx, stream_index, true);
@@ -1554,6 +1633,7 @@ fn init_simple_filtergraph(
     mux: &mut Muxer,
     filter_graphs: &mut Vec<FilterGraph>,
     input_file_idx: usize,
+    per_map_codec_opts: Option<HashMap<CString, CString>>,
 ) -> Result<()> {
     let codec_type = demux.get_stream(stream_index).codec_type;
 
@@ -1596,6 +1676,7 @@ fn init_simple_filtergraph(
         enc,
         Some((input_file_idx, stream_index)),
         single_stream_direct_input,
+        per_map_codec_opts,
     )?;
 
     filter_graphs.push(filter_graph);
@@ -1801,7 +1882,7 @@ fn output_bind_by_unlabeled_filter(
                     continue;
                 }
 
-                choose_encoder(mux, output_filter.media_type)?
+                choose_encoder(mux, output_filter.media_type, None)?
             };
 
             match option {
@@ -1827,7 +1908,17 @@ fn output_bind_by_unlabeled_filter(
                 }
                 Some((codec_id, enc)) => {
                     *auto_disable |= 1 << media_type as i32;
-                    ofilter_bind_ost(index, mux, filter_graph, i, codec_id, enc, None, false)?;
+                    ofilter_bind_ost(
+                        index,
+                        mux,
+                        filter_graph,
+                        i,
+                        codec_id,
+                        enc,
+                        None,
+                        false,
+                        None,
+                    )?;
                 }
             }
         }
@@ -1845,6 +1936,7 @@ pub(super) fn ofilter_bind_ost(
     enc: *const AVCodec,
     stream_source: Option<(usize, usize)>,
     single_stream_direct_input: bool,
+    per_map_codec_opts: Option<HashMap<CString, CString>>,
 ) -> Result<usize> {
     let output_filter = &mut filter_graph.outputs[output_filter_index];
     let (frame_sender, output_stream_index) = mux.add_enc_stream(
@@ -1852,6 +1944,7 @@ pub(super) fn ofilter_bind_ost(
         enc,
         filter_graph.node.clone(),
         single_stream_direct_input,
+        per_map_codec_opts,
     )?;
     output_filter.set_dst(frame_sender);
 
@@ -1870,14 +1963,51 @@ pub(super) fn ofilter_bind_ost(
     Ok(output_stream_index)
 }
 
+/// A per-map encoder request only makes sense for media types FFmpeg can
+/// encode; on any other type `choose_encoder` resolves to stream copy, which
+/// would silently swallow the request. Split out so the fail-loud rule is
+/// unit-testable without a `Muxer`.
+fn reject_per_map_codec_for_unencodable(
+    media_type: AVMediaType,
+    per_map_codec: Option<&str>,
+) -> Result<()> {
+    match media_type {
+        AVMEDIA_TYPE_VIDEO | AVMEDIA_TYPE_AUDIO | AVMEDIA_TYPE_SUBTITLE => Ok(()),
+        _ => match per_map_codec {
+            None => Ok(()),
+            Some(name) => {
+                error!(target: LOG_TARGET,
+                    "Per-map codec '{name}' requested for a {media_type:?} stream, \
+                     which cannot be re-encoded."
+                );
+                Err(Error::OpenOutput(OpenOutputError::InvalidOption(format!(
+                    "per-map codec '{name}' is not supported for {media_type:?} \
+                     streams; only video, audio and subtitle streams can carry a \
+                     per-map encoder"
+                ))))
+            }
+        },
+    }
+}
+
+/// Resolve the encoder for one output stream. `per_map_codec` is the
+/// stream-map-level request (`StreamMap::codec`, FFmpeg `-c:v:0`); it wins
+/// over the per-type `Output::set_*_codec` value, which in turn wins over
+/// the container format's default — FFmpeg's "the most specific matching
+/// `-c` applies" chain. Paths without a per-map spec (auto-map, unlabeled
+/// complex-filter outputs, the video writer) pass `None` and keep the
+/// per-type behavior bit for bit.
 pub(super) fn choose_encoder(
     mux: &Muxer,
     media_type: AVMediaType,
+    per_map_codec: Option<&str>,
 ) -> Result<Option<(AVCodecID, *const AVCodec)>> {
+    reject_per_map_codec_for_unencodable(media_type, per_map_codec)?;
+    let per_map_codec = per_map_codec.map(str::to_owned);
     let media_codec = match media_type {
-        AVMEDIA_TYPE_VIDEO => mux.video_codec.clone(),
-        AVMEDIA_TYPE_AUDIO => mux.audio_codec.clone(),
-        AVMEDIA_TYPE_SUBTITLE => mux.subtitle_codec.clone(),
+        AVMEDIA_TYPE_VIDEO => per_map_codec.or_else(|| mux.video_codec.clone()),
+        AVMEDIA_TYPE_AUDIO => per_map_codec.or_else(|| mux.audio_codec.clone()),
+        AVMEDIA_TYPE_SUBTITLE => per_map_codec.or_else(|| mux.subtitle_codec.clone()),
         _ => return Ok(None),
     };
 
@@ -1956,4 +2086,31 @@ pub(super) fn choose_encoder(
     };
 
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn per_map_codec_is_rejected_for_unencodable_media_types() {
+        // DATA/ATTACHMENT maps resolve to stream copy; a per-map codec on
+        // them must fail loud instead of being silently swallowed.
+        for media_type in [AVMEDIA_TYPE_DATA, AVMEDIA_TYPE_ATTACHMENT] {
+            match reject_per_map_codec_for_unencodable(media_type, Some("aac")) {
+                Err(Error::OpenOutput(OpenOutputError::InvalidOption(msg))) => {
+                    assert!(msg.contains("per-map codec 'aac'"), "got: {msg}");
+                }
+                other => panic!("expected InvalidOption for {media_type:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn per_map_codec_passes_for_encodable_media_types_and_none() {
+        for media_type in [AVMEDIA_TYPE_VIDEO, AVMEDIA_TYPE_AUDIO, AVMEDIA_TYPE_SUBTITLE] {
+            assert!(reject_per_map_codec_for_unencodable(media_type, Some("x")).is_ok());
+        }
+        assert!(reject_per_map_codec_for_unencodable(AVMEDIA_TYPE_DATA, None).is_ok());
+    }
 }

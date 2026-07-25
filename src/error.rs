@@ -1039,6 +1039,21 @@ pub enum OpenOutputError {
     #[error("Stream map '{0}' matches no streams;")]
     MatchesNoStreams(String),
 
+    /// A stream map combined stream copy with a per-map re-encoding
+    /// request ([`StreamMap::codec`] / [`StreamMap::codec_opt`]): copied
+    /// packets never pass through an encoder, so a per-map codec or
+    /// per-map codec options could never take effect. Raised at `build()`
+    /// instead of silently ignoring the request (the FFmpeg CLI merely
+    /// warns about such unused options).
+    ///
+    /// [`StreamMap::codec`]: crate::core::context::output::StreamMap::codec
+    /// [`StreamMap::codec_opt`]: crate::core::context::output::StreamMap::codec_opt
+    #[error(
+        "stream map '{spec}' requests stream copy together with {what}; \
+         stream copy and per-map re-encoding settings are mutually exclusive"
+    )]
+    StreamMapCopyConflict { spec: String, what: &'static str },
+
     #[error("Invalid label {0}")]
     InvalidLabel(String),
 

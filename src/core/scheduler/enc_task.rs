@@ -1101,15 +1101,36 @@ fn set_encoder_opts(
     subtitle_codec_opts: &Option<HashMap<CString, CString>>,
     enc_ctx_box: &CodecContext,
 ) -> crate::error::Result<()> {
-    let mut encoder_opts = DictGuard::new(if enc_stream.codec_type == AVMEDIA_TYPE_VIDEO {
-        hashmap_to_avdictionary(video_codec_opts)
-    } else if enc_stream.codec_type == AVMEDIA_TYPE_AUDIO {
-        hashmap_to_avdictionary(audio_codec_opts)
-    } else if enc_stream.codec_type == AVMEDIA_TYPE_SUBTITLE {
-        hashmap_to_avdictionary(subtitle_codec_opts)
-    } else {
-        null_mut()
-    });
+    let no_type_opts = None;
+    let type_opts = match enc_stream.codec_type {
+        AVMEDIA_TYPE_VIDEO => video_codec_opts,
+        AVMEDIA_TYPE_AUDIO => audio_codec_opts,
+        AVMEDIA_TYPE_SUBTITLE => subtitle_codec_opts,
+        _ => &no_type_opts,
+    };
+
+    // Per-map options (StreamMap::codec_opt) merge over the per-type table
+    // KEY BY KEY — FFmpeg matches every option's stream specifier
+    // independently, so `-b:v 4M -preset:v:0 slow` leaves stream v:0 with
+    // BOTH the bitrate and the preset. Replacing the whole table would drop
+    // the per-type keys. Every consumer below (the AVOption application AND
+    // the automatic-threading detection) must read this merged view; a
+    // per-map `threads` read only here but not there would be applied and
+    // then overwritten by `thread_count = 0`.
+    let merged;
+    let effective_opts: &Option<HashMap<CString, CString>> = match &enc_stream.per_map_codec_opts {
+        None => type_opts,
+        Some(per_map_opts) => {
+            let mut map = type_opts.clone().unwrap_or_default();
+            for (key, value) in per_map_opts {
+                map.insert(key.clone(), value.clone());
+            }
+            merged = Some(map);
+            &merged
+        }
+    };
+
+    let mut encoder_opts = DictGuard::new(hashmap_to_avdictionary(effective_opts));
     if !encoder_opts.as_ptr().is_null() {
         let ret = unsafe {
             av_opt_set_dict2(
@@ -1150,14 +1171,10 @@ fn set_encoder_opts(
     // core. Hardware encoders ignore thread_count, so no codec gating beyond
     // media type is needed; subtitles are excluded. A user-supplied `threads`
     // (applied above via the opts dict) is preserved by only defaulting when
-    // absent.
+    // absent — detected on the MERGED per-stream view, so a per-map
+    // `threads` survives exactly like a per-type one.
     if enc_stream.codec_type == AVMEDIA_TYPE_VIDEO || enc_stream.codec_type == AVMEDIA_TYPE_AUDIO {
-        let codec_opts = if enc_stream.codec_type == AVMEDIA_TYPE_VIDEO {
-            video_codec_opts
-        } else {
-            audio_codec_opts
-        };
-        let user_set_threads = codec_opts
+        let user_set_threads = effective_opts
             .as_ref()
             .is_some_and(|m| m.keys().any(|k| k.as_bytes() == b"threads"));
         if !user_set_threads {
@@ -2264,18 +2281,116 @@ const PRE_MUX_FULL_WAIT_SLICE: Duration = Duration::from_millis(200);
 mod tests {
     use super::should_cascade_break;
     use super::{
-        account_slice, park_pre_mux, send_to_mux, SendToMuxError, PRE_MUX_FULL_WAIT_SLICE,
+        account_slice, park_pre_mux, send_to_mux, set_encoder_opts, SendToMuxError,
+        PRE_MUX_FULL_WAIT_SLICE,
     };
+    use crate::core::context::encoder_stream::EncoderStream;
     use crate::core::context::pre_mux_queue::{channel, PreMuxQueueConfig, PreQueueTryPush};
-    use crate::core::context::{MuxStartGate, PacketBox, PacketData};
+    use crate::core::context::{CodecContext, MuxStartGate, PacketBox, PacketData};
     use crate::core::scheduler::ffmpeg_scheduler::{
         notify_pause_waiters, STATUS_END, STATUS_PAUSE, STATUS_RUN,
     };
     use ffmpeg_next::packet::{Mut, Ref};
     use ffmpeg_sys_next::AVMediaType::AVMEDIA_TYPE_VIDEO;
+    use std::collections::HashMap;
+    use std::ffi::CString;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    fn copts(pairs: &[(&str, &str)]) -> Option<HashMap<CString, CString>> {
+        Some(
+            pairs
+                .iter()
+                .map(|(k, v)| (CString::new(*k).unwrap(), CString::new(*v).unwrap()))
+                .collect(),
+        )
+    }
+
+    /// A real encoder context plus a minimal video `EncoderStream` around
+    /// it. `set_encoder_opts` only reads the codec type, the stream index,
+    /// and the per-map table; the channel endpoints are never touched.
+    fn enc_opts_fixture(
+        per_map_codec_opts: Option<HashMap<CString, CString>>,
+    ) -> (EncoderStream, CodecContext) {
+        let enc =
+            unsafe { ffmpeg_sys_next::avcodec_find_encoder(ffmpeg_sys_next::AVCodecID::AV_CODEC_ID_MPEG4) };
+        assert!(!enc.is_null(), "the native mpeg4 encoder must be present");
+        let enc_ctx = unsafe { ffmpeg_sys_next::avcodec_alloc_context3(enc) };
+        assert!(!enc_ctx.is_null());
+        let enc_ctx_box = CodecContext::new(enc_ctx);
+
+        let (_frame_tx, frame_rx) = crossbeam_channel::bounded(1);
+        let (pkt_tx, _pkt_rx) = crossbeam_channel::bounded(1);
+        let (pre_tx, _pre_rx) = channel(PreMuxQueueConfig {
+            max_packets: 8,
+            data_threshold: 1024,
+        });
+        let enc_stream = EncoderStream::new(
+            0,
+            std::ptr::null_mut(),
+            AVMEDIA_TYPE_VIDEO,
+            enc,
+            None,
+            None,
+            Vec::new(),
+            frame_rx,
+            pkt_tx,
+            pre_tx,
+            Arc::new(MuxStartGate::new()),
+            false,
+            per_map_codec_opts,
+        );
+        (enc_stream, enc_ctx_box)
+    }
+
+    fn thread_count(ctx: &CodecContext) -> i32 {
+        unsafe { (*ctx.as_ptr()).thread_count }
+    }
+
+    fn max_b_frames(ctx: &CodecContext) -> i32 {
+        unsafe { (*ctx.as_ptr()).max_b_frames }
+    }
+
+    /// The Miss-B regression: a per-map `threads=1` must be visible to the
+    /// automatic-threading detection, or it is applied through the dict and
+    /// then overwritten by `thread_count = 0` right below.
+    #[test]
+    fn per_map_threads_survive_the_auto_threading_default() {
+        let (enc_stream, ctx) = enc_opts_fixture(copts(&[("threads", "1")]));
+        set_encoder_opts(&enc_stream, &None, &None, &None, &ctx).unwrap();
+        assert_eq!(thread_count(&ctx), 1);
+    }
+
+    #[test]
+    fn auto_threading_still_defaults_to_zero_without_any_threads_option() {
+        let (enc_stream, ctx) = enc_opts_fixture(None);
+        set_encoder_opts(&enc_stream, &None, &None, &None, &ctx).unwrap();
+        assert_eq!(thread_count(&ctx), 0);
+    }
+
+    /// Per-key merge, not whole-table replacement: the per-map `threads`
+    /// overrides the per-type one, while the per-type-only `bf` still
+    /// reaches the encoder context.
+    #[test]
+    fn per_map_options_merge_key_by_key_over_the_per_type_table() {
+        let (enc_stream, ctx) = enc_opts_fixture(copts(&[("threads", "1")]));
+        let video_opts = copts(&[("threads", "3"), ("bf", "2")]);
+        set_encoder_opts(&enc_stream, &video_opts, &None, &None, &ctx).unwrap();
+        assert_eq!(thread_count(&ctx), 1, "per-map key must win on conflicts");
+        assert_eq!(max_b_frames(&ctx), 2, "per-type-only key must survive the merge");
+    }
+
+    /// The merged view flows the other way too: a per-type `threads` is
+    /// still detected when the per-map table only carries unrelated keys.
+    #[test]
+    fn per_type_threads_are_detected_through_the_merged_view() {
+        let (enc_stream, ctx) = enc_opts_fixture(copts(&[("bf", "2")]));
+        let video_opts = copts(&[("threads", "3")]);
+        set_encoder_opts(&enc_stream, &video_opts, &None, &None, &ctx).unwrap();
+        assert_eq!(thread_count(&ctx), 3);
+        assert_eq!(max_b_frames(&ctx), 2);
+    }
 
     fn park_test_packet(payload: usize) -> PacketBox {
         let packet = if payload == 0 {

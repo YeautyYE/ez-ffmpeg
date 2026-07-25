@@ -141,13 +141,23 @@ pub(crate) fn build_writer_context(
         // gates on them before ever calling it), so preserve disable_video
         // here: skip the bind and let the streamless check below reject it.
         if !mux.video_disable {
-            match choose_encoder(mux, AVMEDIA_TYPE_VIDEO)? {
+            match choose_encoder(mux, AVMEDIA_TYPE_VIDEO, None)? {
                 Some((codec_id, enc)) => {
                     // stream_source: none (no input file). single_stream_direct_input:
                     // true — the graph is fed by exactly one source, matching the
                     // one-stream simple graph (init_simple_filtergraph), so CFR
                     // handling and initial-ts preservation behave identically.
-                    ofilter_bind_ost(0, mux, &mut filter_graph, 0, codec_id, enc, None, true)?;
+                    ofilter_bind_ost(
+                        0,
+                        mux,
+                        &mut filter_graph,
+                        0,
+                        codec_id,
+                        enc,
+                        None,
+                        true,
+                        None,
+                    )?;
                 }
                 None => {
                     // set_video_codec("copy"): there is no packet stream to copy
