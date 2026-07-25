@@ -79,6 +79,22 @@ pub enum StreamInfo {
         /// The rotation of the video stream in degrees. This value is retrieved from the metadata.
         /// Common values are 0, 90, 180, and 270.
         rotate: i32,
+
+        /// The YCbCr color matrix as the raw `AVColorSpace` value (e.g.
+        /// `AVCOL_SPC_BT709` = 1, `AVCOL_SPC_BT2020_NCL` = 9). Streams with no
+        /// tag report `AVCOL_SPC_UNSPECIFIED` = 2.
+        color_space: i32,
+
+        /// The transfer characteristic (TRC) as the raw
+        /// `AVColorTransferCharacteristic` value (e.g. `AVCOL_TRC_BT709` = 1,
+        /// `AVCOL_TRC_SMPTE2084` = 16 for PQ, `AVCOL_TRC_ARIB_STD_B67` = 18 for
+        /// HLG). This is the primary field for distinguishing HDR from SDR.
+        color_transfer: i32,
+
+        /// The color primaries as the raw `AVColorPrimaries` value (e.g.
+        /// `AVCOL_PRI_BT709` = 1, `AVCOL_PRI_BT2020` = 9). Untagged streams
+        /// report `AVCOL_PRI_UNSPECIFIED` = 2.
+        color_primaries: i32,
     },
     /// Audio stream information
     #[non_exhaustive]
@@ -298,6 +314,12 @@ unsafe fn extract_stream_info_from_stream(
             let bit_rate = codecpar.bit_rate;
             let pixel_format = codecpar.format;
             let video_delay = codecpar.video_delay;
+            // Raw AVColorSpace / AVColorTransferCharacteristic / AVColorPrimaries
+            // values (same fields the frame-export HDR fast-fail reads). Kept as
+            // i32 so the public surface carries no ffmpeg_sys enum types.
+            let color_space = codecpar.color_space as i32;
+            let color_transfer = codecpar.color_trc as i32;
+            let color_primaries = codecpar.color_primaries as i32;
             let r_frame_rate = stream.r_frame_rate;
             let sample_aspect_ratio = stream.sample_aspect_ratio;
             let fps = if avg_frame_rate.den == 0 {
@@ -336,6 +358,9 @@ unsafe fn extract_stream_info_from_stream(
                 video_delay,
                 fps,
                 rotate,
+                color_space,
+                color_transfer,
+                color_primaries,
             }
         }
         AVMEDIA_TYPE_AUDIO => {
@@ -845,6 +870,9 @@ mod tests {
             video_delay: 0,
             fps: 30.0,
             rotate: 0,
+            color_space: 0,
+            color_transfer: 0,
+            color_primaries: 0,
             codec_id: AVCodecID::AV_CODEC_ID_H264,
             codec_name: "h264".to_string(),
             metadata: HashMap::new(),
@@ -900,6 +928,9 @@ mod tests {
             video_delay: 0,
             fps: 30.0,
             rotate: 0,
+            color_space: 0,
+            color_transfer: 0,
+            color_primaries: 0,
             codec_id: AVCodecID::AV_CODEC_ID_H264,
             codec_name: "h264".to_string(),
             metadata: HashMap::new(),
