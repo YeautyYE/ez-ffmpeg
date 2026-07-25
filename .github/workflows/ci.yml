@@ -276,6 +276,41 @@ jobs:
       - name: Doctests
         run: cargo test --doc --features async,rtmp,flv,subtitle,wgpu,cli ${{ matrix.ffmpeg-features }}
 
+      # aarch64 second-stage confirmation for the NAL start-code scan
+      # refactor (perf/nal-stride3-scan, C2). Its x86-64 win is established
+      # (paired same-round benchmark: 19 corpora, medians 1.01-3.3x, no pair
+      # below parity); ARM throughput was the one open item in the
+      # SHIP-TWO-STAGE disposition. This runs the in-repo #[ignore]
+      # micro-benchmark on the arm64 runner, prints the full same-round
+      # paired table (parent byte scan vs shipped stride scan) to the CI log
+      # for review via `gh run view --log`, then applies a lenient
+      # net-regression gate: nal_scan_parity_gate.py requires each corpus's
+      # pooled median paired ratio >= 0.85 on both walks. That floor sits
+      # below the x86 win (near-parity 1-2 byte-NAL corpora hover around 1.0
+      # even unpinned) so it will not flake, yet a breach means the stride
+      # scan is a material per-corpus loss on ARM and the aarch64 byte-scan
+      # fallback (#[cfg(target_arch = "aarch64")] over the parent byte
+      # finder) should be gated in before release tagging.
+      #
+      # Pinned to the 7.1 arm64 lane only: 7.1 links a cached shared FFmpeg,
+      # so the release build recompiles Rust only (8.1 rebuilds FFmpeg
+      # statically in release); the scanner is core and feature-independent,
+      # so no extra cargo features are needed; and x64 needs no run (the x86
+      # evidence is complete on the branch). Three invocations pool fifteen
+      # same-round rounds per corpus so the median stays stable on a shared
+      # runner (the near-parity tiny-NAL corpora are the noise-sensitive
+      # ones and this keeps their pooled median clear of the floor).
+      - name: NAL start-code scan aarch64 parity benchmark
+        if: matrix.arch == 'arm64' && matrix.ffmpeg == '7.1'
+        run: |
+          set -o pipefail
+          : > nal_scan_bench.log
+          for i in 1 2 3; do
+            cargo test --release --lib bench_nal_startcode_scan ${{ matrix.ffmpeg-features }} \
+              -- --ignored --nocapture | tee -a nal_scan_bench.log
+          done
+          python3 .github/scripts/nal_scan_parity_gate.py nal_scan_bench.log
+
   cli-goldens:
     # Strict semantic-golden lane for the cli feature: builds a
     # version-matched FFmpeg WITH programs and libx264 (GPL is fine for CI
