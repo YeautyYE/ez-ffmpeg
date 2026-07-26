@@ -1,0 +1,255 @@
+//! The shared live A/V fanout and the per-watcher keyframe gate: each
+//! frame is serialized once per channel and refcount-cloned to every
+//! watcher that passes the gate. Metadata fanout deliberately stays
+//! per-session (`events`): metadata rides csid 3, whose header-compression
+//! chain belongs to the per-session serializers — see the
+//! `MediaChannel::fanout_serializer` doc.
+
+use super::{
+    serialize_media, ClientAction, MediaChannel, ReceivedDataType, RtmpScheduler, ServerResult,
+};
+use crate::flv::flv_tag_body::{
+    is_audio_sequence_header, is_video_keyframe, is_video_sequence_header,
+};
+use bytes::Bytes;
+use log::debug;
+use rml_rtmp::time::RtmpTimestamp;
+
+impl RtmpScheduler {
+    pub(super) fn handle_audio_video_data_received(
+        &mut self,
+        stream_key: &str,
+        timestamp: RtmpTimestamp,
+        data: Bytes,
+        data_type: ReceivedDataType,
+        server_results: &mut Vec<ServerResult>,
+    ) {
+        let channel = match self.channels.get_mut(stream_key) {
+            Some(channel) => channel,
+            None => return,
+        };
+
+        // Pre-compute flags once to avoid repeated calls in hot path
+        let is_video = matches!(data_type, ReceivedDataType::Video);
+        let (is_keyframe, is_sequence_header) = if is_video {
+            (is_video_keyframe(&data), is_video_sequence_header(&data))
+        } else {
+            (false, is_audio_sequence_header(&data))
+        };
+
+        // If this is an audio or video sequence header we need to save it, so it can be
+        // distributed to any late coming watchers
+        match data_type {
+            ReceivedDataType::Video => {
+                if is_sequence_header {
+                    // A codec-config change (a video sequence header whose bytes
+                    // differ from the cached one) invalidates every cached GOP:
+                    // they were encoded under the OLD header, and a late joiner
+                    // that gets the NEW header followed by those OLD-config
+                    // frames decodes garbage. Drop the stale history so replay
+                    // restarts from the new-config GOPs. A byte-identical resend
+                    // (the common keepalive case) leaves the cache untouched.
+                    if channel
+                        .video_sequence_header
+                        .as_ref()
+                        .is_some_and(|cached| cached != &data)
+                    {
+                        channel.gops.clear();
+                    }
+                    channel.video_sequence_header = Some(data.clone());
+                    channel.video_timestamp = timestamp;
+                }
+                channel.gops.save_frame_data(
+                    crate::rtmp::gop::FrameData::Video {
+                        timestamp,
+                        data: data.clone(),
+                    },
+                    is_keyframe,
+                );
+            }
+
+            ReceivedDataType::Audio => {
+                if is_sequence_header {
+                    // Same reasoning as the video path. Audio frames share this
+                    // channel's single GOP cache, so an audio codec change also
+                    // clears the cached video GOPs. That is safe (a joiner just
+                    // replays fewer frames and catches up on the next live keyframe)
+                    // and audio-config changes are rare; correctness over a
+                    // marginally longer catch-up.
+                    if channel
+                        .audio_sequence_header
+                        .as_ref()
+                        .is_some_and(|cached| cached != &data)
+                    {
+                        channel.gops.clear();
+                    }
+                    channel.audio_sequence_header = Some(data.clone());
+                    channel.audio_timestamp = timestamp;
+                }
+                channel.gops.save_frame_data(
+                    crate::rtmp::gop::FrameData::Audio {
+                        timestamp,
+                        data: data.clone(),
+                    },
+                    false,
+                );
+            }
+        }
+
+        // Disjoint field borrows: the watcher set is iterated while the
+        // shared serializer is driven mutably below.
+        let MediaChannel {
+            watching_client_ids,
+            metadata,
+            fanout_serializer,
+            ..
+        } = channel;
+
+        // Detect an audio-only stream from the publisher's metadata: it declares
+        // an audio codec but no video codec. Computed once per received packet so
+        // the per-watcher gate can deliver audio for such streams instead of
+        // waiting for a video keyframe that never comes (see
+        // `should_send_to_watcher`).
+        let channel_is_audio_only = metadata
+            .as_ref()
+            .is_some_and(|m| m.audio_codec_id.is_some() && m.video_codec_id.is_none());
+
+        // Shared fanout serialization: this message's wire bytes per
+        // `message_stream_id` group, serialized on the channel serializer
+        // the FIRST time a watcher of that group passes the gate; every
+        // other watcher of the group gets a `Bytes` refcount clone. The
+        // type-0 header embeds the stream id (the only per-watcher-variable
+        // field), hence the grouping; in practice every connection's first
+        // play stream is 1, so this is one entry.
+        let mut serialized_groups: Vec<(u32, Bytes)> = Vec::new();
+
+        for client_id in watching_client_ids.iter() {
+            let client = match self.clients.get_mut(*client_id) {
+                Some(client) => client,
+                None => continue,
+            };
+
+            // Defense-in-depth: a watcher whose current action points at a
+            // different stream must not receive this channel's frames, even
+            // if its id is still (incorrectly) present in this watcher set.
+            let active_stream_id = match &client.current_action {
+                ClientAction::Watching {
+                    stream_key: watched_stream_key,
+                    stream_id,
+                } => {
+                    if *watched_stream_key != stream_key {
+                        debug!(
+                            "Rtmp client {} is watching '{}'; skipping frame delivery \
+                             from channel '{}'",
+                            client_id, watched_stream_key, stream_key
+                        );
+                        continue;
+                    }
+                    *stream_id
+                }
+                _ => continue,
+            };
+
+            let should_send_to_client = should_send_to_watcher(
+                data_type,
+                client.has_received_video_keyframe,
+                is_keyframe,
+                is_sequence_header,
+                channel_is_audio_only,
+            );
+
+            if !should_send_to_client {
+                continue;
+            }
+
+            // The keyframe gate trusts the container flag: is_keyframe
+            // means the encoder flagged this packet as a keyframe (FLV
+            // frame type 1, AVC NALU packet type 0x01). The NAL payload
+            // is not inspected, so a mis-flagged packet passes the
+            // gate. FFmpeg's flvdec (libavformat/flvdec.c derives
+            // AV_PKT_FLAG_KEY from the same frame-type nibble) and
+            // mainstream RTMP servers place the same trust in the
+            // container flag, which keeps this per-packet path free of
+            // NAL parsing.
+            if is_video && is_keyframe {
+                client.has_received_video_keyframe = true;
+            }
+
+            let wire_bytes = match serialized_groups
+                .iter()
+                .find(|(stream_id, _)| *stream_id == active_stream_id)
+            {
+                Some((_, bytes)) => bytes.clone(),
+                None => match serialize_media(
+                    fanout_serializer,
+                    data_type,
+                    active_stream_id,
+                    data.clone(),
+                    timestamp,
+                    true,
+                ) {
+                    Ok(packet) => {
+                        let bytes = Bytes::from(packet.bytes);
+                        serialized_groups.push((active_stream_id, bytes.clone()));
+                        bytes
+                    }
+                    Err(error) => {
+                        // Deterministic for the (message, group) pair, so
+                        // every watcher of the group lands here — the same
+                        // per-watcher disconnect the per-session path
+                        // produced when its send failed.
+                        let data_type_str = if is_video { "video" } else { "audio" };
+                        debug!(
+                            "Rtmp error serializing {} data for client on connection id {}: {:?}",
+                            data_type_str, client.connection_id, error
+                        );
+                        server_results.push(ServerResult::DisconnectConnection {
+                            connection_id: client.connection_id,
+                        });
+                        continue;
+                    }
+                },
+            };
+
+            server_results.push(ServerResult::OutboundPacket {
+                target_connection_id: client.connection_id,
+                bytes: wire_bytes,
+                can_be_dropped: true,
+                is_keyframe,
+                is_sequence_header,
+                is_video,
+            });
+        }
+    }
+}
+
+/// Decide whether a freshly received media packet should be forwarded to a
+/// watching client right now.
+///
+/// Video is gated on the client already having a keyframe to start decoding
+/// from (the packet itself passes if it *is* that keyframe or a sequence
+/// header). Audio is normally gated the same way so that A/V playback starts in
+/// sync — but that coupling is only correct when the stream actually carries
+/// video. An audio-only stream never produces a video keyframe, so gating its
+/// audio on one leaves every subscriber permanently silent.
+///
+/// We only relax audio delivery when the publisher's metadata positively
+/// declares the stream audio-only (`channel_is_audio_only`); absent that
+/// signal we keep gating on a keyframe, which preserves A/V start-up sync even
+/// during the window before the first video packet arrives. (An audio-only
+/// stream that publishes no metadata at all is the one residual case still
+/// gated — rare, since real audio-only publishers send `onMetaData`.)
+pub(super) fn should_send_to_watcher(
+    data_type: ReceivedDataType,
+    has_received_video_keyframe: bool,
+    is_keyframe: bool,
+    is_sequence_header: bool,
+    channel_is_audio_only: bool,
+) -> bool {
+    match data_type {
+        ReceivedDataType::Video => has_received_video_keyframe || is_sequence_header || is_keyframe,
+        ReceivedDataType::Audio => {
+            has_received_video_keyframe || is_sequence_header || channel_is_audio_only
+        }
+    }
+}
