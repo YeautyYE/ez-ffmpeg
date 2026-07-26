@@ -354,7 +354,9 @@ pub trait PacketSinkHandler: Send + 'static {
     fn on_job_failed(&mut self, _summary: &JobFailureSummary) {}
 
     /// Terminal failure. For delivery-path errors (strict-tier violations,
-    /// failing callbacks) the same error is also the job result. When the
+    /// failing callbacks) the same error is also reported as the job result
+    /// unless an earlier failure already settled it (job settlement is
+    /// first-error-wins). When the
     /// JOB failed elsewhere (after this sink drained or truncating its
     /// delivery), the callback receives a synthesized
     /// [`PacketSinkError::JobFailed`] summarizing that failure, while

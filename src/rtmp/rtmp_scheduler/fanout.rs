@@ -1,6 +1,10 @@
 //! The shared live A/V fanout and the per-watcher keyframe gate: each
-//! frame is serialized once per channel and refcount-cloned to every
-//! watcher that passes the gate. Metadata fanout deliberately stays
+//! frame is serialized once per distinct active message stream ID among
+//! the gate-passing watchers, with `serialized_groups` caching SUCCESSFUL
+//! serializations only — the cached bytes are refcount-cloned to every
+//! further watcher of the group, while a failed serialization caches
+//! nothing and is re-attempted (and fails deterministically) per watcher
+//! of that group, disconnecting each. Metadata fanout deliberately stays
 //! per-session (`events`): metadata rides csid 3, whose header-compression
 //! chain belongs to the per-session serializers — see the
 //! `MediaChannel::fanout_serializer` doc.
@@ -117,10 +121,14 @@ impl RtmpScheduler {
         // Shared fanout serialization: this message's wire bytes per
         // `message_stream_id` group, serialized on the channel serializer
         // the FIRST time a watcher of that group passes the gate; every
-        // other watcher of the group gets a `Bytes` refcount clone. The
-        // type-0 header embeds the stream id (the only per-watcher-variable
-        // field), hence the grouping; in practice every connection's first
-        // play stream is 1, so this is one entry.
+        // other watcher of the group gets a `Bytes` refcount clone. Only a
+        // SUCCESSFUL serialization is cached — the error arm below caches
+        // nothing, so each remaining watcher of the group re-attempts (and
+        // deterministically re-fails) its own serialization on the way to
+        // its disconnect. The type-0 header embeds the stream id (the only
+        // per-watcher-variable field), hence the grouping; watchers sharing
+        // a stream id share one entry, so the common case stays a single
+        // serialization.
         let mut serialized_groups: Vec<(u32, Bytes)> = Vec::new();
 
         for client_id in watching_client_ids.iter() {

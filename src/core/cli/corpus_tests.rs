@@ -390,7 +390,7 @@ fn corpus_threads_and_progress() {
     rejected(
         "ffmpeg -i in.mp4 -progress p.txt -y out.mp4",
         "UnsupportedOption",
-        "documented gap",
+        "FfmpegScheduler::progress_handle",
     );
 }
 

@@ -373,15 +373,27 @@ fn pick_filter_default(devices: &[HWDevice]) -> (Option<HWDevice>, Option<usize>
     (picked, advisory)
 }
 
+/// Picks the first registered device whose type matches one of the codec's
+/// hardware configs (ffmpeg_hw.c `hw_device_match_by_codec`).
+///
+/// Caller contract: `codec` must be a non-null pointer to a codec obtained
+/// from FFmpeg's registry (`avcodec_find_decoder`/`_encoder`), which lives
+/// for the process — every call site passes such a pointer directly.
 pub(crate) fn hw_device_match_by_codec(codec: *const AVCodec) -> Option<HWDevice> {
     let mut i = 0;
 
     loop {
+        // SAFETY: `codec` is non-null and registry-owned per the caller
+        // contract above; `i` is a plain enumeration index the call treats
+        // as out-of-range by returning NULL.
         let config = unsafe { avcodec_get_hw_config(codec, i) };
         if config.is_null() {
             return None;
         }
 
+        // SAFETY: `config` was null-checked above and points at the codec's
+        // static hw-config table (registry-owned, process lifetime); only
+        // plain fields are read.
         unsafe {
             if (*config).methods as u32 & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as u32 == 0 {
                 i += 1;
@@ -450,6 +462,10 @@ struct DictGuard(*mut AVDictionary);
 impl Drop for DictGuard {
     fn drop(&mut self) {
         if !self.0.is_null() {
+            // SAFETY: the pointer is non-null and owned solely by this
+            // guard (parse() built it and nothing else frees it);
+            // av_dict_free nulls the out-param, so a double drop cannot
+            // occur.
             unsafe { av_dict_free(&mut self.0) };
         }
     }
@@ -526,6 +542,15 @@ fn settle(result: Result<HWDevice, InitFailure>) -> (i32, Option<HWDevice>) {
     }
 }
 
+/// Logger-reentrancy caveat (pre-existing design, disclosed): the locked
+/// body below runs `av_hwdevice_ctx_create` while INIT_LOCK is held, and
+/// FFmpeg may emit its own log lines during device creation — the
+/// process-wide `log` backend is therefore invoked UNDER that lock. ez's
+/// own log macros are kept outside the lock (see `settle`), but a user log
+/// handler that re-enters device-management APIs (this function,
+/// [`hw_device_init_from_type`], `init_filter_hw_device`) from inside such
+/// a message can deadlock on INIT_LOCK. Log handlers must treat records as
+/// data: format and forward them, never call back into this crate.
 pub(crate) fn hw_device_init_from_string(arg: &str) -> (i32, Option<HWDevice>) {
     // Serialize the whole reuse-check -> create -> register sequence: two
     // concurrent calls with the same spec must not both miss the reuse check and
@@ -558,6 +583,8 @@ fn hw_device_init_from_string_locked(arg: &str) -> Result<HWDevice, InitFailure>
             )),
         });
     };
+    // SAFETY: `type_name` is a live NUL-terminated string borrowed for the
+    // call only; the lookup returns an enum value, no pointer escapes.
     let device_type = unsafe { av_hwdevice_find_type_by_name(type_name.as_ptr()) };
     if device_type == AVHWDeviceType::AV_HWDEVICE_TYPE_NONE {
         return Err(InitFailure {
@@ -681,6 +708,9 @@ fn hw_device_init_from_string_locked(arg: &str) -> Result<HWDevice, InitFailure>
     Ok(dev)
 }
 
+/// Logger-reentrancy caveat: same as [`hw_device_init_from_string`] —
+/// device creation runs under INIT_LOCK and FFmpeg may log during it, so a
+/// log handler re-entering device-management APIs can deadlock.
 pub(crate) fn hw_device_init_from_type(
     device_type: AVHWDeviceType,
     device: Option<String>,
@@ -995,6 +1025,9 @@ pub fn is_filter_available(name: &str) -> bool {
     let Ok(name_cstr) = CString::new(name) else {
         return false;
     };
+    // SAFETY: `name_cstr` is a live NUL-terminated string borrowed for the
+    // call only; the returned registry pointer is only null-checked, never
+    // dereferenced.
     !unsafe { avfilter_get_by_name(name_cstr.as_ptr()) }.is_null()
 }
 
@@ -1015,7 +1048,8 @@ pub fn is_filter_available(name: &str) -> bool {
 /// Note: probing creates (and immediately frees) one device per type, which can
 /// load vendor libraries; call it once at startup, not per job. Probe devices
 /// are never registered for pipeline use, so this has no effect on
-/// `filter_hw_device` selection.
+/// `filter_hw_device` selection. Probing can also make FFmpeg emit its own
+/// log lines; no ez-ffmpeg lock is held on this path.
 pub fn get_gpu_filter_backends() -> Vec<GpuFilterBackend> {
     let mut backends = Vec::new();
     let mut device_type = AVHWDeviceType::AV_HWDEVICE_TYPE_NONE;
