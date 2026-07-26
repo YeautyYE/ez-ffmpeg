@@ -1,12 +1,13 @@
 //! Frame & sample export for AI/CV — decode a video into packed RGB frames
 //! (and audio into f32 PCM) in one pass, correctly.
 //!
-//! # Experimental (0.14)
+//! # Experimental
 //!
-//! This module is **experimental**. Its API shape may be reshaped in 0.15;
-//! within the 0.14.x line, patch releases will not break it. Correctness
-//! defects (deadlocks, over-delivery, dropped errors, wrong strides, wrong
-//! color) are **not** waived by this banner — they are release blockers.
+//! This module is **experimental**: introduced in 0.14, its API shape may
+//! still be reshaped in minor releases while it settles; within a minor
+//! line, patch releases will not break it. Correctness defects (deadlocks,
+//! over-delivery, dropped errors, wrong strides, wrong color) are **not**
+//! waived by this banner — they are release blockers.
 //!
 //! # What it does
 //!

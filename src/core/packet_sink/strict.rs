@@ -606,6 +606,7 @@ impl PacketSinkWorker {
     /// or not that failure truncated this sink's delivery — `wait()` keeps
     /// the original error); stays silent for aborts and clean cancellation.
     /// On that JobFailed path only, a registered `on_job_failed` observer
+    /// (builder callback or handler override)
     /// receives the structured summary first, under its own containment, so
     /// a panicking observer can never skip the terminal dispatch — its
     /// caught payload is parked and disposed only AFTER the terminal
@@ -865,7 +866,8 @@ mod tests {
     use super::*;
     use crate::core::context::PacketData;
     use crate::core::packet_sink::{
-        EncodedPacket, JobFailureKind, JobFailureSummary, PacketSink, PacketSinkEvent,
+        EncodedPacket, JobFailureKind, JobFailureSummary, PacketCallbackResult, PacketSink,
+        PacketSinkEvent, PacketSinkHandler,
     };
     use ffmpeg_next::packet::Mut;
     use ffmpeg_sys_next::{
@@ -2114,6 +2116,157 @@ mod tests {
             }
             other => panic!("expected the JobFailed terminal, got {other:?}"),
         }
+    }
+
+    /// Handler mirror of the builder observer path: an overridden
+    /// `PacketSinkHandler::on_job_failed` receives the classified summary
+    /// exactly once, immediately BEFORE `on_delivery_error(JobFailed)`,
+    /// with the message byte-identical through both callbacks, and no
+    /// `on_end`.
+    #[test]
+    fn handler_on_job_failed_fires_before_the_job_failed_terminal() {
+        struct RecordingHandler {
+            log: Arc<Mutex<Vec<(&'static str, String)>>>,
+        }
+        impl PacketSinkHandler for RecordingHandler {
+            fn on_packet(&mut self, _packet: &PacketView<'_>) -> PacketCallbackResult {
+                Ok(())
+            }
+            fn on_end(&mut self) {
+                self.log.lock().unwrap().push(("end", String::new()));
+            }
+            fn on_job_failed(&mut self, summary: &JobFailureSummary) {
+                self.log
+                    .lock()
+                    .unwrap()
+                    .push(("job_failed", summary.message().to_string()));
+            }
+            fn on_delivery_error(&mut self, error: &PacketSinkError) {
+                let message = match error {
+                    PacketSinkError::JobFailed { message } => message.clone(),
+                    other => format!("unexpected terminal: {other}"),
+                };
+                self.log.lock().unwrap().push(("delivery_error", message));
+            }
+        }
+
+        let ctx = video_ctx();
+        let log: Arc<Mutex<Vec<(&'static str, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = PacketSink::from_handler(RecordingHandler { log: log.clone() });
+        let mut worker = collect(&ctx, sink).unwrap();
+        assert_eq!(worker.deliver_stream_info(), 0);
+        let recorded = crate::error::Error::Muxing(
+            crate::error::MuxingOperationError::InterleavedWriteError(
+                crate::error::MuxingError::UnknownError(AVERROR_EXTERNAL),
+            ),
+        );
+        worker.finish(
+            false,
+            AVERROR_EXTERNAL,
+            false,
+            Some(JobFailureSummary::from_error(&recorded)),
+        );
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 2, "exactly one observer + one terminal: {log:?}");
+        assert_eq!(log[0].0, "job_failed", "the handler override fires first");
+        assert_eq!(log[1].0, "delivery_error", "then the terminal");
+        assert_eq!(log[0].1, recorded.to_string());
+        assert_eq!(log[1].1, recorded.to_string());
+    }
+
+    /// A handler WITHOUT the `on_job_failed` override keeps the exact
+    /// terminal-only shape — pins the default-empty trait method as a
+    /// zero-behavior-change addition.
+    #[test]
+    fn handler_without_on_job_failed_override_keeps_the_terminal_only_shape() {
+        struct TerminalOnlyHandler {
+            log: Arc<Mutex<Vec<(&'static str, String)>>>,
+        }
+        impl PacketSinkHandler for TerminalOnlyHandler {
+            fn on_packet(&mut self, _packet: &PacketView<'_>) -> PacketCallbackResult {
+                Ok(())
+            }
+            fn on_end(&mut self) {
+                self.log.lock().unwrap().push(("end", String::new()));
+            }
+            fn on_delivery_error(&mut self, error: &PacketSinkError) {
+                let message = match error {
+                    PacketSinkError::JobFailed { message } => message.clone(),
+                    other => format!("unexpected terminal: {other}"),
+                };
+                self.log.lock().unwrap().push(("delivery_error", message));
+            }
+        }
+
+        let ctx = video_ctx();
+        let log: Arc<Mutex<Vec<(&'static str, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = PacketSink::from_handler(TerminalOnlyHandler { log: log.clone() });
+        let mut worker = collect(&ctx, sink).unwrap();
+        assert_eq!(worker.deliver_stream_info(), 0);
+        let recorded = crate::error::Error::WorkerPanicked("muxer1:mpegts".to_string());
+        worker.finish(
+            false,
+            AVERROR_EXTERNAL,
+            false,
+            Some(JobFailureSummary::from_error(&recorded)),
+        );
+        let log = log.lock().unwrap();
+        assert_eq!(
+            log.len(),
+            1,
+            "exactly the terminal event with the default no-op observer: {log:?}"
+        );
+        assert_eq!(log[0].0, "delivery_error");
+        assert_eq!(log[0].1, recorded.to_string());
+    }
+
+    /// A panicking handler `on_job_failed` override is contained and the
+    /// terminal `on_delivery_error(JobFailed)` STILL fires — the handler
+    /// mirror of the builder-observer containment guarantee.
+    #[test]
+    fn handler_on_job_failed_panic_is_contained_and_terminal_still_fires() {
+        struct PanickingObserverHandler {
+            log: Arc<Mutex<Vec<(&'static str, String)>>>,
+        }
+        impl PacketSinkHandler for PanickingObserverHandler {
+            fn on_packet(&mut self, _packet: &PacketView<'_>) -> PacketCallbackResult {
+                Ok(())
+            }
+            fn on_end(&mut self) {
+                self.log.lock().unwrap().push(("end", String::new()));
+            }
+            fn on_job_failed(&mut self, _summary: &JobFailureSummary) {
+                panic!("injected handler on_job_failed panic");
+            }
+            fn on_delivery_error(&mut self, error: &PacketSinkError) {
+                let message = match error {
+                    PacketSinkError::JobFailed { message } => message.clone(),
+                    other => format!("unexpected terminal: {other}"),
+                };
+                self.log.lock().unwrap().push(("delivery_error", message));
+            }
+        }
+
+        let ctx = video_ctx();
+        let log: Arc<Mutex<Vec<(&'static str, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = PacketSink::from_handler(PanickingObserverHandler { log: log.clone() });
+        let mut worker = collect(&ctx, sink).unwrap();
+        assert_eq!(worker.deliver_stream_info(), 0);
+        let recorded = crate::error::Error::WorkerPanicked("muxer1:mpegts".to_string());
+        worker.finish(
+            false,
+            AVERROR_EXTERNAL,
+            false,
+            Some(JobFailureSummary::from_error(&recorded)),
+        );
+        let log = log.lock().unwrap();
+        assert_eq!(
+            log.len(),
+            1,
+            "exactly the terminal event despite the override panic: {log:?}"
+        );
+        assert_eq!(log[0].0, "delivery_error");
+        assert_eq!(log[0].1, recorded.to_string());
     }
 
     /// (e) Channel adapter: the job-failure path queues a structured
