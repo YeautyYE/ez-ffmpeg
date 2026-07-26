@@ -421,6 +421,20 @@ impl<S: 'static> FfmpegScheduler<S> {
     ) -> Arc<crate::core::scheduler::progress::ProgressTracker> {
         self.progress.clone()
     }
+
+    /// The one place a progress handle is minted: arms the per-packet
+    /// byte-position probe (only observed jobs pay for `total_size`
+    /// sampling on the mux hot path), then wraps the shared state. The
+    /// `Running` and `Paused` typestates delegate here — the handle itself
+    /// is state-independent.
+    fn make_progress_handle(&self) -> crate::core::scheduler::progress::ProgressHandle {
+        self.progress.mark_observed();
+        crate::core::scheduler::progress::ProgressHandle::new(
+            self.status.clone(),
+            self.pause_epoch.clone(),
+            self.progress.clone(),
+        )
+    }
 }
 
 impl FfmpegScheduler<Initialization> {
@@ -993,14 +1007,7 @@ impl FfmpegScheduler<Running> {
     /// scheduler.wait()?;
     /// ```
     pub fn progress_handle(&self) -> crate::core::scheduler::progress::ProgressHandle {
-        // Arm the per-packet byte-position probe: only observed jobs pay for
-        // total_size sampling on the mux hot path.
-        self.progress.mark_observed();
-        crate::core::scheduler::progress::ProgressHandle::new(
-            self.status.clone(),
-            self.pause_epoch.clone(),
-            self.progress.clone(),
-        )
+        self.make_progress_handle()
     }
 
     /// Pauses a running FFmpeg job, transitioning from `Running` to `Paused`.
@@ -1294,14 +1301,7 @@ impl FfmpegScheduler<Paused> {
     /// [`FfmpegScheduler::<Running>::progress_handle`]: FfmpegScheduler::progress_handle
     /// [`ProgressState::Paused`]: crate::core::scheduler::progress::ProgressState::Paused
     pub fn progress_handle(&self) -> crate::core::scheduler::progress::ProgressHandle {
-        // Arm the per-packet byte-position probe: only observed jobs pay for
-        // total_size sampling on the mux hot path.
-        self.progress.mark_observed();
-        crate::core::scheduler::progress::ProgressHandle::new(
-            self.status.clone(),
-            self.pause_epoch.clone(),
-            self.progress.clone(),
-        )
+        self.make_progress_handle()
     }
 
     /// Resumes a paused FFmpeg job, transitioning from `Paused` back to `Running`.

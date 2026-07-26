@@ -577,6 +577,33 @@ fn snapshots_survive_scheduler_drop_and_freeze() {
     assert_eq!(state, ProgressState::Ended);
 }
 
+/// An input mapped to no output takes `demux_init`'s early return and never
+/// spawns a worker; its shared `task_exited` flag must still be published,
+/// or `inputs_drained` (which ANDs every demux node's flag) can never
+/// report all inputs drained for the whole job.
+#[test]
+fn unmapped_input_still_counts_as_drained() {
+    let out = tmp_path("progress_unmapped_input.mp4");
+    let context = FfmpegContext::builder()
+        .input(Input::from("testsrc2=duration=1:size=192x108:rate=25").set_format("lavfi"))
+        // Second input exists but no output stream maps it.
+        .input(Input::from("testsrc2=duration=1:size=192x108:rate=25").set_format("lavfi"))
+        .output(
+            Output::from(out.as_str())
+                .add_stream_map("0:v:0")
+                .set_video_codec("mpeg4"),
+        )
+        .build()
+        .expect("unmapped-input context");
+    let scheduler = FfmpegScheduler::new(context).start().expect("start");
+    let tracker = scheduler.progress_tracker_for_test();
+    scheduler.wait().expect("job with an unmapped input");
+    assert!(
+        tracker.inputs_drained(),
+        "the unmapped input's exit flag was never published"
+    );
+}
+
 /// Defect-2 end-to-end gate: a real file-backed job's mux write path takes
 /// per-packet byte-position probes ONLY when a progress handle exists.
 /// Exercises the public `progress_handle()` and the `write_packet` gate,

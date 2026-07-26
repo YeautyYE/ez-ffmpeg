@@ -978,9 +978,22 @@ impl Output {
     /// # Parameters
     /// - `map`: An FFmpeg-style specifier referencing the desired input index and
     ///   media type, like `"0:v?"`, or a [`StreamMap`]. The copy flag is
-    ///   forced on; combining it with [`StreamMap::codec`] /
-    ///   [`StreamMap::codec_opt`] is rejected at build time
+    ///   forced on; combining it with a *different* [`StreamMap::codec`]
+    ///   (anything but `"copy"`, which is redundant and accepted on a
+    ///   selecting map) or with any [`StreamMap::codec_opt`] entry is
+    ///   rejected at build time
     ///   ([`OpenOutputError::StreamMapCopyConflict`](crate::error::OpenOutputError::StreamMapCopyConflict)).
+    ///   A negative (disabling) map such as `"-0:v"` rejects ANY per-map
+    ///   codec — `"copy"` included — with
+    ///   [`OpenOutputError::InvalidOption`](crate::error::OpenOutputError::InvalidOption):
+    ///   a disabling map carries no encoder intent to attach it to.
+    ///
+    /// Behavior change in 0.16: passing a filter output label (e.g.
+    /// `"[v0]"`) with copy now also fails at `build()` with the same
+    /// `StreamMapCopyConflict` — a filter-graph output carries no source
+    /// packets to copy. Through 0.15 the copy request was silently ignored
+    /// and the labeled stream re-encoded; the new error matches the FFmpeg
+    /// CLI, which rejects combining filtergraphs with streamcopy.
     ///
     /// # Returns
     /// * `Self` - for chained method calls.

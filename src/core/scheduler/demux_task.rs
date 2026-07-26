@@ -64,6 +64,16 @@ pub(crate) fn demux_init(
             "The input:{} does not need to be sent to the destination, skip",
             demux.url
         );
+        // No worker is spawned for this input, so no exit path ever flips
+        // its `task_exited` flag — yet the progress tracker collects EVERY
+        // demux node's flag for `inputs_drained`, which would then never
+        // report all inputs drained for a job with an unmapped input.
+        // Publish "exited" here: this input produces nothing, which is the
+        // exact meaning the flag carries.
+        let SchNode::Demux { task_exited, .. } = demux_node.as_ref() else {
+            unreachable!()
+        };
+        task_exited.store(true, Ordering::Release);
         return Ok(());
     }
 
