@@ -594,6 +594,42 @@ pub(crate) unsafe fn free_output_opaque(mut avio_ctx: *mut AVIOContext) {
     }
     let opaque_ptr = (*avio_ctx).opaque as *mut OutputOpaque;
     if !opaque_ptr.is_null() {
+        // The opaque box carries the USER's write/seek callback state, and
+        // its Drop is arbitrary user code with two distinct panic cases:
+        //
+        // - ALREADY UNWINDING (this free running as drop glue — the mux
+        //   teardown guard dropping on a worker panic): a second panic here
+        //   aborts the process before the frames above can release their
+        //   thread slots. Destroy the box under its own catch (per-box
+        //   containment, like the packet-sink disposal) and surface it
+        //   through a catch-protected best-effort log; the job outcome is
+        //   already the in-flight panic.
+        // - NORMAL TEARDOWN: let the panic PROPAGATE. The scheduler guards
+        //   above this frame contain the fallout (bundle disposal is
+        //   contained, the slot releases via its armed guard) and record
+        //   the job as WorkerPanicked — the pinned contract
+        //   (tests/packet_sink.rs, sibling_custom_io_destruction_panic_
+        //   prevents_on_end): a teardown that destroyed user state by
+        //   panicking must fail the job, not vanish into a log line.
+        if std::thread::panicking() {
+            let callback_state_panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || drop(Box::from_raw(opaque_ptr)),
+            ))
+            .map_err(crate::core::packet_sink::dispose_panic_payload)
+            .is_err();
+            avio_context_free(&mut avio_ctx);
+            if callback_state_panicked {
+                // Contained itself: a panicking logger inside unwind drop
+                // glue is exactly the abort this branch exists to prevent.
+                let _ = std::panic::catch_unwind(|| {
+                    log::error!(
+                        "custom-IO output callback state panicked during teardown; the reclaim completed"
+                    );
+                })
+                .map_err(crate::core::packet_sink::dispose_panic_payload);
+            }
+            return;
+        }
         let _ = Box::from_raw(opaque_ptr);
     }
     avio_context_free(&mut avio_ctx);

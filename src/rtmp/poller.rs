@@ -71,7 +71,8 @@ impl Event {
 /// Reserved poller token for the reactor's [`Waker`] (PERF-3).
 ///
 /// Connection tokens pack `(generation << TOKEN_ID_BITS) | id` with each half
-/// sized to the pointer width, and `effective_max_connections` caps ids below
+/// sized to half the pointer width (`usize::BITS / 2` bits — 32 on 64-bit
+/// targets, 16 on 32-bit), and `effective_max_connections` caps ids below
 /// `TOKEN_ID_MASK`, so a connection token can never equal `usize::MAX` even at
 /// the maximum generation. The reactor additionally matches this token before
 /// decoding it as a connection token.
