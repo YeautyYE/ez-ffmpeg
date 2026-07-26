@@ -147,6 +147,34 @@ pub(crate) struct PacketSinkWorker {
     cancelled: bool,
 }
 
+/// Unwind custody of the bundle while [`PacketSinkWorker::collect`]
+/// validates: the validation body allocates and parses (panic-capable
+/// statements), and a panic there would otherwise unwind through a frame
+/// holding the user callback boxes as a bare local — drop glue where one
+/// panicking capture destructor escalates into a process abort. On unwind
+/// the guard destroys the bundle through its per-callback contained
+/// disposal instead; both explicit exits (the Ok worker handoff and every
+/// typed-Err give-back) take the bundle out first via [`Self::take`].
+struct CollectCustody(Option<PacketSink>);
+
+impl CollectCustody {
+    /// Moves the bundle out for an explicit exit. Every `collect` path
+    /// takes at most once and returns immediately after.
+    fn take(&mut self) -> PacketSink {
+        self.0
+            .take()
+            .expect("collect custody consumed twice on one path")
+    }
+}
+
+impl Drop for CollectCustody {
+    fn drop(&mut self) {
+        if let Some(sink) = self.0.take() {
+            let _ = sink.dispose_contained();
+        }
+    }
+}
+
 impl PacketSinkWorker {
     /// Collects and validates the strict-tier stream configuration from the
     /// (never-written) output context. Runs at the header slot: after every
@@ -178,6 +206,11 @@ impl PacketSinkWorker {
             });
         }
 
+        // Everything past this point can panic (allocation, extradata
+        // parsing); custody of the user callback boxes moves into the
+        // contained-disposal guard for the rest of the frame.
+        let mut sink = CollectCustody(Some(sink));
+
         let mut infos = Vec::with_capacity(stream_count);
         let mut streams = Vec::with_capacity(stream_count);
         for stream_index in 0..stream_count {
@@ -190,7 +223,7 @@ impl PacketSinkWorker {
             // anchors rescaling and labels every delivered timestamp).
             if time_base.num <= 0 || time_base.den <= 0 {
                 return Err(Box::new((
-                    sink,
+                    sink.take(),
                     PacketSinkError::InvalidTimeBase {
                         stream_index,
                         num: time_base.num,
@@ -202,7 +235,7 @@ impl PacketSinkWorker {
                 Some(bytes) => bytes,
                 None => {
                     return Err(Box::new((
-                        sink,
+                        sink.take(),
                         PacketSinkError::MissingExtradata { stream_index },
                     )))
                 }
@@ -214,7 +247,7 @@ impl PacketSinkWorker {
                     // guards the codec id itself (h264 only in v1).
                     if (*codecpar).codec_id != ffmpeg_sys_next::AVCodecID::AV_CODEC_ID_H264 {
                         return Err(Box::new((
-                            sink,
+                            sink.take(),
                             PacketSinkError::UnsupportedStream {
                                 kind: "non-H.264 video",
                             },
@@ -223,7 +256,7 @@ impl PacketSinkWorker {
                     let (runtime, delivered, projection) =
                         match AvcRuntime::from_extradata(&extradata, stream_index) {
                             Ok(parts) => parts,
-                            Err(e) => return Err(Box::new((sink, e))),
+                            Err(e) => return Err(Box::new((sink.take(), e))),
                         };
                     let fr = (*st).avg_frame_rate;
                     let frame_rate = (fr.num > 0 && fr.den > 0).then_some(fr);
@@ -264,7 +297,7 @@ impl PacketSinkWorker {
                 AVMEDIA_TYPE_AUDIO => {
                     if (*codecpar).codec_id != ffmpeg_sys_next::AVCodecID::AV_CODEC_ID_AAC {
                         return Err(Box::new((
-                            sink,
+                            sink.take(),
                             PacketSinkError::UnsupportedStream {
                                 kind: "non-AAC audio",
                             },
@@ -272,7 +305,7 @@ impl PacketSinkWorker {
                     }
                     let runtime = match AacRuntime::from_extradata(&extradata, stream_index) {
                         Ok(runtime) => runtime,
-                        Err(e) => return Err(Box::new((sink, e))),
+                        Err(e) => return Err(Box::new((sink.take(), e))),
                     };
                     let channels = (*codecpar).ch_layout.nb_channels;
                     // With channelConfiguration 0 the ASC's embedded
@@ -300,7 +333,7 @@ impl PacketSinkWorker {
                             && !(doubled && advertised == i64::from(pce_channels) * 2)
                         {
                             return Err(Box::new((
-                                sink,
+                                sink.take(),
                                 PacketSinkError::InvalidExtradata {
                                     stream_index,
                                     reason: format!(
@@ -351,7 +384,7 @@ impl PacketSinkWorker {
                 }
                 _ => {
                     return Err(Box::new((
-                        sink,
+                        sink.take(),
                         PacketSinkError::UnsupportedStream {
                             kind: "non-audio/video",
                         },
@@ -374,12 +407,21 @@ impl PacketSinkWorker {
         }
 
         let stream_time_bases = streams.iter().map(|s| s.time_base).collect();
+        // Construct every panic-capable part BEFORE the custody take below:
+        // struct-literal fields evaluate in written order, so a `take()`
+        // written first would hold the bundle bare while a later allocating
+        // field expression (Timeline::new) can still panic — reopening the
+        // exact bare-glue unwind this guard exists to close. With the
+        // timeline pre-built, everything after the take is moves and
+        // constants (`Vec::new` does not allocate): the last fallible step
+        // of this frame is behind us.
+        let timeline = Timeline::new(stream_count);
         Ok(Self {
-            sink,
+            sink: sink.take(),
             infos,
             streams,
             stream_time_bases,
-            timeline: Timeline::new(stream_count),
+            timeline,
             pending_error: None,
             scratch: Vec::new(),
             phase: Phase::Collected,

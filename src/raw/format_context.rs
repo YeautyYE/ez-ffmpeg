@@ -134,6 +134,16 @@ impl FormatContext {
     pub(crate) unsafe fn as_ptr(&self) -> *mut AVFormatContext {
         self.ptr
     }
+
+    /// Whether this context tears down through a custom-IO path — i.e. its
+    /// `pb` is a user-supplied AVIO callback context rather than an
+    /// FFmpeg-opened file. Lets IO-adjacent policy (e.g. whether a size
+    /// probe may reach a user seek callback) branch on the same
+    /// discriminant the teardown already trusts.
+    #[inline]
+    pub(crate) fn is_custom_io(&self) -> bool {
+        matches!(self.mode, Mode::InputCustomIo | Mode::OutputCustomIo)
+    }
 }
 
 impl Drop for FormatContext {
