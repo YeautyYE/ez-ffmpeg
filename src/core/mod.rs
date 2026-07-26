@@ -530,8 +530,8 @@ static INIT_FFMPEG: std::sync::Once = std::sync::Once::new();
 
 extern "C" fn cleanup() {
     let _ = std::panic::catch_unwind(|| {
+        hwaccel::hw_device_free_all();
         unsafe {
-            hwaccel::hw_device_free_all();
             ffmpeg_sys_next::avformat_network_deinit();
         }
 
@@ -735,6 +735,7 @@ unsafe extern "C" fn ffmpeg_log_callback(
 }
 
 fn initialize_ffmpeg() {
+    let mut first_init = false;
     INIT_FFMPEG.call_once(|| {
         unsafe {
             libc::atexit(cleanup as extern "C" fn());
@@ -742,6 +743,13 @@ fn initialize_ffmpeg() {
             ffmpeg_sys_next::avformat_network_init();
             ffmpeg_sys_next::av_log_set_callback(Some(ffmpeg_log_callback));
         }
-        log::info!("FFmpeg initialized.");
+        first_init = true;
     });
+    // Log AFTER call_once: a panicking logger backend must not poison the
+    // Once (which would permanently fail every later FFmpeg entry point),
+    // and a logger that re-enters this crate must not deadlock the
+    // initializer. Same emit-outside-the-lock policy as ffmpeg_log_callback.
+    if first_init {
+        log::info!("FFmpeg initialized.");
+    }
 }
