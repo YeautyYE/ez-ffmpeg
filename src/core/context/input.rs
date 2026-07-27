@@ -1012,6 +1012,12 @@ impl Input {
     /// Common values might include `"cuda"`, `"vaapi"`, `"dxva2"`, `"videotoolbox"`, etc.
     /// Whether it works depends on your FFmpeg build and the hardware you have available.
     ///
+    /// The underlying device context is created on first use of a given
+    /// accel/device configuration and cached process-wide, so repeated jobs
+    /// in a long-running service reuse the context instead of
+    /// re-initializing the driver per job (the cache is bounded; see the
+    /// [`hwaccel`](crate::hwaccel) module docs for the eviction policy).
+    ///
     /// # Parameters
     /// - `hwaccel_name`: A string naming the hardware accel to use.
     ///
