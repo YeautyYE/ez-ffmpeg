@@ -46,6 +46,14 @@ impl<T> ObjPool<T> {
         (self.unref_fn)(&mut obj);
         self.queue.push(obj);
     }
+
+    /// Number of idle objects currently parked in the pool. Test-only probe:
+    /// release-vs-free assertions must not rely on pointer equality, which
+    /// allocator address reuse can satisfy coincidentally.
+    #[cfg(test)]
+    pub(crate) fn idle_count(&self) -> usize {
+        self.queue.len()
+    }
 }
 
 impl<T> Clone for ObjPool<T> {

@@ -714,22 +714,54 @@ fn fix_sub_duration_heartbeat(_dp_arc: Arc<Mutex<DecoderParameter>>, _signal_pts
     0
 }
 
+/// Whether a fan-out destination has already finished. Flags are set-once by
+/// `filter_task`'s `filter_receive_finish` (they only ever go false -> true).
+/// An empty list (plain `add_dst` frame-sink destinations, whose
+/// `fg_input_index` is `usize::MAX`) never finishes.
+fn dst_finished(fg_input_index: usize, finished_flag_list: &[AtomicBool]) -> bool {
+    !finished_flag_list.is_empty()
+        && fg_input_index < finished_flag_list.len()
+        && finished_flag_list[fg_input_index].load(Ordering::Acquire)
+}
+
 unsafe fn dec_send(
     mut frame_box: FrameBox,
     frame_pool: &ObjPool<Frame>,
     senders: &Vec<(Sender<FrameBox>, usize, Arc<[AtomicBool]>)>,
 ) -> crate::error::Result<()> {
-    let mut nb_done = 0;
-    for (i, (sender, fg_input_index, finished_flag_list)) in senders.iter().enumerate() {
-        if !finished_flag_list.is_empty()
-            && *fg_input_index < finished_flag_list.len()
-            && finished_flag_list[*fg_input_index].load(Ordering::Acquire)
-        {
-            nb_done += 1;
-            continue;
-        }
-        if i < senders.len() - 1 {
+    // Move the original to the last LIVE destination instead of a fixed last
+    // index: if the last-indexed destination has finished, the pooled shell
+    // would never be moved onward and Drop (Frame::drop -> av_frame_free)
+    // would destroy one shell per frame, so the next get() re-allocates
+    // (ffapi-05). Flags are set-once, so a destination observed finished here
+    // stays finished. The last-live receiver gets the moved original where
+    // the old loop may have handed it a ref-clone — identical bytes either
+    // way, and the clone arm's allocation-failure exits cannot occur for a
+    // move. Every early exit below recycles its shells instead of dropping
+    // them; error identities are unchanged.
+    let Some(last_live) = senders
+        .iter()
+        .rposition(|(_, fg_input_index, finished_flag_list)| {
+            !dst_finished(*fg_input_index, finished_flag_list)
+        })
+    else {
+        frame_pool.release(frame_box.frame);
+        return Err(Error::EOF);
+    };
+
+    // Senders past last_live were observed finished during the scan; set-once
+    // flags mean the per-iteration skip below would count exactly each of them.
+    let mut nb_done = senders.len() - 1 - last_live;
+    for (i, (sender, fg_input_index, finished_flag_list)) in
+        senders[..=last_live].iter().enumerate()
+    {
+        if i < last_live {
+            if dst_finished(*fg_input_index, finished_flag_list) {
+                nb_done += 1;
+                continue;
+            }
             let Ok(mut to_send) = frame_pool.get() else {
+                frame_pool.release(frame_box.frame);
                 return Err(Decoding(DecodingOperationError::FrameAllocationError(
                     DecodingError::OutOfMemory,
                 )));
@@ -743,6 +775,8 @@ unsafe fn dec_send(
             if !(*frame_box.frame.as_ptr()).buf[0].is_null() {
                 let ret = av_frame_ref(to_send.as_mut_ptr(), frame_box.frame.as_ptr());
                 if ret < 0 {
+                    frame_pool.release(to_send);
+                    frame_pool.release(frame_box.frame);
                     return Err(Decoding(DecodingOperationError::FrameRefError(
                         DecodingError::OutOfMemory,
                     )));
@@ -750,6 +784,8 @@ unsafe fn dec_send(
             } else {
                 let ret = av_frame_copy_props(to_send.as_mut_ptr(), frame_box.frame.as_ptr());
                 if ret < 0 {
+                    frame_pool.release(to_send);
+                    frame_pool.release(frame_box.frame);
                     return Err(Decoding(DecodingOperationError::FrameCopyPropsError(
                         DecodingError::OutOfMemory,
                     )));
@@ -760,17 +796,26 @@ unsafe fn dec_send(
                 frame: to_send,
                 frame_data,
             };
-            if let Err(_) = sender.send(frame_box) {
+            if let Err(err) = sender.send(frame_box) {
                 debug!("Decoder send frame failed, destination already finished");
                 nb_done += 1;
+                frame_pool.release(err.into_inner().frame);
                 continue;
             }
         } else {
+            // The flag may have been set since the scan; this is the same
+            // loop-top skip the pre-last arm takes, plus the shell recycle.
+            if dst_finished(*fg_input_index, finished_flag_list) {
+                nb_done += 1;
+                frame_pool.release(frame_box.frame);
+                break;
+            }
             frame_box.frame_data.fg_input_index = *fg_input_index;
 
-            if let Err(_) = sender.send(frame_box) {
+            if let Err(err) = sender.send(frame_box) {
                 debug!("Decoder send frame failed, destination already finished");
                 nb_done += 1;
+                frame_pool.release(err.into_inner().frame);
             }
             break;
         }
@@ -1929,9 +1974,15 @@ unsafe fn audio_samplerate_update(
 mod tests {
     use super::build_decoder_opts;
     use super::{dec_frame_to_box, dec_open, get_format_callback, DecoderParameter};
-    use super::{decode_stall_limit, DecodeErrorBudget};
+    use super::{dec_send, decode_stall_limit, DecodeErrorBudget};
     use crate::core::context::ffmpeg_context::FfmpegContext;
     use crate::core::context::input::Input;
+    use crate::core::context::obj_pool::ObjPool;
+    use crate::core::context::{FrameBox, FrameData};
+    use crate::core::scheduler::ffmpeg_scheduler::{frame_is_null, unref_frame};
+    use crate::error::{DecodingError, DecodingOperationError, Error};
+    use ffmpeg_next::Frame;
+    use ffmpeg_sys_next::av_frame_alloc;
     use ffmpeg_sys_next::AVMediaType::AVMEDIA_TYPE_VIDEO;
     use ffmpeg_sys_next::{
         av_dict_count, av_dict_get, AVCodecID, AVPixelFormat, AV_DICT_MATCH_CASE, FF_THREAD_FRAME,
@@ -1939,6 +1990,7 @@ mod tests {
     };
     use std::collections::HashMap;
     use std::ffi::{CStr, CString};
+    use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
 
     // Ownership-invariant test (NOT a race repro): pins that `opaque` is a
@@ -2279,5 +2331,192 @@ mod tests {
             guard.remove(&CString::new("threads").unwrap());
         }
         assert_eq!(guard.leftover_keys(), vec!["no_such_opt".to_string()]);
+    }
+
+    fn test_new_frame() -> crate::error::Result<Frame> {
+        // SAFETY: av_frame_alloc returns an owned empty frame or null; null-check
+        // it (extreme OOM) before wrapping so no null frame is dereferenced later.
+        let f = unsafe { av_frame_alloc() };
+        assert!(!f.is_null(), "av_frame_alloc must not fail");
+        Ok(unsafe { Frame::wrap(f) })
+    }
+
+    // A minimal decoded-frame box plus the raw shell pointer, so tests can
+    // assert move-vs-clone by pointer equality. The empty frame (buf[0] null)
+    // drives the props-only clone branch, which needs no pixel buffers.
+    fn test_frame_box() -> (FrameBox, *const ffmpeg_sys_next::AVFrame) {
+        let frame = test_new_frame().expect("frame");
+        let ptr = unsafe { frame.as_ptr() };
+        (
+            FrameBox {
+                frame,
+                frame_data: FrameData {
+                    framerate: None,
+                    bits_per_raw_sample: 0,
+                    input_stream_width: 0,
+                    input_stream_height: 0,
+                    subtitle_header: None,
+                    fg_input_index: usize::MAX,
+                    side_data: None,
+                },
+            },
+            ptr,
+        )
+    }
+
+    // dec_send used to move the pooled original only to the FIXED last sender
+    // index: with that destination flag-finished, the original was never moved
+    // onward — the earlier live sender got an av_frame_ref clone and the
+    // original shell died via Drop (av_frame_free) instead of returning to the
+    // pool, one shell per frame. Pin the last-LIVE selection: the original
+    // (pointer equality) must reach the live sender and the call returns Ok.
+    #[test]
+    fn dec_send_moves_the_original_to_the_last_live_sender() {
+        let (tx0, rx0) = crossbeam_channel::unbounded::<FrameBox>();
+        let (tx1, rx1) = crossbeam_channel::unbounded::<FrameBox>();
+        let flags: Arc<[AtomicBool]> =
+            Arc::from(vec![AtomicBool::new(false), AtomicBool::new(true)]);
+        let senders = vec![(tx0, 0usize, flags.clone()), (tx1, 1usize, flags)];
+        let pool = ObjPool::new(0, test_new_frame, unref_frame, frame_is_null).expect("pool");
+
+        let (frame_box, original) = test_frame_box();
+        // SAFETY: frame_box wraps a valid empty AVFrame and the pool allocates
+        // valid clone shells; dec_send only dereferences these.
+        let result = unsafe { dec_send(frame_box, &pool, &senders) };
+        assert!(result.is_ok(), "one destination is still live");
+
+        let got = rx0.try_recv().expect("the live sender must receive a frame");
+        assert_eq!(
+            // SAFETY: got.frame is the frame dec_send just delivered.
+            unsafe { got.frame.as_ptr() },
+            original,
+            "the last LIVE sender must receive the moved original, not a clone"
+        );
+        assert_eq!(got.frame_data.fg_input_index, 0);
+        assert!(
+            rx1.try_recv().is_err(),
+            "the finished destination must receive nothing"
+        );
+    }
+
+    // All destinations finished: dec_send reports EOF and must recycle the
+    // never-sent shell instead of letting Drop free it. With a zero-seeded
+    // pool the only way get() can return the original pointer is the release
+    // on the no-live path.
+    #[test]
+    fn dec_send_recycles_the_shell_when_all_destinations_finished() {
+        let (tx0, _rx0) = crossbeam_channel::unbounded::<FrameBox>();
+        let flags: Arc<[AtomicBool]> = Arc::from(vec![AtomicBool::new(true)]);
+        let senders = vec![(tx0, 0usize, flags)];
+        let pool = ObjPool::new(0, test_new_frame, unref_frame, frame_is_null).expect("pool");
+
+        let (frame_box, original) = test_frame_box();
+        // SAFETY: as in dec_send_moves_the_original_to_the_last_live_sender.
+        let result = unsafe { dec_send(frame_box, &pool, &senders) };
+        assert!(matches!(result, Err(Error::EOF)));
+
+        // Depth first: pointer equality alone could be satisfied by the
+        // allocator reusing a freed address, but a zero-seeded pool holding
+        // one idle shell proves the release ran.
+        assert_eq!(pool.idle_count(), 1, "the unsent shell must be parked");
+        let recycled = pool.get().expect("pool get");
+        assert_eq!(
+            // SAFETY: recycled came from the pool alive.
+            unsafe { recycled.as_ptr() },
+            original,
+            "the unsent shell must go back to the pool, not through av_frame_free"
+        );
+    }
+
+    // Both SendError arms (receiver gone but flag not yet set) must recycle
+    // the undelivered box and keep the nb_done accounting: a failed clone send
+    // still returns Ok while a live sender remains, and a failed send to the
+    // last live sender with a finished tail still reports EOF.
+    #[test]
+    fn dec_send_send_error_recycles_the_undelivered_box() {
+        // Clone arm: destination 0 is live by flags but its receiver is gone.
+        let (tx0, rx0) = crossbeam_channel::unbounded::<FrameBox>();
+        let (tx1, rx1) = crossbeam_channel::unbounded::<FrameBox>();
+        drop(rx0);
+        let no_flags: Arc<[AtomicBool]> = Arc::from(Vec::<AtomicBool>::new());
+        let senders = vec![(tx0, 0usize, no_flags.clone()), (tx1, 0usize, no_flags)];
+
+        // Zero-seeded pool primed with one known shell: the clone path pops
+        // it, and the SendError arm must push it back.
+        let pool = ObjPool::new(0, test_new_frame, unref_frame, frame_is_null).expect("pool");
+        let shell = test_new_frame().expect("frame");
+        // SAFETY: shell is the valid frame just allocated above.
+        let shell_ptr = unsafe { shell.as_ptr() };
+        pool.release(shell);
+
+        let (frame_box, original) = test_frame_box();
+        // SAFETY: as in dec_send_moves_the_original_to_the_last_live_sender.
+        let result = unsafe { dec_send(frame_box, &pool, &senders) };
+        assert!(result.is_ok(), "the last live destination took the frame");
+
+        let got = rx1.try_recv().expect("the live sender must receive a frame");
+        // SAFETY: got.frame is the frame dec_send just delivered.
+        assert_eq!(unsafe { got.frame.as_ptr() }, original);
+        assert_eq!(pool.idle_count(), 1, "the undelivered clone must be parked");
+        let recycled = pool.get().expect("pool get");
+        assert_eq!(
+            // SAFETY: recycled came from the pool alive.
+            unsafe { recycled.as_ptr() },
+            shell_ptr,
+            "the undelivered clone must be recycled, not freed"
+        );
+
+        // Last-live arm: the only live sender's receiver is gone and the
+        // other destination is flag-finished — the pre-counted tail must keep
+        // nb_done == len so the EOF verdict is preserved, and the returned
+        // original goes back to the pool.
+        let (tx2, rx2) = crossbeam_channel::unbounded::<FrameBox>();
+        let (tx3, _rx3) = crossbeam_channel::unbounded::<FrameBox>();
+        drop(rx2);
+        let flags: Arc<[AtomicBool]> =
+            Arc::from(vec![AtomicBool::new(false), AtomicBool::new(true)]);
+        let senders = vec![(tx2, 0usize, flags.clone()), (tx3, 1usize, flags)];
+        let pool = ObjPool::new(0, test_new_frame, unref_frame, frame_is_null).expect("pool");
+
+        let (frame_box, original) = test_frame_box();
+        // SAFETY: as above.
+        let result = unsafe { dec_send(frame_box, &pool, &senders) };
+        assert!(matches!(result, Err(Error::EOF)));
+        assert_eq!(pool.idle_count(), 1, "the returned original must be parked");
+        let recycled = pool.get().expect("pool get");
+        // SAFETY: recycled came from the pool alive.
+        assert_eq!(unsafe { recycled.as_ptr() }, original);
+    }
+
+    // Allocation failure while cloning for an earlier live sender must
+    // recycle the original before surfacing the error — the old code let
+    // Drop free it. A zero-seeded pool whose create_fn always fails drives
+    // the path deterministically.
+    #[test]
+    fn dec_send_clone_alloc_failure_recycles_the_original() {
+        fn failing_new_frame() -> crate::error::Result<Frame> {
+            Err(Error::Decoding(
+                DecodingOperationError::FrameAllocationError(DecodingError::OutOfMemory),
+            ))
+        }
+        let (tx0, _rx0) = crossbeam_channel::unbounded::<FrameBox>();
+        let (tx1, _rx1) = crossbeam_channel::unbounded::<FrameBox>();
+        let no_flags: Arc<[AtomicBool]> = Arc::from(Vec::<AtomicBool>::new());
+        let senders = vec![(tx0, 0usize, no_flags.clone()), (tx1, 0usize, no_flags)];
+        let pool = ObjPool::new(0, failing_new_frame, unref_frame, frame_is_null).expect("pool");
+
+        let (frame_box, original) = test_frame_box();
+        // SAFETY: as in dec_send_moves_the_original_to_the_last_live_sender.
+        let result = unsafe { dec_send(frame_box, &pool, &senders) };
+        assert!(matches!(
+            result,
+            Err(Error::Decoding(
+                DecodingOperationError::FrameAllocationError(_)
+            ))
+        ));
+        assert_eq!(pool.idle_count(), 1, "the original must be parked, not freed");
+        let recycled = pool.get().expect("pool holds the recycled original");
+        // SAFETY: recycled came from the pool alive.
+        assert_eq!(unsafe { recycled.as_ptr() }, original);
     }
 }
