@@ -116,6 +116,9 @@ pub(crate) fn dec_init(
     let dp = DecoderParameter::new(dec_stream);
     let dp_arc = Arc::new(Mutex::new(dp));
     let dec_ctx = dec_open(dp_arc.clone(), dec_stream, null_mut())?;
+    // dec_open wrote subtitle_header before the worker spawns and nothing
+    // mutates it afterwards, so per-frame boxing must not need the mutex.
+    let subtitle_header = dp_arc.lock().unwrap().dec.subtitle_header.clone();
 
     let senders = dec_stream.take_dsts();
     let exit_on_error = exit_on_error.unwrap_or(false);
@@ -145,6 +148,7 @@ pub(crate) fn dec_init(
         packet_pool,
         dec_ctx,
         dp_arc,
+        subtitle_header,
         _thread_done: thread_done,
     };
 
@@ -202,6 +206,7 @@ pub(crate) fn dec_init(
 
                     if let Err(e) = packet_decode(
                         &resources.dp_arc,
+                        &resources.subtitle_header,
                         resources.dec_ctx.as_mut_ptr(),
                         exit_on_error,
                         packet_box,
@@ -263,8 +268,11 @@ pub(crate) fn dec_init(
                             };
                             (*frame.as_mut_ptr()).time_base = dp.last_frame_tb;
                         }
-                        let frame_box =
-                            dec_frame_to_box(&resources.dp_arc, resources.dec_ctx.as_ptr(), frame);
+                        let frame_box = dec_frame_to_box(
+                            &resources.subtitle_header,
+                            resources.dec_ctx.as_ptr(),
+                            frame,
+                        );
                         if let Err(e) = dec_send(frame_box, &resources.frame_pool, &resources.senders)
                         {
                             if e != Error::EOF {
@@ -301,7 +309,11 @@ pub(crate) fn dec_init(
                 }
             }
 
-            dec_done(&resources.dp_arc, resources.dec_ctx.as_ptr(), &resources.senders);
+            dec_done(
+                &resources.subtitle_header,
+                resources.dec_ctx.as_ptr(),
+                &resources.senders,
+            );
 
             // `resources` tears down at scope end (normal and unwind alike):
             // channels, then the codec context (joining FFmpeg's workers and
@@ -356,6 +368,8 @@ pub(crate) fn dec_init(
 ///   outlive the slot release.
 /// - `dec_ctx` before `dp_arc`: freeing the context joins FFmpeg's workers,
 ///   so no callback can dereference `opaque` once the Arc becomes droppable.
+/// - `subtitle_header`: an owned copy (see `Decoder::subtitle_header`) with no
+///   teardown-order interaction.
 /// - `_thread_done` last: the slot is released only after the full teardown.
 struct DecWorkerResources {
     senders: Vec<(Sender<FrameBox>, usize, Arc<[AtomicBool]>)>,
@@ -364,12 +378,15 @@ struct DecWorkerResources {
     packet_pool: ObjPool<Packet>,
     dec_ctx: CodecContext,
     dp_arc: Arc<Mutex<DecoderParameter>>,
+    subtitle_header: Option<Arc<[u8]>>,
     _thread_done: ThreadDoneGuard,
 }
 
 #[cfg(docsrs)]
+#[allow(clippy::too_many_arguments)] // internal worker-loop call; a params struct only adds ceremony
 unsafe fn transcode_subtitles(
     dp_arc: &Arc<Mutex<DecoderParameter>>,
+    subtitle_header: &Option<Arc<[u8]>>,
     dec_ctx: *mut AVCodecContext,
     exit_on_error: bool,
     packet_box: PacketBox,
@@ -381,8 +398,10 @@ unsafe fn transcode_subtitles(
 }
 
 #[cfg(not(docsrs))]
+#[allow(clippy::too_many_arguments)] // internal worker-loop call; a params struct only adds ceremony
 unsafe fn transcode_subtitles(
     dp_arc: &Arc<Mutex<DecoderParameter>>,
+    subtitle_header: &Option<Arc<[u8]>>,
     dec_ctx: *mut AVCodecContext,
     exit_on_error: bool,
     mut packet_box: PacketBox,
@@ -404,7 +423,7 @@ unsafe fn transcode_subtitles(
         (*frame.as_mut_ptr()).time_base = (*packet_box.packet.as_ptr()).time_base;
         (*frame.as_mut_ptr()).opaque = PacketOpaque::PktOpaqueSubHeartbeat as i32 as *mut c_void;
 
-        let frame_box = dec_frame_to_box(dp_arc, dec_ctx, frame);
+        let frame_box = dec_frame_to_box(subtitle_header, dec_ctx, frame);
 
         let result = dec_send(frame_box, frame_pool, senders);
         packet_pool.release(packet_box.packet);
@@ -503,11 +522,11 @@ unsafe fn transcode_subtitles(
     (*frame.as_mut_ptr()).height = (*dec_ctx).height;
     std::mem::drop(dp);
 
-    process_subtitle(dp_arc, dec_ctx, frame, frame_pool, senders)
+    process_subtitle(subtitle_header, dec_ctx, frame, frame_pool, senders)
 }
 
 unsafe fn process_subtitle(
-    dp_arc: &Arc<Mutex<DecoderParameter>>,
+    subtitle_header: &Option<Arc<[u8]>>,
     dec_ctx: *const AVCodecContext,
     frame: Frame,
     frame_pool: &ObjPool<Frame>,
@@ -527,7 +546,7 @@ unsafe fn process_subtitle(
         return Ok(());
     }
 
-    let frame_box = dec_frame_to_box(dp_arc, dec_ctx, frame);
+    let frame_box = dec_frame_to_box(subtitle_header, dec_ctx, frame);
 
     match dec_send(frame_box, frame_pool, senders) {
         Ok(_) => Ok(()),
@@ -765,12 +784,10 @@ unsafe fn dec_send(
 }
 
 unsafe fn dec_frame_to_box(
-    dp_arc: &Arc<Mutex<DecoderParameter>>,
+    subtitle_header: &Option<Arc<[u8]>>,
     dec_ctx: *const AVCodecContext,
     frame: Frame,
 ) -> FrameBox {
-    let dp = dp_arc.lock().unwrap();
-
     FrameBox {
         frame,
         frame_data: FrameData {
@@ -778,7 +795,7 @@ unsafe fn dec_frame_to_box(
             bits_per_raw_sample: (*dec_ctx).bits_per_raw_sample,
             input_stream_width: (*dec_ctx).width,
             input_stream_height: (*dec_ctx).height,
-            subtitle_header: dp.dec.subtitle_header.clone(),
+            subtitle_header: subtitle_header.clone(),
             fg_input_index: usize::MAX,
             side_data: None,
         },
@@ -885,8 +902,7 @@ fn dec_open(
         (*dec_ctx).opaque = Arc::as_ptr(&dp_arc) as *mut libc::c_void;
 
         {
-            let dp_arc_clone = dp_arc.clone();
-            let mut dp = dp_arc_clone.lock().unwrap();
+            let mut dp = dp_arc.lock().unwrap();
             ret = hw_device_setup_for_decode(&mut dp, dec_stream.codec.as_ptr(), dec_ctx);
             if ret < 0 {
                 error!(
@@ -940,8 +956,7 @@ fn dec_open(
         (*dec_ctx).flags |= AV_CODEC_FLAG_COPY_OPAQUE as i32;
         // we apply cropping outselves
         {
-            let dp_arc_clone = dp_arc.clone();
-            let mut dp = dp_arc_clone.lock().unwrap();
+            let mut dp = dp_arc.lock().unwrap();
             dp.apply_cropping = (*dec_ctx).apply_cropping;
         }
         (*dec_ctx).apply_cropping = 0;
@@ -971,8 +986,7 @@ fn dec_open(
         }
 
         {
-            let dp_arc_clone = dp_arc.clone();
-            let mut dp = dp_arc_clone.lock().unwrap();
+            let mut dp = dp_arc.lock().unwrap();
             // Own a copy of the subtitle header: dec_ctx (and the buffer it
             // points to) is freed when the decoder exits, while encoders read
             // the header later (matches ffmpeg_dec.c owning its own copy).
@@ -1333,7 +1347,7 @@ struct Decoder {
 }
 
 fn dec_done(
-    dp_arc: &Arc<Mutex<DecoderParameter>>,
+    subtitle_header: &Option<Arc<[u8]>>,
     dec_ctx: *const AVCodecContext,
     senders: &Vec<(Sender<FrameBox>, usize, Arc<[AtomicBool]>)>,
 ) {
@@ -1345,7 +1359,7 @@ fn dec_done(
             continue;
         }
 
-        let mut frame_box = unsafe { dec_frame_to_box(dp_arc, dec_ctx, null_frame()) };
+        let mut frame_box = unsafe { dec_frame_to_box(subtitle_header, dec_ctx, null_frame()) };
         frame_box.frame_data.fg_input_index = *fg_input_index;
         if let Err(_) = sender.send(frame_box) {
             debug!("Decoder send EOF failed, destination already finished");
@@ -1468,6 +1482,7 @@ impl DecodeErrorBudget {
 #[allow(clippy::too_many_arguments)] // internal worker-loop call; a params struct only adds ceremony
 unsafe fn packet_decode(
     dp_arc: &Arc<Mutex<DecoderParameter>>,
+    subtitle_header: &Option<Arc<[u8]>>,
     dec_ctx: *mut AVCodecContext,
     exit_on_error: bool,
     packet_box: PacketBox,
@@ -1479,6 +1494,7 @@ unsafe fn packet_decode(
     if !dec_ctx.is_null() && (*dec_ctx).codec_type == AVMEDIA_TYPE_SUBTITLE {
         return transcode_subtitles(
             dp_arc,
+            subtitle_header,
             dec_ctx,
             exit_on_error,
             packet_box,
@@ -1525,8 +1541,7 @@ unsafe fn packet_decode(
 
         packet_pool.release(packet_box.packet);
         if ret != AVERROR_EOF {
-            let dp = dp_arc.clone();
-            let mut dp = dp.lock().unwrap();
+            let mut dp = dp_arc.lock().unwrap();
             dp.dec.decode_errors += 1;
             if !exit_on_error {
                 return Ok(());
@@ -1580,8 +1595,7 @@ unsafe fn packet_decode(
         } else if ret < 0 {
             error!("Decoding error: {}", av_err2str(ret));
             {
-                let dp = dp_arc.clone();
-                let mut dp = dp.lock().unwrap();
+                let mut dp = dp_arc.lock().unwrap();
                 dp.dec.decode_errors += 1;
             }
             frame_pool.release(frame);
@@ -1616,7 +1630,7 @@ unsafe fn packet_decode(
             }
         }
 
-        let mut frame_box = dec_frame_to_box(dp_arc, dec_ctx, frame);
+        let mut frame_box = dec_frame_to_box(subtitle_header, dec_ctx, frame);
         // fdemux_parameter.dec.pts                 = (*frame).pts;
         // fdemux_parameter.dec.tb                  = dec->pkt_timebase;
         // fdemux_parameter.dec.frame_num           = dec->frame_num - 1;
@@ -1624,10 +1638,9 @@ unsafe fn packet_decode(
         (*frame_box.frame.as_mut_ptr()).time_base = (*dec_ctx).pkt_timebase;
 
         if (*dec_ctx).codec_type == AVMEDIA_TYPE_AUDIO {
-            let dp = dp_arc.clone();
-            let mut dp = dp.lock().unwrap();
+            let mut dp = dp_arc.lock().unwrap();
             dp.dec.samples_decoded += (*frame_box.frame.as_ptr()).nb_samples as u64;
-
+            dp.dec.frames_decoded += 1;
             audio_ts_process(dp, frame_box.frame.as_mut_ptr());
         } else if let Err(e) = video_frame_process(
             dp_arc,
@@ -1638,12 +1651,6 @@ unsafe fn packet_decode(
         ) {
             error!("Error while processing the decoded data");
             return Err(e);
-        }
-
-        {
-            let dp = dp_arc.clone();
-            let mut dp = dp.lock().unwrap();
-            dp.dec.frames_decoded += 1;
         }
 
         if let Err(e) = dec_send(frame_box, frame_pool, senders) {
@@ -1717,6 +1724,9 @@ unsafe fn video_frame_process(
     if !(*frame).opaque.is_null() {
         *outputs_mask = (*frame).opaque as usize;
     }
+
+    // Counted only after every fallible step above has succeeded.
+    dp.dec.frames_decoded += 1;
 
     Ok(())
 }
@@ -1918,7 +1928,7 @@ unsafe fn audio_samplerate_update(
 #[cfg(all(test, not(docsrs)))]
 mod tests {
     use super::build_decoder_opts;
-    use super::{dec_open, get_format_callback, DecoderParameter};
+    use super::{dec_frame_to_box, dec_open, get_format_callback, DecoderParameter};
     use super::{decode_stall_limit, DecodeErrorBudget};
     use crate::core::context::ffmpeg_context::FfmpegContext;
     use crate::core::context::input::Input;
@@ -2019,6 +2029,57 @@ mod tests {
             .expect("DecoderParameter must still be alive and unpoisoned");
         drop(_guard);
 
+        drop(ffctx);
+    }
+
+    // Boxing a frame consults only the init-time snapshot, never
+    // DecoderParameter: a synthetic header must round-trip byte-for-byte
+    // into the FrameBox.
+    #[test]
+    fn dec_frame_to_box_carries_the_snapshot_header() {
+        // dec_open consults the process-global device registry even for
+        // HwaccelNone: serialize with the snapshot/sentinel registry tests.
+        let _registry = crate::hwaccel::HW_REGISTRY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let mut ffctx = FfmpegContext::new(
+            vec![Input::from("test.mp4").set_video_codec_opt("threads", "1")],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+        let demuxer = &mut ffctx.demuxs[0];
+        let dec_stream = demuxer
+            .get_streams_mut()
+            .iter_mut()
+            .find(|s| s.codec_type == AVMEDIA_TYPE_VIDEO)
+            .expect("test.mp4 must contain a video stream");
+
+        let dp = DecoderParameter::new(dec_stream);
+        let dp_arc = Arc::new(Mutex::new(dp));
+        let dec_ctx = dec_open(Arc::clone(&dp_arc), dec_stream, std::ptr::null_mut())
+            .expect("opening the decoder must succeed");
+
+        let subtitle_header: Option<Arc<[u8]>> = Some(Arc::from(*b"hdr"));
+        // SAFETY: dec_ctx is the open decoder context owned above; the null
+        // frame mirrors dec_done's EOF boxing.
+        let frame_box = unsafe {
+            dec_frame_to_box(
+                &subtitle_header,
+                dec_ctx.as_ptr(),
+                crate::core::context::null_frame(),
+            )
+        };
+        assert_eq!(
+            frame_box.frame_data.subtitle_header.as_deref(),
+            Some(b"hdr".as_slice()),
+            "the FrameBox must carry the exact snapshot bytes"
+        );
+
+        drop(frame_box);
+        drop(dec_ctx);
         drop(ffctx);
     }
 
