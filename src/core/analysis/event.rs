@@ -14,14 +14,14 @@ use std::ffi::CStr;
 
 // ---- lavfi metadata keys (verified against FFmpeg n7.1) --------------------
 
-const BLACK_START: &str = "lavfi.black_start";
-const BLACK_END: &str = "lavfi.black_end";
 const SILENCE_START: &str = "lavfi.silence_start";
 const SILENCE_END: &str = "lavfi.silence_end";
 const SILENCE_DURATION: &str = "lavfi.silence_duration";
 // Hot per-frame lavfi keys as `&CStr` literals so lookups can call
 // `av_dict_get` directly (see `dict_get`), avoiding the `CString::new` heap
 // allocation `DictionaryRef::get` performs on every call.
+const BLACK_START: &CStr = c"lavfi.black_start";
+const BLACK_END: &CStr = c"lavfi.black_end";
 const SCD_SCORE: &CStr = c"lavfi.scd.score";
 const SCD_TIME: &CStr = c"lavfi.scd.time";
 const CROP_X: &CStr = c"lavfi.cropdetect.x";
@@ -255,11 +255,11 @@ pub(crate) fn parse_frame_metadata(
 }
 
 fn parse_black(md: &DictionaryRef<'_>, out: &mut Vec<MetadataEvent>, state: &mut ParseState) {
-    if let Some(at) = md.get(BLACK_START).and_then(parse_secs) {
+    if let Some(at) = dict_get(md, BLACK_START).and_then(parse_secs) {
         state.pending_black_start = Some(at.time_us);
         out.push(MetadataEvent::BlackStart { at });
     }
-    if let Some(at) = md.get(BLACK_END).and_then(parse_secs) {
+    if let Some(at) = dict_get(md, BLACK_END).and_then(parse_secs) {
         let duration_us = state
             .pending_black_start
             .take()
