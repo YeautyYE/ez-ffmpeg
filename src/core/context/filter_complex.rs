@@ -72,6 +72,15 @@ impl FilterComplex {
     /// Assigns a hardware device for this filter complex, enabling GPU-accelerated
     /// or device-specific filtering.
     ///
+    /// The named device is created (or reused) when the job starts, through
+    /// the process-global device cache described in the
+    /// [`hwaccel`](crate::hwaccel) module docs. It also settles the
+    /// process-wide filter device: that slot is initialized at most once per
+    /// process — concurrent first initializations race and the winner
+    /// settles it, even when its own initialization fails — and attempts
+    /// after settlement have no effect. Repeated calls to this setter before
+    /// the job starts simply replace the builder value.
+    ///
     /// # Parameters
     /// * `hw_device` - A `String` specifying the hardware device name or identifier
     ///   recognized by FFmpeg (e.g., `"cuda"`, `"vaapi"`, `"dxva2"`, etc.).
