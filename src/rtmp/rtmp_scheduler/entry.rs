@@ -269,7 +269,9 @@ impl RtmpScheduler {
         connection_id: usize,
         bytes: &[u8],
     ) -> Result<Vec<ServerResult>, SchedulerError> {
-        self.bytes_received_with_backlog(connection_id, bytes, 0)
+        let mut server_results = Vec::new();
+        self.bytes_received_with_backlog(connection_id, bytes, 0, &mut server_results)?;
+        Ok(server_results)
     }
 
     /// Like `bytes_received`, but told the connection's current write-queue
@@ -277,17 +279,27 @@ impl RtmpScheduler {
     /// against the bytes already queued ahead of it (see
     /// `serving_connection_backlog_bytes`). The reactor supplies the real value;
     /// the plain `bytes_received` wrapper passes 0.
+    ///
+    /// Results are APPENDED to `server_results`; the caller must pass a cleared
+    /// buffer (the reactor reuses one across batches). The same-batch
+    /// join-replay prefix cursor counts entries from index 0, so pre-existing
+    /// entries would inflate the join-burst prefix accounting.
     pub(in crate::rtmp) fn bytes_received_with_backlog(
         &mut self,
         connection_id: usize,
         bytes: &[u8],
         connection_backlog_bytes: usize,
-    ) -> Result<Vec<ServerResult>, SchedulerError> {
+        server_results: &mut Vec<ServerResult>,
+    ) -> Result<(), SchedulerError> {
+        debug_assert!(
+            server_results.is_empty(),
+            "results buffer must be cleared before each batch: the same-batch \
+             join-replay prefix cursor counts entries from index 0"
+        );
         self.serving_connection_backlog_bytes = connection_backlog_bytes;
         // Reset the same-batch join-replay prefix cursor for this input batch.
         self.serving_prefix_scan_pos = 0;
         self.serving_prefix_bytes = 0;
-        let mut server_results = Vec::new();
 
         // Single lookup, copied out at once: handle_session_results below
         // needs &mut self, so a held map borrow would not compile — and the
@@ -301,11 +313,7 @@ impl RtmpScheduler {
                     Err(error) => return Err(error.into()),
                 };
 
-                self.handle_session_results(
-                    connection_id,
-                    initial_session_results,
-                    &mut server_results,
-                );
+                self.handle_session_results(connection_id, initial_session_results, server_results);
                 let client = Client {
                     session,
                     connection_id,
@@ -328,8 +336,8 @@ impl RtmpScheduler {
             };
         }
 
-        self.handle_session_results(connection_id, client_results, &mut server_results);
-        Ok(server_results)
+        self.handle_session_results(connection_id, client_results, server_results);
+        Ok(())
     }
 
     /// Build a liveness ping (RTMP User Control `PingRequest`) for
