@@ -9,8 +9,8 @@
 //!   the chroma/bit-depth extension), and the full SPS and PPS parses
 //!   every extradata path routes each parameter-set body through;
 //! * [`AvcRuntime`] — the per-stream state machine the orchestrator drives:
-//!   payload normalization via the streaming NAL walkers (a census walk
-//!   then a write walk for Annex-B input), IDR classification, S8
+//!   payload normalization via the streaming NAL walkers (one bounded-reserve
+//!   write walk for Annex-B input), IDR classification, S8
 //!   parameter-set fingerprinting and the in-band policy.
 
 mod fingerprint;
