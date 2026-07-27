@@ -764,7 +764,7 @@ impl FfmpegScheduler<Initialization> {
                         .collect();
                     let sq_finished: Arc<[AtomicBool]> =
                         (0..av.len()).map(|_| AtomicBool::new(false)).collect();
-                    let queue = Arc::new((Mutex::new(sq), Condvar::new()));
+                    let queue = Arc::new((Mutex::new(sq), Condvar::new(), AtomicUsize::new(0)));
                     let streams = mux.get_streams_mut();
                     for (pos, sq_idx, source_finished) in members {
                         streams[pos].set_sync_queue(EncSyncHandle {
