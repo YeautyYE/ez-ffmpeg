@@ -603,42 +603,50 @@ unsafe fn ts_fixup(
     };
 
     if (*pkt).pts != AV_NOPTS_VALUE {
-        // audio decoders take precedence for estimating total file duration
-        let pkt_duration = if demux_parameter.have_audio_dec {
-            0
-        } else {
-            (*pkt).duration
-        };
-
         (*pkt).pts += duration;
 
-        // update max/min pts that will be used to compute total file duration
-        // when using -stream_loop
-        if demux_parameter.max_pts.ts == AV_NOPTS_VALUE
-            || av_compare_ts(
-                demux_parameter.max_pts.ts,
-                demux_parameter.max_pts.tb,
-                (*pkt).pts + pkt_duration,
-                (*pkt).time_base,
-            ) < 0
-        {
-            demux_parameter.max_pts = Timestamp {
-                ts: (*pkt).pts + pkt_duration,
-                tb: (*pkt).time_base,
+        // min/max pts feed only seek_to_start's loop-duration math, and
+        // seek_to_start runs only while stream_loop != 0 (it also owns the
+        // only stream_loop mutation, a decrement). Skip the two
+        // av_compare_ts calls per packet when no further loop seek can
+        // consume them. pkt_duration reads (*pkt).duration, not pts, so
+        // computing it after the pts add is value-identical.
+        if demux_parameter.stream_loop != 0 {
+            // audio decoders take precedence for estimating total file duration
+            let pkt_duration = if demux_parameter.have_audio_dec {
+                0
+            } else {
+                (*pkt).duration
             };
-        }
-        if demux_parameter.min_pts.ts == AV_NOPTS_VALUE
-            || av_compare_ts(
-                demux_parameter.min_pts.ts,
-                demux_parameter.min_pts.tb,
-                (*pkt).pts,
-                (*pkt).time_base,
-            ) > 0
-        {
-            demux_parameter.min_pts = Timestamp {
-                ts: (*pkt).pts,
-                tb: (*pkt).time_base,
-            };
+
+            // update max/min pts that will be used to compute total file duration
+            // when using -stream_loop
+            if demux_parameter.max_pts.ts == AV_NOPTS_VALUE
+                || av_compare_ts(
+                    demux_parameter.max_pts.ts,
+                    demux_parameter.max_pts.tb,
+                    (*pkt).pts + pkt_duration,
+                    (*pkt).time_base,
+                ) < 0
+            {
+                demux_parameter.max_pts = Timestamp {
+                    ts: (*pkt).pts + pkt_duration,
+                    tb: (*pkt).time_base,
+                };
+            }
+            if demux_parameter.min_pts.ts == AV_NOPTS_VALUE
+                || av_compare_ts(
+                    demux_parameter.min_pts.ts,
+                    demux_parameter.min_pts.tb,
+                    (*pkt).pts,
+                    (*pkt).time_base,
+                ) > 0
+            {
+                demux_parameter.min_pts = Timestamp {
+                    ts: (*pkt).pts,
+                    tb: (*pkt).time_base,
+                };
+            }
         }
     }
 
