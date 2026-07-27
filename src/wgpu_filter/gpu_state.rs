@@ -85,6 +85,10 @@ pub(crate) struct GpuState {
     /// bind group records the generation it was built against; a mismatch
     /// means `out_view` was recreated and the bind group must be rebuilt.
     resource_generation: u64,
+    /// Device limit snapshot: `wgpu::Device::limits()` rebuilds the whole
+    /// `Limits` struct on every call, and the per-frame size check needs
+    /// only this one constant.
+    pub(crate) max_texture_dim: u32,
 }
 
 /// Mode-specific pass inputs held by [`FrameResources`]. RGBA mode renders
@@ -666,6 +670,7 @@ impl GpuState {
         let pack_uniforms = uniform_buf("ez_pack_uniforms", 48);
 
         Ok(GpuState {
+            max_texture_dim: device.limits().max_texture_dimension_2d,
             device,
             queue,
             sampler,

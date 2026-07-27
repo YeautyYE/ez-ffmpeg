@@ -847,7 +847,7 @@ impl FrameFilter for WgpuFrameFilter {
         // thread through wgpu's uncaptured-error handler; reject oversized
         // frames here with actionable guidance instead.
         let (out_w, out_h) = self.output_size.unwrap_or((in_w, in_h));
-        let max_dim = gpu.device.limits().max_texture_dimension_2d;
+        let max_dim = gpu.max_texture_dim;
         if in_w > max_dim || in_h > max_dim || out_w > max_dim || out_h > max_dim {
             return Err(format!(
                 "Frame size {in_w}x{in_h} (output {out_w}x{out_h}) exceeds the device's \
