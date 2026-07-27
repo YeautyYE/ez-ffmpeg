@@ -87,6 +87,10 @@ pub struct MetadataEventFilter {
     policy: BackpressurePolicy,
     ignore_disconnected: bool,
     state: ParseState,
+    /// Reused per-frame event buffer. Event-carrying frames (every audio
+    /// frame under ebur128, every video frame under cropdetect) would
+    /// otherwise allocate and free a fresh `Vec` on each `filter_frame`.
+    events_scratch: Vec<MetadataEvent>,
 }
 
 impl MetadataEventFilter {
@@ -100,6 +104,7 @@ impl MetadataEventFilter {
             policy: BackpressurePolicy::Error,
             ignore_disconnected: false,
             state: ParseState::default(),
+            events_scratch: Vec::new(),
         }
     }
 
@@ -189,7 +194,11 @@ impl FrameFilter for MetadataEventFilter {
             }
         };
 
-        let mut events = Vec::new();
+        // Reuse the scratch buffer across frames: take it out of `self` so the
+        // dispatch loop below can borrow `self` mutably, then hand it back with
+        // its capacity intact. `Drain` removes every element even when the loop
+        // stops early on a dispatch error, matching the old drop-on-error.
+        let mut events = std::mem::take(&mut self.events_scratch);
         {
             let md = frame.metadata();
             parse_frame_metadata(&md, frame_ts, self.media_type, &mut events, &mut self.state);
@@ -197,9 +206,9 @@ impl FrameFilter for MetadataEventFilter {
         if let Some(end) = frame_end_ts {
             self.state.record_frame_end(end);
         }
-        for ev in events {
-            self.dispatch(ev)?;
-        }
+        let result = events.drain(..).try_for_each(|ev| self.dispatch(ev));
+        self.events_scratch = events;
+        result?;
         Ok(Some(frame)) // passthrough (NoopFilter pattern)
     }
 
