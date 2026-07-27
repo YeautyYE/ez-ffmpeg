@@ -995,11 +995,11 @@ type OutboundWrite = (usize, Bytes, bool, bool, bool, bool);
 
 /// Route a batch of [`ServerResult`]s into the reactor's write / close buffers.
 fn collect_server_results(
-    server_results: Vec<ServerResult>,
+    server_results: &mut Vec<ServerResult>,
     packets_to_write: &mut Vec<OutboundWrite>,
     ids_to_close: &mut Vec<usize>,
 ) {
-    for result in server_results {
+    for result in server_results.drain(..) {
         match result {
             ServerResult::OutboundPacket {
                 target_connection_id,
@@ -1074,6 +1074,9 @@ pub struct Reactor {
     packets_buffer: Vec<OutboundWrite>,
     /// Reusable buffer for IDs to close (avoids allocation in handle_readable)
     ids_to_close_buffer: Vec<usize>,
+    /// Reusable buffer for scheduler results on the publisher feed paths
+    /// (avoids a Vec allocation per media tag / raw chunk)
+    server_results_buffer: Vec<ServerResult>,
     /// Reusable buffer for handle results (avoids allocation in handle_readable)
     results_buffer: Vec<HandleResult>,
     /// Last time the full connection-timeout sweep ran (PERF-10 throttle)
@@ -1124,6 +1127,7 @@ impl Reactor {
             conn_ids_buffer: Vec::with_capacity(1024),
             packets_buffer: Vec::with_capacity(64),
             ids_to_close_buffer: Vec::with_capacity(16),
+            server_results_buffer: Vec::with_capacity(64),
             results_buffer: Vec::with_capacity(16),
             last_timeout_check: Instant::now(),
         })
@@ -1616,9 +1620,17 @@ impl Reactor {
         packets_to_write: &mut Vec<OutboundWrite>,
         ids_to_close: &mut Vec<usize>,
     ) -> bool {
-        match self.scheduler.publish_bytes_received(pub_id, bytes) {
-            Ok(server_results) => {
-                collect_server_results(server_results, packets_to_write, ids_to_close);
+        self.server_results_buffer.clear();
+        match self
+            .scheduler
+            .publish_bytes_received(pub_id, bytes, &mut self.server_results_buffer)
+        {
+            Ok(()) => {
+                collect_server_results(
+                    &mut self.server_results_buffer,
+                    packets_to_write,
+                    ids_to_close,
+                );
                 true
             }
             Err(e) => {
@@ -1686,9 +1698,9 @@ impl Reactor {
                                 // before removal so none is orphaned in Watching.
                                 // Unlike the Disconnected arm, this does NOT re-feed
                                 // the just-errored session.
-                                let results = self.scheduler.abort_publisher_watchers(pub_id);
+                                let mut results = self.scheduler.abort_publisher_watchers(pub_id);
                                 collect_server_results(
-                                    results,
+                                    &mut results,
                                     &mut packets_to_write,
                                     &mut ids_to_close,
                                 );
@@ -1735,9 +1747,9 @@ impl Reactor {
                                 // before removal so none is orphaned in Watching.
                                 // Unlike the Disconnected arm, this does NOT re-feed
                                 // the just-errored session.
-                                let results = self.scheduler.abort_publisher_watchers(pub_id);
+                                let mut results = self.scheduler.abort_publisher_watchers(pub_id);
                                 collect_server_results(
-                                    results,
+                                    &mut results,
                                     &mut packets_to_write,
                                     &mut ids_to_close,
                                 );
@@ -1760,11 +1772,16 @@ impl Reactor {
                         }) => {
                             items += 1;
                             bytes_drained += data.len();
-                            let results = self
-                                .scheduler
-                                .publish_media_received(pub_id, tag_type, timestamp, data);
+                            self.server_results_buffer.clear();
+                            self.scheduler.publish_media_received(
+                                pub_id,
+                                tag_type,
+                                timestamp,
+                                data,
+                                &mut self.server_results_buffer,
+                            );
                             collect_server_results(
-                                results,
+                                &mut self.server_results_buffer,
                                 &mut packets_to_write,
                                 &mut ids_to_close,
                             );
@@ -1833,9 +1850,18 @@ impl Reactor {
         if let Ok(payload) = delete_stream_cmd {
             let mut serializer = ChunkSerializer::new();
             if let Ok(packet) = serializer.serialize(&payload, false, true) {
-                match self.scheduler.publish_bytes_received(pub_id, packet.bytes) {
-                    Ok(server_results) => {
-                        collect_server_results(server_results, packets, ids_to_close);
+                self.server_results_buffer.clear();
+                match self.scheduler.publish_bytes_received(
+                    pub_id,
+                    packet.bytes,
+                    &mut self.server_results_buffer,
+                ) {
+                    Ok(()) => {
+                        collect_server_results(
+                            &mut self.server_results_buffer,
+                            packets,
+                            ids_to_close,
+                        );
                     }
                     Err(e) => {
                         log::warn!(
