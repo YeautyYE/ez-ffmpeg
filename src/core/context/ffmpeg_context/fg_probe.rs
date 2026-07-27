@@ -944,6 +944,11 @@ mod tests {
     // pad is a fabrication with no runtime buffersrc behind it — that
     // mismatch is caught by fg_send_frame's null-filter guard as a typed
     // error. Changing the assumption here must be a conscious decision.
+    //
+    // Only lv2's INPUTS are dynamic (plugin-dependent); its output side is a
+    // static, declared "default" audio pad that exists on the context from
+    // creation, so the output signature takes the real-pad `filter:pad`
+    // naming — same as overlay above — not the synthetic bare-name form.
     #[test]
     fn lv2_chain_head_assumes_exactly_one_input_pad() {
         crate::core::initialize_ffmpeg();
@@ -959,7 +964,7 @@ mod tests {
             assert_eq!(topo.inputs[0].media_type, AVMEDIA_TYPE_AUDIO);
             assert_eq!(
                 sigs(&topo.outputs),
-                vec![("out".into(), AVMEDIA_TYPE_AUDIO, "lv2".into())]
+                vec![("out".into(), AVMEDIA_TYPE_AUDIO, "lv2:default".into())]
             );
         }
     }
