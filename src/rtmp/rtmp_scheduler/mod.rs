@@ -61,6 +61,11 @@ const OUTBOUND_CHUNK_SIZE: usize = 4096;
 /// oversized header is refused at ingest instead of poisoning the cache.
 const MAX_CACHEABLE_SEQUENCE_HEADER_BYTES: usize = 256 * 1024;
 
+/// Watcher-set tables at or below this capacity are never shrunk: iterating
+/// them is already a handful of hashbrown control-group loads per tag, so
+/// small audiences pay zero shrink bookkeeping.
+const WATCHER_SET_SHRINK_MIN_CAPACITY: usize = 64;
+
 enum ClientAction {
     Waiting,
     // Publishing to a stream key. `Rc<str>` because the in-process media path
@@ -144,6 +149,24 @@ impl MediaChannel {
     /// Check if channel should be removed (no publisher and no watchers)
     fn should_remove(&self) -> bool {
         self.publishing_client_id.is_none() && self.watching_client_ids.is_empty()
+    }
+
+    /// Opportunistic high-water shrink of the watcher set, called from the
+    /// single membership-removal site (`play_ended`). std's `HashSet`
+    /// iteration cost tracks table CAPACITY, not `len`, and the per-tag
+    /// fanout walks this set once per media message — without a shrink, a
+    /// flash crowd that decays leaves every later tag paying for the peak
+    /// audience for as long as the channel lives. Quarter-occupancy trigger
+    /// with a `len * 2` target: each shrink at least halves the table (a
+    /// full decay costs O(peak) total, amortized O(1) per leave) and the 2x
+    /// headroom keeps a modest rejoin from immediately regrowing it.
+    fn shrink_watchers_if_sparse(&mut self) {
+        let watchers = &mut self.watching_client_ids;
+        if watchers.capacity() > WATCHER_SET_SHRINK_MIN_CAPACITY
+            && watchers.len() < watchers.capacity() / 4
+        {
+            watchers.shrink_to(watchers.len() * 2);
+        }
     }
 }
 

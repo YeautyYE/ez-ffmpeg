@@ -425,6 +425,7 @@ impl RtmpScheduler {
     pub(super) fn play_ended(&mut self, client_id: usize, stream_key: String) {
         let should_remove = if let Some(channel) = self.channels.get_mut(&stream_key) {
             channel.watching_client_ids.remove(&client_id);
+            channel.shrink_watchers_if_sparse();
             channel.should_remove()
         } else {
             return;
