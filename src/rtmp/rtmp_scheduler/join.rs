@@ -9,7 +9,7 @@ use super::{
 use crate::flv::flv_tag_body::{
     is_audio_sequence_header, is_video_keyframe, is_video_sequence_header,
 };
-use crate::rtmp::gop::FrameData;
+use crate::rtmp::gop::{FrameData, Gops};
 use crate::rtmp::write_queue::QUEUE_WARN_BYTES;
 use log::debug;
 use rml_rtmp::sessions::ServerSessionResult;
@@ -241,6 +241,51 @@ pub(super) fn select_replay_start(sizes: &[usize], budget: usize) -> usize {
         }
     }
     start
+}
+
+/// Drop the frozen GOPs no join burst could ever replay again. The fanout
+/// calls this at each freeze transition (a video-keyframe save), and it
+/// reuses the join's own segment selection — [`select_replay_start`] over
+/// the frozen-only wire sizes with the full [`JOIN_REPLAY_BUDGET_BYTES`] —
+/// as the eviction predicate: everything older than the selected start is
+/// removed. Without it, frozen retention is bounded only by `max_gops`
+/// COUNT, pinning up to `MAX_CURRENT_GOP_BYTES` per GOP that no joiner can
+/// receive.
+///
+/// Why an evicted GOP is permanently unselectable, so every join burst —
+/// past and future — stays byte-identical:
+/// * A frozen GOP's frozen-only suffix sum (its own wire size plus every
+///   newer frozen GOP's) is monotone non-decreasing while it stays cached:
+///   freezes only `push_back` behind it, evictions only `pop_front` in
+///   front of it, and a `FrozenGop`'s size is immutable.
+/// * [`select_replay_start`] guarantees every index below the returned
+///   start has a suffix sum exceeding the budget (its `checked_add`
+///   overflow fails closed identically for this caller and the join-time
+///   caller — it is the same function).
+/// * Any real join's budget is [`JOIN_REPLAY_BUDGET_BYTES`] minus its
+///   prefix (`saturating_sub` in [`build_join_burst`]), hence never larger,
+///   and its size list appends the open GOP's wire size on top of the
+///   frozen ones — so its scan fails at or before the same segment.
+///
+/// Therefore an evicted GOP could never be selected for any current or
+/// future join.
+///
+/// The open GOP is deliberately EXCLUDED from the predicate: its
+/// contribution is non-monotone (the `MAX_CURRENT_GOP_*` caps clear it on
+/// overflow), so counting it would evict frozen GOPs that become
+/// replayable again once the open GOP resets, changing replay output.
+///
+/// Contract for future consumers of `Gops::get_frozen_gops` (stats, DVR,
+/// ...): the frozen set is trimmed to the join-servable suffix — tolerate
+/// that, or relocate this eviction. Silent by design, matching the
+/// count-based eviction inside `Gops::save_frame_data`.
+pub(super) fn evict_unreplayable_frozen(gops: &mut Gops) {
+    let sizes: Vec<usize> = gops
+        .get_frozen_gops()
+        .map(|gop| gop_wire_size(gop.byte_size(), gop.frame_count()))
+        .collect();
+    let start = select_replay_start(&sizes, JOIN_REPLAY_BUDGET_BYTES);
+    gops.remove_oldest_frozen(start);
 }
 
 /// Build the media burst a joining watcher receives, pushing fully-flagged

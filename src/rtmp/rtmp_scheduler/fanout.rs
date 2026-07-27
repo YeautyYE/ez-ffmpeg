@@ -12,6 +12,7 @@
 use super::{
     serialize_media, ClientAction, MediaChannel, ReceivedDataType, RtmpScheduler, ServerResult,
 };
+use super::join::evict_unreplayable_frozen;
 use crate::flv::flv_tag_body::{
     is_audio_sequence_header, is_video_keyframe, is_video_sequence_header,
 };
@@ -70,6 +71,13 @@ impl RtmpScheduler {
                     },
                     is_keyframe,
                 );
+                // A keyframe save is the only event that grows the frozen
+                // history (audio saves and deltas never freeze); frozen GOPs
+                // beyond the join-replay budget can never reach a joiner, so
+                // drop them at the freeze transition.
+                if is_keyframe {
+                    evict_unreplayable_frozen(&mut channel.gops);
+                }
             }
 
             ReceivedDataType::Audio => {
