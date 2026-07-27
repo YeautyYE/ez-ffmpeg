@@ -584,10 +584,13 @@ fn sample_median<F: FnMut()>(mut f: F) -> f64 {
 }
 
 /// (census ns, census+rewrite ns) per pass over `aus` through the injected
-/// finder, mirroring the two-walk Annex-B shape of `normalize_au`. All
-/// benchmark comparison rows go through THIS one function so every variant
-/// shares the same walker shape, call surface and inline opportunity —
-/// each finder in the form it ships (or shipped) in.
+/// finder, keeping the historical two-walk shape the recorded stride-scan
+/// evidence (x86 corpus table, ARM CI parity gate) was gathered under;
+/// production `normalize_au` has since folded to a single reserve-bounded
+/// walk, which the census row times on its own. All benchmark comparison
+/// rows go through THIS one function so every variant shares the same
+/// walker shape, call surface and inline opportunity — each finder in the
+/// form it ships (or shipped) in.
 fn time_pair<F>(aus: &[Vec<u8>], find: F) -> (f64, f64)
 where
     F: Fn(&[u8], usize) -> Option<usize> + Copy,
