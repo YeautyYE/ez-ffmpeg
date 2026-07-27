@@ -223,7 +223,7 @@ pub(crate) fn enc_init(
         // pre-mux queue), so it lies on no wait-for cycle. `enc_sync == None` skips
         // this entirely and runs the verbatim loop below, byte-for-byte.
         if let Some(h) = enc_sync.as_ref() {
-            let (sq_lock, sq_cv) = (&h.queue.0, &h.queue.1);
+            let (sq_lock, sq_cv, sq_waiters) = (&h.queue.0, &h.queue.1, &h.queue.2);
             let sq_idx = h.sq_idx;
             let sq_finished: &[AtomicBool] = &h.sq_finished;
             // This stream's own balancer flag, published at producer-EOF below.
@@ -297,7 +297,7 @@ pub(crate) fn enc_init(
                         q.heartbeat();
                         q.drain_releasable_into(sq_idx, &mut local);
                     }
-                    sq_propagate_and_notify(&mut q, sq_finished, sq_cv);
+                    sq_propagate_and_notify(&mut q, sq_finished, sq_cv, sq_waiters);
                 }
                 for fb in local.drain(..) {
                     if enc_done || stop {
@@ -370,7 +370,7 @@ pub(crate) fn enc_init(
                             // leftovers; they are all at-or-past the boundary.
                             q.drain_releasable_into(sq_idx, &mut local);
                         }
-                        sq_propagate_and_notify(&mut q, sq_finished, sq_cv);
+                        sq_propagate_and_notify(&mut q, sq_finished, sq_cv, sq_waiters);
                     }
                     for fb in local.drain(..) {
                         if stop {
@@ -399,13 +399,19 @@ pub(crate) fn enc_init(
                         let mut q = sq_lock.lock().unwrap();
                         q.heartbeat();
                         q.drain_releasable_into(sq_idx, &mut local);
-                        sq_propagate_and_notify(&mut q, sq_finished, sq_cv);
+                        sq_propagate_and_notify(&mut q, sq_finished, sq_cv, sq_waiters);
                         done = q.is_stream_drained(sq_idx)
                             || is_stopping(scheduler_status.load(Ordering::Acquire));
                         if !done && local.is_empty() {
                             // wait for a peer's head advance; wait_timeout atomically
                             // releases the lock while blocked (deadlock-proof Lemma 1).
-                            let _ = sq_cv.wait_timeout(q, DRAIN_TICK).unwrap();
+                            // Register under the lock so every peer's
+                            // sq_propagate_and_notify from here on sees the waiter;
+                            // deregister under the reacquired guard.
+                            sq_waiters.fetch_add(1, Ordering::Relaxed);
+                            let (q, _) = sq_cv.wait_timeout(q, DRAIN_TICK).unwrap();
+                            sq_waiters.fetch_sub(1, Ordering::Relaxed);
+                            drop(q);
                             continue;
                         }
                     }
@@ -1002,13 +1008,28 @@ unsafe fn sq_frame_end_tb(fb: &FrameBox) -> (Option<i64>, AVRational, i32) {
 /// mark every stream the engine just cascade-finished in `sq_finished` (so a
 /// truncated encoder observes it and enters its drain phase) and wake any
 /// drain-phase peers whose head just advanced. In-memory ops only.
-fn sq_propagate_and_notify(q: &mut SyncQueue<FrameBox>, sq_finished: &[AtomicBool], cv: &Condvar) {
+///
+/// The wake is skipped when `drain_waiters` reads zero. No wakeup can be lost:
+/// waiters register under this same lock before blocking, so a zero read proves
+/// no thread is parked on `cv`; a waiter that registers later re-checks the
+/// queue state under the lock before blocking, so it cannot depend on the
+/// skipped wake — and the 100ms drain tick backstops regardless.
+fn sq_propagate_and_notify(
+    q: &mut SyncQueue<FrameBox>,
+    sq_finished: &[AtomicBool],
+    cv: &Condvar,
+    drain_waiters: &AtomicUsize,
+) {
     let mut newly = Vec::new();
     q.newly_finished(&mut newly);
     for j in newly {
         sq_finished[j].store(true, Ordering::Release);
     }
-    cv.notify_all();
+    // Relaxed suffices: every access to the counter happens inside an
+    // `sq_lock` critical section, so the mutex orders them.
+    if drain_waiters.load(Ordering::Relaxed) != 0 {
+        cv.notify_all();
+    }
 }
 
 /// `-shortest` (sq_enc): encode one frame drained from the queue. The sync-queue
