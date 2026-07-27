@@ -58,7 +58,7 @@ fn a4_trailing_zero_fixture_matches_master_movenc_output() {
         data,
         &[0, 0, 0, 3, 0x06, 0x05, 0xFF, 0, 0, 0, 3, 0x65, 0x88, 0x84]
     );
-    // Census-based reservation: the exact final size was reserved before
+    // Bounded reservation: at least the final size was reserved before
     // writing, so the conversion never reallocated mid-AU.
     assert_eq!(data.len(), 14);
     assert!(scratch.capacity() >= 14);

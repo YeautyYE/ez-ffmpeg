@@ -152,10 +152,9 @@ impl AvcRuntime {
 
     /// Payload normalization: validates NAL boundaries, classifies types
     /// and (for Annex-B input) rewrites into `scratch` as a 4-byte
-    /// length-prefixed access unit. Annex-B input takes TWO linear walks —
-    /// an allocation-free census that reserves the exact output size, then
-    /// the write walk, which therefore never reallocates. The
-    /// already-length-prefixed path is a single validate-only pass,
+    /// length-prefixed access unit in ONE linear walk — a strict arithmetic
+    /// bound reserves the output up front, so the walk never reallocates.
+    /// The already-length-prefixed path is a single validate-only pass,
     /// zero-copy.
     ///
     /// Returns `(is_key, payload)` where `is_key` is IDR presence and
@@ -172,16 +171,16 @@ impl AvcRuntime {
         };
         let (scan, data): (_, &'a [u8]) = if self.annexb_packets {
             scratch.clear();
-            // Reserve the EXACT output size from a start-code census: a
-            // first, allocation-free walk sums `4 + trimmed_nal_len` per
-            // NAL, so the write walk below can never reallocate — not even
-            // for an AU with arbitrarily many 3-byte start codes. Both walks
-            // are linear scans of one AU; the census also front-loads the
-            // boundary validation.
-            let mut exact = 0usize;
-            walk_annexb(payload, |nal| exact += NAL_LENGTH_SIZE + nal.len())
-                .map_err(&malformed)?;
-            scratch.reserve(exact);
+            // Strict output bound, no census walk needed: the output is
+            // sum(4 + nal.len()) over the AU's NALs. Every NAL costs at
+            // least 4 input bytes (a >= 3-byte start code plus >= 1 payload
+            // byte), so nal_count <= payload.len() / 4, and the NAL bytes
+            // themselves are a subset of the input; the +NAL_LENGTH_SIZE
+            // absorbs the division truncation. Reserving this bound keeps
+            // the write walk reallocation-free — the property the old
+            // exact-size census walk existed to provide — at the price of
+            // up to 25% over-reserve on the reused scratch buffer.
+            scratch.reserve(payload.len() + payload.len() / 4 + NAL_LENGTH_SIZE);
             let scan = walk_annexb(payload, |nal| push_length_prefixed(nal, scratch))
                 .map_err(&malformed)?;
             (scan, scratch.as_slice())
