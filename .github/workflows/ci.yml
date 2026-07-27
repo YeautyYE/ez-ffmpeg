@@ -60,6 +60,13 @@
 #     memory is caught (one entirely inside un-instrumented FFmpeg C is not
 #     reliably covered — those regressions are Rust-side here).
 #
+# One specialized job runs on the arm64 runner:
+#
+#   * `armhf` — 32-bit ARM build + test inside an arm32v7 Debian container,
+#     executing natively as AArch32 EL0 code (no QEMU). The only lane where
+#     `target_pointer_width = "32"` code paths actually run. See the job's
+#     own comment for the fleet caveat.
+#
 # All jobs are enforced gates.
 
 name: CI
@@ -623,6 +630,66 @@ jobs:
 
       - name: Check packet-sink examples
         run: cargo check --example packet_sink_avc --example packet_sink_aac_channel --example packet_sink_av_transport --example hdr_to_sdr --features "${{ matrix.test_features }}"
+
+  # 32-bit ARM (armhf) lane. GitHub offers no 32-bit hosted runner, but the
+  # arm64 runners' Neoverse N2 (Cobalt 100) cores execute AArch32 at EL0, so
+  # an armhf container runs natively — real 32-bit words, not QEMU. This is
+  # the only lane where target_pointer_width = "32" code actually executes:
+  # the RTMP poller-token generation split (u16 halves) was once inert on
+  # 32-bit precisely because nothing ran it. Trixie's armhf FFmpeg is 7.1.x,
+  # matching the 7.1 matrix lane, and its GPL libavcodec carries libx264,
+  # which lets the RTMP loopback suite publish for real.
+  #
+  # Fleet caveat: AArch32 EL0 is a property of the current Cobalt 100 fleet,
+  # not a documented GitHub guarantee. If the fleet ever moves to cores
+  # without AArch32 (e.g. Neoverse V2+), the container fails to start or the
+  # in-container canary trips — either way this job goes red loudly rather
+  # than silently testing the wrong width, and the lane then needs a QEMU
+  # fallback decision.
+  armhf:
+    name: Build & Test (armhf 32-bit, FFmpeg 7.1)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      # Host-side canary: a kernel built without 32-bit compat support — the
+      # likely shape of a fleet move to AArch32-less cores — refuses the
+      # PER_LINUX32 personality, so this turns an opaque container crash into
+      # a named diagnosis. lscpu's op-mode line ("32-bit, 64-bit") is the
+      # CPU-level signal. The authoritative ELF32 proof is the in-container
+      # canary at the top of armhf_lane.sh.
+      - name: Verify 32-bit compat on the host
+        run: |
+          lscpu | grep -i 'op-mode' || true
+          if ! setarch linux32 true 2>/dev/null; then
+            echo "Host kernel refuses 32-bit personality (fleet change?)" >&2
+            exit 1
+          fi
+
+      # Same key as every other lane: registry sources are architecture-
+      # independent, so the armhf container can reuse what the arm64 lanes
+      # populated. Mounted into the container below.
+      - name: Cache cargo sources
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-sources-v1-${{ hashFiles('**/Cargo.toml') }}
+
+      # The whole build+test body runs inside an armhf Debian container.
+      # Docker on the arm64 host runs arm32v7 images natively via AArch32.
+      # --platform pins the pull so a manifest-list mixup cannot hand us an
+      # arm64 image (the in-script getconf/dpkg canary double-checks).
+      - name: Build and test in an armhf container
+        run: |
+          mkdir -p "$HOME/.cargo/registry" "$HOME/.cargo/git"
+          docker run --rm --platform linux/arm/v7 \
+            -v "$GITHUB_WORKSPACE:/work" -w /work \
+            -v "$HOME/.cargo/registry:/root/.cargo/registry" \
+            -v "$HOME/.cargo/git:/root/.cargo/git" \
+            arm32v7/debian:trixie bash .github/scripts/armhf_lane.sh
 
   docs:
     name: Docs (docsrs cfg compile)
