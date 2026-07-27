@@ -1218,15 +1218,17 @@ unsafe fn seek_to_start(
         demux_parameter.stream_loop -= 1;
     }
 
-    let loop_status = if demux_parameter.stream_loop > 0 {
-        format!("Remaining loops: {}", demux_parameter.stream_loop)
-    } else if demux_parameter.stream_loop == 0 {
-        "Last loop".to_string()
-    } else {
-        "Infinite loop mode".to_string()
-    };
-
-    debug!("Repositioning stream to starting point: position={start_time}μs, {loop_status}");
+    // The status string lives in the debug! argument position so the log
+    // macro's level check short-circuits the format!/to_string work when
+    // debug logging is off. Log text is byte-identical when it is on.
+    debug!(
+        "Repositioning stream to starting point: position={start_time}μs, {}",
+        match demux_parameter.stream_loop {
+            n if n > 0 => format!("Remaining loops: {n}"),
+            0 => "Last loop".to_string(),
+            _ => "Infinite loop mode".to_string(),
+        }
+    );
 
     ret
 }
