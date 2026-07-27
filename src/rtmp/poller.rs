@@ -11,6 +11,8 @@
 // - EINTR auto-retry
 
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Event interest flags
@@ -897,8 +899,9 @@ pub use windows::{Poller, RawHandle};
 // interrupt the reactor's `poll()` the instant media arrives, instead of
 // waiting up to POLL_TIMEOUT_MS. `Waker` is the reactor-side read end,
 // registered with the `Poller` for readable interest and drained after each
-// poll. `WakeHandle` is a cloneable `Send + Sync` producer handle whose
-// `wake()` writes a coalesced token.
+// poll. `WakeHandle` is a cloneable `Send + Sync` producer handle; `wake()`
+// coalesces on a userspace gate so only the first wake per drain cycle
+// writes the backend fd (see the wrapper block below the backends).
 //
 //   - Linux:      eventfd (a single fd; the kernel sums concurrent writes)
 //   - macOS/BSD:  self-pipe (kqueue EVFILT_READ; EVFILT_USER is an alternative)
@@ -966,13 +969,27 @@ mod waker_backend {
 
     impl WakeHandle {
         /// Signal the reactor. eventfd sums writes, so multiple wakes before a
-        /// drain coalesce into a single readiness event.
-        pub fn wake(&self) {
+        /// drain coalesce into a single readiness event. Returns whether a
+        /// readiness token is now guaranteed on the fd: a successful write, or
+        /// EAGAIN from a saturated counter (already readable without our
+        /// token). Any other failure deposited nothing and reports `false` so
+        /// the caller can recover.
+        pub fn wake(&self) -> bool {
             let val: u64 = 1;
-            // SAFETY: writing 8 bytes from a u64 to a valid eventfd. A saturated
-            // counter returns EAGAIN (EFD_NONBLOCK), which still means a wake is
-            // pending; the result is intentionally ignored.
-            let _ = unsafe { libc::write(self.fd.0, &val as *const u64 as *const libc::c_void, 8) };
+            loop {
+                // SAFETY: writing 8 bytes from a u64 to a valid eventfd.
+                let n = unsafe {
+                    libc::write(self.fd.0, &val as *const u64 as *const libc::c_void, 8)
+                };
+                if n == 8 {
+                    return true;
+                }
+                match io::Error::last_os_error().kind() {
+                    io::ErrorKind::WouldBlock => return true,
+                    io::ErrorKind::Interrupted => continue,
+                    _ => return false,
+                }
+            }
         }
     }
 }
@@ -1084,17 +1101,30 @@ mod waker_backend {
     }
 
     impl WakeHandle {
-        pub fn wake(&self) {
+        /// Signal the reactor. Returns whether a readiness byte is now
+        /// guaranteed on the pipe: a successful write, or EAGAIN from a full
+        /// pipe (already readable without our byte). Any other failure
+        /// deposited nothing and reports `false` so the caller can recover.
+        pub fn wake(&self) -> bool {
             let byte: u8 = 1;
-            // SAFETY: writing 1 byte to a valid non-blocking pipe write end. A
-            // full pipe returns EAGAIN, which still means a wake is pending.
-            let _ = unsafe {
-                libc::write(
-                    self.pipe.write_fd,
-                    &byte as *const u8 as *const libc::c_void,
-                    1,
-                )
-            };
+            loop {
+                // SAFETY: writing 1 byte to a valid non-blocking pipe write end.
+                let n = unsafe {
+                    libc::write(
+                        self.pipe.write_fd,
+                        &byte as *const u8 as *const libc::c_void,
+                        1,
+                    )
+                };
+                if n == 1 {
+                    return true;
+                }
+                match io::Error::last_os_error().kind() {
+                    io::ErrorKind::WouldBlock => return true,
+                    io::ErrorKind::Interrupted => continue,
+                    _ => return false,
+                }
+            }
         }
     }
 }
@@ -1112,7 +1142,11 @@ mod waker_backend {
     extern "system" {
         fn send(s: RawSocket, buf: *const i8, len: i32, flags: i32) -> i32;
         fn recv(s: RawSocket, buf: *mut i8, len: i32, flags: i32) -> i32;
+        fn WSAGetLastError() -> i32;
     }
+
+    const WSAEINTR: i32 = 10004;
+    const WSAEWOULDBLOCK: i32 = 10035;
 
     /// Connected loopback TCP pair; both sockets closed when the last Arc drops.
     struct Pair {
@@ -1172,16 +1206,176 @@ mod waker_backend {
     }
 
     impl WakeHandle {
-        pub fn wake(&self) {
+        /// Signal the reactor. Returns whether a readiness byte is now
+        /// guaranteed queued toward the reader: a successful send, or
+        /// WSAEWOULDBLOCK from a full send buffer (bytes already queued).
+        /// Any other failure deposited nothing and reports `false` so the
+        /// caller can recover.
+        pub fn wake(&self) -> bool {
             let byte: i8 = 1;
-            // SAFETY: send 1 byte on a valid non-blocking loopback socket; a full
-            // send buffer returns WSAEWOULDBLOCK, wake still pending.
-            let _ = unsafe { send(self.pair.writer.as_raw_socket(), &byte as *const i8, 1, 0) };
+            loop {
+                // SAFETY: send 1 byte on a valid non-blocking loopback socket.
+                let n = unsafe { send(self.pair.writer.as_raw_socket(), &byte as *const i8, 1, 0) };
+                if n == 1 {
+                    return true;
+                }
+                // SAFETY: WSAGetLastError reads the calling thread's Winsock
+                // error slot and is the documented way to classify a failed
+                // raw send — Win32 GetLastError (what io::Error::last_os_error
+                // uses) is not guaranteed to carry it.
+                match unsafe { WSAGetLastError() } {
+                    WSAEWOULDBLOCK => return true,
+                    WSAEINTR => continue,
+                    _ => return false,
+                }
+            }
         }
     }
 }
 
-pub use waker_backend::{waker_pair, WakeHandle, Waker};
+// ============================================================================
+// Platform-neutral waker wrapper: userspace pending gate
+// ============================================================================
+//
+// One `Arc<AtomicBool>` (`pending`) is shared by the `Waker` and every
+// `WakeHandle` clone. It gates the backend write so that of all wakes
+// coalesced between two drains only the winner attempts the backend write
+// (one syscall in the common case; an EINTR retry can add more) — the
+// kernel already merges concurrent tokens into the same readiness event
+// (the eventfd sums, the pipe/socket queue bytes), so a skipped write never
+// changes what the poll observes. A corollary: in steady state at most one
+// wake token is outstanding on the backend fd (a drain racing the Windows
+// socket's in-flight byte can transiently leave two transport bytes; the
+// next drain-to-empty absorbs both). The backends therefore treat
+// full-buffer results (EAGAIN / WSAEWOULDBLOCK) as token-present, not as
+// failure — a full fd already holds bytes queued toward the reader.
+//
+// Invariant: `pending == true` implies either an unconsumed readiness token
+// exists on the backend fd, or the winning wake is between its swap and the
+// completion of its backend write — or, when that write definitively
+// failed, its gate re-open is still ahead (see wake()) — or a drain is in
+// progress whose clear, and every reactor re-check of the wake-signaled
+// queues, is still ahead.
+//
+// Protocol:
+//   wake():  the payload enqueue is sequenced before `pending.swap(true,
+//            Release)`; only the false->true transition writes the fd. A
+//            definitively failed backend write (nothing deposited) re-opens
+//            the gate so a later wake retries.
+//   drain(): read the backend fd to empty FIRST, then `pending.swap(false,
+//            Acquire)`.
+//
+// The clear MUST follow the fd read. Clearing first strands the gate: a wake
+// landing between the clear and the read re-writes the fd, the same read
+// then absorbs that token, and the cycle ends with `pending == true` on an
+// empty fd. Since drain() runs only on waker readiness events, no later
+// clear can ever happen and every subsequent wake skips its write — the
+// reactor silently degrades to its poll-timeout cadence. With drain-then-
+// clear the clear is the final flag operation of each cycle, so any `true`
+// that survives it was written by a swap that returned `false` and therefore
+// performed the write.
+//
+// Ordering: both sides use `swap` (an atomic RMW), not `compare_exchange` —
+// an RMW always reads the latest value in the flag's modification order, so
+// a wake issued after a completed clear can never observe a stale `true` and
+// skip a needed write (a failed compare_exchange is formally a plain load,
+// which lacks that guarantee). The Release (wake) / Acquire (drain) pair
+// carries every enqueue coalesced into a cycle happens-before the clear,
+// hence before the reactor's subsequent re-checks of the signaled queues.
+//
+// The reactor loop must keep re-examining every wake-signaled source
+// (status, publisher/handshake registrations, publisher channels) between
+// drain() and the next blocking poll; wakes absorbed by the gate rely on
+// those re-checks instead of a fresh fd token.
+
+/// Reactor-side read end: registered with the [`Poller`], drained after each
+/// waker readiness event.
+pub struct Waker {
+    backend: waker_backend::Waker,
+    pending: Arc<AtomicBool>,
+    /// Test seam: runs between the backend fd drain and the gate clear —
+    /// the exact window the drain-then-clear ordering protects (test only).
+    #[cfg(test)]
+    drain_gap_hook: std::sync::Mutex<Option<Box<dyn FnMut() + Send>>>,
+}
+
+/// Cloneable `Send + Sync` producer handle; see the protocol block above.
+#[derive(Clone)]
+pub struct WakeHandle {
+    backend: waker_backend::WakeHandle,
+    pending: Arc<AtomicBool>,
+}
+
+pub fn waker_pair() -> io::Result<(Waker, WakeHandle)> {
+    let (backend_waker, backend_handle) = waker_backend::waker_pair()?;
+    let pending = Arc::new(AtomicBool::new(false));
+    Ok((
+        Waker {
+            backend: backend_waker,
+            pending: pending.clone(),
+            #[cfg(test)]
+            drain_gap_hook: std::sync::Mutex::new(None),
+        },
+        WakeHandle {
+            backend: backend_handle,
+            pending,
+        },
+    ))
+}
+
+impl Waker {
+    /// Raw handle to register with the Poller for readable interest.
+    pub fn raw_handle(&self) -> RawHandle {
+        self.backend.raw_handle()
+    }
+
+    /// Drain pending wake tokens, then re-open the gate. The backend fd must
+    /// be empty before the flag clears (see the protocol block above).
+    pub fn drain(&self) {
+        self.backend.drain();
+        #[cfg(test)]
+        if let Some(hook) = self.drain_gap_hook.lock().unwrap().as_mut() {
+            hook();
+        }
+        self.pending.swap(false, Ordering::Acquire);
+    }
+
+    /// Install a callback fired between the fd drain and the gate clear
+    /// (test only) — lets a test drive a wake into that window
+    /// deterministically.
+    #[cfg(test)]
+    pub(crate) fn set_drain_gap_hook_for_test(&self, hook: Box<dyn FnMut() + Send>) {
+        *self.drain_gap_hook.lock().unwrap() = Some(hook);
+    }
+}
+
+impl WakeHandle {
+    /// Signal the reactor. Only the winning wake per drain cycle attempts
+    /// the backend write; the rest coalesce on the userspace gate.
+    pub fn wake(&self) {
+        if self.pending.swap(true, Ordering::Release) {
+            return;
+        }
+        if !self.backend.wake() {
+            // The winning write deposited no token (full-buffer results count
+            // as deposited, so this is a teardown-class failure). Re-open the
+            // gate so a later wake retries the write instead of coalescing
+            // behind a token that does not exist. A wake that slipped in
+            // between our swap and this re-open rides the next wake or the
+            // reactor's poll-timeout re-checks — the same bounded fallback a
+            // failed write had when every wake wrote unconditionally. The
+            // gate can degrade one cycle to that fallback; it can no longer
+            // latch shut.
+            self.pending.swap(false, Ordering::Release);
+        }
+    }
+
+    /// Current gate state (test only).
+    #[cfg(test)]
+    pub(crate) fn pending_for_test(&self) -> bool {
+        self.pending.load(Ordering::Relaxed)
+    }
+}
 
 // ============================================================================
 // Tests
@@ -1459,6 +1653,283 @@ mod tests {
             events.iter().all(|e| e.token != WAKER_TOKEN),
             "drain() must clear the wake token"
         );
+
+        // Post-drain re-wake: the gate must have re-armed. Two more wakes
+        // coalesce in userspace, so the eventfd counter holds exactly 1 —
+        // unguarded writes would make the kernel sum it to 2.
+        handle.wake();
+        handle.wake();
+        poller.poll(Some(Duration::from_millis(500)), &mut events).expect("poll");
+        assert!(
+            events
+                .iter()
+                .any(|e| e.token == WAKER_TOKEN && e.is_readable()),
+            "a wake after drain() must produce a fresh readable event"
+        );
+        let mut buf = [0u8; 8];
+        // SAFETY: reading 8 bytes from a valid eventfd into an 8-byte buffer;
+        // a successful read returns the counter and resets it to 0.
+        let n = unsafe { libc::read(waker.raw_handle(), buf.as_mut_ptr() as *mut libc::c_void, 8) };
+        assert_eq!(n, 8, "eventfd must hold a token after a post-drain wake");
+        assert_eq!(
+            u64::from_ne_bytes(buf),
+            1,
+            "coalesced wakes must deposit exactly one token"
+        );
+
+        // drain() on the (manually emptied) fd must still clear the gate so
+        // the next wake reaches the poller.
+        waker.drain();
+        handle.wake();
+        poller.poll(Some(Duration::from_millis(500)), &mut events).expect("poll");
+        assert!(
+            events
+                .iter()
+                .any(|e| e.token == WAKER_TOKEN && e.is_readable()),
+            "the gate must re-arm after every drain()"
+        );
+        waker.drain();
+
+        poller.deregister(waker.raw_handle()).ok();
+    }
+
+    #[test]
+    fn wake_pending_gate_skips_syscall_until_drained() {
+        let (waker, handle) = waker_pair().expect("Failed to create waker");
+
+        assert!(!handle.pending_for_test(), "a fresh pair starts un-armed");
+
+        handle.wake();
+        assert!(handle.pending_for_test(), "the first wake arms the gate");
+
+        handle.wake();
+        handle.wake();
+        assert!(
+            handle.pending_for_test(),
+            "coalesced wakes keep the gate armed"
+        );
+
+        // Clones share the gate: a wake through a clone must be visible to
+        // (and coalesce with) every other handle.
+        let clone = handle.clone();
+        assert!(clone.pending_for_test(), "clones observe the shared gate");
+
+        waker.drain();
+        assert!(
+            !handle.pending_for_test(),
+            "drain() clears the gate only after the fd is empty"
+        );
+        assert!(!clone.pending_for_test(), "clones observe the cleared gate");
+
+        handle.wake();
+        assert!(
+            handle.pending_for_test(),
+            "a post-drain wake arms the gate again"
+        );
+    }
+
+    /// Deterministically drive a wake into the window between the backend fd
+    /// read and the gate clear — the interleaving drain-then-clear exists to
+    /// survive. The gated wake must coalesce (gate still armed, no token) and
+    /// be absorbed by the clear, leaving the gate open. Under the broken
+    /// clear-before-read ordering the same hook wake would observe an open
+    /// gate, write a token the very same drain then swallows, and end the
+    /// cycle latched shut over an empty fd — this test fails on both of its
+    /// gate assertions in that world.
+    #[test]
+    fn wake_in_the_drain_gap_is_absorbed_and_cannot_strand_the_gate() {
+        let mut poller = Poller::new().expect("Failed to create poller");
+        let (waker, handle) = waker_pair().expect("Failed to create waker");
+        poller
+            .register(waker.raw_handle(), WAKER_TOKEN, Interest::READABLE)
+            .expect("Failed to register waker");
+
+        // Arm the gate and deposit a token.
+        handle.wake();
+        let mut events = Vec::new();
+        poller
+            .poll(Some(Duration::from_secs(5)), &mut events)
+            .expect("poll");
+        assert!(events
+            .iter()
+            .any(|e| e.token == WAKER_TOKEN && e.is_readable()));
+
+        // The hook fires between the fd read and the clear, inside drain().
+        let gap_handle = handle.clone();
+        let gap_runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gap_runs_in_hook = gap_runs.clone();
+        waker.set_drain_gap_hook_for_test(Box::new(move || {
+            gap_handle.wake();
+            gap_runs_in_hook.fetch_add(1, Ordering::SeqCst);
+        }));
+        waker.drain();
+        assert_eq!(gap_runs.load(Ordering::SeqCst), 1, "the gap hook must run");
+        assert!(
+            !handle.pending_for_test(),
+            "a wake absorbed mid-drain must leave the gate open (a still-armed \
+             gate here means the clear ran before the fd read)"
+        );
+
+        // The absorbed wake deposited no token, so the fd is quiet...
+        poller
+            .poll(Some(Duration::from_millis(50)), &mut events)
+            .expect("poll");
+        assert!(events.iter().all(|e| e.token != WAKER_TOKEN));
+
+        // ...and the next wake must reach the poller — the strand detector.
+        handle.wake();
+        poller
+            .poll(Some(Duration::from_secs(5)), &mut events)
+            .expect("poll");
+        assert!(
+            events
+                .iter()
+                .any(|e| e.token == WAKER_TOKEN && e.is_readable()),
+            "a wake following an absorbed-in-drain wake must produce a fresh \
+             readiness event"
+        );
+        waker.drain();
+        poller.deregister(waker.raw_handle()).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wake_drain_pingpong_rearms_under_threads() {
+        use std::sync::mpsc;
+
+        let mut poller = Poller::new().expect("Failed to create poller");
+        let (waker, handle) = waker_pair().expect("Failed to create waker");
+        poller
+            .register(waker.raw_handle(), WAKER_TOKEN, Interest::READABLE)
+            .expect("Failed to register waker");
+
+        const ROUNDS: usize = 200;
+        let (turn_tx, turn_rx) = mpsc::channel::<()>();
+        let producer = std::thread::spawn(move || {
+            // Exactly one wake per turn; the consumer drains between turns,
+            // so every round must re-arm the gate and deposit a fresh token.
+            for _ in 0..ROUNDS {
+                if turn_rx.recv().is_err() {
+                    return;
+                }
+                handle.wake();
+            }
+        });
+
+        let mut events = Vec::new();
+        for round in 0..ROUNDS {
+            turn_tx.send(()).expect("producer thread alive");
+            poller
+                .poll(Some(Duration::from_secs(5)), &mut events)
+                .expect("poll");
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e.token == WAKER_TOKEN && e.is_readable()),
+                "round {}: a wake after a drain must reach the poller (a \
+                 stranded gate skips the write and the poll times out)",
+                round
+            );
+            waker.drain();
+        }
+        producer.join().expect("producer thread");
+
+        // Every token consumed: the poller must be quiet again.
+        poller
+            .poll(Some(Duration::from_millis(50)), &mut events)
+            .expect("poll");
+        assert!(events.iter().all(|e| e.token != WAKER_TOKEN));
+
+        poller.deregister(waker.raw_handle()).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wake_freerun_coalesces_and_rearms() {
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Instant;
+
+        let mut poller = Poller::new().expect("Failed to create poller");
+        let (waker, handle) = waker_pair().expect("Failed to create waker");
+        poller
+            .register(waker.raw_handle(), WAKER_TOKEN, Interest::READABLE)
+            .expect("Failed to register waker");
+
+        const WAKES: usize = 200;
+        let count = Arc::new(AtomicUsize::new(0));
+        let producer = {
+            let count = count.clone();
+            let handle = handle.clone();
+            std::thread::spawn(move || {
+                for _ in 0..WAKES {
+                    // The increment is the payload: its visibility to the
+                    // consumer's post-drain re-check rides the gate's
+                    // Release(wake)/Acquire(drain) pairing.
+                    count.fetch_add(1, Ordering::Relaxed);
+                    handle.wake();
+                }
+            })
+        };
+
+        // Drain until the full count is observed AFTER a drain: the protocol
+        // guarantees every coalesced wake's payload is visible by the
+        // re-check following the drain that absorbed (or followed) it.
+        let mut events = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "consumer never observed all {} wakes (lost wake or stranded gate)",
+                WAKES
+            );
+            poller
+                .poll(Some(Duration::from_millis(500)), &mut events)
+                .expect("poll");
+            if events.iter().any(|e| e.token == WAKER_TOKEN) {
+                waker.drain();
+                if count.load(Ordering::Relaxed) == WAKES {
+                    break;
+                }
+            }
+        }
+        producer.join().expect("producer thread");
+
+        // At most one residual token can remain: a wake racing the final
+        // drain's clear re-writes the fd at most once (a write requires the
+        // swap to observe false, which only a completed clear publishes).
+        poller
+            .poll(Some(Duration::from_millis(500)), &mut events)
+            .expect("poll");
+        if events.iter().any(|e| e.token == WAKER_TOKEN) {
+            waker.drain();
+        }
+
+        // Post-quiescence: fd empty, gate cleared.
+        poller
+            .poll(Some(Duration::from_millis(50)), &mut events)
+            .expect("poll");
+        assert!(
+            events.iter().all(|e| e.token != WAKER_TOKEN),
+            "after one settling drain the waker fd must be empty"
+        );
+        assert!(
+            !handle.pending_for_test(),
+            "the gate must be clear once the fd is empty and no drain is in flight"
+        );
+
+        // Direct lost-wake / stranded-gate detector: one more wake must
+        // produce a fresh readiness event.
+        handle.wake();
+        poller
+            .poll(Some(Duration::from_secs(5)), &mut events)
+            .expect("poll");
+        assert!(
+            events
+                .iter()
+                .any(|e| e.token == WAKER_TOKEN && e.is_readable()),
+            "a wake after quiescence must re-arm and reach the poller"
+        );
+        waker.drain();
 
         poller.deregister(waker.raw_handle()).ok();
     }

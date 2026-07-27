@@ -2150,6 +2150,17 @@ impl Reactor {
 
                 // Wakeup token: drain it and fall through to the channel-drain
                 // steps below. Matched before decoding as a connection token.
+                //
+                // drain() also clears the waker's userspace pending gate, and
+                // does so only after the backend fd is empty. Wakes coalesced
+                // by that gate deposit no fresh fd token: their delivery
+                // depends on this loop re-examining every wake-signaled
+                // source — status (step 1), publisher/handshake registrations
+                // (step 3), publisher channels (step 6) — between this call
+                // and the next blocking poll. (New TCP connections are not
+                // waker-signaled; their channel rides the same loop on the
+                // poll cadence.) Do not move this call or hoist channel
+                // processing above it.
                 if poller_token == WAKER_TOKEN {
                     if let Some(waker) = &waker {
                         waker.drain();
