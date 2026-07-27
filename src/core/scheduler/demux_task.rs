@@ -755,19 +755,24 @@ unsafe fn ts_discontinuity_process(
     pkt: *mut AVPacket,
     copy_ts: bool,
 ) {
-    let offset = av_rescale_q(
-        demux_parameter.ts_offset_discont,
-        AV_TIME_BASE_Q,
-        (*pkt).time_base,
-    );
+    // ts_offset_discont is 0 until an actual discontinuity is detected, and
+    // av_rescale_q(0, ..) is 0 with an identity add, so skip the rescale in the
+    // common no-discontinuity case (mirrors the ts_offset and duration guards).
+    if demux_parameter.ts_offset_discont != 0 {
+        let offset = av_rescale_q(
+            demux_parameter.ts_offset_discont,
+            AV_TIME_BASE_Q,
+            (*pkt).time_base,
+        );
 
-    // apply previously-detected timestamp-discontinuity offset
-    // (to all streams, not just audio/video)
-    if (*pkt).dts != AV_NOPTS_VALUE {
-        (*pkt).dts += offset;
-    }
-    if (*pkt).pts != AV_NOPTS_VALUE {
-        (*pkt).pts += offset;
+        // apply previously-detected timestamp-discontinuity offset
+        // (to all streams, not just audio/video)
+        if (*pkt).dts != AV_NOPTS_VALUE {
+            (*pkt).dts += offset;
+        }
+        if (*pkt).pts != AV_NOPTS_VALUE {
+            (*pkt).pts += offset;
+        }
     }
 
     // detect timestamp discontinuities for audio/video
