@@ -6,7 +6,7 @@ use crossbeam_channel::{Receiver, Sender};
 use ffmpeg_sys_next::{AVCodec, AVMediaType, AVStream};
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Condvar, Mutex};
 
 /// `-shortest` frame-level sync-queue handle for one encoded-A/V stream.
@@ -14,10 +14,13 @@ use std::sync::{Arc, Condvar, Mutex};
 /// The `queue` + `sq_finished` `Arc`s are **shared** across a mux's encoder
 /// threads (all encoded-A/V members point at the same `sq_enc`); `sq_idx` is this
 /// stream's own slot. The paired `Condvar` wakes drain-phase encoders when any
-/// peer advances the queue head (see `enc_task` Architecture B).
+/// peer advances the queue head (see `enc_task` Architecture B). The
+/// `AtomicUsize` counts encoders currently parked in that drain-phase
+/// `wait_timeout`; written and read only inside `Mutex` critical sections, it
+/// lets notifiers skip the wake syscall when it reads zero.
 #[derive(Clone)]
 pub(crate) struct EncSyncHandle {
-    pub(crate) queue: Arc<(Mutex<SyncQueue<FrameBox>>, Condvar)>,
+    pub(crate) queue: Arc<(Mutex<SyncQueue<FrameBox>>, Condvar, AtomicUsize)>,
     /// This stream's slot in `sq_enc` (from `SyncQueue::add_stream`).
     pub(crate) sq_idx: usize,
     /// One flag per `sq_enc` stream; set when the engine cascade-finishes that
