@@ -5,6 +5,7 @@ use super::super::join::{
     CONT_HEADER_MAX, JOIN_REPLAY_BUDGET_BYTES, MSG_HEADER_MAX,
 };
 use super::*;
+use crate::flv::flv_tag_body::is_video_keyframe;
 use rml_rtmp::sessions::ServerSessionResult;
 
 // ---- H8: join burst (flags, budget trim, current-GOP inclusion) ----
@@ -569,4 +570,241 @@ fn serving_prefix_scan_is_incremental_and_targeted() {
     // No new entries → unchanged, cursor stable (idempotent).
     assert_eq!(scheduler.advance_serving_prefix(&results, target), 350);
     assert_eq!(scheduler.serving_prefix_scan_pos, 4);
+}
+
+// ---- freeze-time eviction of never-replayable frozen GOPs ----
+//
+// At each freeze (video-keyframe save) the ingest path drops the frozen
+// GOPs whose frozen-only wire suffix already exceeds the maximum possible
+// join budget (`evict_unreplayable_frozen`). These tests drive the REAL
+// ingest path; the direct-save fixtures used by the tests above bypass the
+// trigger on purpose, so the join-side trim stays covered independently.
+
+/// Feed `frames` through the real ingest path (freeze-time eviction runs)
+/// and return the channel's frozen-GOP count, a fresh joiner's burst and
+/// its keyframe gate.
+fn ingest_burst(frames: &[(ReceivedDataType, u32, Bytes)]) -> (usize, Vec<ServerResult>, bool) {
+    let mut scheduler = RtmpScheduler::new(10);
+    assert!(scheduler.new_channel("live".to_string(), 100));
+    for (data_type, timestamp, data) in frames {
+        feed(&mut scheduler, "live", *data_type, *timestamp, data);
+    }
+    let channel = scheduler.channels.get("live").unwrap();
+    let mut client = make_watching_client(7, "live", 1);
+    let mut out = Vec::new();
+    build_join_burst(channel, &mut client, 7, 1, 0, &mut out);
+    (
+        channel.gops.frozen_count(),
+        out,
+        client.has_received_video_keyframe,
+    )
+}
+
+/// Apply the same `frames` with direct `save_frame_data` calls — the fixture
+/// idiom of the tests above, which never runs the freeze-time eviction — and
+/// return a fresh joiner's burst plus its keyframe gate. Mirrors the ingest
+/// path's header caching; no scenario resends a changed header, so the
+/// clear-on-change path has nothing to mirror.
+fn direct_burst(frames: &[(ReceivedDataType, u32, Bytes)]) -> (Vec<ServerResult>, bool) {
+    let mut channel = MediaChannel::new(10);
+    for (data_type, timestamp, data) in frames {
+        match data_type {
+            ReceivedDataType::Video => {
+                if is_video_sequence_header(data) {
+                    channel.video_sequence_header = Some(data.clone());
+                    channel.video_timestamp = RtmpTimestamp { value: *timestamp };
+                }
+                channel.gops.save_frame_data(
+                    video_frame(*timestamp, data.clone()),
+                    is_video_keyframe(data),
+                );
+            }
+            ReceivedDataType::Audio => {
+                if is_audio_sequence_header(data) {
+                    channel.audio_sequence_header = Some(data.clone());
+                    channel.audio_timestamp = RtmpTimestamp { value: *timestamp };
+                }
+                channel
+                    .gops
+                    .save_frame_data(audio_frame(*timestamp, data.clone()), false);
+            }
+        }
+    }
+    let mut client = make_watching_client(7, "live", 1);
+    let mut out = Vec::new();
+    build_join_burst(&channel, &mut client, 7, 1, 0, &mut out);
+    (out, client.has_received_video_keyframe)
+}
+
+fn small_keyframe(marker: u8) -> Bytes {
+    Bytes::from(vec![0x17u8, 0x01, marker, 0x00, 0x00])
+}
+
+fn large_video(first: u8, second: u8, marker: u8, len: usize) -> Bytes {
+    let mut data = vec![0u8; len];
+    data[0] = first;
+    data[1] = second;
+    data[2] = marker;
+    Bytes::from(data)
+}
+
+/// Three ~400 KiB single-keyframe GOPs plus a small fourth keyframe: the
+/// 960 KiB budget covers two of them, so the pre-keyframe header GOP and
+/// GOP1 fall off the servable suffix at the fourth keyframe's freeze.
+fn trim_scenario() -> Vec<(ReceivedDataType, u32, Bytes)> {
+    let gop = |marker: u8| large_video(0x17, 0x01, marker, 400 * 1024);
+    vec![
+        (ReceivedDataType::Video, 0, Bytes::from_static(VIDEO_SEQ)),
+        (ReceivedDataType::Audio, 5, Bytes::from_static(AUDIO_SEQ)),
+        (ReceivedDataType::Video, 100, gop(1)),
+        (ReceivedDataType::Video, 200, gop(2)),
+        (ReceivedDataType::Video, 300, gop(3)),
+        (ReceivedDataType::Video, 400, small_keyframe(4)),
+    ]
+}
+
+/// Two keyframes each alone above the budget: the first one's freeze (at
+/// the second keyframe) creates a frozen GOP no join could ever replay.
+fn oversized_scenario() -> Vec<(ReceivedDataType, u32, Bytes)> {
+    let len = JOIN_REPLAY_BUDGET_BYTES + 1;
+    vec![
+        (ReceivedDataType::Video, 0, Bytes::from_static(VIDEO_SEQ)),
+        (ReceivedDataType::Audio, 5, Bytes::from_static(AUDIO_SEQ)),
+        (ReceivedDataType::Video, 100, large_video(0x17, 0x01, 1, len)),
+        (ReceivedDataType::Video, 200, large_video(0x17, 0x01, 2, len)),
+    ]
+}
+
+/// Small frozen GOPs well under the budget, then a keyframeless run growing
+/// the OPEN GOP past the whole budget: no freeze occurs, so nothing may be
+/// evicted.
+fn masked_scenario() -> Vec<(ReceivedDataType, u32, Bytes)> {
+    vec![
+        (ReceivedDataType::Video, 0, Bytes::from_static(VIDEO_SEQ)),
+        (ReceivedDataType::Audio, 5, Bytes::from_static(AUDIO_SEQ)),
+        (ReceivedDataType::Video, 100, small_keyframe(1)),
+        (ReceivedDataType::Video, 200, small_keyframe(2)),
+        (
+            ReceivedDataType::Video,
+            300,
+            large_video(0x27, 0x01, 3, JOIN_REPLAY_BUDGET_BYTES + 1),
+        ),
+    ]
+}
+
+/// Ingest twin of `join_burst_trims_whole_oldest_gops_to_the_byte_budget`:
+/// the eviction retains exactly the frozen suffix the join can serve, and
+/// the joiner's burst is unchanged.
+#[test]
+fn ingest_evicts_frozen_gops_beyond_the_join_budget_at_freeze_time() {
+    let (frozen_count, out, got_keyframe) = ingest_burst(&trim_scenario());
+
+    // The header GOP (vseq+aseq, frozen by the first keyframe) and GOP1 sit
+    // below the servable suffix once GOP3 freezes; GOP2 + GOP3 survive.
+    assert_eq!(
+        frozen_count, 2,
+        "only the join-servable frozen suffix may be retained"
+    );
+    // vseq + aseq + GOP2 + GOP3 + current: exactly what the untrimmed cache
+    // replays.
+    assert_eq!(out.len(), 5, "the burst must trim the oldest GOP entirely");
+    assert_eq!(
+        burst_flags(&out)[..2],
+        [(false, true, true), (false, true, false)],
+        "sequence headers still open the burst"
+    );
+    assert!(
+        out.iter().all(|p| !packet_contains(p, &[0x17, 0x01, 1])),
+        "no fragment of the evicted GOP1 may be replayed"
+    );
+    assert!(
+        packet_contains(&out[2], &[0x17, 0x01, 2]),
+        "the replay must start at GOP2's keyframe"
+    );
+    assert!(packet_contains(&out[3], &[0x17, 0x01, 3]));
+    assert!(packet_contains(&out[4], &[0x17, 0x01, 4]));
+    assert!(got_keyframe);
+}
+
+/// The core equivalence claim: for the same frame sequence, a joiner of the
+/// evicting ingest path and a joiner of the untrimmed direct-save cache
+/// receive byte-identical bursts — the eviction is wire-invisible.
+#[test]
+fn freeze_time_eviction_keeps_join_bursts_byte_identical() {
+    for (name, frames) in [
+        ("budget trim", trim_scenario()),
+        ("single oversized GOP", oversized_scenario()),
+        ("masked by the open GOP", masked_scenario()),
+    ] {
+        let (_, ingest_out, ingest_gate) = ingest_burst(&frames);
+        let (direct_out, direct_gate) = direct_burst(&frames);
+        assert_eq!(
+            ingest_out.len(),
+            direct_out.len(),
+            "{name}: burst packet counts diverge"
+        );
+        assert_eq!(
+            burst_flags(&ingest_out),
+            burst_flags(&direct_out),
+            "{name}: burst packet flags diverge"
+        );
+        for (i, (ingest_packet, direct_packet)) in
+            ingest_out.iter().zip(direct_out.iter()).enumerate()
+        {
+            if let (
+                ServerResult::OutboundPacket { bytes: a, .. },
+                ServerResult::OutboundPacket { bytes: b, .. },
+            ) = (ingest_packet, direct_packet)
+            {
+                assert_same_bytes(a, b, &format!("{name}: burst packet {i}"));
+            }
+        }
+        assert_eq!(ingest_gate, direct_gate, "{name}: keyframe gate diverges");
+    }
+}
+
+/// Pins the open-GOP exclusion: the open GOP's size is non-monotone (the
+/// current-GOP caps clear it on overflow), so an oversized open GOP masks
+/// the frozen history from THIS join but must never evict it — once the
+/// open GOP resets, the frozen GOPs become replayable again.
+#[test]
+fn an_over_budget_open_gop_masks_but_never_evicts_frozen_history() {
+    let (frozen_count, out, _) = ingest_burst(&masked_scenario());
+
+    assert_eq!(
+        frozen_count, 2,
+        "an oversized open GOP must not evict under-budget frozen history"
+    );
+    assert_eq!(
+        burst_flags(&out),
+        vec![(false, true, true), (false, true, false)],
+        "this join is masked down to the sequence headers"
+    );
+    assert!(
+        out.iter().all(|p| !packet_contains(p, &[0x17, 0x01, 1])),
+        "the retained GOPs are masked, not replayed"
+    );
+}
+
+/// A frozen GOP whose wire size alone exceeds the budget is evicted at its
+/// own freeze; the joiner burst degrades to sequence headers exactly as
+/// `join_burst_with_only_oversized_gops_sends_headers_only` shows for the
+/// untrimmed cache.
+#[test]
+fn a_frozen_gop_over_the_budget_alone_is_evicted_at_its_own_freeze() {
+    let (frozen_count, out, got_keyframe) = ingest_burst(&oversized_scenario());
+
+    assert_eq!(
+        frozen_count, 0,
+        "a never-replayable frozen GOP must not outlive its own freeze"
+    );
+    assert_eq!(
+        burst_flags(&out),
+        vec![(false, true, true), (false, true, false)],
+        "an oversized cache still degrades to sequence headers only"
+    );
+    assert!(
+        !got_keyframe,
+        "no keyframe was replayed, so live deltas stay gated"
+    );
 }
