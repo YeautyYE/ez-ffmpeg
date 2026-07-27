@@ -256,11 +256,102 @@ fn collect_messages(deserializer: &mut ChunkDeserializer, bytes: &[u8]) -> Vec<M
 }
 
 use rml_rtmp::chunk_io::ChunkDeserializer;
-use rml_rtmp::messages::MessagePayload;
+use rml_rtmp::messages::{MessagePayload, UserControlEventType};
 
 fn media_payload(first: u8, second: u8, marker: u8, len: usize) -> Bytes {
     let mut v = vec![marker; len.max(3)];
     v[0] = first;
     v[1] = second;
     Bytes::from(v)
+}
+
+/// The socket-ingest entry appends into a caller-owned results buffer; the
+/// reactor reuses ONE buffer for every batch, clearing it in between. Pin the
+/// append+clear contract: a reused clear-between-batches buffer must yield
+/// exactly the per-batch results of fresh per-batch Vecs. Packets are compared
+/// at wire level (type, stream id, payload) because control-packet chunk
+/// headers carry each session's own epoch-relative timestamp, which races the
+/// wall clock across two sessions.
+#[test]
+fn reused_results_buffer_batches_match_fresh_vecs() {
+    let ping_request = |echo: u32| {
+        let payload = RtmpMessage::UserControl {
+            event_type: UserControlEventType::PingRequest,
+            stream_id: None,
+            buffer_length: None,
+            timestamp: Some(RtmpTimestamp { value: echo }),
+        }
+        .into_message_payload(RtmpTimestamp { value: 0 }, 0)
+        .expect("ping payload");
+        ChunkSerializer::new()
+            .serialize(&payload, false, false)
+            .expect("ping chunk")
+            .bytes
+    };
+    // Session creation (the initial control burst), then two pings with
+    // distinct echo timestamps: any leakage of one batch's entries into the
+    // next would break the per-batch equality below.
+    let batches = [Vec::new(), ping_request(1234), ping_request(5678)];
+
+    let mut baseline = RtmpScheduler::new(10);
+    let mut twin = RtmpScheduler::new(10);
+    let mut reused = Vec::new();
+    let mut baseline_parser = ChunkDeserializer::new();
+    let mut twin_parser = ChunkDeserializer::new();
+    for (index, batch) in batches.iter().enumerate() {
+        let fresh = baseline.bytes_received(1, batch).expect("fresh-Vec batch");
+        reused.clear();
+        twin.bytes_received_with_backlog(1, batch, 0, &mut reused)
+            .expect("reused-buffer batch");
+
+        assert_eq!(
+            burst_flags(&fresh),
+            burst_flags(&reused),
+            "batch {index}: result flags diverge"
+        );
+        let fresh_packets = watcher_packets(&fresh, 1);
+        let reused_packets = watcher_packets(&reused, 1);
+        assert_eq!(
+            fresh_packets.len(),
+            fresh.len(),
+            "batch {index}: every result targets connection 1"
+        );
+        assert!(
+            !fresh_packets.is_empty(),
+            "batch {index} must produce packets for this pin to bite"
+        );
+        assert_eq!(
+            fresh_packets.iter().map(|(_, d)| *d).collect::<Vec<_>>(),
+            reused_packets.iter().map(|(_, d)| *d).collect::<Vec<_>>(),
+            "batch {index}: droppable flags diverge"
+        );
+
+        let mut fresh_wire = Vec::new();
+        for (bytes, _) in &fresh_packets {
+            fresh_wire.extend_from_slice(bytes);
+        }
+        let mut reused_wire = Vec::new();
+        for (bytes, _) in &reused_packets {
+            reused_wire.extend_from_slice(bytes);
+        }
+        let fresh_messages = collect_messages(&mut baseline_parser, &fresh_wire);
+        let reused_messages = collect_messages(&mut twin_parser, &reused_wire);
+        assert_eq!(
+            fresh_messages.len(),
+            reused_messages.len(),
+            "batch {index}: message counts diverge"
+        );
+        for (i, (a, b)) in fresh_messages
+            .iter()
+            .zip(reused_messages.iter())
+            .enumerate()
+        {
+            assert_eq!(a.type_id, b.type_id, "batch {index} message {i}: type");
+            assert_eq!(
+                a.message_stream_id, b.message_stream_id,
+                "batch {index} message {i}: stream id"
+            );
+            assert_eq!(a.data, b.data, "batch {index} message {i}: payload");
+        }
+    }
 }
