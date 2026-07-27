@@ -519,14 +519,9 @@ unsafe fn configure_output_audio_filter(
     // removes the option entirely, and it was a no-op all along — fftools
     // n8.0 dropped the call.
 
-    let mut bprint = AVBPrint {
-        str_: null_mut(),
-        len: 0,
-        size: 0,
-        size_max: 0,
-        reserved_internal_buffer: [0; 1],
-        reserved_padding: [0; 1000],
-    };
+    // Use zeroed() instead of literal init so reserved_padding
+    // matches the arch-dependent struct layout (32-bit vs 64-bit).
+    let mut bprint: AVBPrint = std::mem::zeroed();
     av_bprint_init(&mut bprint, 0, u32::MAX);
 
     choose_sample_fmts(
@@ -860,14 +855,9 @@ unsafe fn configure_output_video_filter(
         return ret;
     }
 
-    let mut bprint = AVBPrint {
-        str_: null_mut(),
-        len: 0,
-        size: 0,
-        size_max: 0,
-        reserved_internal_buffer: [0; 1],
-        reserved_padding: [0; 1000],
-    };
+    // Use zeroed() instead of literal init so reserved_padding
+    // matches the arch-dependent struct layout (32-bit vs 64-bit).
+    let mut bprint: AVBPrint = std::mem::zeroed();
     av_bprint_init(&mut bprint, 0, u32::MAX);
 
     // Use user-specified format (via -pix_fmt) if set, otherwise use encoder-supported formats
@@ -1094,14 +1084,9 @@ unsafe fn configure_input_audio_filter(
     let abuffer_str = std::ffi::CString::new("abuffer").unwrap();
     let abuffer_filter = avfilter_get_by_name(abuffer_str.as_ptr());
 
-    let mut args = AVBPrint {
-        str_: null_mut(),
-        len: 0,
-        size: 0,
-        size_max: 0,
-        reserved_internal_buffer: [0; 1],
-        reserved_padding: [0; 1000],
-    };
+    // Use zeroed() instead of literal init so reserved_padding
+    // matches the arch-dependent struct layout (32-bit vs 64-bit).
+    let mut args: AVBPrint = std::mem::zeroed();
 
     av_bprint_init(&mut args, 0, AV_BPRINT_SIZE_AUTOMATIC as u32);
     // Reject an invalid/unknown sample format instead of feeding a null into the
