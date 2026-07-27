@@ -71,6 +71,15 @@ impl InputController {
         }
     }
 
+    /// Whether the balancing pass can ever change a choke decision (more
+    /// than one demuxer). Exposed so per-packet publishers can skip
+    /// producing values only that pass reads (PERF-6 companion): when this
+    /// is `false`, `update_locked` returns before touching any `last_dts`,
+    /// so nothing ever observes the skipped stores.
+    pub(crate) fn balancing_possible(&self) -> bool {
+        self.balancing_possible
+    }
+
     pub(crate) fn update_locked(&self, scheduler_status: &Arc<AtomicUsize>) {
         // Single-input jobs have nothing to balance: the lone demuxer is always
         // eventually unchoked (via the trailing-stream unchoke or the fallback),

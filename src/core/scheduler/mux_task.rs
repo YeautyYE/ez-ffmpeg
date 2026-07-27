@@ -2653,6 +2653,12 @@ unsafe fn update_last_dts(
     scheduler_status: &Arc<AtomicUsize>,
     pkt: *const AVPacket,
 ) {
+    // last_dts is read only by the balancing pass, and update_locked is a
+    // no-op when balancing is impossible (single input). Skip the rescale
+    // and the store too: nothing can observe them (PERF-6 companion).
+    if !input_controller.balancing_possible() {
+        return;
+    }
     if (*pkt).dts != AV_NOPTS_VALUE {
         let dts = av_rescale_q(
             (*pkt).dts + (*pkt).duration,
