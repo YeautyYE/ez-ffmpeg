@@ -261,11 +261,16 @@ fn test_publish_bytes_to_nonexistent_connection() {
     let nonexistent_connection_id = 999;
 
     // Attempt to publish bytes to a connection that doesn't exist
-    let result = scheduler.publish_bytes_received(nonexistent_connection_id, vec![0x03]);
+    let mut server_results = Vec::new();
+    let result = scheduler.publish_bytes_received(
+        nonexistent_connection_id,
+        vec![0x03],
+        &mut server_results,
+    );
 
-    // Should succeed but return empty results (with warning logged)
+    // Should succeed but append no results (with warning logged)
     assert!(result.is_ok());
-    assert!(result.unwrap().is_empty());
+    assert!(server_results.is_empty());
 }
 
 #[test]
