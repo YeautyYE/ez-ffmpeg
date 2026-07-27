@@ -23,6 +23,15 @@ type FaceCache = HashMap<(String, u16, bool), Option<Arc<LoadedFace>>>;
 
 pub(crate) struct PureRenderer {
     script: Script,
+    /// Stabbing index over `script.events`, built once in `new()`: events
+    /// are immutable once the script is handed to `new()` (`lazy_track_init`
+    /// only resolves PlayRes), so the index can never go stale.
+    /// `events_by_start` holds event indices sorted by `(start_ms, index)`;
+    /// `prefix_max_end_ms[i]` is the max over `events_by_start[..=i]` of
+    /// `start_ms + duration_ms`, with overflow mapped to an `i64::MAX`
+    /// break-suppressing sentinel.
+    events_by_start: Vec<usize>,
+    prefix_max_end_ms: Vec<i64>,
     fonts: FontStore,
     opts: RenderOptions,
     frame_w: i32,
@@ -159,8 +168,31 @@ struct CacheKey {
 
 impl PureRenderer {
     pub(crate) fn new(script: Script, fonts: FontStore, opts: RenderOptions) -> Self {
+        let mut events_by_start: Vec<usize> = (0..script.events.len()).collect();
+        events_by_start.sort_unstable_by_key(|&index| (script.events[index].start_ms, index));
+        let mut prefix_max_end_ms = Vec::with_capacity(events_by_start.len());
+        let mut max_end_ms = i64::MIN;
+        for &index in &events_by_start {
+            let event = &script.events[index];
+            // Overflowing ends become an i64::MAX sentinel: "never break
+            // early past this event — let the candidate expression decide."
+            // Release builds thus stay bit-exact with the old scan: the
+            // break is only ever suppressed (extra candidate checks), and
+            // every admitted candidate evaluates the verbatim plain-`+`
+            // predicate, wrapped degenerates included. Checked builds trap
+            // at exactly the old reachability (`start_ms <= now_ms`
+            // candidates), with one structural exception: at
+            // `now_ms == i64::MAX` every prefix satisfies the break, so an
+            // overflow the old scan tripped on there resolves to the
+            // release-build answer instead. Construction never traps.
+            let end_ms = event.start_ms.checked_add(event.duration_ms).unwrap_or(i64::MAX);
+            max_end_ms = max_end_ms.max(end_ms);
+            prefix_max_end_ms.push(max_end_ms);
+        }
         Self {
             script,
+            events_by_start,
+            prefix_max_end_ms,
             fonts,
             opts,
             frame_w: 0,
@@ -231,21 +263,35 @@ impl PureRenderer {
     /// Indices of events visible at `now_ms`, in layer order (stable over
     /// ReadOrder within a layer, like libass's qsort by layer/ReadOrder).
     /// Fills the caller's buffer so the per-frame call can reuse capacity.
+    /// Candidates come from the start-sorted stabbing index: a binary
+    /// search finds the last start <= now, then a backward walk stops as
+    /// soon as the prefix max-end shows every earlier event has ended.
     fn visible_events(&self, now_ms: i64, visible: &mut Vec<usize>) {
         visible.clear();
-        visible.extend(
-            self.script
-                .events
-                .iter()
-                .enumerate()
-                .filter(|(_, event)| {
-                    now_ms >= event.start_ms && now_ms < event.start_ms + event.duration_ms
-                })
-                .map(|(index, _)| index),
-        );
-        visible.sort_by_key(|&index| {
+        // Valid partition: `events_by_start` ascends by start_ms, so
+        // `start <= now` is a monotone prefix predicate (equal starts share
+        // its value, making the index tiebreaker irrelevant here).
+        let mut pos = self
+            .events_by_start
+            .partition_point(|&index| self.script.events[index].start_ms <= now_ms);
+        while pos > 0 {
+            pos -= 1;
+            if self.prefix_max_end_ms[pos] <= now_ms {
+                // Every event at or before this position has ended.
+                break;
+            }
+            let index = self.events_by_start[pos];
             let event = &self.script.events[index];
-            (event.layer, event.read_order)
+            if now_ms < event.start_ms + event.duration_ms {
+                visible.push(index);
+            }
+        }
+        // (layer, read_order, index) is exactly the total order the old
+        // full scan emitted: it stable-sorted an ascending-index list by
+        // (layer, read_order), which keeps index order within equal pairs.
+        visible.sort_unstable_by_key(|&index| {
+            let event = &self.script.events[index];
+            (event.layer, event.read_order, index)
         });
     }
 }
@@ -634,6 +680,180 @@ mod tests {
         renderer.set_frame_size(640, 360);
         renderer.set_storage_size(640, 360);
         Some(renderer)
+    }
+
+    /// The stabbing-index query must reproduce the old full-scan output
+    /// exactly — the set AND the order — because the visible vector keys
+    /// the frame cache. Font-independent: `visible_events` never renders.
+    #[test]
+    fn visible_events_match_the_linear_scan_reference() {
+        // Overlapping windows across layers, shared starts, an early-start
+        // event spanning everything (a long prefix-max tail), zero-duration
+        // and End<Start degenerates, and a far event behind a long gap.
+        let events = concat!(
+            "Dialogue: 1,0:00:01.00,0:00:05.00,Default,,0,0,0,,A\n",
+            "Dialogue: 0,0:00:02.00,0:00:06.00,Default,,0,0,0,,B\n",
+            "Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,C\n",
+            "Dialogue: 1,0:00:02.50,0:00:04.00,Default,,0,0,0,,D\n",
+            "Dialogue: 0,0:00:03.00,0:00:03.00,Default,,0,0,0,,zero duration\n",
+            "Dialogue: 0,0:00:04.00,0:00:02.00,Default,,0,0,0,,End before Start\n",
+            "Dialogue: 2,0:00:00.50,0:00:10.00,Default,,0,0,0,,spans everything\n",
+            "Dialogue: 0,0:00:20.00,0:00:21.00,Default,,0,0,0,,after the gap\n",
+        );
+        let mut script = ass::parse(&test_util::minimal_ass(events)).expect("parse");
+        // Duplicate (layer, read_order) pair: the old stable sort kept such
+        // ties in index order, which the index tiebreaker must reproduce.
+        script.events[1].read_order = script.events[2].read_order;
+        assert_eq!(script.events[1].layer, script.events[2].layer);
+        let renderer = PureRenderer::new(script, FontStore::new(false), RenderOptions::default());
+
+        // The replaced implementation, verbatim: filter in index order,
+        // stable sort by (layer, read_order).
+        let reference = |now_ms: i64| -> Vec<usize> {
+            let script = renderer.script();
+            let mut visible: Vec<usize> = script
+                .events
+                .iter()
+                .enumerate()
+                .filter(|(_, event)| {
+                    now_ms >= event.start_ms && now_ms < event.start_ms + event.duration_ms
+                })
+                .map(|(index, _)| index)
+                .collect();
+            visible.sort_by_key(|&index| {
+                let event = &script.events[index];
+                (event.layer, event.read_order)
+            });
+            visible
+        };
+
+        let mut visible = Vec::new();
+        for now_ms in [
+            i64::MIN, // long before everything
+            -1,
+            0, // before the first start
+            499,
+            500, // == the earliest start
+            999,
+            1_000, // start shared by two events
+            1_001,
+            2_000,
+            2_500, // deepest overlap
+            2_999,
+            3_000, // == an end, == the zero-duration start
+            3_999,
+            4_000, // == an end, == the End<Start event's start
+            4_999, // last covered millisecond of an event
+            5_000, // == an end
+            5_999,
+            6_000,
+            9_999,
+            10_000, // everything before the gap has ended
+            15_000, // mid-gap
+            20_000, // last event's start
+            20_999,
+            21_000, // == the last end
+            25_000, // after everything
+            i64::MAX,
+        ] {
+            renderer.visible_events(now_ms, &mut visible);
+            assert_eq!(visible, reference(now_ms), "now_ms = {now_ms}");
+        }
+    }
+
+    /// A parsed extreme like `start_ms = i64::MAX` must not overflow index
+    /// construction: the old scan reached `start + duration` only after
+    /// `now >= start` short-circuited, so such an event was inert for every
+    /// query below its start — the eager prefix pass has to stay inert too
+    /// (checked add, overflow to the break-suppressing sentinel), and those
+    /// queries must keep matching the old output.
+    #[test]
+    fn extreme_start_event_keeps_construction_and_queries_inert() {
+        let events = concat!(
+            "Dialogue: 0,0:00:01.00,0:00:05.00,Default,,0,0,0,,normal\n",
+            "Dialogue: 0,0:00:02.00,0:00:06.00,Default,,0,0,0,,poisoned below\n",
+        );
+        let mut script = ass::parse(&test_util::minimal_ass(events)).expect("parse");
+        script.events[1].start_ms = i64::MAX;
+        script.events[1].duration_ms = 1;
+        // The prefix pass visits every event, including this one no query in
+        // the loop below can admit — construction itself is the regression.
+        let renderer = PureRenderer::new(script, FontStore::new(false), RenderOptions::default());
+
+        // The replaced implementation, verbatim; its short-circuit keeps the
+        // poisoned addition unreached for every now_ms tested here.
+        let reference = |now_ms: i64| -> Vec<usize> {
+            let script = renderer.script();
+            let mut visible: Vec<usize> = script
+                .events
+                .iter()
+                .enumerate()
+                .filter(|(_, event)| {
+                    now_ms >= event.start_ms && now_ms < event.start_ms + event.duration_ms
+                })
+                .map(|(index, _)| index)
+                .collect();
+            visible.sort_by_key(|&index| {
+                let event = &script.events[index];
+                (event.layer, event.read_order)
+            });
+            visible
+        };
+
+        let mut visible = Vec::new();
+        for now_ms in [i64::MIN, -1, 0, 1_000, 3_000, 5_999, 6_000, 100_000] {
+            renderer.visible_events(now_ms, &mut visible);
+            assert_eq!(visible, reference(now_ms), "now_ms = {now_ms}");
+        }
+
+        // The one deliberate checked-build delta: at now == i64::MAX every
+        // prefix satisfies the break, so the overflowing addition the old
+        // scan evaluated there (a trap under overflow checks) resolves to
+        // the answer the wrapped arithmetic always produced in release
+        // builds — empty, since every real event has long ended. Asserted
+        // directly because the verbatim reference cannot run this point
+        // under checked math.
+        renderer.visible_events(i64::MAX, &mut visible);
+        assert!(visible.is_empty(), "every event has ended or wrapped away");
+    }
+
+    /// Trap-reachability parity everywhere below `i64::MAX`: the overflow
+    /// sentinel suppresses the early break at and above the poisoned
+    /// position, so the walk still evaluates the overflowing candidate the
+    /// old scan evaluated — and traps at the same expression under checked
+    /// math. Gated on `debug_assertions`, which tracks the default
+    /// overflow-checks pairing.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "overflow")]
+    fn overflowing_candidate_still_traps_below_max_under_checked_math() {
+        let events = "Dialogue: 0,0:00:01.00,0:00:05.00,Default,,0,0,0,,normal\n";
+        let mut script = ass::parse(&test_util::minimal_ass(events)).expect("parse");
+        script.events[0].start_ms = i64::MAX - 1;
+        script.events[0].duration_ms = 2;
+        let renderer = PureRenderer::new(script, FontStore::new(false), RenderOptions::default());
+        let mut visible = Vec::new();
+        renderer.visible_events(i64::MAX - 1, &mut visible);
+    }
+
+    /// Downward wrap: `start_ms = i64::MIN` with a negative duration wraps
+    /// the end to `i64::MAX` in release builds, which made the event visible
+    /// under the old scan for every `now_ms` — the overflow sentinel keeps
+    /// that candidate reachable, so the verbatim predicate reproduces the
+    /// wrap. Under checked math, queries below `i64::MAX` trapped before
+    /// this change and still do, identically, at the same expression — so
+    /// construction is all that can be exercised here.
+    #[test]
+    fn downward_wrapping_event_still_constructs() {
+        let events = concat!(
+            "Dialogue: 0,0:00:01.00,0:00:05.00,Default,,0,0,0,,normal\n",
+            "Dialogue: 0,0:00:02.00,0:00:06.00,Default,,0,0,0,,poisoned below\n",
+        );
+        let mut script = ass::parse(&test_util::minimal_ass(events)).expect("parse");
+        script.events[1].start_ms = i64::MIN;
+        script.events[1].duration_ms = -1;
+        let renderer = PureRenderer::new(script, FontStore::new(false), RenderOptions::default());
+        drop(renderer);
     }
 
     #[test]
