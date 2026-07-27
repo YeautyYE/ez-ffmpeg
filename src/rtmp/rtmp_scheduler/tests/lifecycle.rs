@@ -395,3 +395,60 @@ fn test_invalid_stream_key_warning() {
     // Channel should not be created
     assert!(!scheduler.channels.contains_key(&stream_key));
 }
+
+// The per-tag fanout walks `watching_client_ids` at table CAPACITY,
+// not len, so a flash crowd that decays must not leave every later tag
+// paying for the historical peak. The guarded shrink at the single
+// membership-removal site (`play_ended`) has to walk the capacity back
+// down once occupancy drops below a quarter — without disturbing delivery
+// to the watchers that remain.
+#[test]
+fn watcher_set_capacity_shrinks_after_watcher_churn() {
+    let mut scheduler = RtmpScheduler::new(1);
+    let stream_key = "shrink_stream";
+    let publisher_connection_id = 1;
+    assert!(scheduler.new_channel(stream_key.to_string(), publisher_connection_id));
+
+    // Flash crowd: 512 distinct watchers join, growing the table well
+    // past the shrink floor.
+    let first_watcher = 100;
+    let watcher_count = 512;
+    for connection_id in first_watcher..first_watcher + watcher_count {
+        play(&mut scheduler, connection_id, stream_key);
+    }
+    let channel = scheduler.channels.get(stream_key).unwrap();
+    assert_eq!(channel.watching_client_ids.len(), watcher_count);
+    let peak_capacity = channel.watching_client_ids.capacity();
+    assert!(
+        peak_capacity > WATCHER_SET_SHRINK_MIN_CAPACITY,
+        "512 watchers must grow the table past the shrink floor, got {peak_capacity}"
+    );
+
+    // The crowd decays to one survivor; every leave funnels through
+    // `play_ended`, so the opportunistic shrink runs on the way down.
+    let survivor_connection_id = first_watcher;
+    for connection_id in first_watcher + 1..first_watcher + watcher_count {
+        scheduler.notify_connection_closed(connection_id);
+    }
+    let channel = scheduler.channels.get(stream_key).unwrap();
+    assert_eq!(channel.watching_client_ids.len(), 1);
+    let decayed_capacity = channel.watching_client_ids.capacity();
+    assert!(
+        decayed_capacity < WATCHER_SET_SHRINK_MIN_CAPACITY,
+        "decayed watcher set must shrink below the floor, got {decayed_capacity}"
+    );
+
+    // Fanout must be intact across the rehash: the survivor still
+    // receives media.
+    let results = feed_video(&mut scheduler, stream_key, 0, KEYFRAME);
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            ServerResult::OutboundPacket {
+                target_connection_id,
+                ..
+            } if *target_connection_id == survivor_connection_id
+        )),
+        "survivor must still receive the keyframe after the shrink"
+    );
+}
