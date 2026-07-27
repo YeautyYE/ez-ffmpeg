@@ -86,23 +86,18 @@ impl RtmpScheduler {
     ) -> Result<Vec<ServerResult>, SchedulerError> {
         let mut server_results = Vec::new();
 
-        if !self
-            .publisher_to_client_map
-            .contains_key(&publisher_connection_id)
-        {
+        // Single lookup: the map hit both gates this call and names the
+        // client (the old contains_key + get pair walked the map twice).
+        let Some(&client_id) = self.publisher_to_client_map.get(&publisher_connection_id) else {
             warn!(
                 "Publishing event for non-existent connection_id: {}",
                 publisher_connection_id
             );
             return Ok(server_results);
-        }
+        };
 
         let publisher_results = {
-            let client_id = self
-                .publisher_to_client_map
-                .get(&publisher_connection_id)
-                .unwrap();
-            let client = self.clients.get_mut(*client_id).unwrap();
+            let client = self.clients.get_mut(client_id).unwrap();
             let publisher_results: Vec<ServerSessionResult> =
                 match client.session.handle_input(&bytes) {
                     Ok(results) => results,
@@ -295,34 +290,39 @@ impl RtmpScheduler {
         self.serving_prefix_bytes = 0;
         let mut server_results = Vec::new();
 
-        if !self.connection_to_client_map.contains_key(&connection_id) {
-            let config = ServerSessionConfig::new();
-            let (session, initial_session_results) = match ServerSession::new(config) {
-                Ok(results) => results,
-                Err(error) => return Err(error.into()),
-            };
+        // Single lookup, copied out at once: handle_session_results below
+        // needs &mut self, so a held map borrow would not compile — and the
+        // old contains_key + get pair paid the hash walk twice per batch.
+        let client_id = match self.connection_to_client_map.get(&connection_id).copied() {
+            Some(id) => id,
+            None => {
+                let config = ServerSessionConfig::new();
+                let (session, initial_session_results) = match ServerSession::new(config) {
+                    Ok(results) => results,
+                    Err(error) => return Err(error.into()),
+                };
 
-            self.handle_session_results(
-                connection_id,
-                initial_session_results,
-                &mut server_results,
-            );
-            let client = Client {
-                session,
-                connection_id,
-                current_action: ClientAction::Waiting,
-                has_received_video_keyframe: false,
-            };
+                self.handle_session_results(
+                    connection_id,
+                    initial_session_results,
+                    &mut server_results,
+                );
+                let client = Client {
+                    session,
+                    connection_id,
+                    current_action: ClientAction::Waiting,
+                    has_received_video_keyframe: false,
+                };
 
-            let client_id = Some(self.clients.insert(client));
-            self.connection_to_client_map
-                .insert(connection_id, client_id.unwrap());
-        }
+                let client_id = self.clients.insert(client);
+                self.connection_to_client_map.insert(connection_id, client_id);
+                client_id
+            }
+        };
 
         let client_results: Vec<ServerSessionResult>;
         {
-            let client_id = self.connection_to_client_map.get(&connection_id).unwrap();
-            let client = self.clients.get_mut(*client_id).unwrap();
+            let client = self.clients.get_mut(client_id).unwrap();
             client_results = match client.session.handle_input(bytes) {
                 Ok(results) => results,
                 Err(error) => return Err(error.into()),
