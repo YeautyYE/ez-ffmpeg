@@ -2032,14 +2032,21 @@ unsafe fn encode_frame(
 
         (*pkt).time_base = (*enc_ctx).time_base;
 
+        // A drain iteration that yields no packet (EAGAIN/EOF) or errors out must
+        // return the freshly-fetched shell to the pool; dropping it here frees the
+        // AVPacket and starves the shared pool at one shell per encoded frame
+        // (every encode ends on an EAGAIN probe). Mirrors the flush drain above.
         if ret == AVERROR(EAGAIN) {
+            packet_pool.release(packet);
             return Ok(false);
         } else if ret < 0 {
             if ret == AVERROR_EOF {
                 trace!("EOF reached. No more packets to receive.");
+                packet_pool.release(packet);
                 return Ok(true);
             }
             error!("{:?} encoding failed", (*enc_ctx).codec_type);
+            packet_pool.release(packet);
             return Err(Encoding(EncodingOperationError::ReceivePacketError(
                 EncodingError::from(ret),
             )));
