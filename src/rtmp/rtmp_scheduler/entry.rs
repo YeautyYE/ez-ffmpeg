@@ -83,9 +83,8 @@ impl RtmpScheduler {
         &mut self,
         publisher_connection_id: usize,
         bytes: Vec<u8>,
-    ) -> Result<Vec<ServerResult>, SchedulerError> {
-        let mut server_results = Vec::new();
-
+        server_results: &mut Vec<ServerResult>,
+    ) -> Result<(), SchedulerError> {
         // Single lookup: the map hit both gates this call and names the
         // client (the old contains_key + get pair walked the map twice).
         let Some(&client_id) = self.publisher_to_client_map.get(&publisher_connection_id) else {
@@ -93,7 +92,7 @@ impl RtmpScheduler {
                 "Publishing event for non-existent connection_id: {}",
                 publisher_connection_id
             );
-            return Ok(server_results);
+            return Ok(());
         };
 
         let publisher_results = {
@@ -112,7 +111,7 @@ impl RtmpScheduler {
         // would discard those results — stranding the watcher's finish status and
         // forcing abort_publisher_watchers to double-finalize an already-Completed
         // watcher session. Rejecting up front keeps every watcher side effect out
-        // of a batch that is going to abort (server_results stays empty here).
+        // of a batch that is going to abort (nothing is appended to server_results here).
         for result in &publisher_results {
             if let ServerSessionResult::RaisedEvent(event) = result {
                 if let Some(err) = oversized_sequence_header_error(event) {
@@ -137,7 +136,7 @@ impl RtmpScheduler {
                         // `?` routes an oversized-sequence-header abort out of
                         // publish_bytes_received; the reactor then removes this
                         // misbehaving publisher (the existing abort path).
-                        self.handle_raised_event(usize::MAX, event, &mut server_results)?;
+                        self.handle_raised_event(usize::MAX, event, server_results)?;
                     }
                     ServerSessionEvent::ConnectionRequested {
                         request_id,
@@ -182,7 +181,7 @@ impl RtmpScheduler {
             }
         }
 
-        Ok(server_results)
+        Ok(())
     }
 
     /// Direct in-process media ingest (PERF-5a serialize-bypass).
@@ -200,15 +199,17 @@ impl RtmpScheduler {
     /// Only tag types `0x08` (audio) and `0x09` (video) are delivered here;
     /// metadata (`0x12`) and control messages stay on the byte path because
     /// they require AMF parsing / session state.
+    ///
+    /// Results are appended to `server_results`; the caller owns clearing and
+    /// draining the buffer.
     pub(in crate::rtmp) fn publish_media_received(
         &mut self,
         publisher_connection_id: usize,
         tag_type: u8,
         timestamp: RtmpTimestamp,
         data: Bytes,
-    ) -> Vec<ServerResult> {
-        let mut server_results = Vec::new();
-
+        server_results: &mut Vec<ServerResult>,
+    ) {
         let data_type = match tag_type {
             0x08 => ReceivedDataType::Audio,
             0x09 => ReceivedDataType::Video,
@@ -216,7 +217,7 @@ impl RtmpScheduler {
                 // Only audio/video tags are bypassed; anything else is a
                 // caller bug (metadata and control must stay on the byte path).
                 warn!("In-process media bypass received unexpected FLV tag type {other:#04x}");
-                return server_results;
+                return;
             }
         };
 
@@ -227,7 +228,7 @@ impl RtmpScheduler {
                     "In-process media for non-existent publisher connection_id: {}",
                     publisher_connection_id
                 );
-                return server_results;
+                return;
             }
         };
 
@@ -239,10 +240,10 @@ impl RtmpScheduler {
                         "In-process media for a publisher not in the Publishing state: {}",
                         publisher_connection_id
                     );
-                    return server_results;
+                    return;
                 }
             },
-            None => return server_results,
+            None => return,
         };
 
         // The oversized-sequence-header bound (F2) lives on the untrusted socket
@@ -256,10 +257,8 @@ impl RtmpScheduler {
             timestamp,
             data,
             data_type,
-            &mut server_results,
+            server_results,
         );
-
-        server_results
     }
 
     // The production reactor always supplies a real write-queue backlog via

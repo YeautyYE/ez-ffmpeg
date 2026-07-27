@@ -53,12 +53,15 @@ fn feed_media(
     timestamp: u32,
     data: &'static [u8],
 ) -> Vec<ServerResult> {
+    let mut results = Vec::new();
     scheduler.publish_media_received(
         publisher_conn,
         tag_type,
         RtmpTimestamp { value: timestamp },
         Bytes::from_static(data),
-    )
+        &mut results,
+    );
+    results
 }
 
 const VIDEO_SEQ: &[u8] = &[0x17, 0x00, 0x00, 0x00, 0x00, 0x01, 0x64];
