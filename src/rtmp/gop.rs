@@ -188,6 +188,19 @@ impl Gops {
         self.current_bytes = 0;
     }
 
+    /// Drop the `count` oldest frozen GOPs (front of the deque), keeping the
+    /// newer ones and the open GOP untouched. `count` is clamped to the
+    /// number of frozen GOPs, so over-asking is safe.
+    ///
+    /// This is only the mechanism: the byte-budget policy deciding WHICH
+    /// GOPs can never be replayed lives with the scheduler's join logic
+    /// (`evict_unreplayable_frozen`), next to the join-replay budget it
+    /// reuses. The count-based `pop_front` in `save_frame_data` stays as the
+    /// `max_gops` upper bound on top of it.
+    pub(crate) fn remove_oldest_frozen(&mut self, count: usize) {
+        self.frozen.drain(..count.min(self.frozen.len()));
+    }
+
     /// Get reference iterator for all frozen GOPs (test only)
     #[cfg(test)]
     #[allow(dead_code)]
@@ -318,6 +331,37 @@ mod tests {
 
         // Oldest GOP should be removed
         assert_eq!(gops.frozen_count(), 2);
+    }
+
+    #[test]
+    fn remove_oldest_frozen_drains_the_front_and_saturates() {
+        let mut gops = Gops::new(4);
+
+        // Three frozen GOPs (k1, k2, k3), the fourth keyframe stays current.
+        gops.save_frame_data(make_video_frame(0, b"k1"), true);
+        gops.save_frame_data(make_video_frame(33, b"k2"), true);
+        gops.save_frame_data(make_video_frame(66, b"k3"), true);
+        gops.save_frame_data(make_video_frame(100, b"k4"), true);
+        assert_eq!(gops.frozen_count(), 3);
+
+        // count 0 is a no-op.
+        gops.remove_oldest_frozen(0);
+        assert_eq!(gops.frozen_count(), 3);
+
+        // Removes exactly N oldest, preserving the order of the survivors.
+        gops.remove_oldest_frozen(2);
+        assert_eq!(gops.frozen_count(), 1);
+        let survivor: Vec<_> = gops.get_frozen_gops().collect();
+        match &survivor[0].frames()[0] {
+            FrameData::Video { data, .. } => assert_eq!(data.as_ref(), b"k3"),
+            FrameData::Audio { .. } => panic!("expected the k3 video frame"),
+        }
+        assert_eq!(gops.current_frame_count(), 1, "the open GOP is untouched");
+
+        // count > len saturates instead of panicking.
+        gops.remove_oldest_frozen(10);
+        assert_eq!(gops.frozen_count(), 0);
+        assert_eq!(gops.current_frame_count(), 1);
     }
 
     #[test]
