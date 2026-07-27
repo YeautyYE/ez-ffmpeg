@@ -692,6 +692,33 @@ fn masked_scenario() -> Vec<(ReceivedDataType, u32, Bytes)> {
     ]
 }
 
+/// Three ~400 KiB single-keyframe GOPs, then a ~300 KiB keyframe whose freeze
+/// fires the eviction while the open GOP it just started is itself
+/// size-significant, then two deltas growing that open GOP without another
+/// freeze (0x27 is not a keyframe). At the fourth keyframe's freeze the
+/// frozen-only suffix GOP3+GOP2 (~801 KiB wire) fits the 960 KiB budget and
+/// adding GOP1 overflows it, so exactly the header GOP and GOP1 are evicted;
+/// a predicate that also counted the ~300 KiB open GOP would already overflow
+/// at GOP2 and cut one GOP deeper.
+fn open_gop_evict_scenario() -> Vec<(ReceivedDataType, u32, Bytes)> {
+    let gop = |marker: u8| large_video(0x17, 0x01, marker, 400 * 1024);
+    let delta = |marker: u8| large_video(0x27, 0x01, marker, 10 * 1024);
+    vec![
+        (ReceivedDataType::Video, 0, Bytes::from_static(VIDEO_SEQ)),
+        (ReceivedDataType::Audio, 5, Bytes::from_static(AUDIO_SEQ)),
+        (ReceivedDataType::Video, 100, gop(1)),
+        (ReceivedDataType::Video, 200, gop(2)),
+        (ReceivedDataType::Video, 300, gop(3)),
+        (
+            ReceivedDataType::Video,
+            400,
+            large_video(0x17, 0x01, 4, 300 * 1024),
+        ),
+        (ReceivedDataType::Video, 433, delta(5)),
+        (ReceivedDataType::Video, 466, delta(6)),
+    ]
+}
+
 /// Ingest twin of `join_burst_trims_whole_oldest_gops_to_the_byte_budget`:
 /// the eviction retains exactly the frozen suffix the join can serve, and
 /// the joiner's burst is unchanged.
@@ -726,6 +753,70 @@ fn ingest_evicts_frozen_gops_beyond_the_join_budget_at_freeze_time() {
     assert!(got_keyframe);
 }
 
+/// The eviction predicate is computed over the FROZEN GOPs alone, pinned
+/// where it matters: an eviction that FIRES while the open GOP is itself
+/// size-significant. At the fourth keyframe's freeze the frozen-only suffix
+/// keeps GOP2+GOP3; a predicate that also counted the ~300 KiB open GOP
+/// would push GOP2 past the budget and evict it too (frozen_count 1, not
+/// 2), while a missing eviction would leave all 4. The open GOP must
+/// survive untouched and replay verbatim to a joiner.
+#[test]
+fn eviction_fires_while_the_open_gop_carries_frames() {
+    let mut scheduler = RtmpScheduler::new(10);
+    assert!(scheduler.new_channel("live".to_string(), 100));
+    for (data_type, timestamp, data) in &open_gop_evict_scenario() {
+        feed(&mut scheduler, "live", *data_type, *timestamp, data);
+    }
+
+    let channel = scheduler.channels.get("live").unwrap();
+    // Exactly the unreplayable prefix (header GOP + GOP1) was evicted.
+    assert_eq!(
+        channel.gops.frozen_count(),
+        2,
+        "the eviction cut must be decided by the frozen-only suffix"
+    );
+    // The open GOP is untouched: the firing keyframe plus both deltas.
+    assert_eq!(
+        channel.gops.current_frames().len(),
+        3,
+        "eviction must never touch the open GOP"
+    );
+
+    let mut client = make_watching_client(7, "live", 1);
+    let mut out = Vec::new();
+    build_join_burst(channel, &mut client, 7, 1, 0, &mut out);
+
+    // vseq + aseq + GOP3 + the whole open GOP. GOP2 stays cached but is
+    // masked from THIS join: the join-time size list appends the open GOP,
+    // and ~320 KiB open + GOP3 pushes GOP2 past the budget — the documented
+    // conservative gap between the eviction and the join-time trim.
+    assert_eq!(out.len(), 6, "headers + GOP3 + open GOP (kf4, d5, d6)");
+    assert_eq!(
+        burst_flags(&out)[..2],
+        [(false, true, true), (false, true, false)],
+        "sequence headers still open the burst"
+    );
+    assert!(
+        out.iter().all(|p| !packet_contains(p, &[0x17, 0x01, 1])),
+        "no fragment of the evicted GOP1 may be replayed"
+    );
+    assert!(
+        out.iter().all(|p| !packet_contains(p, &[0x17, 0x01, 2])),
+        "the retained GOP2 is masked from this join, not replayed"
+    );
+    assert!(
+        packet_contains(&out[2], &[0x17, 0x01, 3]),
+        "the replay must start at GOP3's keyframe"
+    );
+    assert!(
+        packet_contains(&out[3], &[0x17, 0x01, 4]),
+        "the open GOP's keyframe must be replayed"
+    );
+    assert!(packet_contains(&out[4], &[0x27, 0x01, 5]));
+    assert!(packet_contains(&out[5], &[0x27, 0x01, 6]));
+    assert!(client.has_received_video_keyframe);
+}
+
 /// The core equivalence claim: for the same frame sequence, a joiner of the
 /// evicting ingest path and a joiner of the untrimmed direct-save cache
 /// receive byte-identical bursts — the eviction is wire-invisible.
@@ -735,6 +826,10 @@ fn freeze_time_eviction_keeps_join_bursts_byte_identical() {
         ("budget trim", trim_scenario()),
         ("single oversized GOP", oversized_scenario()),
         ("masked by the open GOP", masked_scenario()),
+        (
+            "evicting freeze with a populated open GOP",
+            open_gop_evict_scenario(),
+        ),
     ] {
         let (_, ingest_out, ingest_gate) = ingest_burst(&frames);
         let (direct_out, direct_gate) = direct_burst(&frames);
