@@ -292,6 +292,44 @@ fn pipeline_init(
     Ok(())
 }
 
+// Wait interval while some polled filter reports pending output: the
+// request_frame sweep is the only way that output gets delivered, so it must
+// run at a millisecond cadence. (The OS decides what "1ms" means: Windows
+// timer granularity and loaded schedulers stretch it — see
+// `poll_wait_interval`'s tests for why the cadence is pinned by VALUE.)
+const PENDING_POLL_INTERVAL: Duration = Duration::from_millis(1);
+// Wait interval when nothing is pending. Long enough to idle cheaply; short
+// enough to re-check STATUS_END if a stop ever fails to disconnect the
+// source. recv returns immediately when a frame arrives, so active
+// throughput is unaffected. This is also the bound on how long a filter that
+// misreports "no pending output" can delay its own frames: the sweep still
+// runs on every wake.
+const IDLE_RECV_INTERVAL: Duration = Duration::from_millis(100);
+
+/// The wait interval for the pipeline loop's next park, re-derived before
+/// every park: the millisecond cadence exactly while some un-capped polled
+/// filter reports pending output (only the sweep can deliver it), the long
+/// safety-net interval otherwise — an EOF-capped filter is excluded because
+/// the sweep skips it anyway, and an all-`Never` pipeline (empty
+/// `poll_indices`) always parks long. Unit tests pin this choice by exact
+/// interval VALUE: which of the two constants the loop parks on is the
+/// portable property, while the wall-clock rate a park interval turns into
+/// is up to the OS (Windows timer granularity, macOS coalescing under load).
+fn poll_wait_interval(
+    pipeline: &FramePipeline,
+    poll_indices: &[usize],
+    eof_capped: &[bool],
+) -> Duration {
+    if poll_indices
+        .iter()
+        .any(|&i| !eof_capped[i] && pipeline.request_frame_pending_at(i))
+    {
+        PENDING_POLL_INTERVAL
+    } else {
+        IDLE_RECV_INTERVAL
+    }
+}
+
 fn run_pipeline(
     pipeline: &mut FramePipeline,
     frame_receiver: Receiver<FrameBox>,
@@ -325,17 +363,6 @@ fn run_pipeline(
     // source frame re-arms the chain (stream_loop: the next segment's frames
     // flow and its end-of-stream cues the chain again).
     let mut eof_capped = vec![false; pipeline.filters.len()];
-    // Wait interval while some polled filter reports pending output: the
-    // request_frame sweep below is the only way that output gets delivered,
-    // so it must run at a millisecond cadence.
-    const PENDING_POLL_INTERVAL: Duration = Duration::from_millis(1);
-    // Wait interval when nothing is pending. Long enough to idle cheaply;
-    // short enough to re-check STATUS_END if a stop ever fails to disconnect
-    // the source. recv returns immediately when a frame arrives, so active
-    // throughput is unaffected. This is also the bound on how long a filter
-    // that misreports "no pending output" can delay its own frames: the
-    // sweep still runs on every wake.
-    const IDLE_RECV_INTERVAL: Duration = Duration::from_millis(100);
 
     loop {
         // is_stopping() covers STATUS_ABORT as well as STATUS_END, so an abort
@@ -350,25 +377,13 @@ fn run_pipeline(
         }
 
         if !src_finished_flag {
-            // Re-derived every pass: the 1ms cadence is needed exactly while
-            // some un-capped polled filter reports pending output, because
-            // only the sweep below can deliver it. When every polled filter
-            // is idle (or EOF-capped — the sweep skips those anyway), this
-            // blocks like a non-polling pipeline. That park cannot swallow a
-            // wake: a filter only LEAVES the idle state inside a
-            // `filter_frame` call on this very thread, and the frame that
-            // triggers that call wakes recv immediately — so there is no
-            // moment where output is pending while the loop still holds an
-            // idle verdict. An all-`Never` pipeline has no poll indices and
-            // degenerates to the idle interval, as before.
-            let recv_interval = if poll_indices
-                .iter()
-                .any(|&i| !eof_capped[i] && pipeline.request_frame_pending_at(i))
-            {
-                PENDING_POLL_INTERVAL
-            } else {
-                IDLE_RECV_INTERVAL
-            };
+            // Re-derived every pass (see `poll_wait_interval` for the rule).
+            // That park cannot swallow a wake: a filter only LEAVES the idle
+            // state inside a `filter_frame` call on this very thread, and
+            // the frame that triggers that call wakes recv immediately — so
+            // there is no moment where output is pending while the loop
+            // still holds an idle verdict.
+            let recv_interval = poll_wait_interval(pipeline, &poll_indices, &eof_capped);
             let result = frame_receiver.recv_timeout(recv_interval);
             match result {
                 Err(e) => {
@@ -916,7 +931,7 @@ fn frame_filter_init(pipeline: &mut FramePipeline) -> crate::error::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::filter::frame_filter::{FrameFilter, FrameFilterError};
+    use crate::core::filter::frame_filter::{FrameFilter, FrameFilterError, RequestFrameMode};
     use crate::core::filter::frame_filter_context::FrameFilterContext;
     use crate::core::scheduler::ffmpeg_scheduler::{
         frame_is_null, unref_frame, STATUS_END, STATUS_RUN,
@@ -1232,13 +1247,16 @@ mod tests {
 
         // Idle window, measured from a proven-running loop: the source
         // stays connected but sends nothing. The lower bound proves the
-        // parked loop keeps sweeping on every park expiry; the ceiling
-        // proves those expiries come at the long interval. The ceiling
-        // must stay BELOW the pending test's floor (both scaled to a
-        // common rate) — overlapping bands would let one uniform
-        // mid-cadence regression pass both tests. 20 sweeps per 400ms
-        // caps the accepted rate at 50/s: 5x above the true ~10/s park
-        // rate for jitter margin, 4x below the pending floor's 200/s.
+        // parked loop keeps sweeping on every park expiry. The ceiling —
+        // 20 sweeps per 400ms, 5x the true ~4-per-window park rate for
+        // jitter margin — catches a loop wrongly polling at the
+        // millisecond cadence wherever the OS delivers that cadence
+        // faster than the ceiling (CI observed ~25-400 per
+        // 400ms-equivalent on Linux and Windows; one loaded macOS runner
+        // stretched it to ~12, under the ceiling, where the wall clock
+        // cannot discriminate). The interval CHOICE itself is pinned
+        // platform-independently by
+        // `wait_interval_derivation_pins_the_exact_intervals`.
         let baseline = h.await_first_sweep();
         std::thread::sleep(Duration::from_millis(400));
         let idle_polls = h.polls.load(Ordering::SeqCst) - baseline;
@@ -1324,11 +1342,16 @@ mod tests {
     // The flip side of the idle park: a filter reporting pending output must
     // keep the millisecond drain cadence — delayed asynchronous results (the
     // GPU pipeline's readbacks) rely on it for prompt delivery. Measured
-    // from a proven-running loop. The floor must stay ABOVE the idle test's
-    // ceiling (both scaled to a common rate): 120 sweeps per 600ms sets the
-    // minimum accepted rate at 200/s — 5x below the true ~1000/s cadence
-    // for loaded-runner margin, 4x above the idle ceiling's 50/s — so one
-    // uniform mid-cadence regression cannot pass both tests.
+    // from a proven-running loop. What "1ms" turns into on a wall clock is
+    // the OS's call, and CI showed the full spread: ~600 sweeps per 600ms
+    // on Linux, 37 under Windows arm64 timer granularity, down to 18 on a
+    // loaded macOS runner — so no portable floor can also sit above the
+    // idle test's ceiling. This floor therefore discriminates only against
+    // the one reachable regression, a pipeline parking at the idle
+    // interval despite pending output (~6 sweeps per 600ms; 12 is 2x
+    // that); which of the two interval VALUES the loop parks on — the
+    // property a rate can only proxy — is pinned platform-independently by
+    // `wait_interval_derivation_pins_the_exact_intervals`.
     #[test]
     fn pending_hint_keeps_the_millisecond_drain_cadence() {
         let h = spawn_poll_loop(true, 0);
@@ -1337,11 +1360,174 @@ mod tests {
         std::thread::sleep(Duration::from_millis(600));
         let polls = h.polls.load(Ordering::SeqCst) - baseline;
         assert!(
-            polls >= 120,
-            "a pending-output pipeline no longer sweeps at the poll cadence: \
+            polls >= 12,
+            "a pending-output pipeline is parking at the idle interval: \
              only {polls} request_frame calls in 600ms"
         );
 
         finish(h);
+    }
+
+    /// A `RequestFrameMode::Never` filter for the derivation truth table:
+    /// excluded from `poll_indices`, so the wait derivation must never ask
+    /// it for pending state — asking IS a derivation bug (an
+    /// iterate-all-filters form instead of the polled set), hence the
+    /// panic rather than a return value.
+    struct NeverProbe;
+
+    impl FrameFilter for NeverProbe {
+        fn media_type(&self) -> AVMediaType {
+            AVMediaType::AVMEDIA_TYPE_VIDEO
+        }
+
+        fn filter_frame(
+            &mut self,
+            frame: Frame,
+            _ctx: &mut FrameFilterContext,
+        ) -> Result<Option<Frame>, FrameFilterError> {
+            Ok(Some(frame))
+        }
+
+        fn request_frame_mode(&self) -> RequestFrameMode {
+            RequestFrameMode::Never
+        }
+
+        fn request_frame_pending(&self) -> bool {
+            panic!("the wait derivation must not query a Never filter's pending state")
+        }
+    }
+
+    // The interval choice itself, pinned by exact VALUE — the portable half
+    // of the cadence contract (the wall-clock tests above own the live-loop
+    // half). The rule: the millisecond interval iff some polled filter is
+    // BOTH pending and un-capped; anything else — idle, capped, or nothing
+    // to poll — parks at the safety-net interval. Pinned as the complete
+    // truth table over one to three filters — polled and `Never` mixed —
+    // plus the empty set.
+    #[test]
+    fn wait_interval_derivation_pins_the_exact_intervals() {
+        let counters = || {
+            (
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+            )
+        };
+        // Each probe hands back its hint-query counter so the sweep can
+        // assert WHICH filters were consulted, not just the returned
+        // interval.
+        let probe = |pending: bool| {
+            let (polls, filtered, hint_checks) = counters();
+            let queries = hint_checks.clone();
+            (
+                PendingHintProbe {
+                    pending,
+                    queued: 0,
+                    polls,
+                    filtered,
+                    hint_checks,
+                    stop_on_hint_check: None,
+                },
+                queries,
+            )
+        };
+
+        // The contract values themselves, as literals: the branch
+        // assertions below reuse the constants, so this pin — not they —
+        // is what makes an accidental interval edit fail the test.
+        assert_eq!(PENDING_POLL_INTERVAL, Duration::from_millis(1));
+        assert_eq!(IDLE_RECV_INTERVAL, Duration::from_millis(100));
+
+        // The full truth table, one to three filters, each independently
+        // in one of six states: {`Never`, polled-idle, polled-pending} x
+        // {un-capped, capped}. `eof_capped` spans ALL filters (mirroring
+        // the production vector, which is sized to the filter count) while
+        // only `MayProduce` filters enter `poll_indices` — so the table
+        // exercises SPARSE poll sets, where reading the cap vector by
+        // slot position diverges from the correct filter-index read. The
+        // oracle re-derives the expectation from the CONSTRUCTION inputs:
+        // the millisecond interval iff some polled filter is both pending
+        // and un-capped. Any derivation differing anywhere on this space —
+        // cross-filter `any`/`all` mixes, inverted polarity, slot-indexed
+        // cap reads, folds that overwrite instead of accumulate — fails
+        // on its distinguishing row, and one that queries a `Never`
+        // filter's pending state trips that probe's panic. Capped polled
+        // filters are additionally asserted to receive ZERO pending
+        // queries — the documented exclusion pinned as a side effect,
+        // since an operand-order swap in the conjunction returns
+        // identical intervals everywhere yet consults capped filters.
+        for n in 1..=3u32 {
+            for combo in 0..6u32.pow(n) {
+                let mut pipeline = FramePipeline::new(AVMediaType::AVMEDIA_TYPE_VIDEO, Some(0));
+                let mut eof_capped = Vec::new();
+                let mut expected_polled = Vec::new();
+                let mut hint_queries = Vec::new();
+                let mut some_pending_uncapped = false;
+                let mut desc = Vec::new();
+                let mut rest = combo;
+                for i in 0..n as usize {
+                    let d = rest % 6;
+                    rest /= 6;
+                    let never = d < 2;
+                    let pending = d >= 4;
+                    let capped = d % 2 == 1;
+                    if never {
+                        pipeline.add_filter(format!("never{i}"), Box::new(NeverProbe));
+                        hint_queries.push(None);
+                    } else {
+                        let (filter, queries) = probe(pending);
+                        pipeline.add_filter(format!("probe{i}"), Box::new(filter));
+                        expected_polled.push(i);
+                        hint_queries.push(Some(queries));
+                    }
+                    eof_capped.push(capped);
+                    some_pending_uncapped |= !never && pending && !capped;
+                    desc.push(match (never, pending, capped) {
+                        (true, _, false) => "never",
+                        (true, _, true) => "never+capped",
+                        (false, false, false) => "idle",
+                        (false, false, true) => "idle+capped",
+                        (false, true, false) => "pending",
+                        (false, true, true) => "pending+capped",
+                    });
+                }
+                let poll_indices = pipeline.request_frame_indices();
+                assert_eq!(
+                    poll_indices, expected_polled,
+                    "only MayProduce filters may be polled: {desc:?}"
+                );
+                let expected = if some_pending_uncapped {
+                    PENDING_POLL_INTERVAL
+                } else {
+                    IDLE_RECV_INTERVAL
+                };
+                assert_eq!(
+                    poll_wait_interval(&pipeline, &poll_indices, &eof_capped),
+                    expected,
+                    "filter states {desc:?}"
+                );
+                for (i, queries) in hint_queries.iter().enumerate() {
+                    match queries {
+                        Some(queries) if eof_capped[i] => assert_eq!(
+                            queries.load(Ordering::SeqCst),
+                            0,
+                            "a capped filter's pending state must not be queried: \
+                             filter {i} in {desc:?}"
+                        ),
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // No polled filters at all (all-`Never`) → always the long park.
+        let never = FramePipeline::new(AVMediaType::AVMEDIA_TYPE_VIDEO, Some(0));
+        let never_indices = never.request_frame_indices();
+        assert!(never_indices.is_empty());
+        assert_eq!(
+            poll_wait_interval(&never, &never_indices, &[]),
+            IDLE_RECV_INTERVAL,
+            "a pipeline with nothing to poll must park long"
+        );
     }
 }
