@@ -11,6 +11,9 @@ use crate::wgpu_filter::gpu_state::{
 };
 use crate::wgpu_filter::params::SharedParams;
 use crate::wgpu_filter::shaders;
+use crate::wgpu_filter::shared_gpu::GpuGenerationLost;
+#[cfg(test)]
+use crate::wgpu_filter::shared_gpu::SharedGpuGeneration;
 use ffmpeg_next::Frame;
 use ffmpeg_sys_next::AVMediaType;
 use log::warn;
@@ -484,7 +487,15 @@ impl WgpuFrameFilter {
     /// queue position, morphing from `Gpu` to `Done`. With `block = false`
     /// this returns `Ok(false)` when the result is not ready yet; with
     /// `block = true` it always resolves (or errors).
-    fn complete_oldest_gpu(&mut self, block: bool) -> Result<bool, String> {
+    fn complete_oldest_gpu(&mut self, block: bool) -> Result<bool, FrameFilterError> {
+        // A generation killed by any job — this one or a concurrent one on
+        // the shared device — fails every later completion attempt promptly
+        // (including the EOF-marker drain and request_frame polling) instead
+        // of waiting out its own 30s wedge window. Relaxed load: the flag is
+        // a monotonic latch guarding no dependent data.
+        if self.gpu.as_ref().is_some_and(|gpu| gpu.generation_dead()) {
+            return Err(Box::new(GpuGenerationLost));
+        }
         let Some(pos) = self
             .pending
             .iter()
@@ -499,7 +510,29 @@ impl WgpuFrameFilter {
                 unreachable!("position() matched a Gpu entry");
             };
             let t_wait = Instant::now();
-            if !wait_for_map(&gpu.device, slot, block)? {
+            // Every fatal readback path — map failure, dropped callback,
+            // poll error, the wedge timeout — kills the whole shared
+            // generation: this job keeps its original error, concurrent
+            // jobs fail promptly with GpuGenerationLost, and the next job
+            // builds a fresh generation. The warn fires after the atomic
+            // store, with no lock held. A GpuGenerationLost surfacing from
+            // the wait itself means another job already killed (and
+            // announced) the generation — nothing new to mark or log.
+            let done = match wait_for_map(gpu, slot, block) {
+                Ok(done) => done,
+                Err(e) => {
+                    if e.downcast_ref::<GpuGenerationLost>().is_none() {
+                        gpu.shared.mark_dead();
+                        warn!(
+                            "wgpu readback failed fatally; marking the shared GPU \
+                             context lost (concurrent jobs on it fail promptly; the \
+                             next job initializes a fresh one): {e}"
+                        );
+                    }
+                    return Err(e);
+                }
+            };
+            if !done {
                 return Ok(false);
             }
             if let Ok(mut stats) = self.stats.lock() {
@@ -599,6 +632,31 @@ impl WgpuFrameFilter {
     }
 }
 
+#[cfg(test)]
+impl WgpuFrameFilter {
+    /// The shared generation behind this filter's device, once initialized.
+    pub(crate) fn shared_generation_for_test(&self) -> Option<&Arc<SharedGpuGeneration>> {
+        self.gpu.as_ref().map(|gpu| &gpu.shared)
+    }
+
+    /// Initializes against a caller-supplied generation, bypassing the
+    /// process-global cache, so death tests can kill their own private
+    /// generation without flaking concurrently running GPU tests that
+    /// stream on the cached one.
+    pub(crate) fn init_with_generation_for_test(
+        &mut self,
+        generation: Arc<SharedGpuGeneration>,
+    ) -> Result<(), FrameFilterError> {
+        let source = match self.effect_domain {
+            EffectDomain::Rgba => EffectSource::Rgba(&self.fragment_shader),
+            EffectDomain::Yuv => EffectSource::Yuv(&self.fragment_shader),
+        };
+        let gpu = GpuState::from_shared(generation, source, self.params.len)?;
+        self.gpu = Some(gpu);
+        Ok(())
+    }
+}
+
 /// Upper bound on readback progress: a submission older than this whose map
 /// callback has not fired means the device is wedged (hung driver, lost
 /// device with no error callback). Both the blocking wait and the
@@ -614,21 +672,32 @@ const GPU_COMPLETION_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 
 /// Waits (or polls) for a staging buffer map to complete. Returns `Ok(false)`
 /// when `block` is false and the map is not ready yet.
-fn wait_for_map(device: &wgpu::Device, slot: &InFlightFrame, block: bool) -> Result<bool, String> {
-    fn check(slot: &InFlightFrame) -> Result<Option<()>, String> {
+fn wait_for_map(
+    gpu: &GpuState,
+    slot: &InFlightFrame,
+    block: bool,
+) -> Result<bool, FrameFilterError> {
+    fn check(slot: &InFlightFrame) -> Result<Option<()>, FrameFilterError> {
         match slot.staging.map_result() {
             Ok(Ok(())) => Ok(Some(())),
-            Ok(Err(e)) => Err(format!("Staging buffer map failed: {e:?}")),
+            Ok(Err(e)) => Err(format!("Staging buffer map failed: {e:?}").into()),
             Err(TryRecvError::Empty) => Ok(None),
-            Err(TryRecvError::Disconnected) => Err("Staging map callback dropped".to_string()),
+            Err(TryRecvError::Disconnected) => {
+                Err("Staging map callback dropped".to_string().into())
+            }
         }
     }
 
+    // A dead generation's map callbacks may never fire; fail promptly
+    // instead of sitting out the wedge timeout below.
+    if gpu.generation_dead() {
+        return Err(Box::new(GpuGenerationLost));
+    }
     if check(slot)?.is_some() {
         return Ok(true);
     }
     if !block {
-        device
+        gpu.device
             .poll(wgpu::PollType::Poll)
             .map_err(|e| format!("Device poll failed: {e:?}"))?;
         if check(slot)?.is_some() {
@@ -638,13 +707,25 @@ fn wait_for_map(device: &wgpu::Device, slot: &InFlightFrame, block: bool) -> Res
             return Err(format!(
                 "GPU readback made no progress for {}s; the device appears hung",
                 GPU_COMPLETION_TIMEOUT.as_secs()
-            ));
+            )
+            .into());
         }
         return Ok(false);
     }
     let deadline = Instant::now() + GPU_COMPLETION_TIMEOUT;
     loop {
-        device
+        // Re-checked every iteration: a job blocked here while another job
+        // kills the generation surfaces GpuGenerationLost within one poll
+        // cycle instead of waiting out its own timeout.
+        if gpu.generation_dead() {
+            return Err(Box::new(GpuGenerationLost));
+        }
+        // Targeted wait: resolves when THIS slot's submission completes. On
+        // the shared queue a device-wide blocking wait would also ride
+        // sibling filters' submissions — long enough, under a busy
+        // neighbor, to blow the deadline below and falsely retire a
+        // healthy generation through the caller's death funnel.
+        gpu.device
             .poll(wgpu::PollType::WaitForSubmissionIndex(
                 slot.submission.clone(),
             ))
@@ -653,16 +734,27 @@ fn wait_for_map(device: &wgpu::Device, slot: &InFlightFrame, block: bool) -> Res
             return Ok(true);
         }
         // The submission has executed but the map callback has not fired
-        // yet; a full wait pumps the remaining callbacks.
-        device
-            .poll(wgpu::PollType::Wait)
+        // yet; a NON-blocking poll pumps completed callbacks without
+        // waiting on unrelated submissions, and the map state is re-checked
+        // before the deadline so a delivered result always wins over a
+        // timeout.
+        gpu.device
+            .poll(wgpu::PollType::Poll)
             .map_err(|e| format!("Device poll failed: {e:?}"))?;
+        if check(slot)?.is_some() {
+            return Ok(true);
+        }
         if Instant::now() > deadline {
             return Err(format!(
                 "GPU readback made no progress for {}s; the device appears hung",
                 GPU_COMPLETION_TIMEOUT.as_secs()
-            ));
+            )
+            .into());
         }
+        // Briefly yield between pump rounds; the callback lands within a
+        // poll or two on a healthy device, so this path spins only while
+        // the driver is actually delivering.
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
 }
 
@@ -686,6 +778,16 @@ impl FrameFilter for WgpuFrameFilter {
         frame: Frame,
         _ctx: &mut FrameFilterContext,
     ) -> Result<Option<Frame>, FrameFilterError> {
+        // Fail promptly when the shared generation was killed (possibly by
+        // a concurrent job) — checked before ANY per-frame GPU work,
+        // including the hardware dmabuf import below, which must not wrap
+        // raw Vulkan resources of a lost device. One Relaxed load per
+        // frame; the latch guards no dependent data. (complete_oldest_gpu
+        // re-checks for the bypass path, whose blocking drain runs on the
+        // same latch.)
+        if self.gpu.as_ref().is_some_and(|gpu| gpu.generation_dead()) {
+            return Err(Box::new(GpuGenerationLost));
+        }
         // A props-only marker (buf[0] null — see frame_is_eof_marker, which
         // avoids the data[0] check that would misclassify hardware frames whose
         // surface lives in data[3]) or a degenerate frame bypasses GPU work.
@@ -842,6 +944,13 @@ impl FrameFilter for WgpuFrameFilter {
         let matrix_id = frame_io::matrix_id_for(unsafe { (*raw).colorspace }, in_h as i32);
 
         let gpu = self.gpu.as_mut().ok_or("WgpuFrameFilter not initialized")?;
+
+        // Second death check, after the potentially slow hardware import
+        // above: a generation killed since the entry check must not receive
+        // this frame's texture writes and submission.
+        if gpu.generation_dead() {
+            return Err(Box::new(GpuGenerationLost));
+        }
 
         // create_texture failures bypass error scopes and panic the pipeline
         // thread through wgpu's uncaptured-error handler; reject oversized

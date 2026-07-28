@@ -3,10 +3,11 @@
 //! input geometry changes.
 
 use crate::wgpu_filter::frame_io::PlaneLayout;
-use crate::wgpu_filter::hw_interop::{self, HwVulkanInterop};
+use crate::wgpu_filter::hw_interop::HwVulkanInterop;
 use crate::wgpu_filter::shaders;
-use log::info;
+use crate::wgpu_filter::shared_gpu::{self, GpuProfile, SharedGpuGeneration};
 use std::sync::mpsc;
+use std::sync::Arc;
 
 /// Output-plane geometry captured per submitted frame, so in-flight readbacks
 /// stay valid even if `FrameResources` is rebuilt for a new input size while
@@ -46,7 +47,9 @@ pub(crate) enum EffectPipeline {
     },
 }
 
-/// Device-level state created once in `init`.
+/// Device-level state created once in `init`. The device stack itself
+/// (instance/adapter/device/queue) comes from the process-shared generation
+/// cache in `shared_gpu`; everything else here is per-filter.
 pub(crate) struct GpuState {
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
@@ -74,9 +77,11 @@ pub(crate) struct GpuState {
     pub(crate) convert_uniforms_cache: std::cell::Cell<Option<[u32; 4]>>,
     pub(crate) pack_uniforms_cache: std::cell::Cell<Option<[u32; 12]>>,
     pub(crate) resources: Option<FrameResources>,
-    /// Raw Vulkan handles for dmabuf import; present only when the device
-    /// was opened with the external-memory extensions (hw zero-copy input).
-    pub(crate) hw_interop: Option<HwVulkanInterop>,
+    /// Raw Vulkan handles for dmabuf import; present only when the shared
+    /// generation's device was opened with the external-memory extensions
+    /// (hw zero-copy input). Shared with the generation and any sibling
+    /// filters on it; internally synchronized.
+    pub(crate) hw_interop: Option<Arc<HwVulkanInterop>>,
     /// Unified-memory fast path: the pack pass writes the mappable staging
     /// buffer directly (MAPPABLE_PRIMARY_BUFFERS), skipping the storage
     /// buffer and its per-frame copy.
@@ -89,6 +94,12 @@ pub(crate) struct GpuState {
     /// `Limits` struct on every call, and the per-frame size check needs
     /// only this one constant.
     pub(crate) max_texture_dim: u32,
+    /// The process-shared generation this state was built from. `device`,
+    /// `queue`, `hw_interop`, `direct_pack` and `max_texture_dim` above are
+    /// clones/copies of its fields, kept flat so frame-path field accesses
+    /// stay unchanged. Declared last so the per-filter resources above drop
+    /// first (the cache normally outlives them all anyway).
+    pub(crate) shared: Arc<SharedGpuGeneration>,
 }
 
 /// Mode-specific pass inputs held by [`FrameResources`]. RGBA mode renders
@@ -367,73 +378,52 @@ impl GpuState {
         params_len: usize,
         hw_input: bool,
     ) -> Result<Self, String> {
-        // Prefer the primary backends: probing GL/EGL costs ~30-40ms of init
-        // and spams warnings on headless boxes. Fall back to the full set so
-        // GL-only machines keep working exactly as before.
-        let mut instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY,
-            ..Default::default()
-        });
-        let request = wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            force_fallback_adapter: false,
-            compatible_surface: None,
-        };
-        let adapter = match pollster::block_on(instance.request_adapter(&request)) {
-            Ok(adapter) => adapter,
+        let shared = shared_gpu::acquire(GpuProfile::for_hw_input(hw_input))?;
+        Self::from_shared(shared, source, params_len)
+    }
+
+    /// Builds the per-filter half of the state — shader modules, bind group
+    /// layouts, pipelines, sampler, uniform buffers — against an
+    /// already-built shared generation.
+    pub(crate) fn from_shared(
+        shared: Arc<SharedGpuGeneration>,
+        source: EffectSource<'_>,
+        params_len: usize,
+    ) -> Result<Self, String> {
+        let device = shared.device.clone();
+        let queue = shared.queue.clone();
+
+        // Serialize the whole per-filter device section on the shared
+        // device: the error-scope push/pop pairs below are device-global,
+        // so two filters initializing concurrently could steal each other's
+        // validation errors. NO log macros anywhere in this section while
+        // the guard is held (house rule: no logging under a lock).
+        //
+        // A poisoned lock means a sibling init panicked MID-SEQUENCE on this
+        // very device — its error scopes may be unbalanced, and whatever
+        // panicked the device thread is unlikely to be local to that filter.
+        // Building on top of that is not recoverable state: retire the
+        // generation (the next job acquires a fresh one) and fail this init.
+        let _init = match shared.init_lock.lock() {
+            Ok(guard) => guard,
             Err(_) => {
-                instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-                pollster::block_on(instance.request_adapter(&request))
-                    .map_err(|e| format!("No suitable GPU adapter found: {e}"))?
+                shared.mark_dead();
+                return Err(
+                    "a concurrent wgpu filter initialization panicked on the shared \
+                     GPU context; retiring it (the next job initializes a fresh one)"
+                        .to_string(),
+                );
             }
         };
-
-        let adapter_info = adapter.get_info();
-        info!(
-            "WgpuFrameFilter adapter: {} ({:?}, {:?})",
-            adapter_info.name, adapter_info.backend, adapter_info.device_type
-        );
-
-        // On unified-memory GPUs the pack pass can write straight into the
-        // mappable readback buffer, skipping a full copy of the packed frame.
-        // Discrete GPUs keep the copy: mappable memory is slow to write over
-        // PCIe there. EZ_WGPU_DISABLE_DIRECT_PACK=1 forces the copy path
-        // (internal A/B and fallback-coverage knob).
-        let direct_pack = adapter_info.device_type == wgpu::DeviceType::IntegratedGpu
-            && adapter
-                .features()
-                .contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS)
-            && std::env::var("EZ_WGPU_DISABLE_DIRECT_PACK").as_deref() != Ok("1");
-        let device_desc = wgpu::DeviceDescriptor {
-            required_features: if direct_pack {
-                wgpu::Features::MAPPABLE_PRIMARY_BUFFERS
-            } else {
-                wgpu::Features::empty()
-            },
-            ..Default::default()
-        };
-        if direct_pack {
-            info!("WgpuFrameFilter: direct pack readback enabled (unified memory)");
+        // Re-check under the lock: a fatal error latched while this init
+        // queued must not create resources on a retired device.
+        if shared.is_dead() {
+            return Err(
+                "the shared GPU context was lost before this filter finished \
+                 initializing (the next job initializes a fresh one)"
+                    .to_string(),
+            );
         }
-
-        // Zero-copy hardware input needs the device opened with dmabuf-import
-        // extensions; when that is not possible the filter still works, hw
-        // frames just take the download path.
-        let (device, queue, hw_interop) = match hw_input {
-            true => match hw_interop::try_open_dmabuf_device(&adapter, &device_desc) {
-                Some((device, queue, interop)) => (device, queue, Some(interop)),
-                None => {
-                    let (device, queue) = pollster::block_on(adapter.request_device(&device_desc))
-                        .map_err(|e| format!("Failed to create wgpu device: {e}"))?;
-                    (device, queue, None)
-                }
-            },
-            false => {
-                let (device, queue) = pollster::block_on(adapter.request_device(&device_desc))
-                    .map_err(|e| format!("Failed to create wgpu device: {e}"))?;
-                (device, queue, None)
-            }
-        };
 
         let vs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("ez_fullscreen_vs"),
@@ -669,8 +659,12 @@ impl GpuState {
         let convert_uniforms = uniform_buf("ez_convert_uniforms", 16);
         let pack_uniforms = uniform_buf("ez_pack_uniforms", 48);
 
+        // Everything device-scoped is created; release the init lock before
+        // assembling the struct, which takes ownership of `shared`.
+        drop(_init);
+
         Ok(GpuState {
-            max_texture_dim: device.limits().max_texture_dimension_2d,
+            max_texture_dim: shared.max_texture_dim,
             device,
             queue,
             sampler,
@@ -690,10 +684,18 @@ impl GpuState {
             convert_uniforms_cache: std::cell::Cell::new(None),
             pack_uniforms_cache: std::cell::Cell::new(None),
             resources: None,
-            hw_interop,
-            direct_pack,
+            hw_interop: shared.hw_interop.clone(),
+            direct_pack: shared.direct_pack,
             resource_generation: 0,
+            shared,
         })
+    }
+
+    /// Whether the shared generation backing this state was latched dead by
+    /// a fatal device error — this filter's or a concurrent one's. Relaxed
+    /// load; see the flag's docs in `shared_gpu`.
+    pub(crate) fn generation_dead(&self) -> bool {
+        self.shared.is_dead()
     }
 
     pub(crate) fn convert_pipeline(&self, layout: PlaneLayout) -> &wgpu::RenderPipeline {
