@@ -18,7 +18,10 @@ pub enum RequestFrameMode {
     Never,
     /// `request_frame` may yield frames independently of input — a generator
     /// source, or a filter releasing delayed / asynchronous output (e.g. the GPU
-    /// pipeline). The pipeline polls this filter.
+    /// pipeline). The pipeline polls this filter — continuously by default;
+    /// a filter that knows it has nothing in flight can let the pipeline park
+    /// between inputs via
+    /// [`request_frame_pending`](FrameFilter::request_frame_pending).
     MayProduce,
 }
 
@@ -155,6 +158,38 @@ pub trait FrameFilter: Send {
     /// historical always-polled behavior for third-party generator filters.
     fn request_frame_mode(&self) -> RequestFrameMode {
         RequestFrameMode::MayProduce
+    }
+
+    /// Reports whether [`request_frame`](FrameFilter::request_frame) could
+    /// currently deliver output — immediately, or as soon as work already in
+    /// flight completes — without the filter first receiving another
+    /// [`filter_frame`](FrameFilter::filter_frame) call.
+    ///
+    /// While any polled ([`MayProduce`](RequestFrameMode::MayProduce)) filter
+    /// in a pipeline returns `true`, the pipeline keeps the historical ~1ms
+    /// poll cadence so delayed output (e.g. an asynchronous GPU readback) is
+    /// picked up promptly. Once every polled filter returns `false`, the
+    /// pipeline parks on its input channel at a long safety-net interval
+    /// instead of waking ~1000x/sec; an arriving input frame still wakes it
+    /// immediately, and the very next `filter_frame` call re-evaluates the
+    /// hint before the pipeline parks again.
+    ///
+    /// # Contract
+    /// Returning `false` promises that `request_frame` yields no frame until
+    /// after this filter's next `filter_frame` call. A filter whose output can
+    /// materialize on its own — a wall-clock generator, anything not driven
+    /// purely by input it already holds — must keep the default (`true`),
+    /// which preserves the exact pre-existing polling behavior. The pipeline
+    /// still sweeps `request_frame` on every wake regardless of this hint, so
+    /// a filter that misreports `false` degrades but does not lose data while
+    /// the pipeline runs: output already deliverable is picked up at the next
+    /// safety-net wake (currently 100ms), and output that surfaces only
+    /// across repeated `request_frame` calls pays one such interval per call.
+    /// Output still undelivered when the pipeline tears down is discarded
+    /// exactly as it would be under the constant poll cadence. Only `true`
+    /// keeps the low-latency drain.
+    fn request_frame_pending(&self) -> bool {
+        true
     }
 
     /// Cleans up the filter.
