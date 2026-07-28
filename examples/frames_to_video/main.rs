@@ -48,7 +48,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // finish() drains the encoder, writes the container trailer, and reports the
-    // first pipeline error if there was one.
+    // first pipeline error if there was one. It is the only path that finalizes
+    // the file: dropping the writer instead aborts the job and leaves the
+    // output unfinalized.
     writer.finish()?;
     println!("Wrote {total} frames to plasma.mp4");
     Ok(())

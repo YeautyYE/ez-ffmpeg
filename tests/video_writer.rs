@@ -5,7 +5,11 @@
 //! worker (no demuxer, no decoder), so these scenarios run on every FFmpeg
 //! release the crate supports. Teardown paths (finish/drop/abort, worker
 //! failure) run under a watchdog: a hang is a named test failure, not a suite
-//! timeout.
+//! timeout. Drop is an ABORT — only `finish()` finalizes an output — so the
+//! drop scenarios assert bounded teardown, never file contents. The bound
+//! they assert is against remaining graph data on callback-free targets; a
+//! user write/seek callback that never returns would hold any teardown path
+//! and is outside these scenarios.
 
 use ez_ffmpeg::error::{Error, WriterError};
 use ez_ffmpeg::frame_export::{FrameExtractor, PixelLayout};
@@ -129,24 +133,25 @@ fn open_returns_without_first_frame() {
     });
 }
 
-/// I5: dropping without finish still drains every pushed frame (Drop closes
-/// ingress, the frame source emits the EOF marker, then wait() — it is not a
-/// stop() that would truncate the tail).
+/// I5: dropping without finish is an ABORT: it returns within a bounded time
+/// and does not finalize the file — `finish()` is the only graceful path.
+/// File contents are deliberately not asserted (an aborted mp4 may lack its
+/// trailer or hold any prefix of the pushed frames). The bound is on worker
+/// teardown: a blocking write/seek callback — not used by this plain-path
+/// target — could still hold it up indefinitely.
 #[test]
-fn drop_without_finish_keeps_all_frames() {
+fn drop_without_finish_aborts_within_bound() {
     let out = tmp_path("i5_drop.mp4");
-    let out2 = out.clone();
     within(20, "i5", move || {
         let mut w = VideoWriter::builder(64, 48)
             .fps(30, 1)
-            .open(mp4_output(&out2))
+            .open(mp4_output(&out))
             .unwrap();
         for i in 0..10 {
             w.write_owned(frame(&w, i)).unwrap();
         }
-        drop(w); // blocks until the pipeline drains
+        drop(w); // aborts the run; bounded, output not finalized
     });
-    assert_eq!(video_nb_frames(&out), 10);
 }
 
 /// I6: an unknown encoder surfaces as a typed error from open().
@@ -257,6 +262,78 @@ fn wrong_frame_size_is_invalid_size() {
     });
 }
 
+/// write_owned hands the exact `Vec` back on the invalid-size path (the
+/// `SendError` convention): same allocation, length, capacity, and bytes.
+#[test]
+fn write_owned_invalid_size_returns_payload() {
+    let out = tmp_path("owned_invalid_size.mp4");
+    within(15, "owned_invalid_size", move || {
+        let mut w = VideoWriter::builder(64, 48)
+            .fps(30, 1)
+            .open(mp4_output(&out))
+            .unwrap();
+        let expected = w.frame_size();
+        let mut bad = Vec::with_capacity(expected + 123);
+        bad.extend_from_slice(&[7u8; 10]);
+        let cap = bad.capacity();
+        let ptr = bad.as_ptr() as usize;
+        let err = w.write_owned(bad).unwrap_err();
+        assert!(matches!(
+            err.error(),
+            PushError::InvalidSize { expected: e, got: 10 } if *e == expected
+        ));
+        let back = err.into_frame();
+        assert_eq!(back.len(), 10, "length as handed in");
+        assert_eq!(back.capacity(), cap, "capacity as handed in");
+        assert_eq!(back.as_ptr() as usize, ptr, "same allocation, not a copy");
+        assert!(back.iter().all(|&b| b == 7), "content untouched");
+        w.finish().unwrap();
+    });
+}
+
+/// write_owned hands the exact `Vec` back when the pipeline has closed (an
+/// Output frame limit ends the job early): the rejected push is recoverable
+/// and finish() still reports the early completion as a success.
+#[test]
+fn write_owned_closed_pipeline_returns_payload() {
+    let out = tmp_path("owned_closed.mp4");
+    let out2 = out.clone();
+    within(30, "owned_closed", move || {
+        let mut w = VideoWriter::builder(64, 48)
+            .fps(30, 1)
+            .queue_capacity(1)
+            .open(mp4_output(&out2).set_max_video_frames(2))
+            .unwrap();
+        let size = w.frame_size();
+        let mut recovered_once = false;
+        for i in 0..600 {
+            let mut f = Vec::with_capacity(size + 64);
+            f.resize(size, i as u8);
+            let cap = f.capacity();
+            let ptr = f.as_ptr() as usize;
+            match w.write_owned(f) {
+                Ok(()) => {}
+                Err(rejected) => {
+                    assert!(matches!(rejected.error(), PushError::PipelineClosed));
+                    let back = rejected.into_frame();
+                    assert_eq!(back.len(), size, "length as handed in");
+                    assert_eq!(back.capacity(), cap, "capacity as handed in");
+                    assert_eq!(back.as_ptr() as usize, ptr, "same allocation, not a copy");
+                    assert!(back.iter().all(|&b| b == i as u8), "content untouched");
+                    recovered_once = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            recovered_once,
+            "the frame limit must eventually reject a push"
+        );
+        w.finish().expect("frame-limit completion is a success");
+    });
+    assert_eq!(video_nb_frames(&out), 2);
+}
+
 /// EOF-tail correctness through a buffering filter: `reverse` holds every
 /// frame until its input reaches EOF. Only the explicit in-band EOF marker
 /// closes the buffersrc — if end-of-stream were just the ingress sender
@@ -280,24 +357,47 @@ fn finish_flushes_buffering_filter() {
     assert_eq!(video_nb_frames(&out), 10);
 }
 
-/// Drop (no finish) must enqueue the same EOF marker: the buffering filter
-/// still flushes every frame.
+/// Drop (no finish) through a buffering filter: `reverse` still holds every
+/// frame when ingress closes, and the abort must return within the watchdog
+/// window without waiting for any flush. Only `finish()` flushes — that path
+/// is covered above; contents are deliberately not asserted here.
 #[test]
-fn drop_flushes_buffering_filter() {
+fn drop_aborts_through_buffering_filter() {
     let out = tmp_path("eof_reverse_drop.mp4");
-    let out2 = out.clone();
     within(30, "eof_reverse_drop", move || {
         let mut w = VideoWriter::builder(64, 48)
             .fps(30, 1)
             .filter_desc("reverse")
-            .open(mp4_output(&out2))
+            .open(mp4_output(&out))
             .unwrap();
         for i in 0..6 {
             w.write_owned(frame(&w, i * 30)).unwrap();
         }
         drop(w);
     });
-    assert_eq!(video_nb_frames(&out), 6);
+}
+
+/// Drop is bounded even when the graph OUTLIVES the pushed stream: with the
+/// unbounded generator as overlay's MAIN input, ingress EOF does not end the
+/// graph (the secondary's last frame repeats forever, `eof_action=repeat`),
+/// so a draining teardown would never return. Completing at all is the
+/// property: under drop-drains semantics this scenario hangs indefinitely,
+/// which is exactly why Drop aborts. The bound is against the graph's
+/// endless data; this plain-path target uses no user write/seek callback.
+#[test]
+fn drop_aborts_graph_that_outlives_input() {
+    let out = tmp_path("drop_outliving_overlay.mp4");
+    within(30, "drop_outliving_overlay", move || {
+        let mut w = VideoWriter::builder(64, 48)
+            .fps(30, 1)
+            .filter_desc("color=c=red:s=64x48[bg];[bg][in]overlay")
+            .open(mp4_output(&out))
+            .unwrap();
+        for i in 0..5 {
+            w.write_owned(frame(&w, i * 40)).unwrap();
+        }
+        drop(w); // a graceful drain would block forever on the generator
+    });
 }
 
 /// Plane-aware fill, end to end and byte-exact: odd-geometry planar frames
@@ -542,6 +642,114 @@ fn stream_maps_are_rejected() {
         ),
         "expected StreamMapsUnsupported, got {result:?}"
     );
+}
+
+/// Every Output option the writer pipeline could never honor — audio and
+/// subtitle stream configuration, input-referencing metadata — is rejected at
+/// open() with a typed error naming the setter. Rejection happens before the
+/// destination is opened, so a failed open() leaves no file behind.
+#[test]
+fn unsupported_output_options_are_rejected_at_open() {
+    type Configure = Box<dyn FnOnce(Output) -> Output>;
+    let cases: Vec<(&'static str, Configure)> = vec![
+        ("set_audio_codec", Box::new(|o| o.set_audio_codec("aac"))),
+        (
+            "set_audio_codec_opt(s)/set_audio_bitrate",
+            Box::new(|o| o.set_audio_bitrate("128k")),
+        ),
+        ("set_audio_qscale", Box::new(|o| o.set_audio_qscale(3))),
+        (
+            "set_audio_sample_rate",
+            Box::new(|o| o.set_audio_sample_rate(48000)),
+        ),
+        ("set_audio_channels", Box::new(|o| o.set_audio_channels(2))),
+        (
+            "set_audio_sample_fmt",
+            Box::new(|o| o.set_audio_sample_fmt("s16")),
+        ),
+        (
+            "set_audio_bsf",
+            Box::new(|o| o.set_audio_bsf("aac_adtstoasc")),
+        ),
+        (
+            "set_max_audio_frames",
+            Box::new(|o| o.set_max_audio_frames(10)),
+        ),
+        (
+            "set_swr_opts",
+            Box::new(|o| o.set_swr_opts("resampler=soxr")),
+        ),
+        (
+            "set_subtitle_codec",
+            Box::new(|o| o.set_subtitle_codec("mov_text")),
+        ),
+        (
+            "set_subtitle_codec_opt(s)",
+            Box::new(|o| o.set_subtitle_codec_opt("k", "v")),
+        ),
+        ("set_subtitle_bsf", Box::new(|o| o.set_subtitle_bsf("null"))),
+        (
+            "set_max_subtitle_frames",
+            Box::new(|o| o.set_max_subtitle_frames(10)),
+        ),
+        (
+            "map_metadata_from_input",
+            Box::new(|o| o.map_metadata_from_input(0, "g", "g").unwrap()),
+        ),
+        (
+            "add_chapter_metadata",
+            Box::new(|o| o.add_chapter_metadata(0, "title", "Intro")),
+        ),
+        (
+            "add_program_metadata",
+            Box::new(|o| o.add_program_metadata(0, "service_name", "Ch1")),
+        ),
+    ];
+    for (index, (option, configure)) in cases.into_iter().enumerate() {
+        let out = tmp_path(&format!("unsupported_opt_{index}.mp4"));
+        let result = VideoWriter::builder(64, 48)
+            .open(configure(mp4_output(&out)))
+            .map(|_| ());
+        assert!(
+            matches!(
+                &result,
+                Err(Error::Writer(WriterError::UnsupportedOutputOption { option: o, .. }))
+                    if *o == option
+            ),
+            "{option} must be UnsupportedOutputOption, got {result:?}"
+        );
+        assert!(
+            !std::path::Path::new(&out).exists(),
+            "{option}: rejection must happen before the destination is created"
+        );
+    }
+}
+
+/// Options that every writer job satisfies vacuously (nothing to disable,
+/// nothing to cut against, nothing to auto-copy) stay accepted: they ask for
+/// what is already true rather than for a stream or input that cannot exist.
+#[test]
+fn vacuous_output_options_stay_accepted() {
+    let out = tmp_path("vacuous_options.mp4");
+    let out2 = out.clone();
+    within(20, "vacuous_options", move || {
+        let mut w = VideoWriter::builder(64, 48)
+            .fps(30, 1)
+            .open(
+                mp4_output(&out2)
+                    .disable_audio()
+                    .disable_subtitle()
+                    .disable_data()
+                    .disable_auto_copy_metadata()
+                    .set_shortest(true),
+            )
+            .expect("vacuously satisfied options must not fail open()");
+        for i in 0..5 {
+            w.write_owned(frame(&w, i * 40)).unwrap();
+        }
+        w.finish().unwrap();
+    });
+    assert_eq!(video_nb_frames(&out), 5);
 }
 
 /// EOF tail timing: the explicit EOF marker closes the buffersrc at the
