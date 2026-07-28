@@ -304,6 +304,29 @@ pub mod device;
 /// - Hardware acceleration support depends on both FFmpeg’s compilation configuration
 ///   and the underlying system drivers/frameworks. Not all listed accelerations may be
 ///   fully functional on every platform.
+///
+/// # Device lifetime and caching
+///
+/// Hardware device contexts are expensive to create — initialization loads
+/// vendor drivers and libraries, with CUDA context creation the classic
+/// costly case — so ez-ffmpeg manages them with a process-global cache:
+///
+/// - A device context is created on first use of a given configuration
+///   (accel type plus device spec) and cached; later jobs requesting the
+///   same configuration reuse the cached context instead of creating a
+///   new one.
+/// - The cache is bounded at 32 entries; adding a further distinct
+///   configuration evicts the least-recently-requested one. Eviction
+///   releases only the cache's own handle: the underlying FFmpeg device
+///   context is reference-counted and stays alive until no codec, filter
+///   graph, or frame still uses it, so eviction never affects a running
+///   job.
+/// - All cache-owned handles are released at process exit.
+///
+/// There is deliberately no idle-timeout release: recreation is the
+/// expensive direction, so a cached context is kept until the 32-entry
+/// bound evicts it or the process exits (the ffmpeg CLI likewise keeps
+/// its devices until final cleanup).
 pub mod hwaccel;
 
 /// The **codec** module provides helpers for enumerating and querying FFmpeg’s
