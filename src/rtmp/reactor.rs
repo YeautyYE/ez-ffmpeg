@@ -981,18 +981,28 @@ impl IngressBudget {
     /// whole mark bounds memory at that item's size instead of deadlocking
     /// its producer.
     ///
-    /// Liveness: whenever the head waiter blocks, `queued > 0`, so at least
-    /// one prior item was sent, and every producer send is followed by a
-    /// reactor wake whose eventfd/pipe token persists until drained — a
-    /// drain round is therefore already scheduled. Each round releases what
-    /// it drained and notifies, and a budget-limited round forces the next
-    /// poll to be zero-timeout (`publishers_pending` in `run`), so rounds
-    /// continue back-to-back until the head admits; each admission notifies
-    /// again, chaining the queue forward. FIFO extends the head's liveness
-    /// to every waiter behind it. Teardown of the consumer drops the
+    /// Liveness: a parked waiter resumes when the reactor releases drained
+    /// bytes, resting on the loop's bounded cadence, not on any one wake.
+    /// `process_publishers` runs every loop iteration, and the blocking
+    /// poll's timeout is finite in steady state (`POLL_TIMEOUT_MS`,
+    /// 100ms), dropping to zero next iteration once a budget-limited round
+    /// sets `publishers_pending` in `run`. Producer wakes — each channel
+    /// enqueue is normally followed by one (see the waker protocol notes
+    /// in `poller.rs`) — only cut the latency; they are not the liveness
+    /// foundation. `queued > 0` means a predecessor holds admitted bytes,
+    /// in one of two states: already enqueued to the channel, or an
+    /// in-flight reservation between its `acquire` and its channel send
+    /// — and that send may itself park on the channel's item cap
+    /// (`PUBLISHER_CHANNEL_CAPACITY`, 1024); a full channel is by
+    /// construction drained on the same bounded cadence, so the send
+    /// completes and the bytes become channel-visible. Either way the
+    /// bytes reach a drain round in bounded time. Each round releases what
+    /// it drained and notifies; each admission notifies again, chaining
+    /// the queue forward, and FIFO extends the head's liveness to every
+    /// waiter behind it. Teardown of the consumer drops the
     /// [`IngressBudgetGuard`], which closes the account and wakes every
-    /// waiter. No path leaves a waiter without a scheduled drain, a
-    /// predecessor's admission, or a close.
+    /// waiter. No path leaves a waiter without a bounded-cadence drain
+    /// ahead, a predecessor's progress, or a close.
     pub(crate) fn acquire(&self, len: usize) -> Result<(), IngressClosed> {
         let mut inner = self.lock();
         let ticket = inner.next_ticket;
@@ -2589,6 +2599,18 @@ impl Reactor {
 
                 // Wakeup token: drain it and fall through to the channel-drain
                 // steps below. Matched before decoding as a connection token.
+                //
+                // drain() also clears the waker's userspace pending gate, and
+                // does so only after the backend fd is empty. Wakes coalesced
+                // by that gate deposit no fresh fd token: their delivery
+                // depends on this loop re-examining every wake-signaled
+                // source — status (step 1), publisher/handshake registrations
+                // (step 3), publisher channels (step 6, whose drain also
+                // releases ingress-budget bytes that parked producers wait
+                // on) — between this call and the next blocking poll. (New
+                // TCP connections are not waker-signaled; their channel rides
+                // the same loop on the poll cadence.) Do not move this call
+                // or hoist channel processing above it.
                 if poller_token == WAKER_TOKEN {
                     if let Some(waker) = &waker {
                         waker.drain();
