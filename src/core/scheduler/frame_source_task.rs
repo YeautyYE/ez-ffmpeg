@@ -25,6 +25,9 @@
 //!   shell carries no stale reference); a locally built frame references no
 //!   scheduler-owned state, so a `FrameBox` still queued at teardown frees
 //!   safely whenever the last channel endpoint drops.
+//! - Plane buffers recycle too, through a worker-local `PlanePool`; worker
+//!   exit uninits the pool, which is safe while downstream stages (or queued
+//!   `FrameBox`es) still hold pooled buffers — see the `PlanePool` docs.
 
 use crate::core::context::frame_source::{FrameSource, FrameSourceParams};
 use crate::core::context::obj_pool::ObjPool;
@@ -37,9 +40,12 @@ use crate::util::ffmpeg_utils::av_err2str;
 use crate::util::thread_synchronizer::{ThreadDoneGuard, ThreadSynchronizer};
 use crossbeam_channel::{RecvTimeoutError, SendTimeoutError, Sender};
 use ffmpeg_next::Frame;
-use ffmpeg_sys_next::{av_frame_get_buffer, av_image_copy, av_image_fill_arrays, AVRational};
+use ffmpeg_sys_next::{
+    av_buffer_pool_get, av_buffer_pool_init, av_buffer_pool_uninit, av_frame_get_buffer,
+    av_image_copy, av_image_fill_arrays, AVBufferPool, AVFrame, AVRational,
+};
 use log::{debug, error};
-use std::ptr::null_mut;
+use std::ptr::{null_mut, NonNull};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -99,6 +105,12 @@ pub(crate) fn frame_source_init(
             let params = frame_source.params;
             let frame_pool = frame_pool;
 
+            // Recycles the large plane buffers across frames; armed lazily
+            // from the first built frame, so zero-frame jobs never touch it.
+            // A body local like the endpoints above: it drops (pool uninit)
+            // before the guard on every exit path.
+            let mut plane_pool = PlanePool::empty();
+
             let mut nb_frames: i64 = 0;
             loop {
                 let result = ingress.recv_timeout(Duration::from_millis(100));
@@ -114,7 +126,13 @@ pub(crate) fn frame_source_init(
                     Err(RecvTimeoutError::Disconnected) => break,
                 };
 
-                let frame = match build_video_frame(&frame_pool, &params, &data, nb_frames) {
+                let frame = match build_video_frame(
+                    &frame_pool,
+                    &mut plane_pool,
+                    &params,
+                    &data,
+                    nb_frames,
+                ) {
                     Ok(frame) => frame,
                     Err(e) => {
                         error!("Frame source failed to build a frame: {e}");
@@ -203,20 +221,219 @@ fn frame_data_for(params: &FrameSourceParams) -> FrameData {
     }
 }
 
+/// Per-job recycler for the packed plane buffers `build_video_frame` fills,
+/// replacing a multi-MiB `av_buffer_alloc` + first-touch page faults + free
+/// per pushed frame with reuse from a lock-free `AVBufferPool`. Armed lazily
+/// from the FIRST frame's `av_frame_get_buffer` product — that frame is the
+/// layout template, so zero-frame jobs never touch FFmpeg here — and pooled
+/// frames reproduce the captured layout verbatim.
+///
+/// Keyed to the open()-fixed `FrameSourceParams`: the ingress channel
+/// carries bare bytes, so a mid-job geometry change is structurally
+/// impossible today. If a future ingress variant adds per-frame geometry,
+/// recreate on mismatch — uninit the old pool (outstanding buffers are
+/// unaffected) and re-arm from the next template frame, as the wgpu
+/// `OutputFramePool` does per geometry key.
+///
+/// The pool only parks buffers that were once simultaneously in flight (the
+/// bounded filter channel and filter/encoder holds pin the same buffers at
+/// peak today), so peak live-buffer count is unchanged; RSS holds near that
+/// high-water mark between frames instead of sawtoothing. Parked buffers
+/// free at worker exit (`Drop`), in-flight ones at their last unref.
+///
+/// Deliberately `!Send` (`NonNull` field): used only on the worker thread.
+/// Other threads release pooled buffers through FFmpeg's refcounting —
+/// thread-safe with the default pool allocator — never through this struct.
+struct PlanePool {
+    /// Live pool once armed; `None` before the first frame and after a
+    /// failed arming (permanent fallback to `av_frame_get_buffer`).
+    pool: Option<NonNull<AVBufferPool>>,
+    /// Template linesizes, captured verbatim.
+    linesize: [i32; 4],
+    /// Byte offset of each present plane inside the single packed buffer
+    /// (`None` for planes the format does not use). Captured, never derived:
+    /// this inherits whatever `get_video_buffer` did — plane padding bumps,
+    /// absolute alignment, in-buffer palettes like pal8's.
+    offset: [Option<usize>; 4],
+    /// Flips on the one-shot arming attempt, success or not.
+    armed: bool,
+    /// Builds served from the pool. Test-only probe mirroring
+    /// `ObjPool::idle_count`: reuse assertions must not trust pointer
+    /// equality alone, which allocator address reuse can satisfy.
+    #[cfg(test)]
+    pooled_builds: usize,
+}
+
+impl PlanePool {
+    /// Pool that has seen no frame: zero FFmpeg calls and a no-op `Drop`, so
+    /// a job that ends before any push allocates exactly like today.
+    fn empty() -> Self {
+        PlanePool {
+            pool: None,
+            linesize: [0; 4],
+            offset: [None; 4],
+            armed: false,
+            #[cfg(test)]
+            pooled_builds: 0,
+        }
+    }
+
+    /// The init-failure end state (armed, no pool): a real
+    /// `av_buffer_pool_init` failure is not injectable through FFmpeg, so
+    /// tests construct its aftermath directly.
+    #[cfg(test)]
+    fn disarmed() -> Self {
+        PlanePool {
+            armed: true,
+            ..Self::empty()
+        }
+    }
+
+    /// Attaches a pooled plane buffer to the unref'd shell `f`, reproducing
+    /// the captured template layout. `Ok(false)`: pool not armed (first
+    /// frame, or permanent fallback) — the caller must allocate via
+    /// `av_frame_get_buffer`. `Err`: the pool's internal allocation failed,
+    /// the same OOM the fallback path would surface.
+    ///
+    /// # Safety
+    /// `f` must point to a live, unref'd `AVFrame` shell (no buffers, data
+    /// pointers null), exactly what `ObjPool<Frame>` hands out.
+    unsafe fn attach(&mut self, f: *mut AVFrame) -> Result<bool, AllocFrameError> {
+        let Some(pool) = self.pool else {
+            return Ok(false);
+        };
+        // SAFETY: av_buffer_pool_get is thread-safe by contract and returns
+        // a refcount-1 WRITABLE ref — the same writability state
+        // av_frame_get_buffer yields via av_buffer_alloc (no READONLY flag on
+        // this path), so downstream av_frame_make_writable decisions are
+        // unchanged. The offsets were captured from a real same-size buffer
+        // laid out by FFmpeg itself, so base + offset stays in bounds; the
+        // default pool allocator IS av_buffer_alloc — the template's own
+        // allocator — so the base alignment class transfers.
+        let buf = av_buffer_pool_get(pool.as_ptr());
+        if buf.is_null() {
+            return Err(AllocFrameError::OutOfMemory);
+        }
+        (*f).buf[0] = buf;
+        let base = (*buf).data;
+        for i in 0..4 {
+            (*f).linesize[i] = self.linesize[i];
+            if let Some(off) = self.offset[i] {
+                (*f).data[i] = base.add(off);
+            }
+        }
+        // Defensive mirror of get_video_buffer (an unref'd shell already has
+        // this default).
+        (*f).extended_data = (*f).data.as_mut_ptr();
+        #[cfg(test)]
+        {
+            self.pooled_builds += 1;
+        }
+        Ok(true)
+    }
+
+    /// One-shot arming from the first template-built frame: captures the
+    /// buffer size, linesizes, and per-plane offsets, then initialises the
+    /// pool. Any failure leaves `pool == None` with `armed == true` — a
+    /// silent, permanent fallback to per-frame allocation, adding no error
+    /// identity the unpooled path doesn't already have.
+    ///
+    /// # Safety
+    /// `f` must point to a live `AVFrame` that just succeeded
+    /// `av_frame_get_buffer` for the job's fixed params.
+    unsafe fn try_arm_from(&mut self, f: *const AVFrame) {
+        if self.armed {
+            return;
+        }
+        self.armed = true;
+        let buf0 = (*f).buf[0];
+        if buf0.is_null() {
+            return;
+        }
+        let base = (*buf0).data as usize;
+        // AVBufferRef.size is c_int in older FFmpeg majors' bindings and
+        // size_t in newer ones. Widen through i128 for the sign check and
+        // the usize bounds copy so both bindings compile; keep the native
+        // value for av_buffer_pool_init, whose parameter tracks the same
+        // type.
+        let buf_size = (*buf0).size;
+        let size_wide = buf_size as i128;
+        if size_wide <= 0 {
+            return;
+        }
+        let buf_extent = size_wide as usize;
+        let mut offset = [None; 4];
+        for (i, slot) in offset.iter_mut().enumerate() {
+            let d = (*f).data[i];
+            if d.is_null() {
+                continue;
+            }
+            // get_video_buffer packs every plane (palette included) into the
+            // single buf[0]; any other layout is one this pool cannot
+            // reproduce, so stay on the fallback.
+            match (d as usize).checked_sub(base) {
+                Some(off) if off < buf_extent => *slot = Some(off),
+                _ => return,
+            }
+        }
+        // SAFETY: the default alloc callback (None) keeps FFmpeg's documented
+        // lock-free thread-safety for pool get and buffer release; buf_size
+        // is the template buffer's own size.
+        let pool = av_buffer_pool_init(buf_size, None);
+        let Some(pool) = NonNull::new(pool) else {
+            // Tiny pool-struct OOM while the big frame alloc succeeded:
+            // today's path has no pool at all, so this maps to plain success.
+            debug!("av_buffer_pool_init failed; frame source keeps per-frame plane buffers");
+            return;
+        };
+        self.linesize = [
+            (*f).linesize[0],
+            (*f).linesize[1],
+            (*f).linesize[2],
+            (*f).linesize[3],
+        ];
+        self.offset = offset;
+        self.pool = Some(pool);
+    }
+}
+
+impl Drop for PlanePool {
+    fn drop(&mut self) {
+        if let Some(pool) = self.pool {
+            // SAFETY: `pool` came from av_buffer_pool_init and is released
+            // exactly once. uninit only MARKS the pool freeable — documented
+            // safe while buffers are still in use — and the pool frees itself
+            // when the last outstanding buffer returns. So the worker can
+            // exit while filter/encoder still hold pooled frames or
+            // undelivered FrameBoxes sit in the bounded channel; their
+            // eventual unref on any thread is thread-safe with the default
+            // allocator in use here.
+            unsafe {
+                let mut p = pool.as_ptr();
+                av_buffer_pool_uninit(&mut p);
+            }
+        }
+    }
+}
+
 /// Builds one CFR video frame from a tightly packed byte buffer.
 ///
-/// The shell comes from the shared pool (unref'd: no format, no buffers), so
-/// `av_frame_get_buffer` allocates fresh writable planes with its own row
-/// alignment and inter-plane padding. A flat memcpy of the tight user buffer
-/// would therefore interleave rows with padding garbage; instead
-/// `av_image_fill_arrays` lays the descriptor's plane pointers/linesizes over
-/// the tight source and `av_image_copy` copies plane by plane honoring both
-/// linesizes.
+/// The shell comes from the shared pool (unref'd: no format, no buffers).
+/// The first frame allocates fresh writable planes via `av_frame_get_buffer`
+/// — FFmpeg's own row alignment and inter-plane padding — and arms
+/// `plane_pool` with that exact layout; later frames attach a recycled
+/// buffer reproducing it (see [`PlanePool`]). Either way the planes are
+/// padded, so a flat memcpy of the tight user buffer would interleave rows
+/// with padding garbage; instead `av_image_fill_arrays` lays the
+/// descriptor's plane pointers/linesizes over the tight source and
+/// `av_image_copy` copies plane by plane honoring both linesizes — shared,
+/// unchanged code for both buffer paths.
 ///
 /// Stamping: `pts = ordinal`, `duration = 1` tick, `time_base = fps_den/fps_num`
 /// — every frame advances exactly one frame interval (CFR contract).
 fn build_video_frame(
     frame_pool: &ObjPool<Frame>,
+    plane_pool: &mut PlanePool,
     params: &FrameSourceParams,
     data: &[u8],
     pts: i64,
@@ -226,16 +443,34 @@ fn build_video_frame(
     // dimensions/format were validated at open(); `data` outlives the copy and
     // its length was validated against the tight layout of exactly these
     // parameters (frame_size), which av_image_fill_arrays recomputes here.
+    // A pooled buffer carries the template's size and captured offsets, so
+    // every plane write av_image_copy performs stays in bounds exactly as it
+    // did for the template frame.
     unsafe {
         let f = frame.as_mut_ptr();
         (*f).format = params.pix_fmt as i32;
         (*f).width = params.width;
         (*f).height = params.height;
-        let ret = av_frame_get_buffer(f, 0);
-        if ret < 0 {
-            error!("av_frame_get_buffer failed: {}", av_err2str(ret));
-            frame_pool.release(frame);
-            return Err(AllocFrameError::OutOfMemory.into());
+        match plane_pool.attach(f) {
+            Ok(true) => {}
+            Ok(false) => {
+                // Template/fallback path: fresh planes from FFmpeg; the
+                // first success arms the pool with the real layout.
+                let ret = av_frame_get_buffer(f, 0);
+                if ret < 0 {
+                    error!("av_frame_get_buffer failed: {}", av_err2str(ret));
+                    frame_pool.release(frame);
+                    return Err(AllocFrameError::OutOfMemory.into());
+                }
+                plane_pool.try_arm_from(f);
+            }
+            Err(e) => {
+                // Pool get fails only when its internal av_buffer_alloc
+                // fails — the same OOM the path above surfaces.
+                error!("av_buffer_pool_get returned null");
+                frame_pool.release(frame);
+                return Err(e.into());
+            }
         }
 
         let mut src_data: [*mut u8; 4] = [null_mut(); 4];
@@ -281,7 +516,9 @@ fn build_video_frame(
 mod tests {
     use super::*;
     use crate::core::scheduler::ffmpeg_scheduler::{frame_is_null, unref_frame};
-    use ffmpeg_sys_next::AVPixelFormat::{AV_PIX_FMT_GRAY8, AV_PIX_FMT_YUV420P};
+    use ffmpeg_sys_next::AVPixelFormat::{
+        AV_PIX_FMT_GRAY8, AV_PIX_FMT_NV12, AV_PIX_FMT_PAL8, AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUVA420P,
+    };
     use ffmpeg_sys_next::{av_frame_alloc, av_image_get_buffer_size};
 
     fn test_new_frame() -> crate::error::Result<Frame> {
@@ -308,17 +545,73 @@ mod tests {
         unsafe { av_image_get_buffer_size(pix_fmt, w, h, 1) as usize }
     }
 
+    /// Row-walks every plane of `frame` against the tight align=1 source
+    /// `data`, whose per-plane geometry is `planes = [(bytes_per_row, rows)]`
+    /// in buffer order (pal8's palette is one 1024-byte row).
+    fn assert_frame_planes(frame: &Frame, planes: &[(usize, usize)], data: &[u8], ctx: &str) {
+        unsafe {
+            let f = frame.as_ptr();
+            let mut base = 0usize;
+            for (idx, &(bpr, rows)) in planes.iter().enumerate() {
+                let ls = (*f).linesize[idx] as usize;
+                for y in 0..rows {
+                    let row = std::slice::from_raw_parts((*f).data[idx].add(y * ls), bpr);
+                    assert_eq!(
+                        row,
+                        &data[base + y * bpr..base + (y + 1) * bpr],
+                        "{ctx}: plane {idx} row {y}"
+                    );
+                }
+                base += bpr * rows;
+            }
+            assert_eq!(base, data.len(), "{ctx}: plane table must cover the source");
+        }
+    }
+
+    /// Captures a frame's buffer-layout contract: the active-plane mask with
+    /// each active plane's offset from `buf[0].data`, all linesizes, the
+    /// buffer extent, `extended_data` aliasing `data`, and buffer
+    /// writability — the facts `PlanePool::attach` must reproduce verbatim
+    /// from its template.
+    fn frame_layout(frame: &Frame) -> ([Option<usize>; 8], [i32; 8], i128, bool, bool) {
+        unsafe {
+            let f = frame.as_ptr();
+            let buf0 = (*f).buf[0];
+            assert!(!buf0.is_null(), "frame must own a packed buf[0]");
+            let base = (*buf0).data as usize;
+            let mut offsets = [None; 8];
+            for (i, slot) in offsets.iter_mut().enumerate() {
+                let d = (*f).data[i];
+                if !d.is_null() {
+                    *slot = Some(
+                        (d as usize)
+                            .checked_sub(base)
+                            .expect("plane pointer below buffer base"),
+                    );
+                }
+            }
+            (
+                offsets,
+                (*f).linesize,
+                (*buf0).size as i128,
+                std::ptr::eq((*f).extended_data, (*f).data.as_ptr()),
+                ffmpeg_sys_next::av_buffer_is_writable(buf0) == 1,
+            )
+        }
+    }
+
     /// Odd-width gray8: the tight stride (65) differs from the padded frame
     /// linesize, so a flat memcpy would shear rows. Verify every row landed at
     /// its linesize offset with its exact content.
     #[test]
     fn fill_respects_linesize_for_odd_width() {
         let pool = test_pool();
+        let mut plane_pool = PlanePool::empty();
         let p = params(AV_PIX_FMT_GRAY8, 65, 3);
         let data: Vec<u8> = (0..tight_size(p.pix_fmt, 65, 3))
             .map(|i| (i % 251) as u8)
             .collect();
-        let frame = build_video_frame(&pool, &p, &data, 7).expect("build");
+        let frame = build_video_frame(&pool, &mut plane_pool, &p, &data, 7).expect("build");
         unsafe {
             let f = frame.as_ptr();
             assert!((*f).linesize[0] >= 65, "padded linesize expected");
@@ -339,6 +632,7 @@ mod tests {
     #[test]
     fn fill_copies_all_planes_for_odd_yuv420p() {
         let pool = test_pool();
+        let mut plane_pool = PlanePool::empty();
         let (w, h) = (65i32, 49i32);
         let p = params(AV_PIX_FMT_YUV420P, w, h);
         let (cw, ch) = (33usize, 25usize);
@@ -349,7 +643,7 @@ mod tests {
         for (i, b) in data.iter_mut().enumerate() {
             *b = (i * 7 % 253) as u8;
         }
-        let frame = build_video_frame(&pool, &p, &data, 0).expect("build");
+        let frame = build_video_frame(&pool, &mut plane_pool, &p, &data, 0).expect("build");
         unsafe {
             let f = frame.as_ptr();
             let planes = [
@@ -503,21 +797,203 @@ mod tests {
 
     /// A recycled shell (released with buffers attached) must come back clean
     /// and refill correctly — the pool's unref_fn is what discharges the old
-    /// buffers.
+    /// buffers. The second build also goes through the armed plane pool, so
+    /// this doubles as an unref'd-shell-refills-through-the-pool check.
     #[test]
     fn recycled_shell_refills_cleanly() {
         let pool = test_pool();
+        let mut plane_pool = PlanePool::empty();
         let p = params(AV_PIX_FMT_GRAY8, 8, 2);
         let data_a = vec![0xAA; tight_size(p.pix_fmt, 8, 2)];
-        let frame = build_video_frame(&pool, &p, &data_a, 0).expect("first build");
+        let frame = build_video_frame(&pool, &mut plane_pool, &p, &data_a, 0).expect("first build");
         pool.release(frame); // unrefs, stores the shell
         let data_b = vec![0x55; tight_size(p.pix_fmt, 8, 2)];
-        let frame = build_video_frame(&pool, &p, &data_b, 1).expect("recycled build");
+        let frame =
+            build_video_frame(&pool, &mut plane_pool, &p, &data_b, 1).expect("recycled build");
         unsafe {
             let f = frame.as_ptr();
             let row = std::slice::from_raw_parts((*f).data[0], 8);
             assert_eq!(row, &data_b[..8]);
             assert_eq!((*f).pts, 1);
         }
+    }
+
+    /// Steady-state plane reuse: frame 1 (template path) arms the pool,
+    /// frame 2 draws a fresh pooled buffer, and after frame 2's release its
+    /// buffer must come back for frame 3. The cfg(test) counter is the
+    /// primary signal — pointer equality alone could be satisfied by
+    /// allocator address reuse — while the data[0] match is corroborating
+    /// evidence, deterministic here because the pool (not the allocator)
+    /// held that buffer and single-threaded pool reuse is LIFO.
+    #[test]
+    fn pooled_rebuild_reuses_plane_buffer() {
+        let pool = test_pool();
+        let mut plane_pool = PlanePool::empty();
+        let p = params(AV_PIX_FMT_GRAY8, 65, 3);
+        let planes: &[(usize, usize)] = &[(65, 3)];
+        let tight = tight_size(p.pix_fmt, 65, 3);
+        let pat = |seed: u8| -> Vec<u8> {
+            (0..tight)
+                .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+                .collect()
+        };
+
+        let data_a = pat(1);
+        let f1 = build_video_frame(&pool, &mut plane_pool, &p, &data_a, 0).expect("frame 1");
+        assert_eq!(plane_pool.pooled_builds, 0, "frame 1 is the template build");
+        assert!(plane_pool.pool.is_some(), "first build must arm the pool");
+        assert_frame_planes(&f1, planes, &data_a, "frame 1");
+
+        let data_b = pat(2);
+        let f2 = build_video_frame(&pool, &mut plane_pool, &p, &data_b, 1).expect("frame 2");
+        assert_eq!(plane_pool.pooled_builds, 1, "frame 2 must be pooled");
+        assert_frame_planes(&f2, planes, &data_b, "frame 2");
+        let f2_plane0 = unsafe { (*f2.as_ptr()).data[0] as usize };
+        assert_eq!(unsafe { (*f2.as_ptr()).pts }, 1);
+
+        // Releasing frame 2 unrefs the last reference to its plane buffer,
+        // which hands the buffer back to the pool rather than the allocator.
+        pool.release(f2);
+
+        let data_c = pat(3);
+        let f3 = build_video_frame(&pool, &mut plane_pool, &p, &data_c, 2).expect("frame 3");
+        assert_eq!(plane_pool.pooled_builds, 2, "frame 3 must be pooled");
+        let f3_plane0 = unsafe { (*f3.as_ptr()).data[0] as usize };
+        assert_eq!(
+            f3_plane0, f2_plane0,
+            "frame 3 must reuse frame 2's pooled plane buffer"
+        );
+        assert_frame_planes(&f3, planes, &data_c, "frame 3");
+        assert_frame_planes(&f1, planes, &data_a, "frame 1 after reuse");
+    }
+
+    /// Pooled frames must reproduce the template's layout and land content
+    /// byte-exactly across plane-count extremes at odd geometry: gray8 (1
+    /// plane), nv12 (2, interleaved chroma), yuv420p (3), yuva420p (4), and
+    /// pal8 (palette living inside the same packed buffer). Frame 1 is the
+    /// template; frames 2-3 are pooled.
+    #[test]
+    fn pooled_layout_matches_template_across_formats() {
+        let cases: &[(ffmpeg_sys_next::AVPixelFormat, &[(usize, usize)])] = &[
+            (AV_PIX_FMT_GRAY8, &[(65, 49)]),
+            (AV_PIX_FMT_NV12, &[(65, 49), (66, 25)]),
+            (AV_PIX_FMT_YUV420P, &[(65, 49), (33, 25), (33, 25)]),
+            (
+                AV_PIX_FMT_YUVA420P,
+                &[(65, 49), (33, 25), (33, 25), (65, 49)],
+            ),
+            (AV_PIX_FMT_PAL8, &[(65, 49), (1024, 1)]),
+        ];
+        for &(fmt, planes) in cases {
+            let pool = test_pool();
+            let mut plane_pool = PlanePool::empty();
+            let p = params(fmt, 65, 49);
+            let tight = tight_size(fmt, 65, 49);
+            assert_eq!(
+                tight,
+                planes.iter().map(|&(bpr, rows)| bpr * rows).sum::<usize>(),
+                "{fmt:?}: plane table out of sync with FFmpeg's tight layout"
+            );
+            let mut template_layout = None;
+            for n in 0..3i64 {
+                let data: Vec<u8> = (0..tight)
+                    .map(|i| ((i * 7 + n as usize * 31) % 251) as u8)
+                    .collect();
+                let frame = build_video_frame(&pool, &mut plane_pool, &p, &data, n).expect("build");
+                unsafe {
+                    let f = frame.as_ptr();
+                    assert_eq!((*f).pts, n, "{fmt:?} frame {n}: pts");
+                    assert_eq!((*f).duration, 1, "{fmt:?} frame {n}: duration");
+                }
+                // Verbatim layout-contract pin: pooled frames must reproduce
+                // the template's active-plane mask, buffer-relative offsets,
+                // linesizes, buffer extent, extended_data aliasing, and
+                // writability — not merely land equivalent pixels somewhere.
+                let layout = frame_layout(&frame);
+                match &template_layout {
+                    None => template_layout = Some(layout),
+                    Some(template) => assert_eq!(
+                        &layout, template,
+                        "{fmt:?} frame {n}: pooled layout must match the template verbatim"
+                    ),
+                }
+                assert_frame_planes(&frame, planes, &data, &format!("{fmt:?} frame {n}"));
+                pool.release(frame);
+            }
+            assert_eq!(
+                plane_pool.pooled_builds, 2,
+                "{fmt:?}: frames 2-3 must build through the pool"
+            );
+        }
+    }
+
+    /// The deferred-teardown contract: worker exit drops the `PlanePool`
+    /// (`av_buffer_pool_uninit`) while downstream stages may still hold
+    /// pooled frames — FFmpeg keeps every outstanding buffer valid and
+    /// frees the pool itself only when the last one returns. Hold a pooled
+    /// frame across the drop, verify its planes are intact, then release it
+    /// as the true last owner.
+    #[test]
+    fn pooled_buffer_outlives_the_pool() {
+        let pool = test_pool();
+        let mut plane_pool = PlanePool::empty();
+        let p = params(AV_PIX_FMT_YUV420P, 65, 49);
+        let planes: &[(usize, usize)] = &[(65, 49), (33, 25), (33, 25)];
+        let tight = tight_size(p.pix_fmt, 65, 49);
+        let data_a: Vec<u8> = (0..tight).map(|i| (i % 249) as u8).collect();
+        let data_b: Vec<u8> = (0..tight).map(|i| (i % 247) as u8).collect();
+
+        let f1 = build_video_frame(&pool, &mut plane_pool, &p, &data_a, 0).expect("template");
+        let f2 = build_video_frame(&pool, &mut plane_pool, &p, &data_b, 1).expect("pooled");
+        assert_eq!(plane_pool.pooled_builds, 1, "frame 2 must be pooled");
+
+        // Worker exit while the pooled frame is still in flight downstream.
+        drop(plane_pool);
+
+        assert_frame_planes(&f2, planes, &data_b, "pooled frame after pool drop");
+        // The last unref of the pooled buffer, after uninit, frees buffer
+        // and pool together (leak/UAF visible to the sanitizer lane).
+        pool.release(f2);
+        pool.release(f1);
+    }
+
+    /// The permanent-fallback state (armed with no pool, the aftermath of a
+    /// failed pool init) must keep building frames exactly like today's
+    /// unpooled path: byte-exact content, zero pooled builds, no late arming.
+    #[test]
+    fn pool_fallback_builds_identical_frames() {
+        let pool = test_pool();
+        let mut plane_pool = PlanePool::disarmed();
+        let p = params(AV_PIX_FMT_YUV420P, 65, 49);
+        let planes: &[(usize, usize)] = &[(65, 49), (33, 25), (33, 25)];
+        let tight = tight_size(p.pix_fmt, 65, 49);
+        for n in 0..3i64 {
+            let data: Vec<u8> = (0..tight)
+                .map(|i| ((i * 3 + n as usize * 17) % 250) as u8)
+                .collect();
+            let frame = build_video_frame(&pool, &mut plane_pool, &p, &data, n).expect("build");
+            if n == 0 {
+                // The disarmed path must carry the same buffer-layout
+                // contract as a genuine unpooled build, not merely
+                // equivalent pixels.
+                let mut fresh = PlanePool::empty();
+                let twin =
+                    build_video_frame(&pool, &mut fresh, &p, &data, n).expect("unpooled twin");
+                assert_eq!(
+                    frame_layout(&frame),
+                    frame_layout(&twin),
+                    "fallback layout must match a normal unpooled frame"
+                );
+                pool.release(twin);
+            }
+            assert_frame_planes(&frame, planes, &data, &format!("fallback frame {n}"));
+            assert_eq!(unsafe { (*frame.as_ptr()).pts }, n);
+            pool.release(frame);
+        }
+        assert_eq!(
+            plane_pool.pooled_builds, 0,
+            "every fallback build must take the av_frame_get_buffer path"
+        );
+        assert!(plane_pool.pool.is_none(), "a failed arming is permanent");
     }
 }
