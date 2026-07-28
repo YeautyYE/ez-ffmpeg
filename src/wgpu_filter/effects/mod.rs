@@ -180,6 +180,10 @@ impl<P: bytemuck::Pod + Send> FrameFilter for Effect<P> {
         self.filter.request_frame_mode()
     }
 
+    fn request_frame_pending(&self) -> bool {
+        self.filter.request_frame_pending()
+    }
+
     fn uninit(&mut self, ctx: &mut FrameFilterContext) {
         self.filter.uninit(ctx)
     }
