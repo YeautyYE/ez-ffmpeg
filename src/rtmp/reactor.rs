@@ -1074,8 +1074,9 @@ pub struct Reactor {
     packets_buffer: Vec<OutboundWrite>,
     /// Reusable buffer for IDs to close (avoids allocation in handle_readable)
     ids_to_close_buffer: Vec<usize>,
-    /// Reusable buffer for scheduler results on the publisher feed paths
-    /// (avoids a Vec allocation per media tag / raw chunk)
+    /// Reusable buffer for scheduler results on the publisher feed and
+    /// socket-ingest scheduler batches (avoids a Vec allocation per media
+    /// tag / raw chunk / inbound socket batch)
     server_results_buffer: Vec<ServerResult>,
     /// Reusable buffer for handle results (avoids allocation in handle_readable)
     results_buffer: Vec<HandleResult>,
@@ -1489,12 +1490,15 @@ impl Reactor {
             .get(id)
             .map(|conn| conn.pending_bytes())
             .unwrap_or(0);
-        match self
-            .scheduler
-            .bytes_received_with_backlog(id, data, backlog)
-        {
-            Ok(server_results) => {
-                for result in server_results {
+        self.server_results_buffer.clear();
+        match self.scheduler.bytes_received_with_backlog(
+            id,
+            data,
+            backlog,
+            &mut self.server_results_buffer,
+        ) {
+            Ok(()) => {
+                for result in self.server_results_buffer.drain(..) {
                     match result {
                         ServerResult::OutboundPacket {
                             target_connection_id,
