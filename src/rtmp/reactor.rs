@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read};
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 // ============================================================================
@@ -59,7 +59,8 @@ const MAX_READ_PER_POLL: usize = 512 * 1024; // 512KB max read per poll to preve
 /// Capacity of the bounded channel between an in-process publisher and the
 /// reactor. Shared with `embed_rtmp_server`'s sender constructors so the
 /// per-round item budget below always matches what a producer can queue ahead
-/// of one drain.
+/// of one drain. Counts items only; its byte-gate companion is
+/// `PUBLISHER_INGRESS_HIGH_WATER_BYTES` below.
 pub(crate) const PUBLISHER_CHANNEL_CAPACITY: usize = 1024;
 /// Per-publisher, per-round byte budget for `process_publishers`. Mirrors
 /// MAX_READ_PER_POLL so an in-process publisher cannot out-rank a socket
@@ -71,6 +72,24 @@ const MAX_PUBLISH_BYTES_PER_POLL: usize = MAX_READ_PER_POLL;
 /// for streams of tiny packets whose byte total stays low. Equal to the
 /// channel capacity: one round can at most clear a full backlog.
 const MAX_PUBLISH_ITEMS_PER_POLL: usize = PUBLISHER_CHANNEL_CAPACITY;
+/// Per-publisher high-water mark, in bytes, for the ingress budget gating the
+/// in-process publisher channel: a producer's send blocks once this many
+/// undrained bytes are queued, the byte companion to the item-count bound the
+/// channel capacity provides. The mark is deliberately generous on three
+/// axes: it is 16 x MAX_PUBLISH_BYTES_PER_POLL, so a producer can run 16
+/// drain rounds ahead and a healthy reactor never throttles at the gate; it
+/// is ~2.5s of 25 Mbps 1080p video (~1s of 60 Mbps 4K), so GOP-sized muxer
+/// bursts pass untouched; and it equals the channel's 1024 items x 8 KiB, so
+/// streams whose average item is <= 8 KiB hit the pre-existing item cap
+/// first and behave exactly as before — the byte gate binds only for
+/// larger-item streams, whose queue could previously balloon to 1024 x
+/// item-size (hundreds of MiB at 4K keyframe sizes). No low-water resume
+/// mark: hysteresis pays when a pause/resume transition costs a syscall
+/// (poller interest toggling); a Condvar wake is nanoseconds, and releases
+/// are already batched to one notify per publisher per drain round (a
+/// natural ~512 KiB step), so a separate low-water mark would only add
+/// forced producer idle latency.
+pub(crate) const PUBLISHER_INGRESS_HIGH_WATER_BYTES: usize = 8 * 1024 * 1024;
 /// Capacity of the registration handoff between the create paths and the
 /// reactor — the same bound the crossbeam channel it replaced had. Every
 /// queued registration parks a stream-key claim, so an uncapped queue lets a
@@ -737,6 +756,21 @@ pub enum PublisherFeed {
     },
 }
 
+impl PublisherFeed {
+    /// The length this item accounts for in its publisher's
+    /// [`IngressBudget`]: exactly the quantity `process_publishers` adds to
+    /// `bytes_drained` when it consumes the item (Raw → the chunk bytes,
+    /// Media → the tag payload), so producer-side acquires and the reactor's
+    /// per-round releases balance to zero once everything queued has
+    /// drained. Every feed producer must measure through this one helper.
+    pub(crate) fn ingress_len(&self) -> usize {
+        match self {
+            PublisherFeed::Raw(bytes) => bytes.len(),
+            PublisherFeed::Media { data, .. } => data.len(),
+        }
+    }
+}
+
 /// How a registered publisher delivers its data.
 ///
 /// - [`PublisherSource::Raw`] is the public `create_stream_sender` path:
@@ -800,14 +834,233 @@ impl Drop for StreamKeyClaim {
     }
 }
 
+/// Error returned by [`IngressBudget::acquire`] once the budget is closed:
+/// the reactor-side owner of the publisher dropped its
+/// [`IngressBudgetGuard`] (stream removed, registration refused or never
+/// consumed, reactor teardown), so no drain will ever make room again.
+/// Callers map it to the same stream-closed error the dead channel behind
+/// the budget produces.
+#[derive(Debug)]
+pub(crate) struct IngressClosed;
+
+/// The mutable half of an [`IngressBudget`]: all fields live behind one
+/// mutex so the wait predicate in `acquire` and every mutation share a
+/// single linearization point — there is no test-then-park window in which
+/// a release or close could slip between a producer's check and its wait.
+struct BudgetInner {
+    /// Bytes acquired by producers and not yet released by a drain round.
+    queued: usize,
+    /// Set exactly once, by [`IngressBudgetGuard`]'s drop; wakes and refuses
+    /// every producer from then on.
+    closed: bool,
+    /// FIFO admission tickets. Every `acquire` takes `next_ticket` on entry;
+    /// only the acquire holding `serving` may admit, and admission advances
+    /// it. Without the ordering, sibling sender clones with small items
+    /// could refill every released batch ahead of a parked large item and
+    /// starve it indefinitely — capacity alone is not a queue. With one
+    /// producer (both internal paths) the two counters never diverge by
+    /// more than one and the fast path is untouched.
+    next_ticket: u64,
+    serving: u64,
+}
+
+/// Per-publisher byte account bounding how far an in-process producer (a
+/// user thread on the raw path, the FFmpeg muxer thread on the feed path)
+/// may run ahead of the reactor's drain. The publisher channel bounds items
+/// only; this bounds bytes, so a large-item stream blocks in its send at
+/// [`PUBLISHER_INGRESS_HIGH_WATER_BYTES`] instead of queueing 1024 x
+/// item-size. Producers [`acquire`](Self::acquire) before every channel
+/// send; the reactor [`release`](Self::release)s each round's drained bytes
+/// in one batch (see `process_publishers`).
+///
+/// Producer and consumer are different threads, so parking needs a real
+/// primitive: Mutex+Condvar is the house pattern for capacity waits (see
+/// `EncSyncHandle` in `core::context::encoder_stream`). Lock-order safety:
+/// the mutex is held only inside the short `acquire`/`release`/`close`
+/// bodies here — never across a channel operation, another lock, or a log
+/// call — on either thread.
+pub(crate) struct IngressBudget {
+    inner: Mutex<BudgetInner>,
+    cv: Condvar,
+    high_water: usize,
+}
+
+impl IngressBudget {
+    /// Create an account with `high_water` as its byte mark. Returns the
+    /// close-on-drop guard for the reactor side (it travels registration →
+    /// [`PublisherState`], and whichever owner drops it wakes every blocked
+    /// producer) and the shared handle for the producer side.
+    pub(crate) fn new(high_water: usize) -> (IngressBudgetGuard, Arc<IngressBudget>) {
+        let budget = Arc::new(IngressBudget {
+            inner: Mutex::new(BudgetInner {
+                queued: 0,
+                closed: false,
+                next_ticket: 0,
+                serving: 0,
+            }),
+            cv: Condvar::new(),
+            high_water,
+        });
+        (
+            IngressBudgetGuard {
+                budget: budget.clone(),
+            },
+            budget,
+        )
+    }
+
+    /// Lock the account, riding over poisoning: the fields carry no
+    /// cross-statement invariant a panic could tear (every critical section
+    /// is a couple of integer/flag edits), and `close` MUST still wake
+    /// blocked producers even if some other holder panicked — a producer
+    /// parked forever is exactly what the close exists to prevent.
+    fn lock(&self) -> MutexGuard<'_, BudgetInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Reserve `len` bytes ahead of a channel send, blocking while the
+    /// account is over its high-water mark. Admission is FIFO (ticketed):
+    /// competing sender clones are served in arrival order, so a parked
+    /// large item cannot be starved by siblings refilling every released
+    /// batch with small ones. The `queued == 0` term admits the head item
+    /// of any size into an EMPTY account, so a single item larger than the
+    /// whole mark bounds memory at that item's size instead of deadlocking
+    /// its producer.
+    ///
+    /// Liveness: whenever the head waiter blocks, `queued > 0`, so at least
+    /// one prior item was sent, and every producer send is followed by a
+    /// reactor wake whose eventfd/pipe token persists until drained — a
+    /// drain round is therefore already scheduled. Each round releases what
+    /// it drained and notifies, and a budget-limited round forces the next
+    /// poll to be zero-timeout (`publishers_pending` in `run`), so rounds
+    /// continue back-to-back until the head admits; each admission notifies
+    /// again, chaining the queue forward. FIFO extends the head's liveness
+    /// to every waiter behind it. Teardown of the consumer drops the
+    /// [`IngressBudgetGuard`], which closes the account and wakes every
+    /// waiter. No path leaves a waiter without a scheduled drain, a
+    /// predecessor's admission, or a close.
+    pub(crate) fn acquire(&self, len: usize) -> Result<(), IngressClosed> {
+        let mut inner = self.lock();
+        let ticket = inner.next_ticket;
+        inner.next_ticket += 1;
+        while !inner.closed
+            && !(inner.serving == ticket
+                && (inner.queued == 0 || inner.queued.saturating_add(len) <= self.high_water))
+        {
+            inner = self
+                .cv
+                .wait(inner)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        if inner.closed {
+            // Deliberately no `serving` advance: `closed` is terminal and
+            // checked first, so later tickets exit through this arm too.
+            return Err(IngressClosed);
+        }
+        inner.serving += 1;
+        inner.queued = inner.queued.saturating_add(len);
+        let has_waiters = inner.next_ticket != inner.serving;
+        drop(inner);
+        // Hand the head role to the next ticket now — capacity permitting it
+        // admits immediately instead of waiting for the next drain round.
+        // notify_one could wake a non-head ticket, so this must broadcast;
+        // the uncontended fast path (no successor ticket) skips the futex
+        // entirely and pays only the two counter writes.
+        if has_waiters {
+            self.cv.notify_all();
+        }
+        Ok(())
+    }
+
+    /// Return `len` drained (or rolled-back) bytes to the account and wake
+    /// every parked producer. The reactor batches this to one call per
+    /// publisher per drain round, so a blocked producer wakes at most once
+    /// per round — a natural ~512 KiB step — rather than per item.
+    pub(crate) fn release(&self, len: usize) {
+        let mut inner = self.lock();
+        debug_assert!(
+            inner.queued >= len,
+            "ingress budget released more than was acquired ({} < {len})",
+            inner.queued
+        );
+        inner.queued = inner.queued.saturating_sub(len);
+        let has_waiters = inner.next_ticket != inner.serving;
+        drop(inner);
+        if has_waiters {
+            self.cv.notify_all();
+        }
+    }
+
+    /// Close the account: every parked producer wakes with [`IngressClosed`]
+    /// and every later acquire is refused. Idempotent; in production the
+    /// guard's drop is the only caller.
+    fn close(&self) {
+        let mut inner = self.lock();
+        inner.closed = true;
+        drop(inner);
+        self.cv.notify_all();
+    }
+
+    /// Bytes currently acquired and not yet released (test only).
+    #[cfg(test)]
+    pub(crate) fn queued_bytes(&self) -> usize {
+        self.lock().queued
+    }
+
+    /// Tickets taken minus tickets served — the acquires that have entered
+    /// but not yet admitted: parked waiters plus any currently racing the
+    /// lock. Closed-account exits do not advance `serving`, so the count
+    /// stays inflated after a close; use only in pre-close phases (test
+    /// only; lets tests wait until a producer is deterministically inside
+    /// `acquire` before proceeding).
+    #[cfg(test)]
+    pub(crate) fn waiting_acquires(&self) -> u64 {
+        let inner = self.lock();
+        inner.next_ticket - inner.serving
+    }
+}
+
+/// Close-on-drop owner of an [`IngressBudget`], with the same move-only
+/// lifecycle as [`StreamKeyClaim`]: created alongside the registration,
+/// moved into the accepted publisher's [`PublisherState`], and released —
+/// here: closed — **exactly once**, wherever the owning value dies: a
+/// refused enqueue, a queued registration nobody ever consumed (the
+/// [`RegistrationKillSwitch`]'s terminal drain), a scheduler refusal in
+/// [`Reactor::add_publisher`], [`Reactor::remove_publisher`], or the
+/// reactor's `publishers` slab being torn down. Ownership only ever moves,
+/// so there is no instant at which producers could block on an account no
+/// guard would ever close.
+pub(crate) struct IngressBudgetGuard {
+    budget: Arc<IngressBudget>,
+}
+
+impl IngressBudgetGuard {
+    /// Borrow the shared account, for the drain loop to clone.
+    pub(crate) fn budget(&self) -> &Arc<IngressBudget> {
+        &self.budget
+    }
+}
+
+impl Drop for IngressBudgetGuard {
+    fn drop(&mut self) {
+        self.budget.close();
+    }
+}
+
 /// A publisher registration in flight from the server's `register_publisher`
 /// to the reactor. It carries the key claim so a registration dropped
 /// anywhere short of [`Reactor::add_publisher`] taking ownership — refused
 /// at enqueue because the intake is closed or full, or still queued when the
-/// worker's [`RegistrationKillSwitch`] fires — releases the key automatically.
+/// worker's [`RegistrationKillSwitch`] fires — releases the key
+/// automatically. The ingress-budget guard rides the same lifecycle, so the
+/// same drops also close the budget and wake any producer parked at the
+/// byte gate.
 pub(crate) struct PublisherRegistration {
     pub(crate) claim: StreamKeyClaim,
     pub(crate) source: PublisherSource,
+    pub(crate) budget: IngressBudgetGuard,
 }
 
 /// The registration queue proper: the worker-liveness flag and the payload
@@ -980,10 +1233,12 @@ impl Drop for RegistrationKillSwitch {
 /// Owns the stream-key claim for as long as the publisher is accepted.
 /// Dropping the state — [`Reactor::remove_publisher`], or the reactor's
 /// `publishers` slab being dropped on teardown, clean exit and unwind
-/// alike — releases the key.
+/// alike — releases the key and closes the ingress budget, waking any
+/// producer parked at the byte gate.
 pub struct PublisherState {
     pub(crate) claim: StreamKeyClaim,
     pub source: PublisherSource,
+    pub(crate) budget: IngressBudgetGuard,
 }
 
 /// One fanout packet bound for a connection's write queue: (target
@@ -1262,16 +1517,25 @@ impl Reactor {
     /// publishing to, and leaving the claim in place would block that key
     /// for in-process creates forever.
     pub fn add_publisher(&mut self, registration: PublisherRegistration) -> Option<usize> {
-        let PublisherRegistration { claim, source } = registration;
+        let PublisherRegistration {
+            claim,
+            source,
+            budget,
+        } = registration;
         let entry = self.publishers.vacant_entry();
         let id = entry.key();
 
         if self.scheduler.new_channel(claim.key().to_string(), id) {
-            let state = entry.insert(PublisherState { claim, source });
+            let state = entry.insert(PublisherState {
+                claim,
+                source,
+                budget,
+            });
             debug!("Publisher {} added for stream: {}", id, state.claim.key());
             Some(id)
         } else {
-            // Dropping `claim` releases the key.
+            // Dropping `claim` releases the key; dropping `budget` closes
+            // the ingress account, waking any already-parked producer.
             None
         }
     }
@@ -1668,12 +1932,15 @@ impl Reactor {
         let publisher_ids: Vec<usize> = self.publishers.iter().map(|(id, _)| id).collect();
 
         for pub_id in publisher_ids {
-            let source = {
+            let (source, ingress_budget) = {
                 let pub_state = match self.publishers.get(pub_id) {
                     Some(p) => p,
                     None => continue,
                 };
-                pub_state.source.clone()
+                (
+                    pub_state.source.clone(),
+                    pub_state.budget.budget().clone(),
+                )
             };
 
             // Budgets are per publisher per round, so one flooding publisher
@@ -1805,6 +2072,19 @@ impl Reactor {
                         }
                     }
                 },
+            }
+
+            // Hand this round's drained bytes back to the producer side in
+            // one batch — one uncontended lock + notify per publisher per
+            // round, not per item — after every drain-loop exit alike
+            // (Empty, budget stop, disconnect, fatal error), so a producer
+            // parked at the byte gate wakes with the very round that made
+            // room. `bytes_drained` sums exactly what producers acquired
+            // per item (see PublisherFeed::ingress_len). A publisher
+            // scheduled for removal releases here too; its guard's close
+            // follows when remove_publisher drops the state.
+            if bytes_drained > 0 {
+                ingress_budget.release(bytes_drained);
             }
         }
 
@@ -2299,6 +2579,28 @@ impl Reactor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fresh production-sized ingress-budget guard for registration
+    /// literals in tests that never exercise the byte gate (their payloads
+    /// sit far below the mark, so the gate is invisible to them).
+    fn test_budget() -> IngressBudgetGuard {
+        IngressBudget::new(PUBLISHER_INGRESS_HIGH_WATER_BYTES).0
+    }
+
+    /// Pair a direct channel push with the producer-side reservation the
+    /// real send paths perform, so the drain's per-round release accounting
+    /// stays balanced (release debug-asserts it never exceeds what was
+    /// acquired).
+    fn send_acquired(
+        budget: &IngressBudget,
+        feed_tx: &crossbeam_channel::Sender<PublisherFeed>,
+        feed: PublisherFeed,
+    ) {
+        budget
+            .acquire(feed.ingress_len())
+            .expect("the test budget must be open");
+        feed_tx.send(feed).expect("the test channel must accept");
+    }
 
     #[test]
     fn test_connection_state_transitions() {
@@ -3594,11 +3896,13 @@ mod tests {
 
         // Register an in-process (create_rtmp_input-style) Feed publisher.
         let (feed_tx, feed_rx) = crossbeam_channel::bounded(64);
+        let (budget_guard, budget) = IngressBudget::new(PUBLISHER_INGRESS_HIGH_WATER_BYTES);
         let claim = StreamKeyClaim::claim(stream_keys, "live".to_string()).expect("claim");
         let pub_id = reactor
             .add_publisher(PublisherRegistration {
                 claim,
                 source: PublisherSource::Feed(feed_rx),
+                budget: budget_guard,
             })
             .expect("publisher registered");
 
@@ -3607,39 +3911,47 @@ mod tests {
         for control in
             build_publish_control("app".to_string(), "live".to_string()).expect("control")
         {
-            feed_tx.send(PublisherFeed::Raw(control)).unwrap();
+            send_acquired(&budget, &feed_tx, PublisherFeed::Raw(control));
         }
         let video_seq: &[u8] = &[0x17, 0x00, 0x00, 0x00, 0x00, 0x01, 0x64];
         let audio_seq: &[u8] = &[0xaf, 0x00, 0x12, 0x10];
-        feed_tx
-            .send(PublisherFeed::Media {
+        send_acquired(
+            &budget,
+            &feed_tx,
+            PublisherFeed::Media {
                 tag_type: 0x09,
                 timestamp: RtmpTimestamp { value: 0 },
                 data: Bytes::from_static(video_seq),
-            })
-            .unwrap();
-        feed_tx
-            .send(PublisherFeed::Media {
+            },
+        );
+        send_acquired(
+            &budget,
+            &feed_tx,
+            PublisherFeed::Media {
                 tag_type: 0x08,
                 timestamp: RtmpTimestamp { value: 0 },
                 data: Bytes::from_static(audio_seq),
-            })
-            .unwrap();
-        feed_tx
-            .send(PublisherFeed::Media {
+            },
+        );
+        send_acquired(
+            &budget,
+            &feed_tx,
+            PublisherFeed::Media {
                 tag_type: 0x09,
                 timestamp: RtmpTimestamp { value: 33 },
                 data: Bytes::from_static(&[0x17, 0x01, 0xAA, 0xBB]),
-            })
-            .unwrap();
+            },
+        );
         // A second keyframe freezes the first GOP into the replay cache.
-        feed_tx
-            .send(PublisherFeed::Media {
+        send_acquired(
+            &budget,
+            &feed_tx,
+            PublisherFeed::Media {
                 tag_type: 0x09,
                 timestamp: RtmpTimestamp { value: 66 },
                 data: Bytes::from_static(&[0x17, 0x01, 0xCC, 0xDD]),
-            })
-            .unwrap();
+            },
+        );
 
         // Drain the mixed feed; a healthy publisher must not be removed.
         let (removed, _) = reactor.process_publishers();
@@ -3722,6 +4034,7 @@ mod tests {
             .add_publisher(PublisherRegistration {
                 claim,
                 source: PublisherSource::Feed(feed_rx),
+                budget: test_budget(),
             })
             .expect("accepted");
         assert!(
@@ -3743,6 +4056,7 @@ mod tests {
                 .add_publisher(PublisherRegistration {
                     claim,
                     source: PublisherSource::Feed(feed_rx2),
+                    budget: test_budget(),
                 })
                 .is_none(),
             "a key already being published must be refused"
@@ -3777,6 +4091,7 @@ mod tests {
             .enqueue(PublisherRegistration {
                 claim,
                 source: PublisherSource::Feed(feed_rx),
+                budget: test_budget(),
             })
             .unwrap_or_else(|_| panic!("enqueue while the worker lives"));
         status.store(STATUS_END, Ordering::Release);
@@ -3818,6 +4133,7 @@ mod tests {
             .add_publisher(PublisherRegistration {
                 claim,
                 source: PublisherSource::Feed(feed_rx),
+                budget: test_budget(),
             })
             .expect("accepted");
         assert!(
@@ -3865,6 +4181,7 @@ mod tests {
             .enqueue(PublisherRegistration {
                 claim,
                 source: PublisherSource::Feed(feed_rx),
+                budget: test_budget(),
             })
             .unwrap_or_else(|_| panic!("enqueue while the worker lives"));
 
@@ -3891,6 +4208,7 @@ mod tests {
         let refused = registrations.enqueue(PublisherRegistration {
             claim: late_claim,
             source: PublisherSource::Feed(late_rx),
+            budget: test_budget(),
         });
         assert!(
             refused.is_err(),
@@ -3919,6 +4237,7 @@ mod tests {
                 .enqueue(PublisherRegistration {
                     claim,
                     source: PublisherSource::Feed(feed_rx),
+                    budget: test_budget(),
                 })
                 .unwrap_or_else(|_| panic!("enqueue while alive"));
         }
@@ -3960,6 +4279,7 @@ mod tests {
                 .enqueue(PublisherRegistration {
                     claim,
                     source: PublisherSource::Feed(feed_rx),
+                    budget: test_budget(),
                 })
                 .unwrap_or_else(|_| panic!("enqueue {i} within the bound must be accepted"));
         }
@@ -3970,6 +4290,7 @@ mod tests {
         let refused = registrations.enqueue(PublisherRegistration {
             claim,
             source: PublisherSource::Feed(feed_rx),
+            budget: test_budget(),
         });
         assert!(
             matches!(refused, Err(EnqueueRefused::Full(_))),
@@ -4004,6 +4325,7 @@ mod tests {
                 .enqueue(PublisherRegistration {
                     claim,
                     source: PublisherSource::Feed(feed_rx),
+                    budget: test_budget(),
                 })
                 .is_ok(),
             "a drained intake must accept registrations again"
@@ -4030,6 +4352,7 @@ mod tests {
                 .enqueue(PublisherRegistration {
                     claim,
                     source: PublisherSource::Feed(feed_rx),
+                    budget: test_budget(),
                 })
                 .unwrap_or_else(|_| panic!("enqueue {i} within the bound"));
         }
@@ -4089,6 +4412,7 @@ mod tests {
             .enqueue(PublisherRegistration {
                 claim,
                 source: PublisherSource::Feed(feed_rx),
+                budget: test_budget(),
             })
             .unwrap_or_else(|_| panic!("enqueue while the worker lives"));
         assert!(
@@ -4134,6 +4458,7 @@ mod tests {
             .enqueue(PublisherRegistration {
                 claim,
                 source: PublisherSource::Feed(feed_rx),
+                budget: test_budget(),
             })
             .unwrap_or_else(|_| panic!("enqueue while the worker lives"));
 
@@ -4480,23 +4805,27 @@ mod tests {
 
         // Channel larger than the budget so the backlog fits in one send burst.
         let (feed_tx, feed_rx) = crossbeam_channel::bounded(MAX_PUBLISH_ITEMS_PER_POLL + 64);
+        let (budget_guard, budget) = IngressBudget::new(PUBLISHER_INGRESS_HIGH_WATER_BYTES);
         let claim = StreamKeyClaim::claim(stream_keys, "live".to_string()).expect("claim");
         reactor
             .add_publisher(PublisherRegistration {
                 claim,
                 source: PublisherSource::Feed(feed_rx),
+                budget: budget_guard,
             })
             .expect("publisher registered");
 
         // Budget + 6 tiny audio tags queued ahead of a single drain.
         for i in 0..(MAX_PUBLISH_ITEMS_PER_POLL + 6) {
-            feed_tx
-                .send(PublisherFeed::Media {
+            send_acquired(
+                &budget,
+                &feed_tx,
+                PublisherFeed::Media {
                     tag_type: 0x08,
                     timestamp: RtmpTimestamp { value: i as u32 },
                     data: Bytes::from_static(&[0xaf, 0x01, 0x00]),
-                })
-                .unwrap();
+                },
+            );
         }
 
         let (removed, pending) = reactor.process_publishers();
@@ -4525,11 +4854,13 @@ mod tests {
         let mut reactor = Reactor::new(3, None, status).expect("reactor");
 
         let (feed_tx, feed_rx) = crossbeam_channel::bounded(16);
+        let (budget_guard, budget) = IngressBudget::new(PUBLISHER_INGRESS_HIGH_WATER_BYTES);
         let claim = StreamKeyClaim::claim(stream_keys, "live".to_string()).expect("claim");
         reactor
             .add_publisher(PublisherRegistration {
                 claim,
                 source: PublisherSource::Feed(feed_rx),
+                budget: budget_guard,
             })
             .expect("publisher registered");
 
@@ -4537,21 +4868,25 @@ mod tests {
         // (consume-then-check), leaving the fourth for the next round.
         let big = Bytes::from(vec![0u8; 200 * 1024]);
         for i in 0..3u32 {
-            feed_tx
-                .send(PublisherFeed::Media {
+            send_acquired(
+                &budget,
+                &feed_tx,
+                PublisherFeed::Media {
                     tag_type: 0x08,
                     timestamp: RtmpTimestamp { value: i },
                     data: big.clone(),
-                })
-                .unwrap();
+                },
+            );
         }
-        feed_tx
-            .send(PublisherFeed::Media {
+        send_acquired(
+            &budget,
+            &feed_tx,
+            PublisherFeed::Media {
                 tag_type: 0x08,
                 timestamp: RtmpTimestamp { value: 3 },
                 data: Bytes::from_static(&[0xaf, 0x01, 0x00]),
-            })
-            .unwrap();
+            },
+        );
 
         let (removed, pending) = reactor.process_publishers();
         assert!(removed.is_empty());
@@ -4578,11 +4913,13 @@ mod tests {
         let mut reactor = Reactor::new(3, None, status).expect("reactor");
 
         let (feed_tx, feed_rx) = crossbeam_channel::bounded(4);
+        let (budget_guard, budget) = IngressBudget::new(PUBLISHER_INGRESS_HIGH_WATER_BYTES);
         let claim = StreamKeyClaim::claim(stream_keys, "live".to_string()).expect("claim");
         reactor
             .add_publisher(PublisherRegistration {
                 claim,
                 source: PublisherSource::Feed(feed_rx),
+                budget: budget_guard,
             })
             .expect("publisher registered");
 
@@ -4593,21 +4930,25 @@ mod tests {
         oversized[0] = 0xaf;
         oversized[1] = 0x00;
         let oversized = Bytes::from(oversized);
-        feed_tx
-            .send(PublisherFeed::Media {
+        send_acquired(
+            &budget,
+            &feed_tx,
+            PublisherFeed::Media {
                 tag_type: 0x08,
                 timestamp: RtmpTimestamp { value: 0 },
                 data: oversized.clone(),
-            })
-            .unwrap();
+            },
+        );
         let video_seq: &[u8] = &[0x17, 0x00, 0x00, 0x00, 0x00, 0x01, 0x64];
-        feed_tx
-            .send(PublisherFeed::Media {
+        send_acquired(
+            &budget,
+            &feed_tx,
+            PublisherFeed::Media {
                 tag_type: 0x09,
                 timestamp: RtmpTimestamp { value: 1 },
                 data: Bytes::from_static(video_seq),
-            })
-            .unwrap();
+            },
+        );
 
         let (removed, pending) = reactor.process_publishers();
         assert!(removed.is_empty());
@@ -4633,6 +4974,324 @@ mod tests {
             Some(video_seq),
             "the next round must deliver the remaining item"
         );
+    }
+
+    /// Spawn a producer thread calling `acquire(len)` on `budget` and assert
+    /// it parks. The park check is one-sided (the house pattern): a correct
+    /// gate can never complete the acquire, so the bounded window adds no
+    /// flake risk — slow scheduling only makes the check vacuous, never
+    /// wrong — while a gate that fails to block completes fast and trips it.
+    /// Returns the join handle and the channel carrying the acquire's result.
+    fn spawn_parked_acquire(
+        budget: &Arc<IngressBudget>,
+        len: usize,
+    ) -> (
+        std::thread::JoinHandle<()>,
+        std::sync::mpsc::Receiver<Result<(), IngressClosed>>,
+    ) {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let producer_budget = budget.clone();
+        let producer = std::thread::spawn(move || {
+            done_tx
+                .send(producer_budget.acquire(len))
+                .expect("report the acquire's result");
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "an acquire that must park completed immediately"
+        );
+        (producer, done_rx)
+    }
+
+    // Producer-side byte gate: an acquire that would cross the high-water
+    // mark of a non-empty account parks its producer, and a drain-side
+    // release wakes it into the freed capacity.
+    #[test]
+    fn ingress_budget_blocks_at_high_water_and_release_resumes() {
+        let (_guard, budget) = IngressBudget::new(8);
+        budget.acquire(6).expect("an empty account admits");
+
+        let (producer, done_rx) = spawn_parked_acquire(&budget, 6);
+
+        budget.release(6);
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the release must wake the parked producer")
+            .expect("the woken acquire must succeed");
+        producer.join().expect("producer thread exits");
+        assert_eq!(
+            budget.queued_bytes(),
+            6,
+            "only the resumed acquire may remain on the account"
+        );
+    }
+
+    // Admit-when-empty: a single item larger than the whole mark enters an
+    // empty account immediately — memory is bounded at max(mark, one item)
+    // and its producer can never deadlock — while the next oversized item
+    // waits for the full drain that empties the account again.
+    #[test]
+    fn ingress_budget_admits_oversized_item_when_empty() {
+        let (_guard, budget) = IngressBudget::new(8);
+        budget
+            .acquire(100)
+            .expect("an oversized item must enter an empty account");
+        assert_eq!(
+            budget.queued_bytes(),
+            100,
+            "the account must reflect the full oversize"
+        );
+
+        let (producer, done_rx) = spawn_parked_acquire(&budget, 100);
+
+        budget.release(100);
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the full release must wake the second producer")
+            .expect("the woken oversized acquire must succeed");
+        producer.join().expect("producer thread exits");
+        assert_eq!(budget.queued_bytes(), 100);
+    }
+
+    // FIFO admission: a released batch goes to the longest-parked acquire.
+    // Without ticketing, a sibling sender clone's small items could slip
+    // into every released batch ahead of a parked large item and starve it
+    // indefinitely; with it, the small item waits its turn even though
+    // capacity for it exists the moment it arrives.
+    #[test]
+    fn ingress_budget_admission_is_fifo_under_contention() {
+        let (_guard, budget) = IngressBudget::new(8);
+        budget.acquire(6).expect("an empty account admits");
+
+        // Large item first: 6 + 7 > 8 parks it as the head waiter.
+        let (large, large_rx) = spawn_parked_acquire(&budget, 7);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while budget.waiting_acquires() < 1 {
+            assert!(
+                Instant::now() < deadline,
+                "the large acquire never took its ticket"
+            );
+            std::thread::yield_now();
+        }
+        // Small item second: 6 + 1 <= 8, so capacity exists — an unordered
+        // gate would admit it on the spot (the starvation seed); the FIFO
+        // gate parks it behind the head, which spawn_parked_acquire's
+        // completed-immediately check verifies.
+        let (small, small_rx) = spawn_parked_acquire(&budget, 1);
+        while budget.waiting_acquires() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "the small acquire never took its ticket"
+            );
+            std::thread::yield_now();
+        }
+
+        // One full drain: the head (large) admits, and its admission chains
+        // the small one in behind it without another release.
+        budget.release(6);
+        large_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the release must admit the head acquire")
+            .expect("the head acquire succeeds");
+        small_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the head's admission must chain to the next ticket")
+            .expect("the chained acquire succeeds");
+        large.join().expect("large producer exits");
+        small.join().expect("small producer exits");
+        assert_eq!(
+            budget.queued_bytes(),
+            8,
+            "exactly the two post-drain acquires remain on the account"
+        );
+    }
+
+    // Teardown wakes the gate: a parked producer must observe IngressClosed
+    // both from an explicit close and from the guard's drop — the form every
+    // reactor-side teardown path takes.
+    #[test]
+    fn ingress_budget_close_and_guard_drop_wake_blocked_producers() {
+        // Explicit close.
+        let (guard, budget) = IngressBudget::new(8);
+        budget.acquire(6).expect("an empty account admits");
+        let (producer, done_rx) = spawn_parked_acquire(&budget, 6);
+        budget.close();
+        assert!(
+            done_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the close must wake the parked producer")
+                .is_err(),
+            "a woken producer must observe the closed account"
+        );
+        producer.join().expect("producer thread exits");
+        assert!(
+            budget.acquire(1).is_err(),
+            "later acquires must be refused outright"
+        );
+        drop(guard);
+
+        // Guard drop performs the same close through RAII.
+        let (guard, budget) = IngressBudget::new(8);
+        budget.acquire(6).expect("an empty account admits");
+        let (producer, done_rx) = spawn_parked_acquire(&budget, 6);
+        drop(guard);
+        assert!(
+            done_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the guard drop must wake the parked producer")
+                .is_err(),
+            "a woken producer must observe the closed account"
+        );
+        producer.join().expect("producer thread exits");
+    }
+
+    // Drain-side accounting: one process_publishers round releases exactly
+    // the bytes it drained, in one batch, and that release resumes a
+    // producer parked at the gate.
+    #[test]
+    fn process_publishers_releases_drained_bytes() {
+        let stream_keys = Arc::new(dashmap::DashSet::new());
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let mut reactor = Reactor::new(3, None, status).expect("reactor");
+
+        let (feed_tx, feed_rx) = crossbeam_channel::bounded(8);
+        let (budget_guard, budget) = IngressBudget::new(8);
+        let claim = StreamKeyClaim::claim(stream_keys, "live".to_string()).expect("claim");
+        reactor
+            .add_publisher(PublisherRegistration {
+                claim,
+                source: PublisherSource::Feed(feed_rx),
+                budget: budget_guard,
+            })
+            .expect("publisher registered");
+
+        // One acquired-and-sent 32-byte tag fills the account past its mark.
+        let data = Bytes::from(vec![0xafu8; 32]);
+        budget
+            .acquire(data.len())
+            .expect("an empty account admits the first item");
+        feed_tx
+            .send(PublisherFeed::Media {
+                tag_type: 0x08,
+                timestamp: RtmpTimestamp { value: 0 },
+                data,
+            })
+            .unwrap();
+
+        let (producer, done_rx) = spawn_parked_acquire(&budget, 4);
+
+        let (removed, _) = reactor.process_publishers();
+        assert!(removed.is_empty(), "a healthy publisher must not be removed");
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the drain round's release must wake the producer")
+            .expect("the woken acquire must succeed");
+        producer.join().expect("producer thread exits");
+        assert_eq!(
+            budget.queued_bytes(),
+            4,
+            "the round must release exactly what it drained; only the resumed acquire remains"
+        );
+    }
+
+    // Publisher removal — the reactor's last word on an accepted publisher —
+    // drops the state, whose guard closes the budget: a parked producer
+    // errors out instead of waiting on a drain that will never come.
+    #[test]
+    fn remove_publisher_closes_ingress_budget() {
+        let stream_keys = Arc::new(dashmap::DashSet::new());
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let mut reactor = Reactor::new(3, None, status).expect("reactor");
+
+        let (_feed_tx, feed_rx) = crossbeam_channel::bounded::<PublisherFeed>(8);
+        let (budget_guard, budget) = IngressBudget::new(8);
+        let claim = StreamKeyClaim::claim(stream_keys, "live".to_string()).expect("claim");
+        let id = reactor
+            .add_publisher(PublisherRegistration {
+                claim,
+                source: PublisherSource::Feed(feed_rx),
+                budget: budget_guard,
+            })
+            .expect("publisher registered");
+
+        budget.acquire(6).expect("an empty account admits");
+        let (producer, done_rx) = spawn_parked_acquire(&budget, 6);
+
+        reactor.remove_publisher(id);
+        assert!(
+            done_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the removal must wake the parked producer")
+                .is_err(),
+            "a producer woken by removal must observe the closed account"
+        );
+        producer.join().expect("producer thread exits");
+    }
+
+    // Both refusal fates of a registration close its budget: an enqueue the
+    // intake refuses hands the registration back and the caller's drop
+    // closes it; a consumed registration the scheduler refuses inside
+    // add_publisher is dropped there with the same effect. A producer parked
+    // at either gate errors out.
+    #[test]
+    fn refused_registration_closes_ingress_budget() {
+        // Closed-intake refusal.
+        let registrations = RegistrationHandoff::new();
+        registrations.close();
+        let stream_keys: Arc<dashmap::DashSet<String>> = Arc::new(dashmap::DashSet::new());
+        let (_feed_tx, feed_rx) = crossbeam_channel::bounded::<PublisherFeed>(1);
+        let (budget_guard, budget) = IngressBudget::new(8);
+        let claim =
+            StreamKeyClaim::claim(stream_keys.clone(), "refused".to_string()).expect("claim");
+        budget.acquire(6).expect("an empty account admits");
+        let (producer, done_rx) = spawn_parked_acquire(&budget, 6);
+        let refused = registrations.enqueue(PublisherRegistration {
+            claim,
+            source: PublisherSource::Feed(feed_rx),
+            budget: budget_guard,
+        });
+        assert!(
+            matches!(refused, Err(EnqueueRefused::Closed(_))),
+            "the closed intake must refuse the registration"
+        );
+        drop(refused);
+        assert!(
+            done_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("dropping the refusal must wake the parked producer")
+                .is_err(),
+            "a producer woken by the refusal must observe the closed account"
+        );
+        producer.join().expect("producer thread exits");
+
+        // Scheduler refusal inside add_publisher: a network session already
+        // publishes the key, which never touches the in-process key set.
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let mut reactor = Reactor::new(3, None, status).expect("reactor");
+        assert!(reactor.scheduler.new_channel("net".to_string(), 777));
+        let (_feed_tx2, feed_rx2) = crossbeam_channel::bounded::<PublisherFeed>(1);
+        let (budget_guard, budget) = IngressBudget::new(8);
+        let claim = StreamKeyClaim::claim(stream_keys, "net".to_string()).expect("claim");
+        budget.acquire(6).expect("an empty account admits");
+        let (producer, done_rx) = spawn_parked_acquire(&budget, 6);
+        assert!(
+            reactor
+                .add_publisher(PublisherRegistration {
+                    claim,
+                    source: PublisherSource::Feed(feed_rx2),
+                    budget: budget_guard,
+                })
+                .is_none(),
+            "a key already being published must be refused"
+        );
+        assert!(
+            done_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the scheduler refusal must wake the parked producer")
+                .is_err(),
+            "a producer woken by the refusal must observe the closed account"
+        );
+        producer.join().expect("producer thread exits");
     }
 
     /// Fixture for the cap-resume (step 5b) tests: a reactor plus one

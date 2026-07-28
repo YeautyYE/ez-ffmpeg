@@ -412,6 +412,216 @@ fn stream_builder_session_releases_port() {
 // it drives the RAII ServerStopGuard directly on a port-0 server, with no
 // probe/drop/rebind window a parallel test could steal.
 
+/// A raw in-process publisher that outruns the reactor is paced by blocking
+/// backpressure in `send` — never deadlocked and never lossy. The publisher
+/// pushes several times the server's per-publisher ingress byte bound at
+/// full speed while a real TCP watcher consumes; the send loop completing
+/// and the watcher observing every tag in order prove that the ingress
+/// gate, the per-send reactor wake, the budgeted drain and the fanout
+/// compose under the production loop. (Uses the media-plan helpers defined
+/// with the load harness below.)
+///
+/// Engagement tripwire (Linux): the producer snapshots the watcher's
+/// captured-byte counter at the instant its LAST send completes. Under the
+/// gate, at most the high-water window plus pipeline buffering is
+/// undelivered at that instant; an ungated producer finishes at memcpy
+/// speed while delivery lags far behind, so the snapshot lands well below
+/// the bound. The snapshot is taken by the completing thread itself, so it
+/// cannot be deferred past completion (a late snapshot would trivially
+/// satisfy a lower bound). The bound is an environmental heuristic, not a
+/// cross-platform invariant — buffering (watcher write queue, TCP
+/// autotuning, the drain round in flight at release time) varies — so the
+/// assertion is Linux-only, where the CI environment is uniform and a
+/// gate-deleted mutation measured ~42% delivery vs the ~58% bound; other
+/// platforms rely on the unit-level gate pins.
+///
+/// The watcher drains raw bytes during the flood and chunk-deserializes only
+/// afterwards: full delivery is a claim about the publisher's lossless gate,
+/// so the watcher must never become the bottleneck that trips its own
+/// write-queue policy (shedding/disconnect) — a memcpy-speed reader keeps
+/// the watcher path out of the picture, deterministically.
+#[test]
+fn high_water_publisher_backpressure_does_not_deadlock() {
+    // Mirrors the server's internal 8 MiB per-publisher ingress high-water
+    // mark; the total pushed is 6x that, so a producer outrunning the
+    // reactor must park and resume repeatedly for the run to complete —
+    // and the engagement snapshot has a wide structural margin.
+    const INGRESS_HIGH_WATER_BYTES: usize = 8 * 1024 * 1024;
+    const TAG_BYTES: usize = 64 * 1024;
+    const TAG_COUNT: usize = 6 * INGRESS_HIGH_WATER_BYTES / TAG_BYTES;
+    const TOTAL_BYTES: usize = TAG_COUNT * TAG_BYTES;
+
+    let server = EmbedRtmpServer::new_with_gop_limit("127.0.0.1:0", 2)
+        .start()
+        .expect("server start");
+    let addr = server.local_addr().expect("bound address");
+    let sender = server
+        .create_stream_sender("app", "live")
+        .expect("stream sender");
+
+    // Join before any media so full delivery is deterministic (no replay).
+    let mut watcher = Watcher::connect(addr, "app", "live", WATCHDOG);
+
+    // Publish from a producer thread while this thread keeps the pipeline's
+    // consuming end moving, so the reactor's drain rounds keep freeing
+    // ingress budget throughout. Completion is reported over a channel so
+    // the main thread never does an unbounded join on a possibly-parked
+    // producer.
+    // Captured-byte counter shared with the producer: the main loop keeps
+    // it current after every read, and the producer loads it the moment its
+    // final send returns — the engagement snapshot, taken race-free by the
+    // completing thread.
+    let captured_total = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let captured_total_in_producer = std::sync::Arc::clone(&captured_total);
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<usize>();
+    let publisher = std::thread::spawn(move || {
+        let mut serializer = ChunkSerializer::new();
+        let announce = serializer
+            .set_max_chunk_size(4096, RtmpTimestamp::new(0))
+            .expect("publisher chunk size");
+        sender.send(announce.bytes).expect("send SetChunkSize");
+        for (index, body) in std::iter::once(video_sequence_header_tag())
+            .chain((0..TAG_COUNT).map(|seq| video_tag(true, seq as u32, TAG_BYTES)))
+            .enumerate()
+        {
+            let payload = RtmpMessage::VideoData {
+                data: Bytes::from(body),
+            }
+            .into_message_payload(RtmpTimestamp::new(index as u32), 1)
+            .expect("payload conversion");
+            // Non-droppable, so watcher-side shedding can never eat into the
+            // full-delivery assertion: the mechanism under test is the
+            // publisher's ingress gate, upstream of the fanout.
+            let packet = serializer
+                .serialize(&payload, false, false)
+                .expect("publisher serialize");
+            sender.send(packet.bytes).expect("publisher send");
+        }
+        let _ = done_tx.send(
+            captured_total_in_producer.load(std::sync::atomic::Ordering::Relaxed),
+        );
+    });
+
+    // Flood phase: capture raw bytes only. The stream ends in an orderly
+    // EOF — the publisher thread dropping its sender ends the stream, and
+    // the server closes the watcher after flushing (pinned by
+    // `publisher_finish_delivers_stream_eof_to_watcher`) — with a
+    // quiet-after-finish fallback so a missed close cannot hang the test.
+    let deadline = Instant::now() + WATCHDOG;
+    let mut captured: Vec<u8> = Vec::with_capacity(TOTAL_BYTES + 4 * 1024 * 1024);
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut last_data = Instant::now();
+    let mut at_finish: Option<usize> = None;
+    let mut timed_out = false;
+    loop {
+        if Instant::now() >= deadline {
+            // Fall through to the cleanup below rather than panicking here:
+            // the server must be stopped first so a possibly-parked
+            // producer is woken and the join stays bounded.
+            timed_out = true;
+            break;
+        }
+        if at_finish.is_none() {
+            if let Ok(snapshot) = done_rx.try_recv() {
+                at_finish = Some(snapshot);
+            }
+        }
+        match watcher.stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                captured.extend_from_slice(&buf[..n]);
+                captured_total.store(captured.len(), std::sync::atomic::Ordering::Relaxed);
+                last_data = Instant::now();
+            }
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+                if at_finish.is_some() && last_data.elapsed() > Duration::from_secs(2) {
+                    break;
+                }
+            }
+            Err(e) => panic!("watcher socket error: {e:?}"),
+        }
+    }
+    // Bounded completion: a producer still parked here is the deadlock this
+    // test exists to catch. `stop()` — not a bare drop, which has no Drop
+    // hook — tears the reactor down, closing every ingress account and
+    // waking any parked send, so the join below can never hang the test.
+    if at_finish.is_none() {
+        match done_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(snapshot) => at_finish = Some(snapshot),
+            Err(_) => {
+                server.stop();
+                let _ = publisher.join();
+                panic!(
+                    "producer never completed its sends (parked at the gate?); \
+                     {} bytes captured",
+                    captured.len()
+                );
+            }
+        }
+    }
+    if timed_out {
+        server.stop();
+        let _ = publisher.join();
+        panic!("watchdog expired with {} bytes captured", captured.len());
+    }
+    publisher
+        .join()
+        .expect("the publisher must complete every send without deadlocking");
+    // Engagement tripwire (see the doc comment): producer-side snapshot of
+    // delivered bytes at completion. The ~20 MiB allowance covers the
+    // high-water window (8 MiB), the watcher write queue, kernel TCP
+    // buffering on both loopback ends, the drain round in flight at release
+    // time, and the counter's one-read lag. Linux-only: the bound is an
+    // environment heuristic, and the CI mutation evidence lives there.
+    #[cfg(target_os = "linux")]
+    {
+        let snapshot = at_finish.expect("resolved above");
+        assert!(
+            snapshot >= TOTAL_BYTES - INGRESS_HIGH_WATER_BYTES - 12 * 1024 * 1024,
+            "the byte gate never engaged: only {snapshot} bytes were delivered \
+             when the producer finished (total {TOTAL_BYTES})"
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = at_finish;
+
+    // Deserialize the captured stream through the real client session and
+    // assert lossless, in-order delivery of every published tag. Outbound
+    // responses (acknowledgements) are best-effort: the server already
+    // closed the connection at stream end.
+    let mut seqs: Vec<u32> = Vec::new();
+    for slice in captured.chunks(1024 * 1024) {
+        for result in watcher.session.handle_input(slice).expect("handle_input") {
+            match result {
+                ClientSessionResult::OutboundResponse(packet) => {
+                    let _ = watcher.stream.write_all(&packet.bytes);
+                }
+                ClientSessionResult::RaisedEvent(ClientSessionEvent::VideoDataReceived {
+                    data,
+                    ..
+                }) => {
+                    // None for the sequence header; Some(seq) for media tags.
+                    if let Some((seq, _)) = parse_video_stamp(&data) {
+                        seqs.push(seq);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(
+        seqs.len(),
+        TAG_COUNT,
+        "every published tag must reach the watcher"
+    );
+    assert!(
+        seqs.iter().enumerate().all(|(i, &seq)| seq == i as u32),
+        "tags must arrive exactly once, in publish order"
+    );
+
+    server.stop();
+}
+
 // ===========================================================================
 // Load harness (ignored benches)
 // ===========================================================================
