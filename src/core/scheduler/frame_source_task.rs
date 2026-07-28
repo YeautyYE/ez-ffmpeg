@@ -568,6 +568,33 @@ mod tests {
         }
     }
 
+    /// Asserts the frame's planes land inside its packed `buf[0]` without
+    /// overlap: each active plane's span `[offset, offset + rows*linesize)`
+    /// stays within the buffer extent and follows its predecessor's span in
+    /// buffer order. This is the address-independent core of the layout
+    /// contract — exact offsets depend on where the allocator placed the
+    /// buffer (see `pool_fallback_builds_identical_frames`), but bounds,
+    /// ordering, and disjointness never do.
+    fn assert_plane_spans_disjoint(frame: &Frame, planes: &[(usize, usize)], ctx: &str) {
+        let (offsets, linesize, extent, _, _) = frame_layout(frame);
+        let mut prev_end = 0usize;
+        for (idx, &(bpr, rows)) in planes.iter().enumerate() {
+            let off = offsets[idx].unwrap_or_else(|| panic!("{ctx}: plane {idx} missing"));
+            let ls = linesize[idx] as usize;
+            assert!(bpr <= ls, "{ctx}: plane {idx} row wider than its linesize");
+            assert!(
+                off >= prev_end,
+                "{ctx}: plane {idx} at {off} overlaps its predecessor ending at {prev_end}"
+            );
+            let end = off + rows * ls;
+            assert!(
+                (end as i128) <= extent,
+                "{ctx}: plane {idx} span ends at {end}, past the buffer extent {extent}"
+            );
+            prev_end = end;
+        }
+    }
+
     /// Captures a frame's buffer-layout contract: the active-plane mask with
     /// each active plane's offset from `buf[0].data`, all linesizes, the
     /// buffer extent, `extended_data` aliasing `data`, and buffer
@@ -975,17 +1002,36 @@ mod tests {
             if n == 0 {
                 // The disarmed path must carry the same buffer-layout
                 // contract as a genuine unpooled build, not merely
-                // equivalent pixels.
+                // equivalent pixels. Plane OFFSETS are deliberately not
+                // compared: FFmpeg aligns each plane pointer to its
+                // absolute address, so on builds whose av_malloc
+                // alignment class is smaller than that plane alignment
+                // (aarch64: 16 vs 32) the buffer-relative offsets of two
+                // independent allocations legitimately differ by the
+                // bases' alignment slack. Placement is pinned instead by
+                // the span assertions below (in-bounds, ordered,
+                // non-overlapping) plus the row-walk over the content —
+                // together they reject a short buffer, a reordered or
+                // overlapping plane table, and sheared rows.
                 let mut fresh = PlanePool::empty();
                 let twin =
                     build_video_frame(&pool, &mut fresh, &p, &data, n).expect("unpooled twin");
+                let (offsets, linesize, extent, aliased, writable) = frame_layout(&frame);
+                let (t_offsets, t_linesize, t_extent, t_aliased, t_writable) = frame_layout(&twin);
                 assert_eq!(
-                    frame_layout(&frame),
-                    frame_layout(&twin),
-                    "fallback layout must match a normal unpooled frame"
+                    (linesize, extent, aliased, writable),
+                    (t_linesize, t_extent, t_aliased, t_writable),
+                    "fallback must match a normal unpooled frame's deterministic layout"
                 );
+                assert_eq!(
+                    offsets.map(|o| o.is_some()),
+                    t_offsets.map(|o| o.is_some()),
+                    "fallback must populate the same plane set"
+                );
+                assert_plane_spans_disjoint(&twin, planes, "unpooled twin");
                 pool.release(twin);
             }
+            assert_plane_spans_disjoint(&frame, planes, &format!("fallback frame {n}"));
             assert_frame_planes(&frame, planes, &data, &format!("fallback frame {n}"));
             assert_eq!(unsafe { (*frame.as_ptr()).pts }, n);
             pool.release(frame);
