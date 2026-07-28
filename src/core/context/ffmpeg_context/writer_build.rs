@@ -51,10 +51,7 @@ pub(crate) fn build_writer_context(
     let mut outputs = vec![output];
     let mut muxs = open_output_files(&mut outputs, false, &interrupt_state)?;
 
-    // Stream maps address multi-stream mapping problems the writer does not
-    // have: its single video stream IS the mapping. Accepting maps here would
-    // either silently ignore them (this path binds pad 0 unconditionally) or
-    // demand the full map_manual machinery for one stream; reject instead.
+    // Defense in depth for crate-internal callers that bypass VideoWriterBuilder::open.
     if !muxs[0].stream_map_specs.is_empty() || !muxs[0].stream_maps.is_empty() {
         return Err(WriterError::StreamMapsUnsupported.into());
     }
