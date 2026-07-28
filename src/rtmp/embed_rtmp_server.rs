@@ -1004,9 +1004,9 @@ impl EmbedRtmpServer<Running> {
                             // fallback. Per-packet rather than once-after-the-batch:
                             // the channel is bounded (1024), so a large batch would
                             // block in send() before a post-batch wake ever ran,
-                            // stranding the reactor. The eventfd/pipe token coalesces
-                            // the wakes into a single reactor drain, so the cost is a
-                            // cheap (already-signaled) syscall.
+                            // stranding the reactor. The waker's userspace gate
+                            // coalesces the wakes into a single reactor drain, so a
+                            // repeat wake costs an atomic flag test, not a syscall.
                             if let Some(waker) = &wake_handle {
                                 waker.wake();
                             }
