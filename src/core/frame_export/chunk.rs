@@ -7,7 +7,7 @@
 /// [`as_slice`](AudioChunk::as_slice)`.len() == frames * channels`, channels
 /// interleaved (`[L0, R0, L1, R1, …]` for stereo) — the buffer layout
 /// whisper / candle / ort pipelines consume, at whatever sample rate and
-/// channel count this chunk reports (normalize via the extractor's
+/// channel shape this chunk reports (normalize via the extractor's
 /// `sample_rate`/`channels` options when a model needs a fixed shape).
 /// One chunk corresponds to one filtered `AVFrame`; the number of frames per
 /// chunk is not contractual (typically ~1024) and must not be relied upon.
@@ -16,17 +16,20 @@ pub struct AudioChunk {
     index: u64,
     sample_rate: u32,
     channels: u16,
+    channel_layout: String,
     data: Vec<f32>,
 }
 
 impl AudioChunk {
     /// Builds a chunk from an already-interleaved sample buffer. Crate-internal:
-    /// the sink guarantees `data.len()` is a whole multiple of `channels`.
+    /// the sink guarantees `data.len()` is a whole multiple of `channels` and
+    /// that `channel_layout` describes the exported frame's layout.
     pub(crate) fn new(
         pts_us: Option<i64>,
         index: u64,
         sample_rate: u32,
         channels: u16,
+        channel_layout: String,
         data: Vec<f32>,
     ) -> Self {
         // `%` (not `is_multiple_of`) keeps this MSRV-1.80 safe, matching the
@@ -43,6 +46,7 @@ impl AudioChunk {
             index,
             sample_rate,
             channels,
+            channel_layout,
             data,
         }
     }
@@ -70,6 +74,17 @@ impl AudioChunk {
         self.channels
     }
 
+    /// FFmpeg's textual channel-layout description of this chunk (e.g.
+    /// `"mono"`, `"stereo"`, `"5.1"`), read from the exported frame: the
+    /// source layout under the default passthrough, or the converted layout
+    /// when [`channels`](super::SampleExtractor::channels) requested one.
+    /// Above two channels this distinguishes layouts a bare count cannot
+    /// (6 channels may be `"5.1"` or `"6.0"`). Empty when FFmpeg cannot
+    /// describe the layout.
+    pub fn channel_layout(&self) -> &str {
+        &self.channel_layout
+    }
+
     /// The interleaved `f32` samples. Length is `frames * channels`.
     pub fn as_slice(&self) -> &[f32] {
         &self.data
@@ -88,7 +103,25 @@ impl std::fmt::Debug for AudioChunk {
             .field("index", &self.index)
             .field("sample_rate", &self.sample_rate)
             .field("channels", &self.channels)
+            .field("channel_layout", &self.channel_layout)
             .field("samples", &self.data.len())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_accessors_round_trip() {
+        let c = AudioChunk::new(Some(40_000), 2, 48_000, 6, "5.1".to_string(), vec![0.0; 12]);
+        assert_eq!(c.pts_us(), Some(40_000));
+        assert_eq!(c.index(), 2);
+        assert_eq!(c.sample_rate(), 48_000);
+        assert_eq!(c.channels(), 6);
+        assert_eq!(c.channel_layout(), "5.1");
+        assert_eq!(c.as_slice().len(), 12);
+        assert_eq!(c.into_vec().len(), 12);
     }
 }

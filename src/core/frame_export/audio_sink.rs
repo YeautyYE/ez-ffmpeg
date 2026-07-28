@@ -14,8 +14,8 @@ use crate::util::ffmpeg_utils::frame_is_eof_marker;
 use crossbeam_channel::Sender;
 use ffmpeg_next::Frame;
 use ffmpeg_sys_next::{
-    av_rescale_q, AVFrame, AVMediaType, AVMediaType::AVMEDIA_TYPE_AUDIO, AVRational,
-    AVSampleFormat::AV_SAMPLE_FMT_FLT, AV_NOPTS_VALUE,
+    av_channel_layout_describe, av_rescale_q, AVChannelLayout, AVFrame, AVMediaType,
+    AVMediaType::AVMEDIA_TYPE_AUDIO, AVRational, AVSampleFormat::AV_SAMPLE_FMT_FLT, AV_NOPTS_VALUE,
 };
 
 const US_PER_SEC: AVRational = AVRational {
@@ -156,6 +156,10 @@ unsafe fn pack_chunk(
     if sample_rate <= 0 {
         return Err(format!("sample export: non-positive sample rate {sample_rate}").into());
     }
+    // FFmpeg's own description of the frame's layout ("stereo", "5.1", …),
+    // same vocabulary as the packet-sink stream info; empty when the layout
+    // cannot be described.
+    let channel_layout = describe_channel_layout(&(*p).ch_layout);
 
     // Total interleaved f32 count and its byte length, both overflow-checked.
     let n = (nb_samples as usize)
@@ -191,6 +195,87 @@ unsafe fn pack_chunk(
         index,
         sample_rate as u32,
         channels as u16,
+        channel_layout,
         out,
     )))
+}
+
+/// FFmpeg's textual channel-layout description (e.g. "stereo", "5.1"), empty
+/// when the layout cannot be described. Mirrors the packet-sink helper of the
+/// same name so both taps report layouts in the same vocabulary — except this
+/// one always returns the complete description regardless of length, where
+/// the sibling still truncates at a fixed capacity.
+///
+/// # Safety
+/// `layout` must point to a valid, initialized `AVChannelLayout`, alive for
+/// the call.
+unsafe fn describe_channel_layout(layout: *const AVChannelLayout) -> String {
+    describe_channel_layout_with_capacity(layout, 128)
+}
+
+/// `describe_channel_layout`, with the first-attempt buffer capacity exposed
+/// so a too-small attempt can be exercised directly by tests.
+///
+/// `av_channel_layout_describe` NUL-terminates whatever prefix fits and
+/// returns the number of bytes the full description needs (its length plus
+/// the terminator); when that exceeds `capacity`, the first attempt was
+/// truncated and this retries exactly once with a buffer sized to the
+/// reported requirement. The layout does not change between the two calls,
+/// so the retry always fits; a negative return, or a still-too-small report
+/// on the retry, falls back to an empty string, same as the ordinary failure
+/// case.
+///
+/// # Safety
+/// `layout` must point to a valid, initialized `AVChannelLayout`, alive for
+/// the call.
+unsafe fn describe_channel_layout_with_capacity(
+    layout: *const AVChannelLayout,
+    capacity: usize,
+) -> String {
+    let mut buf = vec![0u8; capacity];
+    let n = av_channel_layout_describe(layout, buf.as_mut_ptr() as *mut libc::c_char, buf.len());
+    if n < 0 {
+        return String::new();
+    }
+    if n as usize > buf.len() {
+        // Truncated: the required size is exact, so a retry at that capacity
+        // always fits — the layout is immutable across the two calls.
+        buf = vec![0u8; n as usize];
+        let retried =
+            av_channel_layout_describe(layout, buf.as_mut_ptr() as *mut libc::c_char, buf.len());
+        if retried < 0 || retried as usize > buf.len() {
+            return String::new();
+        }
+    }
+    match std::ffi::CStr::from_bytes_until_nul(&buf) {
+        Ok(c) => c.to_string_lossy().into_owned(),
+        Err(_) => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ffmpeg_sys_next::{av_channel_layout_default, av_channel_layout_uninit};
+
+    /// A too-small first attempt still recovers the complete description via
+    /// the retry, and a first attempt that already fits skips the retry
+    /// entirely — both land on the same string.
+    #[test]
+    fn describe_channel_layout_with_capacity_recovers_the_full_description() {
+        // SAFETY: zeroed then immediately initialized by `av_channel_layout_default`
+        // before any read; uninitialized again once the test is done with it.
+        let mut layout: AVChannelLayout = unsafe { std::mem::zeroed() };
+        unsafe { av_channel_layout_default(&mut layout, 2) };
+
+        // "stereo\0" needs 7 bytes; a 4-byte first attempt must truncate and retry.
+        let via_retry = unsafe { describe_channel_layout_with_capacity(&layout, 4) };
+        assert_eq!(via_retry, "stereo");
+
+        // The default capacity fits "stereo" on the first attempt; no retry needed.
+        let via_first_attempt = unsafe { describe_channel_layout_with_capacity(&layout, 128) };
+        assert_eq!(via_first_attempt, "stereo");
+
+        unsafe { av_channel_layout_uninit(&mut layout) };
+    }
 }

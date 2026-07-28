@@ -4,6 +4,7 @@ use super::audio_iter::SampleIter;
 use super::audio_options::Channels;
 use super::audio_resolve::{resolve_and_build_desc, AudioResolvePlan};
 use super::audio_sink::SampleSink;
+use super::collected::CollectedAudio;
 use super::error::FrameExportError;
 use crate::core::context::demuxer::Demuxer;
 use crate::core::context::ffmpeg_context::FfmpegContext;
@@ -188,12 +189,14 @@ impl SampleExtractor {
     }
 
     /// Runs to completion and flattens every exported chunk into one interleaved
-    /// `f32` buffer. With explicit normalization (e.g.
-    /// [`for_whisper`](Self::for_whisper)) this is the whisper-rs / candle
-    /// handoff shape; with the source-preserving defaults it is simply the
-    /// source's own rate/channel shape, and the flat buffer carries no
-    /// rate/channel metadata — stream [`samples`](Self::samples) when you
-    /// need it per chunk.
+    /// `f32` buffer — the raw convenience layer: just the samples, no metadata.
+    /// With explicit normalization (e.g. [`for_whisper`](Self::for_whisper)) the
+    /// shape is already known and this is the whisper-rs / candle handoff form;
+    /// with the source-preserving defaults the buffer arrives in the source's
+    /// own rate/channel shape, which a bare `Vec<f32>` does not describe — use
+    /// [`collect_audio`](Self::collect_audio) for the same samples with their
+    /// sample rate, channel count, and channel layout attached, or stream
+    /// [`samples`](Self::samples) for per-chunk metadata.
     ///
     /// Memory is `duration_s × rate × channels × 4` bytes (1 h @ 16 kHz mono ≈
     /// 230 MB); use [`samples`](Self::samples) to stream when that is too large.
@@ -211,6 +214,65 @@ impl SampleExtractor {
             }
         }
         Ok(out)
+    }
+
+    /// Runs to completion and returns every exported sample together with the
+    /// shape metadata that describes the buffer — the self-describing form of
+    /// [`collect_samples`](Self::collect_samples): same samples, same order,
+    /// plus the sample rate, channel count, and channel layout they were
+    /// decoded to.
+    ///
+    /// Metadata is read from the first delivered chunk (one run negotiates one
+    /// output shape), so it reports what the run actually produced: the source
+    /// shape under the default passthrough, or the converted shape when
+    /// [`sample_rate`](Self::sample_rate) / [`channels`](Self::channels)
+    /// requested one. When the run delivers no samples at all (an empty audio
+    /// stream), the buffer is empty and the metadata is zeroed (rate 0,
+    /// channels 0, empty layout).
+    ///
+    /// The memory bound and error behavior match
+    /// [`collect_samples`](Self::collect_samples).
+    ///
+    /// ```no_run
+    /// use ez_ffmpeg::frame_export::SampleExtractor;
+    ///
+    /// # fn main() -> Result<(), ez_ffmpeg::error::Error> {
+    /// // Source-preserving extraction that still knows its own shape.
+    /// let audio = SampleExtractor::new("input.mp4").collect_audio()?;
+    /// println!(
+    ///     "{} samples @ {} Hz, {} channel(s), layout {}",
+    ///     audio.as_slice().len(),
+    ///     audio.sample_rate(),
+    ///     audio.channels(),
+    ///     audio.channel_layout(),
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn collect_audio(self) -> crate::error::Result<CollectedAudio> {
+        let mut samples: Vec<f32> = Vec::new();
+        let mut sample_rate = 0u32;
+        let mut channels = 0u16;
+        let mut channel_layout = String::new();
+        for chunk in self.samples()? {
+            let chunk = chunk?;
+            if samples.is_empty() {
+                // First chunk (delivered chunks are never empty): capture the
+                // run's shape, then move the buffer in with no copy.
+                sample_rate = chunk.sample_rate();
+                channels = chunk.channels();
+                channel_layout = chunk.channel_layout().to_string();
+                samples = chunk.into_vec();
+            } else {
+                samples.extend_from_slice(chunk.as_slice());
+            }
+        }
+        Ok(CollectedAudio::new(
+            samples,
+            sample_rate,
+            channels,
+            channel_layout,
+        ))
     }
 
     fn validate(&self) -> crate::error::Result<()> {

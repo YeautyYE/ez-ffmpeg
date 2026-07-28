@@ -88,6 +88,12 @@
 //! # }
 //! ```
 //!
+//! [`SampleExtractor::collect_samples`] flattens a run into one bare
+//! `Vec<f32>`; [`SampleExtractor::collect_audio`] returns the same samples
+//! wrapped in a [`CollectedAudio`], which also reports the sample rate,
+//! channel count, and channel layout it was decoded to. The streaming
+//! [`AudioChunk`]s carry the same metadata per chunk.
+//!
 //! # Threading & teardown
 //!
 //! A run drives the normal scheduler (demux → decode → input frame pipeline →
@@ -138,8 +144,10 @@ mod audio_options;
 mod audio_resolve;
 mod audio_sink;
 mod chunk;
+mod collected;
 
 pub use audio::SampleExtractor;
 pub use audio_iter::SampleIter;
 pub use audio_options::Channels;
 pub use chunk::AudioChunk;
+pub use collected::CollectedAudio;
