@@ -210,6 +210,43 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+thread_local! {
+    static BUILDING_SLOTS: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn slot_id<T>(cell: &SlotCell<T>) -> usize {
+    cell as *const SlotCell<T> as usize
+}
+
+fn building_on_current_thread<T>(cell: &SlotCell<T>) -> bool {
+    let id = slot_id(cell);
+    BUILDING_SLOTS.with(|slots| slots.borrow().contains(&id))
+}
+
+struct BuilderThread {
+    slot: usize,
+}
+
+impl BuilderThread {
+    fn enter<T>(cell: &SlotCell<T>) -> Self {
+        let slot = slot_id(cell);
+        BUILDING_SLOTS.with(|slots| slots.borrow_mut().push(slot));
+        Self { slot }
+    }
+}
+
+impl Drop for BuilderThread {
+    fn drop(&mut self) {
+        BUILDING_SLOTS.with(|slots| {
+            let mut slots = slots.borrow_mut();
+            if let Some(index) = slots.iter().rposition(|slot| *slot == self.slot) {
+                slots.remove(index);
+            }
+        });
+    }
+}
+
 /// Resets a slot from `Building` back to `Idle` if the builder panics (wgpu
 /// can panic inside device creation), waking waiters so the next one becomes
 /// the builder instead of hanging forever. Disarmed on the normal completion
@@ -273,6 +310,15 @@ impl<T: Liveness> GenCache<T> {
                     return Ok(Arc::clone(generation));
                 }
                 Slot::Building => {
+                    // The builder runs without the slot mutex, but a logger or
+                    // dependency callback on that same thread can re-enter the
+                    // cache. Waiting here would wait on this very call to return.
+                    if building_on_current_thread(cell) {
+                        return Err(
+                            "shared GPU generation initialization re-entered on its builder thread"
+                                .to_string(),
+                        );
+                    }
                     // Re-dispatch on whatever state the builder left behind:
                     // Ready is shared, Idle (failed or panicked build) makes
                     // this waiter the next builder.
@@ -291,6 +337,7 @@ impl<T: Liveness> GenCache<T> {
                     let retired = std::mem::replace(&mut *state, Slot::Building);
                     drop(state);
                     let mut guard = BuildingGuard { cell, armed: true };
+                    let builder_thread = BuilderThread::enter(cell);
                     drop(retired);
                     let result = build();
                     guard.armed = false;
@@ -299,6 +346,7 @@ impl<T: Liveness> GenCache<T> {
                         Err(_) => Slot::Idle,
                     };
                     cell.cv.notify_all();
+                    drop(builder_thread);
                     return result;
                 }
             }
@@ -312,19 +360,44 @@ impl<T: Liveness> GenCache<T> {
 /// not report it).
 static CACHE: GenCache<SharedGpuGeneration> = GenCache::new();
 
+pub(crate) struct DeferredInfoLog {
+    target: &'static str,
+    message: String,
+}
+
+impl DeferredInfoLog {
+    pub(crate) fn new(target: &'static str, message: String) -> Self {
+        Self { target, message }
+    }
+}
+
+pub(crate) fn emit_deferred_info(logs: Vec<DeferredInfoLog>) {
+    for record in logs {
+        info!(target: record.target, "{}", record.message);
+    }
+}
+
 /// Acquires the shared generation for `profile`, building one on first use
 /// or after the previous generation died.
 pub(crate) fn acquire(profile: GpuProfile) -> Result<Arc<SharedGpuGeneration>, String> {
-    CACHE.acquire_with(profile, || build_generation(profile))
+    let mut deferred = Vec::new();
+    let result = CACHE.acquire_with(profile, || build_generation(profile, &mut deferred));
+    // `acquire_with` has published Ready (or restored Idle) before returning,
+    // so a logger that initializes another filter can never wait on this build.
+    emit_deferred_info(deferred);
+    result
 }
 
 /// Builds one complete generation: instance, adapter (with the
 /// default-backend second chance), the direct-pack decision, the device —
 /// through the dmabuf path for [`GpuProfile::DmabufCapable`] — plus the
-/// uncaptured-error handler and the limit snapshot. Runs outside all cache
-/// locks, so every log line here fires lock-free, once per generation
-/// instead of once per filter init.
-pub(crate) fn build_generation(profile: GpuProfile) -> Result<Arc<SharedGpuGeneration>, String> {
+/// uncaptured-error handler and the limit snapshot. Runs outside the cache
+/// mutex while its slot is logically `Building`; user-facing records are
+/// collected for [`acquire`] to emit after that state is settled.
+pub(crate) fn build_generation(
+    profile: GpuProfile,
+    deferred: &mut Vec<DeferredInfoLog>,
+) -> Result<Arc<SharedGpuGeneration>, String> {
     // Prefer the primary backends: probing GL/EGL costs ~30-40ms of init
     // and spams warnings on headless boxes. Fall back to the full set so
     // GL-only machines keep working exactly as before.
@@ -347,10 +420,13 @@ pub(crate) fn build_generation(profile: GpuProfile) -> Result<Arc<SharedGpuGener
     };
 
     let adapter_info = adapter.get_info();
-    info!(
-        "WgpuFrameFilter adapter: {} ({:?}, {:?})",
-        adapter_info.name, adapter_info.backend, adapter_info.device_type
-    );
+    deferred.push(DeferredInfoLog::new(
+        module_path!(),
+        format!(
+            "WgpuFrameFilter adapter: {} ({:?}, {:?})",
+            adapter_info.name, adapter_info.backend, adapter_info.device_type
+        ),
+    ));
 
     // On unified-memory GPUs the pack pass can write straight into the
     // mappable readback buffer, skipping a full copy of the packed frame.
@@ -373,7 +449,10 @@ pub(crate) fn build_generation(profile: GpuProfile) -> Result<Arc<SharedGpuGener
         ..Default::default()
     };
     if direct_pack {
-        info!("WgpuFrameFilter: direct pack readback enabled (unified memory)");
+        deferred.push(DeferredInfoLog::new(
+            module_path!(),
+            "WgpuFrameFilter: direct pack readback enabled (unified memory)".to_string(),
+        ));
     }
 
     // Zero-copy hardware input needs the device opened with dmabuf-import
@@ -381,7 +460,7 @@ pub(crate) fn build_generation(profile: GpuProfile) -> Result<Arc<SharedGpuGener
     // frames just take the download path.
     let (device, queue, hw_interop, dmabuf_retry) = match profile {
         GpuProfile::DmabufCapable => {
-            match hw_interop::try_open_dmabuf_device(&adapter, &device_desc) {
+            match hw_interop::try_open_dmabuf_device(&adapter, &device_desc, deferred) {
                 DmabufOpen::Opened(device, queue, interop) => {
                     (device, queue, Some(Arc::new(interop)), false)
                 }

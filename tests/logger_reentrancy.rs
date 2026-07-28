@@ -8,7 +8,7 @@
 //! into a poisoned `Once` (every later FFmpeg entry point fails) or a
 //! same-thread deadlock.
 //!
-//! One `#[test]` runs both scenarios IN ORDER: FFmpeg init is process-once
+//! One `#[test]` runs every scenario IN ORDER: FFmpeg init is process-once
 //! and `log::set_logger` is once-per-process (a test binary installs at
 //! most ONE logger — see tests/common/mod.rs), so the scenarios must share
 //! a process, a logger, and a fixed sequence.
@@ -39,6 +39,22 @@ static SAW_OUTER_FAILURE: AtomicBool = AtomicBool::new(false);
 /// Scenario B: proof the re-entrant inner call returned at all.
 static INNER_CALL_COMPLETED: AtomicBool = AtomicBool::new(false);
 
+/// Scenario C: the first shared-GPU generation announces its adapter only
+/// after publishing the generation, so a logger can initialize another
+/// filter instead of waiting on the build that invoked it.
+#[cfg(feature = "wgpu")]
+static REENTER_ON_WGPU_ADAPTER: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "wgpu")]
+static SAW_WGPU_ADAPTER: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "wgpu")]
+static INNER_WGPU_CALL_COMPLETED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "wgpu")]
+static REENTER_ON_WGPU_DEVICE_CREATE: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "wgpu")]
+static SAW_WGPU_DEVICE_CREATE: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "wgpu")]
+static INNER_WGPU_INIT_REENTRY_REJECTED: AtomicBool = AtomicBool::new(false);
+
 impl log::Log for HookLogger {
     fn enabled(&self, _metadata: &Metadata) -> bool {
         true
@@ -66,6 +82,27 @@ impl log::Log for HookLogger {
             // build's own failure message from recursing further.
             let _ = build_bogus_hw_device_pipeline("ezffmpeg_bogus_inner", "reentrant_inner.mp4");
             INNER_CALL_COMPLETED.store(true, Ordering::SeqCst);
+        }
+
+        #[cfg(feature = "wgpu")]
+        if message.starts_with("WgpuFrameFilter adapter: ")
+            && REENTER_ON_WGPU_ADAPTER.swap(false, Ordering::SeqCst)
+        {
+            SAW_WGPU_ADAPTER.store(true, Ordering::SeqCst);
+            let _ = init_identity_wgpu_filter();
+            INNER_WGPU_CALL_COMPLETED.store(true, Ordering::SeqCst);
+        }
+
+        #[cfg(feature = "wgpu")]
+        if message.starts_with("Device::create_shader_module")
+            && REENTER_ON_WGPU_DEVICE_CREATE.swap(false, Ordering::SeqCst)
+        {
+            SAW_WGPU_DEVICE_CREATE.store(true, Ordering::SeqCst);
+            let reentrant = init_identity_wgpu_filter();
+            INNER_WGPU_INIT_REENTRY_REJECTED.store(
+                matches!(reentrant, Err(ref error) if error.contains("re-entered")),
+                Ordering::SeqCst,
+            );
         }
     }
 
@@ -100,6 +137,19 @@ fn build_bogus_hw_device_pipeline(
                 .set_max_video_frames(1),
         )
         .build()
+}
+
+#[cfg(feature = "wgpu")]
+fn init_identity_wgpu_filter() -> Result<(), String> {
+    use ez_ffmpeg::core::filter::frame_filter::FrameFilter;
+    use ez_ffmpeg::core::filter::frame_filter_context::FrameFilterContext;
+    use ez_ffmpeg::wgpu_filter::WgpuFrameFilter;
+    use std::collections::HashMap;
+
+    let mut filter = WgpuFrameFilter::new_identity().map_err(|error| error.to_string())?;
+    let mut attributes = HashMap::new();
+    let mut context = FrameFilterContext::new("logger_reentrancy", &mut attributes);
+    filter.init(&mut context).map_err(|error| error.to_string())
 }
 
 #[test]
@@ -165,4 +215,67 @@ fn logger_backends_cannot_poison_init_or_deadlock_device_setup() {
         INNER_CALL_COMPLETED.load(Ordering::SeqCst),
         "the logger's re-entrant build must run to completion"
     );
+
+    // ---- Scenario C: shared-GPU generation logging must be re-entrant ----
+
+    #[cfg(feature = "wgpu")]
+    {
+        REENTER_ON_WGPU_ADAPTER.store(true, Ordering::SeqCst);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(init_identity_wgpu_filter());
+        });
+        let outer = match rx.recv_timeout(Duration::from_secs(60)) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                panic!("re-entrant logger deadlocked shared-GPU generation setup (60s watchdog)")
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("outer WGPU initialization thread panicked before reporting")
+            }
+        };
+
+        if SAW_WGPU_ADAPTER.load(Ordering::SeqCst) {
+            assert!(
+                INNER_WGPU_CALL_COMPLETED.load(Ordering::SeqCst),
+                "the logger's re-entrant WGPU initialization must return"
+            );
+        } else {
+            assert!(
+                outer.is_err(),
+                "a completed WGPU initialization must announce its adapter"
+            );
+            eprintln!("skipping WGPU logger re-entry assertion (no adapter): {outer:?}");
+        }
+
+        if outer.is_ok() {
+            log::set_max_level(LevelFilter::Trace);
+            REENTER_ON_WGPU_DEVICE_CREATE.store(true, Ordering::SeqCst);
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(init_identity_wgpu_filter());
+            });
+            let result = match rx.recv_timeout(Duration::from_secs(60)) {
+                Ok(result) => result,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    panic!("re-entrant logger deadlocked shared-GPU device setup (60s watchdog)")
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("WGPU device initialization thread panicked before reporting")
+                }
+            };
+            assert!(
+                result.is_ok(),
+                "outer WGPU initialization failed: {result:?}"
+            );
+            assert!(
+                SAW_WGPU_DEVICE_CREATE.load(Ordering::SeqCst),
+                "wgpu device creation did not emit the expected trace record"
+            );
+            assert!(
+                INNER_WGPU_INIT_REENTRY_REJECTED.load(Ordering::SeqCst),
+                "device-init logger re-entry must return promptly from the protected generation"
+            );
+        }
+    }
 }

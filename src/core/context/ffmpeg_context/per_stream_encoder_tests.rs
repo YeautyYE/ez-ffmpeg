@@ -38,37 +38,48 @@ fn run(context: FfmpegContext, scenario: &str) {
 }
 
 /// One media file carrying TWO audio tracks (mono sine + stereo silence) —
-/// the same-input/same-type fixture. Built once per test binary
-/// (`OnceLock`), so parallel tests never race on the file.
+/// the same-input/same-type fixture. Concurrent first callers build unique
+/// candidates outside the `OnceLock`; the first completed candidate wins.
 fn two_audio_fixture() -> String {
     static FIXTURE: OnceLock<String> = OnceLock::new();
-    FIXTURE
-        .get_or_init(|| {
-            let path = tmp_path("two_audio_fixture.mp4");
-            run(
-                FfmpegContext::builder()
-                    .input(
-                        Input::from("sine=frequency=440:sample_rate=44100:duration=1")
-                            .set_format("lavfi"),
-                    )
-                    .input(
-                        Input::from("anullsrc=channel_layout=stereo:sample_rate=48000")
-                            .set_format("lavfi"),
-                    )
-                    .output(
-                        Output::from(path.as_str())
-                            .set_audio_codec("aac")
-                            .set_recording_time_us(1_000_000)
-                            .add_stream_map("0:a")
-                            .add_stream_map("1:a"),
-                    )
-                    .build()
-                    .unwrap(),
-                "two-audio fixture",
-            );
-            path
-        })
-        .clone()
+    static ATTEMPT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    if let Some(path) = FIXTURE.get() {
+        return path.clone();
+    }
+
+    let attempt = ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = tmp_path(&format!("two_audio_fixture_{attempt}.mp4"));
+    run(
+        FfmpegContext::builder()
+            .input(
+                Input::from("sine=frequency=440:sample_rate=44100:duration=1").set_format("lavfi"),
+            )
+            .input(
+                Input::from("anullsrc=channel_layout=stereo:sample_rate=48000").set_format("lavfi"),
+            )
+            .output(
+                Output::from(path.as_str())
+                    .set_audio_codec("aac")
+                    .set_recording_time_us(1_000_000)
+                    .add_stream_map("0:a")
+                    .add_stream_map("1:a"),
+            )
+            .build()
+            .unwrap(),
+        "two-audio fixture",
+    );
+
+    match FIXTURE.set(path) {
+        Ok(()) => FIXTURE.get().expect("fixture was just published").clone(),
+        Err(loser) => {
+            let _ = std::fs::remove_file(loser);
+            FIXTURE
+                .get()
+                .expect("another fixture candidate won the race")
+                .clone()
+        }
+    }
 }
 
 fn audio_codec_names(path: &str) -> Vec<String> {
