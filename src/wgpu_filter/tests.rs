@@ -622,6 +622,105 @@ fn test_frame_pipeline_driver_semantics() {
     );
 }
 
+/// The non-empty half of the pending-hint contract, pinned WITHOUT a GPU:
+/// a queued ready pass-through entry (via the test hook, standing in for
+/// the device-only pending states) must flip the hint to `true`, and
+/// draining it through the ordinary `request_frame` path must return it to
+/// `false`. Deterministic everywhere — including machines whose device
+/// completes submissions inside `filter_frame`, where the GPU test below
+/// can never observe the in-flight state and an always-`false` override
+/// would otherwise slip through.
+#[test]
+fn test_pending_hint_tracks_a_queued_entry_without_gpu() {
+    let mut filter = WgpuFrameFilter::builder()
+        .shader_wgsl(shaders::IDENTITY_FS)
+        .build()
+        .expect("builder");
+    assert!(
+        !filter.request_frame_pending(),
+        "an empty output queue must not report pending output"
+    );
+
+    filter.queue_ready_output_for_test(make_yuv420p_frame(64, 48));
+    assert!(
+        filter.request_frame_pending(),
+        "a queued entry must report pending output"
+    );
+
+    let mut map = HashMap::new();
+    let mut ctx = make_ctx(&mut map);
+    let out = filter
+        .request_frame(&mut ctx)
+        .expect("request_frame on a ready entry");
+    assert!(out.is_some(), "the queued entry must drain");
+    assert!(
+        !filter.request_frame_pending(),
+        "a drained queue must not report pending output"
+    );
+}
+
+/// `request_frame_pending` must track the output queue — the contract the
+/// pipeline's wait-interval gating relies on: `false` with nothing queued
+/// (letting an idle pipeline park between inputs), `true` while a submission
+/// is in flight, and `false` again once everything drained. The in-flight
+/// assertion is opportunistic (a device may complete inside `filter_frame`);
+/// the deterministic non-empty pin lives in the no-GPU test above.
+#[test]
+fn test_request_frame_pending_tracks_the_output_queue() {
+    let mut filter = WgpuFrameFilter::builder()
+        .shader_wgsl(shaders::IDENTITY_FS)
+        .build()
+        .expect("builder");
+    // Before any input — and before the GPU is touched at all — nothing can
+    // be pending, and the override must say so; the trait default would
+    // claim `true` here.
+    assert!(
+        !filter.request_frame_pending(),
+        "an empty output queue must not report pending output"
+    );
+
+    if !init_filter(&mut filter) {
+        return;
+    }
+    let mut map = HashMap::new();
+    let mut ctx = make_ctx(&mut map);
+
+    let mut delivered = 0usize;
+    if let Some(_out) = filter
+        .filter_frame(make_yuv420p_frame(64, 48), &mut ctx)
+        .expect("filter_frame")
+    {
+        delivered += 1;
+    }
+    // Default frames_in_flight = 2: the submission normally outlives its own
+    // filter_frame call — unless the non-blocking probe already resolved and
+    // delivered it, in which case the queue is rightfully empty again. Either
+    // way the verdict must match the queue.
+    if delivered == 0 {
+        assert!(
+            filter.request_frame_pending(),
+            "an in-flight submission must report pending output"
+        );
+    }
+
+    // Drain to empty; the hint must drop back to idle.
+    for _ in 0..2000 {
+        while let Some(_out) = filter.request_frame(&mut ctx).expect("request_frame") {
+            delivered += 1;
+        }
+        if delivered >= 1 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(delivered, 1, "the submitted frame must drain");
+    assert!(
+        !filter.request_frame_pending(),
+        "a drained queue must not report pending output"
+    );
+    filter.uninit(&mut ctx);
+}
+
 /// A source that ends without any EOF marker (e.g. an upstream abort closes
 /// the channel) must not lose real frames: everything already submitted
 /// drains through `request_frame` polling alone.
