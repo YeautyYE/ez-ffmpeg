@@ -6,9 +6,10 @@ use crate::flv::flv_buffer::FlvBuffer;
 use crate::flv::flv_tag::FlvTag;
 use crate::rtmp::poller::{waker_pair, WakeHandle, Waker};
 use crate::rtmp::reactor::{
-    effective_max_connections, EnqueueRefused, PublisherFeed, PublisherRegistration,
-    PublisherSource, Reactor, RegistrationHandoff, RegistrationKillSwitch, StreamKeyClaim,
-    CHANNEL_HEADROOM, PUBLISHER_CHANNEL_CAPACITY,
+    effective_max_connections, EnqueueRefused, IngressBudget, IngressBudgetGuard, PublisherFeed,
+    PublisherRegistration, PublisherSource, Reactor, RegistrationHandoff, RegistrationKillSwitch,
+    StreamKeyClaim, CHANNEL_HEADROOM, PUBLISHER_CHANNEL_CAPACITY,
+    PUBLISHER_INGRESS_HIGH_WATER_BYTES,
 };
 use bytes::{BufMut, Bytes};
 use log::{debug, error, info, warn};
@@ -742,21 +743,26 @@ pub struct RtmpStreamSender {
     /// drained on the next loop turn instead of waiting up to POLL_TIMEOUT_MS
     /// (~100ms). `None` only for the unit-test constructor (no running reactor).
     wake_handle: Option<WakeHandle>,
+    /// This publisher's ingress byte account: `send` reserves each chunk's
+    /// length before enqueueing it and the reactor returns each round's
+    /// drained bytes in one batch, so a producer running ahead of the drain
+    /// parks at the high-water mark instead of queueing unbounded bytes.
+    /// Clones share the account exactly as they share the channel.
+    budget: Arc<IngressBudget>,
 }
 
 impl RtmpStreamSender {
     /// Sends one already-RTMP-chunk-packaged byte buffer to the stream.
     ///
     /// The underlying channel is bounded, so this **blocks** while the stream's
-    /// queue is full (the server applying backpressure) and returns once space
-    /// frees up. Returns
+    /// queue is full — at its item capacity, or at its byte high-water mark of
+    /// undrained chunk bytes — (the server applying backpressure) and returns
+    /// once space frees up. Returns
     /// [`Error::RtmpStreamClosed`](crate::error::Error::RtmpStreamClosed) if the
     /// stream has been torn down — its receiver was dropped because the server
     /// stopped or the stream was removed.
     pub fn send(&self, chunk: Vec<u8>) -> crate::error::Result<()> {
-        self.inner
-            .send(chunk)
-            .map_err(|_| crate::error::Error::RtmpStreamClosed)?;
+        self.send_quiet(chunk)?;
         // Nudge the reactor so process_publishers drains this Raw channel on the
         // next loop turn rather than after the POLL_TIMEOUT_MS fallback. The
         // internal Feed path (create_rtmp_input) wakes the same way per packet.
@@ -764,6 +770,56 @@ impl RtmpStreamSender {
             wake.wake();
         }
         Ok(())
+    }
+
+    /// The budgeted channel send [`send`](Self::send) and the priming loop in
+    /// `create_stream_sender` share, minus the per-send reactor wake (priming
+    /// keeps its single post-batch wake): reserve the chunk's bytes in the
+    /// publisher's ingress account — parking while the account is over its
+    /// high-water mark — then forward to the channel, rolling the reservation
+    /// back if the channel is dead so sibling clones' accounts stay exact.
+    /// A closed account and a dead channel are the same stream teardown, so
+    /// both failures map to the one existing error identity.
+    fn send_quiet(&self, chunk: Vec<u8>) -> crate::error::Result<()> {
+        let len = chunk.len();
+        self.budget
+            .acquire(len)
+            .map_err(|_| crate::error::Error::RtmpStreamClosed)?;
+        self.inner.send(chunk).map_err(|_| {
+            self.budget.release(len);
+            crate::error::Error::RtmpStreamClosed
+        })
+    }
+}
+
+/// The feed-path counterpart of [`RtmpStreamSender`]'s budgeted send: pairs
+/// the `create_rtmp_input` bypass feed with its publisher's ingress budget so
+/// the FFmpeg muxer thread (inside the AVIO write callback) parks at the byte
+/// high-water mark exactly like a raw sender, instead of queueing unbounded
+/// tag bytes. Internal only — the write callback owns the sole instance.
+struct BudgetedFeedSender {
+    inner: crossbeam_channel::Sender<PublisherFeed>,
+    budget: Arc<IngressBudget>,
+}
+
+impl BudgetedFeedSender {
+    /// Reserve the item's accounted bytes ([`PublisherFeed::ingress_len`],
+    /// the same measure the reactor's drain releases), then forward it,
+    /// rolling the reservation back on a dead channel so the account stays
+    /// exact. A closed budget is the same reactor-side teardown that
+    /// disconnects the channel, so it is reported in the channel's own error
+    /// shape and flows through the caller's existing failure classification.
+    fn send(
+        &self,
+        feed: PublisherFeed,
+    ) -> Result<(), crossbeam_channel::SendError<PublisherFeed>> {
+        let len = feed.ingress_len();
+        if self.budget.acquire(len).is_err() {
+            return Err(crossbeam_channel::SendError(feed));
+        }
+        self.inner.send(feed).inspect_err(|_| {
+            self.budget.release(len);
+        })
     }
 }
 
@@ -1010,12 +1066,22 @@ impl EmbedRtmpServer<Running> {
         };
 
         let (sender, receiver) = crossbeam_channel::bounded(PUBLISHER_CHANNEL_CAPACITY);
-        self.register_publisher(claim, PublisherSource::Raw(receiver))?;
+        let (budget_guard, budget) = IngressBudget::new(PUBLISHER_INGRESS_HIGH_WATER_BYTES);
+        self.register_publisher(claim, PublisherSource::Raw(receiver), budget_guard)?;
 
+        let stream_sender = RtmpStreamSender {
+            inner: sender,
+            wake_handle: self.wake_handle.clone(),
+            budget,
+        };
         // Prime the raw byte channel with the connect / createStream / publish
-        // handshake the server session expects before any media.
+        // handshake the server session expects before any media. The budgeted
+        // quiet send keeps the account exact from the very first byte (the
+        // reactor releases what it drains, primed handshake included) without
+        // adding per-item wakes the plain send never had; a few hundred
+        // control bytes into a fresh account can never park.
         for packet_bytes in build_publish_control(app_name.into(), stream_key)? {
-            if sender.send(packet_bytes).is_err() {
+            if stream_sender.send_quiet(packet_bytes).is_err() {
                 error!("Can't send publish control command to rtmp server.");
                 return Err(RtmpCreateStream.into());
             }
@@ -1028,10 +1094,7 @@ impl EmbedRtmpServer<Running> {
         if let Some(wake_handle) = &self.wake_handle {
             wake_handle.wake();
         }
-        Ok(RtmpStreamSender {
-            inner: sender,
-            wake_handle: self.wake_handle.clone(),
-        })
+        Ok(stream_sender)
     }
 
     /// Registers an in-process publisher whose steady-state audio/video is
@@ -1039,12 +1102,12 @@ impl EmbedRtmpServer<Running> {
     /// control still ride the same feed as serialized RTMP chunk bytes, so the
     /// scheduler sees an identical, in-order message sequence to the raw path.
     ///
-    /// Returns the feed sender, primed with the publish handshake.
+    /// Returns the budget-gated feed sender, primed with the publish handshake.
     fn create_bypass_feed_sender(
         &self,
         app_name: impl Into<String>,
         stream_key: impl Into<String>,
-    ) -> crate::error::Result<crossbeam_channel::Sender<PublisherFeed>> {
+    ) -> crate::error::Result<BudgetedFeedSender> {
         let stream_key = stream_key.into();
         // Claim the key atomically (insert-or-fail); see create_stream_sender.
         let Ok(claim) = StreamKeyClaim::claim(self.stream_keys.clone(), stream_key.clone()) else {
@@ -1052,17 +1115,25 @@ impl EmbedRtmpServer<Running> {
         };
 
         let (sender, receiver) = crossbeam_channel::bounded(PUBLISHER_CHANNEL_CAPACITY);
-        self.register_publisher(claim, PublisherSource::Feed(receiver))?;
+        let (budget_guard, budget) = IngressBudget::new(PUBLISHER_INGRESS_HIGH_WATER_BYTES);
+        self.register_publisher(claim, PublisherSource::Feed(receiver), budget_guard)?;
 
+        let feed_sender = BudgetedFeedSender {
+            inner: sender,
+            budget,
+        };
         // Prime the feed with the same connect / createStream / publish bytes
-        // the raw path would send, wrapped as PublisherFeed::Raw.
+        // the raw path would send, wrapped as PublisherFeed::Raw. The budgeted
+        // send accounts these bytes like any media item, so the reactor's
+        // per-round release never returns bytes nobody acquired; a handshake
+        // into a fresh account can never park.
         for packet_bytes in build_publish_control(app_name.into(), stream_key)? {
-            if sender.send(PublisherFeed::Raw(packet_bytes)).is_err() {
+            if feed_sender.send(PublisherFeed::Raw(packet_bytes)).is_err() {
                 error!("Can't send publish control command to rtmp server.");
                 return Err(RtmpCreateStream.into());
             }
         }
-        Ok(sender)
+        Ok(feed_sender)
     }
 
     /// Hands a newly registered publisher's receiving end to the reactor.
@@ -1070,7 +1141,9 @@ impl EmbedRtmpServer<Running> {
     /// The registration carries the caller's `stream_keys` claim, and the
     /// claim is a drop-releasing guard: whichever side ends up holding the
     /// registration when it dies releases the key, with no path releasing
-    /// twice. Concretely:
+    /// twice. The ingress-budget guard rides the same lifecycle, so those
+    /// same drops also close the budget and wake any producer parked at the
+    /// byte gate. Concretely:
     /// - no registration queue, or the enqueue is refused because the intake
     ///   is closed (worker gone, server stopped) or at capacity: the
     ///   registration drops here, releasing the claim — the refusal and a
@@ -1087,8 +1160,13 @@ impl EmbedRtmpServer<Running> {
         &self,
         claim: StreamKeyClaim,
         source: PublisherSource,
+        budget: IngressBudgetGuard,
     ) -> crate::error::Result<()> {
-        let registration = PublisherRegistration { claim, source };
+        let registration = PublisherRegistration {
+            claim,
+            source,
+            budget,
+        };
         let registrations = match self.registrations.as_ref() {
             Some(registrations) => registrations,
             None => {
@@ -1926,9 +2004,13 @@ mod tests {
     #[test]
     fn stream_sender_reports_stream_closed_and_clones_share_the_stream() {
         let (tx, rx) = crossbeam_channel::bounded::<Vec<u8>>(4);
+        // The reactor-side guard stays alive for the whole test: only the
+        // channel disconnect below may produce the error.
+        let (_budget_guard, budget) = IngressBudget::new(PUBLISHER_INGRESS_HIGH_WATER_BYTES);
         let sender = RtmpStreamSender {
             inner: tx,
             wake_handle: None,
+            budget,
         };
 
         // A clone feeds the same stream: a chunk pushed through the clone is
@@ -2685,11 +2767,57 @@ mod tests {
     /// refuses enqueues. Its claim lives in a key set private to the probe.
     fn probe_registration(key: &str) -> PublisherRegistration {
         let (_feed_tx, feed_rx) = crossbeam_channel::bounded::<PublisherFeed>(1);
+        let (budget, _) = IngressBudget::new(PUBLISHER_INGRESS_HIGH_WATER_BYTES);
         PublisherRegistration {
             claim: StreamKeyClaim::claim(Arc::new(dashmap::DashSet::new()), key.to_string())
                 .expect("a fresh key set accepts its first claim"),
             source: PublisherSource::Feed(feed_rx),
+            budget,
         }
+    }
+
+    // The byte gate keeps the sender's error identity: a send parked at the
+    // high-water mark returns the same RtmpStreamClosed a dead channel
+    // produces, once the reactor-side guard drops (stream teardown).
+    #[test]
+    fn stream_sender_send_maps_budget_close_to_stream_closed() {
+        // `_rx` stays alive: the parked send below must fail through the
+        // budget's close, not through a channel disconnect.
+        let (tx, _rx) = crossbeam_channel::bounded::<Vec<u8>>(4);
+        let (budget_guard, budget) = IngressBudget::new(8);
+        let sender = RtmpStreamSender {
+            inner: tx,
+            wake_handle: None,
+            budget,
+        };
+        sender
+            .send(vec![0u8; 6])
+            .expect("a send into an empty account passes");
+
+        let blocked = sender.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            done_tx
+                .send(blocked.send(vec![0u8; 6]))
+                .expect("report the send result");
+        });
+        // One-sided park check: a correct gate cannot complete this send
+        // while 6 of 8 bytes are queued; slow scheduling only makes the
+        // window vacuous, never wrong.
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "a send past the byte high-water mark must park"
+        );
+
+        drop(budget_guard);
+        assert_eq!(
+            done_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the guard drop must wake the parked send"),
+            Err(crate::error::Error::RtmpStreamClosed),
+            "a send woken by stream teardown reports the stream closed"
+        );
+        producer.join().expect("producer thread exits");
     }
 
     // A reactor panic must not leave the server half-dead: the unwind
