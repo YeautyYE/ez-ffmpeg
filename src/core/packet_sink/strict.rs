@@ -776,19 +776,25 @@ impl PacketSinkWorker {
 /// - `codecpar` must be a valid, non-null `AVCodecParameters` with an
 ///   initialized `ch_layout`, alive for the call.
 unsafe fn describe_channel_layout(codecpar: *const AVCodecParameters) -> String {
-    let mut buf = [0u8; 128];
-    let n = av_channel_layout_describe(
-        &(*codecpar).ch_layout,
-        buf.as_mut_ptr() as *mut libc::c_char,
-        buf.len(),
-    );
-    if n > 0 {
-        match std::ffi::CStr::from_bytes_until_nul(&buf) {
-            Ok(c) => c.to_string_lossy().into_owned(),
-            Err(_) => String::new(),
+    let layout = &(*codecpar).ch_layout;
+    let mut buf = vec![0u8; 128];
+    let n = av_channel_layout_describe(layout, buf.as_mut_ptr() as *mut libc::c_char, buf.len());
+    if n <= 0 {
+        return String::new();
+    }
+    if n as usize > buf.len() {
+        // The required size is exact, and the layout is unchanged between
+        // calls, so one retry at that capacity is sufficient.
+        buf = vec![0u8; n as usize];
+        let retried =
+            av_channel_layout_describe(layout, buf.as_mut_ptr() as *mut libc::c_char, buf.len());
+        if retried <= 0 || retried as usize > buf.len() {
+            return String::new();
         }
-    } else {
-        String::new()
+    }
+    match std::ffi::CStr::from_bytes_until_nul(&buf) {
+        Ok(c) => c.to_string_lossy().into_owned(),
+        Err(_) => String::new(),
     }
 }
 
@@ -913,9 +919,9 @@ mod tests {
     };
     use ffmpeg_next::packet::Mut;
     use ffmpeg_sys_next::{
-        av_guess_format, av_mallocz, av_packet_new_side_data, avformat_alloc_output_context2,
-        avformat_free_context, avformat_new_stream, AVCodecID, AVMediaType,
-        AV_INPUT_BUFFER_PADDING_SIZE,
+        av_channel_layout_custom_init, av_channel_layout_uninit, av_guess_format, av_mallocz,
+        av_packet_new_side_data, avformat_alloc_output_context2, avformat_free_context,
+        avformat_new_stream, AVCodecID, AVMediaType, AV_INPUT_BUFFER_PADDING_SIZE,
     };
     use std::ffi::CString;
     use std::ptr::{null, null_mut};
@@ -1028,6 +1034,59 @@ mod tests {
             );
         }
         ctx
+    }
+
+    /// A custom layout whose text exceeds the first buffer is returned whole.
+    #[test]
+    fn describe_channel_layout_returns_the_full_long_custom_description() {
+        let ctx = TestCtx::new();
+        let stream_index = unsafe {
+            ctx.add_stream(
+                AVMediaType::AVMEDIA_TYPE_AUDIO,
+                AVCodecID::AV_CODEC_ID_AAC,
+                None,
+                AVRational { num: 1, den: 48000 },
+            )
+        };
+        let codecpar = unsafe {
+            let stream = *(*ctx.ctx).streams.add(stream_index);
+            (*stream).codecpar
+        };
+
+        let channel_names: Vec<_> = (0..8).map(|index| format!("channel_{index:02}")).collect();
+        unsafe {
+            av_channel_layout_uninit(&mut (*codecpar).ch_layout);
+            assert_eq!(
+                av_channel_layout_custom_init(
+                    &mut (*codecpar).ch_layout,
+                    channel_names.len() as i32
+                ),
+                0
+            );
+            let map = (*codecpar).ch_layout.u.map;
+            for (index, name) in channel_names.iter().enumerate() {
+                let entry = &mut *map.add(index);
+                assert!(name.len() < entry.name.len());
+                std::ptr::copy_nonoverlapping(
+                    name.as_ptr(),
+                    entry.name.as_mut_ptr().cast::<u8>(),
+                    name.len(),
+                );
+            }
+        }
+
+        let expected = format!(
+            "8 channels ({})",
+            channel_names
+                .iter()
+                .map(|name| format!("UNK@{name}"))
+                .collect::<Vec<_>>()
+                .join("+")
+        );
+        assert!(expected.len() > 127);
+        let actual = unsafe { describe_channel_layout(codecpar) };
+        unsafe { av_channel_layout_uninit(&mut (*codecpar).ch_layout) };
+        assert_eq!(actual, expected);
     }
 
     /// A sink that logs every event; returns the sink and the log.
