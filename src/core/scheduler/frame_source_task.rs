@@ -151,12 +151,17 @@ pub(crate) fn frame_source_init(
                 }
             }
 
-            // Healthy ingress close (finish()/Drop dropped the facade sender,
-            // all queued frames drained above): enqueue the explicit EOF
+            // Healthy ingress close (finish() dropped the facade sender, all
+            // queued frames drained above): enqueue the explicit EOF
             // marker BEFORE this worker's fg_sender drops. This is the only
             // EOF mechanism — see the module docs for why sender-drop alone
-            // is not one. An abort/stop racing in suppresses the marker via
-            // the status poll inside the send loop, which is teardown-benign.
+            // is not one. An abort/stop racing in — including the facade's
+            // Drop/abort, which closes ingress and immediately aborts —
+            // usually suppresses the marker via the status poll inside the
+            // send loop. That poll only re-checks status after a send times
+            // out, though, so a marker that slips through the race window
+            // still lands in a pipeline that is itself already tearing
+            // down — benign either way.
             let eof_marker = FrameBox {
                 frame: null_frame(),
                 frame_data: frame_data_for(&params),

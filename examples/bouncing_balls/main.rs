@@ -100,6 +100,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         writer.write(&frame)?;
     }
 
+    // Only finish() finalizes the file; dropping the writer would abort.
     writer.finish()?;
     println!("Wrote bouncing_balls.mp4");
     Ok(())
