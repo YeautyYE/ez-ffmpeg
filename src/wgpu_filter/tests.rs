@@ -1406,3 +1406,363 @@ fn yuv_builder_rejects_group0_bindings_in_the_body() {
         .build()
         .is_ok());
 }
+
+// --- Shared GPU generation cache ------------------------------------------
+//
+// The slot state machine (single flight, dead-generation replacement,
+// failure retry, panic recovery) is generic over `Liveness`, so the first
+// tests drive it with a plain payload on private cache instances and run on
+// any machine. The GPU-gated tests after them exercise real generations:
+// sharing across filters, profile isolation, and prompt death propagation.
+// No test ever mutates the process-global cache — death tests build their
+// own generation — so they cannot flake concurrently running GPU tests.
+
+use crate::wgpu_filter::shared_gpu::{
+    self, GenCache, GpuGenerationLost, GpuProfile, Liveness, SharedGpuGeneration,
+};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+#[derive(Debug)]
+struct TestGen {
+    id: usize,
+    dead: AtomicBool,
+    /// Mirrors the dmabuf transient-failure retirement: alive but not
+    /// re-servable from the cache.
+    retired: AtomicBool,
+    /// Arms a panic in Drop, standing in for a wgpu destructor blowing up
+    /// during retired-generation teardown.
+    panic_on_drop: AtomicBool,
+}
+
+impl TestGen {
+    fn new(id: usize) -> Arc<Self> {
+        Arc::new(TestGen {
+            id,
+            dead: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
+            panic_on_drop: AtomicBool::new(false),
+        })
+    }
+}
+
+impl Liveness for TestGen {
+    fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Relaxed)
+    }
+
+    fn is_reusable(&self) -> bool {
+        !self.is_dead() && !self.retired.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for TestGen {
+    fn drop(&mut self) {
+        if self.panic_on_drop.load(Ordering::Relaxed) && !std::thread::panicking() {
+            panic!("simulated teardown panic");
+        }
+    }
+}
+
+#[test]
+fn cache_single_flight_builds_once_under_concurrency() {
+    let cache = Arc::new(GenCache::<TestGen>::new());
+    let builds = Arc::new(AtomicUsize::new(0));
+    let handles: Vec<_> = (0..2)
+        .map(|_| {
+            let cache = Arc::clone(&cache);
+            let builds = Arc::clone(&builds);
+            std::thread::spawn(move || {
+                cache.acquire_with(GpuProfile::Basic, || {
+                    builds.fetch_add(1, Ordering::SeqCst);
+                    // Long enough that the second acquire reliably arrives
+                    // while this build is still in flight (the assertions
+                    // hold either way).
+                    std::thread::sleep(Duration::from_millis(50));
+                    Ok(TestGen::new(1))
+                })
+            })
+        })
+        .collect();
+    let results: Vec<Arc<TestGen>> = handles
+        .into_iter()
+        .map(|h| h.join().unwrap().expect("acquire"))
+        .collect();
+    assert_eq!(builds.load(Ordering::SeqCst), 1, "exactly one build ran");
+    assert!(
+        Arc::ptr_eq(&results[0], &results[1]),
+        "both acquires must share one generation"
+    );
+}
+
+#[test]
+fn cache_dead_generation_replaced_next_acquire_old_arc_survives() {
+    let cache = GenCache::<TestGen>::new();
+    let a = cache
+        .acquire_with(GpuProfile::Basic, || Ok(TestGen::new(1)))
+        .expect("first build");
+    let again = cache
+        .acquire_with(GpuProfile::Basic, || {
+            panic!("a live generation must not be rebuilt")
+        })
+        .expect("cached acquire");
+    assert!(Arc::ptr_eq(&a, &again), "live generation is served back");
+
+    a.dead.store(true, Ordering::Relaxed);
+    let b = cache
+        .acquire_with(GpuProfile::Basic, || Ok(TestGen::new(2)))
+        .expect("replacement build");
+    assert!(!Arc::ptr_eq(&a, &b), "a dead generation must be replaced");
+    assert_eq!(b.id, 2, "the replacement is the newly built generation");
+    // The dead generation's Arc contents stay readable for filters still
+    // holding it: they fail promptly, but never dangle.
+    assert_eq!(a.id, 1);
+    assert!(a.is_dead());
+}
+
+#[test]
+fn cache_profiles_isolated() {
+    let cache = GenCache::<TestGen>::new();
+    let basic = cache
+        .acquire_with(GpuProfile::Basic, || Ok(TestGen::new(1)))
+        .expect("basic build");
+    let dmabuf = cache
+        .acquire_with(GpuProfile::DmabufCapable, || Ok(TestGen::new(2)))
+        .expect("dmabuf build");
+    assert!(
+        !Arc::ptr_eq(&basic, &dmabuf),
+        "profiles must own distinct slots"
+    );
+    assert_eq!(
+        (basic.id, dmabuf.id),
+        (1, 2),
+        "each profile ran its own build"
+    );
+    // And each slot serves its own generation back afterwards.
+    let basic_again = cache
+        .acquire_with(GpuProfile::Basic, || panic!("basic slot must be cached"))
+        .expect("basic cached");
+    assert!(Arc::ptr_eq(&basic, &basic_again));
+}
+
+#[test]
+fn cache_failed_build_leaves_slot_retryable() {
+    let cache = GenCache::<TestGen>::new();
+    let builds = AtomicUsize::new(0);
+    let err = cache
+        .acquire_with(GpuProfile::Basic, || {
+            builds.fetch_add(1, Ordering::SeqCst);
+            Err("no backend today".to_string())
+        })
+        .expect_err("a build failure must reach the caller");
+    assert_eq!(err, "no backend today");
+    // The failure reset the slot: the next acquire runs a fresh build
+    // (per-init failure reporting on GPU-less machines, and recovery once
+    // the cause clears).
+    let generation = cache
+        .acquire_with(GpuProfile::Basic, || {
+            builds.fetch_add(1, Ordering::SeqCst);
+            Ok(TestGen::new(3))
+        })
+        .expect("the retry must rebuild");
+    assert_eq!(
+        builds.load(Ordering::SeqCst),
+        2,
+        "both acquires ran a build"
+    );
+    assert_eq!(generation.id, 3);
+}
+
+#[test]
+fn cache_builder_panic_unblocks_waiters() {
+    let cache = Arc::new(GenCache::<TestGen>::new());
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let panicker = {
+        let cache = Arc::clone(&cache);
+        std::thread::spawn(move || {
+            let _ = cache.acquire_with(GpuProfile::Basic, || {
+                started_tx.send(()).expect("signal the waiter");
+                // Give the waiter time to block on the Building slot.
+                std::thread::sleep(Duration::from_millis(100));
+                panic!("simulated build panic");
+            });
+        })
+    };
+    started_rx.recv().expect("builder entered its build");
+    // This acquire waits on the in-flight build; when the builder's unwind
+    // resets the slot it must wake, become the builder itself, and succeed
+    // rather than hang forever.
+    let generation = cache
+        .acquire_with(GpuProfile::Basic, || Ok(TestGen::new(7)))
+        .expect("the waiter takes over after the panic");
+    assert_eq!(generation.id, 7);
+    assert!(
+        panicker.join().is_err(),
+        "the builder thread dies of its own panic"
+    );
+}
+
+#[test]
+fn cache_replaces_live_but_nonreusable_generation() {
+    let cache = GenCache::<TestGen>::new();
+    let a = cache
+        .acquire_with(GpuProfile::DmabufCapable, || Ok(TestGen::new(1)))
+        .expect("first build");
+    a.retired.store(true, Ordering::Relaxed);
+    // Alive-but-retired (the dmabuf transient-failure shape): the next
+    // acquire must rebuild instead of serving the cached Arc back...
+    let b = cache
+        .acquire_with(GpuProfile::DmabufCapable, || Ok(TestGen::new(2)))
+        .expect("replacement build");
+    assert!(
+        !Arc::ptr_eq(&a, &b),
+        "a retired generation must be replaced"
+    );
+    assert_eq!(b.id, 2);
+    // ...while jobs already on the old generation keep running: it is
+    // retired, never killed.
+    assert!(!a.is_dead(), "retirement must not kill running jobs");
+    assert_eq!(a.id, 1);
+}
+
+/// A retired generation's teardown — potentially its final `Arc`, hence
+/// real destructors — must run outside the slot lock, covered by the
+/// builder's reset guard: a panicking destructor surfaces on the acquiring
+/// thread, but leaves the slot Idle, the mutex unpoisoned, and the next
+/// acquire fully functional. (Dropping the retiree while holding the slot
+/// mutex would instead poison it mid-transition and strand the machine.)
+#[test]
+fn cache_retired_teardown_panics_do_not_wedge_the_slot() {
+    let cache = GenCache::<TestGen>::new();
+    let doomed = cache
+        .acquire_with(GpuProfile::Basic, || Ok(TestGen::new(1)))
+        .expect("first build");
+    doomed.dead.store(true, Ordering::Relaxed);
+    doomed.panic_on_drop.store(true, Ordering::Relaxed);
+    drop(doomed); // the cache now holds the final Arc
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cache.acquire_with(GpuProfile::Basic, || Ok(TestGen::new(2)))
+    }));
+    assert!(
+        outcome.is_err(),
+        "the teardown panic must surface on the acquiring thread"
+    );
+
+    // The machine survived: the guard reset the slot and the mutex was
+    // never poisoned mid-teardown, so the next acquire builds normally.
+    let recovered = cache
+        .acquire_with(GpuProfile::Basic, || Ok(TestGen::new(3)))
+        .expect("the cache must stay functional after a teardown panic");
+    assert_eq!(recovered.id, 3);
+}
+
+#[test]
+fn shared_generation_pointer_equal_across_filters() {
+    let mut first = WgpuFrameFilter::new_identity().unwrap();
+    if !init_filter(&mut first) {
+        return;
+    }
+    let mut second = WgpuFrameFilter::new_identity().unwrap();
+    if !init_filter(&mut second) {
+        return;
+    }
+    // Read-only on the process-global cache: both inits must have resolved
+    // to the same live generation (device, queue and snapshots included).
+    let a = first.shared_generation_for_test().expect("initialized");
+    let b = second.shared_generation_for_test().expect("initialized");
+    assert!(
+        Arc::ptr_eq(a, b),
+        "two basic-profile filters must share one generation"
+    );
+}
+
+#[test]
+fn profiles_get_distinct_generations_gpu() {
+    let mut basic = WgpuFrameFilter::new_identity().unwrap();
+    if !init_filter(&mut basic) {
+        return;
+    }
+    let mut hw = WgpuFrameFilter::builder()
+        .shader_wgsl(shaders::IDENTITY_FS)
+        .hw_zero_copy_input(true)
+        .build()
+        .unwrap();
+    if !init_filter(&mut hw) {
+        return;
+    }
+    // Even where dmabuf extensions are unavailable the DmabufCapable
+    // profile owns a separate plain device, so the generations can never
+    // be pointer-equal.
+    let a = basic.shared_generation_for_test().expect("initialized");
+    let b = hw.shared_generation_for_test().expect("initialized");
+    assert!(!Arc::ptr_eq(a, b), "profiles must not share a generation");
+}
+
+#[test]
+fn dead_generation_fails_filter_promptly_with_stable_error() {
+    // A private cache running the real builder: killing this generation
+    // must never touch the process-global slots other GPU tests stream on.
+    let cache = GenCache::<SharedGpuGeneration>::new();
+    let generation = match cache.acquire_with(GpuProfile::Basic, || {
+        shared_gpu::build_generation(GpuProfile::Basic)
+    }) {
+        Ok(generation) => generation,
+        Err(e) if e.contains("adapter") || e.contains("device") => {
+            eprintln!("skipping wgpu test (no GPU): {e}");
+            return;
+        }
+        Err(e) => panic!("generation build failed: {e}"),
+    };
+
+    let mut filter = WgpuFrameFilter::new_identity().unwrap();
+    filter
+        .init_with_generation_for_test(Arc::clone(&generation))
+        .expect("init against the private generation");
+
+    // Prove the generation works, then leave one submission in flight so
+    // the completion path's death check is exercised too. A fast device
+    // can complete a submission within its own filter_frame call
+    // (returning Some), so loop until one stays pending.
+    drive(&mut filter, vec![make_yuv420p_frame(64, 48)], 1);
+    let mut map = HashMap::new();
+    let mut ctx = make_ctx(&mut map);
+    for attempt in 0.. {
+        assert!(attempt < 1000, "device keeps completing within one call");
+        let frame = make_yuv420p_frame(64, 48);
+        if filter
+            .filter_frame(frame, &mut ctx)
+            .expect("filter_frame")
+            .is_none()
+        {
+            break; // one readback is now pending in the output queue
+        }
+    }
+
+    generation.mark_dead();
+    let start = Instant::now();
+    let err = match filter.filter_frame(make_yuv420p_frame(64, 48), &mut ctx) {
+        Err(e) => e,
+        Ok(_) => panic!("filter_frame on a dead generation must fail"),
+    };
+    assert!(
+        err.downcast_ref::<GpuGenerationLost>().is_some(),
+        "unexpected filter_frame error: {err}"
+    );
+    let err = match filter.request_frame(&mut ctx) {
+        Err(e) => e,
+        Ok(_) => panic!("a pending readback on a dead generation must fail"),
+    };
+    assert!(
+        err.downcast_ref::<GpuGenerationLost>().is_some(),
+        "unexpected request_frame error: {err}"
+    );
+    // Prompt failure: well under the 30s wedge window a stuck job used to
+    // sit out on its own.
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "death must surface promptly, took {:?}",
+        start.elapsed()
+    );
+}

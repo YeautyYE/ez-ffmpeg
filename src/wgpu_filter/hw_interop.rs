@@ -32,8 +32,10 @@ const DRM_FORMAT_NV12: u32 = 0x3231_564E; // 'NV12'
 
 /// Raw Vulkan handles needed to import dmabufs into the wgpu device.
 /// All handles are non-owning clones of what wgpu-hal keeps alive; this
-/// struct must not outlive the `wgpu::Device` it was created with (both live
-/// in `GpuState`, dropped together).
+/// struct must not outlive the `wgpu::Device` it was created with. Both are
+/// owned by the shared GPU generation (`shared_gpu::SharedGpuGeneration`),
+/// and every `GpuState` holding an `Arc` of this interop holds that
+/// generation's device alive too, so call-time liveness is structural.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) struct HwVulkanInterop {
     ash_instance: ash::Instance,
@@ -136,18 +138,38 @@ pub(crate) unsafe fn parse_drm_nv12(
     })
 }
 
+/// Outcome of [`try_open_dmabuf_device`], separating "this stack can never
+/// import dmabufs" from "this attempt failed": the shared-generation cache
+/// keeps a plain device permanently for the former, but retires the
+/// generation at the next acquisition for the latter so a later job
+/// re-probes (matching the per-init retry the pre-cache code performed).
+// The variant size gap is fine: this is a transient return value consumed
+// at its single call site, never stored — Box indirection would cost more
+// than the stack bytes it saves.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum DmabufOpen {
+    /// Device opened with the dmabuf-import extensions.
+    Opened(wgpu::Device, wgpu::Queue, HwVulkanInterop),
+    /// The platform, backend, or adapter can never support the import path;
+    /// a plain device is a faithful permanent substitute.
+    Unsupported,
+    /// The open or wrap failed for a non-structural reason (driver refused
+    /// this attempt); a later attempt may succeed.
+    TransientFailure,
+}
+
 /// Attempts to open the adapter through wgpu-hal with the dmabuf-import
-/// device extensions enabled. Returns `None` (with an info log) whenever the
-/// backend or the driver cannot support it, so the caller can fall back to
-/// the plain `request_device` path.
+/// device extensions enabled. Every non-[`DmabufOpen::Opened`] outcome logs
+/// an info line, and the caller falls back to the plain `request_device`
+/// path either way.
 #[cfg(target_os = "linux")]
 pub(crate) fn try_open_dmabuf_device(
     adapter: &wgpu::Adapter,
     device_desc: &wgpu::DeviceDescriptor,
-) -> Option<(wgpu::Device, wgpu::Queue, HwVulkanInterop)> {
+) -> DmabufOpen {
     if adapter.get_info().backend != wgpu::Backend::Vulkan {
         info!("hw zero-copy input: unavailable (non-Vulkan backend)");
-        return None;
+        return DmabufOpen::Unsupported;
     }
     const EXTENSIONS: [&std::ffi::CStr; 3] = [
         khr::external_memory_fd::NAME,
@@ -157,36 +179,51 @@ pub(crate) fn try_open_dmabuf_device(
 
     // SAFETY: the hal adapter guard is used only within this scope; the raw
     // handles cloned out of it stay valid for the wgpu Device's lifetime,
-    // which bounds the lifetime of the returned interop (both in GpuState).
+    // which bounds the lifetime of the returned interop (both owned by the
+    // shared generation).
     unsafe {
         let open_device = {
-            let hal_adapter = adapter.as_hal::<wgpu::hal::api::Vulkan>()?;
+            let Some(hal_adapter) = adapter.as_hal::<wgpu::hal::api::Vulkan>() else {
+                info!("hw zero-copy input: unavailable (no Vulkan hal adapter)");
+                return DmabufOpen::Unsupported;
+            };
             let caps = hal_adapter.physical_device_capabilities();
             if let Some(missing) = EXTENSIONS.iter().find(|e| !caps.supports_extension(e)) {
                 info!(
                     "hw zero-copy input: unavailable (missing {})",
                     missing.to_string_lossy()
                 );
-                return None;
+                return DmabufOpen::Unsupported;
             }
-            hal_adapter
-                .open_with_callback(
-                    device_desc.required_features,
-                    &device_desc.memory_hints,
-                    Some(Box::new(|args| {
-                        args.extensions.extend_from_slice(&EXTENSIONS);
-                    })),
-                )
-                .map_err(|e| info!("hw zero-copy input: device open failed: {e:?}"))
-                .ok()?
+            match hal_adapter.open_with_callback(
+                device_desc.required_features,
+                &device_desc.memory_hints,
+                Some(Box::new(|args| {
+                    args.extensions.extend_from_slice(&EXTENSIONS);
+                })),
+            ) {
+                Ok(open_device) => open_device,
+                Err(e) => {
+                    info!("hw zero-copy input: device open failed: {e:?}");
+                    return DmabufOpen::TransientFailure;
+                }
+            }
         };
         let ash_device = open_device.device.raw_device().clone();
-        let (device, queue) = adapter
+        let (device, queue) = match adapter
             .create_device_from_hal::<wgpu::hal::api::Vulkan>(open_device, device_desc)
-            .map_err(|e| info!("hw zero-copy input: device wrap failed: {e}"))
-            .ok()?;
+        {
+            Ok(pair) => pair,
+            Err(e) => {
+                info!("hw zero-copy input: device wrap failed: {e}");
+                return DmabufOpen::TransientFailure;
+            }
+        };
         let (ash_instance, physical_device) = {
-            let hal_adapter = adapter.as_hal::<wgpu::hal::api::Vulkan>()?;
+            let Some(hal_adapter) = adapter.as_hal::<wgpu::hal::api::Vulkan>() else {
+                info!("hw zero-copy input: unavailable (hal adapter vanished mid-open)");
+                return DmabufOpen::TransientFailure;
+            };
             (
                 hal_adapter.shared_instance().raw_instance().clone(),
                 hal_adapter.raw_physical_device(),
@@ -194,7 +231,7 @@ pub(crate) fn try_open_dmabuf_device(
         };
         let memfd = khr::external_memory_fd::Device::new(&ash_instance, &ash_device);
         info!("hw zero-copy input: dmabuf import enabled");
-        Some((
+        DmabufOpen::Opened(
             device,
             queue,
             HwVulkanInterop {
@@ -204,7 +241,7 @@ pub(crate) fn try_open_dmabuf_device(
                 memfd,
                 supported_modifiers: std::sync::Mutex::new(std::collections::HashMap::new()),
             },
-        ))
+        )
     }
 }
 
@@ -215,8 +252,8 @@ pub(crate) fn try_open_dmabuf_device(
 pub(crate) fn try_open_dmabuf_device(
     _adapter: &wgpu::Adapter,
     _device_desc: &wgpu::DeviceDescriptor,
-) -> Option<(wgpu::Device, wgpu::Queue, HwVulkanInterop)> {
-    None
+) -> DmabufOpen {
+    DmabufOpen::Unsupported
 }
 
 // Only the Linux dmabuf import path (`import_plane`) dups fds; gated with it.
