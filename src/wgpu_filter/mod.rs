@@ -92,6 +92,7 @@ mod gpu_state;
 mod hw_interop;
 mod params;
 pub(crate) mod shaders;
+mod shared_gpu;
 #[cfg(test)]
 mod tests;
 
