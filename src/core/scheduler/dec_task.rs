@@ -782,6 +782,19 @@ unsafe fn dec_send(
                     )));
                 }
             } else {
+                // A null buf[0] here implies a props-only frame, never a
+                // data-bearing frame that merely lacks AVBufferRef backing:
+                // decoder outputs are always reference counted (the
+                // avcodec_receive_frame contract), the EOF-timestamp and
+                // subtitle-heartbeat markers set only opaque/pts/time_base on
+                // pooled shells, and the decoded-subtitle path installs buf[0]
+                // itself (skipping frames where it is null). A frame with data
+                // pointers but no buffer refs would silently lose its payload
+                // in this arm, so assert that input stays unreachable.
+                debug_assert!(
+                    (*frame_box.frame.as_ptr()).data[0].is_null(),
+                    "props-only path reached with data pointers but no AVBufferRef backing"
+                );
                 let ret = av_frame_copy_props(to_send.as_mut_ptr(), frame_box.frame.as_ptr());
                 if ret < 0 {
                     frame_pool.release(to_send);
