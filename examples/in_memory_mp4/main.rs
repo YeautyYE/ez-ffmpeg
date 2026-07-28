@@ -93,6 +93,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         writer.write(&frame)?;
     }
+    // Only finish() finalizes the in-memory container (it triggers the
+    // seek-back that patches the moov atom); dropping the writer would abort
+    // and leave the buffer unfinalized.
     writer.finish()?;
 
     let bytes = std::mem::take(&mut sink.lock().unwrap().buf);
