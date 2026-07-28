@@ -693,3 +693,120 @@ fn keyframeless_gop_does_not_flip_the_replay_keyframe_gate() {
         "an AVC end-of-sequence tag must not flip the keyframe gate"
     );
 }
+
+/// The `(can_be_dropped, is_keyframe, is_sequence_header, is_video)` flags
+/// of every OutboundPacket bound for `connection_id`, in emission order —
+/// the per-watcher companion to `watcher_packets` for flag comparison.
+fn watcher_packet_flags(
+    results: &[ServerResult],
+    connection_id: usize,
+) -> Vec<(bool, bool, bool, bool)> {
+    results
+        .iter()
+        .filter_map(|result| match result {
+            ServerResult::OutboundPacket {
+                target_connection_id,
+                can_be_dropped,
+                is_keyframe,
+                is_sequence_header,
+                is_video,
+                ..
+            } if *target_connection_id == connection_id => Some((
+                *can_be_dropped,
+                *is_keyframe,
+                *is_sequence_header,
+                *is_video,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+// The pre-resolved handle path (the in-process bypass rides
+// distribute_media directly) and the string-keyed path (socket-ingest
+// events resolve the key per tag) must fan out byte-identical per-watcher
+// streams: same wire bytes, same write-queue flags, same order. Two
+// schedulers with identical setups are driven through the two entries with
+// the same tag sequence and compared watcher by watcher (the cross-watcher
+// interleaving is HashSet iteration order, arbitrary per instance, and
+// deliberately not compared).
+#[test]
+fn handle_path_and_string_path_fan_out_byte_identical_streams() {
+    let feed_plan: &[(u8, u32, &'static [u8])] = &[
+        (0x09, 0, VIDEO_SEQ),
+        (0x08, 0, AUDIO_SEQ),
+        // Withheld by the keyframe gate on both paths.
+        (0x09, 33, DELTA),
+        (0x09, 66, KEYFRAME),
+        (0x08, 70, AUDIO_FRAME),
+        (0x09, 99, DELTA),
+    ];
+    let watcher_conns: [usize; 2] = [2, 3];
+
+    let mut by_string = RtmpScheduler::new(10);
+    let mut by_handle = RtmpScheduler::new(10);
+    for scheduler in [&mut by_string, &mut by_handle] {
+        assert!(scheduler.new_channel("live".to_string(), 100));
+        // Distinct stream ids force the serialized-group cache to hold two
+        // entries, exercising the grouping on both paths.
+        play_with_stream_id(scheduler, watcher_conns[0], "live", 1);
+        play_with_stream_id(scheduler, watcher_conns[1], "live", 7);
+    }
+
+    let mut string_results = Vec::new();
+    let mut handle_results = Vec::new();
+    for &(tag_type, timestamp, data) in feed_plan {
+        let data_type = if tag_type == 0x09 {
+            ReceivedDataType::Video
+        } else {
+            ReceivedDataType::Audio
+        };
+        by_string.handle_audio_video_data_received(
+            "live",
+            RtmpTimestamp { value: timestamp },
+            Bytes::from_static(data),
+            data_type,
+            &mut string_results,
+        );
+        by_handle.publish_media_received(
+            100,
+            tag_type,
+            RtmpTimestamp { value: timestamp },
+            Bytes::from_static(data),
+            &mut handle_results,
+        );
+    }
+
+    assert_eq!(
+        string_results.len(),
+        handle_results.len(),
+        "both paths must produce the same number of results"
+    );
+    for watcher_conn in watcher_conns {
+        let expected = watcher_packets(&string_results, watcher_conn);
+        let actual = watcher_packets(&handle_results, watcher_conn);
+        assert!(
+            !expected.is_empty(),
+            "watcher {watcher_conn} must receive media for this pin to bite"
+        );
+        assert_eq!(
+            expected.len(),
+            actual.len(),
+            "watcher {watcher_conn}: packet counts diverge between the paths"
+        );
+        for (index, ((expected_bytes, _), (actual_bytes, _))) in
+            expected.iter().zip(actual.iter()).enumerate()
+        {
+            assert_same_bytes(
+                actual_bytes,
+                expected_bytes,
+                &format!("watcher {watcher_conn} packet {index}"),
+            );
+        }
+        assert_eq!(
+            watcher_packet_flags(&string_results, watcher_conn),
+            watcher_packet_flags(&handle_results, watcher_conn),
+            "watcher {watcher_conn}: write-queue flags diverge between the paths"
+        );
+    }
+}

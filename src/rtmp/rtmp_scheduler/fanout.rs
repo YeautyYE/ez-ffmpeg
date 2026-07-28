@@ -9,10 +9,11 @@
 //! chain belongs to the per-session serializers — see the
 //! `MediaChannel::fanout_serializer` doc.
 
-use super::{
-    serialize_media, ClientAction, MediaChannel, ReceivedDataType, RtmpScheduler, ServerResult,
-};
 use super::join::evict_unreplayable_frozen;
+use super::{
+    serialize_media, ChannelHandle, ChannelSlot, ClientAction, MediaChannel, ReceivedDataType,
+    RtmpScheduler, ServerResult,
+};
 use crate::flv::flv_tag_body::{
     is_audio_sequence_header, is_video_keyframe, is_video_sequence_header,
 };
@@ -21,6 +22,13 @@ use log::debug;
 use rml_rtmp::time::RtmpTimestamp;
 
 impl RtmpScheduler {
+    /// String-keyed entry to the fanout, used by the socket-byte ingest
+    /// path (whose media events carry the stream key by name) and the
+    /// tests: one map lookup resolves the key to its current
+    /// [`ChannelHandle`], then [`RtmpScheduler::distribute_media`] does the
+    /// work. An unknown key returns with no output, exactly as before. The
+    /// in-process bypass skips this resolution entirely by carrying the
+    /// publisher's pre-resolved handle.
     pub(super) fn handle_audio_video_data_received(
         &mut self,
         stream_key: &str,
@@ -29,10 +37,39 @@ impl RtmpScheduler {
         data_type: ReceivedDataType,
         server_results: &mut Vec<ServerResult>,
     ) {
-        let channel = match self.channels.get_mut(stream_key) {
-            Some(channel) => channel,
+        let Some(channel_handle) = self.channels.handle_by_key(stream_key) else {
+            return;
+        };
+        self.distribute_media(channel_handle, timestamp, data, data_type, server_results);
+    }
+
+    /// The per-tag fanout core, reached with a pre-resolved
+    /// [`ChannelHandle`]: one generation-checked slab access replaces the
+    /// per-tag stream-key hash, and the per-watcher membership guard
+    /// compares handles instead of key strings. A stale handle (its
+    /// channel was removed — and the slot possibly reused — after the
+    /// handle was issued) resolves to `None` and returns silently, the
+    /// same observable behavior as an unknown stream key on the string
+    /// path above.
+    pub(super) fn distribute_media(
+        &mut self,
+        channel_handle: ChannelHandle,
+        timestamp: RtmpTimestamp,
+        data: Bytes,
+        data_type: ReceivedDataType,
+        server_results: &mut Vec<ServerResult>,
+    ) {
+        let slot = match self.channels.slot_by_handle_mut(channel_handle) {
+            Some(slot) => slot,
             None => return,
         };
+        // Disjoint slot borrows: the key is read for diagnostics only
+        // while the channel is driven mutably.
+        let ChannelSlot {
+            stream_key,
+            channel,
+            ..
+        } = slot;
 
         // Pre-compute flags once to avoid repeated calls in hot path
         let is_video = matches!(data_type, ReceivedDataType::Video);
@@ -146,14 +183,20 @@ impl RtmpScheduler {
             };
 
             // Defense-in-depth: a watcher whose current action points at a
-            // different stream must not receive this channel's frames, even
-            // if its id is still (incorrectly) present in this watcher set.
+            // different channel must not receive this channel's frames,
+            // even if its id is still (incorrectly) present in this
+            // watcher set. The handle comparison is the old stream-key
+            // comparison one notch stricter: handles also differ across
+            // same-key channel incarnations (remove + recreate), where a
+            // corrupt leftover membership must not resume delivery from
+            // the new incarnation.
             let active_stream_id = match &client.current_action {
                 ClientAction::Watching {
                     stream_key: watched_stream_key,
                     stream_id,
+                    channel: watched_channel,
                 } => {
-                    if *watched_stream_key != stream_key {
+                    if *watched_channel != channel_handle {
                         debug!(
                             "Rtmp client {} is watching '{}'; skipping frame delivery \
                              from channel '{}'",
