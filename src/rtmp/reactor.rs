@@ -89,6 +89,19 @@ const DEFAULT_MAX_CONNECTIONS_WINDOWS: usize = 8000; // Conservative default for
 /// Extra capacity for bounded channel to absorb connection bursts.
 /// Used when creating the connection channel between accept thread and reactor.
 pub const CHANNEL_HEADROOM: usize = 256;
+/// Dirty-id list buffers at or below this capacity are never shrunk, and no
+/// shrink targets less than it. Vec iteration already costs O(len) regardless
+/// of capacity, so the drain-side shrink is memory hygiene only — it keeps a
+/// decayed flash crowd from pinning peak-sized id buffers for the life of the
+/// reactor — and small buffers pay zero shrink bookkeeping.
+const DIRTY_IDS_SHRINK_MIN_CAPACITY: usize = 64;
+/// Consecutive quarter-occupancy drains required before the dirty-id shrink
+/// fires. Both drains run every loop iteration, so without hysteresis a
+/// single idle tick between media batches would discard buffer capacity that
+/// the next batch immediately re-allocates. 64 sparse drains ≈ tens of loop
+/// iterations of sustained low occupancy — decayed for real, not a gap
+/// between frames.
+const SPARSE_DRAINS_BEFORE_SHRINK: u32 = 64;
 
 // ============================================================================
 // System Helpers
@@ -296,6 +309,16 @@ pub struct ReactorConnection {
     /// may not be draining — while the connection stays idle awaiting the
     /// peer's answer.
     last_ping_at: Option<Instant>,
+    /// Whether this connection is already listed in the reactor's
+    /// `pending_flush_ids` for the current marking epoch. Owning the mark
+    /// here lets the fanout enqueue loop dedup with a bool test on the
+    /// connection it already holds `&mut` to (instead of a hash-set insert
+    /// per packet), and makes stale list entries self-resolving: the flag
+    /// dies with the connection, and a fresh connection reusing the slab
+    /// slot is born unmarked, so the drain skips the stale id.
+    in_pending_flush: bool,
+    /// Same scheme as `in_pending_flush`, for `interest_dirty_ids`.
+    in_interest_dirty: bool,
 }
 
 impl ReactorConnection {
@@ -347,6 +370,8 @@ impl ReactorConnection {
             current_interest: Interest::READABLE,
             close_deadline: None,
             last_ping_at: None,
+            in_pending_flush: false,
+            in_interest_dirty: false,
         })
     }
 
@@ -648,6 +673,33 @@ impl ReactorConnection {
             interest = interest.add_writable();
         }
         interest
+    }
+
+    /// Record this connection as needing a flush pass. Returns `true` only on
+    /// the unmarked -> marked transition — the caller must then push the id
+    /// into the reactor's `pending_flush_ids`. Later calls in the same epoch
+    /// return `false` (dedup hit, id already listed).
+    fn mark_pending_flush(&mut self) -> bool {
+        !std::mem::replace(&mut self.in_pending_flush, true)
+    }
+
+    /// Clear and return the pending-flush mark. The flush drain calls this
+    /// once per listed id; `false` means the entry is stale (the slot was
+    /// freed and reused by a never-marked connection) and must be skipped.
+    fn take_pending_flush_mark(&mut self) -> bool {
+        std::mem::replace(&mut self.in_pending_flush, false)
+    }
+
+    /// Same transition contract as [`Self::mark_pending_flush`], for the
+    /// `interest_dirty_ids` list.
+    fn mark_interest_dirty(&mut self) -> bool {
+        !std::mem::replace(&mut self.in_interest_dirty, true)
+    }
+
+    /// Same take contract as [`Self::take_pending_flush_mark`], for the
+    /// interest-dirty mark.
+    fn take_interest_dirty_mark(&mut self) -> bool {
+        std::mem::replace(&mut self.in_interest_dirty, false)
     }
 
     /// Mark as closing
@@ -1055,21 +1107,40 @@ pub struct Reactor {
     status: Arc<AtomicUsize>,
     /// Maximum allowed connections (auto-adjusted by system FD limit)
     max_connections: usize,
-    /// Connections with pending writes that need flushing (dirty tracking for O(m) instead of O(n))
-    pending_flush: HashSet<usize>,
+    /// Ids of connections with pending writes that need flushing (dirty
+    /// tracking for O(m) instead of O(n)). Dedup lives on the connection
+    /// (`ReactorConnection::in_pending_flush`): an id is pushed only on the
+    /// unmarked -> marked transition, so the list holds at most one entry
+    /// per marked connection and the hot fanout path pays a bool test — on
+    /// the connection it already borrows — instead of a hash-set insert per
+    /// packet. Entries for since-removed connections are skipped at drain
+    /// time: the flag died with the connection, and a fresh connection
+    /// reusing the slab slot is born unmarked.
+    pending_flush_ids: Vec<usize>,
     /// Connections that stopped at MAX_READ_PER_POLL and must be re-drained
     /// next loop iteration. An edge-triggered poller (EPOLLET/EV_CLEAR) fires no
     /// new readable event for bytes already in the kernel buffer, so we resume
-    /// the drain ourselves rather than wait for the peer. Unlike `pending_flush`
-    /// (drained within the same iteration) this set crosses iterations, so ids
-    /// must be scrubbed on connection removal: the slab reuses ids and a stale
-    /// entry would read a brand-new connection out of turn.
+    /// the drain ourselves rather than wait for the peer. Unlike the dirty-id
+    /// lists (whose per-connection flags die with the connection, making stale
+    /// entries self-resolving) this set has no such guard, so ids must be
+    /// scrubbed on connection removal: the slab reuses ids and a stale entry
+    /// would read a brand-new connection out of turn.
     read_pending: HashSet<usize>,
-    /// Connections whose poller interest may need updating (dirty tracking for O(m) instead of O(n))
-    interest_dirty: HashSet<usize>,
-    /// Reusable scratch for the ids that enqueued fanout data in the current
-    /// `write_pending_packets` pass (avoids a Vec allocation per fanout)
-    conn_ids_buffer: Vec<usize>,
+    /// Ids of connections whose poller interest may need updating (dirty
+    /// tracking for O(m) instead of O(n)); same flag-gated scheme as
+    /// `pending_flush_ids`, via `ReactorConnection::in_interest_dirty`.
+    interest_dirty_ids: Vec<usize>,
+    /// Reusable snapshot buffer for the two dirty-id drains: the live list is
+    /// swapped in here, so marks landing mid-drain go to the (now empty) live
+    /// list for the next pass and no per-drain Vec is allocated. Cleared —
+    /// and, under sustained sparsity, walked down toward the capacity floor —
+    /// after each drain; the swap rotation parks every backing buffer here,
+    /// so each one meets the shrink policy in turn.
+    dirty_drain_scratch: Vec<usize>,
+    /// Consecutive quarter-occupancy drains observed; the dirty-id shrink
+    /// fires only once this reaches `SPARSE_DRAINS_BEFORE_SHRINK` (see
+    /// `shrink_drain_scratch_if_sparse`).
+    sparse_drain_streak: u32,
     /// Reusable buffer for packets to write (avoids allocation in handle_readable)
     packets_buffer: Vec<OutboundWrite>,
     /// Reusable buffer for IDs to close (avoids allocation in handle_readable)
@@ -1122,10 +1193,11 @@ impl Reactor {
             publishers: slab::Slab::with_capacity(64),
             status,
             max_connections: effective_max,
-            pending_flush: HashSet::with_capacity(256),
+            pending_flush_ids: Vec::with_capacity(256),
             read_pending: HashSet::new(),
-            interest_dirty: HashSet::with_capacity(256),
-            conn_ids_buffer: Vec::with_capacity(1024),
+            interest_dirty_ids: Vec::with_capacity(256),
+            dirty_drain_scratch: Vec::with_capacity(256),
+            sparse_drain_streak: 0,
             packets_buffer: Vec::with_capacity(64),
             ids_to_close_buffer: Vec::with_capacity(16),
             server_results_buffer: Vec::with_capacity(64),
@@ -1221,7 +1293,13 @@ impl Reactor {
         } else {
             // (Re)register writable interest so the poller drives the drain;
             // desired_interest() adds writable while has_pending_writes().
-            self.interest_dirty.insert(id);
+            // The connection is guaranteed present on this branch (only a
+            // kept connection lands here), so the re-borrow cannot miss.
+            if let Some(conn) = self.connections.get_mut(id) {
+                if conn.mark_interest_dirty() {
+                    self.interest_dirty_ids.push(id);
+                }
+            }
         }
     }
 
@@ -1459,8 +1537,12 @@ impl Reactor {
                 return;
             }
             // Mark connection for pending flush and interest update
-            self.pending_flush.insert(id);
-            self.interest_dirty.insert(id);
+            if conn.mark_pending_flush() {
+                self.pending_flush_ids.push(id);
+            }
+            if conn.mark_interest_dirty() {
+                self.interest_dirty_ids.push(id);
+            }
         }
 
         if completed {
@@ -1540,10 +1622,6 @@ impl Reactor {
     /// `ids_to_close_buffer` — how those close is the caller's decision.
     /// Shared by the readable-path fanout and `process_publishers`.
     fn write_pending_packets(&mut self) {
-        // Collect the ids that successfully enqueued data for dirty marking
-        // (clear + reuse the scratch buffer; this runs per fanout round).
-        self.conn_ids_buffer.clear();
-
         // One clock read for the whole drain (PERF-10): the entry timestamp
         // only feeds the seconds-granular age eviction, and at W watchers a
         // per-entry `Instant::now` would be a fanout-scaling cost.
@@ -1572,18 +1650,22 @@ impl Reactor {
                     now,
                 );
                 if enqueued {
-                    self.conn_ids_buffer.push(target_id);
+                    // Mark for pending flush and interest update in the same
+                    // pass. The connection-owned flags gate the pushes, so a
+                    // target hit by several packets this round costs two bool
+                    // tests per repeat — on the connection this loop already
+                    // borrows — and is listed exactly once.
+                    if target_conn.mark_pending_flush() {
+                        self.pending_flush_ids.push(target_id);
+                    }
+                    if target_conn.mark_interest_dirty() {
+                        self.interest_dirty_ids.push(target_id);
+                    }
                 } else {
                     // Backpressure too high, cannot enqueue, close target connection
                     self.ids_to_close_buffer.push(target_id);
                 }
             }
-        }
-
-        // Mark all connections that received data for pending flush and interest update
-        for &id in &self.conn_ids_buffer {
-            self.pending_flush.insert(id);
-            self.interest_dirty.insert(id);
         }
     }
 
@@ -1606,7 +1688,9 @@ impl Reactor {
                     if conn.is_condemned() {
                         return Some(HandleResult::Disconnect(id));
                     }
-                    self.interest_dirty.insert(id);
+                    if conn.mark_interest_dirty() {
+                        self.interest_dirty_ids.push(id);
+                    }
                 }
                 None
             }
@@ -1883,11 +1967,20 @@ impl Reactor {
     fn flush_pending(&mut self) -> Vec<usize> {
         let mut ids_to_close = Vec::new();
 
-        // Drain pending_flush to get IDs that need flushing
-        let pending_ids: Vec<usize> = self.pending_flush.drain().collect();
+        // Swap-snapshot the pending ids: the live list is left empty, so ids
+        // marked while this drain runs land there and are seen next pass
+        // (same semantics the old set drain had for mid-drain inserts).
+        debug_assert!(self.dirty_drain_scratch.is_empty());
+        std::mem::swap(&mut self.dirty_drain_scratch, &mut self.pending_flush_ids);
 
-        for id in pending_ids {
+        for &id in &self.dirty_drain_scratch {
             if let Some(conn) = self.connections.get_mut(id) {
+                // A cleared flag means the entry is stale: the connection that
+                // was marked is gone and a fresh (never-marked) one reuses the
+                // slot. Skip it — a fresh connection owes no flush pass.
+                if !conn.take_pending_flush_mark() {
+                    continue;
+                }
                 if conn.has_pending_writes() {
                     match conn.try_flush() {
                         Ok(true) | Err(_) => {
@@ -1901,16 +1994,18 @@ impl Reactor {
                             ids_to_close.push(id);
                         }
                         Ok(false) => {
-                            // NEW-RS-01: do NOT reinsert into pending_flush. A
+                            // NEW-RS-01: do NOT re-mark for pending flush. A
                             // still-non-empty queue here means try_flush stopped
                             // on WouldBlock (kernel send buffer full); retrying
                             // next loop would just burn a guaranteed-EAGAIN
-                            // syscall. Marking interest_dirty (re)registers
+                            // syscall. Marking interest-dirty (re)registers
                             // writable interest while data is pending, or clears
                             // it once drained (desired_interest() derives
                             // writable from has_pending_writes()); the poller's
                             // writable event then drives the next flush.
-                            self.interest_dirty.insert(id);
+                            if conn.mark_interest_dirty() {
+                                self.interest_dirty_ids.push(id);
+                            }
                         }
                     }
                 } else if conn.is_condemned() {
@@ -1920,12 +2015,49 @@ impl Reactor {
                     ids_to_close.push(id);
                 } else {
                     // No pending writes, ensure writable interest is cleared
-                    self.interest_dirty.insert(id);
+                    if conn.mark_interest_dirty() {
+                        self.interest_dirty_ids.push(id);
+                    }
                 }
             }
         }
 
+        let drained_len = self.dirty_drain_scratch.len();
+        self.dirty_drain_scratch.clear();
+        self.shrink_drain_scratch_if_sparse(drained_len);
+
         ids_to_close
+    }
+
+    /// Opportunistic high-water shrink for the dirty-id buffers, applied to
+    /// the drain snapshot after each pass. Vec iteration is O(len) whatever
+    /// the capacity, so this is memory hygiene only: without it, a flash
+    /// crowd that decays would pin peak-sized buffers for the life of the
+    /// reactor.
+    ///
+    /// Two guards keep the hygiene from becoming allocation churn (both
+    /// drains run every loop iteration, so a naive per-pass shrink would
+    /// discard capacity on every idle tick and regrow it on every burst):
+    /// the shrink target never goes below `DIRTY_IDS_SHRINK_MIN_CAPACITY`,
+    /// and it fires only after `SPARSE_DRAINS_BEFORE_SHRINK` consecutive
+    /// quarter-occupancy passes — one dense pass ends the streak. The streak
+    /// stays saturated while the sparse regime lasts, so once it trips, each
+    /// oversized buffer is walked down as the swap rotation parks it here.
+    /// (The scheduler's watcher-set shrink uses the same quarter-occupancy /
+    /// double-the-survivors shape, but it runs on watcher-departure events,
+    /// not per loop tick, so it needs neither guard.)
+    fn shrink_drain_scratch_if_sparse(&mut self, drained_len: usize) {
+        if drained_len >= self.dirty_drain_scratch.capacity() / 4 {
+            self.sparse_drain_streak = 0;
+            return;
+        }
+        self.sparse_drain_streak = self.sparse_drain_streak.saturating_add(1);
+        if self.sparse_drain_streak >= SPARSE_DRAINS_BEFORE_SHRINK
+            && self.dirty_drain_scratch.capacity() > DIRTY_IDS_SHRINK_MIN_CAPACITY
+        {
+            self.dirty_drain_scratch
+                .shrink_to((drained_len * 2).max(DIRTY_IDS_SHRINK_MIN_CAPACITY));
+        }
     }
 
     /// Check timed out connections, and queue liveness pings for idle
@@ -1986,8 +2118,12 @@ impl Reactor {
             if conn.enqueue_ping(packet.bytes) {
                 debug!("Connection {} idle for {WATCHER_PING_IDLE_SECS}s; ping queued", id);
                 conn.note_ping_queued(now);
-                self.pending_flush.insert(id);
-                self.interest_dirty.insert(id);
+                if conn.mark_pending_flush() {
+                    self.pending_flush_ids.push(id);
+                }
+                if conn.mark_interest_dirty() {
+                    self.interest_dirty_ids.push(id);
+                }
             } else {
                 // enqueue_ping refused (queue at cap) and marked the
                 // connection Closing; route it to the same close path every
@@ -2003,15 +2139,29 @@ impl Reactor {
     ///
     /// Returns the ids whose interest update failed. Such a connection can no
     /// longer have writable interest (re)registered, so a queued-but-WouldBlock
-    /// write would never be driven to completion — it is not in `pending_flush`
-    /// either (NEW-RS-01). Closing it is the only safe recovery; the caller does
-    /// so. The fd is almost always already broken when modify() fails.
+    /// write would never be driven to completion — it is not marked for pending
+    /// flush either (NEW-RS-01). Closing it is the only safe recovery; the caller
+    /// does so. The fd is almost always already broken when modify() fails.
     fn update_dirty_interests(&mut self) -> Vec<usize> {
-        // Drain interest_dirty to get IDs that need updating
-        let dirty_ids: Vec<usize> = self.interest_dirty.drain().collect();
+        // Swap-snapshot the dirty ids; same scheme as flush_pending.
+        debug_assert!(self.dirty_drain_scratch.is_empty());
+        std::mem::swap(&mut self.dirty_drain_scratch, &mut self.interest_dirty_ids);
 
         let mut ids_to_close = Vec::new();
-        for id in dirty_ids {
+        // Indexed loop: update_interest needs `&mut self`, so the scratch
+        // cannot stay borrowed across the call.
+        for i in 0..self.dirty_drain_scratch.len() {
+            let id = self.dirty_drain_scratch[i];
+            let marked = match self.connections.get_mut(id) {
+                Some(conn) => conn.take_interest_dirty_mark(),
+                // Stale entry: the marked connection is gone.
+                None => false,
+            };
+            if !marked {
+                // A cleared flag on a live connection means the slot was
+                // freed and reused by a fresh (never-marked) one: skip it.
+                continue;
+            }
             if let Err(e) = self.update_interest(id) {
                 log::warn!(
                     "Failed to update interest for connection {}: {:?}; closing (queued writes would otherwise stall)",
@@ -2020,6 +2170,11 @@ impl Reactor {
                 ids_to_close.push(id);
             }
         }
+
+        let drained_len = self.dirty_drain_scratch.len();
+        self.dirty_drain_scratch.clear();
+        self.shrink_drain_scratch_if_sparse(drained_len);
+
         ids_to_close
     }
 
@@ -2277,22 +2432,54 @@ impl Reactor {
         info!("Graceful shutdown complete");
     }
 
-    /// Check if a connection ID is in the interest_dirty set (test only)
+    /// Check that a connection is marked interest-dirty AND listed for the
+    /// drain (test only). Requiring both means a positive assertion also
+    /// catches a mark site that lost its id push — a flag without a listing
+    /// would never be serviced. (The converse — a listed id whose flag died —
+    /// is the legal stale state and reads false here.)
     #[cfg(test)]
     pub fn is_interest_dirty(&self, id: usize) -> bool {
-        self.interest_dirty.contains(&id)
+        let flagged = self
+            .connections
+            .get(id)
+            .is_some_and(|conn| conn.in_interest_dirty);
+        flagged && self.interest_dirty_ids.contains(&id)
     }
 
-    /// Check if a connection ID is in the pending_flush set (test only)
+    /// Flag-and-listing check for the pending-flush mark (test only); same
+    /// rationale as [`Self::is_interest_dirty`].
     #[cfg(test)]
     pub fn is_pending_flush(&self, id: usize) -> bool {
-        self.pending_flush.contains(&id)
+        let flagged = self
+            .connections
+            .get(id)
+            .is_some_and(|conn| conn.in_pending_flush);
+        flagged && self.pending_flush_ids.contains(&id)
     }
 
-    /// Clear interest_dirty set and return its previous contents (test only)
+    /// Drain the interest-dirty list — clearing the connection marks, as the
+    /// real drain does — and return the marked ids (test only)
     #[cfg(test)]
     pub fn drain_interest_dirty(&mut self) -> Vec<usize> {
-        self.interest_dirty.drain().collect()
+        let ids = std::mem::take(&mut self.interest_dirty_ids);
+        ids.into_iter()
+            .filter(|&id| {
+                self.connections
+                    .get_mut(id)
+                    .is_some_and(|conn| conn.take_interest_dirty_mark())
+            })
+            .collect()
+    }
+
+    /// Mark a connection for pending flush through the real flag+list path
+    /// (test only): what every production insert site does.
+    #[cfg(test)]
+    pub fn mark_pending_flush_for_test(&mut self, id: usize) {
+        if let Some(conn) = self.connections.get_mut(id) {
+            if conn.mark_pending_flush() {
+                self.pending_flush_ids.push(id);
+            }
+        }
     }
 }
 
@@ -3419,12 +3606,12 @@ mod tests {
             conn.state = ConnectionState::Active;
         }
 
-        // Enqueue data and add to pending_flush set
+        // Enqueue data and mark for pending flush
         let test_data = b"World";
         if let Some(conn) = reactor.connections.get_mut(token.id) {
             conn.enqueue_data(Bytes::from_static(test_data), false, false, false, true, Instant::now());
         }
-        reactor.pending_flush.insert(token.id);
+        reactor.mark_pending_flush_for_test(token.id);
 
         // Clear interest_dirty
         reactor.drain_interest_dirty();
@@ -3505,7 +3692,7 @@ mod tests {
             assert!(conn.has_pending_writes());
         }
 
-        reactor.pending_flush.insert(token.id);
+        reactor.mark_pending_flush_for_test(token.id);
         reactor.drain_interest_dirty();
 
         let closes = reactor.flush_pending();
@@ -3559,9 +3746,9 @@ mod tests {
             assert!(!conn.has_pending_writes());
         }
 
-        // Add to pending_flush even though no data pending
+        // Mark for pending flush even though no data pending
         // (this can happen if data was already flushed between enqueue and flush_pending)
-        reactor.pending_flush.insert(token.id);
+        reactor.mark_pending_flush_for_test(token.id);
 
         // Clear interest_dirty
         reactor.drain_interest_dirty();
@@ -3579,6 +3766,333 @@ mod tests {
 
         // Cleanup
         reactor.remove_connection(token.id);
+    }
+
+    /// Several packets fanned out to one connection in a single round must
+    /// list it for flush/interest exactly once: the connection-owned flags
+    /// gate the id-list pushes, so each drain visits the connection once —
+    /// the dedup the old hash sets provided by membership.
+    #[test]
+    fn dirty_marks_dedup_within_a_round() {
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let mut reactor = Reactor::new(3, None, status).expect("Failed to create reactor");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to get address");
+        let _client = TcpStream::connect(addr).expect("Failed to connect");
+        let (server, _) = listener.accept().expect("Failed to accept");
+
+        let token = reactor
+            .add_connection(server)
+            .expect("Failed to add connection");
+        if let Some(conn) = reactor.connections.get_mut(token.id) {
+            conn.state = ConnectionState::Active;
+        }
+
+        // Two packets to the same target in one fanout round.
+        for _ in 0..2 {
+            reactor.packets_buffer.push((
+                token.id,
+                Bytes::from_static(b"tag"),
+                false,
+                false,
+                false,
+                true,
+            ));
+        }
+        reactor.write_pending_packets();
+
+        assert!(reactor.is_pending_flush(token.id));
+        assert!(reactor.is_interest_dirty(token.id));
+        assert_eq!(
+            reactor.pending_flush_ids,
+            vec![token.id],
+            "two packets to one target must list it for flush exactly once"
+        );
+        assert_eq!(
+            reactor.interest_dirty_ids,
+            vec![token.id],
+            "two packets to one target must list it for interest exactly once"
+        );
+
+        // Each drain visits the id exactly once and consumes the mark.
+        let ids_to_close = reactor.flush_pending();
+        assert!(ids_to_close.is_empty());
+        assert!(!reactor.is_pending_flush(token.id));
+        assert_eq!(
+            reactor.drain_interest_dirty(),
+            vec![token.id],
+            "the interest drain must visit the id exactly once"
+        );
+
+        reactor.remove_connection(token.id);
+    }
+
+    /// Marks clear on drain and re-arm afterwards: after a full
+    /// flush_pending + update_dirty_interests pass the connection is
+    /// unmarked, and a fresh mark lists and drains it again — no sticky
+    /// state in either direction across drain epochs.
+    #[test]
+    fn dirty_marks_rearm_across_drain_epochs() {
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let mut reactor = Reactor::new(3, None, status).expect("Failed to create reactor");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to get address");
+        let _client = TcpStream::connect(addr).expect("Failed to connect");
+        let (server, _) = listener.accept().expect("Failed to accept");
+
+        let token = reactor
+            .add_connection(server)
+            .expect("Failed to add connection");
+        if let Some(conn) = reactor.connections.get_mut(token.id) {
+            conn.state = ConnectionState::Active;
+        }
+
+        // Epoch 1: fanout marks, the two drains consume the marks.
+        reactor.packets_buffer.push((
+            token.id,
+            Bytes::from_static(b"first"),
+            false,
+            false,
+            false,
+            true,
+        ));
+        reactor.write_pending_packets();
+        assert!(reactor.is_pending_flush(token.id));
+        assert!(reactor.is_interest_dirty(token.id));
+
+        assert!(reactor.flush_pending().is_empty());
+        assert!(reactor.update_dirty_interests().is_empty());
+        assert!(
+            !reactor.is_pending_flush(token.id),
+            "the flush drain must clear the mark"
+        );
+        assert!(
+            !reactor.is_interest_dirty(token.id),
+            "the interest drain must clear the mark"
+        );
+
+        // Epoch 2: a fresh mark must be listed and drained again.
+        reactor.packets_buffer.push((
+            token.id,
+            Bytes::from_static(b"second"),
+            false,
+            false,
+            false,
+            true,
+        ));
+        reactor.write_pending_packets();
+        assert!(
+            reactor.is_pending_flush(token.id) && reactor.is_interest_dirty(token.id),
+            "a mark after a drain must re-arm"
+        );
+        assert!(reactor.flush_pending().is_empty());
+        assert!(reactor.update_dirty_interests().is_empty());
+        assert!(!reactor.is_pending_flush(token.id));
+        assert!(!reactor.is_interest_dirty(token.id));
+
+        reactor.remove_connection(token.id);
+    }
+
+    /// Ids marked and then removed before the drain must stay harmless: the
+    /// drains skip them without panicking or closing anything, and a fresh
+    /// connection reusing the slab slot is born unmarked — it is not
+    /// spuriously visited on the stale id's account, while a legitimate new
+    /// mark still drains it.
+    #[test]
+    fn stale_dirty_ids_for_removed_connections_drain_harmlessly() {
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let mut reactor = Reactor::new(3, None, status).expect("Failed to create reactor");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to get address");
+        let _client1 = TcpStream::connect(addr).expect("Failed to connect");
+        let (server1, _) = listener.accept().expect("Failed to accept");
+
+        // Mark the first connection through the real fanout path, then
+        // remove it: removal leaves the raw ids behind in the lists.
+        let token1 = reactor
+            .add_connection(server1)
+            .expect("Failed to add connection");
+        if let Some(conn) = reactor.connections.get_mut(token1.id) {
+            conn.state = ConnectionState::Active;
+        }
+        reactor.packets_buffer.push((
+            token1.id,
+            Bytes::from_static(b"doomed"),
+            false,
+            false,
+            false,
+            true,
+        ));
+        reactor.write_pending_packets();
+        reactor.remove_connection(token1.id);
+
+        // The slab reuses the freed slot for a brand-new connection, so the
+        // stale entries now point at it.
+        let _client2 = TcpStream::connect(addr).expect("Failed to connect");
+        let (server2, _) = listener.accept().expect("Failed to accept");
+        let token2 = reactor
+            .add_connection(server2)
+            .expect("Failed to add connection");
+        assert_eq!(
+            token2.id, token1.id,
+            "the slab must reuse the freed slot for this test to bite"
+        );
+        assert!(
+            !reactor.is_pending_flush(token2.id) && !reactor.is_interest_dirty(token2.id),
+            "a fresh connection must be born unmarked"
+        );
+
+        // Queue data on the fresh connection WITHOUT marking it. The stale
+        // entries must not flush it out of turn or touch its interest.
+        if let Some(conn) = reactor.connections.get_mut(token2.id) {
+            conn.state = ConnectionState::Active;
+            assert!(conn.enqueue_data(
+                Bytes::from_static(b"unscheduled"),
+                false,
+                false,
+                false,
+                true,
+                Instant::now()
+            ));
+        }
+        assert!(
+            reactor.flush_pending().is_empty(),
+            "a stale id must not close anything"
+        );
+        assert!(
+            reactor
+                .connections
+                .get(token2.id)
+                .expect("connection present")
+                .has_pending_writes(),
+            "a stale id must not flush a fresh unmarked connection out of turn"
+        );
+        assert!(
+            reactor.update_dirty_interests().is_empty(),
+            "a stale id must not fail an interest update"
+        );
+        assert!(
+            !reactor
+                .connections
+                .get(token2.id)
+                .expect("connection present")
+                .current_interest
+                .writable,
+            "a stale id must not register writable interest for a fresh connection"
+        );
+
+        // A legitimate mark on the fresh connection still drains it.
+        reactor.packets_buffer.push((
+            token2.id,
+            Bytes::from_static(b"scheduled"),
+            false,
+            false,
+            false,
+            true,
+        ));
+        reactor.write_pending_packets();
+        assert!(reactor.flush_pending().is_empty());
+        assert!(
+            !reactor
+                .connections
+                .get(token2.id)
+                .expect("connection present")
+                .has_pending_writes(),
+            "a real mark must still flush the fresh connection"
+        );
+
+        // And ids whose slot stays EMPTY at drain time are equally harmless.
+        reactor.packets_buffer.push((
+            token2.id,
+            Bytes::from_static(b"doomed again"),
+            false,
+            false,
+            false,
+            true,
+        ));
+        reactor.write_pending_packets();
+        reactor.remove_connection(token2.id);
+        assert!(reactor.flush_pending().is_empty());
+        assert!(reactor.update_dirty_interests().is_empty());
+    }
+
+    /// A flash crowd grows the dirty-id lists to O(peak); once the crowd
+    /// decays, the drain-side guard must walk the backing capacity down to
+    /// the floor instead of pinning peak-sized buffers for the life of the
+    /// reactor — but only after sustained sparsity (the hysteresis streak),
+    /// and never below `DIRTY_IDS_SHRINK_MIN_CAPACITY`, so idle ticks
+    /// between media batches cause no allocation churn.
+    #[test]
+    fn dirty_id_list_capacity_shrinks_after_flash_crowd() {
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let mut reactor = Reactor::new(3, None, status).expect("Failed to create reactor");
+
+        // Flash crowd: 512 marked ids in one epoch. No connections back them
+        // (the marked-then-removed state), which the drain skips harmlessly;
+        // capacity behavior is what is under test here.
+        let flash_crowd: usize = 512;
+        reactor.pending_flush_ids.extend(0..flash_crowd);
+        let peak_capacity = reactor.pending_flush_ids.capacity();
+        assert!(
+            peak_capacity > DIRTY_IDS_SHRINK_MIN_CAPACITY,
+            "512 marked ids must grow the list past the shrink floor, got {peak_capacity}"
+        );
+
+        // Peak-occupancy drain: the guard must NOT fire (occupancy is far
+        // above a quarter of capacity), so the peak buffer survives this
+        // pass — parked in the scratch slot by the snapshot swap.
+        assert!(reactor.flush_pending().is_empty());
+        assert!(
+            reactor
+                .pending_flush_ids
+                .capacity()
+                .max(reactor.dirty_drain_scratch.capacity())
+                >= peak_capacity,
+            "a full drain must not shrink the buffer it just used at peak occupancy"
+        );
+
+        // The crowd decays. A shrink needs SPARSE_DRAINS_BEFORE_SHRINK
+        // consecutive sparse passes first (one idle tick must not discard
+        // capacity); once the streak is up it stays up while the sparse
+        // regime lasts, and the swap rotation walks each flush-side buffer
+        // through the drain position — the +2 covers both.
+        for _ in 0..SPARSE_DRAINS_BEFORE_SHRINK + 2 {
+            reactor.pending_flush_ids.push(0);
+            assert!(reactor.flush_pending().is_empty());
+        }
+        let live_capacity = reactor.pending_flush_ids.capacity();
+        let scratch_capacity = reactor.dirty_drain_scratch.capacity();
+        assert!(
+            live_capacity <= DIRTY_IDS_SHRINK_MIN_CAPACITY,
+            "the decayed live list must shrink to the floor, got {live_capacity}"
+        );
+        assert!(
+            scratch_capacity <= DIRTY_IDS_SHRINK_MIN_CAPACITY,
+            "the decayed drain scratch must shrink to the floor, got {scratch_capacity}"
+        );
+
+        // The interest-side drain applies the same guard through the shared
+        // scratch slot. Its dense first pass resets the streak, so the decay
+        // needs its own sustained-sparsity run.
+        reactor.interest_dirty_ids.extend(0..flash_crowd);
+        let interest_peak = reactor.interest_dirty_ids.capacity();
+        assert!(interest_peak > DIRTY_IDS_SHRINK_MIN_CAPACITY);
+        assert!(reactor.update_dirty_interests().is_empty());
+        for _ in 0..SPARSE_DRAINS_BEFORE_SHRINK + 2 {
+            reactor.interest_dirty_ids.push(0);
+            assert!(reactor.update_dirty_interests().is_empty());
+        }
+        assert!(
+            reactor.interest_dirty_ids.capacity() <= DIRTY_IDS_SHRINK_MIN_CAPACITY,
+            "the decayed interest list must shrink to the floor"
+        );
+        assert!(
+            reactor.dirty_drain_scratch.capacity() <= DIRTY_IDS_SHRINK_MIN_CAPACITY,
+            "the drain scratch must stay shrunk after the interest epochs"
+        );
     }
 
     // PERF-5a: exercise the real mixed PublisherFeed::Raw + PublisherFeed::Media
@@ -4172,7 +4686,8 @@ mod tests {
     // H8.c: a server-initiated close must first try to flush what was queued
     // in the same round — most visibly the finish_playing status a watcher
     // gets when the publisher ends. A raw remove_connection dropped it: the
-    // enqueue marked pending_flush, but the close ran before any flush step.
+    // enqueue marked the connection for pending flush, but the close ran
+    // before any flush step.
     #[test]
     fn close_connection_after_flush_delivers_the_queued_tail() {
         use std::io::Read;
