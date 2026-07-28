@@ -33,7 +33,16 @@ fn ping_watcher_builds_a_ping_request_only_for_watching_clients() {
         .clients
         .get_mut(publisher_client_id)
         .unwrap()
-        .current_action = ClientAction::Publishing(Rc::from("ping_stream"));
+        .current_action = ClientAction::Publishing {
+        stream_key: Rc::from("ping_stream"),
+        // No channel exists for this key; generation 0 is never issued,
+        // so the handle can never resolve. The ping classification under
+        // test only looks at the action's role.
+        channel: ChannelHandle {
+            index: 0,
+            generation: 0,
+        },
+    };
     assert!(scheduler.ping_watcher(publisher_connection_id).is_none());
 
     // A watcher gets a ping, built by its own session. The session's
@@ -42,10 +51,7 @@ fn ping_watcher_builds_a_ping_request_only_for_watching_clients() {
     // session's prior output before the ping — which is the point: the
     // packet has to come from the client's own session, not a fresh
     // serializer.
-    fn drain_messages(
-        deserializer: &mut ChunkDeserializer,
-        bytes: &[u8],
-    ) -> Vec<MessagePayload> {
+    fn drain_messages(deserializer: &mut ChunkDeserializer, bytes: &[u8]) -> Vec<MessagePayload> {
         let mut messages = Vec::new();
         let mut next = deserializer
             .get_next_message(bytes)
@@ -455,5 +461,154 @@ fn watcher_set_capacity_shrinks_after_watcher_churn() {
             } if *target_connection_id == survivor_connection_id
         )),
         "survivor must still receive the keyframe after the shrink"
+    );
+}
+
+// A channel handle must die with its channel: after a full teardown and a
+// re-publish under the same key, the old handle's generation no longer
+// matches the (possibly reused) slot, so distributing through it must do
+// nothing — while the new publisher's own pre-resolved handle flows
+// normally. This is the ABA guard for stream-key reuse, mirroring the
+// reactor's connection-token generations.
+#[test]
+fn stale_handle_after_republish_is_rejected_without_touching_the_new_channel() {
+    let mut scheduler = RtmpScheduler::new(10);
+    assert!(scheduler.new_channel("live".to_string(), 100));
+    let old_handle = scheduler
+        .channels
+        .handle_by_key("live")
+        .expect("channel exists while published");
+
+    // Full teardown with no watchers removes the channel outright.
+    scheduler.notify_publisher_closed(100);
+    assert!(!scheduler.channels.contains_key("live"));
+
+    // A new publisher reclaims the key. With this scheduler's only slot
+    // just freed, the slab hands the same index back — which is the point:
+    // the index alone cannot distinguish the incarnations, so ONLY the
+    // fresh generation makes the old handle stale. Asserting both halves
+    // pins that the generation guard, not an index change, is what
+    // rejects the stale handle below.
+    assert!(scheduler.new_channel("live".to_string(), 101));
+    let new_handle = scheduler
+        .channels
+        .handle_by_key("live")
+        .expect("republished channel exists");
+    assert_eq!(
+        old_handle.index, new_handle.index,
+        "the freed slot must be reused for the ABA scenario to be exercised"
+    );
+    assert_ne!(
+        old_handle.generation, new_handle.generation,
+        "a republish must never revalidate handles from the previous incarnation"
+    );
+
+    play(&mut scheduler, 2, "live");
+    let results = feed_media(&mut scheduler, 101, 0x09, 0, KEYFRAME);
+    assert_eq!(
+        results.len(),
+        1,
+        "the new publisher's keyframe reaches the watcher"
+    );
+
+    // Distributing through the stale handle behaves exactly like an
+    // unknown stream key: no output, no panic, and no state change on the
+    // new incarnation (its GOP cache must not record the stale frame).
+    let frames_before = scheduler
+        .channels
+        .get("live")
+        .unwrap()
+        .gops
+        .current_frames()
+        .len();
+    let mut stale_results = Vec::new();
+    scheduler.distribute_media(
+        old_handle,
+        RtmpTimestamp { value: 33 },
+        Bytes::from_static(DELTA),
+        ReceivedDataType::Video,
+        &mut stale_results,
+    );
+    assert!(
+        stale_results.is_empty(),
+        "a stale handle must distribute nothing"
+    );
+    assert_eq!(
+        scheduler
+            .channels
+            .get("live")
+            .unwrap()
+            .gops
+            .current_frames()
+            .len(),
+        frames_before,
+        "a stale handle must not mutate the live channel's GOP cache"
+    );
+
+    // The new publisher is unaffected afterwards.
+    let results = feed_media(&mut scheduler, 101, 0x09, 66, DELTA);
+    assert_eq!(
+        results.len(),
+        1,
+        "the new publisher keeps flowing after the stale attempt"
+    );
+}
+
+// After the channel is fully torn down (publisher closed, last watcher
+// gone), a leftover handle and an unknown stream key must be
+// indistinguishable: both return silently with no results and neither
+// resurrects the channel.
+#[test]
+fn distribute_after_full_teardown_matches_the_missing_key_path() {
+    let mut scheduler = RtmpScheduler::new(10);
+    assert!(scheduler.new_channel("live".to_string(), 100));
+    play(&mut scheduler, 2, "live");
+    let handle = scheduler
+        .channels
+        .handle_by_key("live")
+        .expect("channel exists while published");
+    assert_eq!(
+        feed_media(&mut scheduler, 100, 0x09, 0, KEYFRAME).len(),
+        1,
+        "the live channel delivers before teardown"
+    );
+
+    // Publisher first (the lingering watcher keeps the channel), then the
+    // last watcher: the empty channel is GCed and its slot freed.
+    scheduler.notify_publisher_closed(100);
+    assert!(
+        scheduler.channels.contains_key("live"),
+        "the lingering watcher must keep the channel alive"
+    );
+    scheduler.notify_connection_closed(2);
+    assert!(!scheduler.channels.contains_key("live"));
+
+    let mut handle_results = Vec::new();
+    scheduler.distribute_media(
+        handle,
+        RtmpTimestamp { value: 33 },
+        Bytes::from_static(KEYFRAME),
+        ReceivedDataType::Video,
+        &mut handle_results,
+    );
+    let mut key_results = Vec::new();
+    scheduler.handle_audio_video_data_received(
+        "live",
+        RtmpTimestamp { value: 33 },
+        Bytes::from_static(KEYFRAME),
+        ReceivedDataType::Video,
+        &mut key_results,
+    );
+    assert!(
+        handle_results.is_empty(),
+        "a handle to a torn-down channel must distribute nothing"
+    );
+    assert!(
+        key_results.is_empty(),
+        "the removed key must distribute nothing on the string path"
+    );
+    assert!(
+        !scheduler.channels.contains_key("live"),
+        "neither path may resurrect the channel"
     );
 }

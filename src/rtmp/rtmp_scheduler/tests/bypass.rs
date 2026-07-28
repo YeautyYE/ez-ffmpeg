@@ -160,10 +160,13 @@ fn fanout_skips_watchers_whose_action_points_at_another_stream() {
         .unwrap();
 
     // Simulate the stale membership this fix prevents: the client's
-    // action moved to another stream but its id was left in A's set.
+    // action moved to another stream (a real channel, with its own
+    // handle) but its id was left in A's set.
+    let (stream_b_handle, _) = scheduler.channels.get_or_create("stream_b", 10);
     scheduler.clients.get_mut(client_id).unwrap().current_action = ClientAction::Watching {
         stream_key: "stream_b".to_string(),
         stream_id: 1,
+        channel: stream_b_handle,
     };
 
     let results = feed_video(&mut scheduler, "stream_a", 0, KEYFRAME);
