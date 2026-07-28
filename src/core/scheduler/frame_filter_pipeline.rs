@@ -311,7 +311,10 @@ fn run_pipeline(
     // from passthrough/metadata filters — the loop never sweeps request_frame
     // and blocks on the input channel with a long safety timeout instead of
     // waking ~1000x/sec. Filters that DO produce (generators, the GPU pipeline's
-    // delayed output) keep the 1ms poll cadence.
+    // delayed output) keep the 1ms poll cadence while they report pending
+    // output; a polled filter that reports itself idle
+    // (`request_frame_pending` = false) lets the loop fall back to the same
+    // long timeout until its next input frame arrives.
     let poll_indices = pipeline.request_frame_indices();
     let needs_polling = !poll_indices.is_empty();
     // Filters whose EOF flush drain hit `EOF_FLUSH_FRAME_CAP`. The regular
@@ -322,14 +325,17 @@ fn run_pipeline(
     // source frame re-arms the chain (stream_loop: the next segment's frames
     // flow and its end-of-stream cues the chain again).
     let mut eof_capped = vec![false; pipeline.filters.len()];
-    let recv_interval = if needs_polling {
-        Duration::from_millis(1)
-    } else {
-        // Long enough to idle cheaply; short enough to re-check STATUS_END if a
-        // stop ever fails to disconnect the source. recv returns immediately
-        // when a frame arrives, so active throughput is unaffected.
-        Duration::from_millis(100)
-    };
+    // Wait interval while some polled filter reports pending output: the
+    // request_frame sweep below is the only way that output gets delivered,
+    // so it must run at a millisecond cadence.
+    const PENDING_POLL_INTERVAL: Duration = Duration::from_millis(1);
+    // Wait interval when nothing is pending. Long enough to idle cheaply;
+    // short enough to re-check STATUS_END if a stop ever fails to disconnect
+    // the source. recv returns immediately when a frame arrives, so active
+    // throughput is unaffected. This is also the bound on how long a filter
+    // that misreports "no pending output" can delay its own frames: the
+    // sweep still runs on every wake.
+    const IDLE_RECV_INTERVAL: Duration = Duration::from_millis(100);
 
     loop {
         // is_stopping() covers STATUS_ABORT as well as STATUS_END, so an abort
@@ -344,6 +350,25 @@ fn run_pipeline(
         }
 
         if !src_finished_flag {
+            // Re-derived every pass: the 1ms cadence is needed exactly while
+            // some un-capped polled filter reports pending output, because
+            // only the sweep below can deliver it. When every polled filter
+            // is idle (or EOF-capped — the sweep skips those anyway), this
+            // blocks like a non-polling pipeline. That park cannot swallow a
+            // wake: a filter only LEAVES the idle state inside a
+            // `filter_frame` call on this very thread, and the frame that
+            // triggers that call wakes recv immediately — so there is no
+            // moment where output is pending while the loop still holds an
+            // idle verdict. An all-`Never` pipeline has no poll indices and
+            // degenerates to the idle interval, as before.
+            let recv_interval = if poll_indices
+                .iter()
+                .any(|&i| !eof_capped[i] && pipeline.request_frame_pending_at(i))
+            {
+                PENDING_POLL_INTERVAL
+            } else {
+                IDLE_RECV_INTERVAL
+            };
             let result = frame_receiver.recv_timeout(recv_interval);
             match result {
                 Err(e) => {
@@ -469,7 +494,18 @@ fn run_pipeline(
                 }
             }
         } else if needs_polling {
-            sleep(Duration::from_millis(1))
+            // Between drain sweeps after the source disconnected. This state
+            // cannot idle at a 1ms cadence: the first sweep that produces
+            // nothing exits the loop below (`src_finished_flag &&
+            // !produced_frame`), so the sleep is paid only between sweeps
+            // that ARE producing. It stays a sleep at all — including for
+            // filters reporting no pending output — so a producer that ends
+            // each sweep but yields again on the next (violating the idle
+            // contract) is paced between sweeps instead of busy-spinning; a
+            // producer that never ends a sweep stays inside the sweep itself
+            // (bounded there by the per-iteration stop checks) and never
+            // reaches this sleep.
+            sleep(PENDING_POLL_INTERVAL)
         } else {
             // Source finished and no filter produces autonomously: nothing left
             // to drain. Returning drops frame_senders, signaling EOF downstream.
@@ -880,9 +916,13 @@ fn frame_filter_init(pipeline: &mut FramePipeline) -> crate::error::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::scheduler::ffmpeg_scheduler::{frame_is_null, unref_frame};
+    use crate::core::filter::frame_filter::{FrameFilter, FrameFilterError};
+    use crate::core::filter::frame_filter_context::FrameFilterContext;
+    use crate::core::scheduler::ffmpeg_scheduler::{
+        frame_is_null, unref_frame, STATUS_END, STATUS_RUN,
+    };
     use ffmpeg_next::Frame;
-    use ffmpeg_sys_next::{av_frame_alloc, AVMediaType, AVPixelFormat};
+    use ffmpeg_sys_next::{av_frame_alloc, av_frame_get_buffer, AVMediaType, AVPixelFormat};
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
@@ -964,5 +1004,344 @@ mod tests {
         drop(got0);
         drop(got1);
         let _ = &pixels;
+    }
+
+    // ---- request_frame_pending poll gating ----
+    //
+    // The hint controls ONLY the loop's wait interval, never whether the
+    // sweep runs: an idle hint must collapse the 1ms cadence to the long
+    // park, while input frames, stop, and even a misreported hint must all
+    // still make progress within one bounded park.
+
+    /// MayProduce probe (default `request_frame_mode`): `pending` is what
+    /// `request_frame_pending` reports, `queued` is how many frames
+    /// `request_frame` will still yield — a misreporting filter keeps
+    /// `queued > 0` while claiming idle. The counters observe the loop from
+    /// the test thread. `hint_checks` counts hint evaluations — the loop's
+    /// last act before each park, with no status check in between — and
+    /// `stop_on_hint_check` publishes a terminal status from INSIDE the
+    /// Nth evaluation: on the worker thread itself, after the loop-top
+    /// status check has already passed and before the park is entered, so
+    /// the stop can only be observed at the check that follows a full
+    /// park. No test-thread timing can move the store outside that window.
+    struct PendingHintProbe {
+        pending: bool,
+        queued: usize,
+        polls: Arc<AtomicUsize>,
+        filtered: Arc<AtomicUsize>,
+        hint_checks: Arc<AtomicUsize>,
+        /// `(n, status)`: store `STATUS_END` into `status` during the nth
+        /// hint evaluation (1-based).
+        stop_on_hint_check: Option<(usize, Arc<AtomicUsize>)>,
+    }
+
+    impl FrameFilter for PendingHintProbe {
+        fn media_type(&self) -> AVMediaType {
+            AVMediaType::AVMEDIA_TYPE_VIDEO
+        }
+
+        fn filter_frame(
+            &mut self,
+            frame: Frame,
+            _ctx: &mut FrameFilterContext,
+        ) -> Result<Option<Frame>, FrameFilterError> {
+            self.filtered.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(frame))
+        }
+
+        fn request_frame(
+            &mut self,
+            _ctx: &mut FrameFilterContext,
+        ) -> Result<Option<Frame>, FrameFilterError> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            if self.queued == 0 {
+                return Ok(None);
+            }
+            self.queued -= 1;
+            Ok(Some(test_new_frame().expect("test frame alloc")))
+        }
+
+        fn request_frame_pending(&self) -> bool {
+            let n = self.hint_checks.fetch_add(1, Ordering::SeqCst) + 1;
+            if let Some((fire_on, status)) = &self.stop_on_hint_check {
+                if n == *fire_on {
+                    status.store(STATUS_END, Ordering::Release);
+                }
+            }
+            self.pending
+        }
+    }
+
+    /// A real (non-marker) frame: owned data buffers via av_frame_get_buffer,
+    /// so buf[0] is non-null and the loop takes the ordinary frame path, and
+    /// no external pixel storage needs to outlive the pipeline thread.
+    fn test_real_frame() -> Frame {
+        unsafe {
+            // SAFETY: the frame is null-checked after allocation and the
+            // buffer allocation's return code is checked before the frame is
+            // handed out; GRAY8 16x16 keeps it a single tiny plane.
+            let f = av_frame_alloc();
+            assert!(!f.is_null(), "av_frame_alloc must not fail");
+            (*f).format = AVPixelFormat::AV_PIX_FMT_GRAY8 as i32;
+            (*f).width = 16;
+            (*f).height = 16;
+            let ret = av_frame_get_buffer(f, 0);
+            assert!(ret >= 0, "av_frame_get_buffer failed: {ret}");
+            Frame::wrap(f)
+        }
+    }
+
+    fn test_frame_box(frame: Frame) -> FrameBox {
+        FrameBox {
+            frame,
+            frame_data: FrameData {
+                framerate: None,
+                bits_per_raw_sample: 0,
+                input_stream_width: 0,
+                input_stream_height: 0,
+                subtitle_header: None,
+                fg_input_index: usize::MAX,
+                side_data: None,
+            },
+        }
+    }
+
+    struct PollLoopHarness {
+        /// `None` once closed (by `finish` or the unwind-safe drop); the
+        /// disconnect is the worker's prompt wake.
+        src_tx: Option<Sender<FrameBox>>,
+        dst_rx: Receiver<FrameBox>,
+        status: Arc<AtomicUsize>,
+        polls: Arc<AtomicUsize>,
+        filtered: Arc<AtomicUsize>,
+        /// Bounded join surrogate: carries `run_pipeline`'s result when the
+        /// worker thread exits.
+        done_rx: Receiver<crate::error::Result<()>>,
+        /// Joined on drop, so an assertion failure mid-test still tears the
+        /// worker down instead of leaking it past the test.
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl PollLoopHarness {
+        /// Blocks until the worker's first `request_frame` sweep, proving
+        /// the loop is running before a timing window opens, and returns
+        /// the poll count at that instant as the window's baseline. Without
+        /// this, a slow spawn could let a cadence ceiling pass vacuously
+        /// (no loop, no polls) or a cadence floor fail spuriously.
+        fn await_first_sweep(&self) -> usize {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                let seen = self.polls.load(Ordering::SeqCst);
+                if seen > 0 {
+                    return seen;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the pipeline worker never reached its first sweep"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    impl Drop for PollLoopHarness {
+        /// Unwind-safe teardown: publish stop, disconnect the source (the
+        /// prompt wake), then JOIN the worker — every exit from a test,
+        /// including a failed assertion, leaves no detached pipeline thread
+        /// behind. A regression that keeps the worker alive turns into a
+        /// hang of the named test rather than a silent leak.
+        fn drop(&mut self) {
+            self.status.store(STATUS_END, Ordering::Release);
+            self.src_tx = None;
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    /// Runs `run_pipeline` on a worker thread against a single
+    /// `PendingHintProbe`, with the source channel held open by the test.
+    fn spawn_poll_loop(pending: bool, queued: usize) -> PollLoopHarness {
+        spawn_poll_loop_with(pending, queued, None)
+    }
+
+    /// `spawn_poll_loop`, with an optional worker-side stop trigger: when
+    /// `stop_on_hint_check` is `Some(n)`, the probe publishes `STATUS_END`
+    /// from inside its nth hint evaluation (see `PendingHintProbe`).
+    fn spawn_poll_loop_with(
+        pending: bool,
+        queued: usize,
+        stop_on_hint_check: Option<usize>,
+    ) -> PollLoopHarness {
+        let (src_tx, src_rx) = crossbeam_channel::bounded::<FrameBox>(8);
+        let (dst_tx, dst_rx) = crossbeam_channel::unbounded::<FrameBox>();
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        let no_flags: Arc<[AtomicBool]> = Arc::from(Vec::<AtomicBool>::new());
+        let senders: FrameSenders = vec![(dst_tx, usize::MAX, no_flags)];
+        let polls = Arc::new(AtomicUsize::new(0));
+        let filtered = Arc::new(AtomicUsize::new(0));
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+
+        let mut pipeline = FramePipeline::new(AVMediaType::AVMEDIA_TYPE_VIDEO, Some(0));
+        pipeline.add_filter(
+            "pending-hint-probe",
+            Box::new(PendingHintProbe {
+                pending,
+                queued,
+                polls: polls.clone(),
+                filtered: filtered.clone(),
+                hint_checks: Arc::new(AtomicUsize::new(0)),
+                stop_on_hint_check: stop_on_hint_check.map(|n| (n, status.clone())),
+            }),
+        );
+        let pool = ObjPool::new(2, test_new_frame, unref_frame, frame_is_null).expect("pool");
+        let status_for_thread = status.clone();
+        let worker = std::thread::spawn(move || {
+            let mut pipeline = pipeline;
+            let result = run_pipeline(&mut pipeline, src_rx, senders, &pool, &status_for_thread);
+            let _ = done_tx.send(result);
+        });
+
+        PollLoopHarness {
+            src_tx: Some(src_tx),
+            dst_rx,
+            status,
+            polls,
+            filtered,
+            done_rx,
+            worker: Some(worker),
+        }
+    }
+
+    fn finish(mut h: PollLoopHarness) {
+        h.status.store(STATUS_END, Ordering::Release);
+        h.src_tx = None;
+        h.done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("pipeline thread must exit after stop")
+            .expect("run_pipeline must exit cleanly");
+        // Dropping `h` joins the already-exited worker.
+    }
+
+    // An idle-hint MayProduce pipeline must park at the long interval (a
+    // handful of sweeps in the window; the old fixed 1ms cadence would show
+    // hundreds) while an arriving frame still flows through promptly.
+    #[test]
+    fn idle_pending_hint_parks_the_poll_sweep_without_delaying_input() {
+        let h = spawn_poll_loop(false, 0);
+
+        // Idle window, measured from a proven-running loop: the source
+        // stays connected but sends nothing. The lower bound proves the
+        // parked loop keeps sweeping on every park expiry; the ceiling
+        // proves those expiries come at the long interval. The ceiling
+        // must stay BELOW the pending test's floor (both scaled to a
+        // common rate) — overlapping bands would let one uniform
+        // mid-cadence regression pass both tests. 20 sweeps per 400ms
+        // caps the accepted rate at 50/s: 5x above the true ~10/s park
+        // rate for jitter margin, 4x below the pending floor's 200/s.
+        let baseline = h.await_first_sweep();
+        std::thread::sleep(Duration::from_millis(400));
+        let idle_polls = h.polls.load(Ordering::SeqCst) - baseline;
+        assert!(
+            (1..=20).contains(&idle_polls),
+            "an idle MayProduce pipeline must park between safety-net sweeps: \
+             {idle_polls} request_frame calls in 400ms"
+        );
+
+        // The park gates only the sweep cadence, never input delivery: the
+        // channel send wakes the parked recv (crossbeam send/recv
+        // semantics — the mechanism the loop was already relying on for
+        // disconnects). The assertion pins delivery liveness; sub-interval
+        // latency is deliberately not timed, to stay robust on a loaded
+        // runner.
+        h.src_tx
+            .as_ref()
+            .expect("source still open")
+            .send(test_frame_box(test_real_frame()))
+            .expect("send to live pipeline");
+        let got = h
+            .dst_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("a frame sent to a parked pipeline must still be delivered");
+        assert_eq!(
+            h.filtered.load(Ordering::SeqCst),
+            1,
+            "the frame must have traversed the filter"
+        );
+        drop(got);
+
+        finish(h);
+    }
+
+    // With the source channel deliberately HELD OPEN (no disconnect wake —
+    // the pathological stop path the idle interval is sized for), a parked
+    // pipeline must still observe the terminal status within one bounded
+    // park; the generous deadline covers scheduler jitter over the 100ms
+    // design bound. The stop is published by the WORKER ITSELF, from
+    // inside its second hint evaluation — after that iteration's loop-top
+    // status check has passed and before its park is entered — so no
+    // test-thread timing can slip the store outside the window: the exit
+    // necessarily observes it at the check that follows a full park. The
+    // second evaluation (not the first) also proves one ordinary
+    // park-and-sweep cycle ran beforehand.
+    #[test]
+    fn parked_idle_pipeline_observes_stop_within_the_bounded_park() {
+        let h = spawn_poll_loop_with(false, 0, Some(2));
+
+        h.done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect(
+                "a parked pipeline must observe stop within the bounded idle \
+                 park interval",
+            )
+            .expect("run_pipeline must exit cleanly on stop");
+    }
+
+    // A filter that misreports "no pending output" while holding frames only
+    // request_frame can release: no input ever arrives, so the safety-net
+    // sweep that runs on every park expiry is the only progress mechanism —
+    // the frames must all surface, never be lost, and the loop must never
+    // deadlock. What is pinned is drained-not-lost (the public misreport
+    // guarantee); the per-frame one-interval latency is deliberately not
+    // timed — a wall-clock assertion there buys no coverage the poll counts
+    // in the neighboring tests do not already give, at real flake cost.
+    #[test]
+    fn false_idle_claim_still_drains_via_the_bounded_park() {
+        let h = spawn_poll_loop(false, 3);
+        h.await_first_sweep();
+
+        for i in 0..3usize {
+            h.dst_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap_or_else(|_| {
+                    panic!("misreported pending output was never drained (frame {i})")
+                });
+        }
+
+        finish(h);
+    }
+
+    // The flip side of the idle park: a filter reporting pending output must
+    // keep the millisecond drain cadence — delayed asynchronous results (the
+    // GPU pipeline's readbacks) rely on it for prompt delivery. Measured
+    // from a proven-running loop. The floor must stay ABOVE the idle test's
+    // ceiling (both scaled to a common rate): 120 sweeps per 600ms sets the
+    // minimum accepted rate at 200/s — 5x below the true ~1000/s cadence
+    // for loaded-runner margin, 4x above the idle ceiling's 50/s — so one
+    // uniform mid-cadence regression cannot pass both tests.
+    #[test]
+    fn pending_hint_keeps_the_millisecond_drain_cadence() {
+        let h = spawn_poll_loop(true, 0);
+
+        let baseline = h.await_first_sweep();
+        std::thread::sleep(Duration::from_millis(600));
+        let polls = h.polls.load(Ordering::SeqCst) - baseline;
+        assert!(
+            polls >= 120,
+            "a pending-output pipeline no longer sweeps at the poll cadence: \
+             only {polls} request_frame calls in 600ms"
+        );
+
+        finish(h);
     }
 }

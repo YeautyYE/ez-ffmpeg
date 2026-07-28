@@ -167,7 +167,8 @@ impl WgpuFrameFilterBuilder {
     /// The default of 2 overlaps frame N's GPU work and readback with frame
     /// N+1's CPU work, hiding most of the GPU roundtrip cost. Output order is
     /// always preserved; results delayed past their `filter_frame` call are
-    /// delivered through `request_frame`, which pipelines poll continuously.
+    /// delivered through `request_frame`, which pipelines poll at a
+    /// millisecond cadence while results are pending.
     /// Set 1 for strictly synchronous behavior where every `filter_frame`
     /// call returns its own frame (lowest latency, e.g. live streaming).
     pub fn frames_in_flight(mut self, count: usize) -> Self {
@@ -639,6 +640,17 @@ impl WgpuFrameFilter {
         self.gpu.as_ref().map(|gpu| &gpu.shared)
     }
 
+    /// Queues a ready pass-through entry directly, standing in for the
+    /// pending states (an in-flight readback, a completed-but-undelivered
+    /// result) that need a live device to construct. Lets the pending-hint
+    /// contract be pinned deterministically on machines without a GPU —
+    /// and on machines whose device completes submissions inside
+    /// `filter_frame`, where the in-flight state is never observable from
+    /// a test.
+    pub(crate) fn queue_ready_output_for_test(&mut self, frame: Frame) {
+        self.pending.push_back(PendingOutput::Done(frame));
+    }
+
     /// Initializes against a caller-supplied generation, bypassing the
     /// process-global cache, so death tests can kill their own private
     /// generation without flaking concurrently running GPU tests that
@@ -1078,6 +1090,19 @@ impl FrameFilter for WgpuFrameFilter {
         _ctx: &mut FrameFilterContext,
     ) -> Result<Option<Frame>, FrameFilterError> {
         self.next_output(false)
+    }
+
+    fn request_frame_pending(&self) -> bool {
+        // `pending` mutates only inside this filter's own calls — submissions
+        // in `filter_frame`, deliveries in `request_frame`/`next_output`,
+        // clearing in `uninit` — all made from the pipeline thread, so an
+        // empty queue proves `request_frame` returns no frame until the next
+        // `filter_frame` call and the pipeline may park instead of pumping
+        // the device at the poll cadence. Non-empty covers queued
+        // pass-throughs and in-flight readbacks alike; readback completion
+        // is DISCOVERED by the poll sweep (`device.poll`), never signaled,
+        // so the sweep must keep running while anything is in flight.
+        !self.pending.is_empty()
     }
 
     fn uninit(&mut self, _ctx: &mut FrameFilterContext) {

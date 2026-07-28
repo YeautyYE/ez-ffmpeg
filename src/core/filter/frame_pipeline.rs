@@ -154,6 +154,16 @@ impl FramePipeline {
         holder.filter.request_frame(&mut ctx)
     }
 
+    /// Whether the filter at `index` currently reports deliverable (or
+    /// in-flight) `request_frame` output — see
+    /// [`FrameFilter::request_frame_pending`]. The pipeline loop derives its
+    /// wait interval from this: the ~1ms poll cadence only while some polled
+    /// filter reports pending output, the long idle interval otherwise.
+    pub(crate) fn request_frame_pending_at(&self, index: usize) -> bool {
+        assert!(index < self.filters.len());
+        self.filters[index].filter.request_frame_pending()
+    }
+
     /// Runs `filter_frame` on the single filter at `index`, returning ITS
     /// output without pushing it further down the chain. The end-of-stream
     /// flush uses this to hand each filter its cue exactly once — routing a
