@@ -76,6 +76,13 @@ fn make_watching_client(connection_id: usize, stream_key: &str, stream_id: u32) 
         current_action: ClientAction::Watching {
             stream_key: stream_key.to_string(),
             stream_id,
+            // Detached fixture: these clients are handed straight to
+            // `build_join_burst`, which never consults the action, so a
+            // never-issued handle (generation 0) is fine.
+            channel: ChannelHandle {
+                index: 0,
+                generation: 0,
+            },
         },
         has_received_video_keyframe: false,
     }
@@ -180,9 +187,7 @@ fn watcher_packets(results: &[ServerResult], connection_id: usize) -> Vec<(Bytes
                 bytes,
                 can_be_dropped,
                 ..
-            } if *target_connection_id == connection_id => {
-                Some((bytes.clone(), *can_be_dropped))
-            }
+            } if *target_connection_id == connection_id => Some((bytes.clone(), *can_be_dropped)),
             _ => None,
         })
         .collect()

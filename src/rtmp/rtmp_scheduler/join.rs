@@ -3,8 +3,8 @@
 //! plus the `play` request handling that drives them.
 
 use super::{
-    new_media_serializer, serialize_media, Client, ClientAction, MediaChannel,
-    ReceivedDataType, RtmpScheduler, ServerResult, OUTBOUND_CHUNK_SIZE,
+    new_media_serializer, serialize_media, Client, ClientAction, MediaChannel, ReceivedDataType,
+    RtmpScheduler, ServerResult, OUTBOUND_CHUNK_SIZE,
 };
 use crate::flv::flv_tag_body::{
     is_audio_sequence_header, is_video_keyframe, is_video_sequence_header,
@@ -70,7 +70,11 @@ impl RtmpScheduler {
     /// (all of which share the serviced connection), so N repeated plays cost
     /// O(N) total rather than the O(N^2) of rescanning the whole vec each time.
     /// Saturating so a pathological batch cannot wrap the accumulator.
-    pub(super) fn advance_serving_prefix(&mut self, server_results: &[ServerResult], target: usize) -> usize {
+    pub(super) fn advance_serving_prefix(
+        &mut self,
+        server_results: &[ServerResult],
+        target: usize,
+    ) -> usize {
         while self.serving_prefix_scan_pos < server_results.len() {
             if let ServerResult::OutboundPacket {
                 target_connection_id,
@@ -144,14 +148,23 @@ impl RtmpScheduler {
         let accept_result;
         let mut join_burst = Vec::new();
         {
-            let client_id = self
+            let client_id = *self
                 .connection_to_client_map
                 .get(&requested_connection_id)
                 .unwrap();
-            let client = self.clients.get_mut(*client_id).unwrap();
+            // Resolve (or create) the channel before the action is
+            // written: the watcher's action stores the pre-resolved
+            // handle the per-tag fanout's membership guard compares
+            // against. An existing slot keeps its handle, so joining a
+            // channel that predates this play (or survives its publisher)
+            // wires the watcher to the same identity the fanout uses.
+            let (channel_handle, slot) = self.channels.get_or_create(&stream_key, self.gop_limit);
+            let channel = &mut slot.channel;
+            let client = self.clients.get_mut(client_id).unwrap();
             client.current_action = ClientAction::Watching {
                 stream_key: stream_key.clone(),
                 stream_id,
+                channel: channel_handle,
             };
             // Reset the keyframe gate for this play request: has_received_video_keyframe
             // is persistent client state, so a connection that previously watched
@@ -161,12 +174,7 @@ impl RtmpScheduler {
             // keyframe, or a later live keyframe, re-sets it.
             client.has_received_video_keyframe = false;
 
-            let channel = self
-                .channels
-                .entry(stream_key.clone())
-                .or_insert_with(|| MediaChannel::new(self.gop_limit));
-
-            channel.watching_client_ids.insert(*client_id);
+            channel.watching_client_ids.insert(client_id);
             accept_result = client.session.accept_request(request_id);
             if let Ok(ref accept_results) = accept_result {
                 // The play-accept control packets (Stream Begin,
