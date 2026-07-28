@@ -3,7 +3,7 @@
 //! lifecycle notifications.
 
 use super::{
-    oversized_sequence_header_error, Client, ClientAction, MediaChannel, ReceivedDataType,
+    oversized_sequence_header_error, ChannelTable, Client, ClientAction, ReceivedDataType,
     RtmpScheduler, SchedulerError, ServerResult,
 };
 use bytes::Bytes;
@@ -15,7 +15,6 @@ use rml_rtmp::sessions::{
 use rml_rtmp::time::RtmpTimestamp;
 use slab::Slab;
 use std::collections::HashMap;
-use std::rc::Rc;
 
 impl RtmpScheduler {
     pub(crate) fn new_channel(
@@ -43,23 +42,27 @@ impl RtmpScheduler {
             }
         };
 
+        // Resolve (or create) the channel slot first: the publisher's
+        // action stores the pre-resolved handle the per-tag media path
+        // rides, and the slot's shared key allocation backs the action's
+        // `Rc<str>`. A slot that already exists (created by early
+        // watchers, or surviving a previous publisher through lingering
+        // watchers) keeps its handle, so those watchers stay wired.
+        let (channel_handle, slot) = self.channels.get_or_create(&stream_key, self.gop_limit);
         let client = Client {
             session,
             connection_id: publisher_connection_id,
-            current_action: ClientAction::Publishing(Rc::from(stream_key.as_str())),
+            current_action: ClientAction::Publishing {
+                stream_key: slot.stream_key.clone(),
+                channel: channel_handle,
+            },
             has_received_video_keyframe: false,
         };
 
-        let client_id = Some(self.clients.insert(client));
+        let client_id = self.clients.insert(client);
         self.publisher_to_client_map
-            .insert(publisher_connection_id, client_id.unwrap());
-
-        // Get or create channel and set publisher ownership
-        let channel = self
-            .channels
-            .entry(stream_key)
-            .or_insert_with(|| MediaChannel::new(self.gop_limit));
-        channel.publishing_client_id = client_id;
+            .insert(publisher_connection_id, client_id);
+        slot.channel.publishing_client_id = Some(client_id);
 
         true
     }
@@ -71,7 +74,7 @@ impl RtmpScheduler {
             clients: Slab::with_capacity(1024),
             connection_to_client_map: HashMap::with_capacity(1024),
             publisher_to_client_map: HashMap::with_capacity(32),
-            channels: HashMap::new(),
+            channels: ChannelTable::new(),
             gop_limit,
             serving_connection_backlog_bytes: 0,
             serving_prefix_scan_pos: 0,
@@ -232,9 +235,13 @@ impl RtmpScheduler {
             }
         };
 
-        let stream_key = match self.clients.get(client_id) {
+        // The publisher's channel was resolved to a handle once, at attach
+        // time (`new_channel`); copying it out ends the `clients` borrow
+        // before the fanout mutates `channels`, and the per-tag path
+        // touches no string at all.
+        let channel_handle = match self.clients.get(client_id) {
             Some(client) => match &client.current_action {
-                ClientAction::Publishing(stream_key) => stream_key.clone(),
+                ClientAction::Publishing { channel, .. } => *channel,
                 _ => {
                     warn!(
                         "In-process media for a publisher not in the Publishing state: {}",
@@ -252,13 +259,7 @@ impl RtmpScheduler {
         // output — a trusted source that never emits an oversized header — so it
         // needs no gate here (and, returning no Result, could not terminate the
         // feed anyway).
-        self.handle_audio_video_data_received(
-            &stream_key,
-            timestamp,
-            data,
-            data_type,
-            server_results,
-        );
+        self.distribute_media(channel_handle, timestamp, data, data_type, server_results);
     }
 
     // The production reactor always supplies a real write-queue backlog via
@@ -322,7 +323,8 @@ impl RtmpScheduler {
                 };
 
                 let client_id = self.clients.insert(client);
-                self.connection_to_client_map.insert(connection_id, client_id);
+                self.connection_to_client_map
+                    .insert(connection_id, client_id);
                 client_id
             }
         };
@@ -375,7 +377,11 @@ impl RtmpScheduler {
     /// classification tests do not require). Exists because reactor-level
     /// tests cannot reach this module's private handlers.
     #[cfg(test)]
-    pub(in crate::rtmp) fn register_watcher_for_test(&mut self, connection_id: usize, stream_key: &str) {
+    pub(in crate::rtmp) fn register_watcher_for_test(
+        &mut self,
+        connection_id: usize,
+        stream_key: &str,
+    ) {
         let _ = self.bytes_received(connection_id, &[]);
         let mut server_results = Vec::new();
         self.handle_play_requested(
@@ -394,10 +400,9 @@ impl RtmpScheduler {
             Some(client_id) => {
                 let client = self.clients.remove(client_id);
                 match client.current_action {
-                    ClientAction::Watching {
-                        stream_key,
-                        stream_id: _,
-                    } => self.play_ended(client_id, stream_key),
+                    ClientAction::Watching { stream_key, .. } => {
+                        self.play_ended(client_id, stream_key)
+                    }
                     ClientAction::Waiting => (),
                     _ => {}
                 }
@@ -414,7 +419,9 @@ impl RtmpScheduler {
             Some(client_id) => {
                 let client = self.clients.remove(client_id);
                 match client.current_action {
-                    ClientAction::Publishing(stream_key) => self.publishing_ended(&stream_key),
+                    ClientAction::Publishing { stream_key, .. } => {
+                        self.publishing_ended(&stream_key)
+                    }
                     _ => {}
                 }
             }
@@ -441,7 +448,7 @@ impl RtmpScheduler {
             .and_then(|client_id| self.clients.get(*client_id))
         {
             Some(client) => match &client.current_action {
-                ClientAction::Publishing(stream_key) => stream_key.clone(),
+                ClientAction::Publishing { stream_key, .. } => stream_key.clone(),
                 _ => return server_results,
             },
             None => return server_results,

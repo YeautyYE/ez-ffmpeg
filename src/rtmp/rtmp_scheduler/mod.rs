@@ -68,13 +68,33 @@ const WATCHER_SET_SHRINK_MIN_CAPACITY: usize = 64;
 
 enum ClientAction {
     Waiting,
-    // Publishing to a stream key. `Rc<str>` because the in-process media path
-    // clones the key once per audio/video tag (to end the borrow of `clients`
-    // before mutating `channels`); a refcount bump there beats a per-tag String
-    // allocation. The scheduler lives on the single reactor thread and already
-    // holds `Rc<StreamMetadata>`, so `Rc` adds no new threading constraint.
-    Publishing(Rc<str>),
-    Watching { stream_key: String, stream_id: u32 },
+    // Publishing to a stream key. The pre-resolved handle is what the
+    // in-process media path copies out per audio/video tag (ending the
+    // borrow of `clients` before mutating `channels`) — a plain integer
+    // pair, so the per-tag path neither hashes nor refcount-clones the key.
+    // The `Rc<str>` key remains for the cold teardown paths
+    // (`notify_publisher_closed`, `abort_publisher_watchers`), which still
+    // resolve by name; it shares the allocation the channel table already
+    // holds for the slot. The scheduler lives on the single reactor thread
+    // and already holds `Rc<StreamMetadata>`, so `Rc` adds no new
+    // threading constraint.
+    Publishing {
+        stream_key: Rc<str>,
+        channel: ChannelHandle,
+    },
+    Watching {
+        stream_key: String,
+        stream_id: u32,
+        /// The channel this watcher registered with, resolved once at
+        /// `play` time: the fanout's per-watcher membership guard compares
+        /// this handle against the channel it is distributing for — an
+        /// integer comparison in place of the old per-watcher string
+        /// comparison. Valid for as long as the membership itself: a
+        /// channel is never removed while its watcher set is non-empty
+        /// (`MediaChannel::should_remove`), and a publisher swap under the
+        /// same key keeps the slot and generation (see [`ChannelSlot`]).
+        channel: ChannelHandle,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -94,11 +114,8 @@ impl Client {
     fn get_active_stream_id(&self) -> Option<u32> {
         match self.current_action {
             ClientAction::Waiting => None,
-            ClientAction::Publishing(_) => None,
-            ClientAction::Watching {
-                stream_key: _,
-                stream_id,
-            } => Some(stream_id),
+            ClientAction::Publishing { .. } => None,
+            ClientAction::Watching { stream_id, .. } => Some(stream_id),
         }
     }
 }
@@ -264,11 +281,189 @@ fn serialize_media(
         .map_err(MediaSerializeError::Chunk)
 }
 
+/// A generation-checked handle to one channel slot in [`ChannelTable`].
+///
+/// The per-tag fanout is the scheduler's hottest path: resolving the target
+/// channel by stream-key string there costs a full string hash per
+/// audio/video tag, plus a per-watcher string comparison in the membership
+/// guard. The handle is resolved ONCE — when a publisher attaches or a
+/// watcher joins — and from then on the per-tag path reaches the channel
+/// with a plain slab index and the guard compares integers.
+///
+/// Slab slots are reused after removal, so a bare index could go stale the
+/// same way reactor connection ids do; the handle therefore also carries
+/// the slot's generation, mirroring the reactor's `ConnectionToken`
+/// (id + generation) ABA guard. A handle whose generation no longer
+/// matches its slot resolves to `None` — observably identical to a stream
+/// key that is no longer in the map. Unlike the poller token, this handle
+/// never crosses a word-size packing boundary, so the generation is a
+/// plain `u64`: bumped once per slot creation, it cannot wrap in any
+/// realistic process lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChannelHandle {
+    /// Slab index of the channel slot.
+    index: usize,
+    /// The slot generation this handle was issued for; see [`ChannelSlot`].
+    generation: u64,
+}
+
+/// One occupied channel slot: the [`MediaChannel`] plus the identity that
+/// makes handles to it checkable.
+///
+/// Invariants, maintained by [`ChannelTable`] (the only mutation surface):
+/// * `generation` is assigned once, at slot creation, from a counter that
+///   starts at 1 and only grows — generation 0 is never issued, and no two
+///   slot creations ever share a generation, even across slab index reuse.
+/// * `stream_key` is bound at creation and never rebound: a slot keeps its
+///   key until the slot itself is removed, so a resolvable handle always
+///   refers to the channel of the key it was issued for. A publisher swap
+///   under the same key (lingering watchers keep the channel alive)
+///   deliberately KEEPS the slot and its generation — channel identity
+///   follows the key's live channel, not the publisher — so watcher
+///   handles stay valid across `publishing_ended`'s state reset, exactly
+///   as their string keys did.
+struct ChannelSlot {
+    generation: u64,
+    /// The owning stream key; shares its allocation with the `by_key` map
+    /// entry (and the publisher's `ClientAction`). Read on the fanout path
+    /// only for diagnostics (the membership-guard skip log).
+    stream_key: Rc<str>,
+    channel: MediaChannel,
+}
+
+/// The scheduler's channel storage: a slab of channel slots plus the
+/// stream-key index over it.
+///
+/// Name lookups (publish/play/metadata/teardown — all control-rate) go
+/// through `by_key` exactly as they did when this was a plain
+/// `HashMap<String, MediaChannel>`; the per-tag media fanout instead
+/// carries a pre-resolved [`ChannelHandle`] and never hashes the key. The
+/// map and the slab stay in lockstep by construction: every insert goes
+/// through [`ChannelTable::get_or_create`] and every removal through
+/// [`ChannelTable::remove`], so `by_key` always points at an occupied slot
+/// whose `stream_key` equals the map key.
+struct ChannelTable {
+    slots: Slab<ChannelSlot>,
+    by_key: HashMap<Rc<str>, usize>,
+    /// Generation stamped into the next created slot; see [`ChannelSlot`].
+    next_generation: u64,
+}
+
+impl ChannelTable {
+    fn new() -> ChannelTable {
+        ChannelTable {
+            slots: Slab::new(),
+            by_key: HashMap::new(),
+            // Generation 0 is reserved as never-issued, so a
+            // default/dangling handle can never resolve.
+            next_generation: 1,
+        }
+    }
+
+    /// The channel under `stream_key`, by name — the control-path lookup,
+    /// same cost as the old direct map get.
+    fn get(&self, stream_key: &str) -> Option<&MediaChannel> {
+        let &index = self.by_key.get(stream_key)?;
+        self.slots.get(index).map(|slot| &slot.channel)
+    }
+
+    /// Mutable name lookup for the control paths (metadata, teardown).
+    fn get_mut(&mut self, stream_key: &str) -> Option<&mut MediaChannel> {
+        let &index = self.by_key.get(stream_key)?;
+        self.slots.get_mut(index).map(|slot| &mut slot.channel)
+    }
+
+    /// Whether a channel exists under `stream_key` (test assertions).
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn contains_key(&self, stream_key: &str) -> bool {
+        self.by_key.contains_key(stream_key)
+    }
+
+    /// The current handle for `stream_key`: the once-per-call resolution
+    /// the string-keyed fanout entry performs before handing off to the
+    /// handle path.
+    fn handle_by_key(&self, stream_key: &str) -> Option<ChannelHandle> {
+        let &index = self.by_key.get(stream_key)?;
+        let slot = self.slots.get(index)?;
+        Some(ChannelHandle {
+            index,
+            generation: slot.generation,
+        })
+    }
+
+    /// Generation-checked slot access: `None` for a handle whose slot was
+    /// removed (and possibly reused for another key) since the handle was
+    /// issued — the stale-handle outcome, observably identical to a
+    /// missing key.
+    fn slot_by_handle_mut(&mut self, handle: ChannelHandle) -> Option<&mut ChannelSlot> {
+        self.slots
+            .get_mut(handle.index)
+            .filter(|slot| slot.generation == handle.generation)
+    }
+
+    /// The existing slot for `stream_key`, or a freshly created one (with
+    /// a new, never-before-issued generation). An existing slot keeps its
+    /// generation: get-or-create is how a new publisher attaches to a
+    /// channel kept alive by lingering watchers, and their handles must
+    /// remain valid across the swap.
+    fn get_or_create(
+        &mut self,
+        stream_key: &str,
+        gop_limit: usize,
+    ) -> (ChannelHandle, &mut ChannelSlot) {
+        let index = match self.by_key.get(stream_key).copied() {
+            Some(index) => index,
+            None => {
+                let generation = self.next_generation;
+                // checked_add keeps the never-reissued invariant
+                // profile-independent: wrapping to 0 would eventually
+                // revalidate stale handles, so exhaustion — unreachable in
+                // any real process at one bump per channel creation — is a
+                // hard stop, not a silent wrap.
+                self.next_generation = self
+                    .next_generation
+                    .checked_add(1)
+                    .expect("channel generation counter exhausted");
+                let key: Rc<str> = Rc::from(stream_key);
+                let index = self.slots.insert(ChannelSlot {
+                    generation,
+                    stream_key: key.clone(),
+                    channel: MediaChannel::new(gop_limit),
+                });
+                self.by_key.insert(key, index);
+                index
+            }
+        };
+        let slot = self
+            .slots
+            .get_mut(index)
+            .expect("channel table invariant: by_key always points at an occupied slot");
+        (
+            ChannelHandle {
+                index,
+                generation: slot.generation,
+            },
+            slot,
+        )
+    }
+
+    /// Remove the channel under `stream_key` — map entry and slot
+    /// together, keeping the two in lockstep. Every handle still referring
+    /// to the slot is stale from here on: the slot is vacant, and a later
+    /// re-creation under any key stamps a fresh generation, so an old
+    /// handle can never resolve again.
+    fn remove(&mut self, stream_key: &str) {
+        if let Some(index) = self.by_key.remove(stream_key) {
+            self.slots.try_remove(index);
+        }
+    }
+}
+
 pub(super) struct RtmpScheduler {
     clients: Slab<Client>,
     connection_to_client_map: HashMap<usize, usize>,
     publisher_to_client_map: HashMap<usize, usize>,
-    channels: HashMap<String, MediaChannel>,
+    channels: ChannelTable,
     gop_limit: usize,
     /// Write-queue backlog of the connection whose input is currently being
     /// serviced, supplied by the reactor at the top of `bytes_received_with_backlog`.
