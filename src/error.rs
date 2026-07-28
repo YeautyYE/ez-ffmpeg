@@ -247,8 +247,8 @@ const _: () = assert!(
 
 /// Builder/open-time validation errors for [`crate::VideoWriter`]. Exported here
 /// (not from the crate root) to mirror the existing `OpenInputError` /
-/// `OpenOutputError` organization; the root surface stays the three settled
-/// writer types.
+/// `OpenOutputError` organization; the root surface stays the settled writer
+/// types (the writer itself, its builder, and the push error pair).
 pub use crate::core::writer::WriterError;
 
 // Hand-written counterpart of the #[from] the sibling variants derive: the

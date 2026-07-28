@@ -194,7 +194,7 @@ pub use self::core::recipes;
 pub use self::core::scheduler::ffmpeg_scheduler::FfmpegScheduler;
 pub use self::core::scheduler::progress::{OutputProgress, Progress, ProgressHandle, ProgressState};
 pub use self::core::stream_info;
-pub use self::core::writer::{PushError, VideoWriter, VideoWriterBuilder};
+pub use self::core::writer::{OwnedPushError, PushError, VideoWriter, VideoWriterBuilder};
 pub use self::core::{set_ffmpeg_log_level, FfmpegLogLevel, FFMPEG_LOG_TARGET};
 
 // ez-ffmpeg is a thin FFmpeg wrapper, so FFmpeg's core types appear in the public
