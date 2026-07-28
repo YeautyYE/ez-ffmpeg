@@ -82,22 +82,91 @@ pub(crate) fn new_hw_devices() -> Mutex<Vec<HWDevice>> {
     Mutex::new(Vec::new())
 }
 
+/// Installs the process-wide explicit filter device from an ffmpeg
+/// `filter_hw_device`-style specification. The first call whose device
+/// initializes successfully settles the selection; see
+/// [`settle_filter_device_slot`] for the exact settlement rules. All
+/// logging happens here, mapped 1:1 from the outcome, so the settlement
+/// core stays log-free and tests pin log-carrying paths by variant.
 pub(crate) fn init_filter_hw_device(hw_device: &str) -> i32 {
-    if FILTER_HW_DEVICE.get().is_some() {
-        warn!("Only one filter device can be used.");
-        return 0;
-    }
-    match hw_device_init_from_string(hw_device) {
-        (0, Some(dev)) => {
-            FILTER_HW_DEVICE.set(Mutex::new(Some(dev))).ok();
+    let outcome =
+        settle_filter_device_slot(&FILTER_HW_DEVICE, || {
+            match hw_device_init_from_string(hw_device) {
+                (0, Some(dev)) => Some(dev),
+                (_, _) => None,
+            }
+        });
+    match outcome {
+        FilterSlotOutcome::Settled => 0,
+        FilterSlotOutcome::AlreadySettled => {
+            warn!("Only one filter device can be used.");
             0
         }
-        (_, _) => {
+        // A race loser proceeds with the settled device silently — the
+        // behavior of the ignored `OnceLock::set` failure this path
+        // replaces. Only calls that find the slot already settled warn.
+        FilterSlotOutcome::RaceLost => 0,
+        FilterSlotOutcome::InitFailed => {
             error!("Invalid filter device {}", hw_device);
-            FILTER_HW_DEVICE.set(Mutex::new(None)).ok();
             AVERROR(EINVAL)
         }
     }
+}
+
+/// What a [`settle_filter_device_slot`] attempt did, one variant per
+/// caller-observable path. [`init_filter_hw_device`] maps
+/// `AlreadySettled` to the only-one-device warning plus success,
+/// `RaceLost` to silent success, and `InitFailed` to the invalid-device
+/// error plus `EINVAL`, so a test pinning a variant pins the
+/// corresponding log line and return code without capturing log output.
+#[derive(Debug, PartialEq, Eq)]
+enum FilterSlotOutcome {
+    /// This call's device settled the slot.
+    Settled,
+    /// The slot was settled before this call did any work; the
+    /// initializer did not run.
+    AlreadySettled,
+    /// This call initialized a device, but a concurrent call settled the
+    /// slot first; the transient device was dropped.
+    RaceLost,
+    /// Initialization failed; this call settled nothing (the slot may
+    /// still be settled by a later or concurrent successful attempt).
+    InitFailed,
+}
+
+/// Settlement core of [`init_filter_hw_device`], generic over the device
+/// type so tests can drive a LOCAL slot: the process-global `OnceLock` has
+/// no reset path, so tests against it would be order-dependent.
+///
+/// Settlement rules:
+/// - A settled slot short-circuits: the initializer does not run and the
+///   settled device stays authoritative.
+/// - A failed initialization settles nothing, so a later — or concurrent
+///   — attempt with a valid specification can still settle the slot.
+///   (Settling the failure would make every later attempt report success
+///   while no explicit device is installed, silently degrading
+///   `hw_device_for_filter` to its registry fallback for the rest of the
+///   process.)
+/// - Two concurrent first calls can both pass the emptiness check and
+///   both initialize; `OnceLock::set` then picks exactly one winner. The
+///   loser's transient handle just drops: the production initializer has
+///   already registered the device in `HW_DEVICES`, so the registry clone
+///   keeps that context alive (bounded by the registry LRU) and nothing
+///   needs rolling back.
+fn settle_filter_device_slot<T>(
+    slot: &OnceLock<Mutex<Option<T>>>,
+    init: impl FnOnce() -> Option<T>,
+) -> FilterSlotOutcome {
+    if slot.get().is_some() {
+        return FilterSlotOutcome::AlreadySettled;
+    }
+    let Some(dev) = init() else {
+        return FilterSlotOutcome::InitFailed;
+    };
+    if slot.set(Mutex::new(Some(dev))).is_err() {
+        return FilterSlotOutcome::RaceLost;
+    }
+    FilterSlotOutcome::Settled
 }
 
 #[repr(i32)]
@@ -1836,6 +1905,174 @@ mod tests {
         assert_eq!(
             failure.log.as_deref(),
             Some("Invalid device specification \"spec\": failed to parse options")
+        );
+    }
+
+    // A failed initialization must NOT settle the filter-device slot:
+    // settling it would make every later call — even one with a valid
+    // specification — take the "already settled" fast path and report
+    // success while no explicit device is installed, silently degrading
+    // hw_device_for_filter to its registry fallback for the rest of the
+    // process. The slot must stay empty so a later valid attempt can
+    // still settle it. Drives a LOCAL slot: the process-global one has no
+    // reset path, so a test against it would be order-dependent. Pinning
+    // InitFailed pins the error!-plus-EINVAL wrapper arm; pinning Settled
+    // pins the silent-success arm (the outcome-to-log mapping in
+    // init_filter_hw_device is 1:1).
+    #[test]
+    fn filter_slot_failed_init_leaves_the_slot_empty_for_a_retry() {
+        let slot: OnceLock<Mutex<Option<&'static str>>> = OnceLock::new();
+
+        assert_eq!(
+            settle_filter_device_slot(&slot, || None),
+            FilterSlotOutcome::InitFailed,
+            "a failed initialization must surface as the error outcome"
+        );
+        assert!(
+            slot.get().is_none(),
+            "a failed initialization must not settle the slot"
+        );
+
+        assert_eq!(
+            settle_filter_device_slot(&slot, || Some("retried")),
+            FilterSlotOutcome::Settled,
+            "a later valid attempt must settle"
+        );
+        let settled = slot.get().expect("the retry must settle the slot");
+        assert_eq!(*settled.lock().unwrap(), Some("retried"));
+    }
+
+    // Once settled, a later call must short-circuit: the initializer must
+    // not run (no second device creation) and the settled device stays
+    // authoritative. Pinning AlreadySettled pins the warn-plus-success
+    // wrapper arm — the historical "only one filter device" semantics.
+    #[test]
+    fn filter_slot_second_call_skips_init_and_keeps_the_settled_device() {
+        let slot: OnceLock<Mutex<Option<&'static str>>> = OnceLock::new();
+        assert_eq!(
+            settle_filter_device_slot(&slot, || Some("first")),
+            FilterSlotOutcome::Settled
+        );
+
+        let mut ran = false;
+        assert_eq!(
+            settle_filter_device_slot(&slot, || {
+                ran = true;
+                Some("second")
+            }),
+            FilterSlotOutcome::AlreadySettled,
+            "a post-settlement call must take the settled fast path"
+        );
+        assert!(
+            !ran,
+            "a post-settlement call must not re-run initialization"
+        );
+        assert_eq!(
+            *slot.get().unwrap().lock().unwrap(),
+            Some("first"),
+            "the settled device must stay authoritative"
+        );
+    }
+
+    // Counts drops so the race test can prove the loser's transient device
+    // is dropped (not leaked or swapped into the slot) while the winner's
+    // survives inside the slot.
+    struct DropProbe {
+        id: &'static str,
+        drops: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    // Two concurrent FIRST calls can both pass the emptiness fast path and
+    // both initialize; OnceLock::set must then pick exactly one winner and
+    // one RaceLost loser (reported as silent success, unlike a
+    // post-settlement call's warning), the slot must hold exactly the
+    // WINNER's device, and the loser's transient device must be DROPPED —
+    // in production the registry clone keeps its context alive, so the
+    // drop is the whole cleanup. The rendezvous sits INSIDE the
+    // initializers: each only runs after its call passed the emptiness
+    // check, so both meeting at the barrier proves both calls are in the
+    // racing window before either settles.
+    #[test]
+    fn filter_slot_concurrent_first_calls_settle_exactly_one_winner() {
+        let slot: OnceLock<Mutex<Option<DropProbe>>> = OnceLock::new();
+        let barrier = std::sync::Barrier::new(2);
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let (a, b) = std::thread::scope(|s| {
+            let spawn_racer = |id: &'static str| {
+                let drops = drops.clone();
+                let barrier = &barrier;
+                let slot = &slot;
+                s.spawn(move || {
+                    settle_filter_device_slot(slot, || {
+                        barrier.wait();
+                        Some(DropProbe { id, drops })
+                    })
+                })
+            };
+            let a = spawn_racer("a");
+            let b = spawn_racer("b");
+            (a.join().unwrap(), b.join().unwrap())
+        });
+
+        let outcomes = [("a", a), ("b", b)];
+        let settled: Vec<&str> = outcomes
+            .iter()
+            .filter(|(_, outcome)| *outcome == FilterSlotOutcome::Settled)
+            .map(|(id, _)| *id)
+            .collect();
+        let lost: Vec<&str> = outcomes
+            .iter()
+            .filter(|(_, outcome)| *outcome == FilterSlotOutcome::RaceLost)
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(
+            (settled.len(), lost.len()),
+            (1, 1),
+            "exactly one racer must settle and one must lose the race, got {outcomes:?}"
+        );
+        assert_eq!(
+            drops.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the loser's transient device must be dropped, and only it"
+        );
+
+        let settled_slot = slot.get().expect("the winner must have settled the slot");
+        let guard = settled_slot.lock().unwrap();
+        let winner = guard.as_ref().expect("the settled slot holds a device");
+        assert_eq!(
+            winner.id, settled[0],
+            "the slot must hold the SETTLED racer's device, not the loser's"
+        );
+    }
+
+    // End-to-end regression on the REAL process-global slot, through the
+    // public wrapper: an invalid specification must return EINVAL and must
+    // NOT settle the slot — proven by the second identical call failing
+    // identically instead of taking the settled fast path's silent
+    // success. An unknown device type fails deterministically on every
+    // platform, before any device or registry state is touched. (The
+    // successful-settlement paths cannot be exercised here: real device
+    // creation is environment-dependent and the global has no reset path,
+    // which is exactly why the state-machine tests above drive a local
+    // slot.)
+    #[test]
+    fn invalid_filter_device_reports_einval_and_leaves_the_global_slot_retryable() {
+        assert_eq!(
+            init_filter_hw_device("no-such-device-type"),
+            AVERROR(EINVAL),
+            "an unknown device type must be rejected"
+        );
+        assert_eq!(
+            init_filter_hw_device("no-such-device-type"),
+            AVERROR(EINVAL),
+            "a failed attempt must leave the slot open, not latch a settled success"
         );
     }
 }
