@@ -72,14 +72,19 @@ impl FilterComplex {
     /// Assigns a hardware device for this filter complex, enabling GPU-accelerated
     /// or device-specific filtering.
     ///
-    /// The named device is created (or reused) when the job starts, through
-    /// the process-global device cache described in the
-    /// [`hwaccel`](crate::hwaccel) module docs. It also settles the
-    /// process-wide filter device: that slot is initialized at most once per
-    /// process — concurrent first initializations race and the winner
-    /// settles it, even when its own initialization fails — and attempts
-    /// after settlement have no effect. Repeated calls to this setter before
-    /// the job starts simply replace the builder value.
+    /// The named device is created (or reused) when the context is built,
+    /// ahead of the job itself, through the process-global device cache
+    /// described in the [`hwaccel`](crate::hwaccel) module docs. It also
+    /// settles the process-wide filter device: that slot is settled by the
+    /// first initialization that succeeds — a failed attempt settles
+    /// nothing itself, leaving the slot open for a later or concurrent
+    /// successful attempt — and concurrent successful first initializations
+    /// race with exactly one settling it (the loser's transient selection
+    /// handle is discarded — its device stays in the process-global cache —
+    /// and its call proceeds, silently, with the settled one). Once
+    /// settled, later attempts log a warning and proceed with the
+    /// already-settled device. Repeated calls to this setter before the
+    /// context is built simply replace the builder value.
     ///
     /// # Parameters
     /// * `hw_device` - A `String` specifying the hardware device name or identifier
