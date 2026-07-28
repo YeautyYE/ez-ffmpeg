@@ -3,7 +3,7 @@
 //! `sine` is a real decode path, so these exercise the whole scheduler pipeline
 //! (demux → decode → aformat/swr → sample sink), not just option plumbing.
 
-use ez_ffmpeg::frame_export::SampleExtractor;
+use ez_ffmpeg::frame_export::{Channels, SampleExtractor};
 use ez_ffmpeg::{FfmpegContext, Input, Output};
 
 /// A finite synthetic audio source.
@@ -61,6 +61,115 @@ fn extracts_interleaved_f32_from_sine() {
         "expected ~44100 mono samples, got {}",
         all.len()
     );
+}
+
+#[test]
+fn collect_audio_reports_the_source_shape() {
+    // Same defaults as collect_samples(): source rate and layout preserved —
+    // the collected form additionally says so.
+    let audio = SampleExtractor::new(lavfi("sine=frequency=440:duration=1:sample_rate=44100"))
+        .collect_audio()
+        .expect("extraction failed");
+    assert_eq!(
+        audio.sample_rate(),
+        44100,
+        "source rate preserved by default"
+    );
+    assert_eq!(audio.channels(), 1, "sine is mono; source layout preserved");
+    assert_eq!(
+        audio.channel_layout(),
+        "mono",
+        "layout described in FFmpeg vocabulary"
+    );
+    assert_clean_pcm(audio.as_slice());
+    assert!(
+        (40_000..=48_000).contains(&audio.as_slice().len()),
+        "expected ~44100 mono samples, got {}",
+        audio.as_slice().len()
+    );
+}
+
+#[test]
+fn collect_audio_buffer_is_identical_to_collect_samples() {
+    // Two runs over the same fixed WAV: collect_audio() must yield exactly the
+    // buffer collect_samples() yields — it only attaches metadata.
+    let dir = std::env::temp_dir().join(format!(
+        "ez_ffmpeg_frame_export_audio_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let wav = dir.join("sine_parity.wav");
+    let wav = wav.to_str().expect("utf-8 path");
+
+    let ctx = FfmpegContext::builder()
+        .input(lavfi("sine=frequency=440:duration=1:sample_rate=44100"))
+        .output(Output::from(wav).set_audio_codec("pcm_s16le"))
+        .build()
+        .expect("build parity wav");
+    ctx.start()
+        .expect("start parity wav encode")
+        .wait()
+        .expect("parity wav encode failed");
+
+    let bare = SampleExtractor::new(wav)
+        .collect_samples()
+        .expect("collect_samples failed");
+    let audio = SampleExtractor::new(wav)
+        .collect_audio()
+        .expect("collect_audio failed");
+
+    assert_clean_pcm(&bare);
+    assert_eq!(audio.sample_rate(), 44100);
+    assert_eq!(audio.channels(), 1);
+    assert_eq!(audio.channel_layout(), "mono");
+    assert_eq!(
+        audio.as_slice(),
+        &bare[..],
+        "collect_audio must not alter the samples"
+    );
+
+    let _ = std::fs::remove_file(wav);
+}
+
+#[test]
+fn chunk_layout_distinguishes_multichannel_shapes() {
+    // Above two channels a bare count is ambiguous (6 channels: "5.1" or
+    // "6.0") — the layout string is the disambiguator, read from the exported
+    // frames. anullsrc is infinite, so the duration window bounds the run.
+    let src = "anullsrc=channel_layout=5.1:sample_rate=48000";
+    let chunks = SampleExtractor::new(lavfi(src))
+        .duration_us(200_000)
+        .samples()
+        .expect("start failed")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("extraction failed");
+    assert!(!chunks.is_empty(), "expected at least one chunk");
+    for c in &chunks {
+        assert_eq!(c.sample_rate(), 48_000);
+        assert_eq!(c.channels(), 6);
+        assert_eq!(
+            c.channel_layout(),
+            "5.1",
+            "source layout preserved verbatim"
+        );
+    }
+
+    // The collected form reports the same shape...
+    let audio = SampleExtractor::new(lavfi(src))
+        .duration_us(200_000)
+        .collect_audio()
+        .expect("extraction failed");
+    assert_eq!(audio.channels(), 6);
+    assert_eq!(audio.channel_layout(), "5.1");
+
+    // ...and a requested conversion reports what was produced, not the source.
+    let audio = SampleExtractor::new(lavfi(src))
+        .duration_us(200_000)
+        .channels(Channels::Stereo)
+        .collect_audio()
+        .expect("extraction failed");
+    assert_eq!(audio.channels(), 2);
+    assert_eq!(audio.channel_layout(), "stereo");
 }
 
 #[test]
