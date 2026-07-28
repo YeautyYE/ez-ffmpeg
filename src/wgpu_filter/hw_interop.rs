@@ -19,11 +19,10 @@
 //! that transition preserves texels in practice. Pixel correctness is
 //! verified by an end-to-end test before trusting a new driver.
 
+use super::shared_gpu::DeferredInfoLog;
 #[cfg(target_os = "linux")]
 use ash::ext;
 use ash::{khr, vk};
-#[cfg(target_os = "linux")]
-use log::info;
 
 /// DRM fourccs accepted for NV12-shaped exports (drm_fourcc.h values).
 const DRM_FORMAT_R8: u32 = 0x2020_3852; // 'R8  '
@@ -159,16 +158,20 @@ pub(crate) enum DmabufOpen {
 }
 
 /// Attempts to open the adapter through wgpu-hal with the dmabuf-import
-/// device extensions enabled. Every non-[`DmabufOpen::Opened`] outcome logs
-/// an info line, and the caller falls back to the plain `request_device`
-/// path either way.
+/// device extensions enabled. Every non-[`DmabufOpen::Opened`] outcome queues
+/// an info line for the caller to emit after the generation slot is settled,
+/// and the caller falls back to the plain `request_device` path either way.
 #[cfg(target_os = "linux")]
 pub(crate) fn try_open_dmabuf_device(
     adapter: &wgpu::Adapter,
     device_desc: &wgpu::DeviceDescriptor,
+    deferred: &mut Vec<DeferredInfoLog>,
 ) -> DmabufOpen {
     if adapter.get_info().backend != wgpu::Backend::Vulkan {
-        info!("hw zero-copy input: unavailable (non-Vulkan backend)");
+        deferred.push(DeferredInfoLog::new(
+            module_path!(),
+            "hw zero-copy input: unavailable (non-Vulkan backend)".to_string(),
+        ));
         return DmabufOpen::Unsupported;
     }
     const EXTENSIONS: [&std::ffi::CStr; 3] = [
@@ -184,15 +187,21 @@ pub(crate) fn try_open_dmabuf_device(
     unsafe {
         let open_device = {
             let Some(hal_adapter) = adapter.as_hal::<wgpu::hal::api::Vulkan>() else {
-                info!("hw zero-copy input: unavailable (no Vulkan hal adapter)");
+                deferred.push(DeferredInfoLog::new(
+                    module_path!(),
+                    "hw zero-copy input: unavailable (no Vulkan hal adapter)".to_string(),
+                ));
                 return DmabufOpen::Unsupported;
             };
             let caps = hal_adapter.physical_device_capabilities();
             if let Some(missing) = EXTENSIONS.iter().find(|e| !caps.supports_extension(e)) {
-                info!(
-                    "hw zero-copy input: unavailable (missing {})",
-                    missing.to_string_lossy()
-                );
+                deferred.push(DeferredInfoLog::new(
+                    module_path!(),
+                    format!(
+                        "hw zero-copy input: unavailable (missing {})",
+                        missing.to_string_lossy()
+                    ),
+                ));
                 return DmabufOpen::Unsupported;
             }
             match hal_adapter.open_with_callback(
@@ -204,7 +213,10 @@ pub(crate) fn try_open_dmabuf_device(
             ) {
                 Ok(open_device) => open_device,
                 Err(e) => {
-                    info!("hw zero-copy input: device open failed: {e:?}");
+                    deferred.push(DeferredInfoLog::new(
+                        module_path!(),
+                        format!("hw zero-copy input: device open failed: {e:?}"),
+                    ));
                     return DmabufOpen::TransientFailure;
                 }
             }
@@ -215,13 +227,19 @@ pub(crate) fn try_open_dmabuf_device(
         {
             Ok(pair) => pair,
             Err(e) => {
-                info!("hw zero-copy input: device wrap failed: {e}");
+                deferred.push(DeferredInfoLog::new(
+                    module_path!(),
+                    format!("hw zero-copy input: device wrap failed: {e}"),
+                ));
                 return DmabufOpen::TransientFailure;
             }
         };
         let (ash_instance, physical_device) = {
             let Some(hal_adapter) = adapter.as_hal::<wgpu::hal::api::Vulkan>() else {
-                info!("hw zero-copy input: unavailable (hal adapter vanished mid-open)");
+                deferred.push(DeferredInfoLog::new(
+                    module_path!(),
+                    "hw zero-copy input: unavailable (hal adapter vanished mid-open)".to_string(),
+                ));
                 return DmabufOpen::TransientFailure;
             };
             (
@@ -230,7 +248,10 @@ pub(crate) fn try_open_dmabuf_device(
             )
         };
         let memfd = khr::external_memory_fd::Device::new(&ash_instance, &ash_device);
-        info!("hw zero-copy input: dmabuf import enabled");
+        deferred.push(DeferredInfoLog::new(
+            module_path!(),
+            "hw zero-copy input: dmabuf import enabled".to_string(),
+        ));
         DmabufOpen::Opened(
             device,
             queue,
@@ -252,6 +273,7 @@ pub(crate) fn try_open_dmabuf_device(
 pub(crate) fn try_open_dmabuf_device(
     _adapter: &wgpu::Adapter,
     _device_desc: &wgpu::DeviceDescriptor,
+    _deferred: &mut Vec<DeferredInfoLog>,
 ) -> DmabufOpen {
     DmabufOpen::Unsupported
 }
