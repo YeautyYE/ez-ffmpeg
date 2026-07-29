@@ -76,7 +76,7 @@ Add **ez-ffmpeg** to your project by including it in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ez-ffmpeg = "0.16"
+ez-ffmpeg = "0.17"
 ```
 
 ### Basic Usage
