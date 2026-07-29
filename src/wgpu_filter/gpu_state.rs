@@ -372,6 +372,43 @@ fn uniform_bgl_entry(
     }
 }
 
+thread_local! {
+    static INITIALIZING_GENERATIONS: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn generation_id(shared: &Arc<SharedGpuGeneration>) -> usize {
+    Arc::as_ptr(shared) as usize
+}
+
+fn initializing_on_current_thread(shared: &Arc<SharedGpuGeneration>) -> bool {
+    let id = generation_id(shared);
+    INITIALIZING_GENERATIONS.with(|generations| generations.borrow().contains(&id))
+}
+
+struct InitializingGeneration {
+    id: usize,
+}
+
+impl InitializingGeneration {
+    fn enter(shared: &Arc<SharedGpuGeneration>) -> Self {
+        let id = generation_id(shared);
+        INITIALIZING_GENERATIONS.with(|generations| generations.borrow_mut().push(id));
+        Self { id }
+    }
+}
+
+impl Drop for InitializingGeneration {
+    fn drop(&mut self) {
+        INITIALIZING_GENERATIONS.with(|generations| {
+            let mut generations = generations.borrow_mut();
+            if let Some(index) = generations.iter().rposition(|id| *id == self.id) {
+                generations.remove(index);
+            }
+        });
+    }
+}
+
 impl GpuState {
     pub(crate) fn new(
         source: EffectSource<'_>,
@@ -404,6 +441,13 @@ impl GpuState {
         // panicked the device thread is unlikely to be local to that filter.
         // Building on top of that is not recoverable state: retire the
         // generation (the next job acquires a fresh one) and fail this init.
+        if initializing_on_current_thread(&shared) {
+            return Err(
+                "shared GPU context initialization re-entered on the thread already initializing it"
+                    .to_string(),
+            );
+        }
+        let init_thread = InitializingGeneration::enter(&shared);
         let _init = match shared.init_lock.lock() {
             Ok(guard) => guard,
             Err(_) => {
@@ -661,6 +705,7 @@ impl GpuState {
 
         // Everything device-scoped is created; release the init lock before
         // assembling the struct, which takes ownership of `shared`.
+        drop(init_thread);
         drop(_init);
 
         Ok(GpuState {

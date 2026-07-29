@@ -323,22 +323,27 @@ unsafe impl Send for HWDevice {}
 pub(crate) fn hw_device_free_all() {
     // Release the pinned filter-device handle (its context survives if a
     // consumer still holds a reference). Poison-tolerant so this atexit
-    // cleanup still runs after a panicked holder.
-    if let Some(slot) = FILTER_HW_DEVICE.get() {
+    // cleanup still runs after a panicked holder. Take under the lock, but
+    // release the AVBufferRef after unlocking because FFmpeg teardown may log.
+    let filter_device = FILTER_HW_DEVICE.get().and_then(|slot| {
         slot.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-    }
+            .take()
+    });
+    drop(filter_device);
 
     // Drop every registry entry: each HWDevice's Drop releases the
     // registry's reference (contexts still held by live consumer refs stay
-    // alive until those release).
-    if let Some(hw_devices) = HW_DEVICES.get() {
-        hw_devices
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
-    }
+    // alive until those release). As above, the values leave the registry
+    // under the lock and run their FFmpeg destructors only after unlocking.
+    let hw_devices = HW_DEVICES.get().map(|hw_devices| {
+        std::mem::take(
+            &mut *hw_devices
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    });
+    drop(hw_devices);
 }
 
 /// Validated name of a hardware device type.
@@ -611,30 +616,25 @@ fn settle(result: Result<HWDevice, InitFailure>) -> (i32, Option<HWDevice>) {
     }
 }
 
-/// Logger-reentrancy caveat (pre-existing design, disclosed): the locked
-/// body below runs `av_hwdevice_ctx_create` while INIT_LOCK is held, and
-/// FFmpeg may emit its own log lines during device creation — the
-/// process-wide `log` backend is therefore invoked UNDER that lock. ez's
-/// own log macros are kept outside the lock (see `settle`), but a user log
-/// handler that re-enters device-management APIs (this function,
-/// [`hw_device_init_from_type`], `init_filter_hw_device`) from inside such
-/// a message can deadlock on INIT_LOCK. Log handlers must treat records as
-/// data: format and forward them, never call back into this crate.
+/// FFmpeg may emit its own log lines synchronously during device creation.
+/// The wrapper defers those records along with ez's own failure message until
+/// after INIT_LOCK is released, so a user logger may re-enter device setup.
 pub(crate) fn hw_device_init_from_string(arg: &str) -> (i32, Option<HWDevice>) {
     // Serialize the whole reuse-check -> create -> register sequence: two
     // concurrent calls with the same spec must not both miss the reuse check and
     // each create (and permanently register) a device, which would leak a context
     // and mint a duplicate auto name. Hardware-device setup is per-job, not
     // per-frame, so this coarse lock is off every hot path.
+    let ffmpeg_logs = crate::core::defer_ffmpeg_logs();
     let result = {
         let _init_guard = init_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         hw_device_init_from_string_locked(arg)
     };
-    // Failure logging is deferred to here, past the guard drop — same
-    // emit-outside-the-lock policy as ffmpeg_log_callback in core/mod.rs
-    // (see `settle`).
+    // FFmpeg callback records retain their original order and precede this
+    // operation's wrapper error, but reach the logger only after the guard.
+    ffmpeg_logs.flush();
     settle(result)
 }
 
@@ -777,9 +777,8 @@ fn hw_device_init_from_string_locked(arg: &str) -> Result<HWDevice, InitFailure>
     Ok(dev)
 }
 
-/// Logger-reentrancy caveat: same as [`hw_device_init_from_string`] —
-/// device creation runs under INIT_LOCK and FFmpeg may log during it, so a
-/// log handler re-entering device-management APIs can deadlock.
+/// FFmpeg callback records are deferred past INIT_LOCK exactly as in
+/// [`hw_device_init_from_string`].
 pub(crate) fn hw_device_init_from_type(
     device_type: AVHWDeviceType,
     device: Option<String>,
@@ -789,15 +788,14 @@ pub(crate) fn hw_device_init_from_type(
     // concurrent identical requests would each create (and permanently register)
     // a device. Hardware-device setup is per-job, not per-frame, so this coarse
     // lock is off every hot path.
+    let ffmpeg_logs = crate::core::defer_ffmpeg_logs();
     let result = {
         let _init_guard = init_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         hw_device_init_from_type_locked(device_type, device)
     };
-    // Failure logging is deferred to here, past the guard drop — same
-    // emit-outside-the-lock policy as ffmpeg_log_callback in core/mod.rs
-    // (see `settle`).
+    ffmpeg_logs.flush();
     settle(result)
 }
 
@@ -981,21 +979,27 @@ const HW_DEVICES_CAP: usize = 32;
 
 fn add_hw_device(device: HWDevice) {
     let devices = HW_DEVICES.get_or_init(new_hw_devices);
-    let mut devices = devices
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    devices.push(device);
-    // Bounded LRU under the registry lock. Evicting drops only the
-    // REGISTRY's reference (HWDevice owns its ref; see Clone/Drop): every
+    let evicted = {
+        let mut devices = devices
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        devices.push(device);
+        let mut evicted = Vec::new();
+        while devices.len() > HW_DEVICES_CAP {
+            evicted.push(devices.remove(0));
+        }
+        evicted
+    };
+    // Bounded LRU selection happens under the registry lock. Eviction drops
+    // only the REGISTRY's reference (HWDevice owns its ref; see Clone/Drop): every
     // consumer path clones its handle while the lock is held, so an evicted
     // device's context is freed by the last consumer handle, never under a
     // live job. An evicted-but-alive device is simply no longer findable —
     // get_by_name/get_by_type/for_filter and name generation all probe the
     // registry only, so a re-issued name can never resolve to the evicted
-    // device.
-    while devices.len() > HW_DEVICES_CAP {
-        drop(devices.remove(0));
-    }
+    // device. The actual AVBufferRef release stays outside the registry guard
+    // because FFmpeg teardown may log through the process-wide backend.
+    drop(evicted);
 }
 
 /// Runtime availability of one GPU filter backend: the hardware device type
@@ -1209,9 +1213,13 @@ mod tests {
             // holding the registry lock poisons the mutex, and a second
             // panic here would abort the process instead of restoring.
             let registry = HW_DEVICES.get_or_init(new_hw_devices);
-            *registry
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = std::mem::take(&mut self.0);
+            let displaced = {
+                let mut registry = registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                std::mem::replace(&mut *registry, std::mem::take(&mut self.0))
+            };
+            drop(displaced);
         }
     }
 
@@ -1292,6 +1300,44 @@ mod tests {
         let buf = unsafe { ffmpeg_sys_next::av_buffer_alloc(1) };
         assert!(!buf.is_null(), "av_buffer_alloc failed");
         buf
+    }
+
+    static RELEASE_SAW_UNLOCKED_REGISTRY: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    unsafe extern "C" fn probe_registry_on_buffer_release(
+        _opaque: *mut libc::c_void,
+        data: *mut u8,
+    ) {
+        let unlocked = HW_DEVICES
+            .get()
+            .is_some_and(|registry| match registry.try_lock() {
+                Ok(_) | Err(std::sync::TryLockError::Poisoned(_)) => true,
+                Err(std::sync::TryLockError::WouldBlock) => false,
+            });
+        RELEASE_SAW_UNLOCKED_REGISTRY.store(unlocked, std::sync::atomic::Ordering::SeqCst);
+        drop(Box::from_raw(data));
+    }
+
+    fn registry_probe_buffer() -> *mut AVBufferRef {
+        let data = Box::into_raw(Box::new(0u8));
+        // SAFETY: `data` is a one-byte allocation transferred to AVBuffer;
+        // the callback reconstructs and frees it exactly once.
+        let buffer = unsafe {
+            ffmpeg_sys_next::av_buffer_create(
+                data,
+                1,
+                Some(probe_registry_on_buffer_release),
+                null_mut(),
+                0,
+            )
+        };
+        if buffer.is_null() {
+            // SAFETY: ownership was not transferred when creation failed.
+            unsafe { drop(Box::from_raw(data)) };
+            panic!("av_buffer_create failed");
+        }
+        buffer
     }
 
     /// Shared payload pointer: identical for every reference to one buffer.
@@ -1452,7 +1498,11 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let before = HW_DEVICES
             .get()
-            .map(|m| m.lock().unwrap().len())
+            .map(|m| {
+                m.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len()
+            })
             .unwrap_or(0);
 
         let (err, dev) = hw_device_init_from_type(
@@ -1464,7 +1514,11 @@ mod tests {
 
         let after = HW_DEVICES
             .get()
-            .map(|m| m.lock().unwrap().len())
+            .map(|m| {
+                m.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len()
+            })
             .unwrap_or(0);
         assert_eq!(
             before, after,
@@ -1479,7 +1533,11 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let devices_before = HW_DEVICES
             .get()
-            .map(|m| m.lock().unwrap().len())
+            .map(|m| {
+                m.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len()
+            })
             .unwrap_or(0);
 
         let backends = get_gpu_filter_backends();
@@ -1500,7 +1558,11 @@ mod tests {
 
         let devices_after = HW_DEVICES
             .get()
-            .map(|m| m.lock().unwrap().len())
+            .map(|m| {
+                m.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len()
+            })
             .unwrap_or(0);
         assert_eq!(
             devices_before, devices_after,
@@ -1705,6 +1767,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn registry_eviction_releases_device_after_unlocking() {
+        let _registry = HW_REGISTRY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = RegistrySnapshot::take();
+
+        RELEASE_SAW_UNLOCKED_REGISTRY.store(false, std::sync::atomic::Ordering::SeqCst);
+        add_hw_device(dev_with_ref("release-probe", None, registry_probe_buffer()));
+        for i in 1..HW_DEVICES_CAP {
+            add_hw_device(dev(&format!("filler-{i}"), None));
+        }
+        add_hw_device(dev("evicting-entry", None));
+
+        assert!(
+            RELEASE_SAW_UNLOCKED_REGISTRY.load(std::sync::atomic::Ordering::SeqCst),
+            "an evicted device must run its release callback after the registry guard drops"
+        );
+    }
+
     // hw_device_for_filter must never pick a TYPE_NONE entry: no filter can
     // bind such a device, and its type has no name — selecting one sent
     // av_hwdevice_get_type_name's NULL straight into CStr::from_ptr inside
@@ -1812,8 +1894,7 @@ mod tests {
         let _restore = RegistrySnapshot::take();
 
         /// Clears the poison flag on Drop — success or assertion unwind —
-        /// so it cannot leak past this test-lock critical section into
-        /// tests that still `.lock().unwrap()` the registry.
+        /// so this test does not leave process-global poison state behind.
         struct ClearPoison;
         impl Drop for ClearPoison {
             fn drop(&mut self) {
