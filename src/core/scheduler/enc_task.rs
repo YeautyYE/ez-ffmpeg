@@ -182,7 +182,7 @@ pub(crate) fn enc_init(
     );
 
     let result = std::thread::Builder::new().name(format!("encoder{stream_index}:{mux_idx}:{encoder_name}")).spawn(move || unsafe {
-        let _thread_done = thread_done_guard;
+        let _thread_done = thread_done_guard.activate();
         let enc_ctx_box = enc_ctx_box;
         let stream_box = stream_box;
         // rebind the frame-owning channel CAPTURES as body locals declared
@@ -2341,8 +2341,9 @@ mod tests {
     fn enc_opts_fixture(
         per_map_codec_opts: Option<HashMap<CString, CString>>,
     ) -> (EncoderStream, CodecContext) {
-        let enc =
-            unsafe { ffmpeg_sys_next::avcodec_find_encoder(ffmpeg_sys_next::AVCodecID::AV_CODEC_ID_MPEG4) };
+        let enc = unsafe {
+            ffmpeg_sys_next::avcodec_find_encoder(ffmpeg_sys_next::AVCodecID::AV_CODEC_ID_MPEG4)
+        };
         assert!(!enc.is_null(), "the native mpeg4 encoder must be present");
         let enc_ctx = unsafe { ffmpeg_sys_next::avcodec_alloc_context3(enc) };
         assert!(!enc_ctx.is_null());
@@ -2406,7 +2407,11 @@ mod tests {
         let video_opts = copts(&[("threads", "3"), ("bf", "2")]);
         set_encoder_opts(&enc_stream, &video_opts, &None, &None, &ctx).unwrap();
         assert_eq!(thread_count(&ctx), 1, "per-map key must win on conflicts");
-        assert_eq!(max_b_frames(&ctx), 2, "per-type-only key must survive the merge");
+        assert_eq!(
+            max_b_frames(&ctx),
+            2,
+            "per-type-only key must survive the merge"
+        );
     }
 
     /// The merged view flows the other way too: a per-type `threads` is

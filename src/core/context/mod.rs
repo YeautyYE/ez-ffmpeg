@@ -570,8 +570,17 @@ pub(crate) fn out_fmt_ctx_free(out_fmt_ctx: *mut AVFormatContext, is_set_write_c
         return;
     }
     unsafe {
-        if is_set_write_callback {
-            free_output_opaque((*out_fmt_ctx).pb);
+        let custom_io_teardown_panic = if is_set_write_callback {
+            // Detach pb before reclaiming it, then retain a callback-state
+            // teardown panic until the owning format context is also freed.
+            // free_output_opaque suppresses its stable panic when this function
+            // is already running during an unwind.
+            let avio_ctx = (*out_fmt_ctx).pb;
+            (*out_fmt_ctx).pb = null_mut();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                free_output_opaque(avio_ctx)
+            }))
+            .err()
         } else if (*(*out_fmt_ctx).oformat).flags & AVFMT_NOFILE == 0 {
             // AVFMT_NOFILE lives on the *output format* flags, not the context flags
             // (where the same bit 0x1 is AVFMT_FLAG_GENPTS). Reading it off the
@@ -580,59 +589,115 @@ pub(crate) fn out_fmt_ctx_free(out_fmt_ctx: *mut AVFormatContext, is_set_write_c
             if !pb.is_null() {
                 avio_closep(&mut pb);
             }
-        }
+            None
+        } else {
+            None
+        };
         avformat_free_context(out_fmt_ctx);
+        if let Some(payload) = custom_io_teardown_panic {
+            std::panic::resume_unwind(payload);
+        }
     }
+}
+
+/// Reports whether a custom input AVIO callback panicked and poisoned its state.
+///
+/// A null AVIO context or null opaque pointer reports `false`.
+///
+/// # Safety
+/// A non-null `avio_ctx` must be a live custom-input `AVIOContext` created by
+/// this crate, and its opaque pointer must still belong to that context. The
+/// caller must have exclusive access while reading the non-atomic poison flag.
+pub(crate) unsafe fn input_custom_io_is_poisoned(avio_ctx: *mut AVIOContext) -> bool {
+    if avio_ctx.is_null() {
+        return false;
+    }
+    let opaque_ptr = (*avio_ctx).opaque as *const InputOpaque;
+    !opaque_ptr.is_null() && (*opaque_ptr).poisoned
+}
+
+/// Reports whether a custom output AVIO callback panicked and poisoned its state.
+///
+/// A null AVIO context or null opaque pointer reports `false`.
+///
+/// # Safety
+/// A non-null `avio_ctx` must be a live custom-output `AVIOContext` created by
+/// this crate, and its opaque pointer must still belong to that context. The
+/// caller must have exclusive access while reading the non-atomic poison flag.
+pub(crate) unsafe fn output_custom_io_is_poisoned(avio_ctx: *mut AVIOContext) -> bool {
+    if avio_ctx.is_null() {
+        return false;
+    }
+    let opaque_ptr = (*avio_ctx).opaque as *const OutputOpaque;
+    !opaque_ptr.is_null() && (*opaque_ptr).poisoned
+}
+
+/// Drops one erased callback box without allowing its destructor panic to skip
+/// sibling callback disposal or AVIO reclamation.
+fn drop_custom_io_callback_contained<T>(callback: T) -> bool {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(callback))) {
+        Ok(()) => false,
+        Err(payload) => {
+            crate::core::packet_sink::dispose_panic_payload(payload);
+            true
+        }
+    }
+}
+
+unsafe fn dispose_output_opaque_callbacks(opaque_ptr: *mut OutputOpaque) -> bool {
+    if opaque_ptr.is_null() {
+        return false;
+    }
+    let OutputOpaque {
+        write,
+        seek,
+        poisoned: _,
+    } = *Box::from_raw(opaque_ptr);
+    let mut panicked = drop_custom_io_callback_contained(write);
+    if let Some(seek) = seek {
+        panicked |= drop_custom_io_callback_contained(seek);
+    }
+    panicked
+}
+
+unsafe fn dispose_input_opaque_callbacks(opaque_ptr: *mut InputOpaque) -> bool {
+    if opaque_ptr.is_null() {
+        return false;
+    }
+    let InputOpaque {
+        read,
+        seek,
+        poisoned: _,
+    } = *Box::from_raw(opaque_ptr);
+    let mut panicked = drop_custom_io_callback_contained(read);
+    if let Some(seek) = seek {
+        panicked |= drop_custom_io_callback_contained(seek);
+    }
+    panicked
 }
 
 pub(crate) unsafe fn free_output_opaque(mut avio_ctx: *mut AVIOContext) {
     if avio_ctx.is_null() {
         return;
     }
+
+    let already_panicking = std::thread::panicking();
+    let mut callback_state_panicked = false;
+    let opaque_ptr = (*avio_ctx).opaque as *mut OutputOpaque;
+    (*avio_ctx).opaque = null_mut();
+    callback_state_panicked |= dispose_output_opaque_callbacks(opaque_ptr);
+
     if !(*avio_ctx).buffer.is_null() {
         av_freep(&mut (*avio_ctx).buffer as *mut _ as *mut c_void);
     }
-    let opaque_ptr = (*avio_ctx).opaque as *mut OutputOpaque;
-    if !opaque_ptr.is_null() {
-        // The opaque box carries the USER's write/seek callback state, and
-        // its Drop is arbitrary user code with two distinct panic cases:
-        //
-        // - ALREADY UNWINDING (this free running as drop glue — the mux
-        //   teardown guard dropping on a worker panic): a second panic here
-        //   aborts the process before the frames above can release their
-        //   thread slots. Destroy the box under its own catch (per-box
-        //   containment, like the packet-sink disposal) and surface it
-        //   through a catch-protected best-effort log; the job outcome is
-        //   already the in-flight panic.
-        // - NORMAL TEARDOWN: let the panic PROPAGATE. The scheduler guards
-        //   above this frame contain the fallout (bundle disposal is
-        //   contained, the slot releases via its armed guard) and record
-        //   the job as WorkerPanicked — the pinned contract
-        //   (tests/packet_sink.rs, sibling_custom_io_destruction_panic_
-        //   prevents_on_end): a teardown that destroyed user state by
-        //   panicking must fail the job, not vanish into a log line.
-        if std::thread::panicking() {
-            let callback_state_panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                || drop(Box::from_raw(opaque_ptr)),
-            ))
-            .map_err(crate::core::packet_sink::dispose_panic_payload)
-            .is_err();
-            avio_context_free(&mut avio_ctx);
-            if callback_state_panicked {
-                // Contained itself: a panicking logger inside unwind drop
-                // glue is exactly the abort this branch exists to prevent.
-                let _ = std::panic::catch_unwind(|| {
-                    log::error!(
-                        "custom-IO output callback state panicked during teardown; the reclaim completed"
-                    );
-                })
-                .map_err(crate::core::packet_sink::dispose_panic_payload);
-            }
-            return;
-        }
-        let _ = Box::from_raw(opaque_ptr);
-    }
     avio_context_free(&mut avio_ctx);
+
+    // A destructor panic on a healthy path is a worker failure, but every
+    // callback box and native allocation must be reclaimed before publishing
+    // it. During an existing unwind the original panic remains authoritative.
+    if callback_state_panicked && !already_panicking {
+        panic!("custom-IO output callback state panicked during teardown");
+    }
 }
 
 pub(crate) fn in_fmt_ctx_free(mut in_fmt_ctx: *mut AVFormatContext, is_set_read_callback: bool) {
@@ -655,13 +720,23 @@ pub(crate) fn in_fmt_ctx_free(mut in_fmt_ctx: *mut AVFormatContext, is_set_read_
 }
 
 pub(crate) unsafe fn free_input_opaque(mut avio_ctx: *mut AVIOContext) {
-    if !avio_ctx.is_null() {
-        let opaque_ptr = (*avio_ctx).opaque as *mut InputOpaque;
-        if !opaque_ptr.is_null() {
-            let _ = Box::from_raw(opaque_ptr);
-        }
+    if avio_ctx.is_null() {
+        return;
+    }
+
+    let already_panicking = std::thread::panicking();
+    let mut callback_state_panicked = false;
+    let opaque_ptr = (*avio_ctx).opaque as *mut InputOpaque;
+    (*avio_ctx).opaque = null_mut();
+    callback_state_panicked |= dispose_input_opaque_callbacks(opaque_ptr);
+
+    if !(*avio_ctx).buffer.is_null() {
         av_freep(&mut (*avio_ctx).buffer as *mut _ as *mut c_void);
-        avio_context_free(&mut avio_ctx);
+    }
+    avio_context_free(&mut avio_ctx);
+
+    if callback_state_panicked && !already_panicking {
+        panic!("custom-IO input callback state panicked during teardown");
     }
 }
 
@@ -763,6 +838,59 @@ mod tests {
     use super::*;
     use crate::core::scheduler::ffmpeg_scheduler::{STATUS_ABORT, STATUS_END, STATUS_RUN};
 
+    unsafe fn test_avio(opaque: *mut c_void, write_flag: libc::c_int) -> *mut AVIOContext {
+        const BUFFER_SIZE: usize = 128;
+        let buffer = ffmpeg_sys_next::av_malloc(BUFFER_SIZE) as *mut u8;
+        assert!(!buffer.is_null(), "test AVIO buffer allocation failed");
+        let avio_ctx = ffmpeg_sys_next::avio_alloc_context(
+            buffer,
+            BUFFER_SIZE as libc::c_int,
+            write_flag,
+            opaque,
+            None,
+            None,
+            None,
+        );
+        if avio_ctx.is_null() {
+            ffmpeg_sys_next::av_free(buffer.cast());
+            panic!("test AVIO context allocation failed");
+        }
+        avio_ctx
+    }
+
+    fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+        payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("non-string panic payload")
+    }
+
+    struct CallbackDropBomb(Arc<AtomicUsize>);
+
+    impl Drop for CallbackDropBomb {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            panic!("test callback capture destructor");
+        }
+    }
+
+    struct FreeInputAvioOnDrop(*mut AVIOContext);
+
+    impl Drop for FreeInputAvioOnDrop {
+        fn drop(&mut self) {
+            unsafe { free_input_opaque(self.0) };
+        }
+    }
+
+    struct FreeOutputAvioOnDrop(*mut AVIOContext);
+
+    impl Drop for FreeOutputAvioOnDrop {
+        fn drop(&mut self) {
+            unsafe { free_output_opaque(self.0) };
+        }
+    }
+
     fn state_with(status: usize) -> Arc<InterruptState> {
         Arc::new(InterruptState::new(Arc::new(AtomicUsize::new(status))))
     }
@@ -825,5 +953,183 @@ mod tests {
         );
         drop(g2);
         assert!(state.should_interrupt_output());
+    }
+
+    #[test]
+    fn custom_io_poison_helpers_read_live_opaque_state() {
+        unsafe {
+            assert!(!input_custom_io_is_poisoned(null_mut()));
+            assert!(!output_custom_io_is_poisoned(null_mut()));
+
+            let input_opaque = Box::into_raw(Box::new(InputOpaque {
+                read: Box::new(|buf| buf.len() as i32),
+                seek: None,
+                poisoned: false,
+            }));
+            let input_avio = test_avio(input_opaque.cast(), 0);
+            assert!(!input_custom_io_is_poisoned(input_avio));
+            (*input_opaque).poisoned = true;
+            assert!(input_custom_io_is_poisoned(input_avio));
+            free_input_opaque(input_avio);
+
+            let output_opaque = Box::into_raw(Box::new(OutputOpaque {
+                write: Box::new(|buf| buf.len() as i32),
+                seek: None,
+                poisoned: false,
+            }));
+            let output_avio = test_avio(output_opaque.cast(), 1);
+            assert!(!output_custom_io_is_poisoned(output_avio));
+            (*output_opaque).poisoned = true;
+            assert!(output_custom_io_is_poisoned(output_avio));
+            free_output_opaque(output_avio);
+        }
+    }
+
+    #[test]
+    fn input_opaque_teardown_drops_each_callback_before_stable_repanic() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let read_bomb = CallbackDropBomb(Arc::clone(&drops));
+        let seek_bomb = CallbackDropBomb(Arc::clone(&drops));
+        let opaque = Box::into_raw(Box::new(InputOpaque {
+            read: Box::new(move |_buf| {
+                let _hold = &read_bomb;
+                0
+            }),
+            seek: Some(Box::new(move |_offset, _whence| {
+                let _hold = &seek_bomb;
+                0
+            })),
+            poisoned: false,
+        }));
+        let avio_ctx = unsafe { test_avio(opaque.cast(), 0) };
+
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            free_input_opaque(avio_ctx)
+        }))
+        .expect_err("normal teardown must publish a stable panic after reclamation");
+        assert_eq!(
+            panic_message(payload.as_ref()),
+            "custom-IO input callback state panicked during teardown"
+        );
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            2,
+            "read and seek callback boxes must both be disposed"
+        );
+    }
+
+    #[test]
+    fn output_opaque_teardown_drops_each_callback_before_stable_repanic() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let write_bomb = CallbackDropBomb(Arc::clone(&drops));
+        let seek_bomb = CallbackDropBomb(Arc::clone(&drops));
+        let opaque = Box::into_raw(Box::new(OutputOpaque {
+            write: Box::new(move |_buf| {
+                let _hold = &write_bomb;
+                0
+            }),
+            seek: Some(Box::new(move |_offset, _whence| {
+                let _hold = &seek_bomb;
+                0
+            })),
+            poisoned: false,
+        }));
+        let avio_ctx = unsafe { test_avio(opaque.cast(), 1) };
+
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            free_output_opaque(avio_ctx)
+        }))
+        .expect_err("normal teardown must publish a stable panic after reclamation");
+        assert_eq!(
+            panic_message(payload.as_ref()),
+            "custom-IO output callback state panicked during teardown"
+        );
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            2,
+            "write and seek callback boxes must both be disposed"
+        );
+    }
+
+    #[test]
+    fn output_format_teardown_preserves_the_deferred_stable_panic() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let write_bomb = CallbackDropBomb(Arc::clone(&drops));
+        let opaque = Box::into_raw(Box::new(OutputOpaque {
+            write: Box::new(move |_buf| {
+                let _hold = &write_bomb;
+                0
+            }),
+            seek: None,
+            poisoned: false,
+        }));
+        let avio_ctx = unsafe { test_avio(opaque.cast(), 1) };
+        let format_ctx = unsafe { ffmpeg_sys_next::avformat_alloc_context() };
+        assert!(
+            !format_ctx.is_null(),
+            "test format context allocation failed"
+        );
+        unsafe {
+            (*format_ctx).pb = avio_ctx;
+        }
+
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            out_fmt_ctx_free(format_ctx, true)
+        }))
+        .expect_err("the owner-level teardown must preserve the stable panic");
+        assert_eq!(
+            panic_message(payload.as_ref()),
+            "custom-IO output callback state panicked during teardown"
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn custom_io_teardown_preserves_an_existing_unwind() {
+        let input_drops = Arc::new(AtomicUsize::new(0));
+        let read_bomb = CallbackDropBomb(Arc::clone(&input_drops));
+        let seek_bomb = CallbackDropBomb(Arc::clone(&input_drops));
+        let input_opaque = Box::into_raw(Box::new(InputOpaque {
+            read: Box::new(move |_buf| {
+                let _hold = &read_bomb;
+                0
+            }),
+            seek: Some(Box::new(move |_offset, _whence| {
+                let _hold = &seek_bomb;
+                0
+            })),
+            poisoned: false,
+        }));
+        let input_avio = unsafe { test_avio(input_opaque.cast(), 0) };
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _free_on_unwind = FreeInputAvioOnDrop(input_avio);
+            panic!("primary input unwind");
+        }))
+        .expect_err("the primary input panic must propagate");
+        assert_eq!(panic_message(payload.as_ref()), "primary input unwind");
+        assert_eq!(input_drops.load(Ordering::SeqCst), 2);
+
+        let output_drops = Arc::new(AtomicUsize::new(0));
+        let write_bomb = CallbackDropBomb(Arc::clone(&output_drops));
+        let seek_bomb = CallbackDropBomb(Arc::clone(&output_drops));
+        let output_opaque = Box::into_raw(Box::new(OutputOpaque {
+            write: Box::new(move |_buf| {
+                let _hold = &write_bomb;
+                0
+            }),
+            seek: Some(Box::new(move |_offset, _whence| {
+                let _hold = &seek_bomb;
+                0
+            })),
+            poisoned: false,
+        }));
+        let output_avio = unsafe { test_avio(output_opaque.cast(), 1) };
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _free_on_unwind = FreeOutputAvioOnDrop(output_avio);
+            panic!("primary output unwind");
+        }))
+        .expect_err("the primary output panic must propagate");
+        assert_eq!(panic_message(payload.as_ref()), "primary output unwind");
+        assert_eq!(output_drops.load(Ordering::SeqCst), 2);
     }
 }

@@ -14,7 +14,7 @@ use crate::error::Error::Muxing;
 use crate::error::{MuxingError, MuxingOperationError, OpenOutputError, WriteHeaderError};
 use crate::raw::{BitStreamFilter, FormatContext};
 use crate::util::ffmpeg_utils::{av_err2str, hashmap_to_avdictionary, DictGuard};
-use crate::util::thread_synchronizer::ThreadSynchronizer;
+use crate::util::thread_synchronizer::{ThreadSynchronizer, WorkerCallbackPanicGuard};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use ffmpeg_next::packet::{Mut, Ref};
 use ffmpeg_next::Packet;
@@ -239,6 +239,12 @@ pub(crate) fn ready_to_init_mux(
         let bsf_chains = mux.bsf_chains.clone();
 
         let result = std::thread::Builder::new().name(format!("ready-to-init-muxer{mux_idx}")).spawn(move || {
+            // Keep caught FFI/waker callback panics attributable through this
+            // waiter's early-exit slot release as well as the all-ready handoff.
+            let _callback_panic_reporter = WorkerCallbackPanicGuard::install(
+                scheduler_status.clone(),
+                scheduler_result.clone(),
+            );
             // Panic net for the pre-counted thread slot (H4 companion): a
             // waiter panic used to leak the slot AND be swallowed into
             // Ok(()). Declared FIRST so it drops LAST on unwind — after the
@@ -446,6 +452,8 @@ fn mux_task_start(
     mux_done: MuxDoneGuard,
     progress: Arc<OutputTelemetry>,
 ) -> crate::error::Result<()> {
+    let _callback_panic_reporter =
+        WorkerCallbackPanicGuard::install(scheduler_status.clone(), scheduler_result.clone());
     let Some(queue_sender) = queue_sender else {
         // No queue means no mapped stream (`Muxer::new_stream` creates the
         // queue with the first stream). A packet sink cannot reach this task
@@ -1041,6 +1049,10 @@ fn _mux_init(
         let _panic_progress = MuxPanicProgressGuard {
             progress: progress.clone(),
         };
+        let _callback_panic_reporter = WorkerCallbackPanicGuard::install(
+            scheduler_status.clone(),
+            scheduler_result.clone(),
+        );
         // Borrow of the guard-owned output context for the FFI calls below;
         // NLL ends this borrow at its last use — the trailer write on a
         // container path that attempts one; earlier for a packet-sink
@@ -1813,6 +1825,19 @@ fn _mux_init(
                 {
                     progress.set_total_size(muxer_filesize((*out_fmt_ctx.as_ptr()).pb));
                 }
+                if out_fmt_ctx.is_custom_io()
+                    && crate::core::context::output_custom_io_is_poisoned(
+                        (*out_fmt_ctx.as_ptr()).pb,
+                    )
+                {
+                    set_scheduler_error(
+                        &scheduler_status,
+                        &scheduler_result,
+                        Muxing(MuxingOperationError::TrailerWriteError(MuxingError::from(
+                            AVERROR(ffmpeg_sys_next::EIO),
+                        ))),
+                    );
+                }
             }
         } else {
             debug!("Muxer skipping trailer due to abort");
@@ -2248,7 +2273,7 @@ impl Drop for MuxSlotGuard {
         self.thread_sync
             .thread_done_with_settled(self.settled_registered.get(), move || {
                 status.store(STATUS_END, Ordering::Release);
-        });
+            });
     }
 }
 
@@ -2285,20 +2310,22 @@ impl SinkDisposal {
 
     /// Mutable access to the live worker for delivery dispatch (`None`
     /// without one — no panic path).
-    fn worker_mut(
-        &mut self,
-    ) -> Option<&mut crate::core::packet_sink::strict::PacketSinkWorker> {
+    fn worker_mut(&mut self) -> Option<&mut crate::core::packet_sink::strict::PacketSinkWorker> {
         self.0.as_mut()
     }
 
     /// Forwards to the worker (`false` without one — no panic path).
     fn cancelled_cleanly(&self) -> bool {
-        self.0.as_ref().is_some_and(|worker| worker.cancelled_cleanly())
+        self.0
+            .as_ref()
+            .is_some_and(|worker| worker.cancelled_cleanly())
     }
 
     /// Forwards to the worker (`None` after disposal — no panic path).
     fn pending_error_cloned(&self) -> Option<crate::error::PacketSinkError> {
-        self.0.as_ref().and_then(|worker| worker.pending_error_cloned())
+        self.0
+            .as_ref()
+            .and_then(|worker| worker.pending_error_cloned())
     }
 
     /// Forwards the terminal dispatch to the worker (no-op after disposal).
@@ -2630,11 +2657,13 @@ impl Drop for MuxTeardownGuard {
         self.pre_receivers.clear();
 
         // (b) JOIN every encoder worker of this muxer. try_recv, NOT recv —
-        // see the struct docs. Join errors (a panicked encoder) are swallowed
-        // like the pre-existing normal-exit join; panic surfacing is a
-        // separate concern (H4).
+        // see the struct docs. The encoder guard already published its panic;
+        // dispose the joined payload under containment instead of dropping
+        // arbitrary user data in this teardown frame.
         while let Ok(handle) = self.enc_handle_receiver.try_recv() {
-            let _ = handle.join();
+            if let Err(payload) = handle.join() {
+                dispose_panic_payload(payload);
+            }
         }
 
         // (c) FREE the output context last (FormatContext::drop ->

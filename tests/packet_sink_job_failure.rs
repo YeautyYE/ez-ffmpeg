@@ -6,14 +6,17 @@
 
 mod common;
 
-use common::wait_with_watchdog;
-use ez_ffmpeg::error::{Error, PacketSinkError};
+use common::{tmp_path_in, wait_with_watchdog};
+use ez_ffmpeg::error::{Error, MuxingOperationError, PacketSinkError};
+use ez_ffmpeg::filter::frame_filter::{FrameFilter, FrameFilterError, RequestFrameMode};
+use ez_ffmpeg::filter::frame_filter_context::FrameFilterContext;
+use ez_ffmpeg::filter::frame_pipeline_builder::FramePipelineBuilder;
 use ez_ffmpeg::packet_sink::{
     JobFailureKind, JobFailureSummary, PacketCallbackResult, PacketSink, PacketSinkHandler,
     PacketView,
 };
-use ez_ffmpeg::{FfmpegContext, Input, Output};
-use std::sync::atomic::{AtomicBool, Ordering};
+use ez_ffmpeg::{AVMediaType, FfmpegContext, Frame, Input, Output};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -81,6 +84,191 @@ fn run_with_failing_sibling(
     result.expect_err("the sibling write failure must fail the job")
 }
 
+fn custom_input_fixture() -> Vec<u8> {
+    let path = tmp_path_in(
+        "ez_ffmpeg_packet_sink_job_failure_tests",
+        "custom_input_worker_panic.ts",
+    );
+    let scheduler = FfmpegContext::builder()
+        .input(Input::from("sine=frequency=440:duration=20").set_format("lavfi"))
+        .output(
+            Output::from(path.as_str())
+                .set_format("mpegts")
+                .set_audio_codec("aac"),
+        )
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+    wait_with_watchdog(scheduler, 60, "custom_input_fixture").unwrap();
+    std::fs::read(path).unwrap()
+}
+
+#[test]
+fn custom_read_panic_after_build_fails_the_running_job() {
+    let bytes = Arc::new(custom_input_fixture());
+    let position = Arc::new(Mutex::new(0usize));
+    let armed = Arc::new(AtomicBool::new(false));
+    let panic_calls = Arc::new(AtomicUsize::new(0));
+
+    let read_bytes = bytes.clone();
+    let read_position = position.clone();
+    let read_armed = armed.clone();
+    let read_panic_calls = panic_calls.clone();
+    let input = Input::new_by_read_callback(move |buf: &mut [u8]| -> i32 {
+        if read_armed.load(Ordering::Acquire) {
+            read_panic_calls.fetch_add(1, Ordering::AcqRel);
+            panic!("test-injected custom read panic");
+        }
+        let mut position = read_position.lock().unwrap();
+        if *position == read_bytes.len() {
+            return ffmpeg_sys_next::AVERROR_EOF;
+        }
+        let len = buf.len().min(read_bytes.len() - *position);
+        buf[..len].copy_from_slice(&read_bytes[*position..*position + len]);
+        *position += len;
+        len as i32
+    })
+    .set_format("mpegts")
+    .set_io_buffer_size(512);
+
+    let sink = PacketSink::builder(|_packet: &PacketView<'_>| Ok(())).build();
+    let context = FfmpegContext::builder()
+        .input(input)
+        .output(Output::from(sink).set_audio_codec("aac"))
+        .build()
+        .unwrap();
+    assert!(
+        *position.lock().unwrap() < bytes.len(),
+        "the fixture must retain worker-side reads after probing"
+    );
+
+    armed.store(true, Ordering::Release);
+    let scheduler = context.start().unwrap();
+    let result = wait_with_watchdog(scheduler, 60, "custom_read_worker_panic");
+    assert!(
+        matches!(result, Err(Error::Demuxing(_))),
+        "the contained read panic must remain a demuxing job error: {result:?}"
+    );
+    assert_eq!(
+        panic_calls.load(Ordering::Acquire),
+        1,
+        "a poisoned custom input must not re-enter the callback"
+    );
+}
+
+#[derive(Default)]
+struct SeekableOutput {
+    bytes: Vec<u8>,
+    position: usize,
+}
+
+struct HoldVideoUntilArmed(Arc<AtomicBool>);
+
+impl FrameFilter for HoldVideoUntilArmed {
+    fn media_type(&self) -> AVMediaType {
+        AVMediaType::AVMEDIA_TYPE_VIDEO
+    }
+
+    fn filter_frame(
+        &mut self,
+        frame: Frame,
+        _ctx: &mut FrameFilterContext,
+    ) -> Result<Option<Frame>, FrameFilterError> {
+        while !self.0.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Ok(Some(frame))
+    }
+
+    fn request_frame_mode(&self) -> RequestFrameMode {
+        RequestFrameMode::Never
+    }
+}
+
+#[test]
+fn final_custom_output_seek_panic_is_a_trailer_error() {
+    let output_state = Arc::new(Mutex::new(SeekableOutput::default()));
+    let probe_armed = Arc::new(AtomicBool::new(false));
+    let panic_calls = Arc::new(AtomicUsize::new(0));
+
+    let write_state = output_state.clone();
+    let output = Output::new_by_write_callback(move |buf: &[u8]| -> i32 {
+        let mut state = write_state.lock().unwrap();
+        let start = state.position;
+        let end = start + buf.len();
+        if state.bytes.len() < end {
+            state.bytes.resize(end, 0);
+        }
+        state.bytes[start..end].copy_from_slice(buf);
+        state.position = end;
+        buf.len() as i32
+    });
+
+    let seek_state = output_state.clone();
+    let seek_armed = probe_armed.clone();
+    let seek_panic_calls = panic_calls.clone();
+    let output = output
+        .set_seek_callback(move |offset: i64, whence: i32| -> i64 {
+            let whence = whence & !ffmpeg_sys_next::AVSEEK_FORCE;
+            if whence == ffmpeg_sys_next::AVSEEK_SIZE {
+                let state = seek_state.lock().unwrap();
+                return state.bytes.len() as i64;
+            }
+            if whence == ffmpeg_sys_next::SEEK_SET && seek_armed.load(Ordering::Acquire) {
+                seek_panic_calls.fetch_add(1, Ordering::AcqRel);
+                panic!("test-injected final seek panic");
+            }
+
+            let mut state = seek_state.lock().unwrap();
+            let target = match whence {
+                ffmpeg_sys_next::SEEK_SET => offset,
+                ffmpeg_sys_next::SEEK_CUR => state.position as i64 + offset,
+                ffmpeg_sys_next::SEEK_END => state.bytes.len() as i64 + offset,
+                _ => return ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::ESPIPE) as i64,
+            };
+            if target < 0 {
+                return ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::ESPIPE) as i64;
+            }
+            state.position = target as usize;
+            target
+        })
+        .set_format("mp4")
+        .set_video_codec("mpeg4")
+        .set_io_buffer_size(4096);
+
+    let gate = FramePipelineBuilder::new(AVMediaType::AVMEDIA_TYPE_VIDEO).filter(
+        "hold-until-progress-observed",
+        Box::new(HoldVideoUntilArmed(probe_armed.clone())),
+    );
+    let scheduler = FfmpegContext::builder()
+        .input(
+            Input::from("color=c=blue:s=320x240:r=30:d=2")
+                .set_format("lavfi")
+                .add_frame_pipeline(gate),
+        )
+        .output(output)
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+    probe_armed.store(true, Ordering::Release);
+
+    let result = wait_with_watchdog(scheduler, 60, "final_custom_output_seek_panic");
+    assert!(
+        matches!(
+            result,
+            Err(Error::Muxing(MuxingOperationError::TrailerWriteError(_)))
+        ),
+        "the contained final seek panic must be a trailer error: {result:?}"
+    );
+    assert_eq!(
+        panic_calls.load(Ordering::Acquire),
+        1,
+        "a poisoned custom output must not re-enter the seek callback"
+    );
+}
+
 /// (b) Registered observer: the sibling failure produces exactly one
 /// structured summary (kind `Mux`, message == the job error's Display
 /// output) immediately before exactly one `JobFailed` terminal, and never
@@ -95,21 +283,21 @@ fn sibling_failure_reaches_on_job_failed_with_a_mux_summary() {
         delivered_cb.store(true, Ordering::Release);
         Ok(())
     })
-        .on_job_failed(move |summary: &JobFailureSummary| {
-            jf_log.lock().unwrap().push(Ev::JobFailed {
-                kind: summary.kind(),
-                message: summary.message().to_string(),
-            });
-        })
-        .on_end(move || end_log.lock().unwrap().push(Ev::End))
-        .on_delivery_error(move |e| {
-            let message = match e {
-                PacketSinkError::JobFailed { message } => message.clone(),
-                other => format!("unexpected terminal: {other}"),
-            };
-            err_log.lock().unwrap().push(Ev::DeliveryError(message));
-        })
-        .build();
+    .on_job_failed(move |summary: &JobFailureSummary| {
+        jf_log.lock().unwrap().push(Ev::JobFailed {
+            kind: summary.kind(),
+            message: summary.message().to_string(),
+        });
+    })
+    .on_end(move || end_log.lock().unwrap().push(Ev::End))
+    .on_delivery_error(move |e| {
+        let message = match e {
+            PacketSinkError::JobFailed { message } => message.clone(),
+            other => format!("unexpected terminal: {other}"),
+        };
+        err_log.lock().unwrap().push(Ev::DeliveryError(message));
+    })
+    .build();
 
     let job_err = run_with_failing_sibling(sink, delivered, "job_failure_summary_registered");
     assert!(
@@ -217,15 +405,15 @@ fn unregistered_on_job_failed_keeps_the_baseline_terminal_shape() {
         delivered_cb.store(true, Ordering::Release);
         Ok(())
     })
-        .on_end(move || end_log.lock().unwrap().push(Ev::End))
-        .on_delivery_error(move |e| {
-            let message = match e {
-                PacketSinkError::JobFailed { message } => message.clone(),
-                other => format!("unexpected terminal: {other}"),
-            };
-            err_log.lock().unwrap().push(Ev::DeliveryError(message));
-        })
-        .build();
+    .on_end(move || end_log.lock().unwrap().push(Ev::End))
+    .on_delivery_error(move |e| {
+        let message = match e {
+            PacketSinkError::JobFailed { message } => message.clone(),
+            other => format!("unexpected terminal: {other}"),
+        };
+        err_log.lock().unwrap().push(Ev::DeliveryError(message));
+    })
+    .build();
 
     let job_err = run_with_failing_sibling(sink, delivered, "job_failure_summary_unregistered");
     assert!(matches!(job_err, Error::Muxing(_)));
