@@ -151,7 +151,7 @@ pub(crate) fn filter_graph_init(
     let result = std::thread::Builder::new()
         .name(format!("filtergraph{fg_index}"))
         .spawn(move || {
-            let _thread_done = thread_done_guard;
+            let _thread_done = thread_done_guard.activate();
             // the frame-owning resources below are `move`-closure CAPTURES,
             // but `_thread_done` (which releases the thread slot, zeroing the sync
             // counter that stop()/wait()/the async Future gate on) is a body local.

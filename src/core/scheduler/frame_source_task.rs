@@ -88,7 +88,7 @@ pub(crate) fn frame_source_init(
     let result = std::thread::Builder::new()
         .name(format!("framesource{index}"))
         .spawn(move || {
-            let _thread_done = thread_done_guard;
+            let _thread_done = thread_done_guard.activate();
             // Progress producer-exit flag: body local declared AFTER the
             // thread-done guard, so on every exit (including unwind) it
             // flips BEFORE the slot release the guard performs.

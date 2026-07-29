@@ -51,11 +51,11 @@ use ffmpeg_sys_next::{
     avcodec_descriptor_get, avcodec_descriptor_get_by_name, avcodec_find_encoder,
     avcodec_find_encoder_by_name, avcodec_get_name, avcodec_parameters_from_context,
     avcodec_parameters_to_context, avformat_alloc_context, avformat_alloc_output_context2,
-    avformat_close_input, avformat_find_stream_info, avformat_flush, avformat_free_context,
-    avformat_open_input, avio_alloc_context, AVCodec, AVCodecID, AVColorRange, AVColorSpace,
-    AVFormatContext, AVMediaType, AVOutputFormat, AVPixelFormat, AVRational, AVSampleFormat,
-    AVStream, AVERROR_ENCODER_NOT_FOUND, AVFMT_FLAG_CUSTOM_IO, AVFMT_GLOBALHEADER,
-    AVFMT_NOBINSEARCH, AVFMT_NOFILE, AVFMT_NOGENSEARCH, AVFMT_NOSTREAMS, AVSEEK_FLAG_BACKWARD,
+    avformat_close_input, avformat_find_stream_info, avformat_flush, avformat_open_input,
+    avio_alloc_context, AVCodec, AVCodecID, AVColorRange, AVColorSpace, AVFormatContext,
+    AVMediaType, AVOutputFormat, AVPixelFormat, AVRational, AVSampleFormat, AVStream,
+    AVERROR_ENCODER_NOT_FOUND, AVFMT_FLAG_CUSTOM_IO, AVFMT_GLOBALHEADER, AVFMT_NOBINSEARCH,
+    AVFMT_NOFILE, AVFMT_NOGENSEARCH, AVFMT_NOSTREAMS, AVSEEK_FLAG_BACKWARD,
     AV_CODEC_PROP_BITMAP_SUB, AV_CODEC_PROP_TEXT_SUB, AV_TIME_BASE,
 };
 #[cfg(not(docsrs))]
@@ -76,13 +76,13 @@ use std::ptr::{null, null_mut};
 use std::sync::Arc;
 
 mod fg_bind;
-#[cfg(all(test, not(docsrs)))]
-mod per_stream_encoder_tests;
 #[cfg(not(docsrs))]
 mod fg_probe;
 pub(crate) mod open_input;
 mod open_output;
 mod opt_util;
+#[cfg(all(test, not(docsrs)))]
+mod per_stream_encoder_tests;
 mod writer_build;
 
 pub(crate) use writer_build::build_writer_context;
@@ -106,7 +106,7 @@ use fg_bind::{bind_fg_inputs_by_fg, fg_complex_bind_input};
 #[cfg(test)]
 use open_input::{read_packet_wrapper, seek_input_packet_wrapper};
 #[cfg(test)]
-use open_output::write_packet_wrapper;
+use open_output::{seek_output_packet_wrapper, write_packet_wrapper};
 
 pub struct FfmpegContext {
     pub(crate) independent_readrate: bool,
@@ -527,8 +527,8 @@ mod tests {
 
     use crate::core::context::ffmpeg_context::{bind_fg_inputs_by_fg, fg_complex_bind_input};
     use crate::core::context::ffmpeg_context::{
-        read_packet_wrapper, seek_input_packet_wrapper, write_packet_wrapper, InputOpaque,
-        OutputOpaque,
+        read_packet_wrapper, seek_input_packet_wrapper, seek_output_packet_wrapper,
+        write_packet_wrapper, InputOpaque, OutputOpaque,
     };
     use crate::core::context::filter_graph::FilterGraph;
     use crate::core::context::input_filter::InputFilter;
@@ -965,6 +965,88 @@ mod tests {
             "the panicking closure must never be re-entered once poisoned"
         );
         unsafe { drop(Box::from_raw(opaque)) };
+    }
+
+    #[test]
+    fn all_avio_wrappers_dispose_panicking_panic_payloads() {
+        struct PanicOnDrop(Arc<AtomicUsize>);
+
+        impl Drop for PanicOnDrop {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, AtomicOrdering::SeqCst);
+                panic!("test panic payload destructor");
+            }
+        }
+
+        let payload_drops = Arc::new(AtomicUsize::new(0));
+        let mut read_buf = [0u8; 8];
+        let write_buf = [0u8; 8];
+
+        let read_drop = Arc::clone(&payload_drops);
+        let input_read = Box::into_raw(Box::new(InputOpaque {
+            read: Box::new(move |_buf| -> i32 {
+                std::panic::panic_any(PanicOnDrop(Arc::clone(&read_drop)))
+            }),
+            seek: None,
+            poisoned: false,
+        }));
+        let ret = unsafe {
+            read_packet_wrapper(
+                input_read as *mut libc::c_void,
+                read_buf.as_mut_ptr(),
+                read_buf.len() as libc::c_int,
+            )
+        };
+        assert_eq!(ret, eio());
+        unsafe { drop(Box::from_raw(input_read)) };
+
+        let seek_drop = Arc::clone(&payload_drops);
+        let input_seek = Box::into_raw(Box::new(InputOpaque {
+            read: Box::new(|buf| buf.len() as i32),
+            seek: Some(Box::new(move |_offset, _whence| -> i64 {
+                std::panic::panic_any(PanicOnDrop(Arc::clone(&seek_drop)))
+            })),
+            poisoned: false,
+        }));
+        let ret = unsafe { seek_input_packet_wrapper(input_seek.cast(), 0, 0) };
+        assert_eq!(ret, eio() as i64);
+        unsafe { drop(Box::from_raw(input_seek)) };
+
+        let write_drop = Arc::clone(&payload_drops);
+        let output_write = Box::into_raw(Box::new(OutputOpaque {
+            write: Box::new(move |_buf| -> i32 {
+                std::panic::panic_any(PanicOnDrop(Arc::clone(&write_drop)))
+            }),
+            seek: None,
+            poisoned: false,
+        }));
+        let ret = unsafe {
+            write_packet_wrapper(
+                output_write.cast(),
+                write_buf.as_ptr(),
+                write_buf.len() as libc::c_int,
+            )
+        };
+        assert_eq!(ret, eio());
+        unsafe { drop(Box::from_raw(output_write)) };
+
+        let output_seek_drop = Arc::clone(&payload_drops);
+        let output_seek = Box::into_raw(Box::new(OutputOpaque {
+            write: Box::new(|buf| buf.len() as i32),
+            seek: Some(Box::new(move |_offset, _whence| -> i64 {
+                std::panic::panic_any(PanicOnDrop(Arc::clone(&output_seek_drop)))
+            })),
+            poisoned: false,
+        }));
+        let ret = unsafe { seek_output_packet_wrapper(output_seek.cast(), 0, 0) };
+        assert_eq!(ret, eio() as i64);
+        unsafe { drop(Box::from_raw(output_seek)) };
+
+        assert_eq!(
+            payload_drops.load(AtomicOrdering::SeqCst),
+            4,
+            "every caught panic payload destructor must run under containment"
+        );
     }
 
     #[test]

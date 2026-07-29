@@ -3,7 +3,73 @@
 //! live workers behind a condvar instead, because threads are detached
 //! `std::thread` spawns whose handles the scheduler does not keep.
 
+use std::cell::RefCell;
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Condvar, Mutex};
+
+#[derive(Clone)]
+struct WorkerCallbackPanicReporter {
+    scheduler_status: Arc<AtomicUsize>,
+    scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
+}
+
+thread_local! {
+    static WORKER_CALLBACK_PANIC_REPORTER: RefCell<Option<WorkerCallbackPanicReporter>> =
+        const { RefCell::new(None) };
+}
+
+/// Installs scheduler error publication for user-code panics that must be
+/// caught before they can leave an FFI callback on this worker.
+pub(crate) struct WorkerCallbackPanicGuard {
+    previous: Option<WorkerCallbackPanicReporter>,
+}
+
+impl WorkerCallbackPanicGuard {
+    pub(crate) fn install(
+        scheduler_status: Arc<AtomicUsize>,
+        scheduler_result: Arc<Mutex<Option<crate::error::Result<()>>>>,
+    ) -> Self {
+        let reporter = WorkerCallbackPanicReporter {
+            scheduler_status,
+            scheduler_result,
+        };
+        let previous = WORKER_CALLBACK_PANIC_REPORTER.with(|slot| slot.replace(Some(reporter)));
+        Self { previous }
+    }
+}
+
+impl Drop for WorkerCallbackPanicGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        WORKER_CALLBACK_PANIC_REPORTER.with(|slot| {
+            slot.replace(previous);
+        });
+    }
+}
+
+/// Records a user-code panic caught at an FFI boundary for the current
+/// scheduler worker. Returns false when the current thread is not owned by a
+/// running scheduler (for example, a build-time FFmpeg call).
+pub(crate) fn report_worker_callback_panic() -> bool {
+    let reporter = WORKER_CALLBACK_PANIC_REPORTER.with(|slot| {
+        slot.try_borrow()
+            .ok()
+            .and_then(|reporter| reporter.as_ref().cloned())
+    });
+    let Some(reporter) = reporter else {
+        return false;
+    };
+    let name = std::thread::current()
+        .name()
+        .unwrap_or("worker")
+        .to_string();
+    crate::core::scheduler::ffmpeg_scheduler::set_scheduler_error(
+        &reporter.scheduler_status,
+        &reporter.scheduler_result,
+        crate::error::Error::WorkerPanicked(name),
+    );
+    true
+}
 
 #[derive(Clone)]
 pub struct ThreadSynchronizer {
@@ -176,7 +242,12 @@ impl ThreadSynchronizer {
         // disarm.
         #[cfg(feature = "async")]
         if let Some(waker) = waker_to_fire {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || waker.wake()));
+            if let Err(payload) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || waker.wake()))
+            {
+                report_worker_callback_panic();
+                crate::core::packet_sink::dispose_panic_payload(payload);
+            }
         }
     }
 
@@ -325,6 +396,7 @@ pub(crate) struct ThreadDoneGuard {
     thread_sync: ThreadSynchronizer,
     scheduler_status: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     scheduler_result: std::sync::Arc<std::sync::Mutex<Option<crate::error::Result<()>>>>,
+    callback_panic_guard: Option<WorkerCallbackPanicGuard>,
 }
 
 impl ThreadDoneGuard {
@@ -337,7 +409,23 @@ impl ThreadDoneGuard {
             thread_sync,
             scheduler_status,
             scheduler_result,
+            callback_panic_guard: None,
         }
+    }
+
+    /// Activates FFI callback panic reporting on the worker after the guard has
+    /// moved off the spawning thread.
+    pub(crate) fn activate(mut self) -> Self {
+        self.activate_in_place();
+        self
+    }
+
+    pub(crate) fn activate_in_place(&mut self) {
+        debug_assert!(self.callback_panic_guard.is_none());
+        self.callback_panic_guard = Some(WorkerCallbackPanicGuard::install(
+            self.scheduler_status.clone(),
+            self.scheduler_result.clone(),
+        ));
     }
 }
 
@@ -597,6 +685,34 @@ mod panic_tests {
         assert!(result.lock().unwrap().is_none());
     }
 
+    #[test]
+    fn activated_worker_reports_a_contained_callback_panic() {
+        let sync = ThreadSynchronizer::new();
+        let status = Arc::new(std::sync::atomic::AtomicUsize::new(
+            crate::core::scheduler::ffmpeg_scheduler::STATUS_RUN,
+        ));
+        let result: Arc<Mutex<Option<crate::error::Result<()>>>> = Arc::new(Mutex::new(None));
+
+        sync.thread_start();
+        let guard = ThreadDoneGuard::adopt(sync.clone(), status.clone(), result.clone());
+        std::thread::Builder::new()
+            .name("ffi-callback-worker".to_string())
+            .spawn(move || {
+                let _guard = guard.activate();
+                assert!(report_worker_callback_panic());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+
+        match result.lock().unwrap().as_ref() {
+            Some(Err(crate::error::Error::WorkerPanicked(name))) => {
+                assert_eq!(name, "ffi-callback-worker");
+            }
+            other => panic!("expected a contained callback panic, got {other:?}"),
+        };
+    }
+
     /// `Waker::wake()` is a safe API with no panic guarantee. It is now
     /// fired OUTSIDE the counter lock and wrapped in `catch_unwind`, so a
     /// panicking waker must NOT propagate out of `thread_done_with` (which would
@@ -633,6 +749,46 @@ mod panic_tests {
         sync.thread_start();
         sync.thread_done_with(|| {});
         sync.wait_for_all_threads();
+    }
+
+    #[cfg(feature = "async")]
+    #[test]
+    fn panicking_waker_payload_is_disposed_under_containment() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::{RawWaker, RawWakerVTable, Waker};
+
+        static DISPOSED: AtomicBool = AtomicBool::new(false);
+
+        struct PayloadBomb;
+        impl Drop for PayloadBomb {
+            fn drop(&mut self) {
+                DISPOSED.store(true, Ordering::Release);
+                if !std::thread::panicking() {
+                    panic!("test-injected waker payload destructor panic");
+                }
+            }
+        }
+
+        unsafe fn clone_panic(_: *const ()) -> RawWaker {
+            RawWaker::new(std::ptr::null(), &PANIC_VTABLE)
+        }
+        unsafe fn wake_panic(_: *const ()) {
+            std::panic::panic_any(PayloadBomb);
+        }
+        unsafe fn drop_noop(_: *const ()) {}
+        static PANIC_VTABLE: RawWakerVTable =
+            RawWakerVTable::new(clone_panic, wake_panic, wake_panic, drop_noop);
+
+        DISPOSED.store(false, Ordering::Release);
+        let sync = ThreadSynchronizer::new();
+        sync.thread_start();
+        sync.set_waker(unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &PANIC_VTABLE)) });
+        sync.thread_done_with(|| {});
+
+        assert!(
+            DISPOSED.load(Ordering::Acquire),
+            "the caught waker panic payload must be disposed"
+        );
     }
 
     /// the async Future gates readiness on `all_threads_done()` (the
