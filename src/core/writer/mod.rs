@@ -899,6 +899,12 @@ fn validate_writer_output(output: &Output) -> Result<(), WriterError> {
             return Err(WriterError::UnsupportedOutputOption { option, reason });
         }
     }
+    // Stream maps address multi-stream selection the writer does not have:
+    // its single pushed video stream IS the mapping, so maps are rejected
+    // rather than silently ignored — and before the destination is opened.
+    if !output.stream_map_specs.is_empty() || !output.stream_maps.is_empty() {
+        return Err(WriterError::StreamMapsUnsupported);
+    }
     Ok(())
 }
 
