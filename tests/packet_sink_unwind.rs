@@ -290,10 +290,7 @@ fn on_end_survives_capture_drop_panic_composed_with_logger_panic() {
 
     // The containment log fired (and panicked): the needle was consumed.
     assert!(
-        TRIGGER
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_none(),
+        TRIGGER.lock().unwrap_or_else(|e| e.into_inner()).is_none(),
         "the containment failure log must have fired and hit the armed logger"
     );
     disarm_all();
@@ -370,10 +367,7 @@ fn settled_result_survives_finish_panic_logger_panic_and_drop_panic() {
     // The terminal-callback failure log fired (and panicked): the needle
     // was consumed.
     assert!(
-        TRIGGER
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_none(),
+        TRIGGER.lock().unwrap_or_else(|e| e.into_inner()).is_none(),
         "the terminal-callback failure log must have fired and hit the armed logger"
     );
     disarm_all();
@@ -431,10 +425,7 @@ fn terminal_entry_logger_panic_still_delivers_on_end() {
     let result = wait_with_watchdog(scheduler, 60, "terminal_entry_logger_panic");
 
     assert!(
-        TRIGGER
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_none(),
+        TRIGGER.lock().unwrap_or_else(|e| e.into_inner()).is_none(),
         "the terminal-entry log must have fired and hit the armed logger"
     );
     disarm_all();
@@ -493,9 +484,7 @@ fn panicking_on_packet_fails_job_with_worker_panic_and_no_terminal() {
 
     match result {
         Err(Error::WorkerPanicked(_)) => {}
-        other => panic!(
-            "a panicking on_packet must fail the job as WorkerPanicked, got {other:?}"
-        ),
+        other => panic!("a panicking on_packet must fail the job as WorkerPanicked, got {other:?}"),
     }
     assert!(
         destroyed_packet.load(Ordering::Acquire) && destroyed_end.load(Ordering::Acquire),
@@ -543,6 +532,7 @@ fn sink_disposal_child() {
         None => {}
         Some("two_destructor_bombs") => child_two_destructor_bombs(),
         Some("panicking_payload_bomb") => child_panicking_payload_bomb(),
+        Some("delivery_payload_bomb") => child_delivery_payload_bomb(),
         Some("delivery_error_source_bomb") => child_delivery_error_source_bomb(),
         Some("delivery_callback_panic_with_capture_bomb") => {
             child_delivery_callback_panic_with_capture_bomb()
@@ -665,6 +655,36 @@ fn child_panicking_payload_bomb() {
     );
 }
 
+/// A delivery callback throws a payload whose destructor panics when the
+/// caught payload is discarded. The delivery boundary must dispose that
+/// payload before rethrowing its stable worker-panic marker; otherwise the
+/// detached thread result owns arbitrary user drop glue.
+fn child_delivery_payload_bomb() {
+    let payload_disposed = Arc::new(AtomicBool::new(false));
+    let payload_flag = payload_disposed.clone();
+    let sink = PacketSink::builder(move |_pkt| {
+        std::panic::panic_any(PayloadBomb(payload_flag.clone()));
+    })
+    .build();
+
+    let scheduler = FfmpegContext::builder()
+        .input(Input::from("sine=frequency=440:duration=1").set_format("lavfi"))
+        .output(Output::from(sink).set_audio_codec("aac"))
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+    let result = wait_with_watchdog(scheduler, 60, "delivery_payload_bomb");
+    assert!(
+        matches!(result, Err(Error::WorkerPanicked(_))),
+        "the delivery panic must retain the WorkerPanicked result: {result:?}"
+    );
+    assert!(
+        payload_disposed.load(Ordering::Acquire),
+        "the delivery panic payload must be disposed before worker exit"
+    );
+}
+
 /// A caller-supplied error source whose destructor panics unconditionally
 /// — even mid-unwind, where an uncontained drop aborts the process. The
 /// shape of the delivery-error custody hazard: once first-error-wins let a
@@ -711,12 +731,10 @@ fn child_delivery_error_source_bomb() {
     let bomb_flag = source_destroyed.clone();
     let (ev_end, ev_err) = (events.clone(), events.clone());
     let sink = PacketSink::builder(move |_pkt| {
-        Err(
-            ez_ffmpeg::packet_sink::PacketCallbackError::with_source(
-                "sink consumer rejection",
-                SourceBomb(bomb_flag.clone()),
-            ),
-        )
+        Err(ez_ffmpeg::packet_sink::PacketCallbackError::with_source(
+            "sink consumer rejection",
+            SourceBomb(bomb_flag.clone()),
+        ))
     })
     .on_end(move || ev_end.lock().unwrap().push("end".to_string()))
     .on_delivery_error(move |e| {
@@ -876,13 +894,12 @@ fn child_delivery_loop_logger_panic_with_capture_bomb() {
 
     let destroyed = Arc::new(AtomicBool::new(false));
     let bomb = AlwaysPanicOnDrop(destroyed.clone());
-    let sink = PacketSink::builder(|_pkt| {
-        Err(ez_ffmpeg::packet_sink::PacketCallbackError::new("stash"))
-    })
-    .on_delivery_error(move |_e| {
-        let _hold = &bomb;
-    })
-    .build();
+    let sink =
+        PacketSink::builder(|_pkt| Err(ez_ffmpeg::packet_sink::PacketCallbackError::new("stash")))
+            .on_delivery_error(move |_e| {
+                let _hold = &bomb;
+            })
+            .build();
 
     *TRIGGER.lock().unwrap_or_else(|e| e.into_inner()) = Some("Error muxing a packet");
     let scheduler = FfmpegContext::builder()
@@ -892,15 +909,16 @@ fn child_delivery_loop_logger_panic_with_capture_bomb() {
         .unwrap()
         .start()
         .unwrap();
-    let result = wait_with_watchdog(scheduler, 60, "delivery_loop_logger_panic_with_capture_bomb");
+    let result = wait_with_watchdog(
+        scheduler,
+        60,
+        "delivery_loop_logger_panic_with_capture_bomb",
+    );
     // The needle must have been consumed — otherwise the scenario silently
     // degraded to the plain callback-error path (no unwind, terminal-region
     // disposal) and proves nothing about mid-loop custody.
     assert!(
-        TRIGGER
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_none(),
+        TRIGGER.lock().unwrap_or_else(|e| e.into_inner()).is_none(),
         "the packet-error log must have fired and hit the armed logger"
     );
     disarm_all();
@@ -946,6 +964,12 @@ fn delivery_error_source_destructor_does_not_abort_the_process() {
 #[test]
 fn panicking_payload_destructor_does_not_abort_the_process() {
     run_child_scenario("panicking_payload_bomb");
+}
+
+/// Parent probe: a delivery-phase hostile panic payload (see the child fn).
+#[test]
+fn delivery_payload_destructor_does_not_abort_the_process() {
+    run_child_scenario("delivery_payload_bomb");
 }
 
 /// Full-job settlement: a filter worker's FINAL log fires AFTER the sink

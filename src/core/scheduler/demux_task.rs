@@ -112,7 +112,7 @@ pub(crate) fn demux_init(
     let result = std::thread::Builder::new()
         .name(format!("demuxer{demux_idx}:{format_name}"))
         .spawn(move || {
-            let _thread_done = thread_done_guard;
+            let _thread_done = thread_done_guard.activate();
             // Move the FormatContext into the worker; it Drops (frees the input
             // context, custom-IO-aware) when this closure ends — the terminal free.
             let in_fmt_ctx = in_fmt_ctx;
@@ -149,6 +149,23 @@ pub(crate) fn demux_init(
 
                 unsafe {
                     let mut ret = av_read_frame(in_fmt_ctx.as_ptr(), packet.as_mut_ptr());
+                    let callback_panicked = in_fmt_ctx.is_custom_io()
+                        && crate::core::context::input_custom_io_is_poisoned(
+                            (*in_fmt_ctx.as_ptr()).pb,
+                        );
+                    if callback_panicked {
+                        // Custom callback panic is not a recoverable demux
+                        // corruption. Publish it before a concurrent stop check
+                        // can turn this iteration into a clean exit.
+                        ret = AVERROR(ffmpeg_sys_next::EIO);
+                        set_scheduler_error(
+                            &scheduler_status,
+                            &scheduler_result,
+                            Demuxing(DemuxingOperationError::ReadFrameError(
+                                DemuxingError::from(ret),
+                            )),
+                        );
+                    }
                     if ret == AVERROR(EAGAIN) {
                         if is_stopping(wait_until_not_paused(&scheduler_status)) {
                             info!("Demuxer receiver end command, finishing.");
@@ -169,7 +186,10 @@ pub(crate) fn demux_init(
                             debug!("EOF while reading input");
                         } else {
                             error!("Error during demuxing: {}", av_err2str(ret));
-                            ret = if !is_started || demux_parameter.exit_on_error {
+                            ret = if callback_panicked
+                                || !is_started
+                                || demux_parameter.exit_on_error
+                            {
                                 ret
                             } else {
                                 0

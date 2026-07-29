@@ -105,10 +105,7 @@ impl From<PacketSinkError> for ProcessFailure {
 }
 
 /// Maps a consumer callback error onto the delivery outcome.
-fn callback_failure(
-    error: PacketCallbackError,
-    stream_index: Option<usize>,
-) -> ProcessFailure {
+fn callback_failure(error: PacketCallbackError, stream_index: Option<usize>) -> ProcessFailure {
     match error.kind {
         CallbackFailureKind::Cancelled => ProcessFailure::Cancelled,
         CallbackFailureKind::JobStopped => ProcessFailure::JobStopped,
@@ -438,7 +435,8 @@ impl PacketSinkWorker {
             return 0;
         }
         self.phase = Phase::Running;
-        if let Err(cb) = self.sink.dispatch_stream_info(&self.infos) {
+        let delivery = contain_delivery_panic(|| self.sink.dispatch_stream_info(&self.infos));
+        if let Err(cb) = delivery {
             match callback_failure(cb, None) {
                 ProcessFailure::Cancelled => self.cancelled = true,
                 ProcessFailure::JobStopped => {}
@@ -525,11 +523,7 @@ impl PacketSinkWorker {
                     .codec
                     .check_new_extradata(bytes, stream_index)?;
             } else if sd_type == AV_PKT_DATA_PARAM_CHANGE {
-                check_param_change(
-                    &self.streams[stream_index].projection,
-                    stream_index,
-                    bytes,
-                )?;
+                check_param_change(&self.streams[stream_index].projection, stream_index, bytes)?;
             }
         }
 
@@ -634,7 +628,8 @@ impl PacketSinkWorker {
             applied_offset,
             data,
         };
-        if let Err(cb) = self.sink.dispatch_packet(&view) {
+        let delivery = contain_delivery_panic(|| self.sink.dispatch_packet(&view));
+        if let Err(cb) = delivery {
             return Err(callback_failure(cb, Some(stream_index)));
         }
         Ok(())
@@ -705,9 +700,9 @@ impl PacketSinkWorker {
             // arbitrary user destructors, which under the crate's two-bomb
             // boundary is an abort-capable operation — nothing abort-capable
             // may sit between the observer and the terminal.
-            let observer_payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                || self.sink.dispatch_job_failed(&summary),
-            ))
+            let observer_payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.sink.dispatch_job_failed(&summary)
+            }))
             .err();
             // Byte-identity by construction: the JobFailed message is MOVED
             // out of the summary, never re-formatted. The dispatch runs
@@ -718,9 +713,10 @@ impl PacketSinkWorker {
             // terminal-region containment observes exactly what it observed
             // before the observer existed.
             let terminal_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.sink.dispatch_delivery_error(&PacketSinkError::JobFailed {
-                    message: summary.into_message(),
-                })
+                self.sink
+                    .dispatch_delivery_error(&PacketSinkError::JobFailed {
+                        message: summary.into_message(),
+                    })
             }));
             let observer_panicked = observer_payload.is_some();
             if let Some(payload) = observer_payload {
@@ -766,6 +762,16 @@ impl PacketSinkWorker {
             panicked |= super::drop_contained(error);
         }
         panicked
+    }
+}
+
+fn contain_delivery_panic<T>(deliver: impl FnOnce() -> T) -> T {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(deliver)) {
+        Ok(value) => value,
+        Err(payload) => {
+            super::dispose_panic_payload(payload);
+            panic!("packet sink delivery callback panicked");
+        }
     }
 }
 
@@ -871,7 +877,9 @@ fn check_param_change(
         let sample_rate = read_i32(data)?;
         // FFmpeg's own param-change handler rejects non-positive rates.
         if sample_rate <= 0 {
-            return Err(malformed(&format!("sample rate {sample_rate} out of range")));
+            return Err(malformed(&format!(
+                "sample rate {sample_rate} out of range"
+            )));
         }
         if sample_rate != projection.sample_rate {
             return Err(PacketSinkError::ConfigChange {
@@ -1002,8 +1010,7 @@ mod tests {
                 (*par).frame_size = 1024;
             }
             if let Some(ed) = extradata {
-                let buf =
-                    av_mallocz(ed.len() + AV_INPUT_BUFFER_PADDING_SIZE as usize) as *mut u8;
+                let buf = av_mallocz(ed.len() + AV_INPUT_BUFFER_PADDING_SIZE as usize) as *mut u8;
                 std::ptr::copy_nonoverlapping(ed.as_ptr(), buf, ed.len());
                 (*par).extradata = buf;
                 (*par).extradata_size = ed.len() as i32;
@@ -1229,10 +1236,7 @@ mod tests {
         // re-invoke the callback (the single Info event below proves it).
         assert_eq!(worker.deliver_stream_info(), 0);
         let mut pb = packet(&idr_au(), 4, 4, tb25(), 0);
-        assert_eq!(
-            unsafe { worker.process_and_deliver(&mut pb) },
-            0
-        );
+        assert_eq!(unsafe { worker.process_and_deliver(&mut pb) }, 0);
         let events = events.lock().unwrap();
         assert!(matches!(events[0], PacketSinkEvent::StreamInfo(_)));
         let PacketSinkEvent::Packet(p) = &events[1] else {
@@ -1515,7 +1519,13 @@ mod tests {
         let mut v = packet(&idr_au(), 5, 5, tb25(), 0);
         assert_eq!(unsafe { worker.process_and_deliver(&mut v) }, 0);
         // Audio at original dts 0 keeps its true relative offset: negative.
-        let mut a = packet(&[0x21, 0x10, 0x04], 0, 0, AVRational { num: 1, den: 44100 }, 1);
+        let mut a = packet(
+            &[0x21, 0x10, 0x04],
+            0,
+            0,
+            AVRational { num: 1, den: 44100 },
+            1,
+        );
         a.packet_data.codec_type = AVMediaType::AVMEDIA_TYPE_AUDIO;
         assert_eq!(unsafe { worker.process_and_deliver(&mut a) }, 0);
 
@@ -1697,8 +1707,9 @@ mod tests {
             (*(*st).codecpar).ch_layout.nb_channels = 1;
         }
         let (sink, _events) = recording_sink();
-        let worker = collect(&ctx, sink)
-            .unwrap_or_else(|e| panic!("an LFE mono core advertising 1 channel must collect: {e:?}"));
+        let worker = collect(&ctx, sink).unwrap_or_else(|e| {
+            panic!("an LFE mono core advertising 1 channel must collect: {e:?}")
+        });
         let audio = worker.infos[0].audio().expect("typed audio configuration");
         assert_eq!(audio.channels(), 1);
         assert_eq!(audio.codec_string(), "mp4a.40.29");
@@ -1785,7 +1796,7 @@ mod tests {
             let ctx = video_ctx();
             let (sink, _events) = recording_sink();
             let mut worker = collect(&ctx, sink).unwrap();
-        assert_eq!(worker.deliver_stream_info(), 0);
+            assert_eq!(worker.deliver_stream_info(), 0);
             let mut a = packet(&idr_au(), first.0, first.1, tb25(), 0);
             assert_eq!(unsafe { worker.process_and_deliver(&mut a) }, 0);
             let mut b = packet(&p_au(), second.0, second.1, tb25(), 0);
@@ -1885,7 +1896,7 @@ mod tests {
         for (payload, what) in cases {
             let (sink, _events) = recording_sink();
             let mut worker = collect(&ctx, sink).unwrap();
-        assert_eq!(worker.deliver_stream_info(), 0);
+            assert_eq!(worker.deliver_stream_info(), 0);
             let mut pb = packet(&idr_au(), 0, 0, tb25(), 0);
             unsafe {
                 let sd = av_packet_new_side_data(
@@ -2044,25 +2055,26 @@ mod tests {
     #[test]
     fn finish_gate_matrix() {
         let ctx = video_ctx();
-        let run = |all_done: bool, ret: i32, aborted: bool, job_error: Option<JobFailureSummary>| {
-            let (sink, events) = recording_sink();
-            let mut worker = collect(&ctx, sink).unwrap();
-        assert_eq!(worker.deliver_stream_info(), 0);
-            worker.finish(all_done, ret, aborted, job_error);
-            // Finish is a one-way phase transition: a second call must be a
-            // no-op and can never fire a second terminal event.
-            worker.finish(true, 0, false, None);
-            let events = events.lock().unwrap();
-            let ends = events
-                .iter()
-                .filter(|e| matches!(e, PacketSinkEvent::End))
-                .count();
-            let errors = events
-                .iter()
-                .filter(|e| matches!(e, PacketSinkEvent::Error(_)))
-                .count();
-            (ends, errors)
-        };
+        let run =
+            |all_done: bool, ret: i32, aborted: bool, job_error: Option<JobFailureSummary>| {
+                let (sink, events) = recording_sink();
+                let mut worker = collect(&ctx, sink).unwrap();
+                assert_eq!(worker.deliver_stream_info(), 0);
+                worker.finish(all_done, ret, aborted, job_error);
+                // Finish is a one-way phase transition: a second call must be a
+                // no-op and can never fire a second terminal event.
+                worker.finish(true, 0, false, None);
+                let events = events.lock().unwrap();
+                let ends = events
+                    .iter()
+                    .filter(|e| matches!(e, PacketSinkEvent::End))
+                    .count();
+                let errors = events
+                    .iter()
+                    .filter(|e| matches!(e, PacketSinkEvent::Error(_)))
+                    .count();
+                (ends, errors)
+            };
         let sibling_failed = || {
             Some(JobFailureSummary::from_error(
                 &crate::error::Error::WorkerPanicked("muxer1:mpegts".to_string()),
@@ -2115,11 +2127,10 @@ mod tests {
             .build();
         let mut worker = collect(&ctx, sink).unwrap();
         assert_eq!(worker.deliver_stream_info(), 0);
-        let recorded = crate::error::Error::Muxing(
-            crate::error::MuxingOperationError::InterleavedWriteError(
+        let recorded =
+            crate::error::Error::Muxing(crate::error::MuxingOperationError::InterleavedWriteError(
                 crate::error::MuxingError::UnknownError(AVERROR_EXTERNAL),
-            ),
-        );
+            ));
         worker.finish(
             false,
             AVERROR_EXTERNAL,
@@ -2256,11 +2267,10 @@ mod tests {
         let sink = PacketSink::from_handler(RecordingHandler { log: log.clone() });
         let mut worker = collect(&ctx, sink).unwrap();
         assert_eq!(worker.deliver_stream_info(), 0);
-        let recorded = crate::error::Error::Muxing(
-            crate::error::MuxingOperationError::InterleavedWriteError(
+        let recorded =
+            crate::error::Error::Muxing(crate::error::MuxingOperationError::InterleavedWriteError(
                 crate::error::MuxingError::UnknownError(AVERROR_EXTERNAL),
-            ),
-        );
+            ));
         worker.finish(
             false,
             AVERROR_EXTERNAL,
@@ -2387,10 +2397,7 @@ mod tests {
             Some(JobFailureSummary::from_error(&recorded)),
         );
         drop(worker);
-        assert!(matches!(
-            rx.recv().unwrap(),
-            PacketSinkEvent::StreamInfo(_)
-        ));
+        assert!(matches!(rx.recv().unwrap(), PacketSinkEvent::StreamInfo(_)));
         match rx.recv().unwrap() {
             PacketSinkEvent::JobFailure(summary) => {
                 assert_eq!(summary.kind(), JobFailureKind::Other);
@@ -2421,10 +2428,7 @@ mod tests {
         assert_eq!(worker.deliver_stream_info(), 0);
         // Drain the stream-info event: exactly ONE slot is free at the
         // terminal — the pre-summary guarantee for the Error event.
-        assert!(matches!(
-            rx.recv().unwrap(),
-            PacketSinkEvent::StreamInfo(_)
-        ));
+        assert!(matches!(rx.recv().unwrap(), PacketSinkEvent::StreamInfo(_)));
         let recorded = crate::error::Error::WorkerPanicked("muxer1:mpegts".to_string());
         worker.finish(
             false,

@@ -632,62 +632,74 @@ impl EmbedRtmpServer<Initialization> {
         let result = std::thread::Builder::new()
             .name("rtmp-server-io".to_string())
             .spawn(move || {
-                for stream in listener.incoming() {
-                    // Check the stop flag on every iteration, not only when the
-                    // listener runs dry: under a steady stream of incoming
-                    // connections the WouldBlock branch is never taken and
-                    // stop() would otherwise never terminate this thread.
-                    if status.load(Ordering::Acquire) == STATUS_END {
-                        info!("Embed rtmp server stopped.");
-                        break;
-                    }
-                    match stream {
-                        Ok(stream) => {
-                            // Use try_send to apply backpressure when channel is full
-                            match stream_sender.try_send(stream) {
-                                Ok(_) => {
-                                    debug!("New rtmp connection accepted.");
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    for stream in listener.incoming() {
+                        // Check the stop flag on every iteration, not only when the
+                        // listener runs dry: under a steady stream of incoming
+                        // connections the WouldBlock branch is never taken and
+                        // stop() would otherwise never terminate this thread.
+                        if status.load(Ordering::Acquire) == STATUS_END {
+                            info!("Embed rtmp server stopped.");
+                            break;
+                        }
+                        match stream {
+                            Ok(stream) => {
+                                // Use try_send to apply backpressure when channel is full
+                                match stream_sender.try_send(stream) {
+                                    Ok(_) => {
+                                        debug!("New rtmp connection accepted.");
+                                    }
+                                    Err(crossbeam_channel::TrySendError::Full(s)) => {
+                                        // Channel full - server at capacity, reject connection immediately
+                                        let _ = s.shutdown(Shutdown::Both);
+                                        debug!(
+                                            "Connection rejected: server at capacity (channel full)"
+                                        );
+                                    }
+                                    Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                                        error!("Connection channel disconnected");
+                                        // The worker died out from under this
+                                        // loop. Its own teardown closes the
+                                        // intake too, but this thread cannot
+                                        // order itself after that: funnel the
+                                        // close ahead of the store here as
+                                        // well, so STATUS_END is never
+                                        // observable over an open intake no
+                                        // matter whose store lands first.
+                                        close_intake_and_publish_end(
+                                            &registrations,
+                                            &status,
+                                            &terminal_cause,
+                                        );
+                                        return;
+                                    }
                                 }
-                                Err(crossbeam_channel::TrySendError::Full(s)) => {
-                                    // Channel full - server at capacity, reject connection immediately
-                                    let _ = s.shutdown(Shutdown::Both);
-                                    debug!(
-                                        "Connection rejected: server at capacity (channel full)"
-                                    );
-                                }
-                                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
-                                    error!("Connection channel disconnected");
-                                    // The worker died out from under this
-                                    // loop. Its own teardown closes the
-                                    // intake too, but this thread cannot
-                                    // order itself after that: funnel the
-                                    // close ahead of the store here as
-                                    // well, so STATUS_END is never
-                                    // observable over an open intake no
-                                    // matter whose store lands first.
-                                    close_intake_and_publish_end(
-                                        &registrations,
-                                        &status,
-                                        &terminal_cause,
-                                    );
-                                    return;
+                            }
+                            Err(e) => {
+                                if e.kind() == std::io::ErrorKind::WouldBlock {
+                                    std::thread::sleep(std::time::Duration::from_millis(100));
+                                } else if is_fd_exhaustion(&e) {
+                                    // Accepting again immediately would fail the same
+                                    // way and spin the CPU; back off and let existing
+                                    // connections close first.
+                                    warn!("Accept failed, file descriptors exhausted: {e}");
+                                    std::thread::sleep(std::time::Duration::from_millis(100));
+                                } else {
+                                    debug!("Rtmp connection error: {:?}", e);
                                 }
                             }
                         }
-                        Err(e) => {
-                            if e.kind() == std::io::ErrorKind::WouldBlock {
-                                std::thread::sleep(std::time::Duration::from_millis(100));
-                            } else if is_fd_exhaustion(&e) {
-                                // Accepting again immediately would fail the same
-                                // way and spin the CPU; back off and let existing
-                                // connections close first.
-                                warn!("Accept failed, file descriptors exhausted: {e}");
-                                std::thread::sleep(std::time::Duration::from_millis(100));
-                            } else {
-                                debug!("Rtmp connection error: {:?}", e);
-                            }
-                        }
                     }
+                }));
+                if let Err(payload) = outcome {
+                    close_intake_and_publish_end(&registrations, &status, &terminal_cause);
+                    let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        error!("Rtmp accept loop panicked; the server is stopped.");
+                    }));
+                    if let Err(report_payload) = report {
+                        crate::core::packet_sink::dispose_panic_payload(report_payload);
+                    }
+                    crate::core::packet_sink::dispose_panic_payload(payload);
                 }
             });
         match result {
@@ -809,10 +821,7 @@ impl BudgetedFeedSender {
     /// exact. A closed budget is the same reactor-side teardown that
     /// disconnects the channel, so it is reported in the channel's own error
     /// shape and flows through the caller's existing failure classification.
-    fn send(
-        &self,
-        feed: PublisherFeed,
-    ) -> Result<(), crossbeam_channel::SendError<PublisherFeed>> {
+    fn send(&self, feed: PublisherFeed) -> Result<(), crossbeam_channel::SendError<PublisherFeed>> {
         let len = feed.ingress_len();
         if self.budget.acquire(len).is_err() {
             return Err(crossbeam_channel::SendError(feed));
@@ -1329,8 +1338,15 @@ fn contain_reactor_panic(
             .downcast_ref::<&str>()
             .copied()
             .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-            .unwrap_or("non-string panic payload");
-        error!("Rtmp reactor panicked ({msg}); the server is stopped and all connections will be closed.");
+            .unwrap_or("non-string panic payload")
+            .to_string();
+        let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            error!("Rtmp reactor panicked ({msg}); the server is stopped and all connections will be closed.");
+        }));
+        if let Err(report_payload) = report {
+            crate::core::packet_sink::dispose_panic_payload(report_payload);
+        }
+        crate::core::packet_sink::dispose_panic_payload(payload);
     }
 }
 
@@ -1382,7 +1398,13 @@ fn handle_connections(
     });
 
     if status.load(Ordering::Acquire) != STATUS_END {
-        error!("Rtmp Server aborted.");
+        close_intake_and_publish_end(kill_switch.handoff(), &status, &terminal_cause);
+        let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            error!("Rtmp Server aborted.");
+        }));
+        if let Err(payload) = report {
+            crate::core::packet_sink::dispose_panic_payload(payload);
+        }
     }
 }
 
@@ -2323,11 +2345,7 @@ mod tests {
                 );
             })
         };
-        let first = settler(
-            server_thread_ids.clone(),
-            threads.clone(),
-            exited.clone(),
-        );
+        let first = settler(server_thread_ids.clone(), threads.clone(), exited.clone());
 
         // Deadline-bounded entry probe, not synchronization: wait until the
         // first settler demonstrably holds the registry lock while joining
@@ -2678,8 +2696,7 @@ mod tests {
 
         // The accept thread's side of the connection channel, kept open and
         // idle for the worker's lifetime — a listener that never accepts.
-        let (_connection_sender, connection_receiver) =
-            crossbeam_channel::bounded::<TcpStream>(1);
+        let (_connection_sender, connection_receiver) = crossbeam_channel::bounded::<TcpStream>(1);
         let worker = {
             let status = status.clone();
             std::thread::Builder::new()
