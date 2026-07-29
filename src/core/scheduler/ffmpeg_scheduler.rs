@@ -1447,7 +1447,7 @@ pub(crate) fn wait_until_not_paused(scheduler_status: &Arc<AtomicUsize>) -> usiz
             return status;
         }
         let (g, _timeout) = cond
-            .wait_timeout(guard, Duration::from_millis(200))
+            .wait_timeout(guard, Duration::from_millis(100))
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard = g;
     }

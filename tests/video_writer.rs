@@ -628,7 +628,7 @@ fn generator_composite_graph_is_accepted() {
 }
 
 /// Stream maps have nothing to select on a writer output (the pushed frames
-/// are the only stream) and are rejected rather than silently ignored.
+/// are the only stream) and are rejected before the destination is opened.
 #[test]
 fn stream_maps_are_rejected() {
     let out = tmp_path("stream_map.mp4");
@@ -641,6 +641,10 @@ fn stream_maps_are_rejected() {
             Err(Error::Writer(WriterError::StreamMapsUnsupported))
         ),
         "expected StreamMapsUnsupported, got {result:?}"
+    );
+    assert!(
+        !std::path::Path::new(&out).exists(),
+        "stream-map rejection must happen before the destination is created"
     );
 }
 
