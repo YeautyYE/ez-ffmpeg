@@ -1,14 +1,14 @@
 use super::*;
 
 pub(in crate::core::context) struct InputOpaque {
-    pub(super) read: Box<dyn FnMut(&mut [u8]) -> i32 + Send>,
-    pub(super) seek: Option<Box<dyn FnMut(i64, i32) -> i64 + Send>>,
+    pub(in crate::core::context) read: Box<dyn FnMut(&mut [u8]) -> i32 + Send>,
+    pub(in crate::core::context) seek: Option<Box<dyn FnMut(i64, i32) -> i64 + Send>>,
     /// Set when a user callback panicked. `catch_unwind` keeps the panic from
     /// crossing the extern "C" boundary, but the closure's captured state is
     /// torn mid-update; calling it again could silently corrupt the stream
     /// (e.g. a cursor advanced before the panic). Once poisoned, every later
     /// callback fails with EIO so the job errors out instead.
-    pub(super) poisoned: bool,
+    pub(in crate::core::context) poisoned: bool,
 }
 
 pub(super) unsafe extern "C" fn read_packet_wrapper(
@@ -34,8 +34,9 @@ pub(super) unsafe extern "C" fn read_packet_wrapper(
     let ret = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (context.read)(slice)))
     {
         Ok(ret) => ret,
-        Err(_) => {
+        Err(payload) => {
             context.poisoned = true;
+            crate::core::packet_sink::dispose_panic_payload(payload);
             return ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO);
         }
     };
@@ -68,8 +69,9 @@ pub(super) unsafe extern "C" fn seek_input_packet_wrapper(
             (*seek_func)(offset, whence)
         })) {
             Ok(ret) => ret,
-            Err(_) => {
+            Err(payload) => {
                 context.poisoned = true;
+                crate::core::packet_sink::dispose_panic_payload(payload);
                 ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO) as i64
             }
         }
@@ -247,8 +249,13 @@ unsafe fn open_input_file(
             if avio_ctx.is_null() {
                 av_freep(&mut avio_ctx_buffer as *mut _ as *mut c_void);
                 // avio_alloc_context never took ownership: reclaim the Box.
-                let _ = Box::from_raw(opaque as *mut InputOpaque);
+                let callback_state_panicked = crate::core::context::dispose_input_opaque_callbacks(
+                    opaque as *mut InputOpaque,
+                );
                 avformat_close_input(&mut in_fmt_ctx);
+                if callback_state_panicked {
+                    panic!("custom-IO input callback state panicked during teardown");
+                }
                 return Err(OpenInputError::OutOfMemory.into());
             }
 

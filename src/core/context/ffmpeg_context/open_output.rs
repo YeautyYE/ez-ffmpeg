@@ -165,7 +165,12 @@ unsafe fn open_output_file(
             if avio_ctx.is_null() {
                 av_freep(&mut avio_ctx_buffer as *mut _ as *mut c_void);
                 // avio_alloc_context never took ownership: reclaim the Box.
-                let _ = Box::from_raw(opaque as *mut OutputOpaque);
+                let callback_state_panicked = crate::core::context::dispose_output_opaque_callbacks(
+                    opaque as *mut OutputOpaque,
+                );
+                if callback_state_panicked {
+                    panic!("custom-IO output callback state panicked during teardown");
+                }
                 return Err(OpenOutputError::OutOfMemory.into());
             }
 
@@ -178,8 +183,12 @@ unsafe fn open_output_file(
             }
 
             if !have_seek_callback && output_requires_seek(out_fmt_ctx) {
-                crate::core::context::free_output_opaque(avio_ctx);
-                avformat_free_context(out_fmt_ctx);
+                // Hand both native allocations to the paired teardown so a
+                // callback-state destructor panic is published only after the
+                // AVIO and its owning format context have both been reclaimed.
+                (*out_fmt_ctx).pb = avio_ctx;
+                (*out_fmt_ctx).flags |= AVFMT_FLAG_CUSTOM_IO;
+                crate::core::context::out_fmt_ctx_free(out_fmt_ctx, true);
                 warn!(target: LOG_TARGET, "The output format supports seeking, but no seek callback is provided. This may cause issues.");
                 return Err(OpenOutputError::SeekFunctionMissing.into());
             }
@@ -435,18 +444,9 @@ fn validate_packet_sink_options(output: &Output) -> Result<()> {
         // A packet sink writes no container, so container metadata can never
         // land anywhere; silently accepting it would misrepresent delivery.
         ("add_metadata", output.global_metadata.is_some()),
-        (
-            "add_stream_metadata",
-            !output.stream_metadata.is_empty(),
-        ),
-        (
-            "add_chapter_metadata",
-            !output.chapter_metadata.is_empty(),
-        ),
-        (
-            "add_program_metadata",
-            !output.program_metadata.is_empty(),
-        ),
+        ("add_stream_metadata", !output.stream_metadata.is_empty()),
+        ("add_chapter_metadata", !output.chapter_metadata.is_empty()),
+        ("add_program_metadata", !output.program_metadata.is_empty()),
         ("map_metadata_from_input", !output.metadata_map.is_empty()),
         // auto_copy_metadata only governs container metadata propagation;
         // toggling it on a sink is a configuration mistake like the rest.
@@ -584,10 +584,10 @@ unsafe fn output_requires_seek(fmt_ctx: *mut AVFormatContext) -> bool {
 }
 
 pub(in crate::core::context) struct OutputOpaque {
-    pub(super) write: Box<dyn FnMut(&[u8]) -> i32 + Send>,
-    pub(super) seek: Option<Box<dyn FnMut(i64, i32) -> i64 + Send>>,
+    pub(in crate::core::context) write: Box<dyn FnMut(&[u8]) -> i32 + Send>,
+    pub(in crate::core::context) seek: Option<Box<dyn FnMut(i64, i32) -> i64 + Send>>,
     /// See [`InputOpaque::poisoned`].
-    pub(super) poisoned: bool,
+    pub(in crate::core::context) poisoned: bool,
 }
 
 pub(super) unsafe extern "C" fn write_packet_wrapper(
@@ -627,8 +627,9 @@ pub(super) unsafe extern "C" fn write_packet_wrapper(
             (context.write)(remaining)
         })) {
             Ok(ret) => ret,
-            Err(_) => {
+            Err(payload) => {
                 context.poisoned = true;
+                crate::core::packet_sink::dispose_panic_payload(payload);
                 return ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO);
             }
         };
@@ -645,7 +646,7 @@ pub(super) unsafe extern "C" fn write_packet_wrapper(
     buf_size
 }
 
-unsafe extern "C" fn seek_output_packet_wrapper(
+pub(super) unsafe extern "C" fn seek_output_packet_wrapper(
     opaque: *mut libc::c_void,
     offset: i64,
     whence: libc::c_int,
@@ -662,8 +663,9 @@ unsafe extern "C" fn seek_output_packet_wrapper(
             (*seek_func)(offset, whence)
         })) {
             Ok(ret) => ret,
-            Err(_) => {
+            Err(payload) => {
                 context.poisoned = true;
+                crate::core::packet_sink::dispose_panic_payload(payload);
                 ffmpeg_sys_next::AVERROR(ffmpeg_sys_next::EIO) as i64
             }
         }

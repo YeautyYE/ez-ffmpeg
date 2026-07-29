@@ -746,15 +746,29 @@ unsafe extern "C" fn ffmpeg_log_callback(
     // (which must not unwind while the state lock is held).
     drop(state);
 
-    if let Some((repeated_level, repeated)) = flush_repeated {
-        log::log!(
-            target: FFMPEG_LOG_TARGET,
-            repeated_level,
-            "FFmpeg: last message repeated {} times",
-            repeated
-        );
+    let emitted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Some((repeated_level, repeated)) = flush_repeated {
+            log::log!(
+                target: FFMPEG_LOG_TARGET,
+                repeated_level,
+                "FFmpeg: last message repeated {} times",
+                repeated
+            );
+        }
+        log::log!(target: FFMPEG_LOG_TARGET, rust_level, "FFmpeg: {}", trimmed_msg);
+    }));
+    if let Err(payload) = emitted {
+        // A logger backend is user code. Keep its unwind inside this C
+        // callback, and publish the failure when FFmpeg called us from a
+        // scheduler-owned worker.
+        let reported = std::panic::catch_unwind(|| {
+            crate::util::thread_synchronizer::report_worker_callback_panic();
+        });
+        if let Err(report_payload) = reported {
+            crate::core::packet_sink::dispose_panic_payload(report_payload);
+        }
+        crate::core::packet_sink::dispose_panic_payload(payload);
     }
-    log::log!(target: FFMPEG_LOG_TARGET, rust_level, "FFmpeg: {}", trimmed_msg);
 }
 
 fn initialize_ffmpeg() {

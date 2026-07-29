@@ -2,6 +2,7 @@ use crate::core::context::decoder_stream::DecoderStream;
 use crate::core::context::encoder_stream::EncoderStream;
 use crate::core::context::obj_pool::ObjPool;
 use crate::core::context::{FrameBox, FrameData};
+use crate::core::filter::frame_filter::FrameFilterError;
 use crate::core::scheduler::type_to_symbol;
 use crate::error::Error::{
     FrameFilterFrameDuplicateFailed, FrameFilterInit, FrameFilterProcess, FrameFilterRequest,
@@ -233,7 +234,7 @@ fn pipeline_init(
             type_to_symbol(pipeline.media_type),
         ))
         .spawn(move || {
-            let _thread_done = thread_done_guard;
+            let _thread_done = thread_done_guard.activate();
             // Move every frame-owning CAPTURE into a body local declared AFTER the
             // guard so it drops BEFORE the guard on EVERY exit path. A closure's
             // captures otherwise drop AFTER its body locals (i.e. after the
@@ -258,12 +259,15 @@ fn pipeline_init(
             let frame_senders = frame_senders;
             let frame_pool = frame_pool;
             if let Err(e) = frame_filter_init(&mut pipeline) {
-                pipeline_uninit(&mut pipeline);
+                // Move the user-backed error into the scheduler result before
+                // another user hook runs. If uninit panics, its unwind must not
+                // drop the init error at the same time.
                 crate::core::scheduler::ffmpeg_scheduler::set_scheduler_error(
                     &scheduler_status,
                     &scheduler_result,
                     e,
                 );
+                pipeline_uninit(&mut pipeline);
                 return;
             }
 
@@ -493,9 +497,11 @@ fn run_pipeline(
                                 send_frame(pipeline, &mut frame_senders, frame_pool, tmp_frame)?
                             }
                             Err(e) => {
-                                error!(
-                                    "Pipeline [index:{}] failed, during filter frame. error: {e}",
-                                    pipeline.stream_index.unwrap_or(usize::MAX),
+                                let e = report_filter_error(
+                                    pipeline.stream_index,
+                                    "during filter frame",
+                                    e,
+                                    true,
                                 );
                                 return Err(FrameFilterProcess(e));
                             }
@@ -557,9 +563,11 @@ fn run_pipeline(
                 }
                 let result = pipeline.request_frame(i);
                 if let Err(e) = result {
-                    error!(
-                        "Pipeline [index:{}] failed, during request frame.",
-                        pipeline.stream_index.unwrap_or(usize::MAX)
+                    let e = report_filter_error(
+                        pipeline.stream_index,
+                        "during request frame",
+                        e,
+                        false,
                     );
                     return Err(FrameFilterRequest(e));
                 }
@@ -575,9 +583,11 @@ fn run_pipeline(
                         send_frame(pipeline, &mut frame_senders, frame_pool, tmp_frame)?
                     }
                     Err(e) => {
-                        error!(
-                            "Pipeline [index:{}] failed, during filter frame. error: {e}",
-                            pipeline.stream_index.unwrap_or(usize::MAX)
+                        let e = report_filter_error(
+                            pipeline.stream_index,
+                            "during filter frame",
+                            e,
+                            true,
                         );
                         return Err(FrameFilterProcess(e));
                     }
@@ -673,10 +683,7 @@ fn flush_pipeline_for_eof(
                 }
             }
             Err(e) => {
-                error!(
-                    "Pipeline [index:{}] failed, during EOF flush cue. error: {e}",
-                    pipeline.stream_index.unwrap_or(usize::MAX),
-                );
+                let e = report_filter_error(pipeline.stream_index, "during EOF flush cue", e, true);
                 return Err(FrameFilterProcess(e));
             }
         }
@@ -717,9 +724,11 @@ fn flush_pipeline_for_eof(
             let tmp_frame = match result {
                 Ok(tmp_frame) => tmp_frame,
                 Err(e) => {
-                    error!(
-                        "Pipeline [index:{}] failed, during EOF flush request frame.",
-                        pipeline.stream_index.unwrap_or(usize::MAX)
+                    let e = report_filter_error(
+                        pipeline.stream_index,
+                        "during EOF flush request frame",
+                        e,
+                        false,
                     );
                     return Err(FrameFilterRequest(e));
                 }
@@ -784,13 +793,78 @@ fn forward_from(
     match pipeline.run_filters_from(next_index, frame) {
         Ok(out) => forward_flushed(pipeline, frame_senders, frame_pool, out).map(|()| true),
         Err(e) => {
-            error!(
-                "Pipeline [index:{}] failed, during EOF flush filter frame. error: {e}",
-                pipeline.stream_index.unwrap_or(usize::MAX)
+            let e = report_filter_error(
+                pipeline.stream_index,
+                "during EOF flush filter frame",
+                e,
+                true,
             );
             Err(FrameFilterProcess(e))
         }
     }
+}
+
+#[derive(Debug)]
+struct FrameFilterObserverPanicked;
+
+struct FrameFilterErrorCustody(Option<FrameFilterError>);
+
+impl FrameFilterErrorCustody {
+    fn take(&mut self) -> FrameFilterError {
+        self.0.take().expect("frame-filter error custody is empty")
+    }
+
+    fn as_ref(&self) -> &FrameFilterError {
+        self.0
+            .as_ref()
+            .expect("frame-filter error custody is empty")
+    }
+}
+
+impl Drop for FrameFilterErrorCustody {
+    fn drop(&mut self) {
+        let Some(error) = self.0.take() else {
+            return;
+        };
+        if let Err(payload) =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(error)))
+        {
+            crate::core::packet_sink::dispose_panic_payload(payload);
+        }
+    }
+}
+
+fn invoke_filter_observer<T>(observer: impl FnOnce() -> T) -> T {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(observer)) {
+        Ok(value) => value,
+        Err(payload) => {
+            crate::core::packet_sink::dispose_panic_payload(payload);
+            std::panic::resume_unwind(Box::new(FrameFilterObserverPanicked));
+        }
+    }
+}
+
+/// Logs a callback-returned error without leaving its user-defined Display or
+/// Drop code exposed to a simultaneous logger panic.
+fn report_filter_error(
+    stream_index: Option<usize>,
+    phase: &'static str,
+    error: FrameFilterError,
+    include_error: bool,
+) -> FrameFilterError {
+    let mut custody = FrameFilterErrorCustody(Some(error));
+    let index = stream_index.unwrap_or(usize::MAX);
+    if include_error {
+        let message = invoke_filter_observer(|| custody.as_ref().to_string());
+        invoke_filter_observer(|| {
+            error!("Pipeline [index:{index}] failed, {phase}. error: {message}");
+        });
+    } else {
+        invoke_filter_observer(|| {
+            error!("Pipeline [index:{index}] failed, {phase}.");
+        });
+    }
+    custody.take()
 }
 
 /// Forwards one flushed chain output downstream; props-only shells (the
@@ -940,6 +1014,62 @@ mod tests {
     use ffmpeg_sys_next::{av_frame_alloc, av_frame_get_buffer, AVMediaType, AVPixelFormat};
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+
+    struct ObserverPayloadBomb(Arc<AtomicBool>);
+
+    impl Drop for ObserverPayloadBomb {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+            panic!("test observer payload destructor panic");
+        }
+    }
+
+    #[derive(Debug)]
+    struct HostileFilterError {
+        display_payload_dropped: Arc<AtomicBool>,
+        error_dropped: Arc<AtomicBool>,
+    }
+
+    impl std::fmt::Display for HostileFilterError {
+        fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            std::panic::panic_any(ObserverPayloadBomb(self.display_payload_dropped.clone()));
+        }
+    }
+
+    impl std::error::Error for HostileFilterError {}
+
+    impl Drop for HostileFilterError {
+        fn drop(&mut self) {
+            self.error_dropped.store(true, Ordering::Release);
+            panic!("test filter error destructor panic");
+        }
+    }
+
+    #[test]
+    fn filter_error_observer_panic_keeps_error_drop_out_of_the_unwind() {
+        let display_payload_dropped = Arc::new(AtomicBool::new(false));
+        let error_dropped = Arc::new(AtomicBool::new(false));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let display_payload_dropped = display_payload_dropped.clone();
+            let error_dropped = error_dropped.clone();
+            move || {
+                let _ = report_filter_error(
+                    Some(7),
+                    "during filter frame",
+                    Box::new(HostileFilterError {
+                        display_payload_dropped,
+                        error_dropped,
+                    }),
+                    true,
+                );
+            }
+        }));
+
+        let payload = outcome.expect_err("the user Display panic must remain a worker panic");
+        assert!(payload.is::<FrameFilterObserverPanicked>());
+        assert!(display_payload_dropped.load(Ordering::Acquire));
+        assert!(error_dropped.load(Ordering::Acquire));
+    }
 
     fn test_new_frame() -> crate::error::Result<Frame> {
         // SAFETY: av_frame_alloc returns an owned empty frame or null; null-check it

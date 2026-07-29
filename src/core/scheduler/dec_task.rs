@@ -27,15 +27,14 @@ use ffmpeg_sys_next::AVSubtitleType::SUBTITLE_BITMAP;
 use ffmpeg_sys_next::{
     av_buffer_create, av_buffer_ref, av_calloc, av_dict_set, av_frame_apply_cropping,
     av_frame_copy_props, av_frame_move_ref, av_frame_ref, av_frame_unref, av_free, av_freep,
-    av_gcd, av_hwframe_transfer_data, av_inv_q, av_mallocz, av_memdup,
-    av_mul_q, av_opt_set_dict2, av_pix_fmt_desc_get, av_rescale_delta, av_rescale_q, av_strdup,
-    avcodec_alloc_context3, avcodec_decode_subtitle2, avcodec_flush_buffers,
-    avcodec_get_hw_config, avcodec_open2, avcodec_parameters_to_context, avcodec_receive_frame,
-    avcodec_send_packet, avsubtitle_free, AVCodec, AVCodecContext, AVFrame, AVHWDeviceType,
-    AVMediaType, AVPixelFormat, AVRational, AVSubtitle, AVSubtitleRect, AVERROR, AVERROR_EOF,
-    AVPALETTE_SIZE, AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX, AV_FRAME_CROP_UNALIGNED,
-    AV_FRAME_FLAG_CORRUPT, AV_NOPTS_VALUE, AV_PIX_FMT_FLAG_HWACCEL, AV_TIME_BASE_Q, EAGAIN, EINVAL,
-    ENOMEM,
+    av_gcd, av_hwframe_transfer_data, av_inv_q, av_mallocz, av_memdup, av_mul_q, av_opt_set_dict2,
+    av_pix_fmt_desc_get, av_rescale_delta, av_rescale_q, av_strdup, avcodec_alloc_context3,
+    avcodec_decode_subtitle2, avcodec_flush_buffers, avcodec_get_hw_config, avcodec_open2,
+    avcodec_parameters_to_context, avcodec_receive_frame, avcodec_send_packet, avsubtitle_free,
+    AVCodec, AVCodecContext, AVFrame, AVHWDeviceType, AVMediaType, AVPixelFormat, AVRational,
+    AVSubtitle, AVSubtitleRect, AVERROR, AVERROR_EOF, AVPALETTE_SIZE,
+    AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX, AV_FRAME_CROP_UNALIGNED, AV_FRAME_FLAG_CORRUPT,
+    AV_NOPTS_VALUE, AV_PIX_FMT_FLAG_HWACCEL, AV_TIME_BASE_Q, EAGAIN, EINVAL, ENOMEM,
 };
 #[cfg(not(docsrs))]
 use ffmpeg_sys_next::{av_channel_layout_copy, AV_CODEC_FLAG_COPY_OPAQUE, FF_THREAD_FRAME};
@@ -159,7 +158,8 @@ pub(crate) fn dec_init(
             // the capture as a body local ties the whole struct (and its
             // field-order teardown) to body scope end, on return and unwind
             // alike, with no reliance on closure-capture drop order.
-            let resources = resources;
+            let mut resources = resources;
+            resources._thread_done.activate_in_place();
             let input_status = false;
             let mut err_exit = false;
 
@@ -273,7 +273,8 @@ pub(crate) fn dec_init(
                             resources.dec_ctx.as_ptr(),
                             frame,
                         );
-                        if let Err(e) = dec_send(frame_box, &resources.frame_pool, &resources.senders)
+                        if let Err(e) =
+                            dec_send(frame_box, &resources.frame_pool, &resources.senders)
                         {
                             if e != Error::EOF {
                                 error!("Error signalling EOF: {e}");
@@ -1123,8 +1124,7 @@ fn hw_device_setup_for_decode(
                 if dp.hwaccel_id == HWAccelID::HwaccelAuto {
                     dp.hwaccel_device_type = dev.device_type;
                 } else if dp.hwaccel_device_type != dev.device_type {
-                    let dev_device_name =
-                        hw_device_type_name(dev.device_type).unwrap_or("unknown");
+                    let dev_device_name = hw_device_type_name(dev.device_type).unwrap_or("unknown");
                     let dp_device_name =
                         hw_device_type_name(dp.hwaccel_device_type).unwrap_or("unknown");
                     error!("Invalid hwaccel device specified for decoder: device {} of type {} is not usable with hwaccel {}.",
@@ -1324,7 +1324,11 @@ unsafe extern "C" fn get_format_callback(
 
     match result {
         Ok(format) => format,
-        Err(_) => AVPixelFormat::AV_PIX_FMT_NONE,
+        Err(payload) => {
+            crate::util::thread_synchronizer::report_worker_callback_panic();
+            crate::core::packet_sink::dispose_panic_payload(payload);
+            AVPixelFormat::AV_PIX_FMT_NONE
+        }
     }
 }
 
@@ -2398,7 +2402,9 @@ mod tests {
         let result = unsafe { dec_send(frame_box, &pool, &senders) };
         assert!(result.is_ok(), "one destination is still live");
 
-        let got = rx0.try_recv().expect("the live sender must receive a frame");
+        let got = rx0
+            .try_recv()
+            .expect("the live sender must receive a frame");
         assert_eq!(
             // SAFETY: got.frame is the frame dec_send just delivered.
             unsafe { got.frame.as_ptr() },
@@ -2467,7 +2473,9 @@ mod tests {
         let result = unsafe { dec_send(frame_box, &pool, &senders) };
         assert!(result.is_ok(), "the last live destination took the frame");
 
-        let got = rx1.try_recv().expect("the live sender must receive a frame");
+        let got = rx1
+            .try_recv()
+            .expect("the live sender must receive a frame");
         // SAFETY: got.frame is the frame dec_send just delivered.
         assert_eq!(unsafe { got.frame.as_ptr() }, original);
         assert_eq!(pool.idle_count(), 1, "the undelivered clone must be parked");
@@ -2527,7 +2535,11 @@ mod tests {
                 DecodingOperationError::FrameAllocationError(_)
             ))
         ));
-        assert_eq!(pool.idle_count(), 1, "the original must be parked, not freed");
+        assert_eq!(
+            pool.idle_count(),
+            1,
+            "the original must be parked, not freed"
+        );
         let recycled = pool.get().expect("pool holds the recycled original");
         // SAFETY: recycled came from the pool alive.
         assert_eq!(unsafe { recycled.as_ptr() }, original);
