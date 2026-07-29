@@ -1596,6 +1596,36 @@ fn cache_single_flight_builds_once_under_concurrency() {
 }
 
 #[test]
+fn cache_builder_thread_reentry_fails_without_waiting_on_itself() {
+    let cache = Arc::new(GenCache::<TestGen>::new());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let reentrant = Arc::clone(&cache);
+        let result = cache.acquire_with(GpuProfile::Basic, || {
+            let inner = reentrant.acquire_with(GpuProfile::Basic, || {
+                panic!("a re-entrant acquire must not start another build")
+            });
+            match inner {
+                Err(error) => assert_eq!(
+                    error,
+                    "shared GPU generation initialization re-entered on its builder thread"
+                ),
+                Ok(_) => panic!("a re-entrant acquire must fail promptly"),
+            }
+            Ok(TestGen::new(1))
+        });
+        tx.send(result.map(|generation| generation.id))
+            .expect("report the outer acquire");
+    });
+
+    let result = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("same-thread cache re-entry must not deadlock");
+    assert_eq!(result.expect("the outer build succeeds"), 1);
+    worker.join().expect("builder thread");
+}
+
+#[test]
 fn cache_dead_generation_replaced_next_acquire_old_arc_survives() {
     let cache = GenCache::<TestGen>::new();
     let a = cache
@@ -1804,9 +1834,12 @@ fn dead_generation_fails_filter_promptly_with_stable_error() {
     // A private cache running the real builder: killing this generation
     // must never touch the process-global slots other GPU tests stream on.
     let cache = GenCache::<SharedGpuGeneration>::new();
-    let generation = match cache.acquire_with(GpuProfile::Basic, || {
-        shared_gpu::build_generation(GpuProfile::Basic)
-    }) {
+    let mut deferred = Vec::new();
+    let generation = cache.acquire_with(GpuProfile::Basic, || {
+        shared_gpu::build_generation(GpuProfile::Basic, &mut deferred)
+    });
+    shared_gpu::emit_deferred_info(deferred);
+    let generation = match generation {
         Ok(generation) => generation,
         Err(e) if e.contains("adapter") || e.contains("device") => {
             eprintln!("skipping wgpu test (no GPU): {e}");

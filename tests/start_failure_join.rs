@@ -49,28 +49,39 @@ use std::time::Duration;
 /// Namespace for this binary's scratch files under `$TMPDIR`.
 const SUBDIR: &str = "ez_ffmpeg_start_failure_tests";
 
-/// A tiny (~30 frame) mpeg4 MP4 the copy scenarios remux from. Built once per
-/// test process with the always-available lavfi `testsrc` + native `mpeg4`
-/// encoder, so the suite stays offline and deterministic.
+/// A tiny (~30 frame) mpeg4 MP4 the copy scenarios remux from. Concurrent
+/// first callers build unique candidates outside the `OnceLock`; the first
+/// completed candidate wins.
 fn fixture_mp4() -> &'static str {
     static FIXTURE: OnceLock<String> = OnceLock::new();
-    FIXTURE.get_or_init(|| {
-        let path = tmp_path_in(SUBDIR, "src.mp4");
-        let running = FfmpegContext::builder()
-            .input(Input::from("testsrc=size=320x240:rate=30:duration=1").set_format("lavfi"))
-            .output(
-                Output::from(path.as_str())
-                    .set_video_codec("mpeg4")
-                    .set_max_video_frames(30),
-            )
-            .build()
-            .expect("fixture context must build")
-            .start()
-            .expect("fixture job must start");
-        let result = wait_with_watchdog(running, 60, "mpeg4 fixture encode");
-        assert!(result.is_ok(), "fixture encode failed: {result:?}");
-        path
-    })
+    static ATTEMPT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    if let Some(path) = FIXTURE.get() {
+        return path;
+    }
+
+    let attempt = ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = tmp_path_in(SUBDIR, &format!("src_{attempt}.mp4"));
+    let running = FfmpegContext::builder()
+        .input(Input::from("testsrc=size=320x240:rate=30:duration=1").set_format("lavfi"))
+        .output(
+            Output::from(path.as_str())
+                .set_video_codec("mpeg4")
+                .set_max_video_frames(30),
+        )
+        .build()
+        .expect("fixture context must build")
+        .start()
+        .expect("fixture job must start");
+    let result = wait_with_watchdog(running, 60, "mpeg4 fixture encode");
+    assert!(result.is_ok(), "fixture encode failed: {result:?}");
+
+    if let Err(loser) = FIXTURE.set(path) {
+        let _ = std::fs::remove_file(loser);
+    }
+    FIXTURE
+        .get()
+        .expect("a completed fixture candidate was published")
 }
 
 /// Runs `build + start` for a scenario whose `start()` MUST fail, on a side

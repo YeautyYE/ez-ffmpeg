@@ -331,11 +331,13 @@ pub(crate) fn encode_and_submit(
 
     if params.len > 0 && params.dirty.swap(false, Ordering::AcqRel) {
         // Poison-tolerant like WgpuParamsHandle::set: the buffer is always
-        // left in a valid state by the writer.
+        // left in a valid state by the writer. Snapshot under the lock, then
+        // call wgpu after unlocking because its logging can invoke user code.
         let bytes = params
             .bytes
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         gpu.queue.write_buffer(&gpu.params_buf, 0, &bytes);
     }
 

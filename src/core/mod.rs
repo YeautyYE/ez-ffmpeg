@@ -686,6 +686,82 @@ static FFMPEG_LOG_STATE: std::sync::Mutex<FfmpegLogState> = std::sync::Mutex::ne
     last_msg: String::new(),
 });
 
+struct DeferredFfmpegLog {
+    level: log::Level,
+    message: String,
+}
+
+thread_local! {
+    static DEFERRED_FFMPEG_LOGS: std::cell::RefCell<Vec<Vec<DeferredFfmpegLog>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Defers FFmpeg callback records on this thread until [`flush`](Self::flush).
+/// Hardware-device creation uses this while holding its process-wide init
+/// lock because FFmpeg may log synchronously from inside the create call.
+pub(crate) struct FfmpegLogScope {
+    active: bool,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+pub(crate) fn defer_ffmpeg_logs() -> FfmpegLogScope {
+    DEFERRED_FFMPEG_LOGS.with(|stacks| stacks.borrow_mut().push(Vec::new()));
+    FfmpegLogScope {
+        active: true,
+        _thread_bound: std::marker::PhantomData,
+    }
+}
+
+impl FfmpegLogScope {
+    /// Releases the deferral scope and emits its records in callback order.
+    /// Nested scopes append to their parent; only the outermost scope reaches
+    /// the user logger.
+    pub(crate) fn flush(mut self) {
+        let records = DEFERRED_FFMPEG_LOGS.with(|stacks| {
+            let mut stacks = stacks.borrow_mut();
+            let records = stacks.pop().expect("FFmpeg log deferral scope is active");
+            if let Some(parent) = stacks.last_mut() {
+                parent.extend(records);
+                Vec::new()
+            } else {
+                records
+            }
+        });
+        self.active = false;
+
+        for record in records {
+            log::log!(target: FFMPEG_LOG_TARGET, record.level, "{}", record.message);
+        }
+    }
+}
+
+impl Drop for FfmpegLogScope {
+    fn drop(&mut self) {
+        if self.active {
+            // Unwinding a protected operation must first release its lock;
+            // dispatching arbitrary logger code from this Drop could mask the
+            // original panic or abort on a second panic.
+            DEFERRED_FFMPEG_LOGS.with(|stacks| {
+                stacks.borrow_mut().pop();
+            });
+        }
+    }
+}
+
+fn defer_ffmpeg_log(level: log::Level, args: std::fmt::Arguments<'_>) -> bool {
+    DEFERRED_FFMPEG_LOGS.with(|stacks| {
+        let mut stacks = stacks.borrow_mut();
+        let Some(records) = stacks.last_mut() else {
+            return false;
+        };
+        records.push(DeferredFfmpegLog {
+            level,
+            message: args.to_string(),
+        });
+        true
+    })
+}
+
 unsafe extern "C" fn ffmpeg_log_callback(
     ptr: *mut libc::c_void,
     level: libc::c_int,
@@ -747,14 +823,21 @@ unsafe extern "C" fn ffmpeg_log_callback(
     drop(state);
 
     if let Some((repeated_level, repeated)) = flush_repeated {
-        log::log!(
-            target: FFMPEG_LOG_TARGET,
+        if !defer_ffmpeg_log(
             repeated_level,
-            "FFmpeg: last message repeated {} times",
-            repeated
-        );
+            format_args!("FFmpeg: last message repeated {} times", repeated),
+        ) {
+            log::log!(
+                target: FFMPEG_LOG_TARGET,
+                repeated_level,
+                "FFmpeg: last message repeated {} times",
+                repeated
+            );
+        }
     }
-    log::log!(target: FFMPEG_LOG_TARGET, rust_level, "FFmpeg: {}", trimmed_msg);
+    if !defer_ffmpeg_log(rust_level, format_args!("FFmpeg: {}", trimmed_msg)) {
+        log::log!(target: FFMPEG_LOG_TARGET, rust_level, "FFmpeg: {}", trimmed_msg);
+    }
 }
 
 fn initialize_ffmpeg() {
