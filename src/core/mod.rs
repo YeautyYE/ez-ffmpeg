@@ -232,7 +232,7 @@ pub mod packet_scanner;
 /// [`PacketSink::channel`](packet_sink::PacketSink::channel) adapter) and hand
 /// it to [`Output::new_by_packet_sink`](crate::Output::new_by_packet_sink).
 /// The v1 strict tier is WebCodecs-aligned: avcC H.264 access units
-/// (libx264) and raw AAC frames with their AudioSpecificConfig. See the
+/// (libx264, h264_nvenc) and raw AAC frames with their AudioSpecificConfig. See the
 /// module documentation for the callback order and the blocking-backpressure
 /// contract.
 pub mod packet_sink;
