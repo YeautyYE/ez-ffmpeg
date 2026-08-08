@@ -1309,12 +1309,29 @@ mod tests {
         _opaque: *mut libc::c_void,
         data: *mut u8,
     ) {
-        let unlocked = HW_DEVICES
-            .get()
-            .is_some_and(|registry| match registry.try_lock() {
-                Ok(_) | Err(std::sync::TryLockError::Poisoned(_)) => true,
-                Err(std::sync::TryLockError::WouldBlock) => false,
-            });
+        // Bounded acquire instead of a one-shot try_lock: the lib suite runs
+        // multi-threaded, and a parallel test may sit inside an unrelated
+        // registry critical section (hw_device_for_filter, another add) at
+        // this exact instant — that is not the hazard this probe guards. The
+        // hazard — eviction freeing the buffer while add_hw_device still
+        // holds the guard — pins the lock to THIS thread for the whole
+        // callback, so no amount of waiting makes try_lock succeed and the
+        // probe still records false.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let unlocked = loop {
+            let Some(registry) = HW_DEVICES.get() else {
+                break false;
+            };
+            match registry.try_lock() {
+                Ok(_) | Err(std::sync::TryLockError::Poisoned(_)) => break true,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if std::time::Instant::now() >= deadline {
+                        break false;
+                    }
+                    std::thread::yield_now();
+                }
+            }
+        };
         RELEASE_SAW_UNLOCKED_REGISTRY.store(unlocked, std::sync::atomic::Ordering::SeqCst);
         drop(Box::from_raw(data));
     }
