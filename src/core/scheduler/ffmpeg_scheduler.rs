@@ -2476,9 +2476,22 @@ mod tests {
         let scheduler = FfmpegScheduler::new(context);
         let scheduler = scheduler.start().unwrap();
 
-        sleep(Duration::from_secs(2));
-
-        assert!(scheduler.is_ended())
+        // Deadline poll instead of a fixed sleep: the contract under test is
+        // that is_ended() flips once the job reaches a terminal state, not
+        // that the transcode beats a wall-clock guess (a loaded CI runner
+        // misses a fixed 2s window). Same watchdog shape as
+        // test_frame_pipeline above: is_ended() also turns true on
+        // error/abort, and the wait() below then surfaces the stored error,
+        // so every terminal state still fails loudly.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !scheduler.is_ended() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "job did not reach a terminal state within 60s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        scheduler.wait().unwrap();
     }
 
     // Exercises videotoolbox decode + h264_videotoolbox encode — Apple-only.
