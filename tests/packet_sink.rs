@@ -137,6 +137,116 @@ fn strict_happy_path_single_video_stream() {
     );
 }
 
+/// h264_nvenc admission: build() must clear the whitelist wherever the
+/// encoder is compiled in — that is this test's CI-stable regression line.
+/// The delivery contract itself is asserted only where the encoder can
+/// actually open (the hardware acceptance line); a build without NVENC
+/// skips at the encoder guard, a build with NVENC but no usable NVIDIA
+/// device skips only on a typed encoder-open failure before any delivery
+/// callback. Acceptance machines export `EZ_FFMPEG_NVENC_MUST_RUN=1`,
+/// which turns every skip path into a failure: on hardware expected to
+/// work, a quiet skip would pass off a regression as green.
+#[test]
+fn nvenc_admission_and_strict_contract() {
+    let must_run = std::env::var_os("EZ_FFMPEG_NVENC_MUST_RUN").is_some();
+    if !have_encoder("h264_nvenc") {
+        assert!(
+            !must_run,
+            "EZ_FFMPEG_NVENC_MUST_RUN is set but h264_nvenc is not in this FFmpeg build"
+        );
+        eprintln!("skipping: h264_nvenc not available in this FFmpeg build");
+        return;
+    }
+    let (sink, log) = recording_sink();
+    let context = FfmpegContext::builder()
+        .input(testsrc(2))
+        .output(
+            Output::new_by_packet_sink(sink)
+                .set_video_codec("h264_nvenc")
+                // No reordering: pts == dts is asserted below.
+                .set_video_codec_opt("bf", "0")
+                .set_framerate(25, 1),
+        )
+        .build()
+        .expect("h264_nvenc must clear the strict-tier whitelist at build()");
+
+    match wait_with_watchdog(context.start().unwrap(), 120, "nvenc_strict_contract") {
+        Ok(()) => {}
+        Err(error) => {
+            // A typed packet-sink error is a contract violation regardless
+            // of hardware.
+            if let ez_ffmpeg::error::Error::PacketSink(e) = &error {
+                panic!("strict-tier contract violation with h264_nvenc: {e}");
+            }
+            // On an acceptance machine the encoder is expected to work, so
+            // every remaining failure is a regression, never a skip.
+            assert!(!must_run, "h264_nvenc job failed in must-run mode: {error}");
+            // Elsewhere, only a typed encoder-open failure before any
+            // delivery callback reads as "no usable NVENC here"
+            // (enc_task maps avcodec_open2 to OpenEncoder). Any other
+            // class, or any failure after delivery started, is a pipeline
+            // problem that must not hide behind the skip.
+            let delivery_started = log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, SinkEv::Info { .. } | SinkEv::Pkt(_)));
+            assert!(!delivery_started, "job failed mid-delivery: {error}");
+            assert!(
+                matches!(&error, ez_ffmpeg::error::Error::OpenEncoder(_)),
+                "failure before delivery is not an encoder-open failure: {error}"
+            );
+            eprintln!("skipping: h264_nvenc cannot open here ({error})");
+            return;
+        }
+    }
+
+    let events = log.lock().unwrap().clone();
+    assert!(events.len() >= 3, "expected info + packets + end");
+    let SinkEv::Info { streams, .. } = &events[0] else {
+        panic!("first event must be on_stream_info, got {:?}", events[0]);
+    };
+    assert_eq!(streams.len(), 1);
+    let info = &streams[0];
+    assert!(info.is_video);
+    assert!(
+        info.codec_string.starts_with("avc1."),
+        "WebCodecs codec string, got {}",
+        info.codec_string
+    );
+    assert_valid_avcc(&info.extradata);
+
+    let last = events.len() - 1;
+    assert!(
+        matches!(&events[last], SinkEv::End { .. }),
+        "last event must be on_end, got {:?}",
+        events[last]
+    );
+    let mut delivered = 0usize;
+    let mut prev_dts: Option<i64> = None;
+    for event in &events[1..last] {
+        let SinkEv::Pkt(p) = event else {
+            panic!("only packets may sit between stream info and end: {event:?}");
+        };
+        delivered += 1;
+        // bf=0 bypasses the wrapper's reorder-delay path entirely.
+        assert_eq!(p.pts, p.dts, "bf=0 must deliver pts == dts");
+        if let Some(prev) = prev_dts {
+            assert!(p.dts > prev, "dts must be strictly increasing");
+        }
+        prev_dts = Some(p.dts);
+        assert!(p.duration > 0, "strict tier guarantees a positive duration");
+        let nals = parse_avcc_au(&p.data);
+        assert!(
+            !nals.iter().any(|n| matches!(n[0] & 0x1F, 7 | 8)),
+            "no in-band parameter sets in strict-tier AUs"
+        );
+    }
+    assert_eq!(delivered, 50, "2 s at 25 fps, one access unit per frame");
+    let packets = sink_packets(&log);
+    assert!(packets[0].is_key, "the stream must open on an IDR");
+}
+
 /// A4 semantic golden: the same pinned encoder configuration muxed to real
 /// fMP4 must yield the same access units (NAL-for-NAL and byte-for-byte),
 /// origin-aligned rational timestamps, durations and key flags as the sink

@@ -586,8 +586,8 @@ impl Output {
     /// filters (`set_*_bsf`), `set_subtitle_codec`, stream copy, and the
     /// `flags` codec option (it could clear the `global_header` flag behind
     /// the out-of-band configuration). The set tracks the validator and may
-    /// grow. The v1 strict tier accepts only whitelisted encoders (video:
-    /// `libx264`; audio: AAC).
+    /// grow. The v1 strict tier accepts only registry-verified encoders
+    /// (video: `libx264`, `h264_nvenc`; audio: AAC).
     ///
     /// `Output::from(sink)` is the equivalent, crate-conventional spelling
     /// and the one used throughout the documentation.

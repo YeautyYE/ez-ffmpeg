@@ -1269,6 +1269,68 @@ mod tests {
         assert!(!p.is_key());
     }
 
+    /// h264_nvenc emission shapes (FFmpeg 7.1/8.1 `nvenc.c`): the wrapper
+    /// may prefix an access unit with SEI, lead with an access-unit
+    /// delimiter under `aud=1`, and append filler data under CBR padding —
+    /// all inside one access unit. The strict walk must accept each shape,
+    /// keep IDR detection intact, and rewrite the AU length-prefixed and
+    /// byte-complete.
+    #[test]
+    fn nvenc_shaped_aus_stay_one_access_unit_through_the_strict_walk() {
+        let ctx = video_ctx();
+        let (sink, events) = recording_sink();
+        let mut worker = collect(&ctx, sink).unwrap();
+        assert_eq!(worker.deliver_stream_info(), 0);
+
+        // SEI-prefixed IDR (a type-6 NAL ahead of the VCL; the walker
+        // classifies by NAL type only and never parses SEI payloads).
+        let mut sei_idr = vec![0, 0, 0, 1, 0x06, 0x01, 0x02, 0x80];
+        sei_idr.extend_from_slice(&[0, 0, 1, 0x65, 0x88, 0x84, 0x21, 0xFF]);
+        let mut pb = packet(&sei_idr, 0, 0, tb25(), 0);
+        assert_eq!(unsafe { worker.process_and_deliver(&mut pb) }, 0);
+
+        // AUD-led non-IDR (`aud=1`).
+        let mut aud_p = vec![0, 0, 0, 1, 0x09, 0xF0];
+        aud_p.extend_from_slice(&[0, 0, 1, 0x41, 0x9A, 0x21, 0x03]);
+        let mut pb = packet(&aud_p, 1, 1, tb25(), 0);
+        assert_eq!(unsafe { worker.process_and_deliver(&mut pb) }, 0);
+
+        // Filler-padded non-IDR (CBR padding appends filler NAL units).
+        let mut filler_p = vec![0, 0, 0, 1, 0x41, 0x9A, 0x22, 0x03];
+        filler_p.extend_from_slice(&[0, 0, 1, 0x0C, 0xFF, 0xFF, 0x80]);
+        let mut pb = packet(&filler_p, 2, 2, tb25(), 0);
+        assert_eq!(unsafe { worker.process_and_deliver(&mut pb) }, 0);
+
+        let events = events.lock().unwrap();
+        let packets: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                PacketSinkEvent::Packet(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(packets.len(), 3, "every shape must be delivered");
+
+        // The SEI prefix must not defeat IDR detection, and each rewrite
+        // must be the complete length-prefixed AU, byte for byte: the
+        // strict tier normalizes framing, it does not drop NAL units.
+        assert!(packets[0].is_key());
+        assert_eq!(
+            packets[0].data(),
+            [0, 0, 0, 4, 0x06, 0x01, 0x02, 0x80, 0, 0, 0, 5, 0x65, 0x88, 0x84, 0x21, 0xFF]
+        );
+        assert!(!packets[1].is_key());
+        assert_eq!(
+            packets[1].data(),
+            [0, 0, 0, 2, 0x09, 0xF0, 0, 0, 0, 4, 0x41, 0x9A, 0x21, 0x03]
+        );
+        assert!(!packets[2].is_key());
+        assert_eq!(
+            packets[2].data(),
+            [0, 0, 0, 4, 0x41, 0x9A, 0x22, 0x03, 0, 0, 0, 4, 0x0C, 0xFF, 0xFF, 0x80]
+        );
+    }
+
     #[test]
     fn s7_rejects_missing_and_disordered_timestamps() {
         let ctx = video_ctx();
