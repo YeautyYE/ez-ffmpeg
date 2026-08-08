@@ -473,10 +473,11 @@ impl Muxer {
     ) -> crate::error::Result<(Sender<FrameBox>, usize)> {
         if self.is_packet_sink() {
             // Strict-tier whitelist (v1): the delivery contract assumes one
-            // packet == one access unit, which is established for libx264
-            // only; audio must be AAC (AudioSpecificConfig configuration).
-            // Enforced here — where the resolved encoder is first known — so
-            // the job fails at build() with a typed error.
+            // packet == one access unit, which is established per encoder in
+            // the verified registry (`packet_sink::registry`); audio must be
+            // AAC (AudioSpecificConfig configuration). Enforced here — where
+            // the resolved encoder is first known — so the job fails at
+            // build() with a typed error.
             validate_packet_sink_encoder(media_type, enc)?;
         }
         let (packet_sender, st, stream_index) = self.new_stream(src_node)?;
@@ -789,11 +790,14 @@ mod tests {
     }
 }
 
-/// Strict-tier whitelist for packet-sink outputs (see `add_enc_stream`).
+/// Strict-tier whitelist for packet-sink outputs (see `add_enc_stream`):
+/// video admission comes from the verified-encoder registry, audio accepts
+/// any AAC encoder (the frame contract is trivially per-packet for AAC).
 fn validate_packet_sink_encoder(
     media_type: AVMediaType,
     enc: *const AVCodec,
 ) -> crate::error::Result<()> {
+    use crate::core::packet_sink::registry;
     use crate::error::PacketSinkError;
     let encoder_name = || {
         if enc.is_null() {
@@ -807,11 +811,11 @@ fn validate_packet_sink_encoder(
     match media_type {
         AVMediaType::AVMEDIA_TYPE_VIDEO => {
             let name = encoder_name();
-            if name != "libx264" {
+            if !registry::is_strict_tier_video_encoder(&name) {
                 return Err(PacketSinkError::EncoderNotWhitelisted {
                     kind: "video",
                     encoder: name,
-                    allowed: "libx264",
+                    allowed: registry::STRICT_TIER_VIDEO_ALLOWED,
                 }
                 .into());
             }
