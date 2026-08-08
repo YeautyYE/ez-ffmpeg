@@ -21,18 +21,25 @@
 //! strict-tier contract, aligned with WebCodecs `"avc"` / AAC consumption:
 //!
 //! * **H.264 video** is delivered as avcC-configured, 4-byte length-prefixed,
-//!   access-unit-complete packets. The encoder whitelist is `libx264` only —
-//!   the delivery contract assumes one packet == one access unit, which is
-//!   established for libx264 and not verified for other encoders. Any other
-//!   video encoder fails the build with a typed error.
+//!   access-unit-complete packets. Video encoders are admitted from a
+//!   verified registry — v1 admits `libx264` and `h264_nvenc` — because the
+//!   delivery contract assumes one packet == one access unit, a property
+//!   the delivery path cannot check per packet and therefore establishes
+//!   per encoder wrapper (audited against the FFmpeg versions CI pins,
+//!   with a hardware acceptance line where encoding needs hardware). Any
+//!   other video encoder fails the build with a typed error. Admission
+//!   only lifts that build-time rejection: whether `h264_nvenc` can open
+//!   still depends on the linked FFmpeg build and on NVIDIA hardware at
+//!   run time.
 //! * **AAC audio** is delivered as raw AAC frames; the stream configuration
 //!   carries the AudioSpecificConfig.
 //! * Anything else (subtitles, data streams, stream copy, bitstream filters)
 //!   is rejected up front with a typed [`PacketSinkError`].
 //!
 //! Future tiers (generic passthrough, HEVC, Annex-B) will introduce their own
-//! construction paths and view/config types; everything here is
-//! `#[non_exhaustive]` so that growth is additive.
+//! construction paths and view/config types, and a per-packet access-unit
+//! verifier may eventually widen video admission beyond the registry;
+//! everything here is `#[non_exhaustive]` so that growth is additive.
 //!
 //! # Callback order
 //!
@@ -190,6 +197,7 @@ mod bench_nal_scan;
 pub(crate) mod codec;
 mod job_failure;
 pub(crate) mod nal_framing;
+pub(crate) mod registry;
 pub(crate) mod side_data;
 pub(crate) mod strict;
 pub(crate) mod timeline;
@@ -210,7 +218,8 @@ pub use job_failure::{JobFailureKind, JobFailureSummary};
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PacketSinkTier {
-    /// WebCodecs-aligned strict tier: avcC H.264 (libx264) + AAC.
+    /// WebCodecs-aligned strict tier: avcC H.264 (registry-verified
+    /// encoders) + AAC.
     #[default]
     Strict,
 }
