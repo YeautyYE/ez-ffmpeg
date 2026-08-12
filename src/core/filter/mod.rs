@@ -1,9 +1,16 @@
 use std::ffi::CStr;
 use std::ptr::null_mut;
 
+/// The [`FrameFilter`](frame_filter::FrameFilter) trait for writing custom
+/// Rust frame-processing stages, plus its polling and error contracts.
 pub mod frame_filter;
 pub mod frame_filter_context;
+/// [`FramePipeline`](frame_pipeline::FramePipeline): an ordered chain of
+/// frame filters applied to one stream, post-decode or pre-encode.
 pub mod frame_pipeline;
+/// [`FramePipelineBuilder`](frame_pipeline_builder::FramePipelineBuilder) for
+/// assembling a [`FramePipeline`](frame_pipeline::FramePipeline) from named
+/// filters.
 pub mod frame_pipeline_builder;
 
 /// Retrieves a list of all filters recognized by FFmpeg.
@@ -25,24 +32,30 @@ pub mod frame_pipeline_builder;
 pub fn get_filters() -> Vec<FilterInfo> {
     let mut filter_infos = Vec::new();
 
-    // Initialize an opaque pointer for the filter iteration.
     let mut opaque = null_mut();
     loop {
+        // SAFETY: av_filter_iterate keeps its iteration state in `opaque`,
+        // which starts as null and is only ever passed back to the same
+        // function. Every non-null return points at an entry of libavfilter's
+        // static filter registry, valid for the life of the process. `name`
+        // is always a NUL-terminated string in that same static data, while
+        // `description` may be null (FFmpeg strips it via
+        // NULL_IF_CONFIG_SMALL in CONFIG_SMALL builds), so it is checked
+        // before being dereferenced.
         unsafe {
-            // Retrieve the next filter descriptor.
             let filter = ffmpeg_sys_next::av_filter_iterate(&mut opaque);
-            // If no more filters are available, break the loop.
             if filter.is_null() {
                 break;
             }
 
-            // Convert the filter's name and description from C strings to Rust strings.
             let name = CStr::from_ptr((*filter).name).to_str().unwrap_or("unknown");
-            let description = CStr::from_ptr((*filter).description).to_str().unwrap_or("");
-            // Retrieve the filter's flags.
+            let description = if (*filter).description.is_null() {
+                ""
+            } else {
+                CStr::from_ptr((*filter).description).to_str().unwrap_or("")
+            };
             let flags = ffmpeg_next::filter::Flags::from_bits_truncate((*filter).flags);
 
-            // Push the filter's information into the vector.
             filter_infos.push(FilterInfo {
                 name: name.to_string(),
                 description: description.to_string(),
@@ -51,7 +64,6 @@ pub fn get_filters() -> Vec<FilterInfo> {
         }
     }
 
-    // Return the vector containing all filter information.
     filter_infos
 }
 
