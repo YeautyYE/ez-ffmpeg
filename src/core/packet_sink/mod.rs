@@ -16,9 +16,12 @@
 //!
 //! # Strict tier (v1)
 //!
-//! The construction paths on [`PacketSink`] build a **strict-tier** sink —
-//! [`PacketView`], [`PacketStreamInfo`] and the callback bundle are the
-//! strict-tier contract, aligned with WebCodecs `"avc"` / AAC consumption:
+//! The construction paths on [`PacketSink`](crate::packet_sink::PacketSink)
+//! build a **strict-tier** sink —
+//! [`PacketView`](crate::packet_sink::PacketView),
+//! [`PacketStreamInfo`](crate::packet_sink::PacketStreamInfo) and the
+//! callback bundle are the strict-tier contract, aligned with WebCodecs
+//! `"avc"` / AAC consumption:
 //!
 //! * **H.264 video** is delivered as avcC-configured, 4-byte length-prefixed,
 //!   access-unit-complete packets. Video encoders are admitted from a
@@ -34,7 +37,8 @@
 //! * **AAC audio** is delivered as raw AAC frames; the stream configuration
 //!   carries the AudioSpecificConfig.
 //! * Anything else (subtitles, data streams, stream copy, bitstream filters)
-//!   is rejected up front with a typed [`PacketSinkError`].
+//!   is rejected up front with a typed
+//!   [`PacketSinkError`](crate::packet_sink::PacketSinkError).
 //!
 //! Future tiers (generic passthrough, HEVC, Annex-B) will introduce their own
 //! construction paths and view/config types, and a per-packet access-unit
@@ -93,8 +97,9 @@
 //! Timestamps are per-stream: within one stream, dts is strictly increasing
 //! and `pts >= dts`. **No cross-stream interleaving order is promised** —
 //! audio and video packets arrive in worker order, and a consumer must route
-//! by [`PacketView::stream_index`] rather than assume global ordering. All
-//! streams share one time origin (see [`PacketView::applied_offset`]). A
+//! by [`PacketView::stream_index`](crate::packet_sink::PacketView::stream_index)
+//! rather than assume global ordering. All streams share one time origin (see
+//! [`PacketView::applied_offset`](crate::packet_sink::PacketView::applied_offset)). A
 //! packet that violates the strict contract (including a mid-stream
 //! configuration change) fails the job typed and is **never delivered**.
 //!
@@ -149,7 +154,8 @@
 //! exactly the backpressure a slow container write exerts today.** No packet
 //! is ever silently dropped. If you need decoupling, copy the borrowed data
 //! out (it is only valid during the callback) and queue it yourself, or use
-//! [`PacketSink::channel`], which does that copy for you and blocks the
+//! [`PacketSink::channel`](crate::packet_sink::PacketSink::channel), which
+//! does that copy for you and blocks the
 //! pipeline only while its bounded channel is full. The channel's blocking
 //! send observes job cancellation, so `stop()` terminates even with a full,
 //! undrained channel.

@@ -21,9 +21,15 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
+/// Typestate marker for [`FfmpegScheduler`]: built but not yet started.
 pub struct Initialization;
+/// Typestate marker for [`FfmpegScheduler`]: the job was started and is in
+/// flight (or already finished; `wait()` observes which).
 pub struct Running;
+/// Typestate marker for [`FfmpegScheduler`]: the job is paused and can be
+/// resumed.
 pub struct Paused;
+/// Typestate marker for a job that has ended.
 pub struct Ended;
 
 // publishes a muxer's `enc_registered` flag on Drop — including on UNWIND.
@@ -292,6 +298,18 @@ impl Drop for RunningGuard {
     }
 }
 
+/// Drives an [`FfmpegContext`] job through its lifecycle: start it, track
+/// its progress, pause and resume it, and wait for — or cut short — its
+/// completion.
+///
+/// The type parameter `S` encodes the lifecycle state at compile time
+/// ([`Initialization`], [`Running`], [`Paused`], [`Ended`]), so only the
+/// operations valid in the current state are available:
+/// [`new`](FfmpegScheduler::new) yields an `Initialization` scheduler, and
+/// [`start`](FfmpegScheduler::start) a `Running` one offering
+/// `wait`/`stop`/`abort`/`pause`. With the `async` feature enabled, a
+/// running scheduler additionally implements `Future` and can be `.await`ed
+/// instead of blocking in [`wait`](FfmpegScheduler::wait).
 pub struct FfmpegScheduler<S> {
     ffmpeg_context: FfmpegContext,
     status: Arc<AtomicUsize>,

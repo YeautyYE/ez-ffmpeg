@@ -1,9 +1,6 @@
-// src/rtmp/gop.rs - Optimized version (Zero-Copy GOP)
-//
-// Optimizations:
+// Zero-copy GOP cache:
 // 1. FrozenGop uses Arc<[FrameData]> for O(1) clone
 // 2. Separates frozen (completed) and current (writing) GOP
-// 3. Keeps old API compatibility layer, marked deprecated
 
 use bytes::Bytes;
 use rml_rtmp::time::RtmpTimestamp;

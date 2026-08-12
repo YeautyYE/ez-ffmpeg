@@ -1,7 +1,7 @@
 //! Built-in, named GPU effects with typed parameters.
 //!
 //! Each constructor returns a typed builder over a preloaded
-//! [`WgpuFrameFilter`](crate::wgpu_filter::WgpuFrameFilter) shader:
+//! [`WgpuFrameFilter`] shader:
 //!
 //! ```rust,ignore
 //! use ez_ffmpeg::wgpu_filter::effects::{adjust, AdjustParams};

@@ -1,11 +1,9 @@
 //! Detector definitions and their FFmpeg `filter_desc` string generation.
 //!
-//! Each variant maps to exactly one FFmpeg detector filter. [`to_filter`] is a
+//! Each variant maps to exactly one FFmpeg detector filter. `to_filter` is a
 //! pure function (unit-tested) that renders the filter string; the runner
 //! assembles those into a filter graph. All detectors are passthrough — they
 //! attach `lavfi.*` metadata to frames without dropping any.
-//!
-//! [`to_filter`]: VideoDetector::to_filter
 
 use crate::error::{Error, Result};
 

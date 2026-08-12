@@ -41,6 +41,14 @@ pub(crate) enum OutputTarget {
     Consumed,
 }
 
+/// One destination of an FFmpeg job: a URL/path, a custom write callback, or
+/// a [`PacketSink`](crate::packet_sink::PacketSink), plus per-output options
+/// — container format, codecs, bitrates, stream mapping, per-output filters,
+/// metadata, and an optional pre-encode [`FramePipeline`].
+///
+/// Anything convertible into an `Output` (a `&str`/`String` URL, a
+/// `PacketSink`) can be passed to the [`FfmpegContext`](crate::FfmpegContext)
+/// builder directly; use the `set_*` methods for fine-grained control.
 pub struct Output {
     /// The output destination (URL, custom byte sink, or packet sink).
     /// Moved out (leaving [`OutputTarget::Consumed`]) when the context is

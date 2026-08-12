@@ -1,7 +1,7 @@
 //! Pure-Rust generation of an HLS master playlist (`master.m3u8`).
 //!
 //! This module has **no FFmpeg dependency**: it turns a list of already-resolved
-//! [`MasterVariant`] descriptors into the text of an
+//! `MasterVariant` descriptors into the text of an
 //! [RFC 8216](https://www.rfc-editor.org/rfc/rfc8216) multivariant (master)
 //! playlist. Keeping the text generation separate from the transcode pipeline
 //! makes it trivially unit-testable and keeps [`crate::core::recipes::hls`]

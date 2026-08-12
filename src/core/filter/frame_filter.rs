@@ -34,6 +34,16 @@ pub enum RequestFrameMode {
 /// / `FrameFilterProcess` / `FrameFilterRequest`, preserving the source.
 pub type FrameFilterError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
+/// A custom frame-processing stage, written in Rust, that runs inside a
+/// [`FramePipeline`](crate::filter::frame_pipeline::FramePipeline) attached
+/// to an input (post-decode) or an output (pre-encode).
+///
+/// Implementations must state their [`media_type`](FrameFilter::media_type);
+/// every other method has a default. Frames enter through
+/// [`filter_frame`](FrameFilter::filter_frame) — whose default drops every
+/// frame, so pass-through filters must override it — and filters that
+/// produce output on their own (generators, asynchronous GPU stages)
+/// deliver it through [`request_frame`](FrameFilter::request_frame).
 pub trait FrameFilter: Send {
     /// Returns the media type this filter operates on.
     ///
@@ -206,11 +216,13 @@ pub trait FrameFilter: Send {
     }
 }
 
+/// A pass-through [`FrameFilter`] that forwards every frame unchanged.
 pub struct NoopFilter {
     media_type: AVMediaType,
 }
 
 impl NoopFilter {
+    /// Creates a no-op filter for the given media type.
     pub fn new(media_type: AVMediaType) -> Self {
         Self { media_type }
     }

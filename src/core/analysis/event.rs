@@ -1,7 +1,7 @@
 //! Typed detection/measurement events and the `lavfi.*` metadata parser.
 //!
 //! FFmpeg's detector filters attach their result to each frame as `lavfi.*`
-//! metadata (an `AVDictionary`). [`parse_frame_metadata`] reads that dictionary
+//! metadata (an `AVDictionary`). `parse_frame_metadata` reads that dictionary
 //! off a decoded/filtered frame and turns the recognised keys into typed
 //! [`MetadataEvent`]s. The metadata keys below were cross-checked against the
 //! FFmpeg n7.1 sources for `blackdetect`, `silencedetect`, `scdet`,

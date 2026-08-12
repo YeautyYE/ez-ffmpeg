@@ -454,7 +454,7 @@ impl EmbedRtmpServer<Initialization> {
     /// lifecycle can be started only once: the first `start()` wins, and
     /// every later attempt — a sibling clone while the server runs, or any
     /// clone after it stopped — fails with
-    /// [`RtmpServerAlreadyStarted`](crate::error::Error::RtmpServerAlreadyStarted),
+    /// [`RtmpServerAlreadyStarted`],
     /// refused before any socket is bound: a second start on a fixed port
     /// reports the lifecycle error, not `AddrInUse` from the winner's port.
     /// A `start()` that fails before it claims the lifecycle (e.g. the

@@ -108,6 +108,13 @@ use open_input::{read_packet_wrapper, seek_input_packet_wrapper};
 #[cfg(test)]
 use open_output::{seek_output_packet_wrapper, write_packet_wrapper};
 
+/// A fully assembled FFmpeg job — inputs, filter graphs, and outputs,
+/// validated and ready to run.
+///
+/// Create one with [`FfmpegContext::builder`], then either call
+/// [`start`](FfmpegContext::start) directly or hand it to an
+/// [`FfmpegScheduler`] for explicit lifecycle control (pause/resume, abort,
+/// async waiting).
 pub struct FfmpegContext {
     pub(crate) independent_readrate: bool,
     pub(crate) demuxs: Vec<Demuxer>,

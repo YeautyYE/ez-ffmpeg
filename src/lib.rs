@@ -168,7 +168,13 @@
 //! please ensure that your usage complies with FFmpeg's license.
 
 pub mod core;
+/// Error handling: the crate-wide [`Error`](error::Error) enum, the
+/// [`Result`](error::Result) alias every API returns, and typed sub-errors
+/// for specific subsystems.
 pub mod error;
+/// FFmpeg-adjacent helpers: AVERROR formatting
+/// ([`av_err2str`](util::ffmpeg_utils::av_err2str)) and frame utilities for
+/// custom filters (writability probes, EOF-marker detection).
 pub mod util;
 
 /// Internal RAII wrappers concentrating raw FFmpeg FFI pointers (Rung-2 boundary).

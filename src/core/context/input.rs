@@ -5,6 +5,15 @@ use std::collections::HashMap;
 // We require `+ Send` on callback types to ensure this.
 // Input is !Sync because FnMut callbacks require exclusive access.
 
+/// One media source of an FFmpeg job: a URL/path (local file, `rtmp://`,
+/// `http://`, capture device, ...) or a custom read callback, plus per-input
+/// options — input format, start/stop offsets, hardware acceleration,
+/// stream looping, and an optional post-decode [`FramePipeline`].
+///
+/// Anything convertible into an `Input` (a `&str`/`String` URL, a boxed read
+/// callback) can be passed to the [`FfmpegContext`](crate::FfmpegContext)
+/// builder directly; start from [`Input::new`] or the `From` conversions
+/// when you need the `set_*` options.
 pub struct Input {
     /// The URL of the input source.
     ///

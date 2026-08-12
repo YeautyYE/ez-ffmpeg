@@ -16,6 +16,13 @@ use ffmpeg_sys_next::{
 };
 use ffmpeg_sys_next::{avformat_alloc_context, avformat_close_input, avformat_open_input};
 
+/// Metadata for a single stream found in a media source, with one variant
+/// per stream kind (video, audio, subtitle, data, attachment, unknown).
+///
+/// Returned by this module's `find_*_stream_info` helpers and
+/// [`find_all_stream_infos`]. The fields mirror FFmpeg's `AVStream` and
+/// `AVCodecParameters`; the enum and every variant are `#[non_exhaustive]`,
+/// so new stream kinds and fields can be added without a breaking change.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum StreamInfo {

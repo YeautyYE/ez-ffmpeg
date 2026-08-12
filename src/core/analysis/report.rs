@@ -1,9 +1,9 @@
 //! Folded analysis report and the streaming event folder.
 //!
-//! [`fold_event`] folds each [`MetadataEvent`] into a running [`FoldState`] as it
+//! `fold_event` folds each [`MetadataEvent`] into a running `FoldState` as it
 //! arrives — collapsing the stream into ranges and summaries without buffering the
-//! per-frame events. [`finalize`] then closes regions left open at end-of-stream,
-//! using the detector's `min_duration` config (via [`FoldConfig`]) to drop
+//! per-frame events. `finalize` then closes regions left open at end-of-stream,
+//! using the detector's `min_duration` config (via `FoldConfig`) to drop
 //! truncated tails shorter than the configured minimum.
 
 use crate::core::analysis::event::MetadataEvent;
