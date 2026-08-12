@@ -2,6 +2,7 @@
 name = "ez-ffmpeg"
 version = "0.17.1"
 edition = "2021"
+rust-version = "1.80"
 authors = ["Yeauty <YeautyYE@gmail.com>"]
 description = "A safe and ergonomic Rust interface for FFmpeg integration, designed for ease of use."
 homepage = "https://github.com/YeautyYE/ez-ffmpeg"
@@ -28,7 +29,7 @@ thiserror = "1.0"
 ffmpeg-next = "8.1.0"
 ffmpeg-sys-next = "8.1.0"
 crossbeam = "0.8.4"
-crossbeam-channel = "0.5.13"
+crossbeam-channel = "0.5.15"
 libc = "0.2.159"
 
 #opengl
@@ -47,7 +48,7 @@ pollster = { version = "0.4", optional = true }
 ash = { version = "0.38", optional = true }
 
 #flv
-bytes = { version = "1.9.0", optional = true }
+bytes = { version = "1.11.1", optional = true }
 
 #rtmp
 rml_rtmp = { version = "0.8", optional = true }
