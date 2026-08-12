@@ -56,8 +56,8 @@ def main() -> int:
     per_corpus: dict[str, list[tuple[float, float]]] = {}
     block: dict[tuple[str, str], dict[str, tuple[int, int]]] = {}
 
-    def flush(block):
-        for (corpus, _rnd), d in block.items():
+    def flush(pending: dict[tuple[str, str], dict[str, tuple[int, int]]]) -> None:
+        for (corpus, _rnd), d in pending.items():
             if "reference_production" in d and "stride3_production" in d:
                 ref, ship = d["reference_production"], d["stride3_production"]
                 if ship[0] > 0 and ship[1] > 0:
@@ -65,22 +65,27 @@ def main() -> int:
                         (ref[0] / ship[0], ref[1] / ship[1])
                     )
 
-    for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
-        if line.startswith("#"):
-            flush(block)
-            block = {}
-            continue
-        parts = line.rstrip("\n").split(",")
-        if len(parts) != 8:
-            continue
-        corpus, _bytes, variant, rnd = parts[0], parts[1], parts[2], parts[3]
-        if variant not in ("reference_production", "stride3_production"):
-            continue
-        try:
-            census_ns, normalize_ns = int(parts[4]), int(parts[6])
-        except ValueError:
-            continue
-        block.setdefault((corpus, rnd), {})[variant] = (census_ns, normalize_ns)
+    try:
+        with open(sys.argv[1], encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("#"):
+                    flush(block)
+                    block = {}
+                    continue
+                parts = line.rstrip("\n").split(",")
+                if len(parts) != 8:
+                    continue
+                corpus, _bytes, variant, rnd = parts[0], parts[1], parts[2], parts[3]
+                if variant not in ("reference_production", "stride3_production"):
+                    continue
+                try:
+                    census_ns, normalize_ns = int(parts[4]), int(parts[6])
+                except ValueError:
+                    continue
+                block.setdefault((corpus, rnd), {})[variant] = (census_ns, normalize_ns)
+    except OSError as err:
+        print(f"FAIL: cannot read {sys.argv[1]}: {err}")
+        return 1
     flush(block)
 
     if not per_corpus:
@@ -94,7 +99,7 @@ def main() -> int:
         f"{'corpus':22s} {'census_med':>10s} {'norm_med':>10s} "
         f"{'min_pair':>9s} {'pairs':>6s}"
     )
-    lowest = 9.9
+    lowest = float("inf")
     failed: list[str] = []
     for corpus in sorted(per_corpus):
         census = [c for c, _ in per_corpus[corpus]]

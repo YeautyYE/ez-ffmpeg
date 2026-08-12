@@ -45,7 +45,7 @@
 # `#[cfg(target_os = "macos")]`, so they do not run on Linux.
 #
 # The `build` job (all-features build + a default-features build + clippy) and
-# the `test` job run per Linux architecture and FFmpeg lane. Two specialized
+# the `test` job run per Linux architecture and FFmpeg lane. Three specialized
 # jobs run once on Linux x64:
 #
 #   * `docs` — compiles the crate under `--cfg docsrs` (`DOCS_RS=1`), which stubs
@@ -59,6 +59,11 @@
 #     see its alloc/free, so a UAF where instrumented Rust touches FFmpeg-freed
 #     memory is caught (one entirely inside un-instrumented FFmpeg C is not
 #     reliably covered — those regressions are Rust-side here).
+#   * `audit` — dependency advisory gate. Cargo.lock is intentionally
+#     untracked, so the job resolves the graph fresh (`cargo generate-lockfile`)
+#     and audits the resolved versions against the RUSTSEC advisory database;
+#     vulnerabilities fail the job, informational advisories only warn
+#     (cargo-audit's default verdict).
 #
 # One specialized job runs on the arm64 runner:
 #
@@ -76,6 +81,10 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+
+# Every job only reads the repository; nothing writes back through the token.
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -106,7 +115,7 @@ jobs:
             ffmpeg: "7.1"
             ffmpeg-features: ""
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # The 8.1 lane git-clones and statically builds FFmpeg inside target/
       # alongside the crate's own build tree, and the sum has exhausted the
@@ -126,13 +135,17 @@ jobs:
             nasm yasm clang pkg-config make git zlib1g-dev
           echo "nasm: $(nasm --version | head -1)"
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned to a commit, so the ref no longer names the toolchain; the
+      # explicit `toolchain` input preserves the original selection (same for
+      # every rust-toolchain step below).
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
+          toolchain: stable
           components: clippy
 
       - name: Cache FFmpeg 7.1 install
         if: matrix.ffmpeg == '7.1'
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ~/ffmpeg71
           key: ${{ runner.os }}-${{ runner.arch }}-ffmpeg71-shared-v1
@@ -157,7 +170,7 @@ jobs:
           echo "LD_LIBRARY_PATH=$HOME/ffmpeg71/lib" >> "$GITHUB_ENV"
 
       - name: Cache cargo sources
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -216,7 +229,7 @@ jobs:
     # layout pins, builder checks — run for real. Media assets are committed
     # as test.mp4.
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # The 8.1 lane git-clones and statically builds FFmpeg inside target/
       # alongside the crate's own build tree, and the sum has exhausted the
@@ -235,11 +248,13 @@ jobs:
           sudo apt-get install -y \
             nasm yasm clang pkg-config make git zlib1g-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
 
       - name: Cache FFmpeg 7.1 install
         if: matrix.ffmpeg == '7.1'
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ~/ffmpeg71
           key: ${{ runner.os }}-${{ runner.arch }}-ffmpeg71-shared-v1
@@ -264,7 +279,7 @@ jobs:
           echo "LD_LIBRARY_PATH=$HOME/ffmpeg71/lib" >> "$GITHUB_ENV"
 
       - name: Cache cargo sources
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -336,7 +351,7 @@ jobs:
             branch: release/7.1
             prefix: ffmpeg71full
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install FFmpeg build toolchain
         run: |
@@ -344,10 +359,12 @@ jobs:
           sudo apt-get install -y \
             nasm yasm clang pkg-config make git zlib1g-dev libx264-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
 
       - name: Cache FFmpeg ${{ matrix.ffmpeg }} full install
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ~/${{ matrix.prefix }}
           key: ${{ runner.os }}-${{ runner.arch }}-${{ matrix.prefix }}-shared-v1
@@ -371,7 +388,7 @@ jobs:
           echo "LD_LIBRARY_PATH=$HOME/${{ matrix.prefix }}/lib" >> "$GITHUB_ENV"
 
       - name: Cache cargo sources
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -493,9 +510,11 @@ jobs:
       CARGO_BUILD_JOBS: 2
       CARGO_INCREMENTAL: 0
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
 
       - name: Verify native Rust target
         shell: bash
@@ -504,7 +523,7 @@ jobs:
           test "$(rustc -vV | sed -n 's/^host: //p')" = "${{ matrix.target }}"
 
       - name: Cache cargo sources
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -551,7 +570,7 @@ jobs:
 
       - name: Cache vcpkg binary packages
         if: matrix.os == 'windows'
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: vcpkg-bincache
           key: ${{ runner.os }}-${{ runner.arch }}-vcpkg-${{ matrix.vcpkg_cache }}
@@ -651,7 +670,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # Host-side canary: a kernel built without 32-bit compat support — the
       # likely shape of a fleet move to AArch32-less cores — refuses the
@@ -671,7 +690,7 @@ jobs:
       # independent, so the armhf container can reuse what the arm64 lanes
       # populated. Mounted into the container below.
       - name: Cache cargo sources
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -695,7 +714,7 @@ jobs:
     name: Docs (docsrs cfg compile)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install FFmpeg build toolchain
         run: |
@@ -703,10 +722,12 @@ jobs:
           sudo apt-get install -y \
             nasm yasm clang pkg-config make git zlib1g-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
 
       - name: Cache cargo sources
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -732,7 +753,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install FFmpeg build toolchain
         run: |
@@ -740,10 +761,12 @@ jobs:
           sudo apt-get install -y \
             nasm yasm clang pkg-config make git zlib1g-dev
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb # nightly
+        with:
+          toolchain: nightly
 
       - name: Cache cargo sources
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -776,3 +799,40 @@ jobs:
             --test frame_export_uniform_test --test frame_export_audio_test \
             --test video_writer --test packet_sink_teardown --test packet_sink_unwind \
             --test logger_reentrancy
+
+  # Dependency advisory gate. Cargo.lock is intentionally untracked, so every
+  # run resolves the dependency graph fresh and audits those resolved versions
+  # against the RUSTSEC advisory database. cargo-audit's default verdict is
+  # the gate: vulnerabilities fail, informational advisories (unmaintained /
+  # unsound / yanked) only warn. The binary is version-pinned, built from
+  # crates.io source with its own committed lockfile (--locked), and cached
+  # keyed on that version, so no additional third-party actions are involved.
+  # Lockfile resolution runs no build scripts, so the job needs no FFmpeg.
+  audit:
+    name: Audit (dependency advisories)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_AUDIT_VERSION: 0.22.2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo-audit binary
+        id: cargo-audit-bin
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-audit-${{ env.CARGO_AUDIT_VERSION }}
+
+      - name: Install cargo-audit
+        if: steps.cargo-audit-bin.outputs.cache-hit != 'true'
+        run: cargo install cargo-audit --locked --version "$CARGO_AUDIT_VERSION"
+
+      - name: Audit dependency advisories
+        run: |
+          cargo generate-lockfile
+          cargo audit
