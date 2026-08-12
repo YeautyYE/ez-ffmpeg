@@ -99,7 +99,13 @@ impl RtmpScheduler {
         };
 
         let publisher_results = {
-            let client = self.clients.get_mut(client_id).unwrap();
+            let Some(client) = self.clients.get_mut(client_id) else {
+                warn!(
+                    "Publishing client {} not found for connection_id: {}",
+                    client_id, publisher_connection_id
+                );
+                return Ok(());
+            };
             let publisher_results: Vec<ServerSessionResult> =
                 match client.session.handle_input(&bytes) {
                     Ok(results) => results,
@@ -145,11 +151,17 @@ impl RtmpScheduler {
                         request_id,
                         app_name: _,
                     } => {
-                        let client_id = self
+                        let Some(client) = self
                             .publisher_to_client_map
                             .get(&publisher_connection_id)
-                            .unwrap();
-                        let client = self.clients.get_mut(*client_id).unwrap();
+                            .and_then(|client_id| self.clients.get_mut(*client_id))
+                        else {
+                            warn!(
+                                "Connection request {} for non-existent publisher connection_id: {}",
+                                request_id, publisher_connection_id
+                            );
+                            continue;
+                        };
                         if let Err(e) = client.session.accept_request(request_id) {
                             warn!(
                                 "Failed to accept connection request {}: {:?}",
@@ -163,11 +175,17 @@ impl RtmpScheduler {
                         stream_key,
                         mode: _,
                     } => {
-                        let client_id = self
+                        let Some(client) = self
                             .publisher_to_client_map
                             .get(&publisher_connection_id)
-                            .unwrap();
-                        let client = self.clients.get_mut(*client_id).unwrap();
+                            .and_then(|client_id| self.clients.get_mut(*client_id))
+                        else {
+                            warn!(
+                                "Publish request {} for stream '{}' on non-existent publisher connection_id: {}",
+                                request_id, stream_key, publisher_connection_id
+                            );
+                            continue;
+                        };
                         if let Err(e) = client.session.accept_request(request_id) {
                             warn!(
                                 "Failed to accept publish request {} for stream '{}': {:?}",
