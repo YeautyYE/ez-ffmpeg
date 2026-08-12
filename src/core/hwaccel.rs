@@ -771,7 +771,15 @@ fn hw_device_init_from_string_locked(arg: &str) -> Result<HWDevice, InitFailure>
         });
     };
 
-    let dev = HWDevice::new(name.unwrap(), device_type, device, Some(arg.to_string()));
+    // `name` is None only when hw_device_default_name exhausted its auto
+    // names; report the same silent ENOMEM as hw_device_init_from_type_locked.
+    let Some(name) = name else {
+        return Err(InitFailure {
+            code: AVERROR(ENOMEM),
+            log: None,
+        });
+    };
+    let dev = HWDevice::new(name, device_type, device, Some(arg.to_string()));
     add_hw_device(dev.clone());
 
     Ok(dev)
