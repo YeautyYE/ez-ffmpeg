@@ -1,6 +1,6 @@
 [package]
 name = "ez-ffmpeg"
-version = "0.17.1"
+version = "0.17.2"
 edition = "2021"
 rust-version = "1.80"
 authors = ["Yeauty <YeautyYE@gmail.com>"]
