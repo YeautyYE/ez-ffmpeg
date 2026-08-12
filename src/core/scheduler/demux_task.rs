@@ -71,7 +71,7 @@ pub(crate) fn demux_init(
         // Publish "exited" here: this input produces nothing, which is the
         // exact meaning the flag carries.
         let SchNode::Demux { task_exited, .. } = demux_node.as_ref() else {
-            unreachable!()
+            unreachable!("a demuxer's node is always SchNode::Demux (built in Demuxer::new)")
         };
         task_exited.store(true, Ordering::Release);
         return Ok(());
@@ -372,7 +372,9 @@ pub(crate) fn demux_init(
             let node = demux_node.as_ref();
             let SchNode::Demux {
                 waiter: _, task_exited
-            } = node else { unreachable!() };
+            } = node else {
+                unreachable!("a demuxer's node is always SchNode::Demux (built in Demuxer::new)")
+            };
             task_exited.store(true, Ordering::Release);
             debug!("Demuxer finished.");
         });
@@ -1279,7 +1281,7 @@ unsafe fn demux_send(
 ) -> i32 {
     let node = demux_node.as_ref();
     let SchNode::Demux { waiter, .. } = node else {
-        unreachable!()
+        unreachable!("a demuxer's node is always SchNode::Demux (built in Demuxer::new)")
     };
     let wait_time = waiter.wait_with_scheduler_status(scheduler_status, independent_readrate);
     if is_stopping(wait_until_not_paused(scheduler_status)) {

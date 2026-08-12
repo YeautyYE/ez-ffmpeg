@@ -179,7 +179,7 @@ pub(crate) fn filter_graph_init(
                 best_input,
             } = node
             else {
-                unreachable!()
+                unreachable!("FilterGraph::new always builds the graph node as SchNode::Filter")
             };
 
             loop {
@@ -215,7 +215,11 @@ pub(crate) fn filter_graph_init(
                         continue;
                     }
                 } else {
-                    unreachable!()
+                    unreachable!(
+                        "fg_input_index {input_index} out of {} pads: every sender into this \
+                         graph is wired with an in-range pad index at bind time",
+                        finished_flag_list.len()
+                    )
                 }
 
                 unsafe {
@@ -360,7 +364,11 @@ fn filter_receive_finish(finished_flag_list: &Arc<[AtomicBool]>, input_index: us
             finished_flag_list[input_index].store(true, Ordering::Release);
         }
     } else {
-        unreachable!()
+        unreachable!(
+            "input_index {input_index} out of {} pads: callers pass an index already \
+             bounds-checked against this same list",
+            finished_flag_list.len()
+        )
     }
 }
 

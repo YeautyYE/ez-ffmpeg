@@ -108,7 +108,7 @@ impl InputController {
         self.demuxs.iter().for_each(|demux| {
             let node = demux.as_ref();
             let SchNode::Demux { waiter, .. } = node else {
-                unreachable!()
+                unreachable!("new() asserts every demuxs entry is SchNode::Demux")
             };
             waiter.set_choked_prev(waiter.get_choked());
             waiter.set_choked_next(true);
@@ -123,7 +123,7 @@ impl InputController {
                 source_finished,
             } = node
             else {
-                unreachable!()
+                unreachable!("new() asserts every mux_streams entry is SchNode::MuxStream")
             };
 
             // unblock sources for output streams that are not finished
@@ -168,7 +168,7 @@ impl InputController {
                     task_exited,
                 } = node
                 else {
-                    unreachable!()
+                    unreachable!("new() asserts every demuxs entry is SchNode::Demux")
                 };
                 if !task_exited.load(Ordering::Acquire) {
                     waiter.set_choked_next(false);
@@ -179,7 +179,7 @@ impl InputController {
         for demux in self.demuxs.iter() {
             let node = demux.as_ref();
             let SchNode::Demux { waiter, .. } = node else {
-                unreachable!()
+                unreachable!("new() asserts every demuxs entry is SchNode::Demux")
             };
             let choked_next = waiter.get_choked_next();
             if waiter.get_choked_prev() != choked_next {
@@ -206,7 +206,7 @@ impl InputController {
             assert!(matches!(node, SchNode::Filter { .. }));
 
             let SchNode::Filter { inputs, best_input } = node else {
-                unreachable!()
+                unreachable!("node matched SchNode::Filter in the assert just above")
             };
 
             // No upstream to walk to — out of range, or a cross-graph hole
@@ -230,7 +230,7 @@ impl InputController {
                     source_finished,
                 } = node
                 else {
-                    unreachable!()
+                    unreachable!("new() asserts every mux_streams entry is SchNode::MuxStream")
                 };
                 if source_finished.load(Ordering::Acquire) {
                     None

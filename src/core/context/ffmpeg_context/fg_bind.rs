@@ -301,7 +301,7 @@ pub(super) fn ifilter_bind_ist(
 
         let node = Arc::make_mut(&mut filter_graph.node);
         let SchNode::Filter { inputs, .. } = node else {
-            unreachable!()
+            unreachable!("FilterGraph::new always builds the graph node as SchNode::Filter")
         };
         // Assign into the pad-indexed slot (pre-sized to the pad count in
         // FilterGraph::new, so `input_index` is always in range — the function

@@ -235,7 +235,9 @@ impl WriteQueue {
                 }
                 self.evict_old_entries(now);
             }
-            BackpressureLevel::Critical => unreachable!(),
+            BackpressureLevel::Critical => unreachable!(
+                "the critical-cap gate above keeps total_bytes below QUEUE_MAX_BYTES, so the level cannot be Critical"
+            ),
         }
 
         true

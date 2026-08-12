@@ -125,7 +125,7 @@ impl StreamSpecifier {
                                 ss.media_type = Some(AVMediaType::AVMEDIA_TYPE_VIDEO);
                                 ss.no_apic = true;
                             }
-                            _ => unreachable!(),
+                            _ => unreachable!("the enclosing match arm only admits v, a, s, t, V"),
                         }
                     } else {
                         break;
