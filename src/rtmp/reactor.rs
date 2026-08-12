@@ -588,23 +588,27 @@ impl ReactorConnection {
         }
     }
 
-    /// Read data (drain until WouldBlock)
+    /// Read data (drain until WouldBlock) into `all_data`
     ///
-    /// Returns (data read, should disconnect)
+    /// Clears `all_data` and fills it with the bytes read, so the reactor
+    /// can pass its reusable scratch buffer and the hot read path allocates
+    /// nothing once that buffer has grown to the connection's burst size.
+    ///
+    /// Returns whether the connection should disconnect (EOF observed)
     /// Note: Limits read to MAX_READ_PER_POLL to prevent memory DoS
-    pub fn try_read(&mut self) -> io::Result<(Vec<u8>, bool)> {
-        let mut all_data = Vec::new();
+    pub fn try_read(&mut self, all_data: &mut Vec<u8>) -> io::Result<bool> {
+        all_data.clear();
 
         loop {
             // Check read limit to prevent unbounded memory growth
             if all_data.len() >= MAX_READ_PER_POLL {
-                return Ok((all_data, false)); // Return data, continue next poll
+                return Ok(false); // Return data, continue next poll
             }
 
             match self.socket.read(&mut self.read_buffer) {
                 Ok(0) => {
                     // Connection closed
-                    return Ok((all_data, true));
+                    return Ok(true);
                 }
                 Ok(n) => {
                     self.last_read_activity = Instant::now();
@@ -613,7 +617,7 @@ impl ReactorConnection {
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                     // No more data available
-                    return Ok((all_data, false));
+                    return Ok(false);
                 }
                 Err(e) => {
                     debug!("Connection {} read error: {:?}", self.token.id, e);
@@ -1416,6 +1420,17 @@ pub struct Reactor {
     server_results_buffer: Vec<ServerResult>,
     /// Reusable buffer for handle results (avoids allocation in handle_readable)
     results_buffer: Vec<HandleResult>,
+    /// Reusable buffer for socket reads (avoids a Vec allocation per
+    /// readable event): `read_connection_data` moves it out for
+    /// `ReactorConnection::try_read` to fill, and `handle_readable` hands
+    /// it back once the batch is processed. Starts at zero capacity, so
+    /// idle wakeups that read nothing still allocate nothing.
+    read_scratch: Vec<u8>,
+    /// Reusable buffer for the publisher-id snapshot `process_publishers`
+    /// walks each round (the snapshot exists to end the `publishers` borrow
+    /// before the drain loop mutates `self`); avoids re-collecting a fresh
+    /// Vec every loop iteration. Empty between rounds.
+    publisher_ids_scratch: Vec<usize>,
     /// Last time the full connection-timeout sweep ran (PERF-10 throttle)
     last_timeout_check: Instant,
 }
@@ -1467,6 +1482,8 @@ impl Reactor {
             ids_to_close_buffer: Vec::with_capacity(16),
             server_results_buffer: Vec::with_capacity(64),
             results_buffer: Vec::with_capacity(16),
+            read_scratch: Vec::new(),
+            publisher_ids_scratch: Vec::new(),
             last_timeout_check: Instant::now(),
         })
     }
@@ -1722,6 +1739,9 @@ impl Reactor {
             self.read_pending.insert(id);
         }
 
+        // Hand the read buffer's allocation back for the next readable event.
+        self.read_scratch = data;
+
         std::mem::take(&mut self.results_buffer)
     }
 
@@ -1755,20 +1775,28 @@ impl Reactor {
             _ => return None,
         };
 
-        match conn.try_read() {
-            Ok((data, close)) => {
+        // Move the reusable scratch buffer out for try_read to fill; every
+        // exit path hands it back (the Some path via handle_readable, once
+        // the batch is processed), so the steady-state read allocates
+        // nothing beyond the buffer's high-water growth.
+        let mut data = std::mem::take(&mut self.read_scratch);
+
+        match conn.try_read(&mut data) {
+            Ok(close) => {
                 // Check if there's data to process
                 if data.is_empty() {
                     // No data, close if needed
                     if close {
                         self.results_buffer.push(HandleResult::Disconnect(id));
                     }
+                    self.read_scratch = data;
                     return None;
                 }
                 Some((data, close))
             }
             Err(_) => {
                 self.results_buffer.push(HandleResult::Disconnect(id));
+                self.read_scratch = data;
                 None
             }
         }
@@ -2027,9 +2055,14 @@ impl Reactor {
         let mut ids_to_close = Vec::new();
         let mut budget_exhausted = false;
 
-        let publisher_ids: Vec<usize> = self.publishers.iter().map(|(id, _)| id).collect();
+        // Snapshot the live publisher ids into the reusable scratch (moved
+        // out so the drain loop below can borrow `self` mutably) instead of
+        // collecting a fresh Vec every loop iteration.
+        debug_assert!(self.publisher_ids_scratch.is_empty());
+        let mut publisher_ids = std::mem::take(&mut self.publisher_ids_scratch);
+        publisher_ids.extend(self.publishers.iter().map(|(id, _)| id));
 
-        for pub_id in publisher_ids {
+        for &pub_id in &publisher_ids {
             let (source, ingress_budget) = {
                 let pub_state = match self.publishers.get(pub_id) {
                     Some(p) => p,
@@ -2185,6 +2218,9 @@ impl Reactor {
                 ingress_budget.release(bytes_drained);
             }
         }
+
+        publisher_ids.clear();
+        self.publisher_ids_scratch = publisher_ids;
 
         // Fan out through the shared enqueue path: move this round's packets
         // into `packets_buffer` (empty here — every user drains it fully) and
@@ -3795,6 +3831,9 @@ mod tests {
         let test_sizes = [128, 1024, 4096, 8192, 16384, 65536];
         let iterations = 100;
 
+        // Reused across reads, like the reactor's read_scratch buffer.
+        let mut read_buf = Vec::new();
+
         println!();
         println!("╔══════════════════════════════════════════════════════════╗");
         println!("║           RTMP Performance Test: Read Throughput         ║");
@@ -3821,7 +3860,7 @@ mod tests {
 
                 // Read via reactor connection
                 if let Some(conn) = reactor.connections.get_mut(token.id) {
-                    let _ = conn.try_read();
+                    let _ = conn.try_read(&mut read_buf);
                 }
             }
 
