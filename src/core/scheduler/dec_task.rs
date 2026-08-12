@@ -428,16 +428,7 @@ unsafe fn transcode_subtitles(
 
         let result = dec_send(frame_box, frame_pool, senders);
         packet_pool.release(packet_box.packet);
-        return match result {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                if e == Error::EOF {
-                    Err(Error::Exit)
-                } else {
-                    Err(e)
-                }
-            }
-        };
+        return result.map_err(eof_to_exit);
     } else if !packet_is_null(&packet_box.packet)
         && (*packet_box.packet.as_ptr()).stream_index >= 0
         && (*packet_box.packet.as_ptr()).opaque as usize as i32
@@ -453,7 +444,6 @@ unsafe fn transcode_subtitles(
             ),
         );
         packet_pool.release(packet_box.packet);
-        // return ret;
         return Ok(());
     }
 
@@ -471,6 +461,12 @@ unsafe fn transcode_subtitles(
         packet_is_eof = true;
     };
 
+    // Lock policy for the DecoderParameter mutex throughout this file:
+    // `.unwrap()` is deliberate fail-fast — a poisoned lock means a peer
+    // thread panicked while holding it, and re-raising the panic here lets
+    // the worker thread boundary record it as Error::WorkerPanicked (see
+    // util/thread_synchronizer.rs). Components that must survive poisoning
+    // (e.g. pre_mux_queue) recover with PoisonError::into_inner instead.
     let mut dp = dp_arc.lock().unwrap();
     // `raw::Subtitle` owns the decoded AVSubtitle: avcodec_decode_subtitle2 fills
     // its rects, and Drop frees them exactly once on every path below — the
@@ -549,16 +545,7 @@ unsafe fn process_subtitle(
 
     let frame_box = dec_frame_to_box(subtitle_header, dec_ctx, frame);
 
-    match dec_send(frame_box, frame_pool, senders) {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            if e == Error::EOF {
-                Err(Error::Exit)
-            } else {
-                Err(e)
-            }
-        }
-    }
+    dec_send(frame_box, frame_pool, senders).map_err(eof_to_exit)
 }
 
 #[cfg(not(docsrs))]
@@ -723,6 +710,16 @@ fn dst_finished(fg_input_index: usize, finished_flag_list: &[AtomicBool]) -> boo
     !finished_flag_list.is_empty()
         && fg_input_index < finished_flag_list.len()
         && finished_flag_list[fg_input_index].load(Ordering::Acquire)
+}
+
+/// Maps `dec_send`'s EOF (every downstream consumer finished) to `Exit`: the
+/// decoder treats it as a signal to leave its task loop, not as an error.
+fn eof_to_exit(e: Error) -> Error {
+    if e == Error::EOF {
+        Error::Exit
+    } else {
+        e
+    }
 }
 
 unsafe fn dec_send(
@@ -1716,11 +1713,7 @@ unsafe fn packet_decode(
         }
 
         if let Err(e) = dec_send(frame_box, frame_pool, senders) {
-            return if e == Error::EOF {
-                Err(Error::Exit)
-            } else {
-                Err(e)
-            };
+            return Err(eof_to_exit(e));
         }
     }
 }

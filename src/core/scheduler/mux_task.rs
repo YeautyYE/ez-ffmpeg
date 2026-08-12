@@ -579,7 +579,13 @@ fn mux_task_start(
 
             let Some(i) = min_stream else { break };
             let packet_box = queues[i].pop_front().unwrap();
-            let _ = queue_sender.send(packet_box);
+            // A send can only fail because the mux worker already exited and
+            // dropped the queue receiver (recording its own task error if it
+            // failed); the channel never reconnects, so stop draining. This
+            // packet and the still-queued ones are freed by their Drop impls.
+            if queue_sender.send(packet_box).is_err() {
+                break;
+            }
         }
     });
     Ok(())
@@ -2701,7 +2707,9 @@ unsafe fn update_last_dts(
             source_finished: _,
         } = node
         else {
-            unreachable!()
+            unreachable!(
+                "mux_stream_nodes holds only SchNode::MuxStream (built in Muxer::new_stream)"
+            )
         };
         last_dts.store(dts, Ordering::Release);
         input_controller.update_locked(scheduler_status);
