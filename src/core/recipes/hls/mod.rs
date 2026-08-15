@@ -17,15 +17,23 @@
 //! - Keyframe alignment across renditions is pursued with **fixed-GOP codec
 //!   AVOptions** (`g` / `keyint_min` / `sc_threshold`, plus closed-GOP
 //!   `x264-params` for libx264) rather than
-//!   [`Output::set_force_key_frames`](crate::Output::set_force_key_frames),
-//!   which remains available for hand-built pipelines. With the same CFR
+//!   [`Output::set_force_key_frames`](crate::Output::set_force_key_frames)
+//!   when the historical `libx264` encoder is used. With the same CFR
 //!   input and GOP length, renditions' keyframe PTS sequences coincide, so
 //!   segments split at the same PTS and are cross-switchable — as long as the
 //!   chosen encoder honors those options. The explicit fixed-GOP/no-scenecut
 //!   parameters are wired for libx264/libx265 (and encoders honoring the
-//!   generic `g`/`sc_threshold` AVOptions); an arbitrary encoder passed to
-//!   [`HlsLadder::video_codec`] may keep inserting scene-cut keyframes, and
-//!   this recipe cannot verify alignment after the fact.
+//!   generic `g`/`sc_threshold` AVOptions). The auto-admitted wrappers
+//!   (`h264_videotoolbox`, `h264_nvenc`, `h264_qsv`, `libopenh264`) — whether
+//!   chosen by [`HlsLadder::video_codec_auto`] or pinned with
+//!   [`HlsLadder::video_codec`] — use encoder-specific options plus a periodic
+//!   IDR request. Any other name passed to [`HlsLadder::video_codec`] may keep
+//!   inserting scene-cut keyframes, and this recipe cannot verify alignment
+//!   after the fact.
+//! - When `libx264` is not registered, the historical default returns a
+//!   typed [`HlsEncoderSelectionError`](crate::error::HlsEncoderSelectionError)
+//!   instead of silently picking another encoder. Opt in to runtime selection
+//!   with [`HlsLadder::video_codec_auto`].
 //!
 //! Segments are MPEG-TS by default; [`HlsLadder::segment_type`] switches the
 //! whole ladder to fragmented-MP4 segments (see [fMP4
@@ -54,10 +62,9 @@
 //!   verified structurally (init segment + `EXT-X-MAP` + `.m4s` segments,
 //!   probe-able end to end); no Apple validation is performed.
 //! - **HEVC:** Apple requires the `hvc1` sample-entry tag for HEVC, but
-//!   libx265 typically emits `hev1` and this crate has no per-stream
-//!   `codec_tag` option to rewrite it — prefer H.264 for Apple targets.
-//!   [`HlsLadder::codecs`] only changes master-playlist metadata, never the
-//!   encoded samples.
+//!   libx265 typically emits `hev1`. Pass [`HlsLadder::video_codec_tag`]
+//!   `"hvc1"` (FFmpeg `-tag:v`) to rewrite it; [`HlsLadder::codecs`] only
+//!   changes master-playlist metadata, never the encoded samples.
 //!
 //! # Example
 //!
@@ -86,6 +93,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::core::context::ffmpeg_context::FfmpegContext;
 use crate::core::context::input::Input;
@@ -93,6 +101,16 @@ use crate::core::context::output::Output;
 use crate::core::recipes::hls_master::{generate_master_playlist, MasterVariant};
 use crate::core::stream_info::{find_audio_stream_info, find_video_stream_info, StreamInfo};
 use crate::error::{Error, Result};
+
+mod bandwidth;
+mod encoder;
+mod probe;
+
+use encoder::{
+    decide, select_auto_fallback, trial_explicit_admitted, Decision, FfmpegRegistry,
+    HlsVideoCodecSelection, ResolvedHlsEncoder,
+};
+use probe::FfmpegOpener;
 
 const DEFAULT_SEGMENT_DURATION: f64 = 6.0;
 const DEFAULT_VIDEO_CODEC: &str = "libx264";
@@ -209,7 +227,7 @@ pub struct HlsLadder {
     segment_duration_s: f64,
     /// GOP length in seconds; `None` tracks `segment_duration_s`.
     gop_seconds: Option<f64>,
-    video_codec: String,
+    selection: HlsVideoCodecSelection,
     audio_codec: String,
     audio_bitrate: String,
     master_name: String,
@@ -221,6 +239,9 @@ pub struct HlsLadder {
     master_codecs: Option<String>,
     /// Media-segment container for every rendition (MPEG-TS or fMP4).
     segment_type: HlsSegmentType,
+    /// Optional sample-entry FourCC applied to every rendition (`-tag:v`).
+    /// `None` leaves the encoder default (`hev1` for libx265).
+    video_codec_tag: Option<String>,
 }
 
 impl HlsLadder {
@@ -232,13 +253,14 @@ impl HlsLadder {
             renditions: Vec::new(),
             segment_duration_s: DEFAULT_SEGMENT_DURATION,
             gop_seconds: None,
-            video_codec: DEFAULT_VIDEO_CODEC.to_string(),
+            selection: HlsVideoCodecSelection::HistoricalDefault,
             audio_codec: DEFAULT_AUDIO_CODEC.to_string(),
             audio_bitrate: DEFAULT_AUDIO_BITRATE.to_string(),
             master_name: DEFAULT_MASTER_NAME.to_string(),
             fps: None,
             master_codecs: None,
             segment_type: HlsSegmentType::default(),
+            video_codec_tag: None,
         }
     }
 
@@ -270,8 +292,56 @@ impl HlsLadder {
     }
 
     /// Sets the video encoder (default `"libx264"`).
+    ///
+    /// `name` is a **literal** encoder name. Passing `"auto"` requests the
+    /// encoder named `auto`, not runtime selection — use
+    /// [`video_codec_auto`](Self::video_codec_auto) for that.
+    ///
+    /// If `name` is one of the auto-admitted wrappers (`h264_videotoolbox`,
+    /// `h264_nvenc`, `h264_qsv`, `libopenh264`), this recipe applies the same
+    /// HLS-safe option set auto mode would (pixel format, `bf=0`, periodic
+    /// IDR). A registered name is trial-opened rung by rung — holding every
+    /// open session at once to prove the ladder's session count — before
+    /// output directories are created; other candidates are not tried. Any other name keeps generic `g`/`keyint_min` /
+    /// `sc_threshold` options, which that encoder may ignore. Encoder names
+    /// are matched exactly (FFmpeg's `avcodec_find_encoder_by_name` is
+    /// case-sensitive). The shared output opener still accepts a codec
+    /// *descriptor* such as `"h264"` when no encoder has that exact name:
+    /// it then selects `avcodec_find_encoder(descriptor.id)`, which is
+    /// host-dependent and is **not** treated as an admitted HLS wrapper.
+    /// Prefer an exact `AVCodec.name`.
     pub fn video_codec(mut self, codec: impl Into<String>) -> Self {
-        self.video_codec = codec.into();
+        self.selection = HlsVideoCodecSelection::Explicit(codec.into());
+        self
+    }
+
+    /// Opt in to runtime-aware H.264 encoder selection.
+    ///
+    /// If `libx264` is registered in the linked FFmpeg build, it is used with
+    /// the historical filter, AVOptions, and playlist formula, and no warning
+    /// is recorded. Only when `libx264` is **not** registered does this method
+    /// trial-open fallbacks in order:
+    /// `h264_videotoolbox`, `h264_nvenc`, `h264_qsv`, `libopenh264`.
+    ///
+    /// Fallback output is host-dependent (quality, speed, profile/level, and
+    /// bytes can change). A reproducible deployment should pin an encoder
+    /// with [`video_codec`](Self::video_codec) instead: auto-admitted names
+    /// get the same HLS-safe option set and, when registered, a rung-by-rung
+    /// trial-open of that encoder only — holding every open session at once.
+    /// Trial-open runs before output directories are created; a later real
+    /// `avcodec_open2` failure is not retried with a different encoder.
+    pub fn video_codec_auto(mut self) -> Self {
+        self.selection = HlsVideoCodecSelection::Auto;
+        self
+    }
+
+    /// Sets the video sample-entry FourCC for every rendition (FFmpeg `-tag:v`).
+    ///
+    /// Use `"hvc1"` when encoding HEVC for Apple HLS: libx265 emits `hev1` by
+    /// default, which many Apple players reject. The token is parsed by
+    /// [`Output::set_video_codec_tag`](crate::Output::set_video_codec_tag).
+    pub fn video_codec_tag(mut self, tag: impl Into<String>) -> Self {
+        self.video_codec_tag = Some(tag.into());
         self
     }
 
@@ -333,61 +403,112 @@ impl HlsLadder {
     /// master playlist — that is [`run`](Self::run)'s job. Use this when you
     /// want to drive the [`crate::FfmpegScheduler`] yourself.
     pub fn build_context(self) -> Result<FfmpegContext> {
+        Ok(self.prepare(false)?.into_context()?.0)
+    }
+
+    /// Encoder used by snapshot tests and by `rendition_output` when prepare
+    /// has not run: historical libx264 wiring, or the explicit resolver
+    /// (AUTO_PRIORITY names get the HLS-safe option set; other names are
+    /// used as-is).
+    #[cfg(test)]
+    fn snapshot_encoder(&self) -> ResolvedHlsEncoder {
+        match &self.selection {
+            HlsVideoCodecSelection::Explicit(name) => ResolvedHlsEncoder::explicit(name.clone()),
+            HlsVideoCodecSelection::HistoricalDefault | HlsVideoCodecSelection::Auto => {
+                ResolvedHlsEncoder::historical()
+            }
+        }
+    }
+
+    fn prepare(self, needs_audio: bool) -> Result<PreparedHlsLadder> {
         self.validate()?;
+        let registry = FfmpegRegistry;
+        let decision = decide(&self.selection, &registry)?;
 
         let (fps_num, fps_den) = self.resolve_fps()?;
-        let gop_us = seconds_to_us(self.effective_gop_seconds());
-        let gop_frames = compute_gop_frames(fps_num, fps_den, gop_us).to_string();
+        let gop_seconds = self.effective_gop_seconds();
+        let gop_us = seconds_to_us(gop_seconds);
+        let gop_frames_n = compute_gop_frames(fps_num, fps_den, gop_us);
+        let gop_frames = gop_frames_n.to_string();
         let hls_time = format_seconds(self.segment_duration_s);
-        let filter_desc = build_split_desc(&self.renditions);
 
-        // Wire every rendition Output first (pure configuration, no
-        // filesystem access), keeping directory creation in one block below.
-        let mut outputs = Vec::with_capacity(self.renditions.len());
-        for (i, rendition) in self.renditions.iter().enumerate() {
-            outputs.push(self.rendition_output(i, rendition, &gop_frames, &hls_time)?);
-        }
-        let rendition_dirs: Vec<PathBuf> = self
-            .renditions
-            .iter()
-            .map(|rendition| self.out_dir.join(rendition.dir_name()))
-            .collect();
+        let encoder = match decision {
+            Decision::Ready(enc) => enc,
+            Decision::NeedTrial => select_auto_fallback(
+                &registry,
+                &FfmpegOpener,
+                &self.renditions,
+                fps_num,
+                fps_den,
+                gop_frames_n,
+                parse_bitrate_bps,
+            )?,
+            Decision::NeedTrialExplicit(kind) => trial_explicit_admitted(
+                &FfmpegOpener,
+                kind,
+                &self.renditions,
+                fps_num,
+                fps_den,
+                gop_frames_n,
+                parse_bitrate_bps,
+            )?,
+        };
 
-        // Consume `self` into owned locals so the move of `input` into the
-        // builder does not conflict with the later use of `out_dir`.
-        let HlsLadder { input, out_dir, .. } = self;
-
-        let mut builder = FfmpegContext::builder()
-            .input(input)
-            .filter_desc(filter_desc);
-        for output in outputs {
-            builder = builder.output(output);
-        }
-        // Build first: encoder resolution happens inside build(), while
-        // output-file I/O is deferred to start(), so the directories are only
-        // needed before start(). Creating them after build() succeeds means a
-        // rejected configuration (e.g. an unavailable encoder) leaves no empty
-        // directory tree behind.
-        let context = builder.build()?;
-
-        create_dir(&out_dir)?;
-        for rendition_dir in &rendition_dirs {
-            create_dir(rendition_dir)?;
+        if encoder.is_fallback {
+            log::warn!(
+                "HlsLadder selected fallback encoder '{}' because 'libx264' is unavailable. \
+                 This opt-in selection may change output quality, speed, profile/level, and \
+                 bytes, and can vary by host.",
+                encoder.name
+            );
         }
 
-        Ok(context)
+        // Measured-BANDWIDTH paths never consume the audio probe (the master
+        // is written from completed segments), so skip the extra input
+        // open/probe — it costs a remote round trip and adds a failure point.
+        let has_audio = if needs_audio && !encoder.wants_measured_bandwidth() {
+            Some(self.resolve_has_audio()?)
+        } else {
+            None
+        };
+
+        Ok(PreparedHlsLadder {
+            ladder: self,
+            encoder,
+            gop_frames,
+            hls_time,
+            has_audio,
+        })
     }
 
     /// Wires one rendition's HLS [`Output`]: playlist path, segment template,
     /// codecs, fixed-GOP options, and the segment-type-specific muxer options.
     /// Pure configuration — no filesystem access — so tests can assert the
     /// exact option wiring without touching disk.
+    #[cfg(test)]
     fn rendition_output(
         &self,
         index: usize,
         rendition: &Rendition,
         gop_frames: &str,
         hls_time: &str,
+    ) -> Result<Output> {
+        self.rendition_output_with(
+            index,
+            rendition,
+            gop_frames,
+            hls_time,
+            &self.snapshot_encoder(),
+        )
+    }
+
+    fn rendition_output_with(
+        &self,
+        index: usize,
+        rendition: &Rendition,
+        gop_frames: &str,
+        hls_time: &str,
+        encoder: &ResolvedHlsEncoder,
     ) -> Result<Output> {
         let rendition_dir = self.out_dir.join(rendition.dir_name());
         let playlist_path = path_to_utf8(&rendition_dir.join("index.m3u8"))?;
@@ -404,21 +525,27 @@ impl HlsLadder {
             // first audio stream shared across renditions.
             .add_stream_map(format!("[v{index}]"))
             .add_stream_map("0:a:0?")
-            .set_video_codec(self.video_codec.as_str())
+            .set_video_codec(encoder.name.as_str())
             .set_video_bitrate(rendition.video_bitrate.clone())
             .set_audio_codec(self.audio_codec.as_str())
             .set_audio_bitrate(self.audio_bitrate.clone())
-            .set_pix_fmt("yuv420p")
-            // Fixed GOP == segment for cross-rendition keyframe alignment.
-            .set_video_codec_opt("g", gop_frames)
-            .set_video_codec_opt("keyint_min", gop_frames)
-            .set_video_codec_opt("sc_threshold", "0")
-            // VBV constraint so the reported BANDWIDTH is meaningful.
-            .set_video_codec_opt("maxrate", rendition.video_bitrate.clone())
-            .set_video_codec_opt("bufsize", bufsize)
+            .set_pix_fmt(encoder.pixel_format)
             .set_format_opt("hls_time", hls_time)
             .set_format_opt("hls_playlist_type", "vod")
             .set_format_opt("hls_segment_filename", segment_template);
+
+        for (key, value) in encoder.codec_opts(gop_frames, &rendition.video_bitrate, &bufsize) {
+            output = output.set_video_codec_opt(key, value);
+        }
+
+        if encoder.wants_periodic_force() {
+            let interval_us = seconds_to_us(self.effective_gop_seconds()).max(1) as u64;
+            output = output.set_force_key_frames_interval(Duration::from_micros(interval_us));
+        }
+
+        if let Some(tag) = self.video_codec_tag.as_deref() {
+            output = output.set_video_codec_tag(tag);
+        }
 
         if self.segment_type == HlsSegmentType::Fmp4 {
             // `hls_segment_type=fmp4` switches the muxer to `.m4s` media
@@ -431,45 +558,25 @@ impl HlsLadder {
                 .set_format_opt("hls_fmp4_init_filename", FMP4_INIT_FILENAME);
         }
 
-        // Closed GOP (scenecut disabled, open-gop off) so each segment is
-        // independently decodable. libx264/libx265 take their `*-params`
-        // here; for other encoders the fixed GOP above still applies but
-        // closed-GOP/scenecut can't be guaranteed (documented limitation).
-        if self.video_codec.eq_ignore_ascii_case("libx264") {
-            output = output.set_video_codec_opt("x264-params", "scenecut=0:open-gop=0");
-        } else if self.video_codec.eq_ignore_ascii_case("libx265") {
-            output = output.set_video_codec_opt("x265-params", "scenecut=0:open-gop=0");
-        }
-
         Ok(output)
     }
 
     /// Runs the ladder to completion, then writes the master playlist.
     ///
-    /// The master playlist text is computed up front but only written to disk
-    /// **after** the transcode succeeds, so a failed run leaves no dangling
-    /// `master.m3u8`. Transcode errors propagate from
+    /// The master playlist is only written to disk **after** the transcode
+    /// succeeds, so a failed run leaves no dangling `master.m3u8`. Transcode
+    /// errors propagate from
     /// [`start`](FfmpegContext::start) / [`wait`](crate::FfmpegScheduler::wait).
+    /// If the transcode succeeds but the master playlist (or its measured
+    /// `BANDWIDTH`) cannot be written, the error states that the transcode
+    /// succeeded and `master.m3u8` was not written; rendition playlists and
+    /// segments are left on disk.
     pub fn run(self) -> Result<()> {
-        self.validate()?;
-
-        // Gather everything the master playlist needs before `self` is consumed.
-        let has_audio = self.resolve_has_audio()?;
-        let variants = self.build_master_variants(has_audio)?;
-        let master_text =
-            generate_master_playlist(&variants, self.segment_type.master_playlist_version());
-        let master_path = self.out_dir.join(&self.master_name);
-
-        let context = self.build_context()?;
+        let prepared = self.prepare(true)?;
+        let (context, master) = prepared.into_context()?;
         let scheduler = context.start()?;
         scheduler.wait()?;
-
-        std::fs::write(&master_path, master_text).map_err(|e| {
-            Error::InvalidRecipeArg(format!(
-                "failed to write master playlist '{}': {e}",
-                master_path.display()
-            ))
-        })?;
+        master.write()?;
         Ok(())
     }
 
@@ -651,11 +758,144 @@ impl HlsLadder {
     }
 }
 
+struct PreparedHlsLadder {
+    ladder: HlsLadder,
+    encoder: ResolvedHlsEncoder,
+    gop_frames: String,
+    hls_time: String,
+    has_audio: Option<bool>,
+}
+
+struct MasterWritePlan {
+    out_dir: PathBuf,
+    master_name: String,
+    version: u32,
+    variants: Option<Vec<MasterVariant>>,
+    renditions: Vec<Rendition>,
+    master_codecs: Option<String>,
+}
+
+impl PreparedHlsLadder {
+    fn into_context(self) -> Result<(FfmpegContext, MasterWritePlan)> {
+        let variants = if self.encoder.wants_measured_bandwidth() {
+            None
+        } else {
+            let has_audio = self.has_audio.unwrap_or(false);
+            Some(self.ladder.build_master_variants(has_audio)?)
+        };
+
+        let filter_desc =
+            build_split_desc_with_format(&self.ladder.renditions, self.encoder.pixel_format);
+        let mut outputs = Vec::with_capacity(self.ladder.renditions.len());
+        for (i, rendition) in self.ladder.renditions.iter().enumerate() {
+            outputs.push(self.ladder.rendition_output_with(
+                i,
+                rendition,
+                &self.gop_frames,
+                &self.hls_time,
+                &self.encoder,
+            )?);
+        }
+        let rendition_dirs: Vec<PathBuf> = self
+            .ladder
+            .renditions
+            .iter()
+            .map(|rendition| self.ladder.out_dir.join(rendition.dir_name()))
+            .collect();
+
+        let master = MasterWritePlan {
+            out_dir: self.ladder.out_dir.clone(),
+            master_name: self.ladder.master_name.clone(),
+            version: self.ladder.segment_type.master_playlist_version(),
+            variants,
+            renditions: self.ladder.renditions.clone(),
+            master_codecs: self.ladder.master_codecs.clone(),
+        };
+
+        let HlsLadder { input, out_dir, .. } = self.ladder;
+
+        let mut builder = FfmpegContext::builder()
+            .input(input)
+            .filter_desc(filter_desc);
+        for output in outputs {
+            builder = builder.output(output);
+        }
+        // Build first: encoder resolution happens inside build(), while
+        // output-file I/O is deferred to start(), so the directories are only
+        // needed before start(). Creating them after build() succeeds means a
+        // rejected configuration (e.g. an unavailable encoder) leaves no empty
+        // directory tree behind.
+        let context = builder.build()?;
+
+        create_dir(&out_dir)?;
+        for rendition_dir in &rendition_dirs {
+            create_dir(rendition_dir)?;
+        }
+
+        Ok((context, master))
+    }
+}
+
+impl MasterWritePlan {
+    fn write(self) -> Result<()> {
+        let variants = if let Some(variants) = self.variants {
+            variants
+        } else {
+            let mut variants = Vec::with_capacity(self.renditions.len());
+            for rendition in &self.renditions {
+                let playlist = self.out_dir.join(rendition.dir_name()).join("index.m3u8");
+                let bandwidth = bandwidth::measured_peak_bps(&playlist).map_err(|e| {
+                    after_transcode_master_error(&self.master_name, flatten_recipe_arg(e))
+                })?;
+                variants.push(MasterVariant {
+                    bandwidth,
+                    width: rendition.width,
+                    height: rendition.height,
+                    uri: format!("{}/index.m3u8", rendition.dir_name()),
+                    codecs: self.master_codecs.clone(),
+                });
+            }
+            variants
+        };
+        let master_text = generate_master_playlist(&variants, self.version);
+        let master_path = self.out_dir.join(&self.master_name);
+        std::fs::write(&master_path, master_text).map_err(|e| {
+            after_transcode_master_error(
+                &self.master_name,
+                format!(
+                    "failed to write master playlist '{}': {e}",
+                    master_path.display()
+                ),
+            )
+        })?;
+        Ok(())
+    }
+}
+
+fn after_transcode_master_error(master_name: &str, detail: impl std::fmt::Display) -> Error {
+    Error::from(crate::error::HlsMasterWriteError {
+        master_name: master_name.to_string(),
+        detail: detail.to_string(),
+    })
+}
+
+fn flatten_recipe_arg(err: Error) -> String {
+    match err {
+        Error::InvalidRecipeArg(message) => message,
+        other => other.to_string(),
+    }
+}
+
 /// Builds the `split` + per-branch `scale`/`format` filtergraph description.
 ///
 /// For N renditions:
 /// `"[0:v]split=N[s0][s1]...;[s0]scale=w0:h0,format=yuv420p[v0];..."`.
+#[cfg(test)]
 fn build_split_desc(renditions: &[Rendition]) -> String {
+    build_split_desc_with_format(renditions, "yuv420p")
+}
+
+fn build_split_desc_with_format(renditions: &[Rendition], pix_fmt: &str) -> String {
     let n = renditions.len();
     let mut desc = format!("[0:v]split={n}");
     for i in 0..n {
@@ -663,7 +903,7 @@ fn build_split_desc(renditions: &[Rendition]) -> String {
     }
     for (i, rendition) in renditions.iter().enumerate() {
         desc.push_str(&format!(
-            ";[s{i}]scale={}:{},setsar=1,format=yuv420p[v{i}]",
+            ";[s{i}]scale={}:{},setsar=1,format={pix_fmt}[v{i}]",
             rendition.width, rendition.height
         ));
     }

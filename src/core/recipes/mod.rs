@@ -20,8 +20,13 @@
 //! FFmpeg build, so this crate documents the chains and ships a runnable
 //! `examples/hdr_to_sdr` rather than a `hdr_to_sdr()` function that would
 //! silently fail on a build without them. Probe first with
-//! [`is_filter_available`](crate::hwaccel::is_filter_available), then drive it
-//! through [`Output::set_video_filter`](crate::Output::set_video_filter).
+//! [`is_filter_available`](crate::capabilities::is_filter_available) for
+//! `zscale` / `libplacebo`, and with
+//! [`is_filter_option_available`](crate::capabilities::is_filter_option_available)
+//! for the FFmpeg 8 `scale` path (`out_primaries`, `out_transfer`, and
+//! `intent` — the `scale` filter name alone exists on FFmpeg 7.1 and a
+//! naive scale grays out PQ/HLG). Then drive the chain through
+//! [`Output::set_video_filter`](crate::Output::set_video_filter).
 //!
 //! A naive `scale,format=yuv420p` produces a washed-out, gray image: it
 //! reinterprets the PQ/HLG brightness curve as SDR gamma and crushes the
@@ -54,10 +59,12 @@
 //! `range=tv` / `out_range=tv`).
 //!
 //! **Verify the look on your own footage.** These chains are
-//! parameter-correct, but tone-mapping is subjective and content-dependent;
-//! the FFmpeg 8 `scale` chain in particular is not exercised by this crate's
-//! CI. Treat `examples/hdr_to_sdr` as a starting point, not a guarantee of a
-//! "correct" picture on every source.
+//! parameter-correct, but tone-mapping is subjective and content-dependent.
+//! CI exercises routing, filter-option probes, side-data deletion when the
+//! `sidedata` filter exists, 10-bit PQ/HLG luma oracles when a CPU backend
+//! exists, and (on the FFmpeg 8.1.2 LGPL lane) the `scale`/`intent=perceptual`
+//! path as a must-run gate. It does not certify a "correct" picture. Treat
+//! `examples/hdr_to_sdr` as a starting point.
 
 pub mod gif;
 pub mod hls;

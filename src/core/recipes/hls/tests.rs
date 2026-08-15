@@ -45,6 +45,15 @@ fn split_desc_every_branch_has_yuv420p() {
     assert_eq!(desc.matches("format=yuv420p").count(), 2);
 }
 
+#[test]
+fn split_desc_qsv_pixel_format_is_nv12() {
+    let renditions = vec![Rendition::new(640, 360, "800k")];
+    assert_eq!(
+        build_split_desc_with_format(&renditions, "nv12"),
+        "[0:v]split=1[s0];[s0]scale=640:360,setsar=1,format=nv12[v0]"
+    );
+}
+
 // ---- compute_gop_frames ----------------------------------------------
 
 #[test]
@@ -293,6 +302,11 @@ fn mpegts_rendition_output_is_frozen() {
         ]))
     );
     assert_eq!(output.audio_codec_opts, Some(opts(&[("b", "128k")])));
+    assert_eq!(
+        output.forced_kf_spec,
+        crate::core::context::output::ForcedKeyframeSpec::None
+    );
+    assert_eq!(output.video_codec_tag, None);
 }
 
 #[test]
@@ -316,6 +330,13 @@ fn fmp4_rendition_output_wires_fmp4_options() {
         .video_codec_opts
         .as_ref()
         .is_some_and(|codec_opts| codec_opts["g"] == "180"));
+}
+
+#[test]
+fn video_codec_tag_wires_through_rendition_output() {
+    let l = ladder().video_codec_tag("hvc1");
+    let output = l.rendition_output(0, &l.renditions[0], "180", "6").unwrap();
+    assert_eq!(output.video_codec_tag.as_deref(), Some("hvc1"));
 }
 
 // ---- master playlist version -------------------------------------------
@@ -371,4 +392,140 @@ fn path_to_utf8_normalizes_separators_for_ffmpeg() {
     assert_eq!(path_to_utf8(p).unwrap(), "//server/share/360p/index.m3u8");
     let p = std::path::Path::new(r"\\?\C:\hls\360p\index.m3u8");
     assert_eq!(path_to_utf8(p).unwrap(), r"\\?\C:\hls\360p\index.m3u8");
+}
+
+#[test]
+fn video_codec_literal_auto_is_not_auto_mode() {
+    let l = ladder().video_codec("auto");
+    assert!(matches!(
+        l.selection,
+        HlsVideoCodecSelection::Explicit(ref name) if name == "auto"
+    ));
+    let output = l.rendition_output(0, &l.renditions[0], "180", "6").unwrap();
+    assert_eq!(output.video_codec.as_deref(), Some("auto"));
+    assert_eq!(
+        output.forced_kf_spec,
+        crate::core::context::output::ForcedKeyframeSpec::None
+    );
+}
+
+#[test]
+fn video_codec_auto_is_opt_in_selection() {
+    assert!(matches!(
+        ladder().video_codec_auto().selection,
+        HlsVideoCodecSelection::Auto
+    ));
+}
+
+#[test]
+fn fallback_qsv_rendition_uses_nv12_periodic_force_and_no_x264_opts() {
+    let l = ladder();
+    let encoder = encoder::ResolvedHlsEncoder::fallback(encoder::FallbackKind::Qsv);
+    let output = l
+        .rendition_output_with(0, &l.renditions[0], "180", "6", &encoder)
+        .unwrap();
+    assert_eq!(output.video_codec.as_deref(), Some("h264_qsv"));
+    assert_eq!(output.pix_fmt.as_deref(), Some("nv12"));
+    assert!(matches!(
+        output.forced_kf_spec,
+        crate::core::context::output::ForcedKeyframeSpec::Periodic { interval_us }
+            if interval_us == 6_000_000
+    ));
+    let opts = output.video_codec_opts.as_ref().unwrap();
+    assert!(!opts.contains_key("keyint_min"));
+    assert!(!opts.contains_key("sc_threshold"));
+    assert!(!opts.contains_key("x264-params"));
+    assert_eq!(opts.get("bf").map(String::as_str), Some("0"));
+    assert_eq!(opts.get("g").map(String::as_str), Some("180"));
+}
+
+#[test]
+fn explicit_qsv_rendition_matches_admitted_prescription() {
+    let l = ladder().video_codec("h264_qsv");
+    let output = l.rendition_output(0, &l.renditions[0], "180", "6").unwrap();
+    assert_eq!(output.video_codec.as_deref(), Some("h264_qsv"));
+    assert_eq!(output.pix_fmt.as_deref(), Some("nv12"));
+    assert!(matches!(
+        output.forced_kf_spec,
+        crate::core::context::output::ForcedKeyframeSpec::Periodic { interval_us }
+            if interval_us == 6_000_000
+    ));
+    let opts = output.video_codec_opts.as_ref().unwrap();
+    assert!(!opts.contains_key("keyint_min"));
+    assert_eq!(opts.get("bf").map(String::as_str), Some("0"));
+}
+
+/// The openh264 prescription in full: an explicitly pinned `libopenh264`
+/// gets the HLS-safe admitted option set — `bf=0` (the wrapper emits no B
+/// frames and the muxer must never wait for reordering), periodic forced
+/// IDRs at the segment interval (openh264 ignores the generic
+/// `g`/`keyint_min` alignment knobs, so segment alignment rides the forced
+/// keyframes), yuv420p, no bufsize, and none of the x264-only options. This
+/// is the encoder-independent half of the segment-alignment evidence; the
+/// runtime half (segments actually starting on IDRs) is the skip-guarded
+/// `openh264_ladder_segments_start_on_idr` in `tests/hls_fmp4.rs`.
+#[test]
+fn explicit_openh264_rendition_matches_admitted_prescription() {
+    let l = ladder().video_codec("libopenh264");
+    let output = l.rendition_output(0, &l.renditions[0], "180", "6").unwrap();
+    assert_eq!(output.video_codec.as_deref(), Some("libopenh264"));
+    assert_eq!(output.pix_fmt.as_deref(), Some("yuv420p"));
+    assert!(matches!(
+        output.forced_kf_spec,
+        crate::core::context::output::ForcedKeyframeSpec::Periodic { interval_us }
+            if interval_us == 6_000_000
+    ));
+    let opts = output.video_codec_opts.as_ref().unwrap();
+    assert_eq!(opts.get("bf").map(String::as_str), Some("0"));
+    assert!(!opts.contains_key("bufsize"));
+    assert!(!opts.contains_key("keyint_min"));
+    assert!(!opts.contains_key("sc_threshold"));
+    assert!(!opts.contains_key("x264-params"));
+}
+
+#[test]
+fn fallback_videotoolbox_omits_bufsize() {
+    let l = ladder();
+    let encoder = encoder::ResolvedHlsEncoder::fallback(encoder::FallbackKind::VideoToolbox);
+    let output = l
+        .rendition_output_with(0, &l.renditions[0], "180", "6", &encoder)
+        .unwrap();
+    assert_eq!(output.pix_fmt.as_deref(), Some("yuv420p"));
+    let opts = output.video_codec_opts.as_ref().unwrap();
+    assert!(!opts.contains_key("bufsize"));
+    assert_eq!(opts.get("flags").map(String::as_str), Some("+cgop"));
+    assert_eq!(opts.get("bf").map(String::as_str), Some("0"));
+}
+
+#[test]
+fn master_write_failure_states_transcode_succeeded() {
+    let dir = std::env::temp_dir().join(format!(
+        "ez-ffmpeg-hls-master-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let err = MasterWritePlan {
+        out_dir: dir.clone(),
+        master_name: "custom.m3u8".into(),
+        version: 3,
+        variants: None,
+        renditions: vec![Rendition::new(640, 360, "800k")],
+        master_codecs: None,
+    }
+    .write()
+    .unwrap_err();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        matches!(err, Error::HlsMasterWrite(_)),
+        "master-write failure must be typed, got {err}"
+    );
+    let text = err.to_string();
+    assert!(
+        text.contains("transcode succeeded") && text.contains("custom.m3u8"),
+        "{text}"
+    );
 }

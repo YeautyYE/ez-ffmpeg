@@ -51,6 +51,24 @@ pub fn get_hwaccels() -> Vec<HWAccelInfo> {
 // the lock for every later accessor).
 static HW_DEVICES: OnceLock<Mutex<Vec<HWDevice>>> = OnceLock::new();
 
+/// Length of the process-global hardware-device registry.
+///
+/// HLS trial-open must not call `hw_device_init_from_type`; leftover and
+/// leftover-adjacent probe tests use this to pin that the table does not
+/// grow across a software encoder open.
+#[cfg(test)]
+pub(crate) fn hw_device_registry_len() -> usize {
+    HW_DEVICES
+        .get()
+        .map(|devices| {
+            devices
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len()
+        })
+        .unwrap_or(0)
+}
+
 /// Serializes the tests that REPLACE, register into, or consume hardware
 /// devices from the process-global `HW_DEVICES` registry — this module's
 /// snapshot/sentinel tests and the macOS videotoolbox scheduler tests. The

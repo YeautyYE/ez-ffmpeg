@@ -19,6 +19,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .rendition(1280, 720, "2800k")
         .rendition(854, 480, "1400k")
         .audio_bitrate("128k")
+        // The default encoder is libx264 (GPL). On an FFmpeg build without
+        // it, add `.video_codec_auto()`: it tries h264_videotoolbox →
+        // h264_nvenc → h264_qsv → libopenh264 with an HLS-safe option set
+        // and fails with a named error (no directories) when none opens.
         .fps(30, 1) // CFR frame rate; omit to probe it from the input.
         .segment_type(segment_type)
         .master("master.m3u8")
