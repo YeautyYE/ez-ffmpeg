@@ -696,7 +696,7 @@ pub(crate) fn parse_seconds_us(value: &str) -> Result<i64, String> {
     let well_formed = parts.next().is_none()
         && !int_part.is_empty()
         && int_part.chars().all(|c| c.is_ascii_digit())
-        && frac_part.is_none_or(|f| !f.is_empty() && f.chars().all(|c| c.is_ascii_digit()));
+        && frac_part.map_or(true, |f| !f.is_empty() && f.chars().all(|c| c.is_ascii_digit()));
     if !well_formed {
         return Err("expected decimal seconds (e.g. `10` or `2.5`)".to_string());
     }
@@ -789,7 +789,7 @@ pub(crate) fn nearest_option(name: &str) -> Option<&'static str> {
     let mut best: Option<(usize, &'static str)> = None;
     for spec in OPTION_TABLE {
         let d = levenshtein(name, spec.name);
-        if best.is_none_or(|(bd, _)| d < bd) {
+        if best.map_or(true, |(bd, _)| d < bd) {
             best = Some((d, spec.name));
         }
     }

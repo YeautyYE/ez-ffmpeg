@@ -262,7 +262,7 @@ impl FontStore {
                 continue;
             }
             let score = style_distance(stored.weight, stored.italic, request);
-            if best.as_ref().is_none_or(|(s, _)| score < *s) {
+            if best.as_ref().map_or(true, |(s, _)| score < *s) {
                 best = Some((score, stored));
             }
         }

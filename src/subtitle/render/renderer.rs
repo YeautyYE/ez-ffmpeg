@@ -535,7 +535,7 @@ impl SubtitleRenderer for PureRenderer {
                 } else if let Some(bbox) = block_bbox(&nodes) {
                     occupied.push(bbox);
                 }
-                node_orders.extend(std::iter::repeat_n(order as u32, nodes.len()));
+                node_orders.extend(std::iter::repeat(order as u32).take(nodes.len()));
                 all_nodes.append(&mut nodes);
             }
             self.nodes = all_nodes;

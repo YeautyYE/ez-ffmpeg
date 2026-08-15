@@ -534,7 +534,7 @@ fn link_outputs_mirror(
                 let target = {
                     let cand = &nodes[ci][nfi];
                     (0..cand.in_linked.len()).find(|&pj| {
-                        !cand.in_linked[pj] && cand.in_labels.get(pj).is_none_or(|l| l.is_none())
+                        !cand.in_linked[pj] && cand.in_labels.get(pj).map_or(true, |l| l.is_none())
                     })
                 };
                 if let Some(pj) = target {

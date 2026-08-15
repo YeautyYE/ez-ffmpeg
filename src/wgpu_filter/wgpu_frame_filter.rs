@@ -860,7 +860,7 @@ impl FrameFilter for WgpuFrameFilter {
                     && self
                         .hw_frames_ctx_pin
                         .as_ref()
-                        .is_none_or(|pin| pin.0.is_null())
+                        .map_or(true, |pin| pin.0.is_null())
                 {
                     // SAFETY: `ctx` is the frame's live hwframes context;
                     // av_buffer_ref only bumps its refcount. A null return
