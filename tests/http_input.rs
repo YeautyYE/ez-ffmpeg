@@ -366,6 +366,46 @@ fn spawn_python_fixture_with_port(
     );
 }
 
+/// Writes a self-contained CA config and returns its path.
+///
+/// The fixture CA generation must pass an explicit `-config` so the system
+/// `openssl.cnf` never contributes extensions: OpenSSL 1.1.1 (still the
+/// `openssl` on GitHub macOS runners) emits `-addext` values *alongside* any
+/// same-named extension from the config's `v3_ca` section, and rustls rejects
+/// certificates with duplicate extensions when they are added as roots.
+fn write_ca_config(dir: &Path, cn: &str) -> PathBuf {
+    let cnf = dir.join("ca.cnf");
+    std::fs::write(
+        &cnf,
+        format!(
+            "[req]\n\
+             distinguished_name = dn\n\
+             x509_extensions = v3_ca\n\
+             prompt = no\n\
+             \n\
+             [dn]\n\
+             CN = {cn}\n\
+             \n\
+             [v3_ca]\n\
+             basicConstraints = critical,CA:TRUE\n\
+             keyUsage = critical,keyCertSign,cRLSign\n\
+             subjectKeyIdentifier = hash\n"
+        ),
+    )
+    .expect("write ca config");
+    cnf
+}
+
+/// Renders the fixture CA certificate as text for build-failure diagnostics.
+fn ca_text_dump(openssl: &str, ca: &Path) -> String {
+    std::process::Command::new(openssl)
+        .args(["x509", "-noout", "-text", "-in"])
+        .arg(ca)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
+}
+
 #[test]
 fn http_mp4_demux_via_explicit_api() {
     let dir = scratch_dir();
@@ -751,21 +791,16 @@ fn https_mp4_demux_via_custom_ca() {
     write_tiny_mp4(&src);
     // rustls only accepts CA:TRUE certificates as trust anchors, so the
     // fixture uses a short-lived CA plus a SAN leaf (not a self-signed leaf).
+    let ca_cnf = write_ca_config(&dir, "ez-ffmpeg-http-input-test-ca");
     let ca_out = std::process::Command::new(openssl)
         .args([
-            "req", "-x509", "-newkey", "rsa:2048", "-days", "1", "-nodes", "-keyout",
+            "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-days", "1", "-nodes", "-keyout",
         ])
         .arg(&ca_key)
         .arg("-out")
         .arg(&ca)
-        .args([
-            "-subj",
-            "/CN=ez-ffmpeg-http-input-test-ca",
-            "-addext",
-            "basicConstraints=critical,CA:TRUE",
-            "-addext",
-            "keyUsage=critical,keyCertSign,cRLSign",
-        ])
+        .arg("-config")
+        .arg(&ca_cnf)
         .output()
         .expect("openssl ca");
     assert!(
@@ -793,12 +828,15 @@ fn https_mp4_demux_via_custom_ca() {
         "openssl csr failed: {}",
         String::from_utf8_lossy(&csr_out.stderr)
     );
-    // LibreSSL (the macOS system `openssl`) has no `x509 -copy_extensions`;
-    // pass the leaf extensions via `-extfile` so both toolchains produce the
-    // same SAN leaf.
+    // Neither LibreSSL nor OpenSSL 1.1.1 (the GitHub macOS runners' `openssl`)
+    // has `x509 -copy_extensions`; pass the leaf extensions via `-extfile` so
+    // every toolchain produces the same SAN leaf.
     let ext = dir.join("server.ext");
-    std::fs::write(&ext, "subjectAltName=IP:127.0.0.1\nextendedKeyUsage=serverAuth\n")
-        .expect("write server ext");
+    std::fs::write(
+        &ext,
+        "subjectAltName=IP:127.0.0.1\nextendedKeyUsage=serverAuth\n",
+    )
+    .expect("write server ext");
     let sign = std::process::Command::new(openssl)
         .args(["x509", "-req", "-in"])
         .arg(&csr)
@@ -808,7 +846,7 @@ fn https_mp4_demux_via_custom_ca() {
         .arg(&ca_key)
         .args(["-CAcreateserial", "-out"])
         .arg(&cert)
-        .args(["-days", "1", "-extfile"])
+        .args(["-days", "1", "-sha256", "-extfile"])
         .arg(&ext)
         .output()
         .expect("openssl sign");
@@ -875,7 +913,12 @@ httpd.serve_forever()
         .add_root_certificate_pem(&pem)
         .unwrap()
         .build()
-        .unwrap();
+        .unwrap_or_else(|e| {
+            panic!(
+                "HttpClient rejected the fixture CA: {e:?}\n{}",
+                ca_text_dump(openssl, &ca)
+            )
+        });
     let input = client.input(&url).build().unwrap();
     let result = FfmpegContext::builder()
         .input(input)
@@ -931,21 +974,16 @@ fn mtls_custom_ca_requires_and_accepts_client_identity() {
     let client_cert = dir.join("client.pem");
     write_tiny_mp4(&src);
 
+    let ca_cnf = write_ca_config(&dir, "ez-ffmpeg-http-input-mtls-ca");
     let ca_out = std::process::Command::new(openssl)
         .args([
-            "req", "-x509", "-newkey", "rsa:2048", "-days", "1", "-nodes", "-keyout",
+            "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-days", "1", "-nodes", "-keyout",
         ])
         .arg(&ca_key)
         .arg("-out")
         .arg(&ca)
-        .args([
-            "-subj",
-            "/CN=ez-ffmpeg-http-input-mtls-ca",
-            "-addext",
-            "basicConstraints=critical,CA:TRUE",
-            "-addext",
-            "keyUsage=critical,keyCertSign,cRLSign",
-        ])
+        .arg("-config")
+        .arg(&ca_cnf)
         .output()
         .expect("openssl ca");
     assert!(
@@ -973,8 +1011,8 @@ fn mtls_custom_ca_requires_and_accepts_client_identity() {
         "openssl server csr failed: {}",
         String::from_utf8_lossy(&csr_out.stderr)
     );
-    // LibreSSL (the macOS system `openssl`) has no `x509 -copy_extensions`;
-    // pass the leaf extensions via `-extfile` on both signings.
+    // Neither LibreSSL nor OpenSSL 1.1.1 has `x509 -copy_extensions`; pass the
+    // leaf extensions via `-extfile` on both signings.
     let server_ext = dir.join("server.ext");
     std::fs::write(
         &server_ext,
@@ -990,7 +1028,7 @@ fn mtls_custom_ca_requires_and_accepts_client_identity() {
         .arg(&ca_key)
         .args(["-CAcreateserial", "-out"])
         .arg(&cert)
-        .args(["-days", "1", "-extfile"])
+        .args(["-days", "1", "-sha256", "-extfile"])
         .arg(&server_ext)
         .output()
         .expect("openssl server sign");
@@ -1028,7 +1066,7 @@ fn mtls_custom_ca_requires_and_accepts_client_identity() {
         .arg(&ca_key)
         .args(["-CAcreateserial", "-out"])
         .arg(&client_cert)
-        .args(["-days", "1", "-extfile"])
+        .args(["-days", "1", "-sha256", "-extfile"])
         .arg(&client_ext)
         .output()
         .expect("openssl client sign");
@@ -1098,7 +1136,12 @@ httpd.serve_forever()
         .add_root_certificate_pem(&ca_pem)
         .unwrap()
         .build()
-        .unwrap();
+        .unwrap_or_else(|e| {
+            panic!(
+                "HttpClient rejected the fixture CA: {e:?}\n{}",
+                ca_text_dump(openssl, &ca)
+            )
+        });
     let missing = remux_http(no_identity.input(&url).build().unwrap(), &out_fail);
     assert!(
         missing.is_err(),
@@ -1118,7 +1161,12 @@ httpd.serve_forever()
         !builder_dbg.contains("BEGIN CERTIFICATE") && !builder_dbg.contains("BEGIN PRIVATE KEY"),
         "mTLS builder Debug must not echo PEM: {builder_dbg}"
     );
-    let client = builder.build().unwrap();
+    let client = builder.build().unwrap_or_else(|e| {
+        panic!(
+            "mTLS identity client build failed: {e:?}\n{}",
+            ca_text_dump(openssl, &ca)
+        )
+    });
     let client_dbg = format!("{client:?}");
     assert!(
         !client_dbg.contains("BEGIN CERTIFICATE") && !client_dbg.contains("BEGIN PRIVATE KEY"),
@@ -1575,21 +1623,16 @@ fn https_to_http_redirect_is_rejected() {
     let cert = dir.join("server.pem");
     let key = dir.join("server.key");
     let csr = dir.join("server.csr");
+    let ca_cnf = write_ca_config(&dir, "ez-ffmpeg-http-input-test-ca");
     let ca_out = std::process::Command::new(openssl)
         .args([
-            "req", "-x509", "-newkey", "rsa:2048", "-days", "1", "-nodes", "-keyout",
+            "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-days", "1", "-nodes", "-keyout",
         ])
         .arg(&ca_key)
         .arg("-out")
         .arg(&ca)
-        .args([
-            "-subj",
-            "/CN=ez-ffmpeg-http-input-test-ca",
-            "-addext",
-            "basicConstraints=critical,CA:TRUE",
-            "-addext",
-            "keyUsage=critical,keyCertSign,cRLSign",
-        ])
+        .arg("-config")
+        .arg(&ca_cnf)
         .output()
         .expect("openssl ca");
     assert!(
@@ -1617,11 +1660,14 @@ fn https_to_http_redirect_is_rejected() {
         "{}",
         String::from_utf8_lossy(&csr_out.stderr)
     );
-    // LibreSSL (the macOS system `openssl`) has no `x509 -copy_extensions`;
-    // pass the leaf extensions via `-extfile`.
+    // Neither LibreSSL nor OpenSSL 1.1.1 has `x509 -copy_extensions`; pass the
+    // leaf extensions via `-extfile`.
     let ext = dir.join("server.ext");
-    std::fs::write(&ext, "subjectAltName=IP:127.0.0.1\nextendedKeyUsage=serverAuth\n")
-        .expect("write server ext");
+    std::fs::write(
+        &ext,
+        "subjectAltName=IP:127.0.0.1\nextendedKeyUsage=serverAuth\n",
+    )
+    .expect("write server ext");
     let sign = std::process::Command::new(openssl)
         .args(["x509", "-req", "-in"])
         .arg(&csr)
@@ -1631,7 +1677,7 @@ fn https_to_http_redirect_is_rejected() {
         .arg(&ca_key)
         .args(["-CAcreateserial", "-out"])
         .arg(&cert)
-        .args(["-days", "1", "-extfile"])
+        .args(["-days", "1", "-sha256", "-extfile"])
         .arg(&ext)
         .output()
         .expect("openssl sign");
@@ -1684,7 +1730,12 @@ httpd.serve_forever()
         .add_root_certificate_pem(&pem)
         .unwrap()
         .build()
-        .unwrap();
+        .unwrap_or_else(|e| {
+            panic!(
+                "HttpClient rejected the fixture CA: {e:?}\n{}",
+                ca_text_dump(openssl, &ca)
+            )
+        });
     let input = client.input(&url).build().unwrap();
     let result = FfmpegContext::builder()
         .input(input)
