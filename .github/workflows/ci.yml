@@ -45,8 +45,11 @@
 # `#[cfg(target_os = "macos")]`, so they do not run on Linux.
 #
 # The `build` job (all-features build + a default-features build + clippy) and
-# the `test` job run per Linux architecture and FFmpeg lane. Three specialized
-# jobs run once on Linux x64:
+# the `test` job run per Linux architecture and FFmpeg lane. The x64/7.1 build
+# lane additionally checks MSRV 1.80 with the `http-input` feature (that lane
+# links a cached shared FFmpeg via pkg-config, so the old-toolchain check
+# compiles Rust only instead of rebuilding FFmpeg from source). Four
+# specialized jobs run once on Linux x64:
 #
 #   * `docs` — compiles the crate under `--cfg docsrs` (`DOCS_RS=1`), which stubs
 #     ez-ffmpeg's own FFI call sites; the gate catches docsrs-stub compile gaps.
@@ -59,6 +62,11 @@
 #     see its alloc/free, so a UAF where instrumented Rust touches FFmpeg-freed
 #     memory is caught (one entirely inside un-instrumented FFmpeg C is not
 #     reliably covered — those regressions are Rust-side here).
+#   * `lgpl-contract` — Ubuntu x64, FFmpeg n8.1.2 shared libraries built with
+#     `--disable-gpl --disable-nonfree --disable-version3 --disable-autodetect`.
+#     Hard-asserts the documented LGPL-minimum matrix (no libx264 / cropdetect,
+#     native AAC/MJPEG/MPEG-4 paths). Contract tests are `#[ignore]` in the
+#     crate and only this job runs them with `--ignored`.
 #   * `audit` — dependency advisory gate. Cargo.lock is intentionally
 #     untracked, so the job resolves the graph fresh (`cargo generate-lockfile`)
 #     and audits the resolved versions against the RUSTSEC advisory database;
@@ -194,10 +202,41 @@ jobs:
       - name: Build (default features)
         run: cargo build ${{ matrix.ffmpeg-features }} --verbose
 
+      # Design §1.3: the empty default feature set must not activate the
+      # http-input stack (reqwest/tokio/QUIC). Cargo.lock is untracked, so
+      # this is a denylist rather than a golden tree.
+      - name: Default tree excludes http-input crates
+        run: |
+          tree="$(cargo tree --no-default-features --edges normal --prefix none --format '{p}')"
+          if printf '%s\n' "$tree" | grep -E '^(reqwest|tokio|quinn|quinn-proto|quinn-udp|hyper-rustls) '; then
+            echo "default feature tree must not activate http-input crates" >&2
+            printf '%s\n' "$tree" | grep -E '^(reqwest|tokio|quinn|quinn-proto|quinn-udp|hyper-rustls) ' >&2
+            exit 1
+          fi
+
       # Safety-hygiene lints surface here. Not `-D warnings` yet: the crate has a
       # pre-existing unused-import / undocumented-unsafe backlog to clear first.
       - name: Clippy
         run: cargo clippy --all-features ${{ matrix.ffmpeg-features }} --lib
+
+      # MSRV gate: the dependency pins must keep MSRV 1.80 real, and
+      # `http-input` is the feature whose dependency tree pulled in the
+      # Edition-2024-risk crates. One lane suffices. Pinned to x64/7.1
+      # because that lane links the cached shared FFmpeg via pkg-config —
+      # the 1.80 check compiles Rust only; on an 8.1 lane the
+      # `ffmpeg-sys-next/build` build script would rebuild FFmpeg from
+      # source a second time under the old toolchain. Runs last in the job:
+      # the toolchain action switches the rustup default, and the explicit
+      # `+1.80.0` keeps the invocation unambiguous either way.
+      - name: Install Rust 1.80.0 (MSRV)
+        if: matrix.arch == 'x64' && matrix.ffmpeg == '7.1'
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # 1.80.0
+        with:
+          toolchain: 1.80.0
+
+      - name: MSRV check (1.80, http-input)
+        if: matrix.arch == 'x64' && matrix.ffmpeg == '7.1'
+        run: cargo +1.80.0 check --no-default-features --features http-input
 
   test:
     name: Test (${{ matrix.arch }}, FFmpeg ${{ matrix.ffmpeg }})
@@ -287,16 +326,26 @@ jobs:
           key: ${{ runner.os }}-cargo-sources-v1-${{ hashFiles('**/Cargo.toml') }}
 
       - name: Test
-        run: cargo test --lib --test avoption_warnings --test build_probe --test builder_option_validation --test frame_export_test --test frame_export_uniform_test --test frame_export_audio_test --test hls_fmp4 --test video_writer --test rawvideo_seek_gating --test per_output_video_filter --test packet_sink --test packet_sink_negative --test packet_sink_teardown --test packet_sink_unwind --test cli_emit_hardening --test hdr_to_sdr_detection --test logger_reentrancy --test packet_sink_job_failure --features async,rtmp,flv,subtitle,wgpu,cli ${{ matrix.ffmpeg-features }}
+        run: cargo test --lib --test avoption_warnings --test build_probe --test builder_option_validation --test frame_export_test --test frame_export_uniform_test --test frame_export_audio_test --test hls_fmp4 --test video_writer --test rawvideo_seek_gating --test per_output_video_filter --test per_output_audio_filter --test codec_tag --test packet_sink --test packet_sink_negative --test packet_sink_teardown --test packet_sink_unwind --test cli_emit_hardening --test hdr_to_sdr_detection --test logger_reentrancy --test packet_sink_job_failure --test http_input --test crop_detection --test custom_io_hardening --test default_tree --features async,rtmp,flv,subtitle,wgpu,cli,http-input ${{ matrix.ffmpeg-features }}
+
+      # Crop parity smoke: native Rust Analysis vs optional GPL ffmpeg
+      # `-vf cropdetect`. Own step so the main Test line never grows
+      # `--ignored` (that would run every ignored test). Linux FFmpeg here
+      # is often program-less or LGPL-ish; the test then records the
+      # rust-only half and skips the executable half instead of failing.
+      # Not added to lgpl-contract `--ignored` tests: those assert absence
+      # of GPL pieces; native crop already runs via `--test crop_detection`.
+      - name: Crop parity bench (ignored 1080p smoke)
+        run: cargo test --release --test crop_parity_bench --features async,rtmp,flv,subtitle,wgpu,cli,http-input ${{ matrix.ffmpeg-features }} -- --ignored --exact rust_on_off_letterbox_1080_smoke
 
       # The packet-sink examples are API surface: keep them compiling on the
       # runtime lane (native-AAC cases in the suites above do real work even
       # without libx264; x264 cases self-skip at runtime).
       - name: Check packet-sink examples
-        run: cargo check --example packet_sink_avc --example packet_sink_aac_channel --example packet_sink_av_transport --example hdr_to_sdr ${{ matrix.ffmpeg-features }}
+        run: cargo check --example packet_sink_avc --example packet_sink_aac_channel --example packet_sink_av_transport --example hdr_to_sdr --example http_input --features http-input ${{ matrix.ffmpeg-features }}
 
       - name: Doctests
-        run: cargo test --doc --features async,rtmp,flv,subtitle,wgpu,cli ${{ matrix.ffmpeg-features }}
+        run: cargo test --doc --features async,rtmp,flv,subtitle,wgpu,cli,http-input ${{ matrix.ffmpeg-features }}
 
       # aarch64 second-stage confirmation for the NAL start-code scan
       # refactor (perf/nal-stride3-scan, C2). Its x86-64 win is established
@@ -439,8 +488,8 @@ jobs:
             os: macos
             target: aarch64-apple-darwin
             ffmpeg: "8.1"
-            build_features: ffmpeg-sys-next/build-videotoolbox,async,opengl,wgpu,rtmp,flv,subtitle,cli
-            test_features: ffmpeg-sys-next/build-videotoolbox,async,rtmp,flv,subtitle,wgpu,cli
+            build_features: ffmpeg-sys-next/build-videotoolbox,async,opengl,wgpu,rtmp,flv,subtitle,cli,http-input
+            test_features: ffmpeg-sys-next/build-videotoolbox,async,rtmp,flv,subtitle,wgpu,cli,http-input
             default_ffmpeg_features: --features ffmpeg-sys-next/build-videotoolbox
             test_args: >-
               --
@@ -451,8 +500,8 @@ jobs:
             os: macos
             target: aarch64-apple-darwin
             ffmpeg: "7.1"
-            build_features: async,opengl,wgpu,rtmp,flv,subtitle,cli
-            test_features: async,rtmp,flv,subtitle,wgpu,cli
+            build_features: async,opengl,wgpu,rtmp,flv,subtitle,cli,http-input
+            test_features: async,rtmp,flv,subtitle,wgpu,cli,http-input
             default_ffmpeg_features: ""
             test_args: >-
               --
@@ -466,8 +515,8 @@ jobs:
             vcpkg_triplet: x64-windows
             vcpkg_ref: b5229343b4b80264ed51e89c6a7dcd0cbe85e9cc
             vcpkg_cache: b5229343-ffmpeg-8.1.2-v1
-            build_features: async,opengl,wgpu,rtmp,flv,subtitle,cli
-            test_features: async,rtmp,flv,subtitle,wgpu,cli
+            build_features: async,opengl,wgpu,rtmp,flv,subtitle,cli,http-input
+            test_features: async,rtmp,flv,subtitle,wgpu,cli,http-input
             default_ffmpeg_features: ""
             test_args: ""
           - runner: windows-2025
@@ -478,8 +527,8 @@ jobs:
             vcpkg_triplet: x64-windows
             vcpkg_ref: 6070d5cb2f818921c10ccdf6f35f3415a2503369
             vcpkg_cache: 6070d5cb-ffmpeg-7.1.2-p5-v1
-            build_features: async,opengl,wgpu,rtmp,flv,subtitle,cli
-            test_features: async,rtmp,flv,subtitle,wgpu,cli
+            build_features: async,opengl,wgpu,rtmp,flv,subtitle,cli,http-input
+            test_features: async,rtmp,flv,subtitle,wgpu,cli,http-input
             default_ffmpeg_features: ""
             test_args: ""
           - runner: windows-11-arm
@@ -490,8 +539,8 @@ jobs:
             vcpkg_triplet: arm64-windows
             vcpkg_ref: b5229343b4b80264ed51e89c6a7dcd0cbe85e9cc
             vcpkg_cache: b5229343-ffmpeg-8.1.2-v1
-            build_features: async,opengl,wgpu,rtmp,flv,subtitle,cli
-            test_features: async,rtmp,flv,subtitle,wgpu,cli
+            build_features: async,opengl,wgpu,rtmp,flv,subtitle,cli,http-input
+            test_features: async,rtmp,flv,subtitle,wgpu,cli,http-input
             default_ffmpeg_features: ""
             test_args: -- --test-threads=1
           - runner: windows-11-arm
@@ -502,8 +551,8 @@ jobs:
             vcpkg_triplet: arm64-windows
             vcpkg_ref: 6070d5cb2f818921c10ccdf6f35f3415a2503369
             vcpkg_cache: 6070d5cb-ffmpeg-7.1.2-p5-v1
-            build_features: async,opengl,wgpu,rtmp,flv,subtitle,cli
-            test_features: async,rtmp,flv,subtitle,wgpu,cli
+            build_features: async,opengl,wgpu,rtmp,flv,subtitle,cli,http-input
+            test_features: async,rtmp,flv,subtitle,wgpu,cli,http-input
             default_ffmpeg_features: ""
             test_args: -- --test-threads=1
     env:
@@ -645,10 +694,28 @@ jobs:
           sudo sysctl -w net.inet.tcp.autorcvbufmax=131072
           sudo sysctl -w net.inet.tcp.autosndbufmax=131072
       - name: Run CPU-only library tests
-        run: cargo test --lib --test avoption_warnings --test build_probe --test builder_option_validation --test frame_export_test --test frame_export_uniform_test --test frame_export_audio_test --test hls_fmp4 --test video_writer --test rawvideo_seek_gating --test per_output_video_filter --test packet_sink --test packet_sink_negative --test packet_sink_teardown --test packet_sink_unwind --test cli_emit_hardening --test hdr_to_sdr_detection --test logger_reentrancy --test packet_sink_job_failure --features "${{ matrix.test_features }}" ${{ matrix.test_args }}
+        run: cargo test --lib --test avoption_warnings --test build_probe --test builder_option_validation --test frame_export_test --test frame_export_uniform_test --test frame_export_audio_test --test hls_fmp4 --test video_writer --test rawvideo_seek_gating --test per_output_video_filter --test per_output_audio_filter --test codec_tag --test packet_sink --test packet_sink_negative --test packet_sink_teardown --test packet_sink_unwind --test cli_emit_hardening --test hdr_to_sdr_detection --test logger_reentrancy --test packet_sink_job_failure --test http_input --test crop_detection --test custom_io_hardening --test default_tree --features "${{ matrix.test_features }}" ${{ matrix.test_args }}
+
+      # Homebrew ffmpeg@7 is GPL and typically ships cropdetect. Gate the
+      # ignored 1080p smoke here only (not Windows, not macOS 8.1 source
+      # builds) so the main CPU-only suite stays free of `--ignored`.
+      - name: Crop parity bench (ignored 1080p smoke)
+        if: matrix.os == 'macos' && matrix.ffmpeg == '7.1'
+        run: cargo test --release --test crop_parity_bench --features "${{ matrix.test_features }}" -- --ignored --exact rust_on_off_letterbox_1080_smoke
+
+      # Homebrew ffmpeg links libzimg, so this is the one hosted lane where
+      # the zscale tone-map E2E is guaranteed runnable. Escalate its skip to
+      # a failure here so the historical-default HDR backend cannot lose its
+      # only fleet-wide runtime coverage silently (the main suite above
+      # already ran these tests; this re-run only enforces the no-skip gate).
+      - name: HDR zscale tone-map must run (macOS Homebrew)
+        if: matrix.os == 'macos' && matrix.ffmpeg == '7.1'
+        env:
+          EZ_FFMPEG_ZSCALE_MUST_RUN: 1
+        run: cargo test --test hdr_to_sdr_detection --features "${{ matrix.test_features }}" zscale
 
       - name: Check packet-sink examples
-        run: cargo check --example packet_sink_avc --example packet_sink_aac_channel --example packet_sink_av_transport --example hdr_to_sdr --features "${{ matrix.test_features }}"
+        run: cargo check --example packet_sink_avc --example packet_sink_aac_channel --example packet_sink_av_transport --example hdr_to_sdr --example http_input --features "${{ matrix.test_features }}"
 
   # 32-bit ARM (armhf) lane. GitHub offers no 32-bit hosted runner, but the
   # arm64 runners' Neoverse N2 (Cobalt 100) cores execute AArch32 at EL0, so
@@ -746,7 +813,7 @@ jobs:
       - name: cargo doc (docsrs cfg)
         env:
           DOCS_RS: "1"
-        run: cargo doc --no-deps --features ffmpeg-sys-next/build,async,opengl,rtmp,flv,subtitle,wgpu
+        run: cargo doc --no-deps --features ffmpeg-sys-next/build,async,opengl,rtmp,flv,subtitle,wgpu,cli,http-input
 
   asan:
     name: ASAN (UAF, FFmpeg 8.1)
@@ -798,7 +865,160 @@ jobs:
             --test build_probe --test frame_export_test \
             --test frame_export_uniform_test --test frame_export_audio_test \
             --test video_writer --test packet_sink_teardown --test packet_sink_unwind \
-            --test logger_reentrancy
+            --test logger_reentrancy --test custom_io_hardening
+
+  # Explicit LGPL-minimum contract. Existing Linux 8.1/7.1 lanes already build
+  # FFmpeg without --enable-gpl, but they skip x264-shaped tests instead of
+  # asserting the absence. This job pins n8.1.2, uses an exact cache key (no
+  # restore-keys), and runs #[ignore] contract binaries that must not skip.
+  lgpl-contract:
+    name: LGPL contract (Ubuntu x64, FFmpeg 8.1.2)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      FFMPEG_PREFIX: /home/runner/ffmpeg-lgpl-8.1.2
+      FFMPEG_SHA: 38b88335f99e76ed89ff3c93f877fdefce736c13
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install FFmpeg build toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc nasm yasm clang pkg-config make git fonts-dejavu-core
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
+
+      - name: Define the LGPL profile
+        id: lgpl-profile
+        shell: bash
+        run: |
+          printf '%s\n' \
+            --disable-gpl \
+            --disable-nonfree \
+            --disable-version3 \
+            --disable-autodetect \
+            --disable-doc \
+            --disable-debug \
+            --disable-static \
+            --enable-shared \
+            --enable-pic \
+            --enable-pthreads \
+            --disable-ffplay \
+            --disable-ffprobe \
+            > "$RUNNER_TEMP/ffmpeg-lgpl.flags"
+          echo "flags_hash=$(sha256sum "$RUNNER_TEMP/ffmpeg-lgpl.flags" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "compiler_major=$(gcc -dumpversion | cut -d. -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache the LGPL FFmpeg install
+        id: cache-ffmpeg-lgpl
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ env.FFMPEG_PREFIX }}
+          key: ${{ runner.os }}-${{ runner.arch }}-ubuntu-24.04-ffmpeg-lgpl-8.1.2-38b88335-${{ steps.lgpl-profile.outputs.flags_hash }}-gcc${{ steps.lgpl-profile.outputs.compiler_major }}-v1
+
+      - name: Build FFmpeg 8.1.2 shared LGPL libraries
+        if: steps.cache-ffmpeg-lgpl.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          git init "$RUNNER_TEMP/ffmpeg-src"
+          git -C "$RUNNER_TEMP/ffmpeg-src" remote add origin \
+            https://github.com/FFmpeg/FFmpeg.git
+          git -C "$RUNNER_TEMP/ffmpeg-src" fetch --depth=1 origin \
+            refs/tags/n8.1.2
+          git -C "$RUNNER_TEMP/ffmpeg-src" checkout --detach FETCH_HEAD
+          test "$(git -C "$RUNNER_TEMP/ffmpeg-src" rev-parse HEAD)" = "$FFMPEG_SHA"
+
+          mapfile -t configure_flags < "$RUNNER_TEMP/ffmpeg-lgpl.flags"
+          cd "$RUNNER_TEMP/ffmpeg-src"
+          ./configure --prefix="$FFMPEG_PREFIX" "${configure_flags[@]}"
+          make -j"$(nproc)"
+          make install
+
+          {
+            echo "ffmpeg_sha=$FFMPEG_SHA"
+            echo "flags_hash=${{ steps.lgpl-profile.outputs.flags_hash }}"
+            echo "compiler_major=${{ steps.lgpl-profile.outputs.compiler_major }}"
+          } > "$FFMPEG_PREFIX/ez-ffmpeg-lgpl-manifest"
+          LD_LIBRARY_PATH="$FFMPEG_PREFIX/lib" \
+            "$FFMPEG_PREFIX/bin/ffmpeg" -hide_banner -buildconf \
+            >> "$FFMPEG_PREFIX/ez-ffmpeg-lgpl-manifest" 2>&1
+
+      - name: Validate the cached build manifest
+        shell: bash
+        run: |
+          test -f "$FFMPEG_PREFIX/ez-ffmpeg-lgpl-manifest"
+          grep -Fx "ffmpeg_sha=$FFMPEG_SHA" \
+            "$FFMPEG_PREFIX/ez-ffmpeg-lgpl-manifest"
+          grep -Fx \
+            "flags_hash=${{ steps.lgpl-profile.outputs.flags_hash }}" \
+            "$FFMPEG_PREFIX/ez-ffmpeg-lgpl-manifest"
+          grep -Fx \
+            "compiler_major=${{ steps.lgpl-profile.outputs.compiler_major }}" \
+            "$FFMPEG_PREFIX/ez-ffmpeg-lgpl-manifest"
+          grep -F -- "--disable-gpl" \
+            "$FFMPEG_PREFIX/ez-ffmpeg-lgpl-manifest"
+          grep -F -- "--disable-nonfree" \
+            "$FFMPEG_PREFIX/ez-ffmpeg-lgpl-manifest"
+          grep -F -- "--disable-version3" \
+            "$FFMPEG_PREFIX/ez-ffmpeg-lgpl-manifest"
+
+      - name: Link against the LGPL profile
+        run: |
+          echo "PKG_CONFIG_PATH=$FFMPEG_PREFIX/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$FFMPEG_PREFIX/lib" >> "$GITHUB_ENV"
+          echo "$FFMPEG_PREFIX/bin" >> "$GITHUB_PATH"
+
+      - name: Record the linked FFmpeg configuration
+        run: |
+          ffmpeg -hide_banner -buildconf
+          ldd "$FFMPEG_PREFIX/bin/ffmpeg"
+
+      - name: Cache cargo sources
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-sources-v1-${{ hashFiles('**/Cargo.toml') }}
+
+      - name: Run LGPL-compatible existing suites
+        env:
+          EZ_FFMPEG_SWSCALE_PERCEPTUAL_MUST_RUN: "1"
+          EZ_FFMPEG_HDR_PIXEL_ORACLE_MUST_RUN: "1"
+        run: >-
+          cargo test
+          --lib
+          --test builder_option_validation
+          --test frame_export_test
+          --test frame_export_uniform_test
+          --test frame_export_audio_test
+          --test hls_fmp4
+          --test video_writer
+          --test subtitle_chain
+          --test packet_sink
+          --test packet_sink_negative
+          --test packet_sink_teardown
+          --test packet_sink_unwind
+          --test packet_sink_job_failure
+          --test crop_detection
+          --test hdr_to_sdr_detection
+          --test http_input
+          --test custom_io_hardening
+          --test default_tree
+          --features async,rtmp,flv,subtitle,cli,http-input
+
+      - name: Run the explicit LGPL contract
+        run: >-
+          cargo test
+          --test lgpl_capabilities
+          --test lgpl_expected_failures
+          --test lgpl_media_paths
+          --features async,rtmp,flv,subtitle,cli
+          -- --ignored --nocapture
 
   # Dependency advisory gate. Cargo.lock is intentionally untracked, so every
   # run resolves the dependency graph fresh and audits those resolved versions

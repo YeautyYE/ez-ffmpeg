@@ -25,7 +25,7 @@ This library:
 - Supports custom Rust filters and flexible input/output handling
 - Offers optional GPU-accelerated custom filters (wgpu) and a high-performance embedded RTMP server
 - Ships one-shot recipes (thumbnails, GIF, HLS), typed detection/measurement APIs (black/silence/scene/loudness), and experimental frame/sample/packet export and WHIP/SRT streaming outputs (experimental APIs may change between minor releases) — see the [crate documentation](https://docs.rs/ez-ffmpeg) for details
-- Documents an [HDR-to-SDR tone-mapping cookbook](https://docs.rs/ez-ffmpeg/latest/ez_ffmpeg/recipes/) (PQ/HLG detection, zscale/libplacebo chains that avoid the washed-out look) with a runnable `examples/hdr_to_sdr`
+- Documents an [HDR-to-SDR tone-mapping cookbook](https://docs.rs/ez-ffmpeg/latest/ez_ffmpeg/recipes/) (PQ/HLG detection, zscale/libplacebo chains that avoid the washed-out look, and FFmpeg 8 `scale` with `intent=perceptual` as the last fallback when neither is available) with a runnable `examples/hdr_to_sdr`
 
 By abstracting the complexity of the raw C API, `ez-ffmpeg` simplifies configuring media pipelines, performing transcoding and filtering, and inspecting media streams.
 
@@ -68,7 +68,7 @@ sudo apt install pkg-config clang libavcodec-dev libavformat-dev \
     libavfilter-dev libavdevice-dev libavutil-dev libswscale-dev libswresample-dev
 ```
 
-Static linking, building FFmpeg from source, and troubleshooting: see [docs/INSTALL.md](https://github.com/YeautyYE/ez-ffmpeg/blob/main/docs/INSTALL.md).
+Static linking, building FFmpeg from source, and troubleshooting: see [docs/INSTALL.md](https://github.com/YeautyYE/ez-ffmpeg/blob/main/docs/INSTALL.md). Homebrew, apt, and vcpkg FFmpeg builds are often configured with `--enable-gpl`; inspect `ffmpeg -buildconf` / `avutil_license()` before shipping a closed-source binary. Closed-source integrators should review the [FFmpeg capability and licensing matrix](https://github.com/YeautyYE/ez-ffmpeg/blob/main/docs/INSTALL.md#ffmpeg-capability-and-licensing-matrix) before selecting an FFmpeg build.
 
 ### Adding the Dependency
 
@@ -122,6 +122,7 @@ More examples can be found [here][examples].
 - **subtitle:** Native ASS/SRT subtitle burn-in rendered by a pure-Rust engine (no libass needed).
 - **async:** Adds asynchronous functionality (allowing you to `.await` operations).
 - **cli:** Strict ffmpeg command-line compatibility subset (run or translate supported commands).
+- **http-input:** Single-resource HTTP(S) input via rustls (`HttpInput`). Opt-in; `Input::from("https://…")` still uses FFmpeg's own protocols.
 - **static:** Enables static linking for FFmpeg libraries (via `ffmpeg-next/static`).
 - **opengl:** *(deprecated, superseded by `wgpu`)* GPU-accelerated OpenGL filters.
 
