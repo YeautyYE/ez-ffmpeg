@@ -358,6 +358,14 @@ pub struct Input {
     /// - Field: `ffmpeg.h:452` (`ist->framerate`, only set with `-r`)
     /// - Application: `ffmpeg_demux.c:329-333` (used in `ist_dts_update`)
     pub(crate) framerate: Option<(i32, i32)>,
+
+    /// Explicit rustls HTTP input. Never set by `Input::from(url)`.
+    #[cfg(feature = "http-input")]
+    pub(crate) http_input: Option<crate::http_input::HttpInput>,
+
+    /// Filled at open time after the HTTP request starts.
+    #[cfg(feature = "http-input")]
+    pub(crate) http_avio: Option<crate::http_input::HttpAvioAttach>,
 }
 
 impl Input {
@@ -1429,6 +1437,10 @@ impl From<Box<dyn FnMut(&mut [u8]) -> i32 + Send>> for Input {
             autorotate: None,
             ts_scale: None,
             framerate: None,
+            #[cfg(feature = "http-input")]
+            http_input: None,
+            #[cfg(feature = "http-input")]
+            http_avio: None,
         }
     }
 }
@@ -1465,6 +1477,10 @@ impl From<String> for Input {
             autorotate: None,
             ts_scale: None,
             framerate: None,
+            #[cfg(feature = "http-input")]
+            http_input: None,
+            #[cfg(feature = "http-input")]
+            http_avio: None,
         }
     }
 }

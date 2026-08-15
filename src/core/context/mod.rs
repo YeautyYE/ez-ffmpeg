@@ -36,6 +36,9 @@ const OUTPUT_END_GRACE_US: i64 = 500_000;
 /// Input/Output via set_io_buffer_size (sys-06).
 pub(crate) const DEFAULT_CUSTOM_IO_BUFFER_SIZE: usize = 64 * 1024;
 
+#[cfg(feature = "http-input")]
+pub(crate) mod http_avio;
+
 /// Shared state behind the AVIO interrupt callbacks (fftools installs
 /// decode_interrupt_cb on inputs and outputs, ffmpeg_mux_init.c:3326,3371).
 ///
@@ -78,6 +81,12 @@ impl InterruptState {
         crate::core::scheduler::ffmpeg_scheduler::is_stopping(
             self.scheduler_status.load(Ordering::Acquire),
         )
+    }
+
+    /// Observable by the HTTP AVIO bridge: FFmpeg cannot preempt a Rust `read`.
+    #[cfg(feature = "http-input")]
+    pub(crate) fn is_input_stopping(&self) -> bool {
+        self.should_interrupt_input()
     }
 
     fn should_interrupt_output(&self) -> bool {
@@ -616,6 +625,50 @@ pub(crate) unsafe fn input_custom_io_is_poisoned(avio_ctx: *mut AVIOContext) -> 
     !opaque_ptr.is_null() && (*opaque_ptr).poisoned
 }
 
+/// Take the first terminal HTTP failure recorded on this custom-input AVIO.
+///
+/// # Safety
+/// Same as [`input_custom_io_is_poisoned`].
+#[cfg(feature = "http-input")]
+pub(crate) unsafe fn take_http_input_failure(
+    avio_ctx: *mut AVIOContext,
+) -> Option<crate::http_input::HttpInputError> {
+    if avio_ctx.is_null() {
+        return None;
+    }
+    let opaque_ptr = (*avio_ctx).opaque as *mut InputOpaque;
+    if opaque_ptr.is_null() {
+        return None;
+    }
+    let slot = (*opaque_ptr).http_failure.as_ref()?;
+    slot.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
+/// Record a nested-resource rejection on the parent custom-input AVIO.
+///
+/// # Safety
+/// Same as [`input_custom_io_is_poisoned`].
+#[cfg(feature = "http-input")]
+pub(crate) unsafe fn record_http_input_failure(
+    avio_ctx: *mut AVIOContext,
+    err: crate::http_input::HttpInputError,
+) {
+    if avio_ctx.is_null() {
+        return;
+    }
+    let opaque_ptr = (*avio_ctx).opaque as *mut InputOpaque;
+    if opaque_ptr.is_null() {
+        return;
+    }
+    let Some(slot) = (*opaque_ptr).http_failure.as_ref() else {
+        return;
+    };
+    let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        *guard = Some(err);
+    }
+}
+
 /// Reports whether a custom output AVIO callback panicked and poisoned its state.
 ///
 /// A null AVIO context or null opaque pointer reports `false`.
@@ -668,6 +721,8 @@ unsafe fn dispose_input_opaque_callbacks(opaque_ptr: *mut InputOpaque) -> bool {
         read,
         seek,
         poisoned: _,
+        #[cfg(feature = "http-input")]
+            http_failure: _,
     } = *Box::from_raw(opaque_ptr);
     let mut panicked = drop_custom_io_callback_contained(read);
     if let Some(seek) = seek {
@@ -961,11 +1016,10 @@ mod tests {
             assert!(!input_custom_io_is_poisoned(null_mut()));
             assert!(!output_custom_io_is_poisoned(null_mut()));
 
-            let input_opaque = Box::into_raw(Box::new(InputOpaque {
-                read: Box::new(|buf| buf.len() as i32),
-                seek: None,
-                poisoned: false,
-            }));
+            let input_opaque = Box::into_raw(Box::new(InputOpaque::new(
+                Box::new(|buf| buf.len() as i32),
+                None,
+            )));
             let input_avio = test_avio(input_opaque.cast(), 0);
             assert!(!input_custom_io_is_poisoned(input_avio));
             (*input_opaque).poisoned = true;
@@ -985,6 +1039,38 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "http-input")]
+    #[test]
+    fn nested_io_open_records_typed_http_failure() {
+        use std::sync::Mutex;
+        let slot = Arc::new(Mutex::new(None));
+        unsafe {
+            let opaque = Box::into_raw(Box::new(InputOpaque {
+                read: Box::new(|buf| buf.len() as i32),
+                seek: None,
+                poisoned: false,
+                http_failure: Some(Arc::clone(&slot)),
+            }));
+            let avio = test_avio(opaque.cast(), 0);
+            let mut fmt = std::mem::MaybeUninit::<AVFormatContext>::zeroed();
+            (*fmt.as_mut_ptr()).pb = avio;
+            let ret = http_avio::reject_nested_io_open(
+                fmt.as_mut_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+            );
+            assert!(ret < 0, "nested io_open must fail closed");
+            let err = take_http_input_failure(avio).expect("typed HTTP failure");
+            assert!(matches!(
+                err,
+                crate::http_input::HttpInputError::NestedResourceUnsupported
+            ));
+            free_input_opaque(avio);
+        }
+    }
+
     #[test]
     fn input_opaque_teardown_drops_each_callback_before_stable_repanic() {
         let drops = Arc::new(AtomicUsize::new(0));
@@ -1000,6 +1086,8 @@ mod tests {
                 0
             })),
             poisoned: false,
+            #[cfg(feature = "http-input")]
+            http_failure: None,
         }));
         let avio_ctx = unsafe { test_avio(opaque.cast(), 0) };
 
@@ -1099,6 +1187,8 @@ mod tests {
                 0
             })),
             poisoned: false,
+            #[cfg(feature = "http-input")]
+            http_failure: None,
         }));
         let input_avio = unsafe { test_avio(input_opaque.cast(), 0) };
         let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

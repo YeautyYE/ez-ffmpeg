@@ -881,11 +881,10 @@ mod tests {
 
     #[test]
     fn read_wrapper_clamps_oversized_length_and_allows_exact_fit() {
-        let opaque = Box::into_raw(Box::new(InputOpaque {
-            read: Box::new(|buf| buf.len() as i32 + 64),
-            seek: None,
-            poisoned: false,
-        }));
+        let opaque = Box::into_raw(Box::new(InputOpaque::new(
+            Box::new(|buf| buf.len() as i32 + 64),
+            None,
+        )));
         let mut buf = [0u8; 32];
         let ret = unsafe {
             read_packet_wrapper(
@@ -923,6 +922,8 @@ mod tests {
             }),
             seek: None,
             poisoned: false,
+            #[cfg(feature = "http-input")]
+            http_failure: None,
         }));
         let mut buf = [0u8; 32];
         for _ in 0..3 {
@@ -996,6 +997,8 @@ mod tests {
             }),
             seek: None,
             poisoned: false,
+            #[cfg(feature = "http-input")]
+            http_failure: None,
         }));
         let ret = unsafe {
             read_packet_wrapper(
@@ -1014,6 +1017,8 @@ mod tests {
                 std::panic::panic_any(PanicOnDrop(Arc::clone(&seek_drop)))
             })),
             poisoned: false,
+            #[cfg(feature = "http-input")]
+            http_failure: None,
         }));
         let ret = unsafe { seek_input_packet_wrapper(input_seek.cast(), 0, 0) };
         assert_eq!(ret, eio() as i64);
@@ -1069,6 +1074,8 @@ mod tests {
                 panic!("test-injected seek panic")
             })),
             poisoned: false,
+            #[cfg(feature = "http-input")]
+            http_failure: None,
         }));
         let mut buf = [0u8; 32];
         unsafe {
@@ -1178,11 +1185,10 @@ mod tests {
 
     #[test]
     fn absent_seek_callback_stays_espipe() {
-        let opaque = Box::into_raw(Box::new(InputOpaque {
-            read: Box::new(|buf| buf.len() as i32),
-            seek: None,
-            poisoned: false,
-        }));
+        let opaque = Box::into_raw(Box::new(InputOpaque::new(
+            Box::new(|buf| buf.len() as i32),
+            None,
+        )));
         let ret = unsafe { seek_input_packet_wrapper(opaque as *mut libc::c_void, 0, 0) };
         assert_eq!(
             ret,

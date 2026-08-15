@@ -32,6 +32,25 @@ use std::ffi::CStr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// Prefer a typed HTTP AVIO failure over a generic `av_read_frame` errno.
+fn demux_read_frame_error(in_fmt_ctx: *mut AVFormatContext, ret: i32) -> crate::error::Error {
+    #[cfg(feature = "http-input")]
+    {
+        if !in_fmt_ctx.is_null() {
+            // SAFETY: `in_fmt_ctx` is the demuxer's live format context; `pb`
+            // is either null or this crate's custom-input AVIO.
+            let pb = unsafe { (*in_fmt_ctx).pb };
+            if let Some(err) = unsafe { crate::core::context::take_http_input_failure(pb) } {
+                return crate::error::Error::from(err);
+            }
+        }
+    }
+    let _ = in_fmt_ctx;
+    Demuxing(DemuxingOperationError::ReadFrameError(DemuxingError::from(
+        ret,
+    )))
+}
+
 #[cfg(docsrs)]
 pub(crate) fn demux_init(
     demux_idx: usize,
@@ -250,9 +269,7 @@ pub(crate) fn demux_init(
                             set_scheduler_error(
                                 &scheduler_status,
                                 &scheduler_result,
-                                Demuxing(DemuxingOperationError::ReadFrameError(
-                                    DemuxingError::from(ret),
-                                )),
+                                demux_read_frame_error(in_fmt_ctx.as_ptr(), ret),
                             );
                         }
 

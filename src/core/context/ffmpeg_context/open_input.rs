@@ -1,7 +1,12 @@
 use super::*;
+use std::sync::Arc;
+
+/// Custom-IO read callback: fills the buffer and returns the byte count,
+/// `0` at EOF, or a negative `AVERROR`.
+pub(in crate::core::context) type ReadCallback = Box<dyn FnMut(&mut [u8]) -> i32 + Send>;
 
 pub(in crate::core::context) struct InputOpaque {
-    pub(in crate::core::context) read: Box<dyn FnMut(&mut [u8]) -> i32 + Send>,
+    pub(in crate::core::context) read: ReadCallback,
     pub(in crate::core::context) seek: Option<Box<dyn FnMut(i64, i32) -> i64 + Send>>,
     /// Set when a user callback panicked. `catch_unwind` keeps the panic from
     /// crossing the extern "C" boundary, but the closure's captured state is
@@ -9,6 +14,27 @@ pub(in crate::core::context) struct InputOpaque {
     /// (e.g. a cursor advanced before the panic). Once poisoned, every later
     /// callback fails with EIO so the job errors out instead.
     pub(in crate::core::context) poisoned: bool,
+    /// First terminal HTTP failure for custom AVIO, promoted at open and by
+    /// the demuxer so callers see [`crate::http_input::HttpInputError`]
+    /// instead of a generic FFmpeg errno.
+    #[cfg(feature = "http-input")]
+    pub(in crate::core::context) http_failure:
+        Option<std::sync::Arc<std::sync::Mutex<Option<crate::http_input::HttpInputError>>>>,
+}
+
+impl InputOpaque {
+    pub(in crate::core::context) fn new(
+        read: ReadCallback,
+        seek: Option<Box<dyn FnMut(i64, i32) -> i64 + Send>>,
+    ) -> Self {
+        Self {
+            read,
+            seek,
+            poisoned: false,
+            #[cfg(feature = "http-input")]
+            http_failure: None,
+        }
+    }
 }
 
 pub(super) unsafe extern "C" fn read_packet_wrapper(
@@ -123,6 +149,17 @@ unsafe fn open_input_file(
     Err(Error::Bug)
 }
 
+/// Prefer a typed HTTP AVIO failure over a generic FFmpeg errno.
+#[cfg(all(feature = "http-input", not(docsrs)))]
+unsafe fn promote_http_input_error(
+    avio_ctx: *mut ffmpeg_sys_next::AVIOContext,
+    fallback: Error,
+) -> Error {
+    crate::core::context::take_http_input_failure(avio_ctx)
+        .map(Into::into)
+        .unwrap_or(fallback)
+}
+
 #[cfg(not(docsrs))]
 unsafe fn open_input_file(
     index: usize,
@@ -158,6 +195,11 @@ unsafe fn open_input_file(
             input.io_buffer_size
         ))
         .into());
+    }
+
+    #[cfg(feature = "http-input")]
+    if input.http_input.is_some() {
+        crate::http_input::attach_http_input(input, interrupt_state)?;
     }
 
     let mut in_fmt_ctx = avformat_alloc_context();
@@ -226,11 +268,18 @@ unsafe fn open_input_file(
             }
 
             let have_seek_callback = input.seek_callback.is_some();
-            let input_opaque = Box::new(InputOpaque {
-                read: input.read_callback.take().unwrap(),
-                seek: input.seek_callback.take(),
-                poisoned: false,
-            });
+            #[cfg_attr(not(feature = "http-input"), allow(unused_mut))]
+            let mut input_opaque = InputOpaque::new(
+                input.read_callback.take().unwrap(),
+                input.seek_callback.take(),
+            );
+            #[cfg(feature = "http-input")]
+            {
+                if let Some(http) = &input.http_avio {
+                    input_opaque.http_failure = Some(Arc::clone(&http.failure));
+                }
+            }
+            let input_opaque = Box::new(input_opaque);
             let opaque = Box::into_raw(input_opaque) as *mut libc::c_void;
 
             let avio_ctx = avio_alloc_context(
@@ -262,24 +311,68 @@ unsafe fn open_input_file(
             (*in_fmt_ctx).pb = avio_ctx;
             (*in_fmt_ctx).flags = AVFMT_FLAG_CUSTOM_IO;
 
+            #[cfg(feature = "http-input")]
+            let open_filename = {
+                if let Some(http) = &input.http_avio {
+                    (*avio_ctx).seekable = if http.seekable {
+                        ffmpeg_sys_next::AVIO_SEEKABLE_NORMAL
+                    } else {
+                        0
+                    };
+                    (*in_fmt_ctx).io_open =
+                        Some(crate::core::context::http_avio::reject_nested_io_open);
+                    http.display_url.as_ptr()
+                } else {
+                    null()
+                }
+            };
+            #[cfg(not(feature = "http-input"))]
+            let open_filename = null();
+
             let ret = avformat_open_input(
                 &mut in_fmt_ctx,
-                null(),
+                open_filename,
                 file_iformat,
                 input_opts.as_double_ptr(),
             );
             if ret < 0 {
+                // Take the typed HTTP failure before close_input frees pb.
+                #[cfg(feature = "http-input")]
+                let err =
+                    unsafe { promote_http_input_error(avio_ctx, OpenInputError::from(ret).into()) };
+                #[cfg(not(feature = "http-input"))]
+                let err: Error = OpenInputError::from(ret).into();
                 // close_input first: read_close may still touch s->pb. The
                 // helper also reclaims the callback Box, which leaked here.
                 avformat_close_input(&mut in_fmt_ctx);
                 crate::core::context::free_input_opaque(avio_ctx);
-                return Err(OpenInputError::from(ret).into());
+                return Err(err);
+            }
+
+            #[cfg(feature = "http-input")]
+            if input.http_avio.is_some() {
+                if let Err(e) = crate::http_input::reject_manifest_demuxer(in_fmt_ctx) {
+                    avformat_close_input(&mut in_fmt_ctx);
+                    crate::core::context::free_input_opaque(avio_ctx);
+                    return Err(e.into());
+                }
             }
 
             if let Err(e) = find_stream_info_if_enabled(in_fmt_ctx, input, index) {
+                #[cfg(feature = "http-input")]
+                let e = unsafe { promote_http_input_error(avio_ctx, e) };
                 avformat_close_input(&mut in_fmt_ctx);
                 crate::core::context::free_input_opaque(avio_ctx);
                 return Err(e);
+            }
+
+            #[cfg(feature = "http-input")]
+            if input.http_avio.is_some() {
+                if let Err(e) = crate::http_input::reject_manifest_demuxer(in_fmt_ctx) {
+                    avformat_close_input(&mut in_fmt_ctx);
+                    crate::core::context::free_input_opaque(avio_ctx);
+                    return Err(e.into());
+                }
             }
 
             // The rawvideo demuxer over a read callback is purely sequential and
@@ -344,6 +437,15 @@ unsafe fn open_input_file(
             );
             if ret < 0 {
                 avformat_close_input(&mut in_fmt_ctx);
+                // `get` (not `[..8]`): a multi-byte char spanning byte 8 must
+                // fall through to the errno path, not panic mid-error.
+                if url
+                    .get(..8)
+                    .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+                    && !crate::core::capabilities::is_input_protocol_available("https")
+                {
+                    return Err(OpenInputError::HttpsProtocolUnavailable.into());
+                }
                 return Err(OpenInputError::from(ret).into());
             }
 

@@ -125,6 +125,8 @@
 //!   compatibility manifest; execution is additionally gated on verified (golden-tested)
 //!   command shapes and a verified linked-FFmpeg runtime profile — see the `cli` module docs.
 //! - **`static`**: Uses static linking for FFmpeg libraries (via `ffmpeg-next/static`).
+//! - **`http-input`**: Experimental single-resource HTTP(S) input via rustls
+//!   ([`http_input::HttpInput`]). Default-off; does not change `Input::from(url)` routing.
 //!
 //! ## Relationship to the FFmpeg CLI
 //!
@@ -198,7 +200,9 @@ pub use self::core::packet_scanner;
 pub use self::core::packet_sink;
 pub use self::core::recipes;
 pub use self::core::scheduler::ffmpeg_scheduler::FfmpegScheduler;
-pub use self::core::scheduler::progress::{OutputProgress, Progress, ProgressHandle, ProgressState};
+pub use self::core::scheduler::progress::{
+    OutputProgress, Progress, ProgressHandle, ProgressState,
+};
 pub use self::core::stream_info;
 pub use self::core::writer::{OwnedPushError, PushError, VideoWriter, VideoWriterBuilder};
 pub use self::core::{set_ffmpeg_log_level, FfmpegLogLevel, FFMPEG_LOG_TARGET};
@@ -244,3 +248,10 @@ pub mod flv;
 
 #[cfg(feature = "subtitle")]
 pub mod subtitle;
+
+/// Experimental single-resource HTTP(S) input via rustls.
+///
+/// Compiled only with the default-off `http-input` feature. Existing
+/// `Input::from("https://…")` routing is unchanged.
+#[cfg(feature = "http-input")]
+pub mod http_input;
