@@ -4,7 +4,7 @@
 //! the builder (`LoweredJob::into_context`) — field for field, in the same
 //! order — so generated code and in-process execution cannot drift. Every
 //! emitted call exists in the crate's public API; a checked-in emitted
-//! program is compiled as a real example (`examples/cli_emitted_transcode.rs`)
+//! program is compiled as a real example (`examples/cli_emitted_transcode/main.rs`)
 //! and pinned byte-for-byte by a unit test below (only the header's
 //! crate-version stamp is masked, so a version bump alone never repins).
 
@@ -315,7 +315,7 @@ fn header(
                 Some(shape) => out.push_str(&format!(
                     "// status: verified shape {id} ({}) — verified by the manifest-driven \
                      semantic golden suite (oracle: {:?}) against the ffmpeg CLI; canonical \
-                     emission compile-pinned as examples/{}.rs\n",
+                     emission compile-pinned as examples/{}/main.rs\n",
                     shape.summary, shape.oracle, shape.emitted_example
                 )),
                 None => out.push_str(&format!(
@@ -611,17 +611,17 @@ mod tests {
                 .unwrap_or_else(|e| panic!("emit of {} canonical argv failed: {e}", shape.id));
             let pinned = match shape.emitted_example {
                 "cli_emitted_transcode" => {
-                    include_str!("../../../examples/cli_emitted_transcode.rs")
+                    include_str!("../../../examples/cli_emitted_transcode/main.rs")
                 }
-                "cli_emitted_clip" => include_str!("../../../examples/cli_emitted_clip.rs"),
+                "cli_emitted_clip" => include_str!("../../../examples/cli_emitted_clip/main.rs"),
                 "cli_emitted_audio_extract" => {
-                    include_str!("../../../examples/cli_emitted_audio_extract.rs")
+                    include_str!("../../../examples/cli_emitted_audio_extract/main.rs")
                 }
                 "cli_emitted_thumbnail" => {
-                    include_str!("../../../examples/cli_emitted_thumbnail.rs")
+                    include_str!("../../../examples/cli_emitted_thumbnail/main.rs")
                 }
-                "cli_emitted_scale" => include_str!("../../../examples/cli_emitted_scale.rs"),
-                "cli_emitted_hls" => include_str!("../../../examples/cli_emitted_hls.rs"),
+                "cli_emitted_scale" => include_str!("../../../examples/cli_emitted_scale/main.rs"),
+                "cli_emitted_hls" => include_str!("../../../examples/cli_emitted_hls/main.rs"),
                 other => panic!("shape {} names an unpinned example {other}", shape.id),
             };
             // The emitter writes `\n`; `include_str!` embeds the example as
@@ -636,7 +636,7 @@ mod tests {
             assert_eq!(
                 mask_crate_version(&code),
                 mask_crate_version(&pinned),
-                "examples/{}.rs drifted from the emitter; regenerate it",
+                "examples/{}/main.rs drifted from the emitter; regenerate it",
                 shape.emitted_example
             );
         }

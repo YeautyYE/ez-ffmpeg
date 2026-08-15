@@ -101,7 +101,8 @@ pub(crate) struct VerifiedShape {
     /// runner and pin tests — data-of-record in production builds.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) canonical_argv: &'static [&'static str],
-    /// Basename of the compile-pinned emitted example under `examples/`.
+    /// Directory name of the compile-pinned emitted example under
+    /// `examples/` (its program is `examples/<name>/main.rs`).
     pub(crate) emitted_example: &'static str,
 }
 
