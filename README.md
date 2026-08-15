@@ -20,25 +20,17 @@
 
 This library:
 - Exposes a safe public API; the internal FFmpeg FFI layer uses audited `unsafe` code
-- Keeps the execution logic and parameter conventions as close to FFmpeg as possible
-- Provides an intuitive and user-friendly API for media processing
+- Keeps execution logic and parameter conventions as close to FFmpeg as possible
 - Supports custom Rust filters and flexible input/output handling
 - Offers optional GPU-accelerated custom filters (wgpu) and a high-performance embedded RTMP server
-- Ships one-shot recipes (thumbnails, GIF, HLS), typed detection/measurement APIs (black/silence/scene/loudness), and experimental frame/sample/packet export and WHIP/SRT streaming outputs (experimental APIs may change between minor releases) — see the [crate documentation](https://docs.rs/ez-ffmpeg) for details
-- Documents an [HDR-to-SDR tone-mapping cookbook](https://docs.rs/ez-ffmpeg/latest/ez_ffmpeg/recipes/) (PQ/HLG detection, zscale/libplacebo chains that avoid the washed-out look, and FFmpeg 8 `scale` with `intent=perceptual` as the last fallback when neither is available) with a runnable `examples/hdr_to_sdr`
-
-By abstracting the complexity of the raw C API, `ez-ffmpeg` simplifies configuring media pipelines, performing transcoding and filtering, and inspecting media streams.
+- Ships one-shot recipes (thumbnails, GIF, HLS), typed detection APIs (black/silence/scene/loudness/crop), an [HDR-to-SDR tone-mapping cookbook](https://docs.rs/ez-ffmpeg/latest/ez_ffmpeg/recipes/) (runnable `examples/hdr_to_sdr`), and experimental frame/sample/packet export and WHIP/SRT outputs (experimental APIs may change between minor releases) — see the [crate documentation](https://docs.rs/ez-ffmpeg) for details
 
 The transcoding pipeline is ported from FFmpeg's own `fftools/ffmpeg` sources — same stage semantics, same function names. Migrating a CLI command? See the [CLI-to-API mapping](https://docs.rs/ez-ffmpeg/latest/ez_ffmpeg/#cli-to-api-mapping).
 
 ## Version Requirements
 
-- **Rust:** Version 1.80.0 or higher. The optional `wgpu` feature requires Rust 1.85+.
-- **FFmpeg:** Version 7.1 through 8.x (one build links either major).
-
-## Documentation
-
-More information about this crate can be found in the [crate documentation](https://docs.rs/ez-ffmpeg).
+- **Rust:** 1.80.0 or higher (the optional `wgpu` feature requires 1.85+).
+- **FFmpeg:** 7.1 through 8.x (one build links either major).
 
 ## Quick Start
 
@@ -68,11 +60,9 @@ sudo apt install pkg-config clang libavcodec-dev libavformat-dev \
     libavfilter-dev libavdevice-dev libavutil-dev libswscale-dev libswresample-dev
 ```
 
-Static linking, building FFmpeg from source, and troubleshooting: see [docs/INSTALL.md](https://github.com/YeautyYE/ez-ffmpeg/blob/main/docs/INSTALL.md). Homebrew, apt, and vcpkg FFmpeg builds are often configured with `--enable-gpl`; inspect `ffmpeg -buildconf` / `avutil_license()` before shipping a closed-source binary. Closed-source integrators should review the [FFmpeg capability and licensing matrix](https://github.com/YeautyYE/ez-ffmpeg/blob/main/docs/INSTALL.md#ffmpeg-capability-and-licensing-matrix) before selecting an FFmpeg build.
+Static linking, building FFmpeg from source, and troubleshooting: see [docs/INSTALL.md](https://github.com/YeautyYE/ez-ffmpeg/blob/main/docs/INSTALL.md). Shipping a closed-source binary? Package-manager FFmpeg builds are often GPL — check the [licensing matrix](https://github.com/YeautyYE/ez-ffmpeg/blob/main/docs/INSTALL.md#ffmpeg-capability-and-licensing-matrix) first.
 
 ### Adding the Dependency
-
-Add **ez-ffmpeg** to your project by including it in your `Cargo.toml`:
 
 ```toml
 [dependencies]
@@ -81,9 +71,7 @@ ez-ffmpeg = "0.18"
 
 ### Basic Usage
 
-Below is a basic example to get you started. Create or update your `main.rs` with the following code:
-
-It runs the equivalent of `ffmpeg -i input.mp4 -vf "hue=s=0" output.mov`.
+The equivalent of `ffmpeg -i input.mp4 -vf "hue=s=0" output.mov`:
 
 ```rust
 use ez_ffmpeg::FfmpegContext;
@@ -106,7 +94,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Prefer to start from the command itself? With the `cli` feature, `cli::from_cli` parses a supported `ffmpeg` command into the same pipeline — `from_cli("ffmpeg -i input.mp4 -vf \"hue=s=0\" output.mov")?.start()?.wait()?` — and `cli::emit_rust_code` translates a command into builder code. Unsupported flags fail with explicit errors.
+With the `cli` feature, `cli::from_cli` runs a supported `ffmpeg` command directly and `cli::emit_rust_code` translates one into builder code; unsupported flags fail with explicit errors.
 
 More examples can be found [here][examples].
 
@@ -122,7 +110,7 @@ More examples can be found [here][examples].
 - **subtitle:** Native ASS/SRT subtitle burn-in rendered by a pure-Rust engine (no libass needed).
 - **async:** Adds asynchronous functionality (allowing you to `.await` operations).
 - **cli:** Strict ffmpeg command-line compatibility subset (run or translate supported commands).
-- **http-input:** Single-resource HTTP(S) input via rustls (`HttpInput`). Opt-in; `Input::from("https://…")` still uses FFmpeg's own protocols.
+- **http-input:** HTTP(S) input via rustls (`HttpInput`); rejects HLS/DASH playlists. `Input::from("https://…")` still uses FFmpeg's own protocols.
 - **static:** Enables static linking for FFmpeg libraries (via `ffmpeg-next/static`).
 - **opengl:** *(deprecated, superseded by `wgpu`)* GPU-accelerated OpenGL filters.
 
