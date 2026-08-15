@@ -793,6 +793,12 @@ fn https_mp4_demux_via_custom_ca() {
         "openssl csr failed: {}",
         String::from_utf8_lossy(&csr_out.stderr)
     );
+    // LibreSSL (the macOS system `openssl`) has no `x509 -copy_extensions`;
+    // pass the leaf extensions via `-extfile` so both toolchains produce the
+    // same SAN leaf.
+    let ext = dir.join("server.ext");
+    std::fs::write(&ext, "subjectAltName=IP:127.0.0.1\nextendedKeyUsage=serverAuth\n")
+        .expect("write server ext");
     let sign = std::process::Command::new(openssl)
         .args(["x509", "-req", "-in"])
         .arg(&csr)
@@ -802,7 +808,8 @@ fn https_mp4_demux_via_custom_ca() {
         .arg(&ca_key)
         .args(["-CAcreateserial", "-out"])
         .arg(&cert)
-        .args(["-days", "1", "-copy_extensions", "copy"])
+        .args(["-days", "1", "-extfile"])
+        .arg(&ext)
         .output()
         .expect("openssl sign");
     assert!(
@@ -966,6 +973,14 @@ fn mtls_custom_ca_requires_and_accepts_client_identity() {
         "openssl server csr failed: {}",
         String::from_utf8_lossy(&csr_out.stderr)
     );
+    // LibreSSL (the macOS system `openssl`) has no `x509 -copy_extensions`;
+    // pass the leaf extensions via `-extfile` on both signings.
+    let server_ext = dir.join("server.ext");
+    std::fs::write(
+        &server_ext,
+        "subjectAltName=IP:127.0.0.1\nextendedKeyUsage=serverAuth\n",
+    )
+    .expect("write server ext");
     let sign = std::process::Command::new(openssl)
         .args(["x509", "-req", "-in"])
         .arg(&csr)
@@ -975,7 +990,8 @@ fn mtls_custom_ca_requires_and_accepts_client_identity() {
         .arg(&ca_key)
         .args(["-CAcreateserial", "-out"])
         .arg(&cert)
-        .args(["-days", "1", "-copy_extensions", "copy"])
+        .args(["-days", "1", "-extfile"])
+        .arg(&server_ext)
         .output()
         .expect("openssl server sign");
     assert!(
@@ -1001,6 +1017,8 @@ fn mtls_custom_ca_requires_and_accepts_client_identity() {
         "openssl client csr failed: {}",
         String::from_utf8_lossy(&client_csr_out.stderr)
     );
+    let client_ext = dir.join("client.ext");
+    std::fs::write(&client_ext, "extendedKeyUsage=clientAuth\n").expect("write client ext");
     let client_sign = std::process::Command::new(openssl)
         .args(["x509", "-req", "-in"])
         .arg(&client_csr)
@@ -1010,7 +1028,8 @@ fn mtls_custom_ca_requires_and_accepts_client_identity() {
         .arg(&ca_key)
         .args(["-CAcreateserial", "-out"])
         .arg(&client_cert)
-        .args(["-days", "1", "-copy_extensions", "copy"])
+        .args(["-days", "1", "-extfile"])
+        .arg(&client_ext)
         .output()
         .expect("openssl client sign");
     assert!(
@@ -1598,6 +1617,11 @@ fn https_to_http_redirect_is_rejected() {
         "{}",
         String::from_utf8_lossy(&csr_out.stderr)
     );
+    // LibreSSL (the macOS system `openssl`) has no `x509 -copy_extensions`;
+    // pass the leaf extensions via `-extfile`.
+    let ext = dir.join("server.ext");
+    std::fs::write(&ext, "subjectAltName=IP:127.0.0.1\nextendedKeyUsage=serverAuth\n")
+        .expect("write server ext");
     let sign = std::process::Command::new(openssl)
         .args(["x509", "-req", "-in"])
         .arg(&csr)
@@ -1607,7 +1631,8 @@ fn https_to_http_redirect_is_rejected() {
         .arg(&ca_key)
         .args(["-CAcreateserial", "-out"])
         .arg(&cert)
-        .args(["-days", "1", "-copy_extensions", "copy"])
+        .args(["-days", "1", "-extfile"])
+        .arg(&ext)
         .output()
         .expect("openssl sign");
     assert!(
