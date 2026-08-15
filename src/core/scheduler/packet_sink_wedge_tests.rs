@@ -698,64 +698,88 @@ fn blocked_sibling_stays_interruptible_while_sink_finalizes() {
     // queue sit frozen across a full persist-probe horizon. Where peer
     // stats are unavailable (non-unix, or a failed getsockopt reporting
     // -1) the counter park stands alone, as before.
+    //
+    // On macOS the saturated-queue shortcut is not terminal either: an
+    // 8.1 CI lane completed a "parked" write whose peer queue sat 12
+    // bytes past rcvbuf, frozen from park to settle — sender-side buffer
+    // space freed and absorbed the write without the peer being granted
+    // anything. So on macOS every candidate must also hold through the
+    // frozen horizon, and (on every platform) the accepted generation is
+    // revalidated as the still-in-flight call right before stop() fires;
+    // a candidate completed in the meantime sends the loop back to pick
+    // the live park.
     let stage4_deadline = Instant::now() + Duration::from_secs(60);
     let (parked_gen, rcvbuf_at_park, unread_at_park) = loop {
         let candidate = require_write_parked(stage4_deadline)
             .expect("stage 4: the sibling must be parked inside a tcp write");
         let (rcvbuf, unread) = peer_socket_stats(&stream);
-        if rcvbuf < 0 || unread >= rcvbuf {
-            break (candidate, rcvbuf, unread);
+        let saturated_is_terminal = !cfg!(target_os = "macos");
+        if !(rcvbuf < 0 || (saturated_is_terminal && unread >= rcvbuf)) {
+            let horizon = Instant::now() + Duration::from_secs(8);
+            let frozen = loop {
+                std::thread::sleep(Duration::from_millis(500));
+                let returned = tcp_write_probe::RETURNED.load(Ordering::Acquire);
+                let entered = tcp_write_probe::ENTERED.load(Ordering::Acquire);
+                let (_, unread_now) = peer_socket_stats(&stream);
+                if (entered, returned) != (candidate, candidate - 1) || unread_now != unread {
+                    break false;
+                }
+                if Instant::now() >= horizon {
+                    break true;
+                }
+            };
+            if !frozen {
+                assert!(
+                    Instant::now() < stage4_deadline,
+                    "stage 4: every parked write kept absorbing window grants \
+                     before the deadline (rcvbuf={rcvbuf} unread={unread})"
+                );
+                continue;
+            }
         }
-        let horizon = Instant::now() + Duration::from_secs(8);
-        let frozen = loop {
-            std::thread::sleep(Duration::from_millis(500));
-            let returned = tcp_write_probe::RETURNED.load(Ordering::Acquire);
-            let entered = tcp_write_probe::ENTERED.load(Ordering::Acquire);
-            let (_, unread_now) = peer_socket_stats(&stream);
-            if (entered, returned) != (candidate, candidate - 1) || unread_now != unread {
-                break false;
-            }
-            if Instant::now() >= horizon {
-                break true;
-            }
-        };
-        if frozen {
+        // The liveness half of the contract: a parked write on an ENDED job
+        // would be teardown noise, not the running wedge stop() must cut.
+        assert!(
+            !scheduler.is_ended(),
+            "the job settled during the wedge proof: the sibling exited instead \
+             of blocking, so stop() would be cutting nothing"
+        );
+        // The finalizer half: the sink's terminal coordinator must be PARKED in
+        // the settlement barrier when the cut lands — that overlap is the whole
+        // scene. The 300 ms recording limit makes it likely long before the
+        // socket stages finish, but only the barrier's own waiter count proves
+        // it; a sink still short of its wait would let stop() cut the sibling
+        // with no finalize exemption in play. Parked also means not admitted:
+        // no terminal event may have fired yet.
+        let sink_parked_deadline = Instant::now() + Duration::from_secs(10);
+        while scheduler.parked_settlement_waiters() == 0 {
+            assert!(
+                Instant::now() < sink_parked_deadline,
+                "the sink never parked in the settlement barrier: stop() would \
+                 not be racing a finalizing sink"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            (ends.load(Ordering::Acquire), errors.load(Ordering::Acquire)),
+            (0, 0),
+            "a terminal sink event fired while the coordinator was still parked"
+        );
+        // Pre-stop revalidation: the sink-park wait above leaves time for a
+        // late grant to complete the accepted write; only a candidate that
+        // is still the one in-flight call may be handed to stop().
+        let entered = tcp_write_probe::ENTERED.load(Ordering::Acquire);
+        let returned = tcp_write_probe::RETURNED.load(Ordering::Acquire);
+        if (entered, returned) == (candidate, candidate - 1) {
             break (candidate, rcvbuf, unread);
         }
         assert!(
             Instant::now() < stage4_deadline,
-            "stage 4: every parked write kept absorbing window grants \
-             before the deadline (rcvbuf={rcvbuf} unread={unread})"
+            "stage 4: every accepted park was completed by a late window \
+             grant before stop() could cut it (last: entered={entered} \
+             returned={returned} candidate={candidate})"
         );
     };
-    // The liveness half of the contract: a parked write on an ENDED job
-    // would be teardown noise, not the running wedge stop() must cut.
-    assert!(
-        !scheduler.is_ended(),
-        "the job settled during the wedge proof: the sibling exited instead \
-         of blocking, so stop() would be cutting nothing"
-    );
-    // The finalizer half: the sink's terminal coordinator must be PARKED in
-    // the settlement barrier when the cut lands — that overlap is the whole
-    // scene. The 300 ms recording limit makes it likely long before the
-    // socket stages finish, but only the barrier's own waiter count proves
-    // it; a sink still short of its wait would let stop() cut the sibling
-    // with no finalize exemption in play. Parked also means not admitted:
-    // no terminal event may have fired yet.
-    let sink_parked_deadline = Instant::now() + Duration::from_secs(10);
-    while scheduler.parked_settlement_waiters() == 0 {
-        assert!(
-            Instant::now() < sink_parked_deadline,
-            "the sink never parked in the settlement barrier: stop() would \
-             not be racing a finalizing sink"
-        );
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    assert_eq!(
-        (ends.load(Ordering::Acquire), errors.load(Ordering::Acquire)),
-        (0, 0),
-        "a terminal sink event fired while the coordinator was still parked"
-    );
 
     let (tx, rx) = std::sync::mpsc::channel();
     let stop_worker = std::thread::spawn(move || {
