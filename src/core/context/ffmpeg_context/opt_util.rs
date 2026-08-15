@@ -326,34 +326,38 @@ pub(super) fn outputs_bind(
         }
     }
 
-    // Resolved -vf matrix (each rule enforced at its own assignment point,
-    // so no spelling can dodge it and no legal layout is over-rejected):
-    //   complex video  -> SimpleAndComplexFilter, raised where an unlabeled
+    // Resolved simple-filter matrix (each rule enforced at its own assignment
+    // point, so no spelling can dodge it and no legal layout is over-rejected):
+    //   complex stream -> SimpleAndComplexFilter, raised where an unlabeled
     //                     graph output is ACTUALLY assigned to an output
-    //                     that carries a simple filter
+    //                     that carries a simple filter of the same type
     //                     (output_bind_by_unlabeled_filter), or where a
     //                     labeled graph output is mapped to one (map_manual).
-    //                     When any output uses set_video_filter, unlabeled
-    //                     assignment runs in fftools order — for every
-    //                     output, before its manual/automatic mapping
-    //                     (ffmpeg_mux_init.c create_streams) — so explicit
-    //                     maps cannot reroute the graph past the conflict,
-    //                     while an output the graph does NOT land on keeps
-    //                     its own simple filter, exactly like FFmpeg. A
-    //                     stream-copy candidate output fails right there
-    //                     with the CLI's filtering/streamcopy error instead
-    //                     of deferring the graph to a later encoding output.
-    //   video copy     -> FilterWithStreamCopy (open_output_file for
-    //                     -c:v copy, map_manual for copy maps);
+    //                     When any output uses set_video_filter or
+    //                     set_audio_filter, unlabeled assignment runs in
+    //                     fftools order — for every output, before its
+    //                     manual/automatic mapping (ffmpeg_mux_init.c
+    //                     create_streams) — so explicit maps cannot reroute
+    //                     the graph past the conflict, while an output the
+    //                     graph does NOT land on keeps its own simple filter,
+    //                     exactly like FFmpeg. A stream-copy candidate output
+    //                     fails right there with the CLI's filtering/streamcopy
+    //                     error instead of deferring the graph to a later
+    //                     encoding output.
+    //   copy           -> FilterWithStreamCopy (open_output_file for
+    //                     -c:v/-c:a copy, map_manual for copy maps);
     //   direct encode  -> the filter binds in init_simple_filtergraph,
     //                     which records the consumption;
-    //   no video       -> VideoFilterUnused (postcondition below).
+    //   no stream      -> VideoFilterUnused / AudioFilterUnused
+    //                     (postcondition below).
     //
-    // The fftools-order pass is scoped to jobs that use the per-output
-    // filter: with no set_video_filter anywhere, the legacy order (unlabeled
-    // binding only for map-less outputs) is preserved bit for bit for
-    // existing callers.
-    let fftools_unlabeled_order = muxs.iter().any(|mux| mux.video_filter.is_some());
+    // The fftools-order pass is scoped to jobs that use a per-output
+    // filter: with no set_video_filter / set_audio_filter anywhere, the
+    // legacy order (unlabeled binding only for map-less outputs) is
+    // preserved bit for bit for existing callers.
+    let fftools_unlabeled_order = muxs
+        .iter()
+        .any(|mux| mux.video_filter.is_some() || mux.audio_filter.is_some());
 
     for (i, mux) in muxs.iter_mut().enumerate() {
         // CLI-compat `-vf` structural uniqueness, validated on the demuxer
@@ -405,13 +409,18 @@ pub(super) fn outputs_bind(
             }
         }
 
-        // Filter-consumption postcondition: a configured -vf that no direct
-        // encoded-video stream consumed (audio-only input or maps,
-        // disable_video, an optional video map that matched nothing) must
-        // not be dropped silently.
+        // Filter-consumption postcondition: a configured simple filter that
+        // no direct encoded stream consumed (audio-only/video-only input or
+        // maps, disable_video/disable_audio, an optional map that matched
+        // nothing) must not be dropped silently.
         if let Some(video_filter) = &mux.video_filter {
             if !mux.video_filter_bound {
                 return Err(OpenOutputError::VideoFilterUnused(video_filter.clone()).into());
+            }
+        }
+        if let Some(audio_filter) = &mux.audio_filter {
+            if !mux.audio_filter_bound {
+                return Err(OpenOutputError::AudioFilterUnused(audio_filter.clone()).into());
             }
         }
 
@@ -521,7 +530,7 @@ fn map_manual(
                         .into());
                     }
 
-                    // -vf + a video stream mapped from a complex graph: the
+                    // -vf/-af + a stream mapped from a complex graph: the
                     // per-output filter could not be applied anywhere, so
                     // refuse the pair like the CLI (ffmpeg_mux_init.c
                     // ost_get_filters) instead of silently dropping it.
@@ -529,6 +538,14 @@ fn map_manual(
                         if let Some(video_filter) = &mux.video_filter {
                             return Err(OpenOutputError::SimpleAndComplexFilter(
                                 video_filter.clone(),
+                            )
+                            .into());
+                        }
+                    }
+                    if output_filter.media_type == AVMEDIA_TYPE_AUDIO {
+                        if let Some(audio_filter) = &mux.audio_filter {
+                            return Err(OpenOutputError::SimpleAndComplexFilter(
+                                audio_filter.clone(),
                             )
                             .into());
                         }
@@ -593,13 +610,19 @@ fn map_manual(
         )
     };
 
-    // A copy stream map covering a video stream conflicts with a per-output
-    // video filter exactly like `-c:v copy` does (that spelling is rejected
-    // at build time in open_output_file); map specifiers only expand to
-    // concrete streams here, after the inputs are open.
+    // A copy stream map covering a video/audio stream conflicts with a
+    // per-output filter of the same type exactly like `-c:v copy` / `-c:a
+    // copy` does (those spellings are rejected at build time in
+    // open_output_file); map specifiers only expand to concrete streams
+    // here, after the inputs are open.
     if stream_map.copy && media_type == AVMEDIA_TYPE_VIDEO {
         if let Some(video_filter) = &mux.video_filter {
             return Err(OpenOutputError::FilterWithStreamCopy(video_filter.clone()).into());
+        }
+    }
+    if stream_map.copy && media_type == AVMEDIA_TYPE_AUDIO {
+        if let Some(audio_filter) = &mux.audio_filter {
+            return Err(OpenOutputError::FilterWithStreamCopy(audio_filter.clone()).into());
         }
     }
 
@@ -1639,7 +1662,8 @@ fn init_simple_filtergraph(
 
     // The implicit per-output graph defaults to a passthrough chain; a
     // per-output video filter (Output::set_video_filter, FFmpeg -vf)
-    // replaces the video `null`. Audio has no per-output filter yet.
+    // replaces the video `null`, and a per-output audio filter
+    // (Output::set_audio_filter, FFmpeg -af) replaces the audio `anull`.
     if codec_type == AVMEDIA_TYPE_VIDEO {
         if let Some(custom_desc) = mux.video_filter.as_deref() {
             // User-supplied text enters the graph here — validate its
@@ -1651,9 +1675,16 @@ fn init_simple_filtergraph(
             validate_simple_video_filter(custom_desc, codec_type)?;
             mux.video_filter_bound = true;
         }
+    } else if codec_type == AVMEDIA_TYPE_AUDIO {
+        if let Some(custom_desc) = mux.audio_filter.as_deref() {
+            validate_simple_video_filter(custom_desc, codec_type)?;
+            mux.audio_filter_bound = true;
+        }
     }
     let filter_desc = if codec_type == AVMEDIA_TYPE_VIDEO {
         mux.video_filter.as_deref().unwrap_or("null")
+    } else if codec_type == AVMEDIA_TYPE_AUDIO {
+        mux.audio_filter.as_deref().unwrap_or("anull")
     } else {
         "anull"
     };
@@ -1724,12 +1755,14 @@ fn streamcopy_init(
             return Err(OpenOutputError::from(ret).into());
         }
 
-        // In the CLI this is the user's -tag value, 0 when absent; ez has no
-        // per-stream tag option yet. Seeding it from the copied parameters
-        // made the check below unreachable, so a source tag the target
-        // container cannot represent (e.g. AVI's FMP4 into mp4) was kept and
-        // avformat_write_header rejected it.
-        let mut codec_tag = 0;
+        // In the CLI this is the user's -tag value, 0 when absent. A user-set
+        // tag is honored even when the target container cannot represent it
+        // (the muxer then fails at write_header). Seeding from the copied
+        // parameters when unset made the check below unreachable, so a source
+        // tag the target cannot represent (e.g. AVI's FMP4 into mp4) was kept
+        // and avformat_write_header rejected it.
+        let codec_type = (*(*output_stream).codecpar).codec_type;
+        let mut codec_tag = mux.codec_tag_for(codec_type);
         if codec_tag == 0 {
             let ct = (*(*mux.out_fmt_ctx_ptr()).oformat).codec_tag;
             let mut codec_tag_tmp = 0;
@@ -1752,7 +1785,6 @@ fn streamcopy_init(
         // and ost->frame_rate is only set in new_stream_video() (ffmpeg_mux_init.c:607).
         // Since ez-ffmpeg stores framerate per-file (not per-stream), we need an explicit guard
         // to prevent applying framerate to audio/subtitle streams in streamcopy mode.
-        let codec_type = (*(*output_stream).codecpar).codec_type;
         let mut fr = AVRational { num: 0, den: 0 };
         if codec_type == AVMEDIA_TYPE_VIDEO {
             fr = mux.framerate.unwrap_or(AVRational { num: 0, den: 0 });
@@ -1856,10 +1888,16 @@ fn output_bind_by_unlabeled_filter(
                     && !output_filter.has_dst();
                 if assignable && media_type == AVMEDIA_TYPE_VIDEO {
                     if let Some(video_filter) = &mux.video_filter {
-                        return Err(OpenOutputError::SimpleAndComplexFilter(
-                            video_filter.clone(),
-                        )
-                        .into());
+                        return Err(
+                            OpenOutputError::SimpleAndComplexFilter(video_filter.clone()).into(),
+                        );
+                    }
+                }
+                if assignable && media_type == AVMEDIA_TYPE_AUDIO {
+                    if let Some(audio_filter) = &mux.audio_filter {
+                        return Err(
+                            OpenOutputError::SimpleAndComplexFilter(audio_filter.clone()).into(),
+                        );
                     }
                 }
             }
@@ -2108,7 +2146,11 @@ mod tests {
 
     #[test]
     fn per_map_codec_passes_for_encodable_media_types_and_none() {
-        for media_type in [AVMEDIA_TYPE_VIDEO, AVMEDIA_TYPE_AUDIO, AVMEDIA_TYPE_SUBTITLE] {
+        for media_type in [
+            AVMEDIA_TYPE_VIDEO,
+            AVMEDIA_TYPE_AUDIO,
+            AVMEDIA_TYPE_SUBTITLE,
+        ] {
             assert!(reject_per_map_codec_for_unencodable(media_type, Some("x")).is_ok());
         }
         assert!(reject_per_map_codec_for_unencodable(AVMEDIA_TYPE_DATA, None).is_ok());

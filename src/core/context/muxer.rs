@@ -1,5 +1,7 @@
 use crate::core::context::encoder_stream::EncoderStream;
-use crate::core::context::output::{AttachmentSpec, ExpandedStreamMap, StreamMap, VSyncMethod};
+use crate::core::context::output::{
+    AttachmentSpec, ExpandedStreamMap, ForcedKeyframePlan, StreamMap, VSyncMethod,
+};
 use crate::core::context::pre_mux_queue::{
     self, PreMuxQueueConfig, PreMuxQueueReceiver, PreMuxQueueSender,
 };
@@ -165,9 +167,9 @@ pub(crate) struct Muxer {
     pub(crate) video_qscale: Option<i32>,
     pub(crate) audio_qscale: Option<i32>,
 
-    /// Sorted forced-keyframe times in microseconds (`AV_TIME_BASE_Q`); `None` = off.
-    /// FFmpeg `-force_key_frames` list form, applied to re-encoded video only.
-    pub(crate) forced_kf_pts: Option<Vec<i64>>,
+    /// Forced-keyframe plan (`Output::set_force_key_frames` / interval).
+    /// Applied to re-encoded video only.
+    pub(crate) forced_kf: ForcedKeyframePlan,
 
     pub(crate) max_video_frames: Option<i64>,
     pub(crate) max_audio_frames: Option<i64>,
@@ -219,6 +221,22 @@ pub(crate) struct Muxer {
     /// encoded-video graph. `outputs_bind`'s postcondition turns a configured
     /// but unbound filter into `VideoFilterUnused` instead of dropping it.
     pub(crate) video_filter_bound: bool,
+
+    /// Per-output simple audio filter chain (`Output::set_audio_filter`,
+    /// FFmpeg `-af`). Consumed by `init_simple_filtergraph`, which uses it in
+    /// place of the default `anull` chain for this output's audio stream.
+    pub(crate) audio_filter: Option<String>,
+
+    /// Whether a configured `audio_filter` was actually consumed by a direct
+    /// encoded-audio graph. `outputs_bind`'s postcondition turns a configured
+    /// but unbound filter into `AudioFilterUnused` instead of dropping it.
+    pub(crate) audio_filter_bound: bool,
+
+    /// Per-type codec FourCC (`Output::set_*_codec_tag`, FFmpeg `-tag`).
+    /// `0` means unset, matching FFmpeg.
+    pub(crate) video_codec_tag: u32,
+    pub(crate) audio_codec_tag: u32,
+    pub(crate) subtitle_codec_tag: u32,
 
     // Auto-conversion tuning (NEW-SC-03): sws/swr option strings requested by
     // this output for the auto-inserted scale/aresample filters. Threaded into
@@ -328,7 +346,7 @@ impl Muxer {
         audio_sample_fmt: Option<AVSampleFormat>,
         video_qscale: Option<i32>,
         audio_qscale: Option<i32>,
-        forced_kf_pts: Option<Vec<i64>>,
+        forced_kf: ForcedKeyframePlan,
         max_video_frames: Option<i64>,
         max_audio_frames: Option<i64>,
         max_subtitle_frames: Option<i64>,
@@ -351,6 +369,10 @@ impl Muxer {
         require_unique_video_source: bool,
         strict_avoptions: bool,
         video_filter: Option<String>,
+        audio_filter: Option<String>,
+        video_codec_tag: u32,
+        audio_codec_tag: u32,
+        subtitle_codec_tag: u32,
         pre_mux_queue_config: PreMuxQueueConfig,
         sws_opts: Option<String>,
         swr_opts: Option<String>,
@@ -385,7 +407,7 @@ impl Muxer {
             audio_sample_fmt,
             video_qscale,
             audio_qscale,
-            forced_kf_pts,
+            forced_kf,
             max_video_frames,
             max_audio_frames,
             max_subtitle_frames,
@@ -421,6 +443,11 @@ impl Muxer {
             strict_avoptions,
             video_filter,
             video_filter_bound: false,
+            audio_filter,
+            audio_filter_bound: false,
+            video_codec_tag,
+            audio_codec_tag,
+            subtitle_codec_tag,
             sws_opts,
             swr_opts,
             attachments,
@@ -433,6 +460,16 @@ impl Muxer {
     /// a written container).
     pub(crate) fn is_packet_sink(&self) -> bool {
         self.packet_sink.is_some()
+    }
+
+    /// User-set codec FourCC for `media_type`, or `0` when unset.
+    pub(crate) fn codec_tag_for(&self, media_type: AVMediaType) -> u32 {
+        match media_type {
+            AVMediaType::AVMEDIA_TYPE_VIDEO => self.video_codec_tag,
+            AVMediaType::AVMEDIA_TYPE_AUDIO => self.audio_codec_tag,
+            AVMediaType::AVMEDIA_TYPE_SUBTITLE => self.subtitle_codec_tag,
+            _ => 0,
+        }
     }
 
     /// Takes the packet-sink callbacks for the mux worker handoff.
@@ -475,10 +512,18 @@ impl Muxer {
             // Strict-tier whitelist (v1): the delivery contract assumes one
             // packet == one access unit, which is established per encoder in
             // the verified registry (`packet_sink::registry`); audio must be
-            // AAC (AudioSpecificConfig configuration). Enforced here — where
-            // the resolved encoder is first known — so the job fails at
-            // build() with a typed error.
-            validate_packet_sink_encoder(media_type, enc)?;
+            // AAC (AudioSpecificConfig configuration). VideoToolbox also
+            // fail-closes on explicit B-frames (`bf` / `max_b_frames` other
+            // than integer 0) against the merged per-type + per-map option
+            // table.
+            // Enforced here — where the resolved encoder is first known —
+            // so the job fails at build() with a typed error.
+            validate_packet_sink_encoder(
+                media_type,
+                enc,
+                &self.video_codec_opts,
+                &per_map_codec_opts,
+            )?;
         }
         let (packet_sender, st, stream_index) = self.new_stream(src_node)?;
         let (frame_sender, frame_receiver) = crossbeam_channel::bounded(8);
@@ -510,12 +555,12 @@ impl Muxer {
             None
         };
 
-        // Forced-keyframe times apply to re-encoded video only; audio and subtitle
-        // encoders receive an empty list, so the request never reaches them.
-        let forced_kf_pts = if media_type == AVMediaType::AVMEDIA_TYPE_VIDEO {
-            self.forced_kf_pts.clone().unwrap_or_default()
+        // Forced-keyframe plan applies to re-encoded video only; audio and subtitle
+        // encoders receive Off, so the request never reaches them.
+        let forced_kf = if media_type == AVMediaType::AVMEDIA_TYPE_VIDEO {
+            self.forced_kf.clone()
         } else {
-            Vec::new()
+            ForcedKeyframePlan::Off
         };
 
         // Pre-mux buffer: packets an encoder produces before the muxer opens
@@ -535,14 +580,14 @@ impl Muxer {
             pre_mux_queue::channel(self.pre_mux_queue_config);
         self.src_pre_receivers.push(pre_packet_receiver);
 
-        let stream = EncoderStream::new(
+        let mut stream = EncoderStream::new(
             stream_index,
             st,
             media_type,
             enc,
             vsync_method,
             qscale,
-            forced_kf_pts,
+            forced_kf,
             frame_receiver,
             packet_sender,
             pre_packet_sender,
@@ -550,6 +595,16 @@ impl Muxer {
             self.strict_avoptions,
             per_map_codec_opts,
         );
+        let codec_tag = self.codec_tag_for(media_type);
+        stream.codec_tag = codec_tag;
+        if codec_tag != 0 {
+            // Seed codecpar so a probe before enc_open already sees the tag;
+            // enc_open still has to set enc_ctx.codec_tag before avcodec_open2
+            // because avcodec_parameters_from_context overwrites codecpar.
+            unsafe {
+                (*(*st).codecpar).codec_tag = codec_tag;
+            }
+        }
         self.streams.push(stream);
         Ok((frame_sender, stream_index))
     }
@@ -793,9 +848,14 @@ mod tests {
 /// Strict-tier whitelist for packet-sink outputs (see `add_enc_stream`):
 /// video admission comes from the verified-encoder registry, audio accepts
 /// any AAC encoder (the frame contract is trivially per-packet for AAC).
+/// Explicit B-frame build rejection applies to `h264_videotoolbox` only
+/// (per-map keys overlay per-type `video_codec_opts`); other wrappers rely
+/// on runtime `pts >= dts` enforcement.
 fn validate_packet_sink_encoder(
     media_type: AVMediaType,
     enc: *const AVCodec,
+    video_codec_opts: &Option<HashMap<CString, CString>>,
+    per_map_codec_opts: &Option<HashMap<CString, CString>>,
 ) -> crate::error::Result<()> {
     use crate::core::packet_sink::registry;
     use crate::error::PacketSinkError;
@@ -819,11 +879,20 @@ fn validate_packet_sink_encoder(
                 }
                 .into());
             }
+            // Same key-by-key overlay encoder-open uses: a per-map `bf=0`
+            // can admit a stream whose per-type table asked for B-frames,
+            // and the reverse rejects. The option gate is VideoToolbox-only
+            // (`pts < dts` when `bf>0`); other wrappers stay on runtime
+            // timestamp enforcement.
+            registry::admit_strict_tier_b_frame_opts(
+                &name,
+                merged_video_codec_opts(video_codec_opts, per_map_codec_opts).as_ref(),
+            )?;
         }
         AVMediaType::AVMEDIA_TYPE_AUDIO => {
             // SAFETY: same static-metadata read as above; null is rejected.
-            let is_aac =
-                !enc.is_null() && unsafe { (*enc).id } == ffmpeg_sys_next::AVCodecID::AV_CODEC_ID_AAC;
+            let is_aac = !enc.is_null()
+                && unsafe { (*enc).id } == ffmpeg_sys_next::AVCodecID::AV_CODEC_ID_AAC;
             if !is_aac {
                 return Err(PacketSinkError::EncoderNotWhitelisted {
                     kind: "audio",
@@ -841,6 +910,25 @@ fn validate_packet_sink_encoder(
         }
     }
     Ok(())
+}
+
+/// Per-map codec options win key-by-key over the per-type video table —
+/// the same overlay encoder-open applies. Admission must see that merged
+/// view so a per-map `bf` cannot drift from the options the encoder gets.
+fn merged_video_codec_opts(
+    type_opts: &Option<HashMap<CString, CString>>,
+    per_map_opts: &Option<HashMap<CString, CString>>,
+) -> Option<HashMap<CString, CString>> {
+    if type_opts.is_none() && per_map_opts.is_none() {
+        return None;
+    }
+    let mut merged = type_opts.clone().unwrap_or_default();
+    if let Some(per_map) = per_map_opts {
+        for (key, value) in per_map {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+    Some(merged)
 }
 
 unsafe fn determine_vsync_method(
@@ -912,4 +1000,38 @@ unsafe fn determine_vsync_method(
     }
 
     Ok(vsync_method)
+}
+
+#[cfg(test)]
+mod video_opt_merge_tests {
+    use super::merged_video_codec_opts;
+    use std::collections::HashMap;
+    use std::ffi::CString;
+
+    fn copts(pairs: &[(&str, &str)]) -> HashMap<CString, CString> {
+        pairs
+            .iter()
+            .map(|(k, v)| (CString::new(*k).unwrap(), CString::new(*v).unwrap()))
+            .collect()
+    }
+
+    fn val<'a>(map: &'a HashMap<CString, CString>, key: &str) -> &'a [u8] {
+        map.get(&CString::new(key).unwrap())
+            .unwrap_or_else(|| panic!("missing {key}"))
+            .as_bytes()
+    }
+
+    #[test]
+    fn unset_tables_stay_none() {
+        assert!(merged_video_codec_opts(&None, &None).is_none());
+    }
+
+    #[test]
+    fn per_map_keys_overlay_per_type() {
+        let type_opts = Some(copts(&[("bf", "3"), ("g", "25")]));
+        let per_map = Some(copts(&[("bf", "0")]));
+        let merged = merged_video_codec_opts(&type_opts, &per_map).unwrap();
+        assert_eq!(val(&merged, "bf"), b"0", "per-map must win on conflicts");
+        assert_eq!(val(&merged, "g"), b"25", "per-type-only keys must survive");
+    }
 }

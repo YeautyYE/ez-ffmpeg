@@ -258,11 +258,10 @@ pub struct Output {
     // set audio quality (codec-specific)
     pub(crate) audio_qscale: Option<i32>,
 
-    /// Raw forced-keyframe spec (FFmpeg `-force_key_frames` list form), as
-    /// given to [`Output::set_force_key_frames`]. `None` = feature off.
-    /// Parsed and validated at open time (`parse_forced_key_frames`), like
-    /// every other deferred option; applies to re-encoded video only.
-    pub(crate) forced_kf_spec: Option<String>,
+    /// Forced-keyframe request: list-form times, periodic interval, or off.
+    /// List-form strings are parsed at open time (`parse_forced_key_frames`);
+    /// periodic mode is typed. Applies to re-encoded video only.
+    pub(crate) forced_kf_spec: ForcedKeyframeSpec,
 
     /// Maximum number of **video** frames to encode (equivalent to `-frames:v` in FFmpeg).
     ///
@@ -427,6 +426,19 @@ pub struct Output {
     /// the passthrough `null` chain. Set via [`Output::set_video_filter`].
     pub(crate) video_filter: Option<String>,
 
+    /// Per-output simple **audio** filter chain (FFmpeg `-af`), applied to
+    /// this output's re-encoded audio stream through the implicit per-output
+    /// filtergraph (it replaces the default `anull` chain). Must be a linear
+    /// chain: exactly one audio input pad and one audio output pad. `None` ⇒
+    /// the passthrough `anull` chain. Set via [`Output::set_audio_filter`].
+    pub(crate) audio_filter: Option<String>,
+
+    /// Per-type codec FourCC (FFmpeg `-tag:v` / `-tag:a` / `-tag:s`). Stored
+    /// as the user string and parsed at `build()`; `None` ⇒ unset (`0`).
+    pub(crate) video_codec_tag: Option<String>,
+    pub(crate) audio_codec_tag: Option<String>,
+    pub(crate) subtitle_codec_tag: Option<String>,
+
     /// sws (libswscale) options for the `scale` filters libavfilter
     /// auto-inserts ahead of this output's encoder. Maps to the graph-level
     /// `AVFilterGraph.scale_sws_opts`. Default `None`. Set via
@@ -502,7 +514,7 @@ impl Output {
             audio_sample_fmt: None,
             video_qscale: None,
             audio_qscale: None,
-            forced_kf_spec: None,
+            forced_kf_spec: ForcedKeyframeSpec::None,
             max_video_frames: None,
             max_audio_frames: None,
             max_subtitle_frames: None,
@@ -524,6 +536,10 @@ impl Output {
             require_unique_video_source: false,
             strict_avoptions: false,
             video_filter: None,
+            audio_filter: None,
+            video_codec_tag: None,
+            audio_codec_tag: None,
+            subtitle_codec_tag: None,
             sws_opts: None,
             swr_opts: None,
             attachments: Vec::new(),
@@ -590,12 +606,14 @@ impl Output {
     /// `add_stream_metadata`, `add_chapter_metadata`, `add_program_metadata`,
     /// `map_metadata_from_input`, `disable_auto_copy_metadata`). Pipeline
     /// features outside the strict tier's delivery contract are rejected as
-    /// policy, not for lack of a container: `set_video_filter`, bitstream
+    /// policy, not for lack of a container: `set_video_filter`,
+    /// `set_audio_filter`, bitstream
     /// filters (`set_*_bsf`), `set_subtitle_codec`, stream copy, and the
     /// `flags` codec option (it could clear the `global_header` flag behind
     /// the out-of-band configuration). The set tracks the validator and may
     /// grow. The v1 strict tier accepts only registry-verified encoders
-    /// (video: `libx264`, `h264_nvenc`; audio: AAC).
+    /// (video: `libx264`, `h264_nvenc`, `h264_videotoolbox` with `bf=0`,
+    /// `libopenh264`; audio: AAC).
     ///
     /// `Output::from(sink)` is the equivalent, crate-conventional spelling
     /// and the one used throughout the documentation.
@@ -849,6 +867,50 @@ impl Output {
     /// ```
     pub fn set_subtitle_codec(mut self, subtitle_codec: impl Into<String>) -> Self {
         self.subtitle_codec = Some(subtitle_codec.into());
+        self
+    }
+
+    /// Sets the video stream's codec FourCC, equivalent to FFmpeg `-tag:v`.
+    ///
+    /// The token is either a whole-token integer (decimal or `0x` hex, matching
+    /// FFmpeg's `strtol(..., 0)`) or a four-character tag such as `"hvc1"` /
+    /// `"mp4v"` (little-endian `AV_RL32`). Setting `("tag", ...)` as a codec
+    /// option does **not** reach `codecpar->codec_tag`; this setter is the
+    /// path that does.
+    ///
+    /// The setter is infallible and stores the token as given. An empty string
+    /// fails [`FfmpegContextBuilder::build`](crate::core::context::ffmpeg_context_builder::FfmpegContextBuilder::build) with
+    /// [`OpenOutputError::InvalidOption`]. On stream copy, a user-set tag is
+    /// honored even when the target container cannot represent it (the muxer
+    /// then fails at `write_header`) — the crate does not auto-clear a tag
+    /// the caller asked for.
+    ///
+    /// **Equivalent FFmpeg command:**
+    /// ```sh
+    /// ffmpeg -i input.mp4 -c:v libx265 -tag:v hvc1 output.mp4
+    /// ```
+    ///
+    /// [`OpenOutputError::InvalidOption`]: crate::error::OpenOutputError::InvalidOption
+    pub fn set_video_codec_tag(mut self, tag: impl Into<String>) -> Self {
+        self.video_codec_tag = Some(tag.into());
+        self
+    }
+
+    /// Sets the audio stream's codec FourCC, equivalent to FFmpeg `-tag:a`.
+    ///
+    /// See [`set_video_codec_tag`](Self::set_video_codec_tag) for the token
+    /// grammar and when the value is applied.
+    pub fn set_audio_codec_tag(mut self, tag: impl Into<String>) -> Self {
+        self.audio_codec_tag = Some(tag.into());
+        self
+    }
+
+    /// Sets the subtitle stream's codec FourCC, equivalent to FFmpeg `-tag:s`.
+    ///
+    /// See [`set_video_codec_tag`](Self::set_video_codec_tag) for the token
+    /// grammar and when the value is applied.
+    pub fn set_subtitle_codec_tag(mut self, tag: impl Into<String>) -> Self {
+        self.subtitle_codec_tag = Some(tag.into());
         self
     }
 
@@ -1393,7 +1455,33 @@ impl Output {
     ///     .set_force_key_frames("0,5,10.5");
     /// ```
     pub fn set_force_key_frames(mut self, spec: impl Into<String>) -> Self {
-        self.forced_kf_spec = Some(spec.into());
+        self.forced_kf_spec = ForcedKeyframeSpec::Times(spec.into());
+        self
+    }
+
+    /// Request an intra frame at the first video frame with a valid timestamp
+    /// and every `interval` thereafter, anchored to that first timestamp.
+    ///
+    /// Subsequent targets are `origin + k * interval` in microseconds. Each
+    /// target is applied to the first frame whose PTS is at least that
+    /// instant. If a frame skips one or more targets (a drop), that frame is
+    /// forced once and the cursor advances to the first target strictly after
+    /// its PTS — missed targets are not repaid on later frames.
+    ///
+    /// Times are encoder presentation timestamps. `pict_type = I` remains a
+    /// request: software encoders typically honor it; hardware encoders may
+    /// not. Applies only to re-encoded video. A zero interval is rejected when
+    /// the context is built.
+    ///
+    /// This is the typed periodic subset of FFmpeg's `-force_key_frames`; it
+    /// does not parse `expr:` strings. The list form
+    /// [`set_force_key_frames`](Self::set_force_key_frames) is unchanged.
+    ///
+    /// Calling this after [`set_force_key_frames`](Self::set_force_key_frames)
+    /// (or the reverse) replaces the previous request.
+    pub fn set_force_key_frames_interval(mut self, interval: std::time::Duration) -> Self {
+        let interval_us = i64::try_from(interval.as_micros()).unwrap_or(i64::MAX);
+        self.forced_kf_spec = ForcedKeyframeSpec::Periodic { interval_us };
         self
     }
 
@@ -1701,7 +1789,7 @@ impl Output {
     ///   [`OpenOutputError::SimpleAndComplexFilter`], matching the CLI's rule
     ///   for `-vf` + `-filter_complex` on the same stream.
     /// - **Audio is untouched**: only the video stream runs through this
-    ///   chain. There is no per-output audio (`-af`) equivalent yet.
+    ///   chain. Use [`set_audio_filter`](Self::set_audio_filter) for `-af`.
     /// - **Must be consumed**: if the output ends up with no re-encoded
     ///   video stream at all (audio-only input, [`disable_video`], maps that
     ///   match no video stream), the build fails with
@@ -1749,6 +1837,86 @@ impl Output {
     /// chain, restoring the implicit passthrough (`null`) graph.
     pub fn clear_video_filter(mut self) -> Self {
         self.video_filter = None;
+        self
+    }
+
+    /// Sets a simple **audio** filter chain for this output, equivalent to
+    /// FFmpeg `-af` (`-filter:a`).
+    ///
+    /// The chain is applied to this output's **re-encoded** audio stream: every
+    /// simple (non-`filter_complex`) audio encode already runs through an
+    /// implicit per-output filtergraph whose description defaults to the
+    /// passthrough `anull` chain, and this method replaces that `anull` with
+    /// the given description. The filter text is passed to FFmpeg verbatim —
+    /// the same string the CLI accepts after `-af` works here unchanged, e.g.
+    /// `"aformat=sample_rates=16000"` or `"loudnorm"`.
+    ///
+    /// Unlike [`FfmpegContextBuilder::filter_desc`], which creates one
+    /// context-level graph shared by all outputs, this filter belongs to this
+    /// `Output` alone: with several outputs, each can carry its own chain (or
+    /// none), matching how the CLI scopes `-af` to the output file it precedes.
+    ///
+    /// # Contract
+    /// - **Linear chain only**: the description must have exactly one audio
+    ///   input pad and one audio output pad. Splitting/merging descriptions
+    ///   (e.g. `asplit`) fail the build with
+    ///   [`OpenOutputError::SimpleFilterInvalidShape`]; non-audio chains (e.g.
+    ///   `scale`) fail with [`OpenOutputError::SimpleFilterMediaTypeMismatch`].
+    ///   Use [`FfmpegContextBuilder::filter_desc`] for complex graphs.
+    /// - **Re-encode only**: combining this with `set_audio_codec("copy")` or
+    ///   a copy stream map covering an audio stream fails the build with
+    ///   [`OpenOutputError::FilterWithStreamCopy`], matching the CLI's
+    ///   "Filtering and streamcopy cannot be used together".
+    /// - **Simple xor complex**: if this output's audio is fed by a
+    ///   context-level filtergraph output, the build fails with
+    ///   [`OpenOutputError::SimpleAndComplexFilter`], matching the CLI's rule
+    ///   for `-af` + `-filter_complex` on the same stream.
+    /// - **Video is untouched**: only the audio stream runs through this
+    ///   chain. Use [`set_video_filter`](Self::set_video_filter) for `-vf`.
+    /// - **Must be consumed**: if the output ends up with no re-encoded
+    ///   audio stream at all (video-only input, [`disable_audio`], maps that
+    ///   match no audio stream), the build fails with
+    ///   [`OpenOutputError::AudioFilterUnused`] instead of silently dropping
+    ///   the chain.
+    /// - **VideoWriter**: a [`VideoWriter`](crate::VideoWriter) opening this
+    ///   `Output` rejects the setter — a writer job has no audio stream.
+    ///
+    /// [`disable_audio`]: Self::disable_audio
+    /// [`OpenOutputError::AudioFilterUnused`]: crate::error::OpenOutputError::AudioFilterUnused
+    ///
+    /// An **empty string is kept** and fails the build like `-af ""` fails
+    /// the CLI (an empty graph parses to zero pads); use
+    /// [`clear_audio_filter`](Self::clear_audio_filter) to remove a
+    /// previously set chain. The description itself is validated when the
+    /// context is built; an invalid filter name surfaces as a
+    /// [`FilterGraphParseError`](crate::error::FilterGraphParseError) from
+    /// `build()`, not from this setter.
+    ///
+    /// **Equivalent FFmpeg command:**
+    /// ```sh
+    /// ffmpeg -i input.m4a -af aformat=sample_rates=16000 -c:a aac out.m4a
+    /// ```
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// let output = Output::from("out.m4a")
+    ///     .set_audio_filter("aformat=sample_rates=16000"); // -af aformat=sample_rates=16000
+    /// ```
+    ///
+    /// [`FfmpegContextBuilder::filter_desc`]: crate::core::context::ffmpeg_context_builder::FfmpegContextBuilder::filter_desc
+    /// [`OpenOutputError::SimpleFilterInvalidShape`]: crate::error::OpenOutputError::SimpleFilterInvalidShape
+    /// [`OpenOutputError::SimpleFilterMediaTypeMismatch`]: crate::error::OpenOutputError::SimpleFilterMediaTypeMismatch
+    /// [`OpenOutputError::FilterWithStreamCopy`]: crate::error::OpenOutputError::FilterWithStreamCopy
+    /// [`OpenOutputError::SimpleAndComplexFilter`]: crate::error::OpenOutputError::SimpleAndComplexFilter
+    pub fn set_audio_filter(mut self, filter_chain: impl Into<String>) -> Self {
+        self.audio_filter = Some(filter_chain.into());
+        self
+    }
+
+    /// Removes a previously set [`set_audio_filter`](Self::set_audio_filter)
+    /// chain, restoring the implicit passthrough (`anull`) graph.
+    pub fn clear_audio_filter(mut self) -> Self {
+        self.audio_filter = None;
         self
     }
 
@@ -1809,6 +1977,50 @@ impl Output {
     }
 }
 
+/// Parse a codec FourCC the way FFmpeg's `-tag` does.
+///
+/// A whole-token C `strtol` integer (base 0: decimal or `0x` hex) is used
+/// when every character is consumed; otherwise the first four bytes are
+/// read as a little-endian `AV_RL32` FourCC (`"hvc1"`, `"mp4v"`). An empty
+/// string is rejected — unlike the CLI, which treats it as unset (`0`).
+pub(crate) fn parse_codec_tag(tag: &str) -> std::result::Result<u32, String> {
+    if tag.is_empty() {
+        return Err("codec tag must not be empty".into());
+    }
+    if let Some(n) = codec_tag_strtol_full(tag) {
+        return Ok(n);
+    }
+    Ok(codec_tag_av_rl32(tag.as_bytes()))
+}
+
+fn codec_tag_av_rl32(bytes: &[u8]) -> u32 {
+    let mut tag = 0u32;
+    for (i, &b) in bytes.iter().take(4).enumerate() {
+        tag |= u32::from(b) << (8 * i);
+    }
+    tag
+}
+
+/// FFmpeg `strtol(arg, &tail, 0)` that only succeeds when `*tail == 0`
+/// (the whole token was numeric). Leading ASCII whitespace is skipped.
+fn codec_tag_strtol_full(s: &str) -> Option<u32> {
+    let t = s.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    if t.is_empty() {
+        return Some(0);
+    }
+    let t = t.strip_prefix('+').unwrap_or(t);
+    if t.starts_with('-') {
+        return None;
+    }
+    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        if hex.is_empty() {
+            return None;
+        }
+        return u32::from_str_radix(hex, 16).ok();
+    }
+    t.parse::<u32>().ok()
+}
+
 impl From<Box<dyn FnMut(&[u8]) -> i32 + Send>> for Output {
     fn from(write_callback: Box<dyn FnMut(&[u8]) -> i32 + Send>) -> Self {
         Self::with_target(OutputTarget::CustomIo {
@@ -1863,6 +2075,92 @@ pub(crate) struct ExpandedStreamMap {
     pub(crate) codec_opts: Option<HashMap<std::ffi::CString, std::ffi::CString>>,
 }
 
+/// Forced-keyframe request stored on [`Output`] until open time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ForcedKeyframeSpec {
+    /// Feature off.
+    None,
+    /// Unparsed list-form string (`"0,5,10.5"`), validated at open.
+    Times(String),
+    /// Periodic IDR request every `interval_us` microseconds from the first
+    /// valid frame PTS.
+    Periodic { interval_us: i64 },
+}
+
+/// Parsed forced-keyframe plan handed to the muxer / encoder thread.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) enum ForcedKeyframePlan {
+    #[default]
+    Off,
+    Times(Vec<i64>),
+    Periodic { interval_us: i64 },
+}
+
+/// Mutable periodic-force cursor used while encoding.
+#[derive(Debug, Clone)]
+pub(crate) struct PeriodicKeyframeState {
+    pub interval_us: i64,
+    pub origin_us: Option<i64>,
+    pub next_index: u64,
+}
+
+impl PeriodicKeyframeState {
+    pub(crate) fn new(interval_us: i64) -> Self {
+        Self {
+            interval_us,
+            origin_us: None,
+            next_index: 0,
+        }
+    }
+}
+
+/// Apply one frame to the periodic schedule. `pts_us == None` is `AV_NOPTS_VALUE`
+/// and never forces. Returns whether this frame should request an intra frame.
+pub(crate) fn apply_periodic_keyframe(
+    state: &mut PeriodicKeyframeState,
+    pts_us: Option<i64>,
+) -> bool {
+    let Some(pts) = pts_us else {
+        return false;
+    };
+    if state.interval_us <= 0 {
+        return false;
+    }
+    match state.origin_us {
+        None => {
+            state.origin_us = Some(pts);
+            state.next_index = 1;
+            true
+        }
+        Some(origin) => {
+            let Some(target) = periodic_target(origin, state.next_index, state.interval_us) else {
+                return false;
+            };
+            if pts < target {
+                return false;
+            }
+            state.next_index = first_index_strictly_after(origin, state.interval_us, pts);
+            true
+        }
+    }
+}
+
+fn periodic_target(origin: i64, index: u64, interval: i64) -> Option<i64> {
+    i64::try_from(i128::from(origin) + i128::from(index) * i128::from(interval)).ok()
+}
+
+fn first_index_strictly_after(origin: i64, interval: i64, pts: i64) -> u64 {
+    if interval <= 0 {
+        return u64::MAX;
+    }
+    let delta = i128::from(pts) - i128::from(origin);
+    if delta < 0 {
+        return 0;
+    }
+    let k = delta / i128::from(interval) + 1;
+    u64::try_from(k).unwrap_or(u64::MAX)
+}
+
 /// Parse an FFmpeg `-force_key_frames` **list-form** spec (e.g. `"0,5,10.5"`) into a
 /// sorted `Vec<i64>` of microsecond timestamps (`AV_TIME_BASE_Q` units).
 ///
@@ -1906,7 +2204,10 @@ pub(crate) fn parse_forced_key_frames(spec: &str) -> Result<Vec<i64>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_forced_key_frames, Output};
+    use super::{
+        apply_periodic_keyframe, parse_codec_tag, parse_forced_key_frames, ForcedKeyframeSpec,
+        Output, PeriodicKeyframeState,
+    };
 
     #[test]
     fn io_buffer_size_is_unset_until_the_setter_runs() {
@@ -1992,6 +2293,41 @@ mod tests {
         assert_eq!(Output::new_by_write_callback(|_| 0).video_filter, None);
     }
 
+    #[test]
+    fn set_audio_filter_stores_chain() {
+        let output = Output::from("out.m4a").set_audio_filter("aformat=sample_rates=16000");
+        assert_eq!(
+            output.audio_filter.as_deref(),
+            Some("aformat=sample_rates=16000")
+        );
+    }
+
+    #[test]
+    fn clear_audio_filter_resets() {
+        let output = Output::from("out.m4a")
+            .set_audio_filter("loudnorm")
+            .clear_audio_filter();
+        assert_eq!(output.audio_filter, None);
+    }
+
+    #[test]
+    fn parse_codec_tag_fourcc_is_little_endian() {
+        fn mktag(tag: &str) -> u32 {
+            let b = tag.as_bytes();
+            u32::from(b[0])
+                | (u32::from(b[1]) << 8)
+                | (u32::from(b[2]) << 16)
+                | (u32::from(b[3]) << 24)
+        }
+        assert_eq!(parse_codec_tag("hvc1").unwrap(), mktag("hvc1"));
+        assert_eq!(parse_codec_tag("mp4v").unwrap(), mktag("mp4v"));
+        assert_eq!(parse_codec_tag("FMP4").unwrap(), mktag("FMP4"));
+        assert_eq!(parse_codec_tag("16").unwrap(), 16);
+        assert_eq!(parse_codec_tag("0x10").unwrap(), 16);
+        assert_eq!(parse_codec_tag("0").unwrap(), 0);
+        assert!(parse_codec_tag("").is_err());
+    }
+
     /// Constructor parity for the CLI-only flags: every public construction
     /// path funnels through `with_target`, and the compiler only enforces
     /// field PRESENCE there, not VALUES. A future field whose `with_target`
@@ -2008,6 +2344,10 @@ mod tests {
             assert!(!output.strict_avoptions);
             assert!(!output.require_unique_video_source);
             assert_eq!(output.video_filter, None);
+            assert_eq!(output.audio_filter, None);
+            assert_eq!(output.video_codec_tag, None);
+            assert_eq!(output.audio_codec_tag, None);
+            assert_eq!(output.subtitle_codec_tag, None);
         }
     }
 
@@ -2076,5 +2416,145 @@ mod tests {
     #[test]
     fn rejects_overflow_instead_of_saturating() {
         assert!(parse_forced_key_frames("1e30").is_err());
+    }
+
+    fn force_seq(origin_pts: &[Option<i64>], interval_us: i64) -> Vec<bool> {
+        let mut state = PeriodicKeyframeState::new(interval_us);
+        origin_pts
+            .iter()
+            .copied()
+            .map(|pts| apply_periodic_keyframe(&mut state, pts))
+            .collect()
+    }
+
+    fn cfr_pts(frames: u64, fps_num: i64, fps_den: i64) -> Vec<Option<i64>> {
+        (0..frames)
+            .map(|n| {
+                Some(
+                    i64::try_from(
+                        i128::from(n) * i128::from(fps_den) * 1_000_000 / i128::from(fps_num),
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn periodic_origin_zero() {
+        let pts = cfr_pts(90, 30, 1);
+        let flags = force_seq(&pts, 1_000_000);
+        // 30 fps, 1s interval: frames 0, 30, 60.
+        let forced: Vec<usize> = flags
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| f.then_some(i))
+            .collect();
+        assert_eq!(forced, vec![0, 30, 60]);
+    }
+
+    #[test]
+    fn periodic_origin_nonzero() {
+        // First valid PTS is 2_000_000; subsequent targets 3s, 4s, ...
+        let mut pts = cfr_pts(90, 30, 1);
+        for v in pts.iter_mut().flatten() {
+            *v += 2_000_000;
+        }
+        let flags = force_seq(&pts, 1_000_000);
+        let forced: Vec<usize> = flags
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| f.then_some(i))
+            .collect();
+        assert_eq!(forced, vec![0, 30, 60]);
+        assert_eq!(pts[0], Some(2_000_000));
+    }
+
+    #[test]
+    fn periodic_25_fps() {
+        let flags = force_seq(&cfr_pts(50, 25, 1), 1_000_000);
+        let forced: Vec<usize> = flags
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| f.then_some(i))
+            .collect();
+        assert_eq!(forced, vec![0, 25]);
+    }
+
+    #[test]
+    fn periodic_ntsc_30000_1001() {
+        let flags = force_seq(&cfr_pts(60, 30000, 1001), 1_000_000);
+        assert!(flags[0]);
+        // Targets stay on origin + k*1s, not N/fps, so the second force is
+        // the first frame whose PTS >= 1_000_000.
+        let second = flags.iter().skip(1).position(|f| *f).unwrap() + 1;
+        let pts = i64::try_from(i128::from(second as u64) * 1001 * 1_000_000 / 30000).unwrap();
+        assert!(pts >= 1_000_000);
+        let prev =
+            i64::try_from(i128::from((second as u64) - 1) * 1001 * 1_000_000 / 30000).unwrap();
+        assert!(prev < 1_000_000);
+    }
+
+    #[test]
+    fn periodic_non_integer_interval() {
+        // 30 fps, 1.5s interval: force at 0, then first frame >= 1.5s (frame 45).
+        let flags = force_seq(&cfr_pts(90, 30, 1), 1_500_000);
+        let forced: Vec<usize> = flags
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| f.then_some(i))
+            .collect();
+        assert_eq!(forced, vec![0, 45]);
+    }
+
+    #[test]
+    fn periodic_frame_drop_skips_missed_target() {
+        // origin 0, 2s interval. Frames at 0, 1s, then jump to 4.5s.
+        let pts = vec![Some(0), Some(1_000_000), Some(4_500_000), Some(6_000_000)];
+        let flags = force_seq(&pts, 2_000_000);
+        assert_eq!(flags, vec![true, false, true, true]);
+        // The 2s target was skipped by the jump to 4.5s; next after 4.5s is 6s.
+    }
+
+    #[test]
+    fn periodic_nopts_never_forces_or_sets_origin() {
+        let mut state = PeriodicKeyframeState::new(1_000_000);
+        assert!(!apply_periodic_keyframe(&mut state, None));
+        assert_eq!(state.origin_us, None);
+        assert!(apply_periodic_keyframe(&mut state, Some(5_000_000)));
+        assert_eq!(state.origin_us, Some(5_000_000));
+        assert!(!apply_periodic_keyframe(&mut state, None));
+        assert_eq!(state.origin_us, Some(5_000_000));
+        assert_eq!(state.next_index, 1);
+    }
+
+    #[test]
+    fn periodic_overflow_stops_forcing() {
+        let mut state = PeriodicKeyframeState::new(100);
+        assert!(apply_periodic_keyframe(&mut state, Some(i64::MAX - 10)));
+        // next target = origin + 100 overflows i64.
+        assert!(!apply_periodic_keyframe(&mut state, Some(i64::MAX)));
+    }
+
+    #[test]
+    fn list_mode_setter_still_stores_raw_spec() {
+        let output = Output::from("out.mp4").set_force_key_frames("0,5,10.5");
+        assert_eq!(
+            output.forced_kf_spec,
+            ForcedKeyframeSpec::Times("0,5,10.5".into())
+        );
+    }
+
+    #[test]
+    fn periodic_setter_replaces_list_mode() {
+        let output = Output::from("out.mp4")
+            .set_force_key_frames("0,5")
+            .set_force_key_frames_interval(std::time::Duration::from_secs(2));
+        assert_eq!(
+            output.forced_kf_spec,
+            ForcedKeyframeSpec::Periodic {
+                interval_us: 2_000_000
+            }
+        );
     }
 }

@@ -311,7 +311,7 @@ fn corpus_loudnorm_audio_filter() {
     rejected(
         "ffmpeg -i input.mp4 -af loudnorm -y out.mp4",
         "UnsupportedOption",
-        "per-output audio filter API",
+        "Output::set_audio_filter",
     );
 }
 
@@ -399,7 +399,7 @@ fn corpus_codec_tags_and_never_overwrite() {
     rejected(
         "ffmpeg -i in.mp4 -tag:v hvc1 -y out.mp4",
         "UnsupportedOption",
-        "documented gap",
+        "Output::set_video_codec_tag",
     );
     rejected(
         "ffmpeg -n -i in.mp4 -y out.mp4",

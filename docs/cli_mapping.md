@@ -17,6 +17,8 @@ ez-ffmpeg equivalents. The **Kind** column tells you *how* the mapping works:
   (`AVOption`); the same names the CLI accepts, without the leading dash.
 - **filter** — expressed as an FFmpeg filtergraph string: a simple per-output
   `-vf` chain via [`Output::set_video_filter`](crate::Output::set_video_filter),
+  a simple per-output `-af` chain via
+  [`Output::set_audio_filter`](crate::Output::set_audio_filter),
   complex/multi-input graphs via the context-level
   [`filter_desc`](crate::core::context::ffmpeg_context_builder::FfmpegContextBuilder::filter_desc).
 - **recipe** — a one-shot helper that owns the whole workflow.
@@ -51,13 +53,13 @@ One global convention: CLI *seconds* become *microseconds* in `_us` methods
 | `-ar` / `-ac` / `-sample_fmt` | typed | [`Output::set_audio_sample_rate`](crate::Output::set_audio_sample_rate) / [`set_audio_channels`](crate::Output::set_audio_channels) / [`set_audio_sample_fmt`](crate::Output::set_audio_sample_fmt) | Audio resample/layout parameters. |
 | `-force_key_frames 0,5,10` | typed | [`Output::set_force_key_frames`](crate::Output::set_force_key_frames) | Comma-separated absolute times in **seconds** only; the `expr:` / `HH:MM:SS` / `source` forms are rejected. *cli facade*: rejected entirely (builder-only). |
 | `-bsf:v` / `-bsf:a` / `-bsf:s` | typed | [`Output::set_video_bsf`](crate::Output::set_video_bsf) / [`set_audio_bsf`](crate::Output::set_audio_bsf) / [`set_subtitle_bsf`](crate::Output::set_subtitle_bsf) | Single filter or comma-separated chain (`"h264_mp4toannexb"`). |
-| `-tag:v hvc1` (FourCC / codec tag) | gap | — | Not exposed. Setting `("tag", ...)` as a codec option does not reach `codec_tag`; re-tag with an external remux for now. |
+| `-tag:v hvc1` (FourCC / codec tag) | typed | [`Output::set_video_codec_tag`](crate::Output::set_video_codec_tag) / [`set_audio_codec_tag`](crate::Output::set_audio_codec_tag) / [`set_subtitle_codec_tag`](crate::Output::set_subtitle_codec_tag) | Integer or four-character tag (`"hvc1"`, `"mp4v"`). Setting `("tag", …)` as a codec option does **not** reach `codecpar->codec_tag`. *cli facade*: rejected; use the builder. |
 | `-movflags +faststart` | option | [`Output::set_format_opt`](crate::Output::set_format_opt)`("movflags", "faststart")` | Muxer option. See anchor below. |
 | muxer options (`-hls_time`, `-segment_time`, `-hls_list_size`, ...) | option | [`Output::set_format_opt`](crate::Output::set_format_opt) / [`set_format_opts`](crate::Output::set_format_opts) | Container-level `AVOption`s for the selected muxer. |
 | demuxer/protocol options (`-rtsp_transport tcp`, `-headers`, `-loop 1`, `-probesize`) | option | [`Input::set_format_opt`](crate::Input::set_format_opt) / [`set_format_opts`](crate::Input::set_format_opts) | Applied at `avformat_open_input` time; covers protocol, demuxer and device options. |
 | `-metadata`, `-metadata:s:v`, `-map_metadata` | typed | [`Output::add_metadata`](crate::Output::add_metadata), [`add_stream_metadata`](crate::Output::add_stream_metadata), [`map_metadata_from_input`](crate::Output::map_metadata_from_input) | Global, per-stream, chapter and program metadata; note `add_stream_metadata` returns `Result`. |
 | `-vf` / `-filter:v` (simple per-output chain) | filter | [`Output::set_video_filter`](crate::Output::set_video_filter) | One linear video chain per output, applied to that output's re-encoded video stream; conflicts with stream copy and complex graphs are typed build errors. *cli facade*: `-vf` takes a single `scale=…` chain only, and the `-filter:v` alias is rejected. |
-| `-af` (per-output audio chain) | gap | — | No per-output audio filter API yet; a context-level graph via `filter_desc` is the workaround. |
+| `-af` / `-filter:a` (simple per-output chain) | filter | [`Output::set_audio_filter`](crate::Output::set_audio_filter) | One linear audio chain per output, applied to that output's re-encoded audio stream; conflicts with stream copy and complex graphs are typed build errors. *cli facade*: rejected; use the builder. |
 | `-filter_complex` | filter | builder [`filter_desc`](crate::core::context::ffmpeg_context_builder::FfmpegContextBuilder::filter_desc) | Full filtergraph syntax including labels and multiple inputs. *cli facade*: rejected (complex graphs are planned there). |
 | `-vf scale=1280:-2` (resize) | filter | `Output::from("out.mp4").set_video_filter("scale=1280:-2")` | Through the builder, any scale expression the linked FFmpeg accepts works verbatim. *cli facade*: a single simple `scale=…` chain only — no chains, labels, parentheses or quoting. |
 | watermark (`overlay`) | filter | `.filter_desc("[1:v]scale=100:-1[wm];[0:v][wm]overlay=10:10")` | Second input is the watermark; see `examples/watermarking`. *cli facade*: multi-input commands are rejected (single-input subset). |

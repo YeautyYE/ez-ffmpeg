@@ -686,9 +686,10 @@ impl VideoWriterBuilder {
     ///   (encoder-side resampling of the pushed CFR stream, exactly as in any
     ///   other job), `set_max_video_frames`, `set_start_time_us` /
     ///   `set_recording_time_us` / `set_stop_time_us`, `set_sws_opts`,
-    ///   video-typed frame pipelines (wgpu…), and `set_video_filter` (used
+    ///   video-typed frame pipelines (wgpu…), `set_video_filter` (used
     ///   when no builder-level [`filter_desc`](Self::filter_desc) is set;
-    ///   both at once is [`WriterError::ConflictingFilterDescriptions`])
+    ///   both at once is [`WriterError::ConflictingFilterDescriptions`]),
+    ///   and `set_video_codec_tag` (FFmpeg `-tag:v`)
     /// - vacuously satisfied no-ops: `disable_audio` / `disable_subtitle` /
     ///   `disable_data` (those streams never exist),
     ///   `disable_auto_copy_metadata` (there are no inputs to copy from),
@@ -702,9 +703,11 @@ impl VideoWriterBuilder {
     /// - audio: `set_audio_codec`, `set_audio_codec_opt(s)` /
     ///   `set_audio_bitrate`, `set_audio_qscale`, `set_audio_sample_rate`,
     ///   `set_audio_channels`, `set_audio_sample_fmt`, `set_audio_bsf`,
-    ///   `set_max_audio_frames`, `set_swr_opts`
+    ///   `set_max_audio_frames`, `set_swr_opts`, `set_audio_filter`,
+    ///   `set_audio_codec_tag`
     /// - subtitle: `set_subtitle_codec`, `set_subtitle_codec_opt(s)`,
-    ///   `set_subtitle_bsf`, `set_max_subtitle_frames`
+    ///   `set_subtitle_bsf`, `set_max_subtitle_frames`,
+    ///   `set_subtitle_codec_tag`
     /// - input-referencing: `map_metadata_from_input`,
     ///   `add_chapter_metadata` and `add_program_metadata` (chapters and
     ///   programs only ever come from inputs)
@@ -859,6 +862,16 @@ fn validate_writer_output(output: &Output) -> Result<(), WriterError> {
         ),
         ("set_swr_opts", output.swr_opts.is_some(), NO_AUDIO_STREAM),
         (
+            "set_audio_filter",
+            output.audio_filter.is_some(),
+            NO_AUDIO_STREAM,
+        ),
+        (
+            "set_audio_codec_tag",
+            output.audio_codec_tag.is_some(),
+            NO_AUDIO_STREAM,
+        ),
+        (
             "set_subtitle_codec",
             output.subtitle_codec.is_some(),
             NO_SUBTITLE_STREAM,
@@ -876,6 +889,11 @@ fn validate_writer_output(output: &Output) -> Result<(), WriterError> {
         (
             "set_max_subtitle_frames",
             output.max_subtitle_frames.is_some(),
+            NO_SUBTITLE_STREAM,
+        ),
+        (
+            "set_subtitle_codec_tag",
+            output.subtitle_codec_tag.is_some(),
             NO_SUBTITLE_STREAM,
         ),
         (

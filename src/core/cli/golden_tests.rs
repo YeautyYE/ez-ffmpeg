@@ -638,9 +638,8 @@ fn verified_shapes_pass_their_semantic_goldens() {
 /// guaranteed failure again). Runs ungated: pure argv inspection.
 #[test]
 fn canonical_encoder_extraction_matches_the_manifest() {
-    let by_id = |id: &str| {
-        canonical_encoders(VERIFIED_SHAPES.iter().find(|shape| shape.id == id).unwrap())
-    };
+    let by_id =
+        |id: &str| canonical_encoders(VERIFIED_SHAPES.iter().find(|shape| shape.id == id).unwrap());
     assert_eq!(by_id("V1"), vec!["libx264", "aac"]);
     assert_eq!(by_id("V3"), vec!["aac"]);
     assert_eq!(by_id("V4"), vec!["mjpeg"]);
@@ -651,6 +650,55 @@ fn canonical_encoder_extraction_matches_the_manifest() {
             shape.id
         );
     }
+}
+
+/// License accounting over the verified-shape table, for LGPL hosts. Every
+/// canonical encoder must be classified: either always-present native FFmpeg
+/// encoders that an LGPL-minimum build carries (`aac`, `mjpeg`) or GPL-only
+/// external encoders (`libx264`, `libx265`). The GPL-backed shapes are named
+/// explicitly so an LGPL host knows exactly which goldens the lenient
+/// encoder gate skips on its link: V1, V2, V5 and V6 name `libx264`; only V3
+/// (aac) and V4 (mjpeg) can execute their semantic goldens there. Note the
+/// `lgpl-contract` CI job does NOT run this golden suite — that job asserts
+/// the documented LGPL failure modes; this test only keeps the accounting
+/// honest when a shape or its canonical encoders change. Runs ungated: pure
+/// argv inspection.
+#[test]
+fn gpl_encoder_backed_goldens_are_named_for_lgpl_hosts() {
+    const LGPL_NATIVE: &[&str] = &["aac", "mjpeg"];
+    const GPL_ONLY: &[&str] = &["libx264", "libx265"];
+    let mut gpl_backed: Vec<&str> = Vec::new();
+    let mut lgpl_runnable: Vec<&str> = Vec::new();
+    for shape in VERIFIED_SHAPES {
+        let mut needs_gpl = false;
+        for encoder in canonical_encoders(shape) {
+            if GPL_ONLY.contains(&encoder) {
+                needs_gpl = true;
+            } else {
+                assert!(
+                    LGPL_NATIVE.contains(&encoder),
+                    "{}: canonical encoder `{encoder}` is unaccounted — classify it as \
+                     LGPL-native or GPL-only so LGPL hosts know whether this golden skips",
+                    shape.id
+                );
+            }
+        }
+        if needs_gpl {
+            gpl_backed.push(shape.id);
+        } else {
+            lgpl_runnable.push(shape.id);
+        }
+    }
+    assert_eq!(
+        gpl_backed,
+        ["V1", "V2", "V5", "V6"],
+        "the libx264-backed goldens (skipped on LGPL links) drifted"
+    );
+    assert_eq!(
+        lgpl_runnable,
+        ["V3", "V4"],
+        "the LGPL-runnable goldens drifted"
+    );
 }
 
 /// Structural evidence that V1's -crf/-preset survive the pipeline: the
@@ -724,8 +772,8 @@ fn oracle_transcode(run: &GoldenRun) {
     let probe_out = probe_dir.join("crf30.mp4").to_string_lossy().into_owned();
     let fixture = fixture_for("V1");
     let probe_args = [
-        "-i", &fixture, "-c:v", "libx264", "-crf", "30", "-preset", "fast", "-c:a", "aac",
-        "-y", &probe_out,
+        "-i", &fixture, "-c:v", "libx264", "-crf", "30", "-preset", "fast", "-c:a", "aac", "-y",
+        &probe_out,
     ];
     let context = from_cli_args(&probe_args).expect("V1 crf probe must pass the gates");
     run_context(context, "V1 crf probe");

@@ -44,9 +44,8 @@ pub(crate) struct EncoderStream {
     pub(crate) encoder: *const AVCodec,
     pub(crate) vsync_method: Option<VSyncMethod>,
     pub(crate) qscale: Option<i32>,
-    /// Sorted forced-keyframe times in microseconds (`AV_TIME_BASE_Q`); empty = off.
-    /// Video only — populated by the muxer's `add_enc_stream` gate.
-    pub(crate) forced_kf_pts: Vec<i64>,
+    /// Forced-keyframe plan; `Off` = feature off. Video only.
+    pub(crate) forced_kf: crate::core::context::output::ForcedKeyframePlan,
     src: Option<Receiver<FrameBox>>,
     dst: Option<Sender<PacketBox>>,
     dst_pre: Option<PreMuxQueueSender>,
@@ -64,6 +63,10 @@ pub(crate) struct EncoderStream {
     /// carrying options. Merged key by key over the muxer's per-type
     /// tables in `enc_task::set_encoder_opts`.
     pub(crate) per_map_codec_opts: Option<HashMap<CString, CString>>,
+    /// Per-type codec FourCC (`Output::set_*_codec_tag`, FFmpeg `-tag`).
+    /// `0` means unset, matching FFmpeg: the encoder default or the
+    /// streamcopy auto-clear path applies.
+    pub(crate) codec_tag: u32,
 }
 
 impl EncoderStream {
@@ -74,7 +77,7 @@ impl EncoderStream {
         encoder: *const AVCodec,
         vsync_method: Option<VSyncMethod>,
         qscale: Option<i32>,
-        forced_kf_pts: Vec<i64>,
+        forced_kf: crate::core::context::output::ForcedKeyframePlan,
         src: Receiver<FrameBox>,
         dst: Sender<PacketBox>,
         dst_pre: PreMuxQueueSender,
@@ -89,7 +92,7 @@ impl EncoderStream {
             encoder,
             vsync_method,
             qscale,
-            forced_kf_pts,
+            forced_kf,
             src: Some(src),
             dst: Some(dst),
             dst_pre: Some(dst_pre),
@@ -97,6 +100,7 @@ impl EncoderStream {
             sync_queue: None,
             strict_avoptions,
             per_map_codec_opts,
+            codec_tag: 0,
         }
     }
 

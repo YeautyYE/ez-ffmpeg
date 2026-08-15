@@ -149,14 +149,24 @@ pub(crate) fn enc_init(
         &enc_ctx_box,
     )?;
 
+    // Apply `-tag` after AVOptions so the typed setter wins over a `tag=`
+    // codec option. Must land on enc_ctx before avcodec_open2: afterwards
+    // avcodec_parameters_from_context copies the encoder default (hev1 vs
+    // hvc1) onto codecpar.
+    if enc_stream.codec_tag != 0 {
+        unsafe {
+            (*enc_ctx_box.as_mut_ptr()).codec_tag = enc_stream.codec_tag;
+        }
+    }
+
     let receiver = enc_stream.take_src();
     let pkt_sender = enc_stream.take_dst();
     let pre_pkt_sender = enc_stream.take_dst_pre();
     let mux_start_gate = enc_stream.take_mux_start_gate();
 
-    // Forced-keyframe times ride inside EncoderStream (video only, empty = off).
-    // Move them out before the encoder thread starts, mirroring take_src() above.
-    let forced_kf_pts = std::mem::take(&mut enc_stream.forced_kf_pts);
+    // Forced-keyframe plan rides inside EncoderStream (video only, Off = feature off).
+    // Move it out before the encoder thread starts, mirroring take_src() above.
+    let forced_kf_plan = std::mem::take(&mut enc_stream.forced_kf);
 
     // -shortest frame-level sync-queue handle: `Some` only for an encoded-A/V
     // member of a mux built with `sq_enc`. Moved into the encoder thread; drives
@@ -207,11 +217,9 @@ pub(crate) fn enc_init(
         let mut audio_frame_queue: VecDeque<FrameBox> = VecDeque::new();
         let mut is_finished = false;
 
-        // Per-encoder forced-keyframe cursor (fftools KeyframeForceCtx, list subset).
-        let mut forced_kf = ForcedKeyframes {
-            pts: forced_kf_pts,
-            index: 0,
-        };
+        // Per-encoder forced-keyframe cursor (fftools KeyframeForceCtx list
+        // subset, plus typed periodic mode).
+        let mut forced_kf = ForcedKeyframes::from_plan(forced_kf_plan);
 
         // ===== Architecture B (sq_enc / -shortest): producer-then-drainer =====
         // Runs only for an encoded-A/V member of an sq_enc mux. The encoder both
@@ -1758,15 +1766,29 @@ unsafe fn frame_is_aligned(align_mask: usize, frame: *const AVFrame) -> bool {
     false
 }
 
-/// fftools `KeyframeForceCtx` (list subset): sorted forced-keyframe times in
-/// `AV_TIME_BASE_Q` microseconds plus the cursor into them. One per video encoder;
-/// `index` advances across frames as forced times are consumed. Empty `pts` = off.
+/// fftools `KeyframeForceCtx` (list subset) plus typed periodic IDR requests.
 #[cfg(not(docsrs))]
-struct ForcedKeyframes {
-    /// Sorted ascending, microseconds.
-    pts: Vec<i64>,
-    /// Cursor into `pts`.
-    index: usize,
+enum ForcedKeyframes {
+    Off,
+    Times { pts: Vec<i64>, index: usize },
+    Periodic(crate::core::context::output::PeriodicKeyframeState),
+}
+
+#[cfg(not(docsrs))]
+impl ForcedKeyframes {
+    fn from_plan(plan: crate::core::context::output::ForcedKeyframePlan) -> Self {
+        match plan {
+            crate::core::context::output::ForcedKeyframePlan::Off => Self::Off,
+            crate::core::context::output::ForcedKeyframePlan::Times(pts) => {
+                Self::Times { pts, index: 0 }
+            }
+            crate::core::context::output::ForcedKeyframePlan::Periodic { interval_us } => {
+                Self::Periodic(crate::core::context::output::PeriodicKeyframeState::new(
+                    interval_us,
+                ))
+            }
+        }
+    }
 }
 
 #[cfg(not(docsrs))]
@@ -1828,22 +1850,43 @@ fn frame_encode(
                 (*frame).quality = (*enc_ctx).global_quality;
                 (*frame).pict_type = AV_PICTURE_TYPE_NONE;
 
-                // fftools forced_kf_apply (list form): request an IDR at the first
+                // List form: fftools forced_kf_apply — request an IDR at the first
                 // frame whose PTS reaches the next forced time. `if`, not `while` —
-                // at most one advance per frame, matching the CLI. The empty-list and
-                // NOPTS checks are defensive supersets that never force spuriously.
-                if !forced_kf.pts.is_empty()
-                    && (*frame).pts != AV_NOPTS_VALUE
-                    && forced_kf.index < forced_kf.pts.len()
-                    && av_compare_ts(
-                        (*frame).pts,
-                        (*frame).time_base,
-                        forced_kf.pts[forced_kf.index],
-                        AV_TIME_BASE_Q,
-                    ) >= 0
-                {
-                    (*frame).pict_type = AV_PICTURE_TYPE_I;
-                    forced_kf.index += 1;
+                // at most one advance per frame, matching the CLI.
+                // Periodic form: origin is the first valid PTS; targets are
+                // origin + k*interval; a dropped frame that crosses several
+                // targets forces once and skips the missed ones.
+                match forced_kf {
+                    ForcedKeyframes::Off => {}
+                    ForcedKeyframes::Times { pts, index } => {
+                        if !pts.is_empty()
+                            && (*frame).pts != AV_NOPTS_VALUE
+                            && *index < pts.len()
+                            && av_compare_ts(
+                                (*frame).pts,
+                                (*frame).time_base,
+                                pts[*index],
+                                AV_TIME_BASE_Q,
+                            ) >= 0
+                        {
+                            (*frame).pict_type = AV_PICTURE_TYPE_I;
+                            *index += 1;
+                        }
+                    }
+                    ForcedKeyframes::Periodic(state) => {
+                        let pts_us = if (*frame).pts == AV_NOPTS_VALUE {
+                            None
+                        } else {
+                            Some(av_rescale_q(
+                                (*frame).pts,
+                                (*frame).time_base,
+                                AV_TIME_BASE_Q,
+                            ))
+                        };
+                        if crate::core::context::output::apply_periodic_keyframe(state, pts_us) {
+                            (*frame).pict_type = AV_PICTURE_TYPE_I;
+                        }
+                    }
                 }
             } else if (*(*enc_ctx).codec).capabilities & AV_CODEC_CAP_PARAM_CHANGE as i32 == 0
                 && (*enc_ctx).ch_layout.nb_channels != (*frame).ch_layout.nb_channels
@@ -2362,7 +2405,7 @@ mod tests {
             enc,
             None,
             None,
-            Vec::new(),
+            crate::core::context::output::ForcedKeyframePlan::Off,
             frame_rx,
             pkt_tx,
             pre_tx,

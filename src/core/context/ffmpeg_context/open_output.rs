@@ -100,6 +100,14 @@ unsafe fn open_output_file(
     if let (Some(filter), Some("copy")) = (&output.video_filter, output.video_codec.as_deref()) {
         return Err(OpenOutputError::FilterWithStreamCopy(filter.clone()).into());
     }
+    if let (Some(filter), Some("copy")) = (&output.audio_filter, output.audio_codec.as_deref()) {
+        return Err(OpenOutputError::FilterWithStreamCopy(filter.clone()).into());
+    }
+
+    let video_codec_tag = parse_output_codec_tag("set_video_codec_tag", &output.video_codec_tag)?;
+    let audio_codec_tag = parse_output_codec_tag("set_audio_codec_tag", &output.audio_codec_tag)?;
+    let subtitle_codec_tag =
+        parse_output_codec_tag("set_subtitle_codec_tag", &output.subtitle_codec_tag)?;
 
     let mut out_fmt_ctx = null_mut();
     // Frees out_fmt_ctx (and, for custom IO, its AVIO + callback box) on any
@@ -284,14 +292,29 @@ unsafe fn open_output_file(
         None => None,
     };
 
-    // Parse the deferred forced-keyframe spec; the setter stores it raw so
-    // a typo fails the build here, not mid-chain in user code.
-    let forced_kf_pts = match &output.forced_kf_spec {
-        Some(spec) => Some(
-            crate::core::context::output::parse_forced_key_frames(spec)
-                .map_err(OpenOutputError::InvalidOption)?,
-        ),
-        None => None,
+    // Parse the deferred forced-keyframe spec; the setter stores list-form
+    // raw so a typo fails the build here, not mid-chain in user code.
+    let forced_kf = match &output.forced_kf_spec {
+        crate::core::context::output::ForcedKeyframeSpec::None => {
+            crate::core::context::output::ForcedKeyframePlan::Off
+        }
+        crate::core::context::output::ForcedKeyframeSpec::Times(spec) => {
+            crate::core::context::output::ForcedKeyframePlan::Times(
+                crate::core::context::output::parse_forced_key_frames(spec)
+                    .map_err(OpenOutputError::InvalidOption)?,
+            )
+        }
+        crate::core::context::output::ForcedKeyframeSpec::Periodic { interval_us } => {
+            if *interval_us <= 0 {
+                return Err(OpenOutputError::InvalidOption(
+                    "force_key_frames interval must be positive".to_string(),
+                )
+                .into());
+            }
+            crate::core::context::output::ForcedKeyframePlan::Periodic {
+                interval_us: *interval_us,
+            }
+        }
     };
 
     // Resolve the sample-format name like pix_fmt above: same failure mode
@@ -355,7 +378,7 @@ unsafe fn open_output_file(
         audio_sample_fmt,
         output.video_qscale,
         output.audio_qscale,
-        forced_kf_pts,
+        forced_kf,
         output.max_video_frames,
         output.max_audio_frames,
         output.max_subtitle_frames,
@@ -378,6 +401,10 @@ unsafe fn open_output_file(
         output.require_unique_video_source,
         output.strict_avoptions,
         output.video_filter.clone(),
+        output.audio_filter.clone(),
+        video_codec_tag,
+        audio_codec_tag,
+        subtitle_codec_tag,
         crate::core::context::pre_mux_queue::PreMuxQueueConfig {
             max_packets: output.max_muxing_queue_size,
             data_threshold: output.muxing_queue_data_threshold,
@@ -415,6 +442,14 @@ enum PreparedTarget {
     PacketSink(crate::core::packet_sink::PacketSink),
 }
 
+fn parse_output_codec_tag(setter: &str, tag: &Option<String>) -> Result<u32> {
+    match tag.as_deref() {
+        None => Ok(0),
+        Some(s) => crate::core::context::output::parse_codec_tag(s)
+            .map_err(|msg| OpenOutputError::InvalidOption(format!("{setter}: {msg}")).into()),
+    }
+}
+
 /// Build-time validation for packet-sink outputs: every option a sink
 /// cannot honor is a typed configuration error. Two families are rejected —
 /// container-only options (no container is written, so they could never
@@ -433,11 +468,12 @@ fn validate_packet_sink_options(output: &Output) -> Result<()> {
         ("set_video_bsf", output.video_bsf.is_some()),
         ("set_audio_bsf", output.audio_bsf.is_some()),
         ("set_subtitle_bsf", output.subtitle_bsf.is_some()),
-        // The strict tier delivers encoded packets; per-output video filters
+        // The strict tier delivers encoded packets; per-output simple filters
         // are container-output features for now. Rejecting the pair here also
         // keeps sink outputs out of the filter binding pre-pass, so a sink can
         // never flip the job-wide fftools unlabeled binding order.
         ("set_video_filter", output.video_filter.is_some()),
+        ("set_audio_filter", output.audio_filter.is_some()),
         ("set_format_opt", output.format_opts.is_some()),
         ("add_attachment", !output.attachments.is_empty()),
         ("set_subtitle_codec", output.subtitle_codec.is_some()),
