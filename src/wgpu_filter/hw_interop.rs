@@ -145,6 +145,9 @@ pub(crate) unsafe fn parse_drm_nv12(
 // The variant size gap is fine: this is a transient return value consumed
 // at its single call site, never stored — Box indirection would cost more
 // than the stack bytes it saves.
+// Off Linux only the `Unsupported` stub is constructed; the other variants
+// exist so the call site stays platform-independent.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum DmabufOpen {
     /// Device opened with the dmabuf-import extensions.

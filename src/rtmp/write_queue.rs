@@ -21,7 +21,7 @@ const MAX_IOV: usize = 64;
 // Backpressure threshold constants
 // QUEUE_WARN_BYTES is crate-visible: the scheduler derives its join-replay
 // burst budget from it so a full burst stays in the Normal band (zero drops).
-pub(crate) const QUEUE_WARN_BYTES: usize = 1 * 1024 * 1024; // 1MB warning
+pub(crate) const QUEUE_WARN_BYTES: usize = 1024 * 1024; // 1MB warning
 const QUEUE_HIGH_BYTES: usize = 2 * 1024 * 1024; // 2MB high watermark
 const QUEUE_MAX_BYTES: usize = 4 * 1024 * 1024; // 4MB disconnect
 const QUEUE_MAX_AGE_SECS: u64 = 10; // 10 second timeout
