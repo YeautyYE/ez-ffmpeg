@@ -15,10 +15,17 @@
 //!    PQ and HLG need tone mapping, wide-gamut-but-SDR needs only a gamut
 //!    conversion, and true SDR is left untouched. Routing on transfer (not
 //!    just primaries) avoids darkening standards-valid SDR BT.2020 clips.
-//! 2. **Probe** which tone-mapping filters this FFmpeg build actually has
-//!    (`ez_ffmpeg::hwaccel::is_filter_available`) — `zscale`/`tonemap` (needs
-//!    libzimg) or `libplacebo` (needs a Vulkan-capable build). Homebrew's
-//!    ffmpeg, for example, ships neither.
+//! 2. **Probe** which backends this FFmpeg build actually has, using filter
+//!    *and option* probes (`ez_ffmpeg::capabilities::is_filter_available` /
+//!    `is_filter_option_available`) — `zscale`/`tonemap` (needs libzimg),
+//!    `libplacebo` (needs a Vulkan-capable build), or FFmpeg 8 `scale` with
+//!    `out_primaries` / `out_transfer` / `intent=perceptual`. FFmpeg 7.1
+//!    without zimg/libplacebo has no correct built-in PQ/HLG path and fails
+//!    closed. wgpu is 8-bit BT.601/709 only and is never auto-routed for HDR.
+//!    Registered is not the same as runnable: each candidate that passes the
+//!    static probe is preflighted by configuring a tiny lavfi test graph, so
+//!    a compiled-in `libplacebo` without a Vulkan runtime falls through to
+//!    the next backend instead of failing after routing committed to it.
 //! 3. **Build** the correct filter chain with the parameters that keep the
 //!    output from graying out (explicit `peak`, `desat=0`, full re-tagging).
 //! 4. **Run** it, copying audio through unchanged.
@@ -37,9 +44,11 @@
 //!   `peak` to your master's real peak luminance (`peak = nits / 100`, so a
 //!   1000-nit master is `peak=10`, a 4000-nit master `peak=40`) and try
 //!   `mobius` if `hable` looks too dark.
-//! - The FFmpeg 8 `scale` fallback chain (shown in the error message when no
-//!   tone-mapping filter is compiled in) is UNVERIFIED here; test it on a real
-//!   FFmpeg 8 build before relying on it.
+//! - The FFmpeg 8 `scale` fallback is selected only when the linked FFmpeg
+//!   actually exposes `scale`'s `out_primaries`, `out_transfer`, and `intent`
+//!   options. On FFmpeg 7.1 those options are missing, so the example fails
+//!   closed instead of emitting a naive `scale` that would gray out the
+//!   picture. Verify the look on a real FFmpeg 8 build before relying on it.
 //!
 //! # Usage
 //!
@@ -56,7 +65,10 @@ use std::error::Error;
 
 use ez_ffmpeg::stream_info::{find_video_stream_info, StreamInfo};
 use ez_ffmpeg::{FfmpegContext, FfmpegScheduler, Output};
-use routing::{build_chain, classify, no_backend_message, pick_backend, ColorKind};
+use routing::{
+    build_chain, classify, preflight_chain, probe_hdr_caps, route_with_preflight, ColorKind,
+    RoutingPolicy,
+};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
@@ -92,8 +104,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // Probe capabilities for THIS kind: wide-gamut SDR needs only `zscale`,
-    // while PQ/HLG additionally need `tonemap` (or libplacebo).
-    let backend = pick_backend(kind, prefer_gpu).ok_or_else(no_backend_message)?;
+    // while PQ/HLG additionally need `tonemap` (or libplacebo). `route`
+    // keeps the candidate `Tried:` list on the error path.
+    let policy = if prefer_gpu {
+        RoutingPolicy::QualityFirst
+    } else {
+        RoutingPolicy::Compatible
+    };
+    // Preflight each statically-available candidate by configuring a tiny
+    // test graph: a backend whose filter is registered but whose graph will
+    // not configure (libplacebo without Vulkan) is skipped with a recorded
+    // rejection instead of aborting the conversion.
+    let preflight = |kind: ColorKind, chain: &str| preflight_chain(kind, chain);
+    let backend = route_with_preflight(kind, policy, probe_hdr_caps(), Some(&preflight))?.selected;
     println!("using backend: {backend:?}");
 
     // Explicit peak for the common 1000-nit consumer HDR master. Change to your
