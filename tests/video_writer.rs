@@ -684,6 +684,14 @@ fn unsupported_output_options_are_rejected_at_open() {
             Box::new(|o| o.set_swr_opts("resampler=soxr")),
         ),
         (
+            "set_audio_filter",
+            Box::new(|o| o.set_audio_filter("aformat=sample_rates=16000")),
+        ),
+        (
+            "set_audio_codec_tag",
+            Box::new(|o| o.set_audio_codec_tag("mp4a")),
+        ),
+        (
             "set_subtitle_codec",
             Box::new(|o| o.set_subtitle_codec("mov_text")),
         ),
@@ -695,6 +703,10 @@ fn unsupported_output_options_are_rejected_at_open() {
         (
             "set_max_subtitle_frames",
             Box::new(|o| o.set_max_subtitle_frames(10)),
+        ),
+        (
+            "set_subtitle_codec_tag",
+            Box::new(|o| o.set_subtitle_codec_tag("tx3g")),
         ),
         (
             "map_metadata_from_input",

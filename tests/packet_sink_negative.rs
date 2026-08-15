@@ -58,6 +58,10 @@ fn build_rejects_muxer_only_options() {
             Output::new_by_packet_sink(noop_sink()).set_video_filter("scale=1280:-2"),
         ),
         (
+            "set_audio_filter",
+            Output::new_by_packet_sink(noop_sink()).set_audio_filter("aformat=sample_rates=16000"),
+        ),
+        (
             "set_format_opt",
             Output::new_by_packet_sink(noop_sink()).set_format_opt("movflags", "+faststart"),
         ),
@@ -185,8 +189,14 @@ fn build_rejects_non_whitelisted_encoders() {
         Error::PacketSink(PacketSinkError::EncoderNotWhitelisted {
             kind: "video",
             encoder,
-            ..
-        }) => assert_eq!(encoder, "mpeg4"),
+            allowed,
+        }) => {
+            assert_eq!(encoder, "mpeg4");
+            assert!(
+                allowed.contains("h264_videotoolbox") && allowed.contains("libopenh264"),
+                "allowed list must name the admitted wrappers, got {allowed}"
+            );
+        }
         other => panic!("expected the video whitelist rejection, got {other:?}"),
     }
     // Audio must be AAC.
@@ -203,6 +213,69 @@ fn build_rejects_non_whitelisted_encoders() {
     }
 }
 
+/// VideoToolbox verified scope is `bf=0`. An explicit nonzero `bf` must fail
+/// at `build()`, not be rewritten. Skip when the wrapper is not in this
+/// FFmpeg build — the name never reaches admission then.
+#[test]
+fn videotoolbox_explicit_b_frames_rejected_at_build() {
+    if !have_encoder("h264_videotoolbox") {
+        eprintln!("skipping: h264_videotoolbox not available in this FFmpeg build");
+        return;
+    }
+    match build_err(
+        testsrc(1),
+        Output::new_by_packet_sink(noop_sink())
+            .set_video_codec("h264_videotoolbox")
+            .set_video_codec_opt("bf", "3"),
+    ) {
+        Error::PacketSink(PacketSinkError::BFramesUnsupported { encoder }) => {
+            assert_eq!(encoder, "h264_videotoolbox");
+        }
+        other => panic!("expected VT B-frame admission rejection, got {other:?}"),
+    }
+}
+
+/// Same VideoToolbox B-frame gate as `bf`, via the policy-recognized
+/// admission key `max_b_frames` (not an FFmpeg `AVOption` alias of `bf`;
+/// a leftover `max_b_frames=0` is never applied as encoder `bf`).
+#[test]
+fn videotoolbox_explicit_max_b_frames_rejected_at_build() {
+    if !have_encoder("h264_videotoolbox") {
+        eprintln!("skipping: h264_videotoolbox not available in this FFmpeg build");
+        return;
+    }
+    match build_err(
+        testsrc(1),
+        Output::new_by_packet_sink(noop_sink())
+            .set_video_codec("h264_videotoolbox")
+            .set_video_codec_opt("max_b_frames", "2"),
+    ) {
+        Error::PacketSink(PacketSinkError::BFramesUnsupported { encoder }) => {
+            assert_eq!(encoder, "h264_videotoolbox");
+        }
+        other => panic!("expected VT B-frame admission rejection, got {other:?}"),
+    }
+}
+
+/// libx264 explicit B-frames are admitted at build; runtime still enforces
+/// `pts >= dts`. The build-time gate is VideoToolbox-only.
+#[test]
+fn libx264_explicit_b_frames_are_admitted_at_build() {
+    if !have_encoder("libx264") {
+        eprintln!("skipping: libx264 not available in this FFmpeg build");
+        return;
+    }
+    FfmpegContext::builder()
+        .input(testsrc(1))
+        .output(
+            Output::new_by_packet_sink(noop_sink())
+                .set_video_codec("libx264")
+                .set_video_codec_opt("bf", "3"),
+        )
+        .build()
+        .expect("libx264 explicit bf=3 must still construct");
+}
+
 /// §2.4 blind spot: with open-GOP, the encoder raises its raw key flag on
 /// non-IDR recovery points; the sink must expose only fresh-decoder-safe
 /// random access points (IDR) as key.
@@ -216,7 +289,10 @@ fn open_gop_non_idr_recovery_points_are_not_key() {
         output
             .set_video_codec("libx264")
             .set_video_codec_opt("preset", "medium")
-            .set_video_codec_opt("x264-params", "open-gop=1:keyint=12:min-keyint=12:scenecut=0")
+            .set_video_codec_opt(
+                "x264-params",
+                "open-gop=1:keyint=12:min-keyint=12:scenecut=0",
+            )
     };
 
     // Premise check on the container path: the raw KEY flag marks more than
@@ -226,8 +302,10 @@ fn open_gop_non_idr_recovery_points_are_not_key() {
     wait_with_watchdog(
         FfmpegContext::builder()
             .input(testsrc(3))
-            .output(pin(Output::from(baseline_path.as_str()))
-                .set_format_opt("movflags", "+frag_keyframe+empty_moov"))
+            .output(
+                pin(Output::from(baseline_path.as_str()))
+                    .set_format_opt("movflags", "+frag_keyframe+empty_moov"),
+            )
             .build()
             .unwrap()
             .start()

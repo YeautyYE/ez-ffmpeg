@@ -393,7 +393,10 @@ fn in_memory_roundtrip_via_custom_io_succeeds() {
         60,
         "in-memory roundtrip",
     );
-    assert!(result.is_ok(), "healthy custom-IO roundtrip failed: {result:?}");
+    assert!(
+        result.is_ok(),
+        "healthy custom-IO roundtrip failed: {result:?}"
+    );
 
     let bytes = sink.lock().unwrap().buf.clone();
     assert!(

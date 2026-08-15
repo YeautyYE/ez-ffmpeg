@@ -592,7 +592,9 @@ fn multi_output_complex_conflict_hits_the_filtered_output() {
                     .add_stream_map("0:v")
                     .set_video_filter("scale=160:120"),
             )
-            .output(Output::from(tmp_path("multi_out_bypass_b.mp4").as_str()).set_video_codec("mpeg4"))
+            .output(
+                Output::from(tmp_path("multi_out_bypass_b.mp4").as_str()).set_video_codec("mpeg4"),
+            )
             .build(),
     );
     assert!(
@@ -735,7 +737,10 @@ fn disconnected_graph_is_rejected() {
     // into the sink while the encoder consumes the unrelated source forever.
     let input = video_fixture("shape_disconnected_in.mp4");
     let reason = shape_reason(&input, "nullsink;color=c=black:s=64x64");
-    assert!(reason.contains("disconnected sub-graphs"), "reason: {reason}");
+    assert!(
+        reason.contains("disconnected sub-graphs"),
+        "reason: {reason}"
+    );
 }
 
 #[test]
@@ -1040,7 +1045,10 @@ fn unlabeled_graph_on_earlier_output_frees_a_later_simple_filter() {
         .into_iter()
         .filter(|info| matches!(info, StreamInfo::Video { .. }))
         .count();
-    assert_eq!(video_streams, 2, "output 0 must carry the graph and the mapped stream");
+    assert_eq!(
+        video_streams, 2,
+        "output 0 must carry the graph and the mapped stream"
+    );
     // Output #1's own filter applied.
     assert_eq!(video_dimensions(&filtered), (160, 120));
 }
@@ -1095,9 +1103,7 @@ fn copy_first_output_cannot_defer_the_graph_to_a_later_encoder() {
         FfmpegContext::builder()
             .input(input.as_str())
             .filter_desc("hue=s=0")
-            .output(
-                Output::from(tmp_path("copy_candidate_a.mp4").as_str()).set_video_codec("copy"),
-            )
+            .output(Output::from(tmp_path("copy_candidate_a.mp4").as_str()).set_video_codec("copy"))
             .output(
                 Output::from(tmp_path("copy_candidate_b.mp4").as_str()).set_video_codec("mpeg4"),
             )
@@ -1260,6 +1266,14 @@ fn legacy_jobs_keep_the_mapless_only_unlabeled_binding_order() {
     };
     // Legacy: the mapped output gets ONLY its map; the map-less output gets
     // the graph.
-    assert_eq!(count_videos(&mapped), 1, "mapped output must not receive the graph");
-    assert_eq!(count_videos(&graphed), 1, "map-less output receives the graph");
+    assert_eq!(
+        count_videos(&mapped),
+        1,
+        "mapped output must not receive the graph"
+    );
+    assert_eq!(
+        count_videos(&graphed),
+        1,
+        "map-less output receives the graph"
+    );
 }

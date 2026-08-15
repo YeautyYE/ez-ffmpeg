@@ -116,9 +116,10 @@ impl JsonParser<'_> {
                 "expected {:?} {ctx}, found {:?}",
                 byte as char, found as char
             )),
-            None => {
-                self.fail(&format!("expected {:?} {ctx}, found end of document", byte as char))
-            }
+            None => self.fail(&format!(
+                "expected {:?} {ctx}, found end of document",
+                byte as char
+            )),
         }
     }
 
@@ -386,7 +387,12 @@ impl JsonParser<'_> {
 /// once, so a doubled entry is not cargo's record), a non-u64 fingerprint
 /// — is a hard failure naming the record, never a guess.
 fn lib_dep_fingerprint(json: &str, source: &Path) -> u64 {
-    let parser = JsonParser { bytes: json.as_bytes(), pos: 0, depth: 0, source };
+    let parser = JsonParser {
+        bytes: json.as_bytes(),
+        pos: 0,
+        depth: 0,
+        source,
+    };
     let root = parser.document();
     let Value::Object(members) = root else {
         panic!(
@@ -396,7 +402,10 @@ fn lib_dep_fingerprint(json: &str, source: &Path) -> u64 {
             root.describe()
         );
     };
-    let mut deps_values = members.iter().filter(|(key, _)| key == "deps").map(|(_, val)| val);
+    let mut deps_values = members
+        .iter()
+        .filter(|(key, _)| key == "deps")
+        .map(|(_, val)| val);
     let deps = deps_values.next().unwrap_or_else(|| {
         panic!(
             "no top-level `deps` key in {}; cargo's fingerprint JSON may have changed shape — \
@@ -564,7 +573,10 @@ fn linked_rlib() -> (PathBuf, PathBuf, Vec<String>) {
         .map(|byte| format!("{byte:02x}"))
         .collect();
     let entries = std::fs::read_dir(&fingerprint_root).unwrap_or_else(|err| {
-        panic!("cannot read fingerprint root {} ({err})", fingerprint_root.display())
+        panic!(
+            "cannot read fingerprint root {} ({err})",
+            fingerprint_root.display()
+        )
     });
     // Uniqueness below is a claim about ALL candidate records, so every
     // record this walk touches must be decoded: an unreadable entry, a

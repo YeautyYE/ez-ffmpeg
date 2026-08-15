@@ -497,9 +497,7 @@ fn high_water_publisher_backpressure_does_not_deadlock() {
                 .expect("publisher serialize");
             sender.send(packet.bytes).expect("publisher send");
         }
-        let _ = done_tx.send(
-            captured_total_in_producer.load(std::sync::atomic::Ordering::Relaxed),
-        );
+        let _ = done_tx.send(captured_total_in_producer.load(std::sync::atomic::Ordering::Relaxed));
     });
 
     // Flood phase: capture raw bytes only. The stream ends in an orderly
@@ -868,7 +866,10 @@ fn run_publisher(sender: RtmpStreamSender, stop: Arc<AtomicBool>) -> PublisherRe
             continue;
         }
         let next = next_video.min(next_audio);
-        std::thread::sleep(next.saturating_duration_since(now).min(Duration::from_millis(5)));
+        std::thread::sleep(
+            next.saturating_duration_since(now)
+                .min(Duration::from_millis(5)),
+        );
     }
 
     PublisherReport {
@@ -1021,7 +1022,10 @@ fn run_subscriber(
         };
         // Full RTMP chunk deserialization — the correctness canary under
         // load: a corrupted chunk stream panics the run here.
-        let results = watcher.session.handle_input(&buf[..n]).expect("handle_input");
+        let results = watcher
+            .session
+            .handle_input(&buf[..n])
+            .expect("handle_input");
         let now_ns = nanos_since_epoch();
         let is_recording = recording.load(Ordering::Relaxed);
         for result in results {
@@ -1205,7 +1209,8 @@ fn run_load_scenario(scenario: LoadScenario) {
         let recording = recording.clone();
         let connected = connected.clone();
         let slow_stall = scenario.slow_stall;
-        let stagger = Duration::from_millis((i as u64) * if scenario.watchers >= 500 { 2 } else { 1 });
+        let stagger =
+            Duration::from_millis((i as u64) * if scenario.watchers >= 500 { 2 } else { 1 });
         subscribers.push(
             std::thread::Builder::new()
                 .name(format!("load-sub-{i}"))

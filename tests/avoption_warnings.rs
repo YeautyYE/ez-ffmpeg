@@ -68,7 +68,10 @@ fn unconsumed_muxer_option_warns_at_header() {
         .expect("start")
         .wait();
     // The unknown option is lenient: the job must still succeed.
-    assert!(result.is_ok(), "unknown muxer option must not fail the job: {result:?}");
+    assert!(
+        result.is_ok(),
+        "unknown muxer option must not fail the job: {result:?}"
+    );
 
     assert_warning_containing("Option 'ez_unknown_muxer_opt' was not recognized by output 0");
 }

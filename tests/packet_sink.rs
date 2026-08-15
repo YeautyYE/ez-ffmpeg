@@ -8,7 +8,7 @@ mod common;
 
 use common::{
     have_encoder, parse_avcc_au, rational_eq, recording_sink, sink_packets, tmp_path_in,
-    wait_with_watchdog, SinkEv,
+    wait_with_watchdog, SinkEv, SinkLog,
 };
 use ez_ffmpeg::packet_sink::{PacketSink, PacketSinkEvent};
 use ez_ffmpeg::stream_info::StreamInfo;
@@ -47,7 +47,10 @@ fn assert_valid_avcc(avcc: &[u8]) {
     // Full bytes, not masked views: the reserved bits around the length
     // size and the SPS count are all ones in every conforming record
     // (ff_isom_write_avcc emits 0xFF and 0xE0 | count).
-    assert_eq!(avcc[4], 0xFF, "reserved ones + lengthSizeMinusOne 3 (4-byte)");
+    assert_eq!(
+        avcc[4], 0xFF,
+        "reserved ones + lengthSizeMinusOne 3 (4-byte)"
+    );
     assert_eq!(avcc[5] & 0xE0, 0xE0, "byte 5 reserved bits must be ones");
     assert!(avcc[5] & 0x1F >= 1, "at least one SPS");
 }
@@ -118,9 +121,7 @@ fn strict_happy_path_single_video_stream() {
         // AU-complete AVCC payload, reparsed independently.
         let nals = parse_avcc_au(&p.data);
         assert!(
-            !nals
-                .iter()
-                .any(|n| matches!(n[0] & 0x1F, 7 | 8)),
+            !nals.iter().any(|n| matches!(n[0] & 0x1F, 7 | 8)),
             "no in-band parameter sets in strict-tier AUs"
         );
     }
@@ -245,6 +246,284 @@ fn nvenc_admission_and_strict_contract() {
     assert_eq!(delivered, 50, "2 s at 25 fps, one access unit per frame");
     let packets = sink_packets(&log);
     assert!(packets[0].is_key, "the stream must open on an IDR");
+}
+
+/// Shared skip-guard for optional-encoder admission tests. A typed
+/// packet-sink error is always a contract violation. `must_run` turns every
+/// remaining skip into a failure so a broken test cannot pass silently on
+/// a machine that is supposed to exercise the encoder.
+fn skip_optional_encoder_open(
+    must_run: bool,
+    encoder: &str,
+    error: &ez_ffmpeg::error::Error,
+    log: &SinkLog,
+) {
+    if let ez_ffmpeg::error::Error::PacketSink(e) = error {
+        panic!("strict-tier contract violation with {encoder}: {e}");
+    }
+    assert!(!must_run, "{encoder} job failed in must-run mode: {error}");
+    let delivery_started = log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| matches!(event, SinkEv::Info { .. } | SinkEv::Pkt(_)));
+    assert!(!delivery_started, "job failed mid-delivery: {error}");
+    assert!(
+        matches!(error, ez_ffmpeg::error::Error::OpenEncoder(_)),
+        "failure before delivery is not an encoder-open failure: {error}"
+    );
+    eprintln!("skipping: {encoder} cannot open here ({error})");
+}
+
+fn assert_strict_h264_delivery(
+    log: &SinkLog,
+    expected_packets: Option<usize>,
+    pts_equals_dts: bool,
+    min_vcl_nals: Option<usize>,
+) {
+    let events = log.lock().unwrap().clone();
+    assert!(events.len() >= 3, "expected info + packets + end");
+    let SinkEv::Info { streams, .. } = &events[0] else {
+        panic!("first event must be on_stream_info, got {:?}", events[0]);
+    };
+    assert_eq!(streams.len(), 1);
+    let info = &streams[0];
+    assert!(info.is_video);
+    assert!(
+        info.codec_string.starts_with("avc1."),
+        "WebCodecs codec string, got {}",
+        info.codec_string
+    );
+    assert_valid_avcc(&info.extradata);
+
+    let last = events.len() - 1;
+    assert!(
+        matches!(&events[last], SinkEv::End { .. }),
+        "last event must be on_end, got {:?}",
+        events[last]
+    );
+    let mut delivered = 0usize;
+    let mut prev_dts: Option<i64> = None;
+    let mut saw_multi_slice = false;
+    for event in &events[1..last] {
+        let SinkEv::Pkt(p) = event else {
+            panic!("only packets may sit between stream info and end: {event:?}");
+        };
+        delivered += 1;
+        assert!(
+            !p.data.is_empty(),
+            "encoder must not deliver an empty access unit"
+        );
+        if pts_equals_dts {
+            assert_eq!(p.pts, p.dts, "no-reorder path must deliver pts == dts");
+        } else {
+            assert!(p.pts >= p.dts, "pts must not precede dts");
+        }
+        if let Some(prev) = prev_dts {
+            assert!(p.dts > prev, "dts must be strictly increasing");
+        }
+        prev_dts = Some(p.dts);
+        assert!(p.duration > 0, "strict tier guarantees a positive duration");
+        let nals = parse_avcc_au(&p.data);
+        assert!(
+            !nals.iter().any(|n| matches!(n[0] & 0x1F, 7 | 8)),
+            "no in-band parameter sets in strict-tier AUs"
+        );
+        let vcl = nals
+            .iter()
+            .filter(|n| matches!(n[0] & 0x1F, 1 | 2 | 5))
+            .count();
+        assert!(vcl >= 1, "each packet must contain VCL data");
+        if let Some(min) = min_vcl_nals {
+            if vcl >= min {
+                saw_multi_slice = true;
+            }
+        }
+    }
+    if let Some(expected) = expected_packets {
+        assert_eq!(
+            delivered, expected,
+            "2 s at 25 fps, one access unit per frame"
+        );
+    } else {
+        assert!(delivered > 0, "at least one packet must be delivered");
+    }
+    if min_vcl_nals.is_some() {
+        assert!(
+            saw_multi_slice,
+            "expected at least one multi-slice packet (slices stay in one AU)"
+        );
+    }
+    let packets = sink_packets(log);
+    assert!(packets[0].is_key, "the stream must open on an IDR");
+}
+
+/// libopenh264 admission: build() must clear the whitelist wherever the
+/// encoder is compiled in. The delivery contract is asserted wherever the
+/// encoder can actually open (software; still skip-guarded because the
+/// OpenH264 shared library can be missing at runtime). Acceptance machines
+/// export `EZ_FFMPEG_OPENH264_MUST_RUN=1`, which turns every skip into a
+/// failure. Hosted CI does not currently provide that lane, so skips remain
+/// skip-guards unless the env is set.
+#[test]
+fn openh264_admission_and_strict_contract() {
+    let must_run = std::env::var_os("EZ_FFMPEG_OPENH264_MUST_RUN").is_some();
+    if !have_encoder("libopenh264") {
+        assert!(
+            !must_run,
+            "EZ_FFMPEG_OPENH264_MUST_RUN is set but libopenh264 is not in this FFmpeg build"
+        );
+        eprintln!("skipping: libopenh264 not available in this FFmpeg build");
+        return;
+    }
+    let (sink, log) = recording_sink();
+    let context = FfmpegContext::builder()
+        .input(testsrc(2))
+        .output(
+            Output::new_by_packet_sink(sink)
+                .set_video_codec("libopenh264")
+                .set_video_codec_opt("g", "25")
+                .set_video_codec_opt("slices", "4")
+                .set_video_codec_opt("allow_skip_frames", "0")
+                .set_framerate(25, 1),
+        )
+        .build()
+        .expect("libopenh264 must clear the strict-tier whitelist at build()");
+
+    match wait_with_watchdog(context.start().unwrap(), 120, "openh264_strict_contract") {
+        Ok(()) => {}
+        Err(error) => {
+            skip_optional_encoder_open(must_run, "libopenh264", &error, &log);
+            return;
+        }
+    }
+    assert_strict_h264_delivery(&log, Some(50), true, Some(2));
+}
+
+/// Default (single-slice) OpenH264 shape, so admission is not pinned to
+/// the slices=4 wrapper path alone.
+#[test]
+fn openh264_default_slice_count_strict_contract() {
+    let must_run = std::env::var_os("EZ_FFMPEG_OPENH264_MUST_RUN").is_some();
+    if !have_encoder("libopenh264") {
+        assert!(
+            !must_run,
+            "EZ_FFMPEG_OPENH264_MUST_RUN is set but libopenh264 is not in this FFmpeg build"
+        );
+        eprintln!("skipping: libopenh264 not available in this FFmpeg build");
+        return;
+    }
+    let (sink, log) = recording_sink();
+    let context = FfmpegContext::builder()
+        .input(testsrc(2))
+        .output(
+            Output::new_by_packet_sink(sink)
+                .set_video_codec("libopenh264")
+                .set_video_codec_opt("g", "25")
+                .set_video_codec_opt("allow_skip_frames", "0")
+                .set_framerate(25, 1),
+        )
+        .build()
+        .expect("libopenh264 must clear the strict-tier whitelist at build()");
+
+    match wait_with_watchdog(
+        context.start().unwrap(),
+        120,
+        "openh264_default_slice_strict_contract",
+    ) {
+        Ok(()) => {}
+        Err(error) => {
+            skip_optional_encoder_open(must_run, "libopenh264", &error, &log);
+            return;
+        }
+    }
+    assert_strict_h264_delivery(&log, Some(50), true, None);
+}
+
+/// Frame skip may drop packets; it must not emit empty AUs or break dts.
+#[test]
+fn openh264_allow_skip_frames_has_no_empty_packets() {
+    let must_run = std::env::var_os("EZ_FFMPEG_OPENH264_MUST_RUN").is_some();
+    if !have_encoder("libopenh264") {
+        assert!(
+            !must_run,
+            "EZ_FFMPEG_OPENH264_MUST_RUN is set but libopenh264 is not in this FFmpeg build"
+        );
+        eprintln!("skipping: libopenh264 not available in this FFmpeg build");
+        return;
+    }
+    let (sink, log) = recording_sink();
+    let context = FfmpegContext::builder()
+        .input(testsrc(2))
+        .output(
+            Output::new_by_packet_sink(sink)
+                .set_video_codec("libopenh264")
+                .set_video_codec_opt("allow_skip_frames", "1")
+                .set_framerate(25, 1),
+        )
+        .build()
+        .expect("libopenh264 must clear the strict-tier whitelist at build()");
+
+    match wait_with_watchdog(context.start().unwrap(), 120, "openh264_skip_frames") {
+        Ok(()) => {}
+        Err(error) => {
+            skip_optional_encoder_open(must_run, "libopenh264", &error, &log);
+            return;
+        }
+    }
+    assert_strict_h264_delivery(&log, None, true, None);
+}
+
+/// h264_videotoolbox admission. Strict-tier wrappers reject an explicit
+/// `bf` / `max_b_frames` that is not integer 0 (`BFramesUnsupported`).
+/// Verified VT success is still `bf=0` — B-frame reorder can violate
+/// `pts >= dts`. Options are not rewritten.
+///
+/// A missing or busy compression session may skip only as a typed
+/// `OpenEncoder` failure before any delivery callback. Acceptance machines
+/// export `EZ_FFMPEG_VT_MUST_RUN=1`, which turns every skip into a failure.
+/// Hosted CI does not currently provide that lane, so skips remain
+/// skip-guards unless the env is set.
+#[cfg(target_os = "macos")]
+#[test]
+fn videotoolbox_admission_and_strict_contract() {
+    let must_run = std::env::var_os("EZ_FFMPEG_VT_MUST_RUN").is_some();
+    if !have_encoder("h264_videotoolbox") {
+        assert!(
+            !must_run,
+            "EZ_FFMPEG_VT_MUST_RUN is set but h264_videotoolbox is not in this FFmpeg build"
+        );
+        eprintln!("skipping: h264_videotoolbox not available in this FFmpeg build");
+        return;
+    }
+    let (sink, log) = recording_sink();
+    let context = FfmpegContext::builder()
+        .input(testsrc(2))
+        .output(
+            Output::new_by_packet_sink(sink)
+                .set_video_codec("h264_videotoolbox")
+                .set_video_codec_opt("profile", "main")
+                .set_video_codec_opt("bf", "0")
+                .set_video_codec_opt("g", "25")
+                .set_video_codec_opt("realtime", "0")
+                .set_video_codec_opt("allow_sw", "0")
+                .set_framerate(25, 1),
+        )
+        .build()
+        .expect("h264_videotoolbox must clear the strict-tier whitelist at build()");
+
+    match wait_with_watchdog(
+        context.start().unwrap(),
+        120,
+        "videotoolbox_strict_contract",
+    ) {
+        Ok(()) => {}
+        Err(error) => {
+            skip_optional_encoder_open(must_run, "h264_videotoolbox", &error, &log);
+            return;
+        }
+    }
+    assert_strict_h264_delivery(&log, Some(50), true, None);
 }
 
 /// A4 semantic golden: the same pinned encoder configuration muxed to real
@@ -408,8 +687,7 @@ fn av_job_shares_one_time_origin() {
             .filter(|p| p.stream_index == info.stream_index)
             .collect();
         assert!(!stream_packets.is_empty(), "both streams must deliver");
-        let tick_us =
-            1_000_000i64 * info.time_base.num as i64 / info.time_base.den as i64 + 1;
+        let tick_us = 1_000_000i64 * info.time_base.num as i64 / info.time_base.den as i64 + 1;
         let offset_us = stream_packets[0].applied_offset_us;
         assert!(
             (offset_us - anchor_offset_us).abs() <= tick_us,
@@ -563,7 +841,11 @@ fn sibling_custom_io_destruction_panic_prevents_on_end() {
     let result = wait_with_watchdog(
         FfmpegContext::builder()
             .input(Input::from("sine=frequency=440:duration=1").set_format("lavfi"))
-            .output(Output::from(sink).set_audio_codec("aac").add_stream_map("0:a"))
+            .output(
+                Output::from(sink)
+                    .set_audio_codec("aac")
+                    .add_stream_map("0:a"),
+            )
             .output(sibling.add_stream_map("0:a"))
             .build()
             .unwrap()
@@ -611,7 +893,9 @@ fn two_sinks_settle_and_both_reach_their_terminals() {
         .on_end(move || {
             let _ = tx_short.send(());
             met.store(
-                rx_long.recv_timeout(std::time::Duration::from_secs(15)).is_ok(),
+                rx_long
+                    .recv_timeout(std::time::Duration::from_secs(15))
+                    .is_ok(),
                 std::sync::atomic::Ordering::Release,
             );
         })
@@ -621,7 +905,9 @@ fn two_sinks_settle_and_both_reach_their_terminals() {
         .on_end(move || {
             let _ = tx_long.send(());
             met.store(
-                rx_short.recv_timeout(std::time::Duration::from_secs(15)).is_ok(),
+                rx_short
+                    .recv_timeout(std::time::Duration::from_secs(15))
+                    .is_ok(),
                 std::sync::atomic::Ordering::Release,
             );
         })
@@ -684,7 +970,8 @@ fn mixed_truncated_and_healthy_sinks_settle_without_deadlock() {
     .on_delivery_error(move |_e| {
         let _ = tx_a.send(());
         met.store(
-            rx_b.recv_timeout(std::time::Duration::from_secs(10)).is_ok(),
+            rx_b.recv_timeout(std::time::Duration::from_secs(10))
+                .is_ok(),
             std::sync::atomic::Ordering::Release,
         );
     })
@@ -698,7 +985,8 @@ fn mixed_truncated_and_healthy_sinks_settle_without_deadlock() {
     .on_delivery_error(move |_e| {
         let _ = tx_b.send(());
         met.store(
-            rx_a.recv_timeout(std::time::Duration::from_secs(10)).is_ok(),
+            rx_a.recv_timeout(std::time::Duration::from_secs(10))
+                .is_ok(),
             std::sync::atomic::Ordering::Release,
         );
     })
@@ -789,7 +1077,10 @@ fn mixed_truncated_and_healthy_sinks_settle_without_deadlock() {
     sibling_go.store(true, std::sync::atomic::Ordering::Release);
 
     let result = wait_with_watchdog(scheduler, 120, "mixed_settlement");
-    assert!(result.is_err(), "the sibling write failure must fail the job");
+    assert!(
+        result.is_err(),
+        "the sibling write failure must fail the job"
+    );
     assert!(
         met_a.load(std::sync::atomic::Ordering::Acquire)
             && met_b.load(std::sync::atomic::Ordering::Acquire),
@@ -846,7 +1137,8 @@ fn on_end_waits_for_live_peers_after_a_register_only_sink_departs() {
     }
     impl Drop for ParkThenPanicOnDrop {
         fn drop(&mut self) {
-            self.parked.store(true, std::sync::atomic::Ordering::Release);
+            self.parked
+                .store(true, std::sync::atomic::Ordering::Release);
             while !self.gate.load(std::sync::atomic::Ordering::Acquire) {
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
@@ -953,7 +1245,10 @@ fn on_end_waits_for_live_peers_after_a_register_only_sink_departs() {
     let result = stop_thread.join().expect("stop() must return");
     match result {
         Err(ez_ffmpeg::error::Error::WorkerPanicked(name)) => {
-            assert!(name.contains("muxer"), "expected the sibling muxer, got {name:?}");
+            assert!(
+                name.contains("muxer"),
+                "expected the sibling muxer, got {name:?}"
+            );
         }
         other => panic!("expected WorkerPanicked from the sibling capture, got {other:?}"),
     }
@@ -1160,7 +1455,10 @@ fn lagging_consumer_still_ends_with_end() {
             _ => {}
         }
     }
-    assert_eq!(ends, 1, "a stream without Err must end with exactly one End");
+    assert_eq!(
+        ends, 1,
+        "a stream without Err must end with exactly one End"
+    );
     assert_eq!(after_end, 0, "nothing may follow the terminal End");
 }
 

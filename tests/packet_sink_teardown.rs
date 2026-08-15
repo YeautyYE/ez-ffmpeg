@@ -320,9 +320,7 @@ fn abort_during_final_delivery_fires_no_terminal_callback() {
             // the observation poll's panic drops `abort_done_tx`, which
             // releases this recv immediately (Disconnected).
             let _ = abort_request_tx.send(());
-            let released_by_signal = abort_done_rx
-                .recv_timeout(Duration::from_secs(90))
-                .is_ok();
+            let released_by_signal = abort_done_rx.recv_timeout(Duration::from_secs(90)).is_ok();
             RELEASED_BY_HANDSHAKE.store(released_by_signal, Ordering::Release);
         }
         Ok(())

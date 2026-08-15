@@ -160,7 +160,10 @@ pub fn recording_sink() -> (PacketSink, SinkLog) {
     let (info_log, pkt_log, end_log, err_log) =
         (log.clone(), log.clone(), log.clone(), log.clone());
     let sink = PacketSink::builder(move |pkt: &PacketView<'_>| {
-        pkt_log.lock().unwrap().push(SinkEv::Pkt(SinkPkt::from_view(pkt)));
+        pkt_log
+            .lock()
+            .unwrap()
+            .push(SinkEv::Pkt(SinkPkt::from_view(pkt)));
         Ok(())
     })
     .on_stream_info(move |infos: &[PacketStreamInfo]| {
