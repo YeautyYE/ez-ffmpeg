@@ -278,6 +278,25 @@ pub enum Error {
     #[error("Invalid recipe argument: {0}")]
     InvalidRecipeArg(String),
 
+    /// A decoded frame could not be analyzed (unsupported pixel format,
+    /// interlaced fields, or a hardware surface). This is a runtime frame
+    /// condition, not a recipe/config error — those stay
+    /// [`InvalidRecipeArg`](Error::InvalidRecipeArg). Boxed so [`Error`]
+    /// stays within the 64-byte layout contract.
+    #[error("analysis frame error: {0}")]
+    AnalysisFrame(Box<str>),
+
+    /// HLS ladder video-encoder selection failed. Boxed so the payload stays
+    /// inside the crate-wide [`Error`] size contract.
+    #[error("{0}")]
+    HlsEncoderSelection(Box<HlsEncoderSelectionError>),
+
+    /// HLS master playlist write failed after every rendition transcode
+    /// succeeded. Boxed so the payload stays inside the crate-wide [`Error`]
+    /// size contract.
+    #[error("{0}")]
+    HlsMasterWrite(Box<HlsMasterWriteError>),
+
     /// A container-info query was called with an out-of-range index.
     #[error("Container info error: {0}")]
     ContainerInfo(#[from] ContainerInfoError),
@@ -329,6 +348,12 @@ pub enum Error {
         /// The option key that was left unconsumed.
         option: String,
     },
+
+    // HTTP_INPUT_ERROR_VARIANT
+    /// Boxed so [`Error`] stays within the 64-byte layout contract.
+    #[cfg(feature = "http-input")]
+    #[error("HTTP input error: {0}")]
+    HttpInput(Box<crate::http_input::HttpInputError>),
 }
 
 // `Error` rides in every hot-path `Result` — the per-frame encoder and filter
@@ -345,11 +370,208 @@ const _: () = assert!(
     "Error grew past its 64-byte layout: shrink the new payload (static labels) or box the variant"
 );
 
+impl From<HlsEncoderSelectionError> for Error {
+    fn from(err: HlsEncoderSelectionError) -> Self {
+        Error::HlsEncoderSelection(Box::new(err))
+    }
+}
+
+impl From<HlsMasterWriteError> for Error {
+    fn from(err: HlsMasterWriteError) -> Self {
+        Error::HlsMasterWrite(Box::new(err))
+    }
+}
+
+/// Failure to select a video encoder for [`crate::recipes::HlsLadder`].
+///
+/// The historical default (`libx264`) is never silently replaced. Callers
+/// either get this typed error or opt in with
+/// [`HlsLadder::video_codec_auto`](crate::recipes::HlsLadder::video_codec_auto).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum HlsEncoderSelectionError {
+    /// [`HlsLadder`](crate::recipes::HlsLadder) was left on its historical
+    /// `libx264` default, and that encoder is not registered in the linked
+    /// FFmpeg build. No fallback was selected.
+    HistoricalDefaultUnavailable {
+        /// Auto-admitted H.264 encoder names that are registered. Presence
+        /// here is not runtime-ready and does not prove HLS alignment.
+        registered_auto_candidates: Vec<String>,
+        /// Other registered H.264 encoders that can only be chosen with
+        /// [`.video_codec(...)`](crate::recipes::HlsLadder::video_codec);
+        /// this recipe does not manage their alignment.
+        registered_explicit_h264_encoders: Vec<String>,
+    },
+    /// [`HlsLadder::video_codec_auto`](crate::recipes::HlsLadder::video_codec_auto)
+    /// ran after `libx264` was unavailable and no candidate could be opened
+    /// for every rendition.
+    AutoSelectionFailed {
+        /// One entry per auto-priority encoder, in selection order.
+        attempts: Vec<HlsEncoderAttempt>,
+    },
+    /// A pinned auto-admitted encoder (`.video_codec("h264_qsv")` and the
+    /// other AUTO_PRIORITY names) failed trial-open (rungs are opened one by
+    /// one; all sessions are held concurrently to prove the ladder's session
+    /// count). No other encoder was tried, and output directories were not
+    /// created.
+    ExplicitOpenFailed {
+        /// Encoder name the caller pinned.
+        encoder: String,
+        /// Width of the rendition that failed to open.
+        width: u32,
+        /// Height of the rendition that failed to open.
+        height: u32,
+        /// Raw FFmpeg `AVERROR` code from `avcodec_open2` (or setup).
+        raw_code: i32,
+        /// `av_strerror` text for [`raw_code`](Self::ExplicitOpenFailed::raw_code).
+        message: String,
+    },
+}
+
+/// One auto-selection attempt recorded in
+/// [`HlsEncoderSelectionError::AutoSelectionFailed`].
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct HlsEncoderAttempt {
+    /// Encoder name that was considered.
+    pub encoder: String,
+    /// Why this encoder was not used.
+    pub outcome: HlsEncoderAttemptOutcome,
+}
+
+/// Outcome of one auto-selection attempt.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum HlsEncoderAttemptOutcome {
+    /// `avcodec_find_encoder_by_name` returned null.
+    NotRegistered,
+    /// Trial `avcodec_open2` failed for a rendition of this ladder.
+    OpenFailed {
+        /// Width of the rendition that failed to open.
+        width: u32,
+        /// Height of the rendition that failed to open.
+        height: u32,
+        /// Raw FFmpeg `AVERROR` code from `avcodec_open2` (or setup).
+        raw_code: i32,
+        /// `av_strerror` text for [`raw_code`](Self::OpenFailed::raw_code).
+        message: String,
+    },
+}
+
+fn format_encoder_name_list(names: &[String]) -> String {
+    if names.is_empty() {
+        "none".to_string()
+    } else {
+        names.join(", ")
+    }
+}
+
+impl std::fmt::Display for HlsEncoderSelectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HlsEncoderSelectionError::HistoricalDefaultUnavailable {
+                registered_auto_candidates,
+                registered_explicit_h264_encoders,
+            } => write!(
+                f,
+                "HlsLadder's historical default encoder 'libx264' is not available in the linked \
+                 FFmpeg build. No fallback was selected automatically because encoder quality, \
+                 hardware use, and HLS keyframe behavior differ. For an LGPL-only FFmpeg build, \
+                 opt in to runtime selection with `.video_codec_auto()`, or pin a registered \
+                 encoder with `.video_codec(\"...\")`. Named auto-admitted encoders \
+                 (h264_videotoolbox, h264_nvenc, h264_qsv, libopenh264) use this recipe's \
+                 HLS-safe option set; other explicit names do not. Registered auto candidates \
+                 (runtime readiness and this host's output alignment not verified): {}. \
+                 Other registered H.264 encoders (explicit only; HLS alignment unmanaged): {}. \
+                 List all registered encoders with `codec::get_encoders()`. \
+                 See docs/INSTALL.md#ffmpeg-capability-and-licensing-matrix.",
+                format_encoder_name_list(registered_auto_candidates),
+                format_encoder_name_list(registered_explicit_h264_encoders),
+            ),
+            HlsEncoderSelectionError::AutoSelectionFailed { attempts } => {
+                let tried = attempts
+                    .iter()
+                    .map(|attempt| match &attempt.outcome {
+                        HlsEncoderAttemptOutcome::NotRegistered => {
+                            format!("{} (not registered)", attempt.encoder)
+                        }
+                        HlsEncoderAttemptOutcome::OpenFailed {
+                            width,
+                            height,
+                            message,
+                            ..
+                        } => format!(
+                            "{} ({}x{} encoder open failed: {message})",
+                            attempt.encoder, width, height
+                        ),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(
+                    f,
+                    "HlsLadder could not select a runtime-ready H.264 encoder after 'libx264' was \
+                     unavailable. Tried: {tried}. Enable one of these encoders in the linked \
+                     FFmpeg build, choose one explicitly with `.video_codec(\"...\")`, or see \
+                     docs/INSTALL.md#ffmpeg-capability-and-licensing-matrix."
+                )
+            }
+            HlsEncoderSelectionError::ExplicitOpenFailed {
+                encoder,
+                width,
+                height,
+                message,
+                ..
+            } => write!(
+                f,
+                "HlsLadder could not trial-open pinned encoder '{encoder}' for {width}x{height}: \
+                 {message}. Output directories were not created. Pin a different encoder with \
+                 `.video_codec(\"...\")`, use `.video_codec_auto()`, or see \
+                 docs/INSTALL.md#ffmpeg-capability-and-licensing-matrix."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for HlsEncoderSelectionError {}
+
+/// Master playlist write failed after every HLS rendition transcode succeeded.
+///
+/// The media playlists may already be on disk; only the master file (or the
+/// BANDWIDTH measurement that feeds it) failed. Display always starts with
+/// `transcode succeeded` so operators do not treat this as an encoder miss.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct HlsMasterWriteError {
+    /// Master playlist file name the recipe tried to write.
+    pub master_name: String,
+    /// Why the write, or the BANDWIDTH measurement that feeds it, failed.
+    pub detail: String,
+}
+
+impl std::fmt::Display for HlsMasterWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "transcode succeeded but {} was not written: {}",
+            self.master_name, self.detail
+        )
+    }
+}
+
+impl std::error::Error for HlsMasterWriteError {}
+
 /// Builder/open-time validation errors for [`crate::VideoWriter`]. Exported here
 /// (not from the crate root) to mirror the existing `OpenInputError` /
 /// `OpenOutputError` organization; the root surface stays the settled writer
 /// types (the writer itself, its builder, and the push error pair).
 pub use crate::core::writer::WriterError;
+
+#[cfg(feature = "http-input")]
+impl From<crate::http_input::HttpInputError> for Error {
+    fn from(err: crate::http_input::HttpInputError) -> Self {
+        Error::HttpInput(Box::new(err))
+    }
+}
 
 // Hand-written counterpart of the #[from] the sibling variants derive: the
 // error type inherits deprecation from the deprecated `opengl` module, so
@@ -795,6 +1017,21 @@ pub enum PacketSinkError {
         allowed: &'static str,
     },
 
+    /// An admitted video encoder was given an explicit B-frame option
+    /// outside the strict-tier verified scope (`bf=0` / `max_b_frames=0`).
+    ///
+    /// Unset keys are not this error: they keep the wrapper default. This
+    /// crate does not rewrite the caller's options.
+    #[error(
+        "encoder '{encoder}' rejected explicit B-frames on a packet-sink output \
+         (every present bf / max_b_frames key must be integer 0 or removed; \
+         unset keeps the wrapper default)"
+    )]
+    BFramesUnsupported {
+        /// The encoder name that was configured.
+        encoder: String,
+    },
+
     /// No stream was mapped to the packet-sink output.
     #[error("packet-sink output has no streams")]
     NoStreams,
@@ -852,7 +1089,9 @@ pub enum PacketSinkError {
     },
 
     /// A packet's dts did not strictly increase within its stream.
-    #[error("output stream {stream_index}: non-monotonic dts (previous {prev}, current {current})")]
+    #[error(
+        "output stream {stream_index}: non-monotonic dts (previous {prev}, current {current})"
+    )]
     NonMonotonicDts {
         /// Index of the offending output stream.
         stream_index: usize,
@@ -883,7 +1122,9 @@ pub enum PacketSinkError {
     },
 
     /// Rescaling a timestamp onto the shared time origin overflowed.
-    #[error("output stream {stream_index}: timestamp overflow while applying the shared time origin")]
+    #[error(
+        "output stream {stream_index}: timestamp overflow while applying the shared time origin"
+    )]
     TimestampOverflow {
         /// Index of the offending output stream.
         stream_index: usize,
@@ -955,7 +1196,9 @@ pub enum PacketSinkError {
 
     /// The job failed outside this sink's delivery path; handed to
     /// `on_delivery_error` only, while `wait()` keeps the original error.
-    #[error("the job failed outside this packet sink; delivery may have been truncated: {message}")]
+    #[error(
+        "the job failed outside this packet sink; delivery may have been truncated: {message}"
+    )]
     JobFailed {
         /// Display rendering of the error that actually failed the job.
         message: String,
@@ -1112,6 +1355,24 @@ pub enum OpenInputError {
     /// provides no seek callback.
     #[error("No seek callback is provided")]
     SeekFunctionMissing,
+
+    /// `Input::from("https://…")` failed because the linked FFmpeg has no
+    /// HTTPS protocol. This does **not** route the URL through rustls.
+    #[cfg(not(feature = "http-input"))]
+    #[error(
+        "FFmpeg HTTPS input is unavailable. Enable the ez-ffmpeg \"http-input\" feature \
+         and use HttpInput, or link an FFmpeg build with an HTTPS/TLS backend \
+         (GnuTLS or OpenSSL)."
+    )]
+    HttpsProtocolUnavailable,
+
+    /// Same failure with the feature already enabled: still not hijacked.
+    #[cfg(feature = "http-input")]
+    #[error(
+        "FFmpeg HTTPS input is unavailable. The \"http-input\" feature is enabled; use \
+         HttpInput::builder(url), or link an FFmpeg build with an HTTPS/TLS backend."
+    )]
+    HttpsProtocolUnavailable,
 }
 
 impl From<i32> for OpenInputError {
@@ -1548,30 +1809,34 @@ pub enum OpenOutputError {
     #[error("Attachment mimetype must not be empty (file '{0}')")]
     AttachmentEmptyMimetype(String),
 
-    /// A per-output video filter ([`Output::set_video_filter`]) was combined
-    /// with stream copy for the same output's video — either
-    /// `set_video_codec("copy")` or a copy stream map covering a video
-    /// stream. Mirrors the FFmpeg CLI error for `-vf` + `-c:v copy`
+    /// A per-output simple filter ([`Output::set_video_filter`] or
+    /// [`Output::set_audio_filter`]) was combined with stream copy for the
+    /// same output stream — either `set_video_codec("copy")` /
+    /// `set_audio_codec("copy")` or a copy stream map covering that stream.
+    /// Mirrors the FFmpeg CLI error for `-vf`/`-af` + `-c copy`
     /// ("Filtering and streamcopy cannot be used together",
     /// ffmpeg_mux_init.c streamcopy_init).
     ///
     /// [`Output::set_video_filter`]: crate::core::context::output::Output::set_video_filter
+    /// [`Output::set_audio_filter`]: crate::core::context::output::Output::set_audio_filter
     #[error(
         "Filtergraph '{0}' was specified, but codec copy was selected for the \
-         output's video stream. Filtering and streamcopy cannot be used together"
+         matching output stream. Filtering and streamcopy cannot be used together"
     )]
     FilterWithStreamCopy(String),
 
-    /// A per-output video filter ([`Output::set_video_filter`]) was set on an
-    /// output whose video stream is fed by a context-level filtergraph
+    /// A per-output simple filter ([`Output::set_video_filter`] or
+    /// [`Output::set_audio_filter`]) was set on an output whose matching
+    /// stream is fed by a context-level filtergraph
     /// (`FfmpegContextBuilder::filter_desc`). Mirrors the FFmpeg CLI error for
-    /// `-vf` + `-filter_complex` on the same stream (ffmpeg_mux_init.c
+    /// `-vf`/`-af` + `-filter_complex` on the same stream (ffmpeg_mux_init.c
     /// ost_get_filters: "Simple and complex filtering cannot be used together
     /// for the same stream").
     ///
     /// [`Output::set_video_filter`]: crate::core::context::output::Output::set_video_filter
+    /// [`Output::set_audio_filter`]: crate::core::context::output::Output::set_audio_filter
     #[error(
-        "Filtergraph '{0}' was specified for a video stream fed from a \
+        "Filtergraph '{0}' was specified for a stream fed from a \
          context-level filtergraph. Simple and complex filtering cannot be \
          used together for the same stream"
     )]
@@ -1614,6 +1879,21 @@ pub enum OpenOutputError {
          stream"
     )]
     VideoFilterUnused(String),
+
+    /// A configured [`Output::set_audio_filter`] chain that no re-encoded
+    /// audio stream ended up consuming: the output has no audio stream at all
+    /// (video-only input, `disable_audio()`, or maps that matched no audio
+    /// stream). The ffmpeg CLI silently ignores `-af` in that situation; the
+    /// crate refuses instead of dropping configuration on the floor.
+    ///
+    /// [`Output::set_audio_filter`]: crate::core::context::output::Output::set_audio_filter
+    #[error(
+        "audio filter '{0}' was configured, but the output ended up with no \
+         re-encoded audio stream to run it (video-only input, disable_audio(), \
+         or maps matching no audio stream); remove the filter or map an audio \
+         stream"
+    )]
+    AudioFilterUnused(String),
 
     /// A per-output simple filtergraph's pads must match the stream's media
     /// type (fftools fg_create_simple: "Filtergraph has a %s output, cannot
@@ -2421,6 +2701,89 @@ mod tests {
             err.to_string(),
             "OpenGL filter error: OpenGL context creation failed: \
              Failed to create Surfman connection"
+        );
+    }
+
+    #[test]
+    fn hls_encoder_selection_error_is_boxed_under_size_cap() {
+        use super::{Error, HlsEncoderSelectionError};
+        assert!(std::mem::size_of::<Error>() <= 64);
+        let err = Error::from(HlsEncoderSelectionError::HistoricalDefaultUnavailable {
+            registered_auto_candidates: Vec::new(),
+            registered_explicit_h264_encoders: Vec::new(),
+        });
+        match &err {
+            Error::HlsEncoderSelection(_) => {}
+            other => panic!("expected boxed HLS error, got {other}"),
+        }
+        let text = err.to_string();
+        assert!(text.contains("libx264"));
+        assert!(text.contains("LGPL"));
+        assert!(text.contains(".video_codec_auto()"));
+        assert!(text.contains(": none."));
+    }
+
+    #[test]
+    fn hls_explicit_open_failed_pins_display() {
+        use super::{Error, HlsEncoderSelectionError};
+        let err = Error::from(HlsEncoderSelectionError::ExplicitOpenFailed {
+            encoder: "h264_qsv".into(),
+            width: 1920,
+            height: 1080,
+            raw_code: -1,
+            message: "device busy".into(),
+        });
+        let text = err.to_string();
+        assert!(text.contains("pinned encoder 'h264_qsv'"), "{text}");
+        assert!(text.contains("1920x1080"), "{text}");
+        assert!(text.contains("device busy"), "{text}");
+        assert!(
+            text.contains("Output directories were not created"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn hls_master_write_error_is_boxed_under_size_cap() {
+        use super::{Error, HlsMasterWriteError};
+        assert!(std::mem::size_of::<Error>() <= 64);
+        let err = Error::from(HlsMasterWriteError {
+            master_name: "custom.m3u8".into(),
+            detail: "failed to write master playlist".into(),
+        });
+        match &err {
+            Error::HlsMasterWrite(_) => {}
+            other => panic!("expected boxed HLS master-write error, got {other}"),
+        }
+        let text = err.to_string();
+        assert!(text.contains("transcode succeeded"), "{text}");
+        assert!(text.contains("custom.m3u8"), "{text}");
+        assert!(text.contains("failed to write master playlist"), "{text}");
+    }
+
+    #[test]
+    fn analysis_frame_error_is_boxed_under_size_cap() {
+        use super::Error;
+        assert!(std::mem::size_of::<Error>() <= 64);
+        let err = Error::AnalysisFrame("interlaced".into());
+        match &err {
+            Error::AnalysisFrame(_) => {}
+            other => panic!("expected boxed analysis-frame error, got {other}"),
+        }
+        assert_eq!(err.to_string(), "analysis frame error: interlaced");
+    }
+
+    #[test]
+    fn packet_sink_b_frames_unsupported_pins_display() {
+        use super::{Error, PacketSinkError};
+        let err = Error::from(PacketSinkError::BFramesUnsupported {
+            encoder: "h264_videotoolbox".into(),
+        });
+        assert_eq!(
+            err.to_string(),
+            "Packet sink error: encoder 'h264_videotoolbox' rejected explicit \
+             B-frames on a packet-sink output (every present bf / max_b_frames \
+             key must be integer 0 or removed; unset keeps the wrapper default)"
         );
     }
 }

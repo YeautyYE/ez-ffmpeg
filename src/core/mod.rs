@@ -232,7 +232,7 @@ pub mod packet_scanner;
 /// [`PacketSink::channel`](packet_sink::PacketSink::channel) adapter) and hand
 /// it to [`Output::new_by_packet_sink`](crate::Output::new_by_packet_sink).
 /// The v1 strict tier is WebCodecs-aligned: avcC H.264 access units
-/// (libx264, h264_nvenc) and raw AAC frames with their AudioSpecificConfig. See the
+/// (libx264, h264_nvenc, h264_videotoolbox with `bf=0`, libopenh264) and raw AAC frames with their AudioSpecificConfig. See the
 /// module documentation for the callback order and the blocking-backpressure
 /// contract.
 pub mod packet_sink;
@@ -377,10 +377,10 @@ pub mod hwaccel;
 pub mod codec;
 
 /// The **capabilities** module provides lightweight probes for what the
-/// linked FFmpeg build contains — whether a muxer (output format) or an
-/// output-capable I/O protocol was compiled in. Use these before configuring
-/// outputs that depend on optional components (e.g. `whip`, `srt`) to fail
-/// fast with an actionable error instead of a mid-pipeline failure.
+/// linked FFmpeg build contains — muxers, codecs, filters, and I/O
+/// protocols. Use these before configuring outputs that depend on optional
+/// components (e.g. `whip`, `srt`, `libx264`) to fail fast with an
+/// actionable error instead of a mid-pipeline failure.
 ///
 /// # Public API
 ///
@@ -388,6 +388,17 @@ pub mod codec;
 ///   muxer by short name (e.g. `"matroska"`, `"mpegts"`, `"whip"`).
 /// - [`is_output_protocol_available()`](capabilities::is_output_protocol_available):
 ///   Checks for an I/O protocol that supports writing (e.g. `"file"`, `"srt"`).
+/// - [`is_input_protocol_available()`](capabilities::is_input_protocol_available):
+///   Checks for an I/O protocol that supports reading (e.g. `"file"`, `"https"`).
+/// - [`is_encoder_available()`](capabilities::is_encoder_available): Exact-name
+///   encoder probe (registered ≠ runtime-ready for hardware wrappers).
+/// - [`is_decoder_available()`](capabilities::is_decoder_available): Exact-name
+///   decoder probe.
+/// - [`is_filter_available()`](capabilities::is_filter_available): Filter probe
+///   (same answer as [`hwaccel::is_filter_available`]).
+/// - [`is_filter_option_available()`](capabilities::is_filter_option_available):
+///   Filter-option probe (name + option, including child classes such as
+///   SwsContext `intent`). Compiled-in ≠ the option performs a color transform.
 ///
 /// # Example
 ///
@@ -400,8 +411,8 @@ pub mod codec;
 /// # Notes
 ///
 /// - A `true` result only means the component is registered in the linked
-///   FFmpeg build; encoders, TLS backends, endpoint compatibility, and
-///   network reachability are separate concerns.
+///   FFmpeg build; device/driver readiness, TLS backends, endpoint
+///   compatibility, and network reachability are separate concerns.
 /// - Muxer names and protocol names are separate namespaces (the `srt`
 ///   muxer is the SubRip subtitle format, not the SRT streaming protocol).
 pub mod capabilities;
@@ -533,9 +544,9 @@ pub mod filter;
 /// ```
 pub(crate) mod metadata;
 
-/// The **analysis** module surfaces the results of FFmpeg detector/measurement
-/// filters (`blackdetect`, `silencedetect`, `scdet`, `cropdetect`, `ebur128`)
-/// as typed Rust events and a folded report, instead of only FFmpeg logs.
+/// The **analysis** module surfaces typed detection results: native Rust crop /
+/// letterbox detection plus FFmpeg metadata from `blackdetect`,
+/// `silencedetect`, `scdet`, and `ebur128`.
 pub mod analysis;
 
 /// The **recipes** module provides one-shot helpers for common workflows
