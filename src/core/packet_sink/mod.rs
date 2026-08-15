@@ -24,16 +24,26 @@
 //! `"avc"` / AAC consumption:
 //!
 //! * **H.264 video** is delivered as avcC-configured, 4-byte length-prefixed,
-//!   access-unit-complete packets. Video encoders are admitted from a
-//!   verified registry — v1 admits `libx264` and `h264_nvenc` — because the
-//!   delivery contract assumes one packet == one access unit, a property
-//!   the delivery path cannot check per packet and therefore establishes
-//!   per encoder wrapper (audited against the FFmpeg versions CI pins,
-//!   with a hardware acceptance line where encoding needs hardware). Any
-//!   other video encoder fails the build with a typed error. Admission
-//!   only lifts that build-time rejection: whether `h264_nvenc` can open
-//!   still depends on the linked FFmpeg build and on NVIDIA hardware at
-//!   run time.
+//!   access-unit-complete packets. The verified wrappers are `libx264`,
+//!   `h264_nvenc`, `h264_videotoolbox`, and `libopenh264`. Strict-tier
+//!   delivery requires `pts >= dts`; an explicit `bf` or `max_b_frames`
+//!   other than integer `"0"` is rejected at build time for
+//!   `h264_videotoolbox` (`PacketSinkError::BFramesUnsupported`). Other
+//!   admitted wrappers keep runtime timestamp enforcement. `max_b_frames` is a
+//!   policy-recognized admission key, **not** an FFmpeg `AVOption` alias of
+//!   `bf`: a leftover `max_b_frames=0` does not set the encoder's `bf` and
+//!   does not guarantee `dts == pts`. Options are not
+//!   rewritten. Unset B-frame keys are admitted (the wrapper's FFmpeg
+//!   default applies). Admission does not guarantee that the linked FFmpeg
+//!   build contains an encoder or that required hardware is available — it
+//!   only lifts the build-time name rejection and the explicit B-frame
+//!   check. The delivery contract assumes one packet == one access unit, a
+//!   property the Trusted path does not check per packet and therefore
+//!   establishes per encoder wrapper (audited against the FFmpeg versions
+//!   CI pins, with a hardware acceptance line where encoding needs
+//!   hardware). Any other video encoder fails the build with a typed error.
+//!   `libopenh264` needs `--enable-libopenh264`; that is an LGPL-compatible
+//!   **copyright** combination, not an H.264 patent grant.
 //! * **AAC audio** is delivered as raw AAC frames; the stream configuration
 //!   carries the AudioSpecificConfig.
 //! * Anything else (subtitles, data streams, stream copy, bitstream filters)
@@ -189,9 +199,9 @@
 //! }
 //! ```
 
-pub use crate::error::PacketSinkError;
 use crate::core::scheduler::ffmpeg_scheduler::{is_stopping, FfmpegScheduler, Running};
 use crate::core::scheduler::owned_run_iter::OwnedRunIter;
+pub use crate::error::PacketSinkError;
 use ffmpeg_sys_next::{AVCodecID, AVMediaType, AVRational};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -225,7 +235,10 @@ pub use job_failure::{JobFailureKind, JobFailureSummary};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PacketSinkTier {
     /// WebCodecs-aligned strict tier: avcC H.264 (registry-verified
-    /// encoders) + AAC.
+    /// wrappers: libx264, h264_nvenc, h264_videotoolbox, libopenh264;
+    /// VideoToolbox explicit non-zero `bf` / `max_b_frames` is rejected at
+    /// build — `max_b_frames` is a policy admission key, not an FFmpeg
+    /// alias of `bf`, and is never applied to the encoder) + AAC.
     #[default]
     Strict,
 }
@@ -667,9 +680,11 @@ impl<'a> PacketView<'a> {
     }
 
     /// Decode timestamp in [`time_base`](Self::time_base) units, strictly
-    /// increasing per stream. May be negative on non-anchor streams (a stream
-    /// whose timeline starts earlier than the anchor stream keeps its true
-    /// relative offset) and, with B-frames, ahead of `pts` reordering.
+    /// increasing per stream. The strict tier also requires `pts >= dts` on
+    /// every delivered packet: B-frame reordering that would invert that
+    /// fails the job before delivery. May be negative on non-anchor streams
+    /// (a stream whose timeline starts earlier than the anchor stream keeps
+    /// its true relative offset).
     pub fn dts(&self) -> i64 {
         self.dts
     }
@@ -734,18 +749,18 @@ impl<'a> PacketView<'a> {
         self.applied_offset
     }
 
-    /// The packet payload. H.264: one complete access unit, 4-byte
-    /// length-prefixed (AVCC), parameter sets carried out-of-band in the
-    /// stream configuration. AAC: one raw AAC frame.
+    /// The packet payload. H.264: 4-byte length-prefixed (AVCC), parameter
+    /// sets carried out-of-band in the stream configuration. The Trusted
+    /// path does **not** inspect each payload to prove one complete access
+    /// unit; that property is assumed from the admitted encoder wrappers.
+    /// AAC: one raw AAC frame.
     pub fn data(&self) -> &'a [u8] {
         self.data
     }
 }
 
-pub(crate) type StreamInfoFn =
-    Box<dyn FnMut(&[PacketStreamInfo]) -> PacketCallbackResult + Send>;
-pub(crate) type PacketFn =
-    Box<dyn for<'a> FnMut(&PacketView<'a>) -> PacketCallbackResult + Send>;
+pub(crate) type StreamInfoFn = Box<dyn FnMut(&[PacketStreamInfo]) -> PacketCallbackResult + Send>;
+pub(crate) type PacketFn = Box<dyn for<'a> FnMut(&PacketView<'a>) -> PacketCallbackResult + Send>;
 pub(crate) type EndFn = Box<dyn FnMut() + Send>;
 pub(crate) type JobFailedFn = Box<dyn FnMut(&JobFailureSummary) + Send>;
 pub(crate) type DeliveryErrorFn = Box<dyn FnMut(&PacketSinkError) + Send>;
@@ -1470,9 +1485,7 @@ impl std::fmt::Display for PacketRecvTimeoutError {
             PacketRecvTimeoutError::Timeout => {
                 f.write_str("timed out waiting for a packet-sink event")
             }
-            PacketRecvTimeoutError::Disconnected => {
-                f.write_str("packet-sink channel disconnected")
-            }
+            PacketRecvTimeoutError::Disconnected => f.write_str("packet-sink channel disconnected"),
         }
     }
 }
@@ -1504,9 +1517,7 @@ impl std::fmt::Debug for PacketEventsPairingError {
 
 impl std::fmt::Display for PacketEventsPairingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(
-            "packet-sink receiver paired with a scheduler that is not running its sink",
-        )
+        f.write_str("packet-sink receiver paired with a scheduler that is not running its sink")
     }
 }
 
@@ -1845,7 +1856,8 @@ mod tests {
             }
         }
 
-        let flags: Vec<Arc<AtomicBool>> = (0..4).map(|_| Arc::new(AtomicBool::new(false))).collect();
+        let flags: Vec<Arc<AtomicBool>> =
+            (0..4).map(|_| Arc::new(AtomicBool::new(false))).collect();
         let (b0, b1, b2, b3) = (
             DropBomb(flags[0].clone()),
             DropBomb(flags[1].clone()),
@@ -1894,7 +1906,9 @@ mod tests {
         assert!(destroyed.load(Ordering::Acquire));
 
         // Benign sinks report no panic.
-        assert!(!PacketSink::builder(|_pkt| Ok(())).build().dispose_contained());
+        assert!(!PacketSink::builder(|_pkt| Ok(()))
+            .build()
+            .dispose_contained());
     }
 
     #[test]

@@ -22,7 +22,9 @@ of any length. Callbacks block the encoding pipeline while they run; see the
 
 ## How to Run
 
-1. Use an FFmpeg build that includes libx264 (on the strict tier's verified
-   encoder whitelist); the example prints a notice and exits otherwise.
+1. Use an FFmpeg build that includes libx264; the example prints a notice and
+   exits otherwise. (The strict tier's verified whitelist also admits
+   `h264_nvenc`, `h264_videotoolbox`, and `libopenh264` — swap the
+   `set_video_codec` name to use one of those.)
 2. From the repository root, run `cargo run --example packet_sink_avc`.
 3. The program prints the decoder configuration and a delivery summary.

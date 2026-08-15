@@ -50,8 +50,8 @@ fn find_startcode_reference(data: &[u8], from: usize) -> Option<usize> {
     if data.len() < 3 {
         return None;
     }
-    let i = (from..data.len() - 2)
-        .find(|&i| data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1)?;
+    let i =
+        (from..data.len() - 2).find(|&i| data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1)?;
     if i > from && data[i - 1] == 0 {
         Some(i - 1)
     } else {
@@ -76,8 +76,7 @@ fn find_startcode_swar(data: &[u8], from: usize) -> Option<usize> {
     while i < end {
         if i + 8 <= n {
             let word = u64::from_le_bytes(data[i..i + 8].try_into().expect("8-byte chunk"));
-            let zeros =
-                word.wrapping_sub(0x0101_0101_0101_0101) & !word & 0x8080_8080_8080_8080;
+            let zeros = word.wrapping_sub(0x0101_0101_0101_0101) & !word & 0x8080_8080_8080_8080;
             if zeros == 0 {
                 // No zero byte in the word: no triple can start within it.
                 i += 8;
@@ -445,7 +444,11 @@ fn scan_variants_match_reference_on_constructed_boundaries() {
         fixtures.push(vec![0u8; len]);
     }
     // Isolated zeros, all-ones, and 00 01 repeats.
-    fixtures.push((0..64u8).map(|i| if i % 2 == 0 { 0 } else { 0xAB }).collect());
+    fixtures.push(
+        (0..64u8)
+            .map(|i| if i % 2 == 0 { 0 } else { 0xAB })
+            .collect(),
+    );
     fixtures.push(vec![1u8; 64]);
     fixtures.push([0u8, 1].repeat(32));
     // Triples straddling the first 8-byte word after a leading zero run.
@@ -478,7 +481,10 @@ fn scan_variants_match_reference_on_constructed_boundaries() {
     assert_eq!(find_startcode_reference(&[0, 0, 0, 1], 0), Some(0));
     assert_eq!(find_startcode_reference(&[0, 0, 0, 1], 1), Some(1));
     assert_eq!(find_startcode_reference(&[0, 0, 1], 1), None);
-    assert_eq!(find_startcode_reference(&[0xAA, 0, 0, 1, 0, 0, 1], 0), Some(1));
+    assert_eq!(
+        find_startcode_reference(&[0xAA, 0, 0, 1, 0, 0, 1], 0),
+        Some(1)
+    );
 }
 
 /// Walker-level parity on seeded-random access units across density
@@ -493,7 +499,12 @@ fn walker_parity_on_seeded_random_aus() {
     for _ in 0..60 {
         let n1 = gen_nal(0x41, 17 + (rng.next() as usize * 7) % 2000, &mut rng, 0xFF);
         let n2 = gen_nal(0x06, 2 + (rng.next() as usize) % 60, &mut rng, 0xFF);
-        let n3 = gen_nal(0x65, 100 + (rng.next() as usize * 31) % 4000, &mut rng, 0x00);
+        let n3 = gen_nal(
+            0x65,
+            100 + (rng.next() as usize * 31) % 4000,
+            &mut rng,
+            0x00,
+        );
         let n4 = gen_nal(0x41, 64 + (rng.next() as usize) % 512, &mut rng, 0x01);
         aus.push(make_au(&[n2.clone(), n3.clone()]));
         aus.push(make_au(&[n1, n2, n3, n4]));
@@ -773,7 +784,9 @@ fn bench_nal_startcode_scan() {
         // screens which variant to promote, it is NOT the gate. Round -1
         // marks the aggregated screening cell.
         let screen: [(&str, Timer); 3] = [
-            ("reference_byte", |aus| time_pair(aus, find_startcode_reference)),
+            ("reference_byte", |aus| {
+                time_pair(aus, find_startcode_reference)
+            }),
             ("stride3_shipping", |aus| time_pair(aus, find_startcode)),
             ("swar_rejected", |aus| time_pair(aus, find_startcode_swar)),
         ];

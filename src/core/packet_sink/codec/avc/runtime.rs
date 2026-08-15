@@ -1,8 +1,7 @@
 //! [`AvcRuntime`] — the per-stream state machine the orchestrator drives.
 
 use super::{
-    build_avcc, parse_avcc_parameter_sets, parse_parameter_sets, CodecProjection,
-    ConfigFingerprint,
+    build_avcc, parse_avcc_parameter_sets, parse_parameter_sets, CodecProjection, ConfigFingerprint,
 };
 use crate::core::packet_sink::nal_framing::{
     push_length_prefixed, walk_annexb, walk_length_prefixed, NAL_LENGTH_SIZE, NAL_PPS, NAL_SPS,
@@ -112,12 +111,11 @@ impl AvcRuntime {
         bytes: &[u8],
         stream_index: usize,
     ) -> Result<(), PacketSinkError> {
-        let config = parse_parameter_sets(bytes).map_err(|reason| {
-            PacketSinkError::ConfigChange {
+        let config =
+            parse_parameter_sets(bytes).map_err(|reason| PacketSinkError::ConfigChange {
                 stream_index,
                 what: format!("invalid NEW_EXTRADATA ({reason})"),
-            }
-        })?;
+            })?;
         // Composite baseline, part 2: the derived projection consumers were
         // told (profile/compatibility/level, from the announcement's own
         // ordered first SPS — the same derivation on_stream_info used). A

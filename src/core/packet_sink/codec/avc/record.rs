@@ -133,7 +133,10 @@ pub(super) fn parse_avcc_record(avcc: &[u8]) -> Result<AvccRecord, String> {
         return Err(format!("avcC too short ({} bytes)", avcc.len()));
     }
     if avcc[0] != 1 {
-        return Err(format!("avcC configurationVersion is {} (expected 1)", avcc[0]));
+        return Err(format!(
+            "avcC configurationVersion is {} (expected 1)",
+            avcc[0]
+        ));
     }
     let header = CodecProjection {
         profile: avcc[1],
@@ -423,9 +426,7 @@ fn read_u16_prefixed(data: &[u8], pos: &mut usize) -> Result<Vec<u8>, String> {
 /// survives FFmpeg's verbatim extradata copy on remux.
 fn writer_extension_triple(profile_idc: u8, summary: &SpsSummary) -> (u8, u8, u8) {
     match profile_idc {
-        100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 => {
-            summary.chroma_info()
-        }
+        100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 => summary.chroma_info(),
         _ => (1, 8, 8),
     }
 }
@@ -445,7 +446,10 @@ fn writer_extension_triple(profile_idc: u8, summary: &SpsSummary) -> (u8, u8, u8
 /// compares like with like; the record consistency check is wider — it also admits the raw
 /// SPS-coded triple, which survives the writer's verbatim copy of a
 /// non-Annex-B extradata.
-pub(super) fn derived_extension(first_sps: &[u8], first_summary: &SpsSummary) -> Option<(u8, u8, u8)> {
+pub(super) fn derived_extension(
+    first_sps: &[u8],
+    first_summary: &SpsSummary,
+) -> Option<(u8, u8, u8)> {
     match first_sps[1] {
         66 | 77 | 88 => None,
         profile => Some(writer_extension_triple(profile, first_summary)),

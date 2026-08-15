@@ -15,8 +15,9 @@
 //! counters and the latest chunk, so memory stays bounded no matter how long
 //! the stream runs.
 //!
-//! Requires an FFmpeg build with libx264 (on the strict tier's verified
-//! encoder whitelist).
+//! Requires an FFmpeg build with libx264. The strict tier's verified video
+//! whitelist is `libx264`, `h264_nvenc`, `h264_videotoolbox`, and
+//! `libopenh264`; any admitted name works here via `set_video_codec`.
 //!
 //! Run it:
 //!

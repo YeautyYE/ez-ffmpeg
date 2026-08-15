@@ -13,6 +13,12 @@
 //!   write walk for Annex-B input), IDR classification, S8
 //!   parameter-set fingerprinting and the in-band policy.
 
+// Test-backed prototype for unaudited H.264 wrappers. Not called from the
+// Trusted `AvcRuntime::normalize_au` path — audited encoders must not pay
+// per-NAL slice-header work. `dead_code` is allowed until a
+// ValidateBoundaries policy is wired through the muxer (out of this change).
+#[allow(dead_code)]
+mod au_boundary;
 mod fingerprint;
 mod pps;
 mod rbsp;
