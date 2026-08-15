@@ -1,9 +1,10 @@
 //! Detector definitions and their FFmpeg `filter_desc` string generation.
 //!
-//! Each variant maps to exactly one FFmpeg detector filter. `to_filter` is a
-//! pure function (unit-tested) that renders the filter string; the runner
-//! assembles those into a filter graph. All detectors are passthrough — they
-//! attach `lavfi.*` metadata to frames without dropping any.
+//! Lavfi detectors (`Black`, `Scene`, audio) map to one FFmpeg filter each.
+//! [`VideoDetector::Crop`] is native Rust and is not rendered into the graph.
+//! `to_filter` is a pure function (unit-tested); the runner assembles lavfi
+//! strings into a filter graph. Lavfi detectors are passthrough — they attach
+//! `lavfi.*` metadata to frames without dropping any.
 
 use crate::error::{Error, Result};
 
@@ -26,11 +27,29 @@ pub enum VideoDetector {
     /// 10%, not `0.10`). Runs with `sc_pass=0` so frames/metadata pass through
     /// untouched.
     Scene { threshold_pct: f64 },
-    /// `cropdetect`: suggests a crop rectangle.
+    /// Native luma crop / letterbox detection (not FFmpeg `cropdetect`).
     ///
-    /// - `limit`: luminance threshold below which a pixel is "black".
-    /// - `round`: width/height are rounded to a multiple of this.
-    /// - `reset`: recompute the crop every N frames (0 = never reset).
+    /// Runs on decoded **progressive** CPU Y planes inside
+    /// [`MetadataEventFilter`](crate::core::analysis::filter::MetadataEventFilter).
+    /// An interlaced, hardware, or otherwise
+    /// unreadable frame fails the job as [`Error::AnalysisFrame`] (not
+    /// [`Error::InvalidRecipeArg`]). Event and
+    /// report fields are unchanged, but coordinates are **not** guaranteed to
+    /// match FFmpeg bit-for-bit.
+    ///
+    /// - `limit`: 8-bit-equivalent luma threshold (`0..=255` is scaled by bit
+    ///   depth; `0` disables black classification and yields the full frame;
+    ///   values `> 255` are treated as a raw code). 10-bit `24` becomes 96.
+    /// - `round`: width/height are expanded **outward** to a multiple of this
+    ///   (never cutting detected content). `0`/`1` skip extra multiples.
+    /// - `reset`: every N evaluated frames, drop temporal evidence but keep the
+    ///   current stable rectangle (`0` = never). This is a finite window, not
+    ///   a permanent historical maximum.
+    ///
+    /// The first two real frames are skipped (`skip=2`) and three further
+    /// high-confidence candidates are required before the first event. Use
+    /// [`crate::analysis::CropDetectionOptions`] to change skip or the
+    /// threshold type.
     Crop { limit: u32, round: u32, reset: u32 },
 }
 
@@ -57,31 +76,38 @@ pub enum AudioDetector {
 
 impl VideoDetector {
     /// The bare FFmpeg filter name, for capability checks.
-    pub(crate) fn filter_name(&self) -> &'static str {
+    ///
+    /// [`VideoDetector::Crop`] is native Rust and has no lavfi name.
+    pub(crate) fn filter_name(&self) -> Option<&'static str> {
         match self {
-            VideoDetector::Black { .. } => "blackdetect",
-            VideoDetector::Scene { .. } => "scdet",
-            VideoDetector::Crop { .. } => "cropdetect",
+            VideoDetector::Black { .. } => Some("blackdetect"),
+            VideoDetector::Scene { .. } => Some("scdet"),
+            VideoDetector::Crop { .. } => None,
         }
     }
 
     /// Renders this detector as an FFmpeg filter string.
-    pub(crate) fn to_filter(&self) -> String {
+    ///
+    /// [`VideoDetector::Crop`] returns `None` — it is not inserted into the
+    /// lavfi graph.
+    pub(crate) fn to_filter(&self) -> Option<String> {
         match *self {
             VideoDetector::Black {
                 min_duration_s,
                 pixel_th,
                 picture_th,
-            } => format!("blackdetect=d={min_duration_s}:pix_th={pixel_th}:pic_th={picture_th}"),
+            } => Some(format!(
+                "blackdetect=d={min_duration_s}:pix_th={pixel_th}:pic_th={picture_th}"
+            )),
             VideoDetector::Scene { threshold_pct } => {
-                format!("scdet=threshold={threshold_pct}:sc_pass=0")
+                Some(format!("scdet=threshold={threshold_pct}:sc_pass=0"))
             }
-            VideoDetector::Crop {
-                limit,
-                round,
-                reset,
-            } => format!("cropdetect=limit={limit}:round={round}:reset={reset}"),
+            VideoDetector::Crop { .. } => None,
         }
+    }
+
+    pub(crate) fn is_native_crop(&self) -> bool {
+        matches!(self, VideoDetector::Crop { .. })
     }
 
     /// Rejects values outside each detector's documented range up front, so
@@ -119,12 +145,10 @@ impl VideoDetector {
                 round,
                 reset,
             } => {
-                // cropdetect maps these onto FFmpeg int AVOptions; values above
-                // i32::MAX would overflow into a late graph error.
                 for (v, what) in [
-                    (limit, "cropdetect limit"),
-                    (round, "cropdetect round"),
-                    (reset, "cropdetect reset"),
+                    (limit, "crop limit"),
+                    (round, "crop round"),
+                    (reset, "crop reset"),
                 ] {
                     if v > i32::MAX as u32 {
                         return Err(Error::InvalidRecipeArg(format!(
@@ -206,7 +230,10 @@ mod tests {
             pixel_th: 0.1,
             picture_th: 0.98,
         };
-        assert_eq!(d.to_filter(), "blackdetect=d=0.1:pix_th=0.1:pic_th=0.98");
+        assert_eq!(
+            d.to_filter().unwrap(),
+            "blackdetect=d=0.1:pix_th=0.1:pic_th=0.98"
+        );
     }
 
     #[test]
@@ -214,17 +241,19 @@ mod tests {
         let d = VideoDetector::Scene {
             threshold_pct: 10.0,
         };
-        assert_eq!(d.to_filter(), "scdet=threshold=10:sc_pass=0");
+        assert_eq!(d.to_filter().unwrap(), "scdet=threshold=10:sc_pass=0");
     }
 
     #[test]
-    fn crop_filter_string() {
+    fn crop_is_native_not_lavfi() {
         let d = VideoDetector::Crop {
             limit: 24,
             round: 16,
             reset: 0,
         };
-        assert_eq!(d.to_filter(), "cropdetect=limit=24:round=16:reset=0");
+        assert!(d.to_filter().is_none());
+        assert!(d.filter_name().is_none());
+        assert!(d.is_native_crop());
     }
 
     #[test]

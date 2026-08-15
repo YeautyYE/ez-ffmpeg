@@ -8,6 +8,7 @@
 //! detectors are split into separate `asplit` branches so `ebur128`'s 100 ms
 //! re-chunking never perturbs `silencedetect`.
 
+use crate::core::analysis::crop::{CropDetectionOptions, CropObservation, DetailedAnalysisReport};
 use crate::core::analysis::detector::{AudioDetector, VideoDetector};
 use crate::core::analysis::event::{secs_to_us, MetadataEvent};
 use crate::core::analysis::filter::{EventSink, MetadataEventFilter, SinkError};
@@ -22,11 +23,30 @@ use std::ffi::CString;
 use std::ptr;
 use std::sync::{Arc, Mutex};
 
+/// Re-surfaces a typed analysis error that crossed the frame-filter
+/// boundary. [`MetadataEventFilter`] boxes [`Error`] so interlaced /
+/// hardware crop failures stay [`Error::AnalysisFrame`] (and config
+/// failures stay [`Error::InvalidRecipeArg`]) after `wait()`.
+fn map_analysis_terminal(e: Error) -> Error {
+    match e {
+        Error::FrameFilterProcess(boxed) => match boxed.downcast::<Error>() {
+            Ok(inner) => match *inner {
+                Error::AnalysisFrame(msg) => Error::AnalysisFrame(msg),
+                Error::InvalidRecipeArg(msg) => Error::InvalidRecipeArg(msg),
+                other => Error::FrameFilterProcess(Box::new(other)),
+            },
+            Err(other) => Error::FrameFilterProcess(other),
+        },
+        other => other,
+    }
+}
+
 /// A one-shot detection/measurement run over a single input.
 pub struct Analysis {
     input: Input,
     video: Vec<VideoDetector>,
     audio: Vec<AudioDetector>,
+    crop_options: Option<CropDetectionOptions>,
 }
 
 /// One mapped detector branch: a filter-graph output label and its media type.
@@ -43,12 +63,21 @@ impl Analysis {
             input: input.into(),
             video: Vec::new(),
             audio: Vec::new(),
+            crop_options: None,
         }
     }
 
     /// Adds a video detector. At most one of each kind is allowed per run.
     pub fn video_detector(mut self, detector: VideoDetector) -> Self {
         self.video.push(detector);
+        self
+    }
+
+    /// Adds native crop detection via [`CropDetectionOptions`].
+    ///
+    /// Mutually exclusive with [`VideoDetector::Crop`] on the same run.
+    pub fn crop_detection(mut self, options: CropDetectionOptions) -> Self {
+        self.crop_options = Some(options);
         self
     }
 
@@ -63,11 +92,21 @@ impl Analysis {
     /// # Errors
     /// - [`Error::InvalidRecipeArg`] if no detectors are configured, a detector
     ///   kind is duplicated, or a required filter / the `null` muxer is missing.
+    /// - [`Error::AnalysisFrame`] if native crop detection cannot read a
+    ///   decoded frame (interlaced fields, hardware surface, unsupported
+    ///   format).
     /// - Any error bubbling up from the underlying FFmpeg run.
     pub fn run(self) -> crate::error::Result<AnalysisReport> {
+        Ok(self.run_detailed()?.report)
+    }
+
+    /// Like [`run`](Self::run), but also returns the last raw/aligned crop
+    /// observation when native crop detection ran.
+    pub fn run_detailed(self) -> crate::error::Result<DetailedAnalysisReport> {
         self.validate()?;
         self.check_capabilities()?;
 
+        let crop = self.resolved_crop()?;
         let (filter_desc, branches) = self.plan();
         let cfg = self.fold_config();
 
@@ -75,7 +114,14 @@ impl Analysis {
         let pipelines: Vec<FramePipeline> = branches
             .iter()
             .enumerate()
-            .map(|(index, branch)| make_pipeline(branch.media, index, collector.clone()))
+            .map(|(index, branch)| {
+                let crop = if branch.media == AVMEDIA_TYPE_VIDEO {
+                    crop.clone()
+                } else {
+                    None
+                };
+                make_pipeline(branch.media, index, collector.clone(), crop)
+            })
             .collect();
 
         let mut output = Output::from("-")
@@ -90,7 +136,11 @@ impl Analysis {
             .filter_desc(filter_desc)
             .output(output)
             .build()?;
-        FfmpegScheduler::new(context).start()?.wait()?;
+        FfmpegScheduler::new(context)
+            .start()
+            .map_err(map_analysis_terminal)?
+            .wait()
+            .map_err(map_analysis_terminal)?;
 
         let state = collector
             .lock()
@@ -101,13 +151,17 @@ impl Analysis {
                         .to_string(),
                 )
             })?;
-        Ok(finalize(state, &cfg))
+        let last_crop_observation = state.last_crop_observation;
+        Ok(DetailedAnalysisReport {
+            report: finalize(state, &cfg),
+            last_crop_observation,
+        })
     }
 
     /// Rejects empty and duplicated detector sets (duplicate detectors of the
     /// same kind write indistinguishable `lavfi.*` keys).
     fn validate(&self) -> crate::error::Result<()> {
-        if self.video.is_empty() && self.audio.is_empty() {
+        if self.video.is_empty() && self.audio.is_empty() && self.crop_options.is_none() {
             return Err(Error::InvalidRecipeArg(
                 "Analysis requires at least one detector".to_string(),
             ));
@@ -122,10 +176,16 @@ impl Analysis {
             if seen_video[idx] {
                 return Err(Error::InvalidRecipeArg(format!(
                     "duplicate video detector '{}' on the same media",
-                    detector.filter_name()
+                    detector.filter_name().unwrap_or("crop")
                 )));
             }
             seen_video[idx] = true;
+        }
+        if seen_video[2] && self.crop_options.is_some() {
+            return Err(Error::InvalidRecipeArg(
+                "crop detection is configured twice (VideoDetector::Crop and Analysis::crop_detection)"
+                    .to_string(),
+            ));
         }
         let mut seen_audio = [false; 2];
         for detector in &self.audio {
@@ -147,21 +207,51 @@ impl Analysis {
         for detector in &self.audio {
             detector.validate()?;
         }
+        if let Some(opts) = &self.crop_options {
+            opts.validate()?;
+        }
         Ok(())
+    }
+
+    fn resolved_crop(&self) -> crate::error::Result<Option<CropDetectionOptions>> {
+        if let Some(opts) = &self.crop_options {
+            return Ok(Some(opts.clone()));
+        }
+        for detector in &self.video {
+            if let VideoDetector::Crop {
+                limit,
+                round,
+                reset,
+            } = *detector
+            {
+                return Ok(Some(CropDetectionOptions::from_legacy(limit, round, reset)));
+            }
+        }
+        Ok(None)
     }
 
     /// Verifies the chosen filters, `asplit` (if needed), and the `null` muxer
     /// exist in the linked FFmpeg build. Best-effort — passing here does not
     /// guarantee the graph parses.
+    ///
+    /// Native crop does **not** require `cropdetect`. A crop-only video branch
+    /// uses the lavfi `null` passthrough.
     fn check_capabilities(&self) -> crate::error::Result<()> {
         for detector in &self.video {
-            require_filter(detector.filter_name())?;
+            if let Some(name) = detector.filter_name() {
+                require_filter(name)?;
+            }
         }
         for detector in &self.audio {
             require_filter(detector.filter_name())?;
         }
         if self.audio.len() >= 2 {
             require_filter("asplit")?;
+        }
+        let has_lavfi_video = self.video.iter().any(|d| d.to_filter().is_some());
+        let has_crop = self.crop_options.is_some() || self.video.iter().any(|d| d.is_native_crop());
+        if has_crop && !has_lavfi_video {
+            require_filter("null")?;
         }
         require_null_muxer()
     }
@@ -171,22 +261,23 @@ impl Analysis {
         let mut desc_parts: Vec<String> = Vec::new();
         let mut branches: Vec<Branch> = Vec::new();
 
-        // Video detectors are all passthrough, so they chain on one branch.
-        if !self.video.is_empty() {
-            let chain = self
-                .video
-                .iter()
-                .map(|d| d.to_filter())
-                .collect::<Vec<_>>()
-                .join(",");
+        let lavfi_video: Vec<String> = self.video.iter().filter_map(|d| d.to_filter()).collect();
+        let has_crop = self.crop_options.is_some() || self.video.iter().any(|d| d.is_native_crop());
+        if !lavfi_video.is_empty() {
+            let chain = lavfi_video.join(",");
             desc_parts.push(format!("[0:v]{chain}[vdet]"));
+            branches.push(Branch {
+                media: AVMEDIA_TYPE_VIDEO,
+                map: "[vdet]".to_string(),
+            });
+        } else if has_crop {
+            desc_parts.push("[0:v]null[vdet]".to_string());
             branches.push(Branch {
                 media: AVMEDIA_TYPE_VIDEO,
                 map: "[vdet]".to_string(),
             });
         }
 
-        // Audio detectors must be isolated: split into one branch each.
         match self.audio.len() {
             0 => {}
             1 => {
@@ -254,8 +345,20 @@ fn make_pipeline(
     media: AVMediaType,
     stream_index: usize,
     collector: Arc<Mutex<FoldState>>,
+    crop: Option<CropDetectionOptions>,
 ) -> FramePipeline {
-    let filter = MetadataEventFilter::new(media, FoldSink { collector });
+    let obs_collector = collector.clone();
+    let mut filter = MetadataEventFilter::new(media, FoldSink { collector });
+    if let Some(options) = crop {
+        filter =
+            filter
+                .with_crop_detection(options)
+                .with_crop_observer(move |obs: CropObservation| {
+                    if let Ok(mut guard) = obs_collector.lock() {
+                        guard.last_crop_observation = Some(obs);
+                    }
+                });
+    }
     FramePipelineBuilder::new(media)
         .filter("analysis", Box::new(filter))
         .set_stream_index(stream_index)
@@ -324,6 +427,53 @@ mod tests {
             .plan();
         assert_eq!(desc, "[0:a]ebur128=metadata=1:peak=true[adet0]");
         assert_eq!(branches.len(), 1);
+    }
+
+    #[test]
+    fn plan_crop_only_uses_null_passthrough() {
+        let (desc, branches) = Analysis::new("input.mp4")
+            .video_detector(VideoDetector::Crop {
+                limit: 24,
+                round: 16,
+                reset: 0,
+            })
+            .plan();
+        assert_eq!(desc, "[0:v]null[vdet]");
+        assert!(!desc.contains("cropdetect"));
+        assert_eq!(branches.len(), 1);
+        assert_eq!(branches[0].media, AVMEDIA_TYPE_VIDEO);
+    }
+
+    #[test]
+    fn plan_crop_with_black_omits_cropdetect() {
+        let (desc, _) = Analysis::new("input.mp4")
+            .video_detector(VideoDetector::Black {
+                min_duration_s: 0.1,
+                pixel_th: 0.1,
+                picture_th: 0.98,
+            })
+            .video_detector(VideoDetector::Crop {
+                limit: 24,
+                round: 16,
+                reset: 0,
+            })
+            .plan();
+        assert!(desc.contains("blackdetect"));
+        assert!(!desc.contains("cropdetect"));
+        assert!(!desc.contains("null[vdet]"));
+    }
+
+    #[test]
+    fn duplicate_crop_api_is_rejected() {
+        let result = Analysis::new("input.mp4")
+            .video_detector(VideoDetector::Crop {
+                limit: 24,
+                round: 16,
+                reset: 0,
+            })
+            .crop_detection(CropDetectionOptions::new())
+            .validate();
+        assert!(matches!(result, Err(Error::InvalidRecipeArg(_))));
     }
 
     #[test]
@@ -447,5 +597,16 @@ mod tests {
         let report = finalize(state, &FoldConfig::default());
         assert_eq!(report.scenes.len(), 4);
         assert_eq!(report.black.len(), 1);
+    }
+
+    #[test]
+    fn map_analysis_terminal_restores_analysis_frame() {
+        let boxed: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(Error::AnalysisFrame("interlaced".into()));
+        let mapped = map_analysis_terminal(Error::FrameFilterProcess(boxed));
+        assert!(
+            matches!(mapped, Error::AnalysisFrame(_)),
+            "typed AnalysisFrame must survive the filter boundary, got {mapped}"
+        );
     }
 }

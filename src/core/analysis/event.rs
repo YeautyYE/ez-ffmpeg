@@ -147,7 +147,9 @@ pub enum MetadataEvent {
     /// A scene change was detected (`scdet`); emitted only on frames that
     /// carry `lavfi.scd.time`. `score` is the `lavfi.scd.score` value.
     SceneChange { at: Timestamp, score: f64 },
-    /// A crop suggestion for this frame (`cropdetect`).
+    /// A crop suggestion for this frame (native luma scanner, or legacy
+    /// `lavfi.cropdetect.*` when an explicit `cropdetect` graph is attached
+    /// and native crop is not configured).
     CropDetect {
         at: Timestamp,
         x: i32,
@@ -235,6 +237,7 @@ pub(crate) fn parse_frame_metadata(
     media: AVMediaType,
     out: &mut Vec<MetadataEvent>,
     state: &mut ParseState,
+    skip_legacy_crop: bool,
 ) {
     if let Some(ts) = frame_ts {
         state.last_ts = Some(ts);
@@ -244,7 +247,9 @@ pub(crate) fn parse_frame_metadata(
         AVMEDIA_TYPE_VIDEO => {
             parse_black(md, out, state);
             parse_scene(md, out);
-            parse_crop(md, frame_ts, out);
+            if !skip_legacy_crop {
+                parse_crop(md, frame_ts, out);
+            }
         }
         AVMEDIA_TYPE_AUDIO => {
             parse_silence(md, out, state);
@@ -420,7 +425,7 @@ mod tests {
     ) -> Vec<MetadataEvent> {
         let f = md_frame(pairs);
         let mut out = Vec::new();
-        parse_frame_metadata(&f.metadata(), None, media, &mut out, state);
+        parse_frame_metadata(&f.metadata(), None, media, &mut out, state, false);
         out
     }
 
@@ -545,7 +550,14 @@ mod tests {
             ("lavfi.r128.LRA", "5.0"),
         ]);
         let mut out = Vec::new();
-        parse_frame_metadata(&f.metadata(), ts, AVMEDIA_TYPE_AUDIO, &mut out, &mut state);
+        parse_frame_metadata(
+            &f.metadata(),
+            ts,
+            AVMEDIA_TYPE_AUDIO,
+            &mut out,
+            &mut state,
+            false,
+        );
         match &out[0] {
             MetadataEvent::R128Frame {
                 true_peak,
@@ -573,7 +585,14 @@ mod tests {
             ("lavfi.r128.true_peak", "-1.5"),
         ]);
         let mut out = Vec::new();
-        parse_frame_metadata(&f.metadata(), ts, AVMEDIA_TYPE_AUDIO, &mut out, &mut state);
+        parse_frame_metadata(
+            &f.metadata(),
+            ts,
+            AVMEDIA_TYPE_AUDIO,
+            &mut out,
+            &mut state,
+            false,
+        );
         match &out[0] {
             MetadataEvent::R128Frame { true_peak, .. } => assert_eq!(*true_peak, Some(-1.5)),
             other => panic!("expected R128Frame, got {other:?}"),
@@ -588,5 +607,46 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn legacy_crop_metadata_parses_when_enabled() {
+        let mut state = ParseState::default();
+        let ts = Timestamp::from_secs(1.0).unwrap();
+        let f = md_frame(&[
+            ("lavfi.cropdetect.x", "8"),
+            ("lavfi.cropdetect.y", "16"),
+            ("lavfi.cropdetect.w", "300"),
+            ("lavfi.cropdetect.h", "200"),
+        ]);
+        let mut out = Vec::new();
+        parse_frame_metadata(
+            &f.metadata(),
+            Some(ts),
+            AVMEDIA_TYPE_VIDEO,
+            &mut out,
+            &mut state,
+            false,
+        );
+        assert_eq!(
+            out,
+            vec![MetadataEvent::CropDetect {
+                at: ts,
+                x: 8,
+                y: 16,
+                w: 300,
+                h: 200,
+            }]
+        );
+        out.clear();
+        parse_frame_metadata(
+            &f.metadata(),
+            Some(ts),
+            AVMEDIA_TYPE_VIDEO,
+            &mut out,
+            &mut state,
+            true,
+        );
+        assert!(out.is_empty());
     }
 }

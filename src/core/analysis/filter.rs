@@ -1,15 +1,18 @@
 //! The reusable [`MetadataEventFilter`] and its event-sink plumbing.
 //!
 //! [`MetadataEventFilter`] is a passthrough [`FrameFilter`]: it reads each
-//! frame's `lavfi.*` metadata into [`MetadataEvent`]s, pushes them to an
+//! frame's `lavfi.*` metadata into [`MetadataEvent`]s, optionally runs the
+//! native Rust crop scanner on the same frame, pushes events to an
 //! [`EventSink`], and returns the frame unchanged (the `NoopFilter` pattern).
 //! Mount it on an output frame pipeline downstream of the detector filters.
 
+use crate::core::analysis::crop::{CropDetectionOptions, CropObservation, CropScanner};
 use crate::core::analysis::event::{parse_frame_metadata, MetadataEvent, ParseState, Timestamp};
 use crate::core::filter::frame_filter::{FrameFilter, FrameFilterError, RequestFrameMode};
 use crate::core::filter::frame_filter_context::FrameFilterContext;
 use ffmpeg_next::Frame;
 use ffmpeg_sys_next::{AVMediaType, AV_NOPTS_VALUE};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::time::Duration;
 
@@ -80,7 +83,8 @@ impl<F: FnMut(MetadataEvent) + Send> EventSink for F {
     }
 }
 
-/// A passthrough [`FrameFilter`] that surfaces detector metadata as events.
+/// A passthrough [`FrameFilter`] that surfaces detector metadata as events
+/// and can run native Rust crop detection on the same video frames.
 pub struct MetadataEventFilter {
     media_type: AVMediaType,
     sink: Box<dyn EventSink>,
@@ -88,9 +92,12 @@ pub struct MetadataEventFilter {
     ignore_disconnected: bool,
     state: ParseState,
     /// Reused per-frame event buffer. Event-carrying frames (every audio
-    /// frame under ebur128, every video frame under cropdetect) would
+    /// frame under ebur128, every video frame under native crop) would
     /// otherwise allocate and free a fresh `Vec` on each `filter_frame`.
     events_scratch: Vec<MetadataEvent>,
+    crop_options: Option<CropDetectionOptions>,
+    crop: Option<CropScanner>,
+    crop_observer: Option<Box<dyn FnMut(CropObservation) + Send>>,
 }
 
 impl MetadataEventFilter {
@@ -105,6 +112,9 @@ impl MetadataEventFilter {
             ignore_disconnected: false,
             state: ParseState::default(),
             events_scratch: Vec::new(),
+            crop_options: None,
+            crop: None,
+            crop_observer: None,
         }
     }
 
@@ -118,6 +128,29 @@ impl MetadataEventFilter {
     /// continue instead of aborting. [`BackpressurePolicy::Drop`] implies this.
     pub fn ignore_disconnected(mut self, ignore: bool) -> Self {
         self.ignore_disconnected = ignore;
+        self
+    }
+
+    /// Enable native crop / letterbox detection on this filter.
+    ///
+    /// Must be used on a video filter; `init` returns an error if the media
+    /// type is not video.
+    pub fn with_crop_detection(mut self, options: CropDetectionOptions) -> Self {
+        self.crop_options = Some(options);
+        self
+    }
+
+    /// Receive raw + aligned crop observations (same values as the published
+    /// [`MetadataEvent::CropDetect`], plus half-open raw bounds).
+    ///
+    /// The observer is invoked only after a stable rectangle is published.
+    /// Panics in the observer are caught and discarded so they cannot unwind
+    /// through the media pipeline.
+    pub fn with_crop_observer(
+        mut self,
+        observer: impl FnMut(CropObservation) + Send + 'static,
+    ) -> Self {
+        self.crop_observer = Some(Box::new(observer));
         self
     }
 
@@ -156,6 +189,25 @@ impl FrameFilter for MetadataEventFilter {
     fn request_frame_mode(&self) -> RequestFrameMode {
         // Pure metadata tap: transforms input, never generates frames (PERF-8).
         RequestFrameMode::Never
+    }
+
+    fn init(&mut self, ctx: &mut FrameFilterContext) -> Result<(), FrameFilterError> {
+        if let Some(options) = self.crop_options.take() {
+            if self.media_type != ffmpeg_sys_next::AVMediaType::AVMEDIA_TYPE_VIDEO {
+                return Err(
+                    "crop detection can only be attached to a video MetadataEventFilter".into(),
+                );
+            }
+            self.crop =
+                Some(CropScanner::new(options).map_err(|e| -> FrameFilterError { Box::new(e) })?);
+        }
+        if self.crop_observer.is_some() && self.crop.is_none() {
+            return Err(
+                "with_crop_observer requires with_crop_detection on the same filter".into(),
+            );
+        }
+        log::debug!("Initializing filter:{}", ctx.name());
+        Ok(())
     }
 
     fn filter_frame(
@@ -201,7 +253,38 @@ impl FrameFilter for MetadataEventFilter {
         let mut events = std::mem::take(&mut self.events_scratch);
         {
             let md = frame.metadata();
-            parse_frame_metadata(&md, frame_ts, self.media_type, &mut events, &mut self.state);
+            parse_frame_metadata(
+                &md,
+                frame_ts,
+                self.media_type,
+                &mut events,
+                &mut self.state,
+                self.crop.is_some(),
+            );
+        }
+        let scene_changed = events
+            .iter()
+            .any(|ev| matches!(ev, MetadataEvent::SceneChange { .. }));
+        let crop_out = if let Some(scanner) = self.crop.as_mut() {
+            scanner
+                .process_frame(&frame, frame_ts, scene_changed)
+                .map_err(|e| -> FrameFilterError { Box::new(e) })?
+        } else {
+            None
+        };
+        if let Some((sug, obs)) = crop_out {
+            events.push(MetadataEvent::CropDetect {
+                at: obs.at,
+                x: sug.x,
+                y: sug.y,
+                w: sug.w,
+                h: sug.h,
+            });
+            if let Some(observer) = self.crop_observer.as_mut() {
+                if let Err(payload) = catch_unwind(AssertUnwindSafe(|| observer(obs))) {
+                    crate::core::packet_sink::dispose_panic_payload(payload);
+                }
+            }
         }
         if let Some(end) = frame_end_ts {
             self.state.record_frame_end(end);

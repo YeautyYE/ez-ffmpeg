@@ -31,7 +31,8 @@ pub struct SceneChange {
     pub score: f64,
 }
 
-/// A suggested crop rectangle (last stable `cropdetect` value).
+/// A suggested crop rectangle (last stable native-scanner or legacy
+/// `cropdetect` metadata value).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CropSuggestion {
     pub x: i32,
@@ -81,6 +82,7 @@ pub(crate) struct FoldState {
     pending_silence: Vec<(Option<usize>, i64)>,
     video_end_us: Option<i64>,
     audio_end_us: Option<i64>,
+    pub(crate) last_crop_observation: Option<crate::core::analysis::crop::CropObservation>,
 }
 
 #[cfg(test)]
