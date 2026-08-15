@@ -19,11 +19,20 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn scratch_dir() -> PathBuf {
+    // pid + per-process sequence keep parallel tests collision-free even on
+    // hosts whose clock is too coarse for `as_nanos` to differ between two
+    // simultaneous starts; a name collision would let one test's cleanup
+    // delete another test's files mid-run.
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!("ez-ffmpeg-http-input-{nanos}"));
+    let dir = std::env::temp_dir().join(format!(
+        "ez-ffmpeg-http-input-{}-{}-{nanos}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -929,7 +938,23 @@ httpd.serve_forever()
     let _ = child.kill();
     let _ = child.wait();
     result.unwrap();
-    assert!(out.metadata().unwrap().len() > 0);
+    // One windows-2025 CI run hit NotFound here right after a successful
+    // remux; list the scratch dir so any recurrence shows what survived.
+    let out_meta = out.metadata().unwrap_or_else(|err| {
+        let listing = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(", "),
+            Err(e) => format!("<read_dir failed: {e}>"),
+        };
+        panic!(
+            "out.mp4 missing after a successful remux: {err}; {} contains [{listing}]",
+            dir.display()
+        )
+    });
+    assert!(out_meta.len() > 0);
     let _ = std::fs::remove_dir_all(dir);
 }
 
