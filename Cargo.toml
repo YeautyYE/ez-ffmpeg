@@ -72,8 +72,10 @@ zeroize = { version = "=1.8.2", optional = true, default-features = false }
 chacha20 = { version = "=0.9.1", optional = true, default-features = false }
 # reqwest lists quinn as an unused optional; 0.11.16+ pulls rand 0.10 → chacha20 0.10.
 # Keep the pins; do not activate them from `http-input` (no HTTP/3).
+# quinn-proto 0.11.15 clears RUSTSEC-2026-0037 / RUSTSEC-2026-0185 while
+# staying on the 1.80-resolvable dependency set.
 quinn = { version = "=0.11.9", optional = true, default-features = false }
-quinn-proto = { version = "=0.11.13", optional = true, default-features = false }
+quinn-proto = { version = "=0.11.15", optional = true, default-features = false }
 # quinn-udp 0.5.15+ requires rustc 1.85.
 quinn-udp = { version = "=0.5.14", optional = true, default-features = false }
 
