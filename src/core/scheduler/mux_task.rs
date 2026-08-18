@@ -3873,14 +3873,39 @@ mod tests {
         let parked_probe = Arc::clone(&parked);
         let joined_probe = Arc::clone(&joined_cleanly);
 
-        // The "encoder": parks on the now-full queue with a long timeout; only
-        // the guard closing the queue can release it within the test bound.
-        // Fullness needs BOTH limits exceeded (FFmpeg parity: packet cap AND
-        // byte threshold), so the waited-for size must overshoot the
-        // threshold too — the parked empty packet contributes 0 bytes.
+        // The "encoder": the same shape as enc_task's send loop — try the
+        // admission, park on Full, retry after every wake. wait_for_space is
+        // advisory (one bounded condvar wait; spurious wakeups are legal and
+        // the caller re-runs the authoritative admission), so the thread may
+        // only report completion when try_push says Disconnected — i.e. the
+        // guard's close. Fullness needs BOTH limits exceeded (FFmpeg parity:
+        // packet cap AND byte threshold), so the retried packet carries a
+        // 2-byte payload to overshoot the 1-byte threshold; the parked empty
+        // packet contributes 0 bytes and only holds the packet cap.
         let handle = std::thread::spawn(move || {
-            parked_probe.store(true, Ordering::SeqCst);
-            pre_sender.wait_for_space(2, Duration::from_secs(30));
+            let mut second = PacketBox {
+                packet: Packet::new(2),
+                packet_data: PacketData {
+                    dts_est: 1,
+                    codec_type: AVMEDIA_TYPE_VIDEO,
+                    output_stream_index: 0,
+                    is_copy: false,
+                },
+            };
+            loop {
+                match pre_sender.try_push(second) {
+                    PreQueueTryPush::Sent => panic!(
+                        "the second packet was admitted: the queue was supposed \
+                         to stay full for the whole test (nothing drains it)"
+                    ),
+                    PreQueueTryPush::Full(back) => {
+                        second = back;
+                        parked_probe.store(true, Ordering::SeqCst);
+                        pre_sender.wait_for_space(2, Duration::from_secs(30));
+                    }
+                    PreQueueTryPush::Disconnected(_) => break,
+                }
+            }
             joined_probe.store(true, Ordering::SeqCst);
         });
 
@@ -3889,8 +3914,10 @@ mod tests {
         let (handle_tx, handle_rx) = crossbeam_channel::unbounded();
         handle_tx.send(handle).unwrap();
 
-        // Wait until the encoder reached the park call, give it a beat to
-        // enter the condvar wait, then prove it is genuinely blocked.
+        // Wait until the encoder reached the park call. The completion flag
+        // can only flip on a Disconnected admission (never on a spurious
+        // wake — those loop back into Full), so after a grace beat a set
+        // flag means the queue closed or admitted prematurely.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !parked.load(Ordering::SeqCst) {
             assert!(std::time::Instant::now() < deadline, "encoder never parked");
