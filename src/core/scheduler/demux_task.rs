@@ -520,6 +520,15 @@ unsafe fn interruptible_usleep(mut remaining_us: i64, scheduler_status: &Arc<Ato
     }
 }
 
+/// Whether the past-limit trigger packet's OWN timestamps prove that cutting
+/// a decoder at this packet loses no frame the inserted trim would keep (see
+/// `DEMUX_SEND_RECORDING_TIME_EOF_DECODE`).
+unsafe fn decode_cut_is_certain(pkt: *const AVPacket) -> bool {
+    let dts = (*pkt).dts;
+    let pts = (*pkt).pts;
+    dts != AV_NOPTS_VALUE && pts != AV_NOPTS_VALUE && pts >= dts
+}
+
 unsafe fn input_packet_process(
     demux_parameter: &mut DemuxerParameter,
     in_fmt_ctx: *mut AVFormatContext,
@@ -542,7 +551,10 @@ unsafe fn input_packet_process(
                 .get_mut((*pkt).stream_index as usize)
                 .unwrap();
             if ds.dts >= recording_time_us + start_time {
-                *send_flags |= DEMUX_SEND_STREAMCOPY_EOF;
+                *send_flags |= DEMUX_SEND_RECORDING_TIME_EOF;
+                if decode_cut_is_certain(pkt) {
+                    *send_flags |= DEMUX_SEND_RECORDING_TIME_EOF_DECODE;
+                }
             }
         }
     }
@@ -1481,7 +1493,36 @@ unsafe fn demux_send_for_stream(
     unreachable!("move_pos was selected from a still-active destination")
 }
 
-const DEMUX_SEND_STREAMCOPY_EOF: usize = 1 << 0;
+/// fftools' `DEMUX_SEND_STREAMCOPY_EOF` (ffmpeg_demux.c input_packet_process /
+/// ffmpeg_sched.c demux_stream_send_to_dst), renamed for what it does here.
+/// fftools converts the first past-recording-limit packet into EOF for MUX
+/// (streamcopy) destinations only and keeps feeding decoders to the end of the
+/// file — the trim/atrim inserted from `recording_time` (fg_bind.rs) already
+/// bounds what the graph EMITS, so those extra reads buy nothing. ez converts
+/// the packet for decoder destinations too: the decoder receives it as the
+/// data-carrying `stream_index = -1` drain-and-finish sentinel (dec_task.rs),
+/// the same per-stream accounting feeds the `nb_streams_finished` exit, and
+/// the demuxer stops READING at the recording window's tail instead of at job
+/// teardown — on slow/remote sources those post-window reads were seconds of
+/// wasted IO contending with other inputs. Copy destinations convert on this
+/// bit alone (fftools parity); a decoder is cut only when the companion
+/// `DEMUX_SEND_RECORDING_TIME_EOF_DECODE` bit is also set.
+const DEMUX_SEND_RECORDING_TIME_EOF: usize = 1 << 0;
+
+/// Companion bit for DECODER destinations: set only when the trigger packet's
+/// OWN timestamps prove the cut loses no frame the graph would have kept —
+/// the packet carries a real dts (`ds.dts`, which the trigger compares, is a
+/// duration-accumulating ESTIMATE when it does not: `ist_dts_update`) and a
+/// pts with `pts >= dts`, so every frame it decodes to has
+/// `pts >= dts >= limit` and the trim inserted from `recording_time`
+/// (fg_bind.rs) drops it; frames still buffered in the decoder from earlier
+/// packets are drained by the sentinel, not lost. Without that certainty (a
+/// timestamp-missing stream, or a malformed `pts < dts` packet that can
+/// decode to frames BEFORE the window tail) the decoder keeps the
+/// pre-conversion path: the packet is delivered and the trim decides by
+/// decoded frame pts — the post-window reads are wasted IO again, but no
+/// frame the old path produced is lost.
+const DEMUX_SEND_RECORDING_TIME_EOF_DECODE: usize = 1 << 1;
 
 /// Non-EOF fatal sentinel: a streamcopy pre-mux queue stayed full past the
 /// deadline. The demux loop must abort the job (the real error is recorded via
@@ -1555,10 +1596,24 @@ unsafe fn demux_stream_send_to_dst(
         return AVERROR_EOF;
     }
 
-    if !packet_is_null(&packet_box.packet)
-        && output_stream_index.is_some()
-        && (flags & DEMUX_SEND_STREAMCOPY_EOF) != 0
-    {
+    // Recording limit reached: convert this packet into the destination's EOF
+    // marker instead of delivering it — copy destinations on the base bit
+    // alone (fftools parity), decoder destinations only when the packet's own
+    // timestamps prove the cut is lossless (the _DECODE bit; an uncertain
+    // packet keeps flowing and the input-side trim decides by frame pts). A
+    // decoder reads a `stream_index = -1` packet that carries payload OR side
+    // data as its terminal drain sentinel; only a fully EMPTY -1 packet is
+    // the seek/stream_loop flush that resets and keeps the decoder alive
+    // (dec_task.rs `have_data`). Demuxed packets carry payload (side-data-only
+    // packets still read as terminal); in the hypothetical fully-empty case
+    // the decoder merely resets and the job still ends through the demux exit
+    // below plus the channel-disconnect teardown — the pre-change path.
+    let recording_cut = if output_stream_index.is_some() {
+        (flags & DEMUX_SEND_RECORDING_TIME_EOF) != 0
+    } else {
+        (flags & DEMUX_SEND_RECORDING_TIME_EOF_DECODE) != 0
+    };
+    if !packet_is_null(&packet_box.packet) && recording_cut {
         unsafe {
             (*packet_box.packet.as_mut_ptr()).stream_index = -1;
         }
@@ -1566,7 +1621,7 @@ unsafe fn demux_stream_send_to_dst(
     }
 
     if let Some(output_stream_index) = output_stream_index {
-        if (flags & DEMUX_SEND_STREAMCOPY_EOF) == 0 {
+        if (flags & DEMUX_SEND_RECORDING_TIME_EOF) == 0 {
             (*packet_box.packet.as_mut_ptr()).stream_index = *output_stream_index as i32;
         }
         packet_box.packet_data.output_stream_index = *output_stream_index as i32;
@@ -1574,8 +1629,10 @@ unsafe fn demux_stream_send_to_dst(
     }
 
     if *dst_finished {
-        // Copy EOF marker (a real dts): still routed through the gate so it
-        // drains in DTS order with the stream's data packets.
+        // Recording-limit EOF marker (a real dts): a copy destination still
+        // routes it through the gate so it drains in DTS order with the
+        // stream's data packets; a decoder destination takes the direct
+        // bounded channel like any other packet.
         match route_dst_send(
             packet_box,
             packet_dst,
@@ -1672,9 +1729,259 @@ unsafe fn demux_flush(
 
 #[cfg(test)]
 mod tests {
+    use ffmpeg_next::packet::Ref;
     use ffmpeg_sys_next::{
         av_inv_q, av_rescale_q, AVRational, AV_NOPTS_VALUE, AV_TIME_BASE, AV_TIME_BASE_Q,
     };
+
+    struct DstSendFixture {
+        status: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        pause_epoch: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        result: std::sync::Arc<std::sync::Mutex<Option<crate::error::Result<()>>>>,
+    }
+
+    fn dst_send_fixture() -> DstSendFixture {
+        use crate::core::scheduler::ffmpeg_scheduler::STATUS_RUN;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::{Arc, Mutex};
+        DstSendFixture {
+            status: Arc::new(AtomicUsize::new(STATUS_RUN)),
+            pause_epoch: Arc::new(AtomicUsize::new(0)),
+            result: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn data_packet_box() -> crate::core::context::PacketBox {
+        use crate::core::context::{PacketBox, PacketData};
+        use ffmpeg_sys_next::AVMediaType::AVMEDIA_TYPE_VIDEO;
+        PacketBox {
+            // A real data-carrying packet, as every packet reaching the
+            // recording-limit conversion is.
+            packet: ffmpeg_next::Packet::new(8),
+            packet_data: PacketData {
+                dts_est: 0,
+                codec_type: AVMEDIA_TYPE_VIDEO,
+                output_stream_index: 0,
+                is_copy: false,
+            },
+        }
+    }
+
+    // Recording-limit regression: the EOF conversion must apply to DECODER
+    // destinations, not only streamcopy. The packet becomes the data-carrying
+    // `stream_index = -1` sentinel the decoder drains-and-finishes on
+    // (dec_task.rs `have_data`), the destination is marked finished, and the
+    // AVERROR_EOF return feeds the per-stream `nb_streams_finished` exit that
+    // stops the demuxer's reads at the window tail. Before this, a decode-fed
+    // job read (and paid slow-source IO for) everything past the window until
+    // teardown.
+    #[test]
+    fn recording_limit_converts_the_packet_into_a_decoder_drain_sentinel() {
+        use super::{
+            demux_stream_send_to_dst, DEMUX_SEND_RECORDING_TIME_EOF,
+            DEMUX_SEND_RECORDING_TIME_EOF_DECODE,
+        };
+        use ffmpeg_sys_next::AVERROR_EOF;
+
+        let fx = dst_send_fixture();
+        let (tx, rx) = crossbeam_channel::bounded(2);
+        let mut dst_finished = false;
+
+        let ret = unsafe {
+            demux_stream_send_to_dst(
+                data_packet_box(),
+                &tx,
+                &None, // a decoder destination
+                &mut dst_finished,
+                None,
+                // The trigger packet's timestamps certified the cut
+                // (input_packet_process sets both bits together then).
+                DEMUX_SEND_RECORDING_TIME_EOF | DEMUX_SEND_RECORDING_TIME_EOF_DECODE,
+                &fx.status,
+                &fx.pause_epoch,
+                &fx.result,
+            )
+        };
+
+        assert_eq!(
+            ret, AVERROR_EOF,
+            "the recording-limit send must report this destination finished"
+        );
+        assert!(dst_finished, "the decoder destination must be marked done");
+        let marker = rx
+            .try_recv()
+            .expect("the converted packet must still be delivered as the drain sentinel");
+        unsafe {
+            assert_eq!(
+                (*marker.packet.as_ptr()).stream_index,
+                -1,
+                "the sentinel is the stream_index = -1 marker the decoder drains on"
+            );
+            assert!(
+                !(*marker.packet.as_ptr()).buf.is_null(),
+                "the sentinel must stay data-carrying: a dataless -1 packet is the \
+                 seek/stream_loop flush that RESETS the decoder instead of finishing it"
+            );
+        }
+    }
+
+    // Guard the gate removal in the other direction: without the flag a
+    // decoder destination receives the packet untouched and stays live.
+    #[test]
+    fn no_recording_flag_delivers_the_packet_to_a_decoder_untouched() {
+        use super::demux_stream_send_to_dst;
+
+        let fx = dst_send_fixture();
+        let (tx, rx) = crossbeam_channel::bounded(2);
+        let mut dst_finished = false;
+
+        let ret = unsafe {
+            demux_stream_send_to_dst(
+                data_packet_box(),
+                &tx,
+                &None,
+                &mut dst_finished,
+                None,
+                0,
+                &fx.status,
+                &fx.pause_epoch,
+                &fx.result,
+            )
+        };
+
+        assert_eq!(ret, 0, "a plain delivery must not report EOF");
+        assert!(!dst_finished, "the destination stays live");
+        let delivered = rx.try_recv().expect("the packet must be delivered");
+        unsafe {
+            assert_eq!(
+                (*delivered.packet.as_ptr()).stream_index,
+                0,
+                "a decoder destination's packet keeps its demuxer stream index"
+            );
+        }
+    }
+
+    // The lossless-cut guard: when the trigger packet's timestamps cannot
+    // prove that every frame it decodes to lies past the window (`ds.dts` was
+    // estimated, or a malformed pts < dts packet), the base recording flag is
+    // set WITHOUT the _DECODE bit — and a decoder destination must keep
+    // receiving the packet untouched so the input-side trim, which sees real
+    // decoded frame pts, makes the call. Cutting here instead would drop
+    // frames the pre-conversion path delivered.
+    #[test]
+    fn uncertain_timestamps_keep_feeding_the_decoder() {
+        use super::{demux_stream_send_to_dst, DEMUX_SEND_RECORDING_TIME_EOF};
+
+        let fx = dst_send_fixture();
+        let (tx, rx) = crossbeam_channel::bounded(2);
+        let mut dst_finished = false;
+
+        let ret = unsafe {
+            demux_stream_send_to_dst(
+                data_packet_box(),
+                &tx,
+                &None, // a decoder destination
+                &mut dst_finished,
+                None,
+                DEMUX_SEND_RECORDING_TIME_EOF, // no _DECODE bit: uncertain
+                &fx.status,
+                &fx.pause_epoch,
+                &fx.result,
+            )
+        };
+
+        assert_eq!(ret, 0, "an uncertain cut must not finish a decoder");
+        assert!(!dst_finished, "the decoder destination stays live");
+        let delivered = rx.try_recv().expect("the packet must be delivered");
+        unsafe {
+            assert_eq!(
+                (*delivered.packet.as_ptr()).stream_index,
+                0,
+                "the packet reaches the decoder unconverted"
+            );
+        }
+    }
+
+    // Copy destinations keep the unconditional fftools-parity conversion: the
+    // base flag alone cuts them even when the packet's timestamps could not
+    // certify a decoder cut (a copy destination forwards packets whole, so
+    // the frame-loss concern does not exist there and the pre-existing
+    // `ds.dts` semantics stay untouched).
+    #[test]
+    fn uncertain_timestamps_still_cut_a_copy_destination() {
+        use super::{demux_stream_send_to_dst, DEMUX_SEND_RECORDING_TIME_EOF};
+        use ffmpeg_sys_next::AVERROR_EOF;
+
+        let fx = dst_send_fixture();
+        let (tx, rx) = crossbeam_channel::bounded(2);
+        let mut dst_finished = false;
+
+        let ret = unsafe {
+            demux_stream_send_to_dst(
+                data_packet_box(),
+                &tx,
+                &Some(3), // a streamcopy destination
+                &mut dst_finished,
+                None,
+                DEMUX_SEND_RECORDING_TIME_EOF,
+                &fx.status,
+                &fx.pause_epoch,
+                &fx.result,
+            )
+        };
+
+        assert_eq!(ret, AVERROR_EOF, "the copy destination is done at the limit");
+        assert!(dst_finished, "the copy destination must be marked done");
+        let marker = rx
+            .try_recv()
+            .expect("the EOF marker must still be delivered to the muxer");
+        unsafe {
+            assert_eq!(
+                (*marker.packet.as_ptr()).stream_index,
+                -1,
+                "the copy destination receives the stream_index = -1 EOF marker"
+            );
+        }
+        assert!(marker.packet_data.is_copy, "copy metadata is still applied");
+    }
+
+    fn packet_with_ts(pts: i64, dts: i64) -> ffmpeg_next::Packet {
+        use ffmpeg_next::packet::Mut;
+        let mut p = ffmpeg_next::Packet::new(8);
+        unsafe {
+            (*p.as_mut_ptr()).pts = pts;
+            (*p.as_mut_ptr()).dts = dts;
+        }
+        p
+    }
+
+    // The certainty predicate itself: real dts (the trigger compares ds.dts,
+    // which is only the packet's dts when the packet HAS one), real pts, and
+    // pts >= dts. Anything else must fall back to delivering the packet.
+    #[test]
+    fn decode_cut_certainty_requires_real_sane_timestamps() {
+        use super::decode_cut_is_certain;
+
+        unsafe {
+            assert!(decode_cut_is_certain(packet_with_ts(5, 5).as_ptr()));
+            assert!(decode_cut_is_certain(packet_with_ts(6, 5).as_ptr()));
+            assert!(
+                !decode_cut_is_certain(packet_with_ts(AV_NOPTS_VALUE, 5).as_ptr()),
+                "missing pts: the decoded frame timeline is not provable"
+            );
+            assert!(
+                !decode_cut_is_certain(packet_with_ts(5, AV_NOPTS_VALUE).as_ptr()),
+                "missing dts: the trigger compared an estimated ds.dts"
+            );
+            assert!(
+                !decode_cut_is_certain(packet_with_ts(3, 5).as_ptr()),
+                "pts < dts: the packet can decode to frames before the window tail"
+            );
+            assert!(!decode_cut_is_certain(
+                packet_with_ts(AV_NOPTS_VALUE, AV_NOPTS_VALUE).as_ptr()
+            ));
+        }
+    }
 
     /// Apply ts_scale to a timestamp value.
     /// Returns the scaled timestamp, or AV_NOPTS_VALUE if input is AV_NOPTS_VALUE.
