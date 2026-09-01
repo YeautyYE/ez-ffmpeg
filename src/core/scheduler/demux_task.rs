@@ -388,7 +388,7 @@ pub(crate) fn demux_init(
 
             let node = demux_node.as_ref();
             let SchNode::Demux {
-                waiter: _, task_exited
+                waiter: _, task_exited, ..
             } = node else {
                 unreachable!("a demuxer's node is always SchNode::Demux (built in Demuxer::new)")
             };

@@ -57,6 +57,11 @@ impl FilterGraph {
             node: Arc::new(SchNode::Filter {
                 inputs: (0..pad_count).map(|_| None).collect(),
                 best_input: Arc::new(AtomicUsize::from(0)),
+                // Every pad starts un-primed; the filter task flips each flag
+                // once it learns that pad's format (or EOF), and the balancing
+                // pass fans pre-configuration unchokes out to all still-set
+                // pads (input_controller.rs `awaiting_format`).
+                awaiting_format: (0..pad_count).map(|_| AtomicBool::new(true)).collect(),
             }),
         }
     }

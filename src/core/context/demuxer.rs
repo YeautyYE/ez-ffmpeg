@@ -185,6 +185,7 @@ impl Demuxer {
             node: Arc::new(SchNode::Demux {
                 waiter: Arc::new(Default::default()),
                 task_exited: Arc::new(Default::default()),
+                parked_risk: Arc::new(Default::default()),
             }),
             streams,
             dsts: vec![],

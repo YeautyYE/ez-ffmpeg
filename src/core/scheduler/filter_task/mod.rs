@@ -175,20 +175,84 @@ pub(crate) fn filter_graph_init(
             fgp.swr_opts = graph_swr_opts;
             let node = filter_node.as_ref();
             let SchNode::Filter {
-                inputs: _,
+                inputs,
                 best_input,
+                awaiting_format,
             } = node
             else {
                 unreachable!("FilterGraph::new always builds the graph node as SchNode::Filter")
             };
+            // Becomes true once every pad has published a format (or EOF);
+            // the flags only ever flip false-ward, so the publish scan below
+            // is skipped for the rest of the run after that.
+            let mut all_pads_primed = false;
+            // Pads whose demuxer this thread has counted into `parked_risk`
+            // (one-shot bookkeeping so the release below is exactly balanced).
+            let mut parked_counted = vec![false; ifps.len()];
 
             loop {
                 // update scheduling to account for desired input stream, if it changed
                 //
                 // this check needs no locking because only the filtering thread
                 // updates this value
-                if fgp.next_in != best_input.load(Ordering::Acquire) {
+                let mut sched_stale = fgp.next_in != best_input.load(Ordering::Acquire);
+                if sched_stale {
                     best_input.store(fgp.next_in, Ordering::Release);
+                }
+                // Publish which pads are still missing their first frame: the
+                // balancing pass fans pre-configuration unchokes out to ALL of
+                // them (input_controller.rs `awaiting_format`), so cold inputs
+                // prime in parallel and a primed pad's demuxer is re-choked
+                // while the stragglers keep reading. Same predicate as the
+                // pre-config input selection in fg_read_frames.
+                if !all_pads_primed {
+                    let primed_now = ifps.iter().all(|ifp| ifp.format >= 0 || ifp.eof);
+                    for (pad, (ifp, awaiting)) in
+                        ifps.iter().zip(awaiting_format.iter()).enumerate()
+                    {
+                        if ifp.format < 0 && !ifp.eof {
+                            continue;
+                        }
+                        if awaiting.load(Ordering::Acquire) {
+                            // Primed while the graph still awaits other pads:
+                            // every further frame arriving here can only PARK
+                            // in this pad's bounded pre-config queue, so count
+                            // the feeding demuxer out of the pre-config
+                            // fan-out (it stays reachable through
+                            // `best_input`). Counted BEFORE the flag flip is
+                            // published: a concurrent balancing pass must
+                            // never observe this pad as non-awaiting while
+                            // the demuxer still reads as risk-free — it would
+                            // volunteer the shared demuxer in that gap. A
+                            // pass in the reverse gap (risk counted, flag
+                            // still true) merely keeps treating the pad as
+                            // awaiting, the already-bounded one-iteration
+                            // transient. An EOF pad delivers no more frames
+                            // and is not counted.
+                            if !primed_now && ifp.format >= 0 && !ifp.eof {
+                                if let Some(Some(src)) = inputs.get(pad) {
+                                    if let SchNode::Demux { parked_risk, .. } = src.as_ref() {
+                                        parked_risk.fetch_add(1, Ordering::AcqRel);
+                                        parked_counted[pad] = true;
+                                    }
+                                }
+                            }
+                            awaiting.store(false, Ordering::Release);
+                            sched_stale = true;
+                        }
+                    }
+                    if primed_now {
+                        all_pads_primed = true;
+                        // Every format is in: the graph configures this
+                        // iteration, parked frames replay into it and new
+                        // frames flow through, so the demuxers counted above
+                        // rejoin the fan-out for any graphs still priming.
+                        if release_parked_risk(&mut parked_counted, inputs) {
+                            sched_stale = true;
+                        }
+                    }
+                }
+                if sched_stale {
                     input_controller.update_locked(&scheduler_status);
                 }
 
@@ -332,6 +396,16 @@ pub(crate) fn filter_graph_init(
                 }
             }
 
+            // The loop can exit while this graph never configured (all
+            // sources disconnected or a stop before every pad primed): any
+            // parked-risk count still held would serialize the shared
+            // demuxer for the REMAINING graphs for the rest of the job.
+            // Release and rebalance once so they notice (a stop makes the
+            // update a no-op).
+            if release_parked_risk(&mut parked_counted, inputs) {
+                input_controller.update_locked(&scheduler_status);
+            }
+
             for ofp in &mut ofps {
                 let ret = unsafe { fg_output_frame(&mut fgp, ofp, null_frame(), &frame_pool) };
                 if ret < 0 {
@@ -356,6 +430,33 @@ pub(crate) fn filter_graph_init(
     }
 
     Ok(())
+}
+
+/// Releases every parked-risk count this filter worker still holds
+/// (`SchNode::Demux::parked_risk`, counted in the loop-top publish scan when
+/// a pad primes into a still-cold graph). Runs when the graph gets its last
+/// format (parked frames replay and new frames flow, so the demuxers rejoin
+/// the pre-config fan-out) and again on worker exit, which can happen before
+/// the graph ever configures. Returns whether anything was released, so the
+/// caller can trigger a rebalance.
+fn release_parked_risk(
+    parked_counted: &mut [bool],
+    inputs: &[Option<Arc<SchNode>>],
+) -> bool {
+    let mut released = false;
+    for (pad, counted) in parked_counted.iter_mut().enumerate() {
+        if !*counted {
+            continue;
+        }
+        *counted = false;
+        if let Some(Some(src)) = inputs.get(pad) {
+            if let SchNode::Demux { parked_risk, .. } = src.as_ref() {
+                parked_risk.fetch_sub(1, Ordering::AcqRel);
+                released = true;
+            }
+        }
+    }
+    released
 }
 
 fn filter_receive_finish(finished_flag_list: &Arc<[AtomicBool]>, input_index: usize) {

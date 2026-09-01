@@ -20,6 +20,17 @@ pub(crate) enum SchNode {
     Demux {
         waiter: Arc<SchWaiter>,
         task_exited: Arc<AtomicBool>,
+        /// How many graph input pads fed by this demuxer have already primed
+        /// (seen their first decoded frame) while their graph still awaits
+        /// other pads. Every frame this demuxer sends such a pad can only
+        /// PARK in that graph's bounded pre-config queue (runtime.rs), so
+        /// while this is non-zero the pre-configuration fan-out stops
+        /// volunteering this demuxer and defers it to the `best_input` walk —
+        /// the serial semantics, which kept those queues shallow. Each
+        /// graph's filter thread is the writer (loop-top publish scan in
+        /// filter_task: +1 when a pad primes into a still-cold graph, -1 for
+        /// each counted pad once the graph has every format and configures).
+        parked_risk: Arc<AtomicUsize>,
     },
     Filter {
         /// One slot per filter pad, pad-indexed. A pad fed by a demuxer holds
@@ -28,6 +39,20 @@ pub(crate) enum SchNode {
         /// keep their pad index instead of being shifted.
         inputs: Vec<Option<Arc<SchNode>>>,
         best_input: Arc<AtomicUsize>,
+        /// Pad-indexed pre-configuration flags: `true` until the pad has seen
+        /// the frame that fixes its format (`ifp.format >= 0`) or went EOF.
+        /// The graph cannot be configured while any pad still awaits a frame
+        /// (filter_task/runtime.rs), and the filter thread is the only writer,
+        /// flipping each flag false exactly once. While any flag is set,
+        /// `unchoke_for_stream` fans out to EVERY flagged pad's demuxer
+        /// instead of following `best_input`, so N cold inputs prime in
+        /// parallel — time to the first output packet is max(cold costs), not
+        /// their sum. fftools rotates its pre-config `best_input` through the
+        /// missing pads one at a time (ffmpeg_filter.c fg_read_frames),
+        /// serializing those cold reads; the CLI never notices on local
+        /// files, but seek+read on a slow/remote source costs seconds per
+        /// input and this crate's windowed multi-input jobs pay it per input.
+        awaiting_format: Arc<[AtomicBool]>,
     },
     MuxStream {
         src: Arc<SchNode>,
@@ -166,6 +191,7 @@ impl InputController {
                 let SchNode::Demux {
                     waiter,
                     task_exited,
+                    ..
                 } = node
                 else {
                     unreachable!("new() asserts every demuxs entry is SchNode::Demux")
@@ -188,12 +214,16 @@ impl InputController {
         }
     }
 
-    /// Walks up from a mux stream to the demuxer feeding its selected input and
-    /// unchokes it. Returns whether a demuxer was actually reached: a stray
-    /// empty/out-of-range scheduler input list (a zero-input graph is rejected at
-    /// build, but a short/unbound cross-graph list could still occur) unchokes
-    /// nothing, so the caller must NOT count it as progress — otherwise the
-    /// all-live-demuxer fallback is skipped and a multi-demuxer job hangs.
+    /// Walks up from a mux stream to the demuxer(s) feeding its selected input
+    /// and unchokes them. Returns whether the stream's demand was FULLY
+    /// resolved to demuxers: a stray empty/out-of-range scheduler input list, a
+    /// cross-graph hole, or an awaiting pad that dead-ends in one (a zero-input
+    /// graph is rejected at build, but a short/unbound cross-graph list could
+    /// still occur) leaves some needed source unreached, so the caller must NOT
+    /// count it as progress — otherwise the all-live-demuxer fallback is
+    /// skipped and a multi-demuxer job hangs. A partially-resolved fan-out may
+    /// have unchoked demuxers AND return `false`: the unchokes stand, and the
+    /// fallback additionally releases whatever could not be walked to.
     fn unchoke_for_stream(mut src: &Arc<SchNode>) -> bool {
         loop {
             let node = src.as_ref();
@@ -205,9 +235,59 @@ impl InputController {
 
             assert!(matches!(node, SchNode::Filter { .. }));
 
-            let SchNode::Filter { inputs, best_input } = node else {
+            let SchNode::Filter {
+                inputs,
+                best_input,
+                awaiting_format,
+            } = node
+            else {
                 unreachable!("node matched SchNode::Filter in the assert just above")
             };
+
+            // Pre-configuration fan-out: while any pad still awaits its first
+            // frame the graph cannot be configured, so following only
+            // `best_input` would prime the inputs one at a time and the first
+            // output packet would wait for the SUM of every input's cold
+            // seek+read cost. Unchoke every awaiting pad's source instead; a
+            // pad that primes drops out of the set, so the next pass re-chokes
+            // its demuxer (bounding the pre-config frame queues to pipeline
+            // drain) while the stragglers keep reading. An awaiting pad that
+            // resolves to no demuxer — a cross-graph hole — reports failure so
+            // the caller still runs the all-live-demuxer fallback, the only
+            // edge that reaches the upstream graph's demuxer.
+            //
+            // One class of source is NOT volunteered: a demuxer already
+            // feeding a primed pad of a still-unconfigured graph (its
+            // `parked_risk`, maintained by the filter threads). Demuxers read
+            // ALL their streams in file order, so unchoking one for pad A
+            // also floods every other pad it feeds — and a primed pad of a
+            // cold graph can only PARK those frames in its bounded pre-config
+            // queue until the caps fail the job. The serial walk kept such
+            // queues shallow by reaching a demuxer only through `best_input`
+            // rotation, so a risky demuxer is deferred to exactly that: the
+            // selected pad is still walked unconditionally, which keeps
+            // liveness (and worst-case queue depth) identical to the
+            // pre-fan-out semantics.
+            let mut awaiting_any = false;
+            let mut resolved = true;
+            let selected = best_input.load(Ordering::Acquire);
+            for (pad, awaiting) in awaiting_format.iter().enumerate() {
+                if !awaiting.load(Ordering::Acquire) {
+                    continue;
+                }
+                awaiting_any = true;
+                match inputs.get(pad) {
+                    Some(Some(next)) => {
+                        if pad == selected || !Self::has_parked_risk(next) {
+                            resolved &= Self::unchoke_for_stream(next);
+                        }
+                    }
+                    _ => resolved = false,
+                }
+            }
+            if awaiting_any {
+                return resolved;
+            }
 
             // No upstream to walk to — out of range, or a cross-graph hole
             // (`Some(None)`): reached no demuxer.
@@ -216,6 +296,17 @@ impl InputController {
             };
             src = next;
         }
+    }
+
+    /// Whether this pad source is a demuxer currently feeding at least one
+    /// primed pad of a still-unconfigured graph (`SchNode::Demux::parked_risk`
+    /// — frames sent to such a pad park in its pre-config queue). Anything
+    /// other than a demuxer carries no such state and is never deferred.
+    fn has_parked_risk(node: &Arc<SchNode>) -> bool {
+        matches!(
+            node.as_ref(),
+            SchNode::Demux { parked_risk, .. } if parked_risk.load(Ordering::Acquire) > 0
+        )
     }
 
     fn trailing_dts(&self) -> i64 {
@@ -261,7 +352,18 @@ mod tests {
         Arc::new(SchNode::Demux {
             waiter: Arc::new(SchWaiter::new()),
             task_exited: Arc::new(AtomicBool::new(false)),
+            parked_risk: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    /// Marks `node` as feeding `n` primed pads of still-unconfigured graphs —
+    /// what the filter thread's publish scan does when a pad primes into a
+    /// graph that is still cold (filter_task).
+    fn set_parked_risk(node: &Arc<SchNode>, n: usize) {
+        match node.as_ref() {
+            SchNode::Demux { parked_risk, .. } => parked_risk.store(n, Ordering::Release),
+            _ => unreachable!("expected a demux node"),
+        }
     }
 
     fn mux_stream(src: Arc<SchNode>, last_dts: i64) -> Arc<SchNode> {
@@ -295,10 +397,24 @@ mod tests {
         }
     }
 
+    /// A CONFIGURED graph node: every pad already primed, so the walk follows
+    /// `best_input` — the mode all the pre-existing tests exercise.
     fn filter_node(inputs: Vec<Option<Arc<SchNode>>>, best_input: usize) -> Arc<SchNode> {
+        let pad_count = inputs.len();
+        filter_node_awaiting(inputs, best_input, &vec![false; pad_count])
+    }
+
+    /// A graph node with explicit per-pad awaiting flags (`true` = the pad has
+    /// not yet seen its first frame, i.e. the graph is still pre-config).
+    fn filter_node_awaiting(
+        inputs: Vec<Option<Arc<SchNode>>>,
+        best_input: usize,
+        awaiting: &[bool],
+    ) -> Arc<SchNode> {
         Arc::new(SchNode::Filter {
             inputs,
             best_input: Arc::new(AtomicUsize::new(best_input)),
+            awaiting_format: awaiting.iter().map(|&a| AtomicBool::new(a)).collect(),
         })
     }
 
@@ -356,6 +472,210 @@ mod tests {
         let f = filter_node(vec![None, Some(d.clone())], 1);
         assert!(InputController::unchoke_for_stream(&f));
         assert!(!waiter_of(&d).get_choked_next());
+    }
+
+    // Multi-input cold-start regression: while a graph awaits configuration,
+    // ONE balancing pass must unchoke EVERY pad still missing its first frame —
+    // not just the single `best_input` pad. Serial priming made the first
+    // output packet wait for the SUM of each input's cold seek+read cost
+    // (seconds per input on SMB/busy disks); the fan-out makes it the max.
+    #[test]
+    fn awaiting_pads_unchoke_in_parallel() {
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let d0 = demux_node();
+        let d1 = demux_node();
+        let d2 = demux_node();
+        // Pre-config: best_input still points at pad 0, all pads awaiting.
+        let f = filter_node_awaiting(
+            vec![Some(d0.clone()), Some(d1.clone()), Some(d2.clone())],
+            0,
+            &[true, true, true],
+        );
+        // No packets yet: the stream's last_dts is unset, so it is eligible.
+        let m = mux_stream(f, AV_NOPTS_VALUE);
+        let ctrl = InputController::new(vec![d0.clone(), d1.clone(), d2.clone()], vec![m]);
+        ctrl.update_locked(&status);
+
+        for (i, d) in [&d0, &d1, &d2].iter().enumerate() {
+            assert!(
+                !waiter_of(d).get_choked(),
+                "demuxer {i} must be unchoked while its pad still awaits a frame"
+            );
+        }
+    }
+
+    // The flip side of the fan-out: a pad that HAS primed drops out of the
+    // awaiting set, so its demuxer is re-choked while the stragglers keep
+    // reading — this is what bounds the pre-config frame queues to pipeline
+    // drain instead of letting a fast input decode unchecked for the seconds a
+    // slow peer needs (the per-pad frame/byte caps would fail the job).
+    #[test]
+    fn primed_pad_rechokes_while_peers_still_prime() {
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let primed = demux_node();
+        let cold = demux_node();
+        let f = filter_node_awaiting(
+            vec![Some(primed.clone()), Some(cold.clone())],
+            // best_input already rotated to the cold pad, as fg_read_frames
+            // does once pad 0 has a format.
+            1,
+            &[false, true],
+        );
+        let m = mux_stream(f, AV_NOPTS_VALUE);
+        let ctrl = InputController::new(vec![primed.clone(), cold.clone()], vec![m]);
+        ctrl.update_locked(&status);
+
+        assert!(
+            waiter_of(&primed).get_choked(),
+            "a primed pad's demuxer must be re-choked while peers still prime"
+        );
+        assert!(
+            !waiter_of(&cold).get_choked(),
+            "an awaiting pad's demuxer must keep reading"
+        );
+    }
+
+    // An awaiting pad that is a cross-graph hole resolves to no demuxer from
+    // this graph. The walk may have unchoked its OTHER awaiting pads, but it
+    // must still report failure so update_locked runs the all-live-demuxer
+    // fallback — the only edge that reaches the upstream graph's demuxer.
+    #[test]
+    fn awaiting_cross_graph_hole_still_runs_the_fallback() {
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let direct = demux_node();
+        let upstream = demux_node(); // feeds the hole pad through another graph
+        let f = filter_node_awaiting(vec![None, Some(direct.clone())], 0, &[true, true]);
+        let m = mux_stream(f, AV_NOPTS_VALUE);
+        let ctrl = InputController::new(vec![direct.clone(), upstream.clone()], vec![m]);
+        ctrl.update_locked(&status);
+
+        assert!(
+            !waiter_of(&direct).get_choked(),
+            "the walkable awaiting pad is unchoked by the fan-out"
+        );
+        assert!(
+            !waiter_of(&upstream).get_choked(),
+            "the hole pad's unreachable source must be released by the fallback"
+        );
+    }
+
+    // Once every pad is primed the fan-out is over: the walk follows
+    // `best_input` again and a non-selected pad's demuxer stays choked. Locks
+    // the mode transition back to the fftools balancing semantics.
+    #[test]
+    fn all_pads_primed_follows_best_input_again() {
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let selected = demux_node();
+        let idle = demux_node();
+        let f = filter_node_awaiting(
+            vec![Some(selected.clone()), Some(idle.clone())],
+            0,
+            &[false, false],
+        );
+        let m = mux_stream(f, 1_000);
+        let ctrl = InputController::new(vec![selected.clone(), idle.clone()], vec![m]);
+        ctrl.update_locked(&status);
+
+        assert!(
+            !waiter_of(&selected).get_choked(),
+            "the best_input pad's demuxer is unchoked"
+        );
+        assert!(
+            waiter_of(&idle).get_choked(),
+            "a non-selected pad's demuxer is choked once the graph is configured"
+        );
+    }
+
+    // A demuxer read for one graph floods EVERY pad it feeds. If one of those
+    // pads has already primed while its graph is still cold, each flooded
+    // frame parks in that pad's bounded pre-config queue — so the fan-out
+    // must NOT volunteer such a demuxer for a different awaiting pad; it
+    // stays deferred to `best_input` rotation exactly like the serial walk,
+    // which kept those queues shallow.
+    #[test]
+    fn parked_risk_defers_a_shared_demuxer_from_the_fanout() {
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let cold = demux_node();
+        let shared = demux_node();
+        // Another still-cold graph already primed a pad fed by `shared`.
+        set_parked_risk(&shared, 1);
+        // This graph awaits both pads; best_input points at the cold pad.
+        let f = filter_node_awaiting(
+            vec![Some(cold.clone()), Some(shared.clone())],
+            0,
+            &[true, true],
+        );
+        let m = mux_stream(f, AV_NOPTS_VALUE);
+        let ctrl = InputController::new(vec![cold.clone(), shared.clone()], vec![m]);
+        ctrl.update_locked(&status);
+
+        assert!(
+            !waiter_of(&cold).get_choked(),
+            "the risk-free awaiting pad's demuxer is unchoked by the fan-out"
+        );
+        assert!(
+            waiter_of(&shared).get_choked(),
+            "a demuxer feeding a primed pad of a cold graph must not be volunteered"
+        );
+    }
+
+    // The serial-parity floor: the pad `best_input` selects is walked
+    // UNCONDITIONALLY, parked risk or not — the pre-fan-out semantics reached
+    // the demuxer the same way, and skipping it would strand the pad (its
+    // priming REQUIRES reading that demuxer, parked frames and all).
+    #[test]
+    fn parked_risk_demuxer_is_still_walked_as_the_selected_pad() {
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let other = demux_node();
+        let shared = demux_node();
+        set_parked_risk(&shared, 1);
+        // best_input has rotated to the shared demuxer's pad.
+        let f = filter_node_awaiting(
+            vec![Some(other.clone()), Some(shared.clone())],
+            1,
+            &[true, true],
+        );
+        let m = mux_stream(f, AV_NOPTS_VALUE);
+        let ctrl = InputController::new(vec![other.clone(), shared.clone()], vec![m]);
+        ctrl.update_locked(&status);
+
+        assert!(
+            !waiter_of(&shared).get_choked(),
+            "the selected pad's demuxer is unchoked even while it carries parked risk"
+        );
+        assert!(
+            !waiter_of(&other).get_choked(),
+            "the risk-free awaiting peer still primes in parallel"
+        );
+    }
+
+    // Once the graph holding the primed pad configures, its filter thread
+    // releases the risk count and the demuxer rejoins the fan-out.
+    #[test]
+    fn parked_risk_release_restores_the_fanout() {
+        let status = Arc::new(AtomicUsize::new(STATUS_RUN));
+        let cold = demux_node();
+        let shared = demux_node();
+        set_parked_risk(&shared, 1);
+        let f = filter_node_awaiting(
+            vec![Some(cold.clone()), Some(shared.clone())],
+            0,
+            &[true, true],
+        );
+        let m = mux_stream(f, AV_NOPTS_VALUE);
+        let ctrl = InputController::new(vec![cold.clone(), shared.clone()], vec![m]);
+        ctrl.update_locked(&status);
+        assert!(
+            waiter_of(&shared).get_choked(),
+            "deferred while the risk is outstanding"
+        );
+
+        set_parked_risk(&shared, 0);
+        ctrl.update_locked(&status);
+        assert!(
+            !waiter_of(&shared).get_choked(),
+            "rejoins the fan-out once the blocking graph configured"
+        );
     }
 
     // A mix of resolved and unresolved eligible streams must STILL run the
