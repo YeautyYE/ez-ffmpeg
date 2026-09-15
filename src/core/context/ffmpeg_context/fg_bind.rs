@@ -1,8 +1,12 @@
 use super::*;
+use crate::core::context::frame_source::FrameSourceParams;
+use crate::core::frame_push::FramePushError;
 
 pub(super) fn fg_bind_inputs(
     filter_graphs: &mut Vec<FilterGraph>,
     demuxs: &mut Vec<Demuxer>,
+    file_map: &[InputSlot],
+    pushes: &mut [PendingFrameSource],
 ) -> Result<()> {
     if filter_graphs.is_empty() {
         return Ok(());
@@ -11,7 +15,7 @@ pub(super) fn fg_bind_inputs(
 
     for filter_graph in filter_graphs.iter_mut() {
         for i in 0..filter_graph.inputs.len() {
-            fg_complex_bind_input(filter_graph, i, demuxs)?;
+            fg_complex_bind_input(filter_graph, i, demuxs, file_map, pushes)?;
         }
     }
 
@@ -104,10 +108,19 @@ pub(super) fn bind_fg_inputs_by_fg(filter_graphs: &mut Vec<FilterGraph>) -> Resu
     Ok(())
 }
 
+/// What a filter input pad resolved to: a concrete demuxer stream or a
+/// frame-push source awaiting its one binding.
+enum LinkTarget {
+    Demux { demux_idx: usize, stream_idx: usize },
+    Push { push_idx: usize },
+}
+
 pub(super) fn fg_complex_bind_input(
     filter_graph: &mut FilterGraph,
     input_filter_index: usize,
     demuxs: &mut Vec<Demuxer>,
+    file_map: &[InputSlot],
+    pushes: &mut [PendingFrameSource],
 ) -> Result<()> {
     // A pad already connected to another filtergraph's output must not also
     // be bound to a demuxer stream (covers labeled pads including the
@@ -118,56 +131,166 @@ pub(super) fn fg_complex_bind_input(
 
     let graph_desc = &filter_graph.graph_desc;
     let input_filter = &mut filter_graph.inputs[input_filter_index];
-    let (demux_idx, stream_idx) = if !input_filter.linklabel.is_empty()
-        && input_filter.linklabel != "in"
-    {
-        let (demux_idx, stream_idx) = fg_find_input_idx_by_linklabel(
+    let target = if !input_filter.linklabel.is_empty() && input_filter.linklabel != "in" {
+        let target = fg_find_input_by_linklabel(
             &input_filter.linklabel,
             input_filter.media_type,
             demuxs,
+            file_map,
+            pushes,
             graph_desc,
         )?;
 
-        info!(target: LOG_TARGET,
-            "Binding filter input with label '{}' to input stream {stream_idx}:{demux_idx}",
-            input_filter.linklabel
-        );
-        (demux_idx, stream_idx)
+        match &target {
+            LinkTarget::Demux {
+                demux_idx,
+                stream_idx,
+            } => {
+                info!(target: LOG_TARGET,
+                    "Binding filter input with label '{}' to input stream {stream_idx}:{demux_idx}",
+                    input_filter.linklabel
+                );
+            }
+            LinkTarget::Push { push_idx } => {
+                info!(target: LOG_TARGET,
+                    "Binding filter input with label '{}' to frame-push input {}",
+                    input_filter.linklabel, pushes[*push_idx].user_index
+                );
+            }
+        }
+        target
     } else {
-        let mut demux_idx = -1i32;
-        let mut stream_idx = 0;
-        for (d_idx, demux) in demuxs.iter().enumerate() {
-            for (st_idx, intput_stream) in demux.get_streams().iter().enumerate() {
-                if intput_stream.is_used() {
-                    continue;
+        // Unlabeled pad: first unused source of the pad's media type, in the
+        // user's input order — a frame-push position competes exactly like a
+        // demuxer's streams at that position. With no push inputs this walk
+        // visits the demuxers in list order, i.e. the historical behavior.
+        let mut found = None;
+        for slot in file_map {
+            match *slot {
+                InputSlot::Demux(d_idx) => {
+                    let demux = &demuxs[d_idx];
+                    for (st_idx, input_stream) in demux.get_streams().iter().enumerate() {
+                        if input_stream.is_used() {
+                            continue;
+                        }
+                        if input_stream.codec_type == input_filter.media_type {
+                            found = Some(LinkTarget::Demux {
+                                demux_idx: d_idx,
+                                stream_idx: st_idx,
+                            });
+                            break;
+                        }
+                    }
                 }
-                if intput_stream.codec_type == input_filter.media_type {
-                    demux_idx = d_idx as i32;
-                    stream_idx = st_idx;
-                    break;
+                InputSlot::Push(p_idx) => {
+                    if pushes[p_idx].fg_binding.is_none()
+                        && input_filter.media_type == AVMEDIA_TYPE_VIDEO
+                    {
+                        found = Some(LinkTarget::Push { push_idx: p_idx });
+                    }
                 }
             }
-            if demux_idx >= 0 {
+            if found.is_some() {
                 break;
             }
         }
 
-        if demux_idx < 0 {
+        let Some(target) = found else {
             warn!(target: LOG_TARGET,
                 "Cannot find a matching stream for unlabeled input pad {}",
                 input_filter.name
             );
             return Err(FilterGraphParseError::InvalidArgument.into());
+        };
+        if let LinkTarget::Demux {
+            demux_idx,
+            stream_idx,
+        } = &target
+        {
+            debug!(target: LOG_TARGET, "FilterGraph binding unlabeled input {input_filter_index} to input stream {stream_idx}:{demux_idx}");
         }
-
-        debug!(target: LOG_TARGET, "FilterGraph binding unlabeled input {input_filter_index} to input stream {stream_idx}:{demux_idx}");
-
-        (demux_idx as usize, stream_idx)
+        target
     };
 
-    let demux = &mut demuxs[demux_idx];
+    match target {
+        LinkTarget::Demux {
+            demux_idx,
+            stream_idx,
+        } => {
+            let demux = &mut demuxs[demux_idx];
+            ifilter_bind_ist(filter_graph, input_filter_index, stream_idx, demux)
+        }
+        LinkTarget::Push { push_idx } => {
+            bind_push_source(filter_graph, input_filter_index, &mut pushes[push_idx])
+        }
+    }
+}
 
-    ifilter_bind_ist(filter_graph, input_filter_index, stream_idx, demux)
+/// Claims a frame-push source for one filter pad: installs the source's
+/// parameters on the pad (buffersrc rate hint, zero-frame fallback) and
+/// stores the graph's frame sender together with the claiming pad's index —
+/// the channel is shared by every pad of the graph, and the filter task
+/// routes each `FrameBox` by the pad stamped on it. The scheduler-input
+/// slot stays the pre-sized `None` hole — there is no demuxer to choke — and
+/// the balancing pass skips it, exactly like the writer's dedicated build.
+fn bind_push_source(
+    filter_graph: &mut FilterGraph,
+    input_index: usize,
+    pending: &mut PendingFrameSource,
+) -> Result<()> {
+    if pending.fg_binding.is_some() {
+        return Err(FramePushError::SourceBoundTwice {
+            input_index: pending.user_index,
+        }
+        .into());
+    }
+    let sender = ifilter_bind_frame_source(filter_graph, input_index, &pending.params);
+    pending.fg_binding = Some((sender, input_index));
+    Ok(())
+}
+
+/// Binds a filtergraph input pad to a headless frame source — the
+/// frame-source analog of [`ifilter_bind_ist`], minus everything that needs
+/// a demuxer. Returns the cloned filtergraph sender the source will feed.
+/// Shared by the writer's dedicated build (pad 0 of its single graph) and
+/// the frame-push binding above (any pad).
+///
+/// Two parameters cannot ride on the frames themselves and must be installed
+/// here:
+/// - `opts.framerate`: not an `AVFrame` field; `configure_filtergraph` copies
+///   it into `AVBufferSrcParameters.frame_rate`. A VFR source has none — a
+///   0/1 rate keeps the graph from advertising a grid the pushed timestamps
+///   do not follow.
+/// - `opts.fallback`: consulted only by the zero-frame `fg_send_eof` path to
+///   configure the graph when EOF arrives before any frame; without it that
+///   path fails with "Cannot determine format after EOF".
+///
+/// The remaining fallback fields (SAR 0/1, colorspace/color_range
+/// UNSPECIFIED) keep their `av_frame_alloc` defaults, which is exactly what a
+/// pushed frame built from an unref'd pool shell carries.
+pub(super) fn ifilter_bind_frame_source(
+    filter_graph: &mut FilterGraph,
+    input_index: usize,
+    params: &FrameSourceParams,
+) -> crossbeam_channel::Sender<crate::core::context::FrameBox> {
+    let input_filter = &mut filter_graph.inputs[input_index];
+    input_filter.opts.framerate = params.framerate.unwrap_or(AVRational { num: 0, den: 1 });
+    // SAFETY: `fallback` is the frame allocated for this pad by
+    // init_filter_graph; only plain fields are written.
+    unsafe {
+        let fallback = input_filter.opts.fallback.as_mut_ptr();
+        (*fallback).format = params.pix_fmt as i32;
+        (*fallback).width = params.width;
+        (*fallback).height = params.height;
+        (*fallback).time_base = params.time_base;
+    }
+    // No demuxer stream may be bound on top of this pad; the scheduler-input
+    // slot (SchNode::Filter.inputs[input_index]) stays the pre-sized None
+    // hole, which the input controller treats as "no demuxer to unchoke".
+    input_filter.bound = true;
+
+    let (sender, _finished_flag_list) = filter_graph.get_src_sender();
+    sender
 }
 
 #[cfg(docsrs)]
@@ -321,15 +444,20 @@ pub(super) fn ifilter_bind_ist(
     }
 }
 
-/// Find input stream index by filter graph linklabel
-/// FFmpeg reference: ffmpeg_filter.c - fg_create logic for parsing filter input specifiers
-/// Uses StreamSpecifier for complete stream specifier parsing
-fn fg_find_input_idx_by_linklabel(
+/// Find a filter-graph input's source by linklabel.
+/// FFmpeg reference: ffmpeg_filter.c - fg_create logic for parsing filter input specifiers.
+/// The leading number is a position in the user's input list (`file_map`);
+/// demuxer positions then use [`StreamSpecifier`] for complete stream
+/// specifier parsing, while frame-push positions accept only a video
+/// specifier (they carry exactly one video stream).
+fn fg_find_input_by_linklabel(
     linklabel: &str,
     filter_media_type: AVMediaType,
     demuxs: &mut Vec<Demuxer>,
+    file_map: &[InputSlot],
+    pushes: &[PendingFrameSource],
     desc: &str,
-) -> Result<(usize, usize)> {
+) -> Result<LinkTarget> {
     // Remove brackets if present
     let new_linklabel = if linklabel.starts_with("[") && linklabel.ends_with("]") {
         if linklabel.len() <= 2 {
@@ -346,7 +474,7 @@ fn fg_find_input_idx_by_linklabel(
     let (file_idx, remainder) =
         strtol(new_linklabel).map_err(|_| FilterGraphParseError::InvalidArgument)?;
 
-    if file_idx < 0 || file_idx as usize >= demuxs.len() {
+    if file_idx < 0 || file_idx as usize >= file_map.len() {
         return Err(InvalidFileIndexInFg(file_idx as usize, desc.to_string()).into());
     }
     let file_idx = file_idx as usize;
@@ -359,6 +487,31 @@ fn fg_find_input_idx_by_linklabel(
         &remainder[1..]
     } else {
         remainder
+    };
+
+    let demux_idx = match file_map[file_idx] {
+        InputSlot::Push(push_idx) => {
+            // A push source carries exactly one video stream (index 0):
+            // accept the bare position, a plain video selector, or stream
+            // index 0 (the demuxer-symmetric spelling); reject everything
+            // else instead of matching it against streams that do not exist.
+            if !(spec_str.is_empty() || spec_str == "v" || spec_str == "v:0" || spec_str == "0") {
+                return Err(FramePushError::NotVideo {
+                    input_index: pushes[push_idx].user_index,
+                    spec: spec_str.to_string(),
+                }
+                .into());
+            }
+            if filter_media_type != AVMEDIA_TYPE_VIDEO {
+                return Err(FramePushError::NotVideo {
+                    input_index: pushes[push_idx].user_index,
+                    spec: String::new(),
+                }
+                .into());
+            }
+            return Ok(LinkTarget::Push { push_idx });
+        }
+        InputSlot::Demux(demux_idx) => demux_idx,
     };
 
     let stream_spec = if spec_str.is_empty() {
@@ -378,7 +531,7 @@ fn fg_find_input_idx_by_linklabel(
     };
 
     // Find first matching stream
-    let demux = &demuxs[file_idx];
+    let demux = &demuxs[demux_idx];
     unsafe {
         let fmt_ctx = demux.in_fmt_ctx_ptr();
 
@@ -390,7 +543,10 @@ fn fg_find_input_idx_by_linklabel(
                 // Additional check: must match filter's media type
                 let codec_type = (*avstream).codecpar.as_ref().unwrap().codec_type;
                 if codec_type == filter_media_type {
-                    return Ok((file_idx, idx));
+                    return Ok(LinkTarget::Demux {
+                        demux_idx,
+                        stream_idx: idx,
+                    });
                 }
                 if codec_type == AVMEDIA_TYPE_SUBTITLE && filter_media_type == AVMEDIA_TYPE_VIDEO {
                     subtitle_only_match = true;

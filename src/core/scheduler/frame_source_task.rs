@@ -104,6 +104,7 @@ pub(crate) fn frame_source_init(
             // same ordering the filter worker relies on (filter_task).
             let ingress = frame_source.ingress;
             let fg_sender = frame_source.fg_sender;
+            let fg_input_index = frame_source.fg_input_index;
             let params = frame_source.params;
             let frame_pool = frame_pool;
 
@@ -151,7 +152,7 @@ pub(crate) fn frame_source_init(
 
                 let frame_box = FrameBox {
                     frame,
-                    frame_data: frame_data_for(&params),
+                    frame_data: frame_data_for(&params, fg_input_index),
                 };
                 if !send_with_status_poll(&fg_sender, frame_box, &scheduler_status, &frame_pool) {
                     return;
@@ -171,7 +172,7 @@ pub(crate) fn frame_source_init(
             // down — benign either way.
             let eof_marker = FrameBox {
                 frame: null_frame(),
-                frame_data: frame_data_for(&params),
+                frame_data: frame_data_for(&params, fg_input_index),
             };
             send_with_status_poll(&fg_sender, eof_marker, &scheduler_status, &frame_pool);
             debug!("Frame source finished after {nb_frames} frame(s).");
@@ -217,15 +218,17 @@ fn send_with_status_poll(
     }
 }
 
-fn frame_data_for(params: &FrameSourceParams) -> FrameData {
+fn frame_data_for(params: &FrameSourceParams, fg_input_index: usize) -> FrameData {
     FrameData {
         framerate: params.framerate,
         bits_per_raw_sample: 0,
         input_stream_width: params.width,
         input_stream_height: params.height,
         subtitle_header: None,
-        // Validated single-input graph: the source always feeds pad 0.
-        fg_input_index: 0,
+        // The consuming graph's frame channel is shared by all of its pads;
+        // the filter task routes on this index, so it must be the pad that
+        // claimed the source (0 for the writer's single-input graph).
+        fg_input_index,
         side_data: None,
     }
 }
@@ -717,7 +720,7 @@ mod tests {
         let p = params(AV_PIX_FMT_GRAY8, 8, 2);
         let boxed = |pool: &ObjPool<Frame>| FrameBox {
             frame: pool.get().unwrap(),
-            frame_data: frame_data_for(&p),
+            frame_data: frame_data_for(&p, 0),
         };
 
         let (tx, rx) = crossbeam_channel::bounded::<FrameBox>(1);
@@ -751,7 +754,7 @@ mod tests {
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
         let frame_box = FrameBox {
             frame: pool.get().unwrap(),
-            frame_data: frame_data_for(&p),
+            frame_data: frame_data_for(&p, 0),
         };
         assert!(!send_with_status_poll(&tx, frame_box, &status, &pool));
     }
@@ -786,6 +789,7 @@ mod tests {
             FrameSource {
                 ingress: ingress_rx,
                 fg_sender: fg_tx,
+                fg_input_index: 0,
                 params: p,
             },
             pool,

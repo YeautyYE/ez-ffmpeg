@@ -255,8 +255,9 @@ pub enum WriterError {
 }
 
 /// Errors returned by [`VideoWriter::write`] / [`VideoWriter::write_owned`]
-/// (the latter wraps them in [`OwnedPushError`], which also carries the
-/// caller's frame back).
+/// and by the frame-push handle's `push` / `push_owned`
+/// ([`FramePushHandle`](crate::FramePushHandle)); the owned variants wrap
+/// them in [`OwnedPushError`], which also carries the caller's frame back.
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum PushError {
@@ -271,6 +272,25 @@ pub enum PushError {
     /// pipeline closed after completing normally.
     #[error("pipeline closed; call finish() to retrieve the pipeline result")]
     PipelineClosed,
+
+    /// The pushed `pts` was not strictly greater than the previous accepted
+    /// frame's. Returned only by frame-push handles
+    /// ([`FramePushHandle`](crate::FramePushHandle)), which forward
+    /// caller-supplied timestamps; [`VideoWriter`] generates its own grid and
+    /// never reports this. The frame was NOT queued — nothing about the
+    /// stream changed, and the caller decides whether to fix the timestamp
+    /// and retry or to fail the job.
+    #[error(
+        "non-monotonic pts {got}: the previously accepted frame has pts {prev}; \
+         pushed timestamps must be strictly increasing"
+    )]
+    NonMonotonicPts { prev: i64, got: i64 },
+
+    /// A negative frame duration was pushed. Returned only by frame-push
+    /// handles; `0` (unknown) is valid and lets downstream derive durations
+    /// from timestamp deltas.
+    #[error("invalid frame duration {got}: must be >= 0 (0 = unknown)")]
+    InvalidDuration { got: i64 },
 }
 
 /// Error returned by [`VideoWriter::write_owned`]: the push failure plus the
@@ -316,6 +336,12 @@ pub struct OwnedPushError {
 }
 
 impl OwnedPushError {
+    /// Crate-internal constructor, shared with the frame-push handle so its
+    /// owned push keeps the same custody-preserving error shape.
+    pub(crate) fn new(frame: Vec<u8>, error: PushError) -> Self {
+        Self { frame, error }
+    }
+
     /// Why the push was rejected.
     pub fn error(&self) -> &PushError {
         &self.error
@@ -811,8 +837,9 @@ impl VideoWriterBuilder {
 
 /// Default queue depth: cap the ingress buffer at `QUEUE_BUDGET_BYTES` while
 /// keeping at least one and at most four frames. `frame_size >= 1` is
-/// guaranteed by the caller, so the division never traps.
-fn adaptive_capacity(frame_size: usize) -> usize {
+/// guaranteed by the caller, so the division never traps. Shared with the
+/// frame-push input builder, whose ingress has the same shape.
+pub(crate) fn adaptive_capacity(frame_size: usize) -> usize {
     (QUEUE_BUDGET_BYTES / frame_size).clamp(1, 4)
 }
 
@@ -953,24 +980,45 @@ fn resolve_source_format(
     width: u32,
     height: u32,
 ) -> Result<(AVPixelFormat, usize), WriterError> {
-    let cstr = CString::new(pixel_format)
-        .map_err(|_| WriterError::UnknownPixelFormat(pixel_format.to_string()))?;
+    resolve_source_format_raw(pixel_format, width, height).map_err(|issue| match issue {
+        SourceFormatIssue::Unknown => WriterError::UnknownPixelFormat(pixel_format.to_string()),
+        SourceFormatIssue::Hardware => WriterError::HardwarePixelFormat(pixel_format.to_string()),
+    })
+}
+
+/// Why a pushed-frame pixel format cannot be used, before facade-specific
+/// error branding ([`WriterError`] here, `FramePushError` for push inputs).
+pub(crate) enum SourceFormatIssue {
+    /// Not a format `av_get_pix_fmt` knows (or one with no computable size).
+    Unknown,
+    /// A hardware format: no CPU byte layout to fill from.
+    Hardware,
+}
+
+/// Shared core of [`resolve_source_format`]: format lookup, hardware
+/// rejection, and the tight `align=1` frame size.
+pub(crate) fn resolve_source_format_raw(
+    pixel_format: &str,
+    width: u32,
+    height: u32,
+) -> Result<(AVPixelFormat, usize), SourceFormatIssue> {
+    let cstr = CString::new(pixel_format).map_err(|_| SourceFormatIssue::Unknown)?;
     // SAFETY: `cstr` is a valid NUL-terminated string for the duration of the
     // call; av_get_pix_fmt only reads it.
     let pix_fmt = unsafe { av_get_pix_fmt(cstr.as_ptr()) };
     if pix_fmt == AV_PIX_FMT_NONE {
-        return Err(WriterError::UnknownPixelFormat(pixel_format.to_string()));
+        return Err(SourceFormatIssue::Unknown);
     }
     // SAFETY: pix_fmt is a valid, non-NONE format; av_pix_fmt_desc_get returns a
     // static descriptor or null.
     let desc = unsafe { av_pix_fmt_desc_get(pix_fmt) };
     if !desc.is_null() && unsafe { (*desc).flags } & (AV_PIX_FMT_FLAG_HWACCEL as u64) != 0 {
-        return Err(WriterError::HardwarePixelFormat(pixel_format.to_string()));
+        return Err(SourceFormatIssue::Hardware);
     }
     // SAFETY: pix_fmt is valid; dimensions are within i32 range.
     let size = unsafe { av_image_get_buffer_size(pix_fmt, width as i32, height as i32, 1) };
     if size <= 0 {
-        return Err(WriterError::UnknownPixelFormat(pixel_format.to_string()));
+        return Err(SourceFormatIssue::Unknown);
     }
     Ok((pix_fmt, size as usize))
 }

@@ -8,7 +8,11 @@ use super::*;
 /// 2. Chapter auto-copy (`copy_chapters`)
 /// 3. Default auto-copy (`copy_metadata_default`)
 /// 4. User-specified metadata (`of_add_metadata`)
-pub(super) unsafe fn process_metadata(mux: &Muxer, demuxs: &Vec<Demuxer>) -> Result<()> {
+pub(super) unsafe fn process_metadata(
+    mux: &Muxer,
+    demuxs: &Vec<Demuxer>,
+    file_map: &[InputSlot],
+) -> Result<()> {
     use crate::core::metadata::MetadataType;
     use crate::core::metadata::{
         copy_chapters_from_input, copy_metadata, copy_metadata_default, of_add_metadata,
@@ -39,15 +43,29 @@ pub(super) unsafe fn process_metadata(mux: &Muxer, demuxs: &Vec<Demuxer>) -> Res
         mark_manual(&mapping.src_type);
         mark_manual(&mapping.dst_type);
 
-        if mapping.input_index >= input_ctxs.len() {
-            log::warn!(target: LOG_TARGET,
-                "Metadata mapping references non-existent input file index {}",
-                mapping.input_index
-            );
-            continue;
-        }
+        // The mapping's index is a position in the user's input list;
+        // translate it to the demuxer it names. A frame-push input carries
+        // no container metadata — same warn-and-continue as a non-existent
+        // index, the established behavior for unusable mappings here.
+        let demux_idx = match file_map.get(mapping.input_index) {
+            Some(InputSlot::Demux(demux_idx)) => *demux_idx,
+            Some(InputSlot::Push(_)) => {
+                log::warn!(target: LOG_TARGET,
+                    "Metadata mapping references frame-push input {}, which carries no metadata",
+                    mapping.input_index
+                );
+                continue;
+            }
+            None => {
+                log::warn!(target: LOG_TARGET,
+                    "Metadata mapping references non-existent input file index {}",
+                    mapping.input_index
+                );
+                continue;
+            }
+        };
 
-        let input_ctx = input_ctxs[mapping.input_index];
+        let input_ctx = input_ctxs[demux_idx];
         if let Err(e) = copy_metadata(
             input_ctx,
             mux.out_fmt_ctx_ptr(),
@@ -121,7 +139,11 @@ fn is_filter_output_linklabel(linklabel: &str) -> bool {
 /// Parse and expand stream map specifications
 /// This mimics FFmpeg's opt_map() behavior: parse once, expand immediately
 /// FFmpeg reference: ffmpeg_opt.c:478-596
-unsafe fn expand_stream_maps(mux: &mut Muxer, demuxs: &[Demuxer]) -> Result<()> {
+unsafe fn expand_stream_maps(
+    mux: &mut Muxer,
+    demuxs: &[Demuxer],
+    file_map: &[InputSlot],
+) -> Result<()> {
     let stream_map_specs = std::mem::take(&mut mux.stream_map_specs);
 
     for spec in stream_map_specs {
@@ -212,12 +234,24 @@ unsafe fn expand_stream_maps(mux: &mut Muxer, demuxs: &[Demuxer]) -> Result<()> 
 
         let (file_idx, remainder) = parse_result.unwrap();
 
-        // FFmpeg reference: opt_map line 513-517 - validate file index
-        if file_idx < 0 || file_idx as usize >= demuxs.len() {
+        // FFmpeg reference: opt_map line 513-517 - validate file index. The
+        // spec's number is a position in the user's input list; translate it
+        // through `file_map` to the demuxer it names. A frame-push position
+        // has no packet stream to map — typed rejection instead of matching
+        // nothing.
+        if file_idx < 0 || file_idx as usize >= file_map.len() {
             warn!(target: LOG_TARGET, "Invalid input file index: {}.", file_idx);
             return Err(Error::OpenOutput(OpenOutputError::InvalidArgument));
         }
-        let file_idx = file_idx as usize;
+        let file_idx = match file_map[file_idx as usize] {
+            InputSlot::Demux(demux_idx) => demux_idx,
+            InputSlot::Push(_) => {
+                return Err(crate::core::frame_push::FramePushError::StreamMapReferencesFramePush {
+                    input_index: file_idx as usize,
+                }
+                .into());
+            }
+        };
 
         // FFmpeg reference: opt_map line 520 - parse stream specifier
         // FFmpeg reference: opt_map line 533 - handle '?' suffix for allow_unused
@@ -313,6 +347,7 @@ pub(super) fn outputs_bind(
     muxs: &mut Vec<Muxer>,
     filter_graphs: &mut Vec<FilterGraph>,
     demuxs: &mut Vec<Demuxer>,
+    file_map: &[InputSlot],
 ) -> Result<()> {
     // FFmpeg reference: ffmpeg.c calls opt_map during command-line parsing
     // We parse and expand stream maps early, before processing individual streams
@@ -321,7 +356,7 @@ pub(super) fn outputs_bind(
     unsafe {
         for mux in muxs.iter_mut() {
             if !mux.stream_map_specs.is_empty() {
-                expand_stream_maps(mux, demuxs)?;
+                expand_stream_maps(mux, demuxs, file_map)?;
             }
         }
     }
@@ -435,7 +470,7 @@ pub(super) fn outputs_bind(
 
         // Process metadata
         unsafe {
-            process_metadata(mux, demuxs)?;
+            process_metadata(mux, demuxs, file_map)?;
         }
     }
 

@@ -83,6 +83,11 @@ pub mod context;
 /// ([`VideoWriter`](writer::VideoWriter)).
 pub mod writer;
 
+/// Frame-push inputs with per-frame timestamps
+/// ([`FramePushSource`](frame_push::FramePushSource)): the context-level
+/// sibling of [`VideoWriter`](writer::VideoWriter).
+pub mod frame_push;
+
 /// Display matrix helpers shared by stream probing and filter graph setup.
 pub(crate) mod display;
 

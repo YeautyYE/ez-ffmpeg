@@ -309,6 +309,10 @@ pub enum Error {
     #[error("Video writer error: {0}")]
     Writer(#[from] crate::core::writer::WriterError),
 
+    /// Building a frame-push input, or wiring it into a context, failed.
+    #[error("Frame-push input error: {0}")]
+    FramePush(#[from] crate::core::frame_push::FramePushError),
+
     /// Pushing a frame into a video writer failed.
     #[error("Video writer push error: {0}")]
     Push(#[from] crate::core::writer::PushError),

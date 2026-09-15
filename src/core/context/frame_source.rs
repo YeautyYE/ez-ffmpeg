@@ -54,5 +54,13 @@ pub(crate) struct FrameSource {
     /// Cloned producer end of the filtergraph's bounded frame channel — the
     /// same channel a decoder would push into (`FilterGraph::get_src_sender`).
     pub(crate) fg_sender: Sender<FrameBox>,
+    /// Input-pad index of the consuming graph, stamped on every outgoing
+    /// `FrameData.fg_input_index` (frames and the EOF marker alike). The
+    /// graph's frame channel is shared by all of its pads and the filter
+    /// task routes each `FrameBox` by that field — a wrong pad here feeds
+    /// another input's buffersrc and starves this one. Always 0 for the
+    /// writer's probe-validated single-input graph; a frame-push input
+    /// carries whichever pad claimed it.
+    pub(crate) fg_input_index: usize,
     pub(crate) params: FrameSourceParams,
 }

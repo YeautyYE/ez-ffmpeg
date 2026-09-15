@@ -195,6 +195,9 @@ pub use self::core::context::output::StreamMap;
 pub use self::core::device;
 pub use self::core::filter;
 pub use self::core::frame_export;
+pub use self::core::frame_push::{
+    FramePushError, FramePushHandle, FramePushSource, FramePushSourceBuilder,
+};
 pub use self::core::hwaccel;
 pub use self::core::packet_scanner;
 pub use self::core::packet_sink;

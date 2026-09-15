@@ -366,6 +366,14 @@ pub struct Input {
     /// Filled at open time after the HTTP request starts.
     #[cfg(feature = "http-input")]
     pub(crate) http_avio: Option<crate::http_input::HttpAvioAttach>,
+
+    /// Frame-push backing ([`FramePushSource`](crate::FramePushSource)): the
+    /// input is fed by frames pushed from Rust code instead of a demuxed
+    /// byte stream. Mutually exclusive with `url`/`read_callback` by
+    /// construction (`Input::from(FramePushSource)` is the only way to set
+    /// it), and every other input option is rejected at context build — a
+    /// push input has no demuxer or decoder for options to act on.
+    pub(crate) frame_push: Option<crate::core::frame_push::FramePushSource>,
 }
 
 impl Input {
@@ -1441,6 +1449,7 @@ impl From<Box<dyn FnMut(&mut [u8]) -> i32 + Send>> for Input {
             http_input: None,
             #[cfg(feature = "http-input")]
             http_avio: None,
+            frame_push: None,
         }
     }
 }
@@ -1481,6 +1490,7 @@ impl From<String> for Input {
             http_input: None,
             #[cfg(feature = "http-input")]
             http_avio: None,
+            frame_push: None,
         }
     }
 }
@@ -1488,6 +1498,18 @@ impl From<String> for Input {
 impl From<&str> for Input {
     fn from(url: &str) -> Self {
         Self::from(String::from(url))
+    }
+}
+
+/// A frame-push input: takes an ordinary input position, fed by the paired
+/// [`FramePushHandle`](crate::FramePushHandle) instead of a demuxer. Every
+/// other [`Input`] option is rejected when the context is built.
+impl From<crate::core::frame_push::FramePushSource> for Input {
+    fn from(source: crate::core::frame_push::FramePushSource) -> Self {
+        let mut input = Self::from(String::new());
+        input.url = None;
+        input.frame_push = Some(source);
+        input
     }
 }
 

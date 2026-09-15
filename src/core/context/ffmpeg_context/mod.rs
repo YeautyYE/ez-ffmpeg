@@ -195,7 +195,7 @@ impl FfmpegContext {
 
     pub(crate) fn new_with_options(
         mut independent_readrate: bool,
-        mut inputs: Vec<Input>,
+        inputs: Vec<Input>,
         mut filter_complexs: Vec<FilterComplex>,
         mut outputs: Vec<Output>,
         copy_ts: bool,
@@ -217,6 +217,13 @@ impl FfmpegContext {
             scheduler_status.clone(),
         ));
 
+        // Split frame-push inputs out of the demuxer-bound list while
+        // recording every original position: user-facing input indices
+        // (filter linklabels "[N:v]", stream maps, metadata maps) are
+        // positions in the builder's input list, and `file_map` translates
+        // them to the right backing after the split.
+        let (mut inputs, mut pending_pushes, file_map) = split_frame_push_inputs(inputs)?;
+
         let mut demuxs = open_input_files(&mut inputs, copy_ts, &interrupt_state)?;
 
         if demuxs.len() <= 1 {
@@ -235,15 +242,34 @@ impl FfmpegContext {
 
         let mut filter_graphs = if !filter_complexs.is_empty() {
             let mut filter_graphs = init_filter_graphs(filter_complexs)?;
-            fg_bind_inputs(&mut filter_graphs, &mut demuxs)?;
+            fg_bind_inputs(
+                &mut filter_graphs,
+                &mut demuxs,
+                &file_map,
+                &mut pending_pushes,
+            )?;
             filter_graphs
         } else {
             Vec::new()
         };
 
+        // Every frame-push input must have been claimed by exactly one filter
+        // pad; a source nothing consumes would park its producer's `push`
+        // forever against a queue no worker drains. Checked here — before any
+        // output opens — so the root cause surfaces instead of a downstream
+        // "output has no streams".
+        for pending in &pending_pushes {
+            if pending.fg_binding.is_none() {
+                return Err(crate::core::frame_push::FramePushError::UnboundSource {
+                    input_index: pending.user_index,
+                }
+                .into());
+            }
+        }
+
         let mut muxs = open_output_files(&mut outputs, copy_ts, &interrupt_state)?;
 
-        outputs_bind(&mut muxs, &mut filter_graphs, &mut demuxs)?;
+        outputs_bind(&mut muxs, &mut filter_graphs, &mut demuxs, &file_map)?;
 
         // Propagate input recording_time to mux as a convenience feature.
         // This allows users to set recording_time on Input and have it work
@@ -276,12 +302,30 @@ impl FfmpegContext {
 
         check_frame_filter_pipeline(&muxs, &demuxs)?;
 
+        // Bound-check done above; assemble the workers' sources and arm each
+        // handle's fail-fast probe with this job's status. A handle can only
+        // ever reach one context build (the source moved in), so the slot is
+        // empty here.
+        let mut frame_sources = Vec::with_capacity(pending_pushes.len());
+        for pending in pending_pushes {
+            let Some((fg_sender, fg_input_index)) = pending.fg_binding else {
+                return Err(Error::Bug);
+            };
+            let _ = pending.status_slot.set(scheduler_status.clone());
+            frame_sources.push(crate::core::context::frame_source::FrameSource {
+                ingress: pending.ingress,
+                fg_sender,
+                fg_input_index,
+                params: pending.params,
+            });
+        }
+
         Ok(Self {
             independent_readrate,
             demuxs,
             filter_graphs,
             muxs,
-            frame_sources: Vec::new(),
+            frame_sources,
             scheduler_status,
             interrupt_state,
         })
@@ -289,6 +333,210 @@ impl FfmpegContext {
 }
 
 const START_AT_ZERO: bool = false;
+
+/// What a user-facing input position resolves to after
+/// [`split_frame_push_inputs`]: an opened demuxer or a pending frame-push
+/// source, each indexed into its own list. Filter linklabels (`[N:v]`),
+/// stream maps, and metadata maps all speak in positions and translate
+/// through this map.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InputSlot {
+    Demux(usize),
+    Push(usize),
+}
+
+/// A frame-push input between the split and its filter-pad binding: carries
+/// everything the eventual `FrameSource` needs, plus the binding slot
+/// `fg_bind` fills and the original position for error messages.
+pub(crate) struct PendingFrameSource {
+    pub(crate) ingress: crossbeam_channel::Receiver<crate::core::context::frame_source::PushedFrame>,
+    pub(crate) params: crate::core::context::frame_source::FrameSourceParams,
+    pub(crate) status_slot:
+        Arc<std::sync::OnceLock<Arc<std::sync::atomic::AtomicUsize>>>,
+    /// Set by the one filter pad that claims this source — the graph's
+    /// shared frame sender plus the claiming pad's index (the filter task
+    /// routes every `FrameBox` by that pad). A second claim is rejected
+    /// ([`FramePushError::SourceBoundTwice`]), and a source left `None`
+    /// after binding fails the build ([`FramePushError::UnboundSource`]).
+    pub(crate) fg_binding:
+        Option<(crossbeam_channel::Sender<crate::core::context::FrameBox>, usize)>,
+    pub(crate) user_index: usize,
+}
+
+use crate::core::frame_push::FramePushError;
+
+/// Splits frame-push inputs out of the demuxer-bound input list, preserving
+/// every original position in the returned [`InputSlot`] map.
+///
+/// A push-backed [`Input`] carries no demuxer and no decoder, so every other
+/// input option is rejected here with the setter's name rather than silently
+/// ignored — the same policy [`crate::VideoWriter`] applies to its `Output`
+/// options. The `Input` destructuring is deliberately exhaustive (no `..`):
+/// adding a field to `Input` must fail compilation here until the new option
+/// is classified as honored or rejected for push inputs.
+fn split_frame_push_inputs(
+    inputs: Vec<Input>,
+) -> Result<(Vec<Input>, Vec<PendingFrameSource>, Vec<InputSlot>)> {
+    let mut regular = Vec::new();
+    let mut pushes = Vec::new();
+    let mut file_map = Vec::with_capacity(inputs.len());
+
+    for (user_index, input) in inputs.into_iter().enumerate() {
+        if input.frame_push.is_none() {
+            file_map.push(InputSlot::Demux(regular.len()));
+            regular.push(input);
+            continue;
+        }
+
+        let Input {
+            url,
+            read_callback,
+            io_buffer_size,
+            seek_callback,
+            frame_pipelines,
+            format,
+            video_codec,
+            audio_codec,
+            subtitle_codec,
+            video_codec_opts,
+            audio_codec_opts,
+            subtitle_codec_opts,
+            exit_on_error,
+            readrate,
+            strict_avoptions,
+            start_time_us,
+            recording_time_us,
+            stop_time_us,
+            stream_loop,
+            hwaccel,
+            hwaccel_device,
+            hwaccel_output_format,
+            log_level_offset,
+            input_opts,
+            find_stream_info,
+            find_stream_info_codec_opts,
+            autorotate,
+            ts_scale,
+            framerate,
+            #[cfg(feature = "http-input")]
+            http_input,
+            #[cfg(feature = "http-input")]
+            http_avio,
+            frame_push,
+        } = input;
+
+        let reject = |option: &'static str| -> Result<()> {
+            Err(FramePushError::UnsupportedInputOption { option }.into())
+        };
+        // `From<FramePushSource>` is the only constructor that sets
+        // `frame_push`, and it starts from the URL ctor's defaults — so any
+        // non-default field below means a setter was called on the push
+        // input. Each check names that setter.
+        if url.is_some() || read_callback.is_some() {
+            // Unreachable through the public API (no setter installs these);
+            // classified for the exhaustiveness contract.
+            reject("Input::new / new_by_read_callback")?;
+        }
+        if io_buffer_size != crate::core::context::DEFAULT_CUSTOM_IO_BUFFER_SIZE {
+            reject("set_io_buffer_size")?;
+        }
+        if seek_callback.is_some() {
+            reject("set_seek_callback")?;
+        }
+        if frame_pipelines.is_some() {
+            reject("add_frame_pipeline")?;
+        }
+        if format.is_some() {
+            reject("set_format")?;
+        }
+        if video_codec.is_some() {
+            reject("set_video_codec")?;
+        }
+        if audio_codec.is_some() {
+            reject("set_audio_codec")?;
+        }
+        if subtitle_codec.is_some() {
+            reject("set_subtitle_codec")?;
+        }
+        if video_codec_opts.is_some() {
+            reject("set_video_codec_opt(s)")?;
+        }
+        if audio_codec_opts.is_some() {
+            reject("set_audio_codec_opt(s)")?;
+        }
+        if subtitle_codec_opts.is_some() {
+            reject("set_subtitle_codec_opt(s)")?;
+        }
+        if exit_on_error.is_some() {
+            reject("set_exit_on_error")?;
+        }
+        if readrate.is_some() {
+            reject("set_readrate")?;
+        }
+        if strict_avoptions {
+            reject("strict_avoptions")?;
+        }
+        if start_time_us.is_some() {
+            reject("set_start_time_us")?;
+        }
+        if recording_time_us.is_some() {
+            reject("set_recording_time_us")?;
+        }
+        if stop_time_us.is_some() {
+            reject("set_stop_time_us")?;
+        }
+        if stream_loop.is_some() {
+            reject("set_stream_loop")?;
+        }
+        if hwaccel.is_some() {
+            reject("set_hwaccel")?;
+        }
+        if hwaccel_device.is_some() {
+            reject("set_hwaccel_device")?;
+        }
+        if hwaccel_output_format.is_some() {
+            reject("set_hwaccel_output_format")?;
+        }
+        if log_level_offset.is_some() {
+            reject("set_log_level_offset")?;
+        }
+        if input_opts.is_some() {
+            reject("set_input_opt(s)")?;
+        }
+        if !find_stream_info {
+            reject("set_find_stream_info")?;
+        }
+        if find_stream_info_codec_opts.is_some() {
+            reject("set_find_stream_info_codec_opts")?;
+        }
+        if autorotate.is_some() {
+            reject("set_autorotate")?;
+        }
+        if ts_scale.is_some() {
+            reject("set_ts_scale")?;
+        }
+        if framerate.is_some() {
+            reject("set_framerate")?;
+        }
+        #[cfg(feature = "http-input")]
+        if http_input.is_some() || http_avio.is_some() {
+            reject("HttpInput")?;
+        }
+
+        let source = frame_push.expect("checked is_none above");
+        file_map.push(InputSlot::Push(pushes.len()));
+        pushes.push(PendingFrameSource {
+            ingress: source.ingress,
+            params: source.params,
+            status_slot: source.status_slot,
+            fg_binding: None,
+            user_index,
+        });
+    }
+
+    Ok((regular, pushes, file_map))
+}
+
 
 fn correct_input_start_times(demuxs: &mut Vec<Demuxer>, copy_ts: bool) {
     for (i, demux) in demuxs.iter_mut().enumerate() {
@@ -661,7 +909,7 @@ mod tests {
 
         // No demuxers exist: if the pad were (re-)bound to an input stream
         // this would fail with "stream not found".
-        let result = fg_complex_bind_input(&mut consumer, 0, &mut Vec::new());
+        let result = fg_complex_bind_input(&mut consumer, 0, &mut Vec::new(), &[], &mut []);
         assert!(
             result.is_ok(),
             "a pad already bound to another graph must not be re-bound: {result:?}"
@@ -682,7 +930,7 @@ mod tests {
         );
         consumer.inputs[0].bound = true;
 
-        let result = fg_complex_bind_input(&mut consumer, 0, &mut Vec::new());
+        let result = fg_complex_bind_input(&mut consumer, 0, &mut Vec::new(), &[], &mut []);
         assert!(
             result.is_ok(),
             "a bound pad labeled 'in' must not fall through to stream auto-binding: {result:?}"

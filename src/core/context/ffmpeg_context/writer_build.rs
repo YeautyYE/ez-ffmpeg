@@ -23,7 +23,7 @@ use crate::core::context::frame_source::{FrameSource, FrameSourceParams, PushedF
 use crate::core::writer::WriterError;
 use crossbeam_channel::Sender;
 
-use super::fg_bind::{init_filter_graph, probe_writer_filter_shape};
+use super::fg_bind::{ifilter_bind_frame_source, init_filter_graph, probe_writer_filter_shape};
 use super::opt_util::{choose_encoder, ofilter_bind_ost, process_metadata};
 
 /// Builds a frame-push context: one frame source, one filtergraph, one output.
@@ -130,7 +130,7 @@ pub(crate) fn build_writer_context(
     }
 
     let mut filter_graph = init_filter_graph(0, desc, None, None, None)?;
-    let fg_sender = ifilter_bind_frame_source(&mut filter_graph, &params);
+    let fg_sender = ifilter_bind_frame_source(&mut filter_graph, 0, &params);
 
     {
         let mux = &mut muxs[0];
@@ -172,7 +172,7 @@ pub(crate) fn build_writer_context(
         // demuxers the metadata pass degenerates to the user-specified values.
         unsafe {
             crate::core::context::attachment::create_attachment_streams(mux)?;
-            process_metadata(mux, &Vec::new())?;
+            process_metadata(mux, &Vec::new(), &[])?;
         }
     }
 
@@ -196,6 +196,9 @@ pub(crate) fn build_writer_context(
     let frame_source = FrameSource {
         ingress: ingress_receiver,
         fg_sender,
+        // probe_writer_filter_shape validated a single-input graph above, so
+        // the source always feeds pad 0.
+        fg_input_index: 0,
         params,
     };
 
@@ -213,43 +216,3 @@ pub(crate) fn build_writer_context(
     ))
 }
 
-/// Binds filtergraph input pad 0 to a headless frame source — the frame-source
-/// analog of `ifilter_bind_ist` (`fg_bind.rs`), minus everything that needs a
-/// demuxer. Returns the cloned filtergraph sender the source will feed.
-///
-/// Two parameters cannot ride on the frames themselves and must be installed
-/// here:
-/// - `opts.framerate`: not an `AVFrame` field; `configure_filtergraph` copies
-///   it into `AVBufferSrcParameters.frame_rate`. A VFR source has none — a
-///   0/1 rate keeps the graph from advertising a grid the pushed timestamps
-///   do not follow.
-/// - `opts.fallback`: consulted only by the zero-frame `fg_send_eof` path to
-///   configure the graph when EOF arrives before any frame; without it that
-///   path fails with "Cannot determine format after EOF".
-///
-/// The remaining fallback fields (SAR 0/1, colorspace/color_range
-/// UNSPECIFIED) keep their `av_frame_alloc` defaults, which is exactly what a
-/// pushed frame built from an unref'd pool shell carries.
-fn ifilter_bind_frame_source(
-    filter_graph: &mut FilterGraph,
-    params: &FrameSourceParams,
-) -> Sender<crate::core::context::FrameBox> {
-    let input_filter = &mut filter_graph.inputs[0];
-    input_filter.opts.framerate = params.framerate.unwrap_or(AVRational { num: 0, den: 1 });
-    // SAFETY: `fallback` is the frame allocated for this pad by
-    // init_filter_graph; only plain fields are written.
-    unsafe {
-        let fallback = input_filter.opts.fallback.as_mut_ptr();
-        (*fallback).format = params.pix_fmt as i32;
-        (*fallback).width = params.width;
-        (*fallback).height = params.height;
-        (*fallback).time_base = params.time_base;
-    }
-    // No demuxer stream may be bound on top of this pad; the scheduler-input
-    // slot (SchNode::Filter.inputs[0]) stays the pre-sized None hole, which
-    // the input controller treats as "no demuxer to unchoke".
-    input_filter.bound = true;
-
-    let (sender, _finished_flag_list) = filter_graph.get_src_sender();
-    sender
-}
