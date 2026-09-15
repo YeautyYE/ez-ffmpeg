@@ -1,6 +1,7 @@
-//! Counted frame-source worker for [`VideoWriter`](crate::VideoWriter) jobs:
-//! turns tightly packed byte buffers from the facade's ingress channel into
-//! pool-backed CFR `AVFrame`s and pushes them into the filtergraph's bounded
+//! Counted frame-source worker for frame-push jobs
+//! ([`VideoWriter`](crate::VideoWriter) and frame-push inputs): turns timed,
+//! tightly packed byte buffers from the facade's ingress channel into
+//! pool-backed `AVFrame`s and pushes them into the filtergraph's bounded
 //! frame channel — exactly where a decoder would.
 //!
 //! Teardown contract (the load-bearing part):
@@ -18,8 +19,9 @@
 //!   (`filter_task` merely breaks its loop and flushes outputs), which would
 //!   lose frames still buffered inside filters like `reverse` and skip the
 //!   zero-frame fallback configuration. The null marker closes the source at
-//!   its accumulated frame-end time — exact for this CFR source, because
-//!   every pushed frame carries `duration = 1` tick.
+//!   its accumulated frame-end time — exact whenever the pushed frames carry
+//!   real durations (the CFR writer's grid always does; a VFR frame pushed
+//!   with duration 0 ends at its own pts).
 //! - Frames come from the shared scheduler `frame_pool` so shells recycle
 //!   (`ObjPool::release` runs `av_frame_unref` before storing, so a reused
 //!   shell carries no stale reference); a locally built frame references no
@@ -29,7 +31,7 @@
 //!   exit uninits the pool, which is safe while downstream stages (or queued
 //!   `FrameBox`es) still hold pooled buffers — see the `PlanePool` docs.
 
-use crate::core::context::frame_source::{FrameSource, FrameSourceParams};
+use crate::core::context::frame_source::{FrameSource, FrameSourceParams, PushedFrame};
 use crate::core::context::obj_pool::ObjPool;
 use crate::core::context::{null_frame, FrameBox, FrameData};
 use crate::core::scheduler::ffmpeg_scheduler::{
@@ -42,7 +44,7 @@ use crossbeam_channel::{RecvTimeoutError, SendTimeoutError, Sender};
 use ffmpeg_next::Frame;
 use ffmpeg_sys_next::{
     av_buffer_pool_get, av_buffer_pool_init, av_buffer_pool_uninit, av_frame_get_buffer,
-    av_image_copy, av_image_fill_arrays, AVBufferPool, AVFrame, AVRational,
+    av_image_copy, av_image_fill_arrays, AVBufferPool, AVFrame,
 };
 use log::{debug, error};
 use std::ptr::{null_mut, NonNull};
@@ -120,8 +122,12 @@ pub(crate) fn frame_source_init(
                     return;
                 }
 
-                let data = match result {
-                    Ok(data) => data,
+                let PushedFrame {
+                    data,
+                    pts,
+                    duration,
+                } = match result {
+                    Ok(pushed) => pushed,
                     Err(RecvTimeoutError::Timeout) => continue,
                     Err(RecvTimeoutError::Disconnected) => break,
                 };
@@ -131,7 +137,8 @@ pub(crate) fn frame_source_init(
                     &mut plane_pool,
                     &params,
                     &data,
-                    nb_frames,
+                    pts,
+                    duration,
                 ) {
                     Ok(frame) => frame,
                     Err(e) => {
@@ -212,10 +219,7 @@ fn send_with_status_poll(
 
 fn frame_data_for(params: &FrameSourceParams) -> FrameData {
     FrameData {
-        framerate: Some(AVRational {
-            num: params.fps_num,
-            den: params.fps_den,
-        }),
+        framerate: params.framerate,
         bits_per_raw_sample: 0,
         input_stream_width: params.width,
         input_stream_height: params.height,
@@ -421,7 +425,7 @@ impl Drop for PlanePool {
     }
 }
 
-/// Builds one CFR video frame from a tightly packed byte buffer.
+/// Builds one video frame from a tightly packed byte buffer.
 ///
 /// The shell comes from the shared pool (unref'd: no format, no buffers).
 /// The first frame allocates fresh writable planes via `av_frame_get_buffer`
@@ -434,14 +438,18 @@ impl Drop for PlanePool {
 /// `av_image_copy` copies plane by plane honoring both linesizes — shared,
 /// unchanged code for both buffer paths.
 ///
-/// Stamping: `pts = ordinal`, `duration = 1` tick, `time_base = fps_den/fps_num`
-/// — every frame advances exactly one frame interval (CFR contract).
+/// Stamping: `pts` and `duration` land verbatim in `params.time_base` ticks.
+/// The producing facade owns the values — a CFR writer sends the ordinal
+/// grid (`pts = ordinal`, `duration = 1`, `time_base = 1/fps`), a VFR push
+/// handle forwards the caller's timestamps — so this path never branches on
+/// the timing mode.
 fn build_video_frame(
     frame_pool: &ObjPool<Frame>,
     plane_pool: &mut PlanePool,
     params: &FrameSourceParams,
     data: &[u8],
     pts: i64,
+    duration: i64,
 ) -> crate::error::Result<Frame> {
     let mut frame = frame_pool.get()?;
     // SAFETY: `frame` is a live unref'd AVFrame shell owned by this function;
@@ -508,11 +516,8 @@ fn build_video_frame(
         );
 
         (*f).pts = pts;
-        (*f).duration = 1;
-        (*f).time_base = AVRational {
-            num: params.fps_den,
-            den: params.fps_num,
-        };
+        (*f).duration = duration;
+        (*f).time_base = params.time_base;
     }
     Ok(frame)
 }
@@ -524,7 +529,7 @@ mod tests {
     use ffmpeg_sys_next::AVPixelFormat::{
         AV_PIX_FMT_GRAY8, AV_PIX_FMT_NV12, AV_PIX_FMT_PAL8, AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUVA420P,
     };
-    use ffmpeg_sys_next::{av_frame_alloc, av_image_get_buffer_size};
+    use ffmpeg_sys_next::{av_frame_alloc, av_image_get_buffer_size, AVRational};
 
     fn test_new_frame() -> crate::error::Result<Frame> {
         let f = unsafe { av_frame_alloc() };
@@ -541,8 +546,8 @@ mod tests {
             width: w,
             height: h,
             pix_fmt,
-            fps_num: 30,
-            fps_den: 1,
+            time_base: AVRational { num: 1, den: 30 },
+            framerate: Some(AVRational { num: 30, den: 1 }),
         }
     }
 
@@ -643,7 +648,7 @@ mod tests {
         let data: Vec<u8> = (0..tight_size(p.pix_fmt, 65, 3))
             .map(|i| (i % 251) as u8)
             .collect();
-        let frame = build_video_frame(&pool, &mut plane_pool, &p, &data, 7).expect("build");
+        let frame = build_video_frame(&pool, &mut plane_pool, &p, &data, 7, 1).expect("build");
         unsafe {
             let f = frame.as_ptr();
             assert!((*f).linesize[0] >= 65, "padded linesize expected");
@@ -675,7 +680,7 @@ mod tests {
         for (i, b) in data.iter_mut().enumerate() {
             *b = (i * 7 % 253) as u8;
         }
-        let frame = build_video_frame(&pool, &mut plane_pool, &p, &data, 0).expect("build");
+        let frame = build_video_frame(&pool, &mut plane_pool, &p, &data, 0, 1).expect("build");
         unsafe {
             let f = frame.as_ptr();
             let planes = [
@@ -770,7 +775,7 @@ mod tests {
         let p = params(AV_PIX_FMT_GRAY8, 8, 2);
         let size = tight_size(p.pix_fmt, 8, 2);
 
-        let (ingress_tx, ingress_rx) = crossbeam_channel::bounded::<Vec<u8>>(4);
+        let (ingress_tx, ingress_rx) = crossbeam_channel::bounded::<PushedFrame>(4);
         let (fg_tx, fg_rx) = crossbeam_channel::bounded::<FrameBox>(1);
         let status = Arc::new(AtomicUsize::new(STATUS_RUN));
         let thread_sync = ThreadSynchronizer::new();
@@ -793,8 +798,20 @@ mod tests {
 
         // Frame 1 fills the 1-slot filter channel; frame 2 parks the worker
         // inside send_timeout (the receiver is deliberately never read).
-        ingress_tx.send(vec![1u8; size]).unwrap();
-        ingress_tx.send(vec![2u8; size]).unwrap();
+        ingress_tx
+            .send(PushedFrame {
+                data: vec![1u8; size],
+                pts: 0,
+                duration: 1,
+            })
+            .unwrap();
+        ingress_tx
+            .send(PushedFrame {
+                data: vec![2u8; size],
+                pts: 1,
+                duration: 1,
+            })
+            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(20);
         while !(fg_rx.is_full() && ingress_tx.is_empty()) {
             assert!(
@@ -837,11 +854,12 @@ mod tests {
         let mut plane_pool = PlanePool::empty();
         let p = params(AV_PIX_FMT_GRAY8, 8, 2);
         let data_a = vec![0xAA; tight_size(p.pix_fmt, 8, 2)];
-        let frame = build_video_frame(&pool, &mut plane_pool, &p, &data_a, 0).expect("first build");
+        let frame =
+            build_video_frame(&pool, &mut plane_pool, &p, &data_a, 0, 1).expect("first build");
         pool.release(frame); // unrefs, stores the shell
         let data_b = vec![0x55; tight_size(p.pix_fmt, 8, 2)];
         let frame =
-            build_video_frame(&pool, &mut plane_pool, &p, &data_b, 1).expect("recycled build");
+            build_video_frame(&pool, &mut plane_pool, &p, &data_b, 1, 1).expect("recycled build");
         unsafe {
             let f = frame.as_ptr();
             let row = std::slice::from_raw_parts((*f).data[0], 8);
@@ -871,13 +889,13 @@ mod tests {
         };
 
         let data_a = pat(1);
-        let f1 = build_video_frame(&pool, &mut plane_pool, &p, &data_a, 0).expect("frame 1");
+        let f1 = build_video_frame(&pool, &mut plane_pool, &p, &data_a, 0, 1).expect("frame 1");
         assert_eq!(plane_pool.pooled_builds, 0, "frame 1 is the template build");
         assert!(plane_pool.pool.is_some(), "first build must arm the pool");
         assert_frame_planes(&f1, planes, &data_a, "frame 1");
 
         let data_b = pat(2);
-        let f2 = build_video_frame(&pool, &mut plane_pool, &p, &data_b, 1).expect("frame 2");
+        let f2 = build_video_frame(&pool, &mut plane_pool, &p, &data_b, 1, 1).expect("frame 2");
         assert_eq!(plane_pool.pooled_builds, 1, "frame 2 must be pooled");
         assert_frame_planes(&f2, planes, &data_b, "frame 2");
         let f2_plane0 = unsafe { (*f2.as_ptr()).data[0] as usize };
@@ -888,7 +906,7 @@ mod tests {
         pool.release(f2);
 
         let data_c = pat(3);
-        let f3 = build_video_frame(&pool, &mut plane_pool, &p, &data_c, 2).expect("frame 3");
+        let f3 = build_video_frame(&pool, &mut plane_pool, &p, &data_c, 2, 1).expect("frame 3");
         assert_eq!(plane_pool.pooled_builds, 2, "frame 3 must be pooled");
         let f3_plane0 = unsafe { (*f3.as_ptr()).data[0] as usize };
         assert_eq!(
@@ -931,7 +949,8 @@ mod tests {
                 let data: Vec<u8> = (0..tight)
                     .map(|i| ((i * 7 + n as usize * 31) % 251) as u8)
                     .collect();
-                let frame = build_video_frame(&pool, &mut plane_pool, &p, &data, n).expect("build");
+                let frame =
+                    build_video_frame(&pool, &mut plane_pool, &p, &data, n, 1).expect("build");
                 unsafe {
                     let f = frame.as_ptr();
                     assert_eq!((*f).pts, n, "{fmt:?} frame {n}: pts");
@@ -975,8 +994,8 @@ mod tests {
         let data_a: Vec<u8> = (0..tight).map(|i| (i % 249) as u8).collect();
         let data_b: Vec<u8> = (0..tight).map(|i| (i % 247) as u8).collect();
 
-        let f1 = build_video_frame(&pool, &mut plane_pool, &p, &data_a, 0).expect("template");
-        let f2 = build_video_frame(&pool, &mut plane_pool, &p, &data_b, 1).expect("pooled");
+        let f1 = build_video_frame(&pool, &mut plane_pool, &p, &data_a, 0, 1).expect("template");
+        let f2 = build_video_frame(&pool, &mut plane_pool, &p, &data_b, 1, 1).expect("pooled");
         assert_eq!(plane_pool.pooled_builds, 1, "frame 2 must be pooled");
 
         // Worker exit while the pooled frame is still in flight downstream.
@@ -1003,7 +1022,7 @@ mod tests {
             let data: Vec<u8> = (0..tight)
                 .map(|i| ((i * 3 + n as usize * 17) % 250) as u8)
                 .collect();
-            let frame = build_video_frame(&pool, &mut plane_pool, &p, &data, n).expect("build");
+            let frame = build_video_frame(&pool, &mut plane_pool, &p, &data, n, 1).expect("build");
             if n == 0 {
                 // The disarmed path must carry the same buffer-layout
                 // contract as a genuine unpooled build, not merely
@@ -1020,7 +1039,7 @@ mod tests {
                 // overlapping plane table, and sheared rows.
                 let mut fresh = PlanePool::empty();
                 let twin =
-                    build_video_frame(&pool, &mut fresh, &p, &data, n).expect("unpooled twin");
+                    build_video_frame(&pool, &mut fresh, &p, &data, n, 1).expect("unpooled twin");
                 let (offsets, linesize, extent, aliased, writable) = frame_layout(&frame);
                 let (t_offsets, t_linesize, t_extent, t_aliased, t_writable) = frame_layout(&twin);
                 assert_eq!(

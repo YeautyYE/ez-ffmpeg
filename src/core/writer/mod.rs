@@ -115,12 +115,12 @@ use std::time::Duration;
 use crossbeam_channel::{SendTimeoutError, Sender};
 use ffmpeg_sys_next::AVPixelFormat::AV_PIX_FMT_NONE;
 use ffmpeg_sys_next::{
-    av_get_pix_fmt, av_image_get_buffer_size, av_pix_fmt_desc_get, AVPixelFormat,
+    av_get_pix_fmt, av_image_get_buffer_size, av_pix_fmt_desc_get, AVPixelFormat, AVRational,
     AV_PIX_FMT_FLAG_HWACCEL,
 };
 
 use crate::core::context::ffmpeg_context::build_writer_context;
-use crate::core::context::frame_source::FrameSourceParams;
+use crate::core::context::frame_source::{FrameSourceParams, PushedFrame};
 use crate::core::context::output::Output;
 use crate::core::scheduler::ffmpeg_scheduler::{is_stopping, FfmpegScheduler, Running};
 use crate::error::OpenOutputError;
@@ -390,10 +390,15 @@ impl From<OwnedPushError> for crate::error::Error {
 /// docs).
 pub struct VideoWriter {
     /// `None` once ingress is closed by `finish`/`abort`/`Drop`.
-    sender: Option<Sender<Vec<u8>>>,
+    sender: Option<Sender<PushedFrame>>,
     /// `None` once consumed by `finish`/`abort`, so `Drop` is a no-op afterward.
     scheduler: Option<FfmpegScheduler<Running>>,
     frame_size: usize,
+    /// Ordinal of the next accepted frame — the writer generates its CFR grid
+    /// here (`pts = ordinal`, `duration = 1` tick of `1/fps`) and the worker
+    /// stamps whatever it is sent. Advances only when a frame is actually
+    /// queued, so a rejected or returned frame never leaves a pts hole.
+    next_pts: i64,
     /// The scheduler status atomic, polled by `write` to fail fast when the
     /// pipeline is stopping rather than blocking on a full queue forever.
     status: Arc<AtomicUsize>,
@@ -477,16 +482,23 @@ impl VideoWriter {
                 })
             }
         };
-        let mut msg = frame;
+        let mut msg = PushedFrame {
+            data: frame,
+            pts: self.next_pts,
+            duration: 1,
+        };
         loop {
             match sender.send_timeout(msg, SEND_POLL) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    self.next_pts += 1;
+                    return Ok(());
+                }
                 Err(SendTimeoutError::Timeout(returned)) => {
                     // Full queue = backpressure. Re-check status so a pipeline
                     // that dies while we are parked wakes us instead of hanging.
                     if is_stopping(self.status.load(Ordering::Acquire)) {
                         return Err(OwnedPushError {
-                            frame: returned,
+                            frame: returned.data,
                             error: PushError::PipelineClosed,
                         });
                     }
@@ -494,7 +506,7 @@ impl VideoWriter {
                 }
                 Err(SendTimeoutError::Disconnected(returned)) => {
                     return Err(OwnedPushError {
-                        frame: returned,
+                        frame: returned.data,
                         error: PushError::PipelineClosed,
                     })
                 }
@@ -758,8 +770,14 @@ impl VideoWriterBuilder {
             width: self.width as i32,
             height: self.height as i32,
             pix_fmt,
-            fps_num: self.fps_num,
-            fps_den: self.fps_den,
+            time_base: AVRational {
+                num: self.fps_den,
+                den: self.fps_num,
+            },
+            framerate: Some(AVRational {
+                num: self.fps_num,
+                den: self.fps_den,
+            }),
         };
 
         let (ctx, sender) =
@@ -785,6 +803,7 @@ impl VideoWriterBuilder {
             sender: Some(sender),
             scheduler: Some(scheduler),
             frame_size,
+            next_pts: 0,
             status,
         })
     }
@@ -1133,8 +1152,8 @@ mod tests {
                 width: 64,
                 height: 48,
                 pix_fmt: AV_PIX_FMT_RGBA,
-                fps_num: 30,
-                fps_den: 1,
+                time_base: AVRational { num: 1, den: 30 },
+                framerate: Some(AVRational { num: 30, den: 1 }),
             };
             let (ctx, sender) = build_writer_context(
                 params,
@@ -1147,7 +1166,11 @@ mod tests {
             // Put the worker mid-stream so it holds a pooled frame path, not
             // just an idle recv.
             sender
-                .send(vec![0u8; 64 * 48 * 4])
+                .send(PushedFrame {
+                    data: vec![0u8; 64 * 48 * 4],
+                    pts: 0,
+                    duration: 1,
+                })
                 .expect("worker must be consuming");
 
             let (tx, rx) = std::sync::mpsc::channel();

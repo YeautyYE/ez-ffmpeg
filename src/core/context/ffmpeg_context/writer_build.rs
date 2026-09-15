@@ -19,7 +19,7 @@
 //! scheduler status (see `scheduler::frame_source_task`).
 
 use super::*;
-use crate::core::context::frame_source::{FrameSource, FrameSourceParams};
+use crate::core::context::frame_source::{FrameSource, FrameSourceParams, PushedFrame};
 use crate::core::writer::WriterError;
 use crossbeam_channel::Sender;
 
@@ -36,7 +36,7 @@ pub(crate) fn build_writer_context(
     queue_capacity: usize,
     filter_desc: Option<&str>,
     output: Output,
-) -> Result<(FfmpegContext, Sender<Vec<u8>>)> {
+) -> Result<(FfmpegContext, Sender<PushedFrame>)> {
     crate::core::initialize_ffmpeg();
 
     // Same bootstrap as new_with_options: the status atomic must exist before
@@ -220,7 +220,9 @@ pub(crate) fn build_writer_context(
 /// Two parameters cannot ride on the frames themselves and must be installed
 /// here:
 /// - `opts.framerate`: not an `AVFrame` field; `configure_filtergraph` copies
-///   it into `AVBufferSrcParameters.frame_rate`.
+///   it into `AVBufferSrcParameters.frame_rate`. A VFR source has none — a
+///   0/1 rate keeps the graph from advertising a grid the pushed timestamps
+///   do not follow.
 /// - `opts.fallback`: consulted only by the zero-frame `fg_send_eof` path to
 ///   configure the graph when EOF arrives before any frame; without it that
 ///   path fails with "Cannot determine format after EOF".
@@ -233,10 +235,7 @@ fn ifilter_bind_frame_source(
     params: &FrameSourceParams,
 ) -> Sender<crate::core::context::FrameBox> {
     let input_filter = &mut filter_graph.inputs[0];
-    input_filter.opts.framerate = AVRational {
-        num: params.fps_num,
-        den: params.fps_den,
-    };
+    input_filter.opts.framerate = params.framerate.unwrap_or(AVRational { num: 0, den: 1 });
     // SAFETY: `fallback` is the frame allocated for this pad by
     // init_filter_graph; only plain fields are written.
     unsafe {
@@ -244,10 +243,7 @@ fn ifilter_bind_frame_source(
         (*fallback).format = params.pix_fmt as i32;
         (*fallback).width = params.width;
         (*fallback).height = params.height;
-        (*fallback).time_base = AVRational {
-            num: params.fps_den,
-            den: params.fps_num,
-        };
+        (*fallback).time_base = params.time_base;
     }
     // No demuxer stream may be bound on top of this pad; the scheduler-input
     // slot (SchNode::Filter.inputs[0]) stays the pre-sized None hole, which
