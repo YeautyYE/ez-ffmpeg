@@ -63,7 +63,9 @@ rustls-native-certs = { version = "=0.8.4", optional = true }
 # rustls 0.23.25+ needs subtle ^2.5; rml_rtmp → crypto-mac 0.10.1 pins
 # subtle =2.4. Pin rustls to the spike-verified line and crypto-mac 0.10.0
 # (no exact subtle pin) so default / --all-features resolution unifies.
-rustls = { version = "=0.23.43", optional = true, default-features = false, features = ["ring", "std"] }
+# 0.23.45 clears RUSTSEC-2026-0285; its only req bump (rustls-webpki
+# ^0.103.14) stays MSRV 1.71, keeping the 1.80-resolvable dependency set.
+rustls = { version = "=0.23.45", optional = true, default-features = false, features = ["ring", "std"] }
 crypto-mac = { version = "=0.10.0", optional = true }
 hyper-rustls = { version = "=0.27.7", optional = true, default-features = false }
 idna_adapter = { version = "=1.1.0", optional = true, default-features = false }
