@@ -10,7 +10,9 @@ impl Output {
 
     /// Add or update global metadata for the output file.
     ///
-    /// If value is empty string, the key will be removed (FFmpeg behavior).
+    /// If value is empty string, the key is removed from the output file
+    /// (FFmpeg behavior). This also removes a key that was automatically
+    /// copied from the input, matching the CLI's `-metadata key=`.
     /// Replicates FFmpeg's `-metadata key=value` option.
     ///
     /// FFmpeg reference: fftools/ffmpeg_opt.c (`opt_metadata()` handles `-metadata key=value`).
@@ -25,16 +27,15 @@ impl Output {
         let key = key.into();
         let value = value.into();
 
-        if value.is_empty() {
-            // Empty value means remove the key (FFmpeg behavior)
-            if let Some(ref mut metadata) = self.global_metadata {
-                metadata.remove(&key);
-            }
-        } else {
-            self.global_metadata
-                .get_or_insert_with(HashMap::new)
-                .insert(key, value);
-        }
+        // An empty value is FFmpeg's deletion spelling (`-metadata key=`) and is
+        // kept in the map as a marker rather than resolved here. The marker must
+        // survive to `of_add_metadata`, which runs AFTER the automatic
+        // input->output copy: deleting the key at this point would only drop it
+        // from the builder's own configuration, leaving the copy's value on the
+        // output.
+        self.global_metadata
+            .get_or_insert_with(HashMap::new)
+            .insert(key, value);
         self
     }
 
@@ -59,7 +60,13 @@ impl Output {
         self
     }
 
-    /// Remove a global metadata key.
+    /// Remove a global metadata key from the output file.
+    ///
+    /// This removes a key that was automatically copied from the input as well
+    /// as any value set through [`Self::add_metadata`]. Implemented by leaving
+    /// an empty-value deletion marker for `of_add_metadata` rather than by
+    /// clearing the builder's own configuration, so the removal is applied
+    /// after the automatic input->output copy.
     ///
     /// FFmpeg reference: fftools/ffmpeg_opt.c (`-metadata key=` deletes the key when value is
     /// empty; we follow the same rule by interpreting an empty string as removal).
@@ -71,15 +78,17 @@ impl Output {
     ///     .remove_metadata("title");  // Remove the title
     /// ```
     pub fn remove_metadata(mut self, key: &str) -> Self {
-        if let Some(ref mut metadata) = self.global_metadata {
-            metadata.remove(key);
-        }
+        self.global_metadata
+            .get_or_insert_with(HashMap::new)
+            .insert(key.to_string(), String::new());
         self
     }
 
     /// Clear all metadata (global, stream, chapter, program) and mappings.
     ///
-    /// Useful when you want to start fresh without any metadata.
+    /// Useful when you want to start fresh without any metadata. Disables the
+    /// automatic input->output metadata copy, so keys inherited from the input
+    /// do not reappear afterwards.
     ///
     /// FFmpeg reference: fftools/ffmpeg_opt.c (users typically issue `-map_metadata -1` and then
     /// reapply `-metadata` options; this helper emulates that workflow programmatically).
@@ -96,6 +105,10 @@ impl Output {
         self.chapter_metadata.clear();
         self.program_metadata.clear();
         self.metadata_map.clear();
+        // `-map_metadata -1` also stops the automatic copy. Without this the
+        // cleared state is refilled by `copy_metadata_default`, which runs
+        // before `of_add_metadata` and has no marker to suppress it.
+        self.auto_copy_metadata = false;
         self
     }
 
@@ -174,7 +187,9 @@ impl Output {
     /// Add or update chapter-specific metadata.
     ///
     /// Chapters are used for DVD-like navigation points in media files.
-    /// If value is empty string, the key will be removed (FFmpeg behavior).
+    /// If value is empty string, the key is removed from the chapter
+    /// (FFmpeg behavior). As with global metadata, the empty value is kept as a
+    /// deletion marker so it is applied after chapters are copied from the input.
     /// Replicates FFmpeg's `-metadata:c:N key=value` option.
     /// FFmpeg reference: fftools/ffmpeg_opt.c (`opt_metadata()` handles the `c:` target selector).
     ///
@@ -193,24 +208,21 @@ impl Output {
         let key = key.into();
         let value = value.into();
 
-        if value.is_empty() {
-            // Empty value means remove the key (FFmpeg behavior)
-            if let Some(metadata) = self.chapter_metadata.get_mut(&chapter_index) {
-                metadata.remove(&key);
-            }
-        } else {
-            self.chapter_metadata
-                .entry(chapter_index)
-                .or_default()
-                .insert(key, value);
-        }
+        // Empty value = deletion marker; see `add_metadata` for why it is not
+        // resolved here.
+        self.chapter_metadata
+            .entry(chapter_index)
+            .or_default()
+            .insert(key, value);
         self
     }
 
     /// Add or update program-specific metadata.
     ///
     /// Programs are used in multi-program transport streams (e.g., MPEG-TS).
-    /// If value is empty string, the key will be removed (FFmpeg behavior).
+    /// If value is empty string, the key is removed from the program
+    /// (FFmpeg behavior). As with global metadata, the empty value is kept as a
+    /// deletion marker so it is applied after metadata is copied from the input.
     /// Replicates FFmpeg's `-metadata:p:N key=value` option.
     /// FFmpeg reference: fftools/ffmpeg_opt.c (`opt_metadata()` with `p:` selector).
     ///
@@ -229,17 +241,12 @@ impl Output {
         let key = key.into();
         let value = value.into();
 
-        if value.is_empty() {
-            // Empty value means remove the key (FFmpeg behavior)
-            if let Some(metadata) = self.program_metadata.get_mut(&program_index) {
-                metadata.remove(&key);
-            }
-        } else {
-            self.program_metadata
-                .entry(program_index)
-                .or_default()
-                .insert(key, value);
-        }
+        // Empty value = deletion marker; see `add_metadata` for why it is not
+        // resolved here.
+        self.program_metadata
+            .entry(program_index)
+            .or_default()
+            .insert(key, value);
         self
     }
 
@@ -288,5 +295,102 @@ impl Output {
         });
 
         Ok(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These pin the DELETION-MARKER contract at the setter level. The
+    // end-to-end behavior is covered by `tests/metadata.rs`; what matters here
+    // is that an empty value survives as an empty-string entry, because
+    // `of_add_metadata` is what turns it into `av_dict_set(key, NULL, 0)` and
+    // it runs AFTER the automatic input->output copy. A setter that resolves
+    // the empty value locally (by dropping the key) would leave the copied
+    // value on the output — the bug these tests exist to prevent.
+
+    #[test]
+    fn empty_global_value_is_kept_as_deletion_marker() {
+        let output = Output::from("out.mp4")
+            .add_metadata("artist", "Someone")
+            .add_metadata("artist", "");
+
+        let map = output.global_metadata.expect("map exists");
+        assert_eq!(
+            map.get("artist").map(String::as_str),
+            Some(""),
+            "empty value must survive as a marker, not be dropped: {map:?}"
+        );
+    }
+
+    #[test]
+    fn remove_metadata_records_a_deletion_marker() {
+        let output = Output::from("out.mp4").remove_metadata("artist");
+
+        let map = output
+            .global_metadata
+            .expect("remove_metadata must record a marker even when nothing was set");
+        assert_eq!(map.get("artist").map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn last_write_wins_for_global_metadata() {
+        // Delete then set: the later value wins.
+        let output = Output::from("out.mp4")
+            .add_metadata("artist", "")
+            .add_metadata("artist", "Final");
+        assert_eq!(
+            output
+                .global_metadata
+                .expect("map")
+                .get("artist")
+                .map(String::as_str),
+            Some("Final")
+        );
+    }
+
+    #[test]
+    fn empty_chapter_value_is_kept_as_deletion_marker() {
+        let output = Output::from("out.mkv")
+            .add_chapter_metadata(0, "title", "One")
+            .add_chapter_metadata(0, "title", "");
+
+        let map = output.chapter_metadata.get(&0).expect("chapter 0 entry");
+        assert_eq!(
+            map.get("title").map(String::as_str),
+            Some(""),
+            "empty chapter value must survive as a marker: {map:?}"
+        );
+    }
+
+    #[test]
+    fn empty_program_value_is_kept_as_deletion_marker() {
+        let output = Output::from("out.ts")
+            .add_program_metadata(0, "service_name", "Ch1")
+            .add_program_metadata(0, "service_name", "");
+
+        let map = output.program_metadata.get(&0).expect("program 0 entry");
+        assert_eq!(
+            map.get("service_name").map(String::as_str),
+            Some(""),
+            "empty program value must survive as a marker: {map:?}"
+        );
+    }
+
+    #[test]
+    fn clear_all_metadata_disables_auto_copy() {
+        // The whole point of the clear is that the automatic input->output
+        // copy must not refill the container afterwards.
+        let output = Output::from("out.mp4")
+            .add_metadata("title", "T")
+            .clear_all_metadata();
+
+        assert!(!output.auto_copy_metadata, "auto-copy must be disabled");
+        assert!(output.global_metadata.is_none());
+        assert!(output.stream_metadata.is_empty());
+        assert!(output.chapter_metadata.is_empty());
+        assert!(output.program_metadata.is_empty());
+        assert!(output.metadata_map.is_empty());
     }
 }
