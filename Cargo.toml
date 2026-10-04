@@ -51,15 +51,19 @@ ash = { version = "0.38", optional = true }
 bytes = { version = "1.11.1", optional = true }
 
 # http-input (default-off). Tokio is current-thread only (no rt-multi-thread).
-# hyper-rustls / idna_adapter / zeroize / chacha20 / quinn* / crypto-mac /
-# security-framework are resolver pins so Cargo 1.80 does not select
-# Edition 2024 / MSRV 1.85 transitive crates. They stay optional here and
-# are NOT activated by `http-input` (same as quinn). Drop the pins once
+# hyper-util / hyper-rustls / idna_adapter / zeroize / chacha20 / quinn* /
+# crypto-mac / security-framework are resolver pins so Cargo 1.80 does not
+# select Edition 2024 / MSRV 1.85 transitive crates. They stay optional here
+# and are NOT activated by `http-input` (same as quinn). Drop the pins once
 # upstream ranges stay on 1.80.
 reqwest = { version = "=0.12.28", optional = true, default-features = false, features = ["rustls-tls-manual-roots", "stream"] }
 tokio = { version = "=1.47.1", optional = true, default-features = false, features = ["rt", "net", "time", "sync", "macros"] }
 futures-util = { version = "=0.3.31", optional = true, default-features = false, features = ["std"] }
 rustls-native-certs = { version = "=0.8.4", optional = true }
+# hyper-util 0.1.21 (2026-09-24) moved to Edition 2024 / MSRV 1.85, which
+# Cargo 1.80 cannot even parse; reqwest's `hyper-util ^0.1.12` would otherwise
+# resolve to it on every fresh lockfile (Cargo.lock is untracked).
+hyper-util = { version = "=0.1.20", optional = true, default-features = false }
 # rustls 0.23.25+ needs subtle ^2.5; rml_rtmp → crypto-mac 0.10.1 pins
 # subtle =2.4. Pin rustls to the spike-verified line and crypto-mac 0.10.0
 # (no exact subtle pin) so default / --all-features resolution unifies.
