@@ -62,6 +62,33 @@ fn has_attached_pic(path: &str) -> bool {
         .any(|(_, d)| d & AV_DISPOSITION_ATTACHED_PIC != 0)
 }
 
+/// `(codec_name, width, height)` of the stream carrying `attached_pic`, or
+/// `None` when no stream carries one.
+fn attached_pic_shape(path: &str) -> Option<(String, i32, i32)> {
+    unsafe {
+        let c_path = CString::new(path).unwrap();
+        let mut fmt: *mut AVFormatContext = ptr::null_mut();
+        let ret = avformat_open_input(&mut fmt, c_path.as_ptr(), ptr::null_mut(), ptr::null_mut());
+        assert!(ret >= 0, "avformat_open_input({path}) failed: {ret}");
+        assert!(avformat_find_stream_info(fmt, ptr::null_mut()) >= 0);
+        let shape = (0..(*fmt).nb_streams as usize).find_map(|i| {
+            let st = *(*fmt).streams.add(i);
+            if (*st).disposition & AV_DISPOSITION_ATTACHED_PIC == 0 {
+                return None;
+            }
+            let par = (*st).codecpar;
+            let name = std::ffi::CStr::from_ptr(
+                ffmpeg_sys_next::avcodec_get_name((*par).codec_id),
+            )
+            .to_string_lossy()
+            .into_owned();
+            Some((name, (*par).width, (*par).height))
+        });
+        avformat_close_input(&mut fmt);
+        shape
+    }
+}
+
 fn video_dispositions(path: &str) -> Vec<i32> {
     streams_of(path)
         .into_iter()
@@ -110,15 +137,24 @@ fn cli(args: &[&str]) -> bool {
 // environment without the CLI skips; a fixture that builds but lacks the
 // property under test asserts, so the scenarios cannot silently no-op.
 
-/// A FLAC whose cover art is an `attached_pic` PNG stream. Returns `None` only
-/// when the ffmpeg CLI cannot be spawned; a CLI that runs but fails the render
-/// or the remux asserts, so the scenario cannot silently degrade into a no-op.
+/// A FLAC whose cover art is an `attached_pic` MJPEG stream. Returns `None`
+/// only when the ffmpeg CLI cannot be spawned; a CLI that runs but fails the
+/// render or the remux asserts, so the scenario cannot silently degrade into a
+/// no-op.
+///
+/// The cover is MJPEG and the render names its encoder explicitly. The
+/// LGPL-minimum CI profile builds FFmpeg with `--disable-gpl --disable-autodetect`
+/// (no zlib, hence no PNG encoder) and puts that binary on `PATH`, while MJPEG,
+/// FLAC and the lavfi sources are all native there. Callers that make the crate
+/// RE-ENCODE the cover additionally need a PNG encoder — that is the crate
+/// guessing a container default, not a choice the fixture can make, so those
+/// callers gate on it themselves.
 fn cover_flac_fixture(name: &str) -> Option<String> {
-    let png = tmp_path(&format!("{name}.cover.png"));
+    let cover = tmp_path(&format!("{name}.cover.jpg"));
     if !cli(&[
         "-y", "-loglevel", "error",
         "-f", "lavfi", "-i", "color=c=red:s=120x120:d=1",
-        "-frames:v", "1", &png,
+        "-frames:v", "1", "-c:v", "mjpeg", &cover,
     ]) {
         return None; // ffmpeg CLI absent -> skip
     }
@@ -128,7 +164,7 @@ fn cover_flac_fixture(name: &str) -> Option<String> {
         cli(&[
             "-y", "-loglevel", "error",
             "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
-            "-i", &png,
+            "-i", &cover,
             "-map", "0:a", "-map", "1:v",
             "-c:a", "flac", "-c:v", "copy",
             "-disposition:v", "attached_pic",
@@ -202,8 +238,17 @@ fn reencode_fixture(name: &str) -> Option<String> {
 /// The core of #66: the cover survives a FLAC -> FLAC copy, and the output
 /// stream carries `AV_DISPOSITION_ATTACHED_PIC`. Before the fix the output had
 /// only the audio stream.
+///
+/// The job passes no codec, so the cover is re-encoded and FFmpeg guesses PNG
+/// from the container; a build without a PNG encoder (the LGPL-minimum CI
+/// profile) skips. The override test below covers the copy path, which needs no
+/// such encoder.
 #[test]
 fn attached_pic_disposition_is_inherited_flac_to_flac() {
+    if !ez_ffmpeg::capabilities::is_encoder_available("png") {
+        eprintln!("skipping: no PNG encoder to re-encode the cover with");
+        return;
+    }
     let Some(input) = cover_flac_fixture("inherit") else {
         eprintln!("skipping: ffmpeg CLI unavailable");
         return;
@@ -224,13 +269,18 @@ fn attached_pic_disposition_is_inherited_flac_to_flac() {
         "cover art lost: output streams {:?}",
         streams_of(&out)
     );
-    // Byte-for-byte the same size as the input proves the picture payload
-    // survived, not just the disposition bit.
-    let (a, b) = (
-        std::fs::metadata(&input).unwrap().len(),
-        std::fs::metadata(&out).unwrap().len(),
+    // A real 120x120 picture, not just the disposition bit. Neither side passes
+    // a codec, so the cover is DECODED AND RE-ENCODED (MJPEG in, PNG out) — the
+    // CLI with the same argv does the same and is not byte-identical to its own
+    // input either. The invariant is therefore the picture's presence and
+    // geometry, which survives the re-encode; a `-c copy` would additionally
+    // preserve the JPEG bytes, but that is a different command.
+    assert_eq!(
+        attached_pic_shape(&out),
+        Some(("png".to_string(), 120, 120)),
+        "the output cover is not the expected re-encoded picture: {:?}",
+        attached_pic_shape(&out)
     );
-    assert_eq!(a, b, "cover art payload changed size ({a} -> {b})");
 }
 
 /// A source stream's default disposition must reach the output too.
