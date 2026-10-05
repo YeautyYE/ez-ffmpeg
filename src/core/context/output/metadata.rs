@@ -184,6 +184,48 @@ impl Output {
         Ok(self)
     }
 
+    /// Set the disposition of matching output streams.
+    ///
+    /// Replicates FFmpeg's `-disposition[:stream_specifier] value`. Values use
+    /// the stream AVOption's flag syntax, including `default`, `forced`,
+    /// `attached_pic`, combinations, `+`/`-` prefixes, and `0`. An empty
+    /// specifier targets every stream, matching the CLI's unqualified
+    /// `-disposition`. If several options match one stream, the last matching
+    /// option wins.
+    ///
+    /// Input-backed streams inherit their input dispositions before manual
+    /// overrides. Any matching manual option suppresses automatic default
+    /// marking for all media types; otherwise, when a media type has multiple
+    /// output streams but no default, its first non-attached-picture stream
+    /// becomes the default.
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// let output = Output::from("output.mkv")
+    ///     .set_disposition("a:0", "default+forced")?;
+    /// // Unqualified: every stream.
+    /// let output = Output::from("output.mkv").set_disposition("", "forced")?;
+    /// ```
+    ///
+    /// # Errors
+    /// Returns an error if the stream specifier syntax is invalid.
+    pub fn set_disposition(
+        mut self,
+        stream_spec: impl Into<String>,
+        disposition: impl Into<String>,
+    ) -> Result<Self, String> {
+        let stream_spec = stream_spec.into();
+        // An empty specifier is the CLI's unqualified form and matches every
+        // stream. `StreamSpecifier::parse` rejects the empty string, so it is
+        // left unparsed here and matched by the `default()` specifier at apply
+        // time (list type `All`, no media type -> wildcard).
+        if !stream_spec.is_empty() {
+            crate::core::metadata::StreamSpecifier::parse(&stream_spec)?;
+        }
+        self.dispositions.push((stream_spec, disposition.into()));
+        Ok(self)
+    }
+
     /// Add or update chapter-specific metadata.
     ///
     /// Chapters are used for DVD-like navigation points in media files.
@@ -301,6 +343,39 @@ impl Output {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disposition_options_preserve_order_and_validate_specifiers() {
+        let output = Output::from("out.mkv")
+            .set_disposition("a:0", "default")
+            .expect("valid specifier")
+            .set_disposition("a:0", "+forced")
+            .expect("valid specifier");
+
+        assert_eq!(
+            output.dispositions,
+            [
+                ("a:0".into(), "default".into()),
+                ("a:0".into(), "+forced".into())
+            ]
+        );
+        assert!(Output::from("out.mkv")
+            .set_disposition("x", "default")
+            .is_err());
+    }
+
+    /// The unqualified form (`-disposition` with no stream specifier) targets
+    /// every stream, so an empty specifier must be accepted and stored
+    /// verbatim — it is a wildcard, not the malformed input that
+    /// `StreamSpecifier::parse` rejects it as.
+    #[test]
+    fn empty_specifier_is_the_unqualified_disposition() {
+        let output = Output::from("out.mkv")
+            .set_disposition("", "forced")
+            .expect("the unqualified form must be accepted");
+
+        assert_eq!(output.dispositions, [("".into(), "forced".into())]);
+    }
 
     // These pin the DELETION-MARKER contract at the setter level. The
     // end-to-end behavior is covered by `tests/metadata.rs`; what matters here

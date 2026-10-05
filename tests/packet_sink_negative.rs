@@ -80,6 +80,12 @@ fn build_rejects_muxer_only_options() {
                 .expect("stream spec parses"),
         ),
         (
+            "set_disposition",
+            Output::new_by_packet_sink(noop_sink())
+                .set_disposition("v:0", "default")
+                .expect("stream spec parses"),
+        ),
+        (
             "disable_auto_copy_metadata",
             Output::new_by_packet_sink(noop_sink()).disable_auto_copy_metadata(),
         ),

@@ -472,6 +472,13 @@ pub(super) fn outputs_bind(
         unsafe {
             process_metadata(mux, demuxs, file_map)?;
         }
+
+        // CLI ordering: copy_meta, set_dispositions, then of_stream_init
+        // (ffmpeg_mux_init.c:3389/3405/3433). The mux worker is not spawned yet.
+        unsafe {
+            super::dispositions::set_dispositions(mux, demuxs)
+                .map_err(OpenOutputError::InvalidOption)?;
+        }
     }
 
     Ok(())

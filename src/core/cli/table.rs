@@ -467,6 +467,7 @@ pub(crate) const KNOWN_REJECTIONS: &[(&str, &str, Option<&str>)] = &[
     ("-hwaccel", "hardware acceleration is planned for a future release (the builder equivalent exists: Input::set_hwaccel)", None),
     ("-tag:v", "codec tags are outside the verified CLI subset (the builder equivalent exists: Output::set_video_codec_tag)", None),
     ("-tag:a", "codec tags are outside the verified CLI subset (the builder equivalent exists: Output::set_audio_codec_tag)", None),
+    ("-disposition", "stream dispositions are not in the verified CLI subset (the builder equivalent exists: Output::set_disposition)", None),
     ("-attach", "attachments are not in the current supported subset (the builder equivalent exists: Output::add_attachment)", None),
     ("-hls_flags", "only the single-rendition VOD HLS option set is in the current supported subset (hls_time, hls_playlist_type vod, hls_list_size 0, hls_segment_filename)", None),
     ("-hls_segment_type", "only the single-rendition VOD HLS option set is in the current supported subset", None),

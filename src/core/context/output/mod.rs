@@ -370,6 +370,9 @@ pub struct Output {
     /// During output initialization, each specifier is matched against actual streams
     pub(crate) stream_metadata: Vec<(String, String, String)>, // (spec, key, value) tuples
 
+    /// Ordered `-disposition[:stream_specifier] value` options.
+    pub(crate) dispositions: Vec<(String, String)>,
+
     /// Chapter-specific metadata, indexed by chapter index
     pub(crate) chapter_metadata: HashMap<usize, HashMap<String, String>>,
 
@@ -524,6 +527,7 @@ impl Output {
             format_opts: None,
             global_metadata: None,
             stream_metadata: Vec::new(),
+            dispositions: Vec::new(),
             chapter_metadata: HashMap::new(),
             program_metadata: HashMap::new(),
             metadata_map: Vec::new(),

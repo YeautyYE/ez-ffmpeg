@@ -741,6 +741,59 @@ fn unsupported_output_options_are_rejected_at_open() {
     }
 }
 
+/// `set_disposition` reaches the writer's single video stream. The writer has
+/// its own context-construction path (`writer_build.rs`), so an option that is
+/// honored on the regular path is not automatically honored here — this pins
+/// that the disposition pass runs on the writer path too.
+#[test]
+fn disposition_reaches_the_writer_video_stream() {
+    let out = tmp_path("writer_disposition.mkv");
+    let out2 = out.clone();
+    within(30, "writer_disposition", move || {
+        let mut w = VideoWriter::builder(64, 48)
+            .fps(30, 1)
+            .open(
+                Output::from(out2.as_str())
+                    .set_video_codec("mpeg4")
+                    .set_disposition("", "forced")
+                    .expect("valid specifier"),
+            )
+            .expect("open failed");
+        for i in 0..10 {
+            w.write_owned(frame(&w, i)).unwrap();
+        }
+        w.finish().unwrap();
+    });
+
+    let disposition = unsafe {
+        let c_path = std::ffi::CString::new(out.as_str()).unwrap();
+        let mut fmt: *mut ffmpeg_sys_next::AVFormatContext = std::ptr::null_mut();
+        let ret = ffmpeg_sys_next::avformat_open_input(
+            &mut fmt,
+            c_path.as_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        assert!(ret >= 0, "re-opening the writer output failed: {ret}");
+        assert!(ffmpeg_sys_next::avformat_find_stream_info(fmt, std::ptr::null_mut()) >= 0);
+        let mut found = None;
+        for i in 0..(*fmt).nb_streams as usize {
+            let st = *(*fmt).streams.add(i);
+            if (*(*st).codecpar).codec_type == ffmpeg_sys_next::AVMediaType::AVMEDIA_TYPE_VIDEO {
+                found = Some((*st).disposition);
+                break;
+            }
+        }
+        ffmpeg_sys_next::avformat_close_input(&mut fmt);
+        found.expect("the writer output has no video stream")
+    };
+    assert_ne!(
+        disposition & ffmpeg_sys_next::AV_DISPOSITION_FORCED,
+        0,
+        "the forced disposition did not reach the writer's video stream: {disposition:#x}"
+    );
+}
+
 /// Options that every writer job satisfies vacuously (nothing to disable,
 /// nothing to cut against, nothing to auto-copy) stay accepted: they ask for
 /// what is already true rather than for a stream or input that cannot exist.

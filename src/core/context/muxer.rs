@@ -185,6 +185,7 @@ pub(crate) struct Muxer {
     // Metadata fields
     pub(crate) global_metadata: Option<HashMap<String, String>>,
     pub(crate) stream_metadata: Vec<(String, String, String)>, // (spec, key, value)
+    pub(crate) dispositions: Vec<(String, String)>,
     pub(crate) chapter_metadata: HashMap<usize, HashMap<String, String>>,
     pub(crate) program_metadata: HashMap<usize, HashMap<String, String>>,
     pub(crate) metadata_map: Vec<crate::core::metadata::MetadataMapping>,
@@ -429,6 +430,7 @@ impl Muxer {
             mux_stream_nodes: vec![],
             global_metadata,
             stream_metadata,
+            dispositions: Vec::new(),
             chapter_metadata,
             program_metadata,
             metadata_map,
@@ -526,6 +528,15 @@ impl Muxer {
             )?;
         }
         let (packet_sender, st, stream_index) = self.new_stream(src_node)?;
+        // `avformat_new_stream` was called with a null codec, so `codec_type`
+        // is still zero (which is `AVMEDIA_TYPE_VIDEO`) until the encoder runs
+        // `avcodec_parameters_from_context` at `enc_init`. Everything that
+        // classifies an output stream before then — `set_dispositions`, and
+        // `StreamSpecifier::matches` for output-side stream metadata — reads
+        // `codecpar`, so record the type now.
+        unsafe {
+            (*(*st).codecpar).codec_type = media_type;
+        }
         let (frame_sender, frame_receiver) = crossbeam_channel::bounded(8);
 
         let vsync_method = if media_type == AVMediaType::AVMEDIA_TYPE_VIDEO {

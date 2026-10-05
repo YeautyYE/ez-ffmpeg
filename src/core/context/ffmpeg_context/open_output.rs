@@ -414,6 +414,8 @@ unsafe fn open_output_file(
         std::mem::take(&mut output.attachments),
         interrupt_state.clone(),
     );
+    // Set after construction so `Muxer::new` keeps its parameter list.
+    mux.dispositions = output.dispositions.clone();
 
     if let PreparedTarget::PacketSink(sink) = prepared {
         // PacketSinkPolicy: the encoder-visible muxing flags are pinned by
@@ -481,6 +483,9 @@ fn validate_packet_sink_options(output: &Output) -> Result<()> {
         // land anywhere; silently accepting it would misrepresent delivery.
         ("add_metadata", output.global_metadata.is_some()),
         ("add_stream_metadata", !output.stream_metadata.is_empty()),
+        // A disposition only ever reaches a container's stream header, so on
+        // a sink it would be accepted and never take effect.
+        ("set_disposition", !output.dispositions.is_empty()),
         ("add_chapter_metadata", !output.chapter_metadata.is_empty()),
         ("add_program_metadata", !output.program_metadata.is_empty()),
         ("map_metadata_from_input", !output.metadata_map.is_empty()),

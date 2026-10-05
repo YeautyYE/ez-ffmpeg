@@ -168,11 +168,21 @@ pub(crate) fn build_writer_context(
             }
         }
 
-        // Keep outputs_bind's tail: attachment streams, then metadata. With no
-        // demuxers the metadata pass degenerates to the user-specified values.
+        // Keep outputs_bind's tail: attachment streams, then metadata, then
+        // dispositions. With no demuxers the disposition pass has no input to
+        // inherit from, so it applies the user's manual values and, when there
+        // is none, the automatic default marking. That marking is inert for
+        // the single video stream, but not for attachments: two attachments
+        // form a media type with >1 stream, so the first gains DEFAULT in the
+        // stream header — the CLI's own algorithm, confirmed against it. (A
+        // container may still not serialize the flag for attachments; that is
+        // the muxer's business, not the pass's.) Same ordering as the regular
+        // path (opt_util.rs): copy_meta, then set_dispositions.
         unsafe {
             crate::core::context::attachment::create_attachment_streams(mux)?;
             process_metadata(mux, &Vec::new(), &[])?;
+            super::dispositions::set_dispositions(mux, &[])
+                .map_err(OpenOutputError::InvalidOption)?;
         }
     }
 

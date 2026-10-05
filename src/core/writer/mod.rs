@@ -715,6 +715,8 @@ impl VideoWriterBuilder {
     /// - container: `set_format`, `set_format_opt(s)`, `add_metadata` /
     ///   `add_metadata_map` / `remove_metadata` / `clear_all_metadata`,
     ///   `add_stream_metadata`, `add_attachment(_with_mimetype)`,
+    ///   `set_disposition` (runs the same pass as any job: the single video
+    ///   stream, and any attachment streams the output carries),
     ///   `set_max_muxing_queue_size`, `set_muxing_queue_data_threshold`
     /// - video encoding: `set_video_codec` (except `"copy"`, rejected: pushed
     ///   frames must be encoded), `set_video_codec_opt(s)` /

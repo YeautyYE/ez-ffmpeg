@@ -269,7 +269,15 @@ fn resolution_guess_multi_video_best_not_first_requires_index() {
                 Output::from(path.to_str().unwrap())
                     .set_video_codec("mpeg2video")
                     .add_stream_map("[b]")
-                    .add_stream_map("[a]"),
+                    .add_stream_map("[a]")
+                    // Two video output streams and no default marked: the
+                    // automatic default pass would otherwise mark the sparse
+                    // first stream, and `av_find_best_stream` prefers a
+                    // default-marked stream (`libavformat/avformat.c:538`),
+                    // which would make the exported stream the first one and
+                    // defeat the layout this test needs.
+                    .set_disposition("v:0", "0")
+                    .expect("valid specifier"),
             )
             .build()
             .expect("build sparse+dense two-video fixture"),

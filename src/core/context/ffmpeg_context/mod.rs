@@ -75,6 +75,7 @@ use std::ffi::{c_void, CStr, CString};
 use std::ptr::{null, null_mut};
 use std::sync::Arc;
 
+mod dispositions;
 mod fg_bind;
 #[cfg(not(docsrs))]
 mod fg_probe;
