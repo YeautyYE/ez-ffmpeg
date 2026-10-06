@@ -326,7 +326,7 @@ jobs:
           key: ${{ runner.os }}-cargo-sources-v1-${{ hashFiles('**/Cargo.toml') }}
 
       - name: Test
-        run: cargo test --lib --test avoption_warnings --test build_probe --test builder_option_validation --test frame_export_test --test frame_export_uniform_test --test frame_export_audio_test --test hls_fmp4 --test video_writer --test frame_push --test rawvideo_seek_gating --test per_output_video_filter --test per_output_audio_filter --test codec_tag --test metadata --test dispositions --test packet_sink --test packet_sink_negative --test packet_sink_teardown --test packet_sink_unwind --test cli_emit_hardening --test hdr_to_sdr_detection --test logger_reentrancy --test packet_sink_job_failure --test http_input --test crop_detection --test custom_io_hardening --test default_tree --features async,rtmp,flv,subtitle,wgpu,cli,http-input ${{ matrix.ffmpeg-features }}
+        run: cargo test --lib --test avoption_warnings --test build_probe --test builder_option_validation --test frame_export_test --test frame_export_uniform_test --test frame_export_audio_test --test hls_fmp4 --test video_writer --test frame_push --test rawvideo_seek_gating --test per_output_video_filter --test per_output_audio_filter --test codec_tag --test metadata --test dispositions --test autoscale --test packet_sink --test packet_sink_negative --test packet_sink_teardown --test packet_sink_unwind --test cli_emit_hardening --test hdr_to_sdr_detection --test logger_reentrancy --test packet_sink_job_failure --test http_input --test crop_detection --test custom_io_hardening --test default_tree --features async,rtmp,flv,subtitle,wgpu,cli,http-input ${{ matrix.ffmpeg-features }}
 
       # Crop parity smoke: native Rust Analysis vs optional GPL ffmpeg
       # `-vf cropdetect`. Own step so the main Test line never grows
@@ -694,7 +694,7 @@ jobs:
           sudo sysctl -w net.inet.tcp.autorcvbufmax=131072
           sudo sysctl -w net.inet.tcp.autosndbufmax=131072
       - name: Run CPU-only library tests
-        run: cargo test --lib --test avoption_warnings --test build_probe --test builder_option_validation --test frame_export_test --test frame_export_uniform_test --test frame_export_audio_test --test hls_fmp4 --test video_writer --test frame_push --test rawvideo_seek_gating --test per_output_video_filter --test per_output_audio_filter --test codec_tag --test metadata --test dispositions --test packet_sink --test packet_sink_negative --test packet_sink_teardown --test packet_sink_unwind --test cli_emit_hardening --test hdr_to_sdr_detection --test logger_reentrancy --test packet_sink_job_failure --test http_input --test crop_detection --test custom_io_hardening --test default_tree --features "${{ matrix.test_features }}" ${{ matrix.test_args }}
+        run: cargo test --lib --test avoption_warnings --test build_probe --test builder_option_validation --test frame_export_test --test frame_export_uniform_test --test frame_export_audio_test --test hls_fmp4 --test video_writer --test frame_push --test rawvideo_seek_gating --test per_output_video_filter --test per_output_audio_filter --test codec_tag --test metadata --test dispositions --test autoscale --test packet_sink --test packet_sink_negative --test packet_sink_teardown --test packet_sink_unwind --test cli_emit_hardening --test hdr_to_sdr_detection --test logger_reentrancy --test packet_sink_job_failure --test http_input --test crop_detection --test custom_io_hardening --test default_tree --features "${{ matrix.test_features }}" ${{ matrix.test_args }}
 
       # Homebrew ffmpeg@7 is GPL and typically ships cropdetect. Gate the
       # ignored 1080p smoke here only (not Windows, not macOS 8.1 source
@@ -865,7 +865,7 @@ jobs:
             --test build_probe --test frame_export_test \
             --test frame_export_uniform_test --test frame_export_audio_test \
             --test video_writer --test packet_sink_teardown --test packet_sink_unwind \
-            --test metadata --test dispositions --test logger_reentrancy --test custom_io_hardening
+            --test metadata --test dispositions --test autoscale --test logger_reentrancy --test custom_io_hardening
 
   # Explicit LGPL-minimum contract. Existing Linux 8.1/7.1 lanes already build
   # FFmpeg without --enable-gpl, but they skip x264-shaped tests instead of
@@ -1000,6 +1000,7 @@ jobs:
           --test video_writer
           --test metadata
           --test dispositions
+          --test autoscale
           --test subtitle_chain
           --test packet_sink
           --test packet_sink_negative

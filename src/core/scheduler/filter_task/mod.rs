@@ -3,7 +3,7 @@ use crate::core::context::input_filter::{InputFilterOptions, IFILTER_FLAG_AUTORO
 use crate::core::context::obj_pool::ObjPool;
 use crate::core::context::output::VSyncMethod;
 use crate::core::context::output::VSyncMethod::{VsyncCfr, VsyncVscfr};
-use crate::core::context::output_filter::OutputFilterOptions;
+use crate::core::context::output_filter::{OutputFilterOptions, OFILTER_FLAG_AUTOSCALE};
 use crate::core::context::{null_frame, FrameBox, FrameData, SideDataList};
 use crate::core::display::get_rotation;
 use crate::core::scheduler::ffmpeg_scheduler::{
@@ -40,7 +40,8 @@ use ffmpeg_sys_next::{
     av_color_space_name, av_dict_free, av_frame_alloc, av_frame_free, av_frame_get_side_data,
     av_frame_move_ref, av_frame_ref, av_frame_remove_side_data, av_freep, av_get_pix_fmt_name,
     av_get_sample_fmt_name, av_inv_q, av_log2, av_malloc, av_opt_find, av_opt_set, av_opt_set_bin,
-    av_opt_set_int, av_q2d, av_rescale_q, av_strdup, avfilter_get_by_name, avfilter_graph_config,
+    av_opt_set_int, av_pix_fmt_desc_get, av_q2d, av_rescale_q, av_strdup, avfilter_get_by_name,
+    avfilter_graph_config,
     avfilter_graph_create_filter, avfilter_graph_request_oldest, avfilter_link,
     avfilter_pad_get_type, avio_close, avio_closep, avio_open, avio_open2, avio_read,
     avio_read_to_bprint, avio_size, AVBPrint, AVBufferRef, AVColorRange, AVColorSpace,

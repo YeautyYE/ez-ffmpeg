@@ -855,6 +855,64 @@ unsafe fn configure_output_video_filter(
         return ret;
     }
 
+    // Auto-scale (`-autoscale`, on by default). `ofp.width`/`ofp.height` are
+    // zero on the first configuration and hold the size the sink negotiated
+    // (recorded at the end of the previous `configure_filtergraph`) from then
+    // on. So nothing is inserted at first, and after a mid-stream resolution
+    // change reconfigures the graph the new frames are pressed back to the size
+    // the encoder was opened with. Without it a decoder-side size change
+    // reaches an encoder sized for the old frame and is rejected (libx264:
+    // "Input picture width (W) is greater than stride (S)").
+    if (ofp.width != 0 || ofp.height != 0) && ofp.opts.flags & OFILTER_FLAG_AUTOSCALE != 0 {
+        // Skip hardware formats: such a sink carries frames the software
+        // scaler cannot consume, so the download has to happen elsewhere
+        // (ffmpeg master's "skip add scale for hardware format"). `ofp.format`
+        // is the format the sink negotiated on the previous configuration —
+        // the same value ffmpeg reads here.
+        let hw_format = ofp.format != AV_PIX_FMT_NONE
+            && av_pix_fmt_desc_get(ofp.format)
+                .as_ref()
+                .is_some_and(|d| d.flags & AV_PIX_FMT_FLAG_HWACCEL as u64 != 0);
+
+        if !hw_format {
+            let mut args = format!("{}:{}", ofp.width, ofp.height);
+            if let Some(sws) = non_empty_opt(&ofp.opts.sws_opts) {
+                args.push(':');
+                args.push_str(sws);
+            }
+            let name = match CString::new(format!("scaler_out_{}", ofp.opts.name)) {
+                Ok(name) => name,
+                Err(_) => return AVERROR(EINVAL),
+            };
+            let args = match CString::new(args) {
+                Ok(args) => args,
+                Err(_) => return AVERROR(EINVAL),
+            };
+            let scale_str = std::ffi::CString::new("scale").unwrap();
+
+            let mut filter = null_mut();
+            ret = avfilter_graph_create_filter(
+                &mut filter,
+                avfilter_get_by_name(scale_str.as_ptr()),
+                name.as_ptr(),
+                args.as_ptr(),
+                null_mut(),
+                graph,
+            );
+            if ret < 0 {
+                return ret;
+            }
+
+            ret = avfilter_link(last_filter, pad_idx as u32, filter, 0);
+            if ret < 0 {
+                return ret;
+            }
+
+            last_filter = filter;
+            pad_idx = 0;
+        }
+    }
+
     // Use zeroed() instead of literal init so reserved_padding
     // matches the arch-dependent struct layout (32-bit vs 64-bit).
     let mut bprint: AVBPrint = std::mem::zeroed();
