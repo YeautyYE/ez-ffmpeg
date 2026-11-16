@@ -1,39 +1,38 @@
 # CI for ez-ffmpeg.
 #
 # Linux build and test jobs run on both native GitHub-hosted architectures
-# (x64 and ARM64) in a two-lane FFmpeg matrix, because the crate supports
-# linking either major and the two lanes are provisioned differently:
+# (x64 and ARM64) in a three-lane FFmpeg matrix: 9.0, 8.1 and 7.1. The crate
+# supports FFmpeg 7.1 through 9.x from one build (one build links exactly one
+# major), and each lane pins a different one so a regression in any supported
+# line fails CI instead of reaching users.
 #
-#   * ffmpeg 8.1 lane — `--features ffmpeg-sys-next/build`: the sys crate's
-#     build script git-clones FFmpeg `release/8.1` (the branch is hardcoded to
-#     the crate's own major.minor) and compiles/statically links it. This is
-#     the same mechanism the pre-8 CI used, which then produced FFmpeg 7.1 —
-#     after the dependency bump the SAME flag silently produces 8.1, which is
-#     exactly why the 7.x lane below must NOT use it.
+# Every lane (all three, on every platform) provisions FFmpeg the same way:
+# an explicit from-source build of `release/<line>` (shared libs, default
+# components, no external deps) installed under $HOME/ffmpeg-<line> and linked
+# via pkg-config. The branches are spelled out on purpose. The earlier CI used
+# `--features ffmpeg-sys-next/build` for the then-current line, which makes the
+# sys crate clone `release/<its own major.minor>` — so bumping the dependency
+# silently changed WHICH FFmpeg a lane tested: the same flag produced 7.1, then
+# 8.1 after one bump. That decouples a lane's label from what it actually
+# links, so every lane now names its branch outright.
 #
-#   * ffmpeg 7.1 lane — explicit from-source build of FFmpeg `release/7.1`
-#     (shared libs, default components, no external deps) installed under
-#     $HOME/ffmpeg71 and linked via pkg-config. This proves the bump keeps
-#     FFmpeg 7.x users working: ffmpeg-sys-next 8.1 probes the installed
-#     headers and only enables cfg flags up to ffmpeg_7_1.
-#
-# Ubuntu's apt FFmpeg (6.1 on 24.04) matches neither lane, so it is never
+# Ubuntu's apt FFmpeg (6.1 on 24.04) matches no lane, so it is never
 # installed; the apt packages below are just the FFmpeg build toolchain
-# (nasm/yasm/clang/pkg-config/zlib). The 7.1 install is cached; the 8.1 lane
-# rebuilds FFmpeg per job because its source-build helper tunes for the current
-# runner CPU.
+# (nasm/yasm/clang/pkg-config/zlib). Each line's install is cached per
+# runner OS/arch.
 #
 # Cargo caches deliberately keep only registry and git sources, never `target`.
 # ffmpeg-sys-next's native source build adds `-march=native -mtune=native`, and
 # GitHub can schedule the same runner architecture on different CPU generations;
 # restoring those compiled artifacts can otherwise terminate tests with SIGILL.
 #
-# Native platform coverage outside Linux runs both FFmpeg lanes on every
+# Native platform coverage outside Linux runs the FFmpeg lanes on every
 # GitHub-hosted architecture: Apple Silicon macOS, Windows x64, and Windows
-# ARM64. macOS builds FFmpeg 8.1 from source and uses Homebrew's versioned
-# FFmpeg 7 formula; Windows checks out pinned vcpkg revisions whose ports carry
-# FFmpeg 8.1.2 and 7.1.2. These jobs build every functional non-static feature,
-# compile the corresponding test trees, and run the CPU-only library suite.
+# ARM64. macOS builds each line from source and uses Homebrew's versioned
+# FFmpeg formulae; Windows checks out pinned vcpkg revisions whose ports carry
+# the 9.0 and 7.1 lines. These jobs build every functional non-static
+# feature, compile the corresponding test trees, and run the CPU-only library
+# suite.
 #
 # GPU-dependent code: the `opengl` frame filter needs a real GPU/display and
 # its tests fail headless ("Failed to create Surfman connection"), so the
@@ -46,23 +45,24 @@
 #
 # The `build` job (all-features build + a default-features build + clippy) and
 # the `test` job run per Linux architecture and FFmpeg lane. The x64/7.1 build
-# lane additionally checks MSRV 1.80 with the `http-input` feature (that lane
-# links a cached shared FFmpeg via pkg-config, so the old-toolchain check
-# compiles Rust only instead of rebuilding FFmpeg from source). Four
-# specialized jobs run once on Linux x64:
+# lane additionally checks MSRV 1.88 with the `http-input` feature (one lane
+# suffices; every lane links its FFmpeg via pkg-config, so the old-toolchain
+# check only recompiles Rust). Four specialized jobs run once on Linux x64:
 #
 #   * `docs` — compiles the crate under `--cfg docsrs` (`DOCS_RS=1`), which stubs
 #     ez-ffmpeg's own FFI call sites; the gate catches docsrs-stub compile gaps.
 #     ffmpeg-sys-next still needs a real FFmpeg for its bindings, so this job builds
 #     one via `ffmpeg-sys-next/build` (not a literal docs.rs run — docs.rs has no
 #     network to clone FFmpeg — but it exercises the same `--cfg docsrs` paths).
+#     That feature's branch follows the sys crate version, which is fine here:
+#     this gate is about docsrs stubs compiling, not about a given FFmpeg line.
 #   * `asan` — AddressSanitizer over the library unit tests and the
 #     lifecycle/teardown integration tests, guarding the use-after-free fixes.
 #     FFmpeg is statically linked via ffmpeg-sys-next/build; ASan's interceptors
 #     see its alloc/free, so a UAF where instrumented Rust touches FFmpeg-freed
 #     memory is caught (one entirely inside un-instrumented FFmpeg C is not
 #     reliably covered — those regressions are Rust-side here).
-#   * `lgpl-contract` — Ubuntu x64, FFmpeg n8.1.2 shared libraries built with
+#   * `lgpl-contract` — Ubuntu x64, FFmpeg n9.0 shared libraries built with
 #     `--disable-gpl --disable-nonfree --disable-version3 --disable-autodetect`.
 #     Hard-asserts the documented LGPL-minimum matrix (no libx264 / cropdetect,
 #     native AAC/MJPEG/MPEG-4 paths). Contract tests are `#[ignore]` in the
@@ -108,29 +108,32 @@ jobs:
         include:
           - runner: ubuntu-24.04
             arch: x64
+            ffmpeg: "9.0"
+            static_archives: true
+          - runner: ubuntu-24.04
+            arch: x64
             ffmpeg: "8.1"
-            ffmpeg-features: "--features ffmpeg-sys-next/build"
           - runner: ubuntu-24.04
             arch: x64
             ffmpeg: "7.1"
-            ffmpeg-features: ""
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            ffmpeg: "9.0"
+            static_archives: true
           - runner: ubuntu-24.04-arm
             arch: arm64
             ffmpeg: "8.1"
-            ffmpeg-features: "--features ffmpeg-sys-next/build"
           - runner: ubuntu-24.04-arm
             arch: arm64
             ffmpeg: "7.1"
-            ffmpeg-features: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      # The 8.1 lane git-clones and statically builds FFmpeg inside target/
-      # alongside the crate's own build tree, and the sum has exhausted the
-      # stock image's free disk. Drop preinstalled toolchains this job never
-      # touches (~25 GiB) before the first build.
-      - name: Free disk space (from-source FFmpeg lane)
-        if: matrix.ffmpeg == '8.1'
+      # Every lane builds FFmpeg from source and links it via pkg-config, and
+      # the build tree sits inside the workspace alongside the crate's own, so
+      # the sum has exhausted the stock image's free disk. Drop preinstalled
+      # toolchains this job never touches (~25 GiB) before the first build.
+      - name: Free disk space (from-source FFmpeg lanes)
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force >/dev/null 2>&1 || true
@@ -151,31 +154,71 @@ jobs:
           toolchain: stable
           components: clippy
 
-      - name: Cache FFmpeg 7.1 install
-        if: matrix.ffmpeg == '7.1'
+      # One cached install per FFmpeg line. The branch is spelled out
+      # (`release/<line>`) instead of relying on ffmpeg-sys-next's `build`
+      # feature, whose branch is derived from the sys crate's own
+      # major.minor — so the feature silently changes which FFmpeg a lane
+      # tests whenever that crate is bumped, which is how this lane once
+      # turned from 7.1 into 8.1 unnoticed.
+      - name: Cache FFmpeg ${{ matrix.ffmpeg }} install
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
-          path: ~/ffmpeg71
-          key: ${{ runner.os }}-${{ runner.arch }}-ffmpeg71-shared-v1
+          path: ~/ffmpeg-${{ matrix.ffmpeg }}
+          # The 9.0 lanes build static archives too; the key must differ or a
+          # shared-only cache would satisfy the `.pc` check and skip them.
+          key: ${{ runner.os }}-${{ runner.arch }}-ffmpeg${{ matrix.ffmpeg }}-v3${{ matrix.static_archives == true && '-static' || '-shared' }}
 
-      - name: Build FFmpeg 7.1 from source (if not cached)
-        if: matrix.ffmpeg == '7.1'
+      - name: Build FFmpeg ${{ matrix.ffmpeg }} from source (if not cached)
         run: |
-          if [ ! -f "$HOME/ffmpeg71/lib/pkgconfig/libavcodec.pc" ]; then
-            git clone --depth=1 -b release/7.1 https://github.com/FFmpeg/FFmpeg ffmpeg-71-src
-            cd ffmpeg-71-src
-            ./configure --prefix="$HOME/ffmpeg71" \
+          prefix="$HOME/ffmpeg-${{ matrix.ffmpeg }}"
+          if [ ! -f "$prefix/lib/pkgconfig/libavcodec.pc" ]; then
+            git clone --depth=1 -b "release/${{ matrix.ffmpeg }}" \
+              https://github.com/FFmpeg/FFmpeg "ffmpeg-${{ matrix.ffmpeg }}-src"
+            cd "ffmpeg-${{ matrix.ffmpeg }}-src"
+            # The 9.0 lane also keeps static archives: with every lane on an
+            # explicit shared-only build, nothing else would link the crate's
+            # `static` feature against real .a files (the old `build`-feature
+            # lane used to). Other lanes stay shared-only to keep build time
+            # and cache size down.
+            static_flag=--disable-static
+            if [ "${{ matrix.static_archives }}" = "true" ]; then
+              static_flag=--enable-static
+            fi
+            ./configure --prefix="$prefix" \
                         --disable-programs --disable-doc \
-                        --disable-static --enable-shared
+                        "$static_flag" --enable-shared
             make -j"$(nproc)"
             make install
           fi
 
-      - name: Point pkg-config at FFmpeg 7.1
-        if: matrix.ffmpeg == '7.1'
+          # Assert the lane links the line its label claims. Deliberately
+          # OUTSIDE the cache-miss branch above: a restored cache or a moved
+          # upstream branch must not leave the lane green on the wrong FFmpeg.
+          # PKG_CONFIG_LIBDIR, not PKG_CONFIG_PATH: the latter only *prepends*,
+          # so a missing prefix would silently fall through to the runner's
+          # system FFmpeg and report its version instead of failing.
+          case "${{ matrix.ffmpeg }}" in
+            9.0) expected_major=63 ;;
+            8.1) expected_major=62 ;;
+            7.1) expected_major=61 ;;
+            *) echo "unhandled FFmpeg lane ${{ matrix.ffmpeg }}" >&2; exit 1 ;;
+          esac
+          actual_major=$(PKG_CONFIG_LIBDIR="$prefix/lib/pkgconfig" \
+            pkg-config --modversion libavcodec | cut -d. -f1)
+          if [ -z "$actual_major" ]; then
+            echo "the FFmpeg ${{ matrix.ffmpeg }} install has no usable libavcodec.pc under $prefix" >&2
+            exit 1
+          fi
+          echo "linked libavcodec: $actual_major.x"
+          if [ "$actual_major" != "$expected_major" ]; then
+            echo "lane ${{ matrix.ffmpeg }} must link libavcodec $expected_major.x, found $actual_major" >&2
+            exit 1
+          fi
+
+      - name: Point pkg-config at FFmpeg ${{ matrix.ffmpeg }}
         run: |
-          echo "PKG_CONFIG_PATH=$HOME/ffmpeg71/lib/pkgconfig" >> "$GITHUB_ENV"
-          echo "LD_LIBRARY_PATH=$HOME/ffmpeg71/lib" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=$HOME/ffmpeg-${{ matrix.ffmpeg }}/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$HOME/ffmpeg-${{ matrix.ffmpeg }}/lib" >> "$GITHUB_ENV"
 
       - name: Cache cargo sources
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
@@ -186,21 +229,21 @@ jobs:
           key: ${{ runner.os }}-cargo-sources-v1-${{ hashFiles('**/Cargo.toml') }}
 
       - name: Build
-        run: cargo build --all-features ${{ matrix.ffmpeg-features }} --verbose
+        run: cargo build --all-features --verbose
 
       # Compiles every #[cfg(test)] tree under --all-features WITHOUT running:
       # the opengl/wgpu suites need a GPU/display to RUN, but their tests carry
       # compile-time signature pins (e.g. the opengl typed-error fn-pointer
       # bindings) that only a test build type-checks. `--no-run` is headless-safe.
       - name: Build tests (all features, no run)
-        run: cargo test --lib --tests --all-features ${{ matrix.ffmpeg-features }} --no-run
+        run: cargo test --lib --tests --all-features --no-run
 
       # The crate's default feature set is empty (`default = []`), yet every job
       # here builds `--all-features`; this proves the no-feature build and its cfg
       # gates still compile. The ffmpeg-features flag only controls how FFmpeg is
       # provisioned, so "default features" still carries it.
       - name: Build (default features)
-        run: cargo build ${{ matrix.ffmpeg-features }} --verbose
+        run: cargo build --verbose
 
       # Design §1.3: the empty default feature set must not activate the
       # http-input stack (reqwest/tokio/QUIC). Cargo.lock is untracked, so
@@ -217,26 +260,28 @@ jobs:
       # Safety-hygiene lints surface here. Not `-D warnings` yet: the crate has a
       # pre-existing unused-import / undocumented-unsafe backlog to clear first.
       - name: Clippy
-        run: cargo clippy --all-features ${{ matrix.ffmpeg-features }} --lib
+        run: cargo clippy --all-features --lib
 
-      # MSRV gate: the dependency pins must keep MSRV 1.80 real, and
-      # `http-input` is the feature whose dependency tree pulled in the
-      # Edition-2024-risk crates. One lane suffices. Pinned to x64/7.1
-      # because that lane links the cached shared FFmpeg via pkg-config —
-      # the 1.80 check compiles Rust only; on an 8.1 lane the
-      # `ffmpeg-sys-next/build` build script would rebuild FFmpeg from
-      # source a second time under the old toolchain. Runs last in the job:
-      # the toolchain action switches the rustup default, and the explicit
-      # `+1.80.0` keeps the invocation unambiguous either way.
-      - name: Install Rust 1.80.0 (MSRV)
+      # MSRV gate: the declared MSRV must stay real. The floor is no longer a
+      # choice — ffmpeg-sys-next 9.x is Edition 2024 and its build script uses
+      # let-chains (1.88), and the CVE-fixed quinn-proto/quinn-udp lines
+      # themselves declare rust-version 1.85. `http-input` is checked because
+      # it carries the largest optional dependency tree (reqwest/tokio/QUIC).
+      # One lane suffices, and x64/7.1 is the arbitrary pick: the MSRV check
+      # only compiles Rust against the FFmpeg the lane already provisioned, so
+      # which line that is does not matter. Runs last in the job: the toolchain
+      # action switches the rustup default, and the explicit `+1.88.0` keeps
+      # the invocation unambiguous either way.
+      - name: Install Rust 1.88.0 (MSRV)
         if: matrix.arch == 'x64' && matrix.ffmpeg == '7.1'
-        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # 1.80.0
+        # Action revision pin; the toolchain to install is the input below.
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
-          toolchain: 1.80.0
+          toolchain: 1.88.0
 
-      - name: MSRV check (1.80, http-input)
+      - name: MSRV check (1.88, http-input)
         if: matrix.arch == 'x64' && matrix.ffmpeg == '7.1'
-        run: cargo +1.80.0 check --no-default-features --features http-input
+        run: cargo +1.88.0 check --no-default-features --features http-input
 
   test:
     name: Test (${{ matrix.arch }}, FFmpeg ${{ matrix.ffmpeg }})
@@ -247,20 +292,24 @@ jobs:
         include:
           - runner: ubuntu-24.04
             arch: x64
+            ffmpeg: "9.0"
+            static_archives: true
+          - runner: ubuntu-24.04
+            arch: x64
             ffmpeg: "8.1"
-            ffmpeg-features: "--features ffmpeg-sys-next/build"
           - runner: ubuntu-24.04
             arch: x64
             ffmpeg: "7.1"
-            ffmpeg-features: ""
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            ffmpeg: "9.0"
+            static_archives: true
           - runner: ubuntu-24.04-arm
             arch: arm64
             ffmpeg: "8.1"
-            ffmpeg-features: "--features ffmpeg-sys-next/build"
           - runner: ubuntu-24.04-arm
             arch: arm64
             ffmpeg: "7.1"
-            ffmpeg-features: ""
     # Runs the full library suite MINUS the opengl feature, whose tests need a
     # GPU/display (surfman connection creation fails headless). The wgpu
     # feature IS included: its GPU oracles self-skip when no adapter exists,
@@ -270,12 +319,11 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      # The 8.1 lane git-clones and statically builds FFmpeg inside target/
-      # alongside the crate's own build tree, and the sum has exhausted the
-      # stock image's free disk. Drop preinstalled toolchains this job never
-      # touches (~25 GiB) before the first build.
-      - name: Free disk space (from-source FFmpeg lane)
-        if: matrix.ffmpeg == '8.1'
+      # Every lane builds FFmpeg from source and links it via pkg-config, and
+      # the build tree sits inside the workspace alongside the crate's own, so
+      # the sum has exhausted the stock image's free disk. Drop preinstalled
+      # toolchains this job never touches (~25 GiB) before the first build.
+      - name: Free disk space (from-source FFmpeg lanes)
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force >/dev/null 2>&1 || true
@@ -291,31 +339,65 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Cache FFmpeg 7.1 install
-        if: matrix.ffmpeg == '7.1'
+      - name: Cache FFmpeg ${{ matrix.ffmpeg }} install
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
-          path: ~/ffmpeg71
-          key: ${{ runner.os }}-${{ runner.arch }}-ffmpeg71-shared-v1
+          path: ~/ffmpeg-${{ matrix.ffmpeg }}
+          # The 9.0 lanes build static archives too; the key must differ or a
+          # shared-only cache would satisfy the `.pc` check and skip them.
+          key: ${{ runner.os }}-${{ runner.arch }}-ffmpeg${{ matrix.ffmpeg }}-v3${{ matrix.static_archives == true && '-static' || '-shared' }}
 
-      - name: Build FFmpeg 7.1 from source (if not cached)
-        if: matrix.ffmpeg == '7.1'
+      - name: Build FFmpeg ${{ matrix.ffmpeg }} from source (if not cached)
         run: |
-          if [ ! -f "$HOME/ffmpeg71/lib/pkgconfig/libavcodec.pc" ]; then
-            git clone --depth=1 -b release/7.1 https://github.com/FFmpeg/FFmpeg ffmpeg-71-src
-            cd ffmpeg-71-src
-            ./configure --prefix="$HOME/ffmpeg71" \
+          prefix="$HOME/ffmpeg-${{ matrix.ffmpeg }}"
+          if [ ! -f "$prefix/lib/pkgconfig/libavcodec.pc" ]; then
+            git clone --depth=1 -b "release/${{ matrix.ffmpeg }}" \
+              https://github.com/FFmpeg/FFmpeg "ffmpeg-${{ matrix.ffmpeg }}-src"
+            cd "ffmpeg-${{ matrix.ffmpeg }}-src"
+            # The 9.0 lane also keeps static archives: with every lane on an
+            # explicit shared-only build, nothing else would link the crate's
+            # `static` feature against real .a files (the old `build`-feature
+            # lane used to). Other lanes stay shared-only to keep build time
+            # and cache size down.
+            static_flag=--disable-static
+            if [ "${{ matrix.static_archives }}" = "true" ]; then
+              static_flag=--enable-static
+            fi
+            ./configure --prefix="$prefix" \
                         --disable-programs --disable-doc \
-                        --disable-static --enable-shared
+                        "$static_flag" --enable-shared
             make -j"$(nproc)"
             make install
           fi
 
-      - name: Point pkg-config at FFmpeg 7.1
-        if: matrix.ffmpeg == '7.1'
+          # Assert the lane links the line its label claims. Deliberately
+          # OUTSIDE the cache-miss branch above: a restored cache or a moved
+          # upstream branch must not leave the lane green on the wrong FFmpeg.
+          # PKG_CONFIG_LIBDIR, not PKG_CONFIG_PATH: the latter only *prepends*,
+          # so a missing prefix would silently fall through to the runner's
+          # system FFmpeg and report its version instead of failing.
+          case "${{ matrix.ffmpeg }}" in
+            9.0) expected_major=63 ;;
+            8.1) expected_major=62 ;;
+            7.1) expected_major=61 ;;
+            *) echo "unhandled FFmpeg lane ${{ matrix.ffmpeg }}" >&2; exit 1 ;;
+          esac
+          actual_major=$(PKG_CONFIG_LIBDIR="$prefix/lib/pkgconfig" \
+            pkg-config --modversion libavcodec | cut -d. -f1)
+          if [ -z "$actual_major" ]; then
+            echo "the FFmpeg ${{ matrix.ffmpeg }} install has no usable libavcodec.pc under $prefix" >&2
+            exit 1
+          fi
+          echo "linked libavcodec: $actual_major.x"
+          if [ "$actual_major" != "$expected_major" ]; then
+            echo "lane ${{ matrix.ffmpeg }} must link libavcodec $expected_major.x, found $actual_major" >&2
+            exit 1
+          fi
+
+      - name: Point pkg-config at FFmpeg ${{ matrix.ffmpeg }}
         run: |
-          echo "PKG_CONFIG_PATH=$HOME/ffmpeg71/lib/pkgconfig" >> "$GITHUB_ENV"
-          echo "LD_LIBRARY_PATH=$HOME/ffmpeg71/lib" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=$HOME/ffmpeg-${{ matrix.ffmpeg }}/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$HOME/ffmpeg-${{ matrix.ffmpeg }}/lib" >> "$GITHUB_ENV"
 
       - name: Cache cargo sources
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
@@ -326,7 +408,15 @@ jobs:
           key: ${{ runner.os }}-cargo-sources-v1-${{ hashFiles('**/Cargo.toml') }}
 
       - name: Test
-        run: cargo test --lib --test avoption_warnings --test build_probe --test builder_option_validation --test frame_export_test --test frame_export_uniform_test --test frame_export_audio_test --test hls_fmp4 --test video_writer --test frame_push --test rawvideo_seek_gating --test per_output_video_filter --test per_output_audio_filter --test codec_tag --test metadata --test dispositions --test autoscale --test packet_sink --test packet_sink_negative --test packet_sink_teardown --test packet_sink_unwind --test cli_emit_hardening --test hdr_to_sdr_detection --test logger_reentrancy --test packet_sink_job_failure --test http_input --test crop_detection --test custom_io_hardening --test default_tree --features async,rtmp,flv,subtitle,wgpu,cli,http-input ${{ matrix.ffmpeg-features }}
+        run: cargo test --lib --test avoption_warnings --test build_probe --test builder_option_validation --test frame_export_test --test frame_export_uniform_test --test frame_export_audio_test --test hls_fmp4 --test video_writer --test frame_push --test rawvideo_seek_gating --test per_output_video_filter --test per_output_audio_filter --test codec_tag --test metadata --test dispositions --test autoscale --test packet_sink --test packet_sink_negative --test packet_sink_teardown --test packet_sink_unwind --test cli_emit_hardening --test hdr_to_sdr_detection --test logger_reentrancy --test packet_sink_job_failure --test http_input --test crop_detection --test custom_io_hardening --test default_tree --features async,rtmp,flv,subtitle,wgpu,cli,http-input
+
+      # The 9.0 lane is the only one built with static archives, so it is the
+      # only place the crate's `static` feature can actually link. `--all-features`
+      # compiles it in the `build` job, but compiling under `--no-run` never
+      # proves the archive link works at runtime. Run the real suite here.
+      - name: Test with static FFmpeg linkage
+        if: matrix.static_archives == true
+        run: cargo test --lib --test build_probe --test frame_export_test --test packet_sink_teardown --features async,rtmp,flv,subtitle,cli,static
 
       # Crop parity smoke: native Rust Analysis vs optional GPL ffmpeg
       # `-vf cropdetect`. Own step so the main Test line never grows
@@ -336,16 +426,16 @@ jobs:
       # Not added to lgpl-contract `--ignored` tests: those assert absence
       # of GPL pieces; native crop already runs via `--test crop_detection`.
       - name: Crop parity bench (ignored 1080p smoke)
-        run: cargo test --release --test crop_parity_bench --features async,rtmp,flv,subtitle,wgpu,cli,http-input ${{ matrix.ffmpeg-features }} -- --ignored --exact rust_on_off_letterbox_1080_smoke
+        run: cargo test --release --test crop_parity_bench --features async,rtmp,flv,subtitle,wgpu,cli,http-input -- --ignored --exact rust_on_off_letterbox_1080_smoke
 
       # The packet-sink examples are API surface: keep them compiling on the
       # runtime lane (native-AAC cases in the suites above do real work even
       # without libx264; x264 cases self-skip at runtime).
       - name: Check packet-sink examples
-        run: cargo check --example packet_sink_avc --example packet_sink_aac_channel --example packet_sink_av_transport --example hdr_to_sdr --example http_input --features http-input ${{ matrix.ffmpeg-features }}
+        run: cargo check --example packet_sink_avc --example packet_sink_aac_channel --example packet_sink_av_transport --example hdr_to_sdr --example http_input --features http-input
 
       - name: Doctests
-        run: cargo test --doc --features async,rtmp,flv,subtitle,wgpu,cli,http-input ${{ matrix.ffmpeg-features }}
+        run: cargo test --doc --features async,rtmp,flv,subtitle,wgpu,cli,http-input
 
       # aarch64 second-stage confirmation for the NAL start-code scan
       # refactor (perf/nal-stride3-scan, C2). Its x86-64 win is established
@@ -377,7 +467,7 @@ jobs:
           set -o pipefail
           : > nal_scan_bench.log
           for i in 1 2 3; do
-            cargo test --release --lib bench_nal_startcode_scan ${{ matrix.ffmpeg-features }} \
+            cargo test --release --lib bench_nal_startcode_scan \
               -- --ignored --nocapture | tee -a nal_scan_bench.log
           done
           python3 .github/scripts/nal_scan_parity_gate.py nal_scan_bench.log
@@ -487,7 +577,8 @@ jobs:
             platform: macos-15-arm64
             os: macos
             target: aarch64-apple-darwin
-            ffmpeg: "8.1"
+            ffmpeg: "9.1"
+            source_build_ffmpeg: true
             build_features: ffmpeg-sys-next/build-videotoolbox,async,opengl,wgpu,rtmp,flv,subtitle,cli,http-input
             test_features: ffmpeg-sys-next/build-videotoolbox,async,rtmp,flv,subtitle,wgpu,cli,http-input
             default_ffmpeg_features: --features ffmpeg-sys-next/build-videotoolbox
@@ -511,10 +602,10 @@ jobs:
             platform: windows-2025-x64
             os: windows
             target: x86_64-pc-windows-msvc
-            ffmpeg: "8.1"
+            ffmpeg: "9.0"
             vcpkg_triplet: x64-windows
-            vcpkg_ref: b5229343b4b80264ed51e89c6a7dcd0cbe85e9cc
-            vcpkg_cache: b5229343-ffmpeg-8.1.2-v1
+            vcpkg_ref: 0c51603115bcb9506c8595ff881bf1222826cab1
+            vcpkg_cache: 0c516031-ffmpeg-9.0.2-p7-v1
             build_features: async,opengl,wgpu,rtmp,flv,subtitle,cli,http-input
             test_features: async,rtmp,flv,subtitle,wgpu,cli,http-input
             default_ffmpeg_features: ""
@@ -535,10 +626,10 @@ jobs:
             platform: windows-11-arm64
             os: windows
             target: aarch64-pc-windows-msvc
-            ffmpeg: "8.1"
+            ffmpeg: "9.0"
             vcpkg_triplet: arm64-windows
-            vcpkg_ref: b5229343b4b80264ed51e89c6a7dcd0cbe85e9cc
-            vcpkg_cache: b5229343-ffmpeg-8.1.2-v1
+            vcpkg_ref: 0c51603115bcb9506c8595ff881bf1222826cab1
+            vcpkg_cache: 0c516031-ffmpeg-9.0.2-p7-v1
             build_features: async,opengl,wgpu,rtmp,flv,subtitle,cli,http-input
             test_features: async,rtmp,flv,subtitle,wgpu,cli,http-input
             default_ffmpeg_features: ""
@@ -570,6 +661,34 @@ jobs:
         run: |
           rustc -vV
           test "$(rustc -vV | sed -n 's/^host: //p')" = "${{ matrix.target }}"
+
+      # Every lane provisions FFmpeg itself and names its branch, EXCEPT this
+      # job's source-build lanes: `ffmpeg-sys-next/build*` derives the branch
+      # from the sys crate's own major.minor, so a dependency bump silently
+      # moves what the lane tests while its label stays put. Probe the resolved
+      # version and fail on drift instead of discovering it months later.
+      - name: Source-build lane matches its FFmpeg label
+        if: matrix.source_build_ffmpeg == true
+        shell: bash
+        run: |
+          # Keep cargo's own diagnostics: with `shell: bash` this step runs
+          # under `-e -o pipefail`, so a resolution failure would otherwise
+          # exit before the message below, with stderr discarded.
+          if ! resolved="$(cargo tree -i ffmpeg-sys-next --format '{p}' \
+                             --color never --depth 0 \
+                             | head -1 | sed 's/.* v\([0-9][0-9.]*\).*/\1/')"; then
+            echo "cargo tree failed to resolve ffmpeg-sys-next (see the error above)" >&2
+            exit 1
+          fi
+          if [ -z "$resolved" ]; then
+            echo "ffmpeg-sys-next is not in the resolved graph" >&2
+            exit 1
+          fi
+          expected_series="${{ matrix.ffmpeg }}"
+          case "$resolved" in
+            "$expected_series".*) echo "ffmpeg-sys-next $resolved selects release/$expected_series" ;;
+            *) echo "lane labels FFmpeg $expected_series but ffmpeg-sys-next $resolved would clone release/${resolved%.*} — fix the label or pin the crate" >&2; exit 1 ;;
+          esac
 
       - name: Cache cargo sources
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
@@ -649,9 +768,9 @@ jobs:
 
       # The crate-level `static` feature is intentionally omitted on Windows:
       # these vcpkg triplets provide shared FFmpeg libraries. macOS uses the
-      # dependency's source-build feature for 8.1 and Homebrew's shared 7.1
-      # libraries for the compatibility lane. Every functional optional feature
-      # is type-checked on each native platform.
+      # dependency's source-build feature for the current line and Homebrew's
+      # shared 7.1 libraries for the compatibility lane. Every functional
+      # optional feature is type-checked on each native platform.
       - name: Build all non-static features
         run: cargo build --features "${{ matrix.build_features }}" --verbose
 
@@ -659,7 +778,7 @@ jobs:
         run: cargo test --lib --tests --features "${{ matrix.build_features }}" --no-run
 
       # This keeps the crate's own default feature set empty while carrying only
-      # the dependency feature needed to provision source-built FFmpeg 8.1 on
+      # the dependency feature needed to provision source-built FFmpeg on
       # macOS. The system/vcpkg lanes pass an empty string here.
       - name: Build default crate features
         run: cargo build ${{ matrix.default_ffmpeg_features }} --verbose
@@ -816,7 +935,7 @@ jobs:
         run: cargo doc --no-deps --features ffmpeg-sys-next/build,async,opengl,rtmp,flv,subtitle,wgpu,cli,http-input
 
   asan:
-    name: ASAN (UAF, FFmpeg 8.1)
+    name: ASAN (UAF, FFmpeg 9.1)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -831,6 +950,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb # nightly
         with:
           toolchain: nightly
+
+      # This job's FFmpeg comes from `ffmpeg-sys-next/build`, whose branch is
+      # the sys crate's own major.minor. The job name says 9.1, so assert it.
+      - name: Source-build lane matches its FFmpeg label
+        shell: bash
+        run: |
+          if ! resolved="$(cargo tree -i ffmpeg-sys-next --format '{p}' \
+                             --color never --depth 0 \
+                             | head -1 | sed 's/.* v\([0-9][0-9.]*\).*/\1/')"; then
+            echo "cargo tree failed to resolve ffmpeg-sys-next (see the error above)" >&2
+            exit 1
+          fi
+          if [ -z "$resolved" ]; then
+            echo "ffmpeg-sys-next is not in the resolved graph" >&2
+            exit 1
+          fi
+          case "$resolved" in
+            9.1.*) echo "ffmpeg-sys-next $resolved selects release/9.1" ;;
+            *) echo "ASAN job says FFmpeg 9.1 but ffmpeg-sys-next $resolved would clone release/${resolved%.*} — update the job name or pin the crate" >&2; exit 1 ;;
+          esac
 
       - name: Cache cargo sources
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
@@ -869,15 +1008,15 @@ jobs:
 
   # Explicit LGPL-minimum contract. Existing Linux 8.1/7.1 lanes already build
   # FFmpeg without --enable-gpl, but they skip x264-shaped tests instead of
-  # asserting the absence. This job pins n8.1.2, uses an exact cache key (no
+  # asserting the absence. This job pins n9.0, uses an exact cache key (no
   # restore-keys), and runs #[ignore] contract binaries that must not skip.
   lgpl-contract:
-    name: LGPL contract (Ubuntu x64, FFmpeg 8.1.2)
+    name: LGPL contract (Ubuntu x64, FFmpeg 9.0)
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
-      FFMPEG_PREFIX: /home/runner/ffmpeg-lgpl-8.1.2
-      FFMPEG_SHA: 38b88335f99e76ed89ff3c93f877fdefce736c13
+      FFMPEG_PREFIX: /home/runner/ffmpeg-lgpl-9.0
+      FFMPEG_SHA: d32b387f2b0a484599d4587d651891f0c63c4238
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -912,15 +1051,16 @@ jobs:
             > "$RUNNER_TEMP/ffmpeg-lgpl.flags"
           echo "flags_hash=$(sha256sum "$RUNNER_TEMP/ffmpeg-lgpl.flags" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
           echo "compiler_major=$(gcc -dumpversion | cut -d. -f1)" >> "$GITHUB_OUTPUT"
+          echo "ffmpeg_short_sha=${FFMPEG_SHA:0:8}" >> "$GITHUB_OUTPUT"
 
       - name: Cache the LGPL FFmpeg install
         id: cache-ffmpeg-lgpl
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ env.FFMPEG_PREFIX }}
-          key: ${{ runner.os }}-${{ runner.arch }}-ubuntu-24.04-ffmpeg-lgpl-8.1.2-38b88335-${{ steps.lgpl-profile.outputs.flags_hash }}-gcc${{ steps.lgpl-profile.outputs.compiler_major }}-v1
+          key: ${{ runner.os }}-${{ runner.arch }}-ubuntu-24.04-ffmpeg-lgpl-9.0-${{ steps.lgpl-profile.outputs.ffmpeg_short_sha }}-${{ steps.lgpl-profile.outputs.flags_hash }}-gcc${{ steps.lgpl-profile.outputs.compiler_major }}-v1
 
-      - name: Build FFmpeg 8.1.2 shared LGPL libraries
+      - name: Build FFmpeg 9.0 shared LGPL libraries
         if: steps.cache-ffmpeg-lgpl.outputs.cache-hit != 'true'
         shell: bash
         run: |
@@ -928,7 +1068,7 @@ jobs:
           git -C "$RUNNER_TEMP/ffmpeg-src" remote add origin \
             https://github.com/FFmpeg/FFmpeg.git
           git -C "$RUNNER_TEMP/ffmpeg-src" fetch --depth=1 origin \
-            refs/tags/n8.1.2
+            refs/tags/n9.0
           git -C "$RUNNER_TEMP/ffmpeg-src" checkout --detach FETCH_HEAD
           test "$(git -C "$RUNNER_TEMP/ffmpeg-src" rev-parse HEAD)" = "$FFMPEG_SHA"
 
