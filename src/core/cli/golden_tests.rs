@@ -584,27 +584,70 @@ fn run_shape(shape: &VerifiedShape) -> Option<GoldenRun> {
 
 /// Path of the compile-pinned example binary; builds it on demand (running
 /// `cargo test --lib` alone does not build examples).
+///
+/// The path comes from cargo's own JSON artifact stream, not from walking up
+/// from this test binary. Cargo's target directory layout is not a stable
+/// interface and it changed: 1.100 builds units under
+/// `target/<profile>/build/<pkg>/<unit-hash>/out/` where earlier versions used
+/// `target/<profile>/deps/`, so a fixed `parent().parent()` resolves to a
+/// directory that merely looks plausible and then reports the example as
+/// missing. `--message-format=json` is a documented interface, so cargo
+/// answering where it put the binary cannot drift out from under us.
 fn example_binary(name: &str) -> std::path::PathBuf {
-    let deps_dir = std::env::current_exe().unwrap();
-    // target/debug/deps/<test-bin> -> target/debug/examples/<name>, carrying
-    // the platform executable suffix (`.exe` on Windows, empty elsewhere).
-    let debug_dir = deps_dir.parent().unwrap().parent().unwrap();
-    let path = debug_dir
-        .join("examples")
-        .join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
-    if path.exists() {
-        return path;
-    }
-    let status = Command::new(env!("CARGO"))
-        .args(["build", "--features", "cli", "--example", name])
-        .status()
+    let out = Command::new(env!("CARGO"))
+        .args([
+            "build",
+            "--features",
+            "cli",
+            "--example",
+            name,
+            "--message-format=json",
+        ])
+        .output()
         .expect("failed to spawn cargo to build the emitted example");
-    assert!(status.success(), "building example {name} failed");
+    assert!(
+        out.status.success(),
+        "building example {name} failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // One `compiler-artifact` line carries this example's executable. Match on
+    // the target name so a sibling example in the same build cannot be picked
+    // up, and fail naming the build output rather than guessing a path.
+    let path = stdout
+        .lines()
+        .filter(|line| line.contains(r#""reason":"compiler-artifact""#))
+        .filter(|line| line.contains(&format!(r#""name":"{name}""#)))
+        .filter(|line| line.contains(r#""kind":["example"]"#))
+        .filter_map(json_string_field_after(r#""executable":"#))
+        .next()
+        .unwrap_or_else(|| {
+            panic!(
+                "cargo reported no executable for example {name}; its artifact line is missing \
+                 from the build output:\n{stdout}"
+            )
+        });
+    let path = std::path::PathBuf::from(path);
     assert!(
         path.exists(),
-        "example binary {path:?} still missing after build"
+        "cargo reported example {name} at {path:?}, which does not exist"
     );
     path
+}
+
+/// Extract a JSON string value that follows `key` on one artifact line.
+///
+/// Deliberately a scanner rather than a JSON dependency: the crate has none,
+/// and the fields read here (`executable`) are plain, escape-free absolute
+/// paths on every platform CI covers. A `null` value yields `None`, which is
+/// how cargo reports a unit that produced no executable.
+fn json_string_field_after(key: &'static str) -> impl Fn(&str) -> Option<String> {
+    move |line: &str| {
+        let rest = line.split_once(key)?.1;
+        let rest = rest.strip_prefix('"')?;
+        let (value, _) = rest.split_once('"')?;
+        Some(value.to_string())
+    }
 }
 
 // ---------------------------------------------------------------------------
