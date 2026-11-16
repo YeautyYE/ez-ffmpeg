@@ -14,7 +14,7 @@
 //! It abstracts the complexity of the raw C API, allowing you to configure media pipelines,
 //! perform transcoding and filtering, and inspect streams with ease.
 //!
-//! The FFmpeg 7.1–8.x system libraries must be installed before this crate
+//! The FFmpeg 7.1–9.x system libraries must be installed before this crate
 //! builds; the
 //! [installation guide](https://github.com/YeautyYE/ez-ffmpeg/blob/main/docs/INSTALL.md)
 //! covers platform prerequisites, static linking, building FFmpeg from
@@ -133,8 +133,10 @@
 //! The transcoding pipeline (demux -> decode -> filter -> encode -> mux) is
 //! ported from the FFmpeg CLI sources, `fftools/ffmpeg` of **FFmpeg 7.x**:
 //! function names, timestamp handling and scheduling semantics follow that
-//! release, and code comments cite the corresponding fftools file and line
-//! (line numbers refer to the FFmpeg `n7.1` tag).
+//! release, and code comments cite the corresponding fftools file and line.
+//! Line numbers refer to the FFmpeg `n7.1` tag unless a comment names a newer
+//! one; behavior that differs from 8.0 onward is gated on the `ffmpeg_8_0`
+//! cfg that `build.rs` derives from the linked FFmpeg.
 //! If you know `ffmpeg_demux.c` or `ffmpeg_filter.c`, grepping this crate
 //! for the same function names (`ts_fixup`, `video_sync_process`,
 //! `enc_open`, `mux_fixup_ts`, ...) lands in the equivalent Rust.

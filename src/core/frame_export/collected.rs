@@ -28,8 +28,9 @@ impl CollectedAudio {
         channels: u16,
         channel_layout: String,
     ) -> Self {
-        // `%` (not `is_multiple_of`) keeps this MSRV-1.80 safe, matching the
-        // sibling chunk type; `usize::is_multiple_of` is only stable since 1.87.
+        // `%` rather than `is_multiple_of`: the latter was not yet stable on the
+        // former Rust 1.80 MSRV. It is available on the current 1.88 minimum, so
+        // this could be switched; kept as-is to match the sibling chunk type.
         #[allow(clippy::manual_is_multiple_of)]
         {
             debug_assert!(

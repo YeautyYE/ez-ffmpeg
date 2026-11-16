@@ -369,11 +369,14 @@ pub enum Error {
 // merely compiling the crate enforces the bound for whichever feature-gated
 // variants that build carries — including feature combinations whose tests
 // are compiled but never run.
-// 72, not 64: on the 1.80 MSRV toolchain the compiler does not yet fold the
-// outer discriminant into the niche of the 64-byte nested enums
-// (`FilterGraphParse` / `FilterGraph` / `PacketSink` payloads), so the same
-// type lays out as 72 bytes there. Modern toolchains fit 64; the companion
-// test below pins that tighter bound where the tests run.
+//
+// 72 rather than 64: 64 is the size measured on the current MSRV (1.88) on
+// aarch64-apple-darwin for every feature combination, and the companion test
+// below pins that tighter figure wherever tests actually run. The compile-time
+// bound stays looser on purpose — 72 was the layout on the historical Rust 1.80
+// toolchain, and no other target has been measured. Tightening it here would
+// fail compilation on any platform that still lays the type out at 72, which
+// the test cannot catch because a compile-only build never runs it.
 const _: () = assert!(
     std::mem::size_of::<Error>() <= 72,
     "Error grew past its layout contract: shrink the new payload (static labels) or box the variant"
@@ -381,9 +384,9 @@ const _: () = assert!(
 
 #[cfg(test)]
 mod layout_tests {
-    /// On current stable the niche-folded layout is 64 bytes; a new variant
-    /// that grows it shows up here (every CI test lane) even though the MSRV
-    /// const bound above must stay at the 1.80 figure.
+    /// Regression test for the tighter 64-byte bound. A new variant that grows
+    /// the type shows up here on every CI test lane; the looser compile-time
+    /// bound above deliberately keeps headroom for unmeasured targets.
     #[test]
     fn error_fits_the_modern_64_byte_layout() {
         assert!(

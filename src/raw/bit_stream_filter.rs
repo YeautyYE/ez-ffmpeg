@@ -9,16 +9,19 @@
 //!
 //! ## Why the FFI surface is declared locally
 //!
-//! `ffmpeg-sys-next` does not bind `libavcodec/bsf.h`: its bindgen input for
-//! libavcodec names only `avcodec.h`, `dv_profile.h` and `vorbis_parser.h`,
-//! and since FFmpeg 5.0 `avcodec.h` no longer includes `bsf.h` — so no
-//! `av_bsf_*` symbol and no `AVBSFContext` exist in the generated bindings.
-//! The symbols themselves are exported by every linked libavcodec in the
-//! crate's supported range (FFmpeg 7.0–8.x), so this module declares the
-//! five entry points it needs and mirrors the public `AVBSFContext` layout,
-//! which is part of FFmpeg's public ABI and has been field-for-field
-//! identical since FFmpeg 5.0 (`libavcodec/bsf.h`: av_class, filter,
-//! priv_data, par_in, par_out, time_base_in, time_base_out).
+//! These declarations originated with `ffmpeg-sys-next` 8.1.x, which did not
+//! explicitly include `libavcodec/bsf.h` among its bindgen input headers (it
+//! named `avcodec.h`, `dv_profile.h`, `vorbis_parser.h`, plus `avfft.h` on
+//! older FFmpeg), and since FFmpeg 5.0 `avcodec.h` no longer includes
+//! `bsf.h` — so no `av_bsf_*` symbol and no `AVBSFContext` existed in the
+//! generated bindings. `ffmpeg-sys-next` 9.x adds it (`build.rs` searches for
+//! `libavcodec/bsf.h` and binds it when present), so the bindings now carry
+//! `av_bsf_*` too; the local declarations are kept as a self-contained ABI
+//! mirror rather than churning every call site. The symbols are exported by
+//! every linked libavcodec in the crate's supported range (FFmpeg 7.1–9.x),
+//! and the mirrored `AVBSFContext` layout is part of FFmpeg's public ABI,
+//! field-for-field identical since FFmpeg 5.0 (`libavcodec/bsf.h`: av_class,
+//! filter, priv_data, par_in, par_out, time_base_in, time_base_out).
 
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_void};

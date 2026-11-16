@@ -96,8 +96,8 @@ impl<'a> BitReader<'a> {
         if self.bits(1)? != 1 {
             return Err("rbsp_trailing_bits stop bit is 0".to_string());
         }
-        // `%` (not `is_multiple_of`) keeps this MSRV-1.80 safe;
-        // `usize::is_multiple_of` is only stable since 1.87.
+        // `%` rather than `is_multiple_of`: the latter was not yet stable on the
+        // former Rust 1.80 MSRV. It is available on the current 1.88 minimum.
         #[allow(clippy::manual_is_multiple_of)]
         while self.pos % 8 != 0 {
             if self.bits(1)? != 0 {

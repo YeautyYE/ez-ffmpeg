@@ -62,7 +62,7 @@
 //! parameter-correct, but tone-mapping is subjective and content-dependent.
 //! CI exercises routing, filter-option probes, side-data deletion when the
 //! `sidedata` filter exists, 10-bit PQ/HLG luma oracles when a CPU backend
-//! exists, and (on the FFmpeg 8.1.2 LGPL lane) the `scale`/`intent=perceptual`
+//! exists, and (on the FFmpeg 9.0 LGPL lane) the `scale`/`intent=perceptual`
 //! path as a must-run gate. It does not certify a "correct" picture. Treat
 //! `examples/hdr_to_sdr` as a starting point.
 

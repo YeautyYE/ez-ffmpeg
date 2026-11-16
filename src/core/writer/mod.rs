@@ -104,7 +104,7 @@
 //!
 //! # FFmpeg versions
 //!
-//! Works on every FFmpeg release this crate supports (7.1–8.x); it opens no
+//! Works on every FFmpeg release this crate supports (7.1–9.x); it opens no
 //! input format context, so no version-specific probing behavior applies.
 
 use std::ffi::CString;

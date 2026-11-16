@@ -16,10 +16,11 @@
 //!
 //! A video encoder enters [`STRICT_TIER_VIDEO_ENCODERS`] only with all of:
 //!
-//! 1. **Wrapper audit** against both FFmpeg versions CI pins (currently 7.1
-//!    and 8.1): exactly one `AVPacket` per encoded picture, honors
-//!    `AV_CODEC_FLAG_GLOBAL_HEADER` (parameter sets in extradata at open
-//!    time, none in-band), monotonically increasing dts.
+//! 1. **Wrapper audit** against each FFmpeg line CI exercises (7.1, 8.1 and
+//!    9.0 in the Linux matrix, plus the source-build 9.1 line): exactly one
+//!    `AVPacket` per encoded picture, honors `AV_CODEC_FLAG_GLOBAL_HEADER`
+//!    (parameter sets in extradata at open time, none in-band),
+//!    monotonically increasing dts.
 //! 2. **Emission-shape fixtures** in the strict-tier unit suite covering the
 //!    wrapper's packet shapes, so CI pins acceptance without the hardware.
 //! 3. **A hardware acceptance line**: a skip-guarded integration test plus a

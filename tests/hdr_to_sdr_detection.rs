@@ -785,7 +785,7 @@ fn colorspace_gamut_only_retags_output_bt709() {
 
 /// 10-bit PQ / HLG pixel oracle. Hosts without zscale+tonemap and without
 /// FFmpeg 8 `scale`/`intent=perceptual` skip unless
-/// `EZ_FFMPEG_HDR_PIXEL_ORACLE_MUST_RUN` is set (the FFmpeg 8.1.2 LGPL
+/// `EZ_FFMPEG_HDR_PIXEL_ORACLE_MUST_RUN` is set (the FFmpeg 9.0 LGPL
 /// contract lane). When a backend exists, the graph is forced through
 /// `yuv420p10le` and the converted luma of a bright patch must sit above a
 /// dark patch, both inside limited-range SDR.

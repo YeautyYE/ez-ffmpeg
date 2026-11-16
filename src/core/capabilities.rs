@@ -321,7 +321,7 @@ pub fn is_filter_available(name: &str) -> bool {
 /// filter. It does **not** mean applying that option performs the intended
 /// color transform: `scale` without `intent=perceptual` will not tone-map
 /// PQ/HLG, and even with the option present the perceptual curve is not a
-/// stable pixel ABI across FFmpeg 8.x releases.
+/// stable pixel ABI across FFmpeg 8.x and 9.x releases.
 ///
 /// Empty names and names containing an interior NUL byte return `false`.
 /// Unknown filters and unknown options return `false`. Child options such

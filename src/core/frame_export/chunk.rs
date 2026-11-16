@@ -32,8 +32,9 @@ impl AudioChunk {
         channel_layout: String,
         data: Vec<f32>,
     ) -> Self {
-        // `%` (not `is_multiple_of`) keeps this MSRV-1.80 safe, matching the
-        // sibling video sink; `usize::is_multiple_of` is only stable since 1.87.
+        // `%` rather than `is_multiple_of`: the latter was not yet stable on the
+        // former Rust 1.80 MSRV. It is available on the current 1.88 minimum, so
+        // this could be switched; kept as-is to match the sibling video sink.
         #[allow(clippy::manual_is_multiple_of)]
         {
             debug_assert!(
