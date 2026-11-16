@@ -7,8 +7,8 @@
 [![Crates.io](https://img.shields.io/crates/v/ez-ffmpeg.svg)](https://crates.io/crates/ez-ffmpeg)
 [![Documentation](https://img.shields.io/badge/docs.rs-ez--ffmpeg-blue)](https://docs.rs/ez-ffmpeg)
 [![License: MIT/Apache-2.0/MPL-2.0](https://img.shields.io/badge/License-MIT%2FApache--2.0%2FMPL--2.0-brightgreen.svg)](https://github.com/YeautyYE/ez-ffmpeg/blob/main/LICENSE-APACHE)
-[![Rust](https://img.shields.io/badge/Rust-%3E=1.80.0-orange)](https://www.rust-lang.org/)
-[![FFmpeg](https://img.shields.io/badge/FFmpeg-7.1--8.x-blue)](https://ffmpeg.org)
+[![Rust](https://img.shields.io/badge/Rust-%3E=1.88.0-orange)](https://www.rust-lang.org/)
+[![FFmpeg](https://img.shields.io/badge/FFmpeg-7.1--9.x-blue)](https://ffmpeg.org)
 [![CI](https://github.com/YeautyYE/ez-ffmpeg/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/YeautyYE/ez-ffmpeg/actions/workflows/ci.yml?query=branch%3Amain+event%3Apush)
 
 </div>
@@ -29,8 +29,12 @@ The transcoding pipeline is ported from FFmpeg's own `fftools/ffmpeg` sources â€
 
 ## Version Requirements
 
-- **Rust:** 1.80.0 or higher (the optional `wgpu` feature requires 1.85+).
-- **FFmpeg:** 7.1 through 8.x (one build links either major).
+- **Rust:** 1.88.0 or higher.
+- **FFmpeg:** 7.1 through 9.x (one build links exactly one major).
+
+These are the requirements of the **upcoming 0.20** release. The latest
+published release (0.19.x) still requires Rust 1.80 and links FFmpeg
+7.1â€“8.x; FFmpeg 9 support is not in any published version yet.
 
 ## Quick Start
 

@@ -8,10 +8,12 @@ release-profile advice.
 
 Version requirements:
 
-- **Rust:** 1.80.0 or higher for the default feature set. The optional `wgpu`
-  GPU-filter feature pulls in the wgpu 26 dependency stack, which currently
-  requires Rust 1.85+.
-- **FFmpeg:** 7.1 through 8.x (one build links either major; the bindings
+- **Rust:** 1.88.0 or higher, for every feature set. This is not a preference:
+  `ffmpeg-sys-next` 9.x is an Edition-2024 crate whose build script uses
+  let-chains, which raise the floor to 1.88. The patched `quinn-proto` and
+  `quinn-udp` releases independently require 1.85, so they rule out 1.80 too.
+  Earlier releases of ez-ffmpeg (0.19.x and below) accepted 1.80.
+- **FFmpeg:** 7.1 through 9.x (one build links exactly one major; the bindings
   gate on the installed version).
 
 ## Platform prerequisites
@@ -40,9 +42,9 @@ separate process and never sees those variables.
 
 ### Linux
 
-ez-ffmpeg links FFmpeg **7.1–8.x**, which is newer than what many
+ez-ffmpeg links FFmpeg **7.1–9.x**, which is newer than what many
 distributions package (Ubuntu 24.04 ships FFmpeg 6.x, for example). Install
-the development libraries from a source that provides FFmpeg 7.1+ or 8 — or
+the development libraries from a source that provides FFmpeg 7.1 or later — or
 build FFmpeg through Cargo (see
 [Building FFmpeg from source](#building-ffmpeg-from-source-linuxmacos)):
 
@@ -51,7 +53,7 @@ build FFmpeg through Cargo (see
 sudo apt install pkg-config clang \
     libavcodec-dev libavformat-dev libavfilter-dev libavdevice-dev \
     libavutil-dev libswscale-dev libswresample-dev
-pkg-config --modversion libavcodec   # needs >= 61.13 (FFmpeg 7.1); 62.x => FFmpeg 8.x
+pkg-config --modversion libavcodec   # needs >= 61.13 (7.1); 62.x => 8.x; 63.x => 9.x
 ```
 
 `pkg-config` and `clang` (for bindgen) are required regardless of how FFmpeg
@@ -103,9 +105,12 @@ the copy ez-ffmpeg uses:
 
 ```toml
 [dependencies]
-ez-ffmpeg = "*"
-# Keep the FFmpeg major in sync with the one ez-ffmpeg depends on:
-ffmpeg-next = { version = "8.1", features = ["build"] }
+# 0.20 is not published yet; until it is, point at a checkout of it.
+ez-ffmpeg = { path = "../ez-ffmpeg" }
+# Keep the requirement compatible with the ffmpeg-next line ez-ffmpeg
+# resolves. Cargo rejects a graph needing two different ffmpeg-sys-next
+# packages: both declare `links = "ffmpeg"`, so they cannot coexist.
+ffmpeg-next = { version = "~9.1.0", features = ["build"] }
 ```
 
 What to expect:
@@ -116,12 +121,18 @@ What to expect:
   `nasm`/`yasm`, `clang`, and `pkg-config`. The first build compiles FFmpeg
   (typically 10–20 minutes) and adds roughly 1 GB to `target/` (the artifacts
   keep debug symbols).
-- **Reproducibility:** the build clones FFmpeg's `release/8.1` **moving
-  branch** at build time, so two clean builds of the same `Cargo.lock` can
-  compile different FFmpeg commits. `--locked` and `cargo vendor` do not
-  cover the nested clone, and offline builds are not supported. This is fine
-  for local decode/analysis and CI; for production, prefer a system FFmpeg
-  you provision and pin yourself.
+- **Reproducibility:** the build clones FFmpeg's `release/<major.minor>`
+  **moving branch** at build time. The branch is derived from the resolved
+  `ffmpeg-sys-next` version, **not** from the `ffmpeg-next` version you write
+  in your manifest — pinning the wrapper alone does not fix it, because the
+  wrapper's own `ffmpeg-sys-next` requirement is semver-flexible. Check
+  `Cargo.lock` for the actual sys version (ez-ffmpeg 0.20 requires `~9.1.1`,
+  so it resolves `release/9.1`), and note that even an exact sys pin does not
+  pin the FFmpeg commit. Two clean builds of the same `Cargo.lock` can
+  therefore compile different FFmpeg commits. `--locked` and `cargo vendor`
+  do not cover the nested clone, and offline builds are not supported. This
+  is fine for local decode/analysis and CI; for production, prefer a system
+  FFmpeg you provision and pin yourself.
 - **Portability:** the upstream build compiles with `-march=native`, so the
   resulting binaries are tied to the building machine's CPU — do not
   redistribute them.
@@ -143,7 +154,7 @@ example H.264 encoding via a **system-installed** libx264 (the feature links
 it, it does not compile it):
 
 ```toml
-ffmpeg-next = { version = "8.1", features = ["build", "build-license-gpl", "build-lib-x264"] }
+ffmpeg-next = { version = "~9.1.0", features = ["build", "build-license-gpl", "build-lib-x264"] }
 ```
 
 Binaries produced this way are subject to the GPL.
@@ -153,7 +164,7 @@ Binaries produced this way are subject to the GPL.
 `ez-ffmpeg` links the FFmpeg libraries selected by your application. Crate
 features do not add codecs or filters to that FFmpeg build.
 
-The **tested LGPL minimum** is a CI profile: FFmpeg 8.1.2 shared libraries
+The **tested LGPL minimum** is a CI profile: FFmpeg 9.0 shared libraries
 configured with `--disable-gpl --disable-nonfree --disable-version3
 --disable-autodetect`. It contains FFmpeg's native LGPL components and no
 optional external libraries. Probe a linked build with
@@ -164,7 +175,7 @@ optional external libraries. Probe a linked build with
 will answer.
 
 The `ffmpeg-next/build` source path above is a different, static, host-CPU
-build. It is not this shared `n8.1.2` contract profile.
+build. It is not this shared `n9.0` contract profile.
 
 This is a technical compatibility matrix, not legal advice. FFmpeg's own
 LGPL checklist recommends building without `--enable-gpl` and
@@ -194,8 +205,11 @@ format.
 
 ### Available while staying LGPL
 
-These need an extra LGPL/permissive encoder, hardware backend, or library.
-They are not in the tested minimum profile.
+These have capability-specific requirements: most need an extra
+LGPL/permissive encoder, hardware backend, or library, and are absent from the
+tested minimum profile. The built-in `scale`/`intent=perceptual` HDR path is
+the exception — it ships with FFmpeg 8.0+ and is exercised in the FFmpeg 9.0
+LGPL contract lane.
 
 | Task | Optional component or replacement | What failure looks like | What to do |
 |---|---|---|---|
@@ -203,13 +217,13 @@ They are not in the tested minimum profile.
 | H.264 software encoding | FFmpeg `libopenh264` wrapper | Named H.264 encoder is absent | Build FFmpeg with libopenh264 or use a platform hardware encoder; review patent obligations separately. OpenH264's BSD-2-Clause code license is not Cisco's binary patent coverage |
 | H.264 hardware encoding | VideoToolbox, NVENC, QSV, AMF, or VAAPI | Encoder is absent, or opening it fails at runtime | Enable the backend and install the required driver/SDK; registry presence does not prove device availability |
 | Strict packet-sink video | `libx264`, `h264_nvenc`, `h264_videotoolbox`, or `libopenh264` | `EncoderNotWhitelisted`, `BFramesUnsupported` (VideoToolbox explicit B-frames only), or `EncoderUnavailable` | Use an admitted encoder that this FFmpeg build actually provides. VideoToolbox explicit `bf` / `max_b_frames` must be integer 0 (or unset). Unset `libx264` still uses FFmpeg's default B-frames; set `bf=0` for `dts == pts`. AAC-only sinks work in the minimum profile |
-| HDR→SDR on FFmpeg 8.x | Built-in `scale` with `intent=perceptual` (after zscale/libplacebo if those are present) | A named routing error before the first output frame | Probe filter options, not the FFmpeg version string; do not treat a gray file as success |
-| HDR→SDR on FFmpeg 7.1 without zimg/libplacebo | No correct built-in PQ/HLG→SDR chain (zimg is zlib; libplacebo is LGPL-2.1) | A named routing error; no output file | Use FFmpeg 8.x `scale` intent, enable zimg or libplacebo, or skip the conversion. Do not use 7.1 `tonemap` on non-linear input. Enabling GPL does not unlock this path |
+| HDR→SDR on FFmpeg 8.0–9.x | Built-in `scale` with `intent=perceptual` (after zscale/libplacebo if those are present) | A named routing error before the first output frame | Probe filter options, not the FFmpeg version string; do not treat a gray file as success |
+| HDR→SDR on FFmpeg 7.1 without zimg/libplacebo | No correct built-in PQ/HLG→SDR chain (zimg is zlib; libplacebo is LGPL-2.1) | A named routing error; no output file | Use FFmpeg 8.0+ `scale` intent, enable zimg or libplacebo, or skip the conversion. Do not use 7.1 `tonemap` on non-linear input. Enabling GPL does not unlock this path |
 | PNG thumbnails | zlib-backed PNG encoder | PNG encoder is unavailable | Rebuild FFmpeg with zlib |
 | WebP thumbnails | libwebp | WebP encoder is unavailable | Rebuild FFmpeg with `--enable-libwebp` |
 | HTTPS input | OpenSSL, GnuTLS, Schannel, or the crate's opt-in `http-input` feature | The `https` input protocol is unavailable | Check `capabilities::is_input_protocol_available("https")`; enable a TLS backend, provide bytes through custom I/O, or use the explicit `HttpInput` API when the `http-input` feature is enabled. Application reconnect is off by default; seekable resume and short-206 continuation require an ETag or Last-Modified unless `require_validator` is set false. A 206 with unknown instance-length (`bytes start-end/*`) is not treated as a complete body. Seeking to a known size is EOF, not a failed Range request. |
 | SRT transport | libsrt | The `srt` output protocol is unavailable | Rebuild FFmpeg with `--enable-libsrt` |
-| WHIP output | FFmpeg 8.x + DTLS backend + compatible codecs | WHIP muxer/protocol or encoder is unavailable | Enable a supported DTLS backend and select compatible audio/video encoders |
+| WHIP output | FFmpeg 8.0+ + DTLS backend + compatible codecs | WHIP muxer/protocol or encoder is unavailable | Enable a supported DTLS backend and select compatible audio/video encoders |
 | AV1 encoding with rav1e | librav1e | `librav1e` encoder is unavailable | Enable librav1e; its code is BSD-2-Clause and it carries the Alliance for Open Media Patent License |
 
 OpenSSL 3.x does not automatically make a GPL-enabled FFmpeg build nonfree:
@@ -256,9 +270,37 @@ inspect with `get_encoders()`, and note that hardware encoders
 The FFmpeg headers found at build time are older than 7.1 (`AVCodecConfig`
 arrived in FFmpeg 7.1). Distribution and vcpkg ports can lag — check with
 `pkg-config --modversion libavcodec` (the API needs libavcodec >= 61.13;
-released FFmpeg 7.1 reports 61.19.x, and 62.x = 8.x) or your
-vcpkg port version, and upgrade to FFmpeg 7.1–8.x.
+released FFmpeg 7.1 reports 61.19.x, 62.x = 8.x, 63.x = 9.x) or your
+vcpkg port version, and upgrade to FFmpeg 7.1–9.x.
 (Reported in [#18](https://github.com/YeautyYE/ez-ffmpeg/issues/18).)
+
+</details>
+
+<details>
+<summary><code>cannot find value `AV_CODEC_ID_V410` in this scope</code> and similar errors inside <code>ffmpeg-next</code> 8.1.x</summary>
+
+The FFmpeg headers found at build time are **newer** than the linked Rust
+crates support. FFmpeg 9 removed `AV_CODEC_ID_V410` / `V308` / `V408`, five
+deprecated `AVCodec` fields (`supported_framerates`, `pix_fmts`,
+`supported_samplerates`, `sample_fmts`, `ch_layouts`) and added side-data
+enum values; `ffmpeg-next` 8.1.x does not gate any of those, so it fails with
+`E0425` / `E0609` / `E0004` while compiling its own sources.
+
+These errors appear whenever `ffmpeg-next` 8.1.x is compiled against FFmpeg 9
+headers. Which headers get found depends on your platform's discovery path,
+not on which `ffmpeg` executable is on `PATH`. `ffmpeg-sys-next` tries the
+`build` feature first if enabled, then `FFMPEG_DIR` (on every platform,
+including MSVC), then vcpkg (MSVC only), then pkg-config. So a vcpkg install
+only matters if discovery reaches it — check your selected baseline and the
+installed package with `vcpkg list`, and remember it may differ from the
+version this project's CI uses.
+
+Two ways out: use ez-ffmpeg 0.20 once it is published (it links
+`ffmpeg-next` 9.x and supports FFmpeg 7.1 through 9.x), or keep ez-ffmpeg
+0.19.x and point it at an 8.1.x install. Note that 8.1.3 is one compatible
+8.x patch release — it is neither a minimum nor a statement that the 8.x
+series has ended; any 8.1.x works equally.
+(Reported in [#67](https://github.com/YeautyYE/ez-ffmpeg/issues/67).)
 
 </details>
 
