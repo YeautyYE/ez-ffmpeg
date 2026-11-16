@@ -2,7 +2,11 @@
 name = "ez-ffmpeg"
 version = "0.19.3"
 edition = "2021"
-rust-version = "1.80"
+# 1.88 comes from ffmpeg-sys-next 9.x: it is `edition = "2024"` AND its build
+# script uses let-chains, which are stable only in 1.88. Edition 2024 alone
+# would allow 1.85. Nothing else forces 1.88 — the patched quinn/rustls/ICU
+# lines below require 1.85 or less, so they rule out 1.80 but not 1.85.
+rust-version = "1.88"
 authors = ["Yeauty <YeautyYE@gmail.com>"]
 description = "A safe and ergonomic Rust interface for FFmpeg integration, designed for ease of use."
 homepage = "https://github.com/YeautyYE/ez-ffmpeg"
@@ -22,12 +26,25 @@ repository = "https://github.com/YeautyYE/ez-ffmpeg"
 [dependencies]
 log = "0.4"
 thiserror = "1.0"
-# 8.1.x is the first upstream line that supports FFmpeg 8 correctly (8.0.x
-# crates fail against FFmpeg 8/8.1 headers). The crates still link FFmpeg
-# 7.x installs: ffmpeg-sys-next probes the installed version and gates its
-# bindings, so this bump does not drop FFmpeg 7 support.
-ffmpeg-next = "8.1.0"
-ffmpeg-sys-next = "8.1.0"
+# 9.x is the upstream line that supports FFmpeg 9: FFmpeg 9 dropped
+# AV_CODEC_ID_V410/V308/V408, removed five deprecated AVCodec fields
+# (supported_framerates, pix_fmts, supported_samplerates, sample_fmts,
+# ch_layouts) and added side-data enum values, and only the 9.x crates gate
+# those differences (`cfg(feature = "ffmpeg_9_0")`). The 8.1.x crates cannot
+# compile against FFmpeg 9 headers at all.
+#
+# FFmpeg 7.1 and 8.x are still supported: ffmpeg-sys-next probes the installed
+# version and gates its bindings, and the 9.x line carries the 7.x/8.x gates
+# too. One build still links exactly one FFmpeg major.
+#
+# `~` (not `^`): upstream documents minor bumps of these crates as
+# semver-major-like breaking changes, and ffmpeg-sys-next derives the branch
+# behind its `build` feature from its OWN major.minor. A caret range would let a
+# routine `cargo update` pull an unvalidated 9.2 line and silently change both
+# the Rust API and the FFmpeg source build. Widen these deliberately, after
+# running the full matrix, not by accident.
+ffmpeg-next = "~9.1.0"
+ffmpeg-sys-next = "~9.1.1"
 crossbeam = "0.8.4"
 crossbeam-channel = "0.5.15"
 libc = "0.2.159"
@@ -51,43 +68,67 @@ ash = { version = "0.38", optional = true }
 bytes = { version = "1.11.1", optional = true }
 
 # http-input (default-off). Tokio is current-thread only (no rt-multi-thread).
-# hyper-util / hyper-rustls / idna_adapter / zeroize / chacha20 / quinn* /
-# crypto-mac / security-framework are resolver pins so Cargo 1.80 does not
-# select Edition 2024 / MSRV 1.85 transitive crates. They stay optional here
-# and are NOT activated by `http-input` (same as quinn). Drop the pins once
-# upstream ranges stay on 1.80.
-reqwest = { version = "=0.12.28", optional = true, default-features = false, features = ["rustls-tls-manual-roots", "stream"] }
-tokio = { version = "=1.47.1", optional = true, default-features = false, features = ["rt", "net", "time", "sync", "macros"] }
-futures-util = { version = "=0.3.31", optional = true, default-features = false, features = ["std"] }
-rustls-native-certs = { version = "=0.8.4", optional = true }
-# hyper-util 0.1.21 (2026-09-24) moved to Edition 2024 / MSRV 1.85, which
-# Cargo 1.80 cannot even parse; reqwest's `hyper-util ^0.1.12` would otherwise
-# resolve to it on every fresh lockfile (Cargo.lock is untracked).
-hyper-util = { version = "=0.1.20", optional = true, default-features = false }
-# rustls 0.23.25+ needs subtle ^2.5; rml_rtmp → crypto-mac 0.10.1 pins
-# subtle =2.4. Pin rustls to the spike-verified line and crypto-mac 0.10.0
-# (no exact subtle pin) so default / --all-features resolution unifies.
-# 0.23.45 clears RUSTSEC-2026-0285; its only req bump (rustls-webpki
-# ^0.103.14) stays MSRV 1.71, keeping the 1.80-resolvable dependency set.
-rustls = { version = "=0.23.45", optional = true, default-features = false, features = ["ring", "std"] }
-crypto-mac = { version = "=0.10.0", optional = true }
-hyper-rustls = { version = "=0.27.7", optional = true, default-features = false }
-idna_adapter = { version = "=1.1.0", optional = true, default-features = false }
-zeroize = { version = "=1.8.2", optional = true, default-features = false }
-# chacha20 0.10+ is Edition 2024 / MSRV 1.85; pin the last 1.80-compatible line.
-chacha20 = { version = "=0.9.1", optional = true, default-features = false }
-# reqwest lists quinn as an unused optional; 0.11.16+ pulls rand 0.10 → chacha20 0.10.
-# Keep the pins; do not activate them from `http-input` (no HTTP/3).
-# quinn-proto 0.11.15 clears RUSTSEC-2026-0037 / RUSTSEC-2026-0185 while
-# staying on the 1.80-resolvable dependency set.
-quinn = { version = "=0.11.9", optional = true, default-features = false }
-quinn-proto = { version = "=0.11.15", optional = true, default-features = false }
-# quinn-udp 0.5.15+ requires rustc 1.85.
-quinn-udp = { version = "=0.5.14", optional = true, default-features = false }
+#
+# These used to be exact `=` pins. They existed so Cargo 1.80 would not resolve
+# Edition-2024 / MSRV-1.85 transitive crates it could not parse. The MSRV is now
+# 1.88, so the `=` pins are gone — and that is what lets the advisory-fixed
+# versions below be selected at all.
+#
+# Where a bound is marked a *security floor*, it is the first release that
+# clears a specific RUSTSEC advisory, because a caret requirement still admits
+# the vulnerable version (a bare `^0.23.45` accepts 0.23.45). Not every bound
+# here is one; only the ones whose comment names an advisory. Raising any of
+# them requires re-running `cargo audit`, not just picking the newest number.
+#
+# Known limit: a transitively-required crate cannot be floored from here, so
+# two advisories are satisfied by our lockfile but not by this manifest:
+#   * rustls-webpki — rustls 0.23.46 requires `^0.103.14`, while
+#     RUSTSEC-2026-0382 is patched from 0.103.16. We resolve 0.103.17.
+#   * crossbeam-epoch — crossbeam 0.8.x requires `^0.9.17`, while
+#     RUSTSEC-2026-0204 is patched from 0.9.20. We resolve 0.9.21.
+# In both cases a downstream lockfile pinned inside the affected range still
+# satisfies this graph. Flooring them from here would mean declaring each as a
+# direct dependency purely as a version pin, for a crate we never name in
+# `src/`; both ranges are the upstreams' to tighten. `cargo audit` on a fresh
+# resolve is what actually catches a regression here.
+#
+# `chacha20` is deliberately NOT declared. It used to be, to pin the 0.9 line,
+# but that pin never constrained anything (nothing in `src/` uses the crate, and
+# quinn's own rand dependency pulls chacha20 0.10 regardless). Keeping it only
+# added an unused 0.9 build under --all-features.
+#
+# `quinn*` stay declared even though `http-input` never activates them:
+# reqwest lists quinn as an unused optional, so leaving them to a fresh resolve
+# picks whatever the resolver wants. These floors are the first releases past
+# the quinn-proto / quinn-udp advisories (RUSTSEC-2026-0338..0343, -0523, -0524
+# need >= 0.11.19; RUSTSEC-2026-0538 needs >= 0.5.16, < 0.6).
+#
+# The subtle constraint that keeps `crypto-mac` on 0.10: crypto-mac 0.10.1
+# pins `subtle = "=2.4"`, while rustls needs `subtle ^2.5`. crypto-mac 0.10.0
+# accepts `subtle = "2"`, so default and --all-features resolution unify on one
+# subtle. Do not bump crypto-mac without rechecking that.
+reqwest = { version = "0.12.28", optional = true, default-features = false, features = ["rustls-tls-manual-roots", "stream"] }
+# Security floor: RUSTSEC-2026-0384 (Interval race) is patched in >= 1.54.1;
+# releases below 1.54.0 are unaffected, but a bare `1.47.1` floor still admits
+# the vulnerable 1.54.0. Its rust-version is 1.85, inside our 1.88.
+tokio = { version = "1.54.1", optional = true, default-features = false, features = ["rt", "net", "time", "sync", "macros"] }
+futures-util = { version = "0.3.31", optional = true, default-features = false, features = ["std"] }
+rustls-native-certs = { version = "0.8.4", optional = true }
+hyper-util = { version = "0.1.20", optional = true, default-features = false }
+# Security floor: RUSTSEC-2026-0346..0349 are patched in >= 0.23.46 only.
+rustls = { version = "0.23.46", optional = true, default-features = false, features = ["ring", "std"] }
+crypto-mac = { version = "0.10.0", optional = true }
+hyper-rustls = { version = "0.27.7", optional = true, default-features = false }
+idna_adapter = { version = "1.1.0", optional = true, default-features = false }
+zeroize = { version = "1.8.2", optional = true, default-features = false }
+quinn = { version = "0.11.12", optional = true, default-features = false }
+quinn-proto = { version = "0.11.19", optional = true, default-features = false }
+quinn-udp = { version = "0.5.16", optional = true, default-features = false }
 
 #rtmp
 rml_rtmp = { version = "0.8", optional = true }
-slab = { version = "0.4", optional = true }
+# Security floor: RUSTSEC-2025-0047 is patched in >= 0.4.11.
+slab = { version = "0.4.11", optional = true }
 dashmap = { version = "6", optional = true }
 byteorder = { version = "1.5", optional = true }
 fontdb = { version = "0.23.0", optional = true }
@@ -101,9 +142,8 @@ unicode-linebreak = { version = "0.1.5", optional = true }
 objc = "0.2"
 core-foundation = "0.10"
 
-# Resolver pin: newer security-framework lines require Rust 1.85.
 [target.'cfg(target_vendor = "apple")'.dependencies]
-security-framework = { version = "=3.6.0", optional = true }
+security-framework = { version = "3.6.0", optional = true }
 
 [features]
 default = []
@@ -152,7 +192,7 @@ tokio = { version = "1", features = ["full"] }
 libc = "0.2.159"
 # Integration tests re-open output files and inspect raw AVStream fields
 # (extradata / codec_type) that the public StreamInfo API does not expose.
-ffmpeg-sys-next = "8.1.0"
+ffmpeg-sys-next = "~9.1.1"
 # Offline WGSL parse/validation of the built-in wgpu shaders: errors would
 # otherwise surface only at pipeline creation on a live GPU device. Same
 # major as wgpu, which compiles these shaders with this naga at runtime.
