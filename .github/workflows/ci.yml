@@ -604,8 +604,8 @@ jobs:
             target: x86_64-pc-windows-msvc
             ffmpeg: "9.0"
             vcpkg_triplet: x64-windows
-            vcpkg_ref: 0c51603115bcb9506c8595ff881bf1222826cab1
-            vcpkg_cache: 0c516031-ffmpeg-9.0.2-p7-v1
+            vcpkg_ref: 964e107c112ca636c0314740bfc0fbec25122b47
+            vcpkg_cache: 964e107c-ffmpeg-9.0.2-p7-v1
             build_features: async,opengl,wgpu,rtmp,flv,subtitle,cli,http-input
             test_features: async,rtmp,flv,subtitle,wgpu,cli,http-input
             default_ffmpeg_features: ""
@@ -628,8 +628,8 @@ jobs:
             target: aarch64-pc-windows-msvc
             ffmpeg: "9.0"
             vcpkg_triplet: arm64-windows
-            vcpkg_ref: 0c51603115bcb9506c8595ff881bf1222826cab1
-            vcpkg_cache: 0c516031-ffmpeg-9.0.2-p7-v1
+            vcpkg_ref: 964e107c112ca636c0314740bfc0fbec25122b47
+            vcpkg_cache: 964e107c-ffmpeg-9.0.2-p7-v1
             build_features: async,opengl,wgpu,rtmp,flv,subtitle,cli,http-input
             test_features: async,rtmp,flv,subtitle,wgpu,cli,http-input
             default_ffmpeg_features: ""

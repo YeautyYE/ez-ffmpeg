@@ -33,6 +33,34 @@ case "$avcodec_version" in
   *) echo "Expected libavcodec 61.x (FFmpeg 7.1), found $avcodec_version" >&2; exit 1 ;;
 esac
 
+# Make this a no-Vulkan libavutil, which is the only 32-bit configuration the
+# current ffmpeg-sys-next can bind.
+#
+# ffmpeg-sys-next ships a minimal <vulkan/vulkan.h> shim for bindgen (it does
+# not want the real Vulkan SDK as a build dependency) and that shim asserts
+# `sizeof(VkPhysicalDeviceFeatures2) == 240`. 240 is the 64-bit size: the
+# struct is a 4-byte enum, a pointer, and 55 u32s, so a 32-bit ABI lays it out
+# at 228 — which is the correct size there, per real Vulkan. Only the
+# assertion is wrong, and it aborts bindgen on every 32-bit target.
+#
+# The shim is reached only through hwcontext_wrapper.h's
+# `#if __has_include(<libavutil/hwcontext_vulkan.h>)`, and FFmpeg installs
+# that header only when configured with Vulkan. Debian enables Vulkan, so
+# removing the header here reproduces a libavutil built without it: the whole
+# Vulkan block is skipped and nothing else about the install changes.
+#
+# Done this way rather than by building FFmpeg from source without Vulkan
+# because Debian's libavcodec is a GPL build carrying libx264, which the
+# rtmp_loopback proof at the end of this script needs; a minimal from-source
+# build has no H.264 encoder and would silently drop that coverage.
+#
+# Revert this once ffmpeg-sys-next makes the assertion pointer-width aware.
+vulkan_hwcontext=/usr/include/libavutil/hwcontext_vulkan.h
+if [ -f "$vulkan_hwcontext" ]; then
+  mv "$vulkan_hwcontext" "$vulkan_hwcontext.disabled-for-32bit"
+  echo "removed $vulkan_hwcontext (32-bit: ffmpeg-sys-next's Vulkan bindgen shim asserts a 64-bit struct size)"
+fi
+
 # Trixie's packaged rustc is frozen at branch time; every other lane tracks
 # stable via rustup, so this one does too. `uname -m` inside the container
 # reports the 64-bit kernel's machine string, which would make rustup

@@ -59,6 +59,34 @@ pkg-config --modversion libavcodec   # needs >= 61.13 (7.1); 62.x => 8.x; 63.x =
 `pkg-config` and `clang` (for bindgen) are required regardless of how FFmpeg
 is provided.
 
+#### 32-bit targets need a libavutil without Vulkan
+
+On a 32-bit target (`armv7-unknown-linux-gnueabihf`, `i686-*`), the build
+currently fails inside `ffmpeg-sys-next` with:
+
+```
+hwcontext_stubs/vulkan/vulkan.h:64:16: error: static assertion failed due to
+requirement 'sizeof(struct VkPhysicalDeviceFeatures2) == 240'
+```
+
+`ffmpeg-sys-next` binds FFmpeg's Vulkan hardware-context against a minimal
+header shim instead of requiring the Vulkan SDK, and that shim asserts the
+struct is 240 bytes. 240 is its 64-bit size; a 32-bit ABI lays the same
+struct out at 228, which is the correct size there. Only the assertion is
+wrong, and it stops bindgen outright.
+
+The shim is reached only through
+`#if __has_include(<libavutil/hwcontext_vulkan.h>)`, and FFmpeg installs that
+header only when it was configured with Vulkan. So the workaround is to link
+a libavutil built **without** Vulkan — build FFmpeg from source with
+`--disable-vulkan`, or use a distribution package that does not enable it.
+Debian and Ubuntu do enable it, so their `libavutil-dev` triggers this.
+
+This affects 0.20 and later, which require `ffmpeg-sys-next` 9.x; 0.19.x is
+unaffected. It is an upstream defect, not a deliberate platform drop — 64-bit
+targets are unaffected, and CI covers 32-bit ARM against a Vulkan-less
+libavutil.
+
 ## Static linking on Windows
 
 Static linking fails with `unresolved external symbol` errors?
