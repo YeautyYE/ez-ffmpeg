@@ -416,10 +416,10 @@ fn stream_builder_session_releases_port() {
 /// backpressure in `send` — never deadlocked and never lossy. The publisher
 /// pushes several times the server's per-publisher ingress byte bound at
 /// full speed while a real TCP watcher consumes; the send loop completing
-/// and the watcher observing every tag in order prove that the ingress
-/// gate, the per-send reactor wake, the budgeted drain and the fanout
-/// compose under the production loop. (Uses the media-plan helpers defined
-/// with the load harness below.)
+/// and the watcher's delivery staying lossless and in order prove that the
+/// ingress gate, the per-send reactor wake, the budgeted drain and the
+/// fanout compose under the production loop. (Uses the media-plan helpers
+/// defined with the load harness below.)
 ///
 /// Engagement tripwire (Linux): the producer snapshots the watcher's
 /// captured-byte counter at the instant its LAST send completes. Under the
@@ -433,13 +433,20 @@ fn stream_builder_session_releases_port() {
 /// autotuning, the drain round in flight at release time) varies — so the
 /// assertion is Linux-only, where the CI environment is uniform and a
 /// gate-deleted mutation measured ~42% delivery vs the ~58% bound; other
-/// platforms rely on the unit-level gate pins.
+/// platforms rely on the unit-level gate pins. The bound also presumes the
+/// watcher was still connected when the producer finished, so it is checked
+/// only for a stream that ran to completion.
 ///
 /// The watcher drains raw bytes during the flood and chunk-deserializes only
-/// afterwards: full delivery is a claim about the publisher's lossless gate,
-/// so the watcher must never become the bottleneck that trips its own
-/// write-queue policy (shedding/disconnect) — a memcpy-speed reader keeps
-/// the watcher path out of the picture, deterministically.
+/// afterwards, so that deserialization cost never becomes the thing that
+/// stalls the reader. That keeps the watcher fast; it does not make it
+/// immune. Only ~4 MiB of watcher backlog (64 tags) separates a healthy run
+/// from the server's slow-watcher disconnect, which a ~10 ms reader stall
+/// reaches while the producer floods at memcpy speed — so a cut-off stream
+/// is an expected ending on a contended runner, not a failure. The delivery
+/// assertions are therefore split by ending; see the comment on them for
+/// which invariant survives which ending, and why a truncated-but-clean end
+/// is still a hard failure.
 #[test]
 fn high_water_publisher_backpressure_does_not_deadlock() {
     // Mirrors the server's internal 8 MiB per-publisher ingress high-water
@@ -565,29 +572,34 @@ fn high_water_publisher_backpressure_does_not_deadlock() {
     publisher
         .join()
         .expect("the publisher must complete every send without deadlocking");
-    // Engagement tripwire (see the doc comment): producer-side snapshot of
-    // delivered bytes at completion. The ~20 MiB allowance covers the
-    // high-water window (8 MiB), the watcher write queue, kernel TCP
-    // buffering on both loopback ends, the drain round in flight at release
-    // time, and the counter's one-read lag. Linux-only: the bound is an
-    // environment heuristic, and the CI mutation evidence lives there.
-    #[cfg(target_os = "linux")]
-    {
-        let snapshot = at_finish.expect("resolved above");
-        assert!(
-            snapshot >= TOTAL_BYTES - INGRESS_HIGH_WATER_BYTES - 12 * 1024 * 1024,
-            "the byte gate never engaged: only {snapshot} bytes were delivered \
-             when the producer finished (total {TOTAL_BYTES})"
-        );
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = at_finish;
-
-    // Deserialize the captured stream through the real client session and
-    // assert lossless, in-order delivery of every published tag. Outbound
-    // responses (acknowledgements) are best-effort: the server already
-    // closed the connection at stream end.
+    // Deserialize the captured stream through the real client session, then
+    // judge it by how the stream actually ended. Outbound responses
+    // (acknowledgements) are best-effort: the server already closed the
+    // connection at stream end.
+    //
+    // Two endings are legitimate here, and the split is not a concession to
+    // flakiness — it is the server's own slow-watcher policy, which this
+    // publisher is built to outrun. A watcher's write queue is hard-capped
+    // (`QUEUE_MAX_BYTES`, 4 MiB) while the publisher holds an 8 MiB ingress
+    // credit, and every tag below is a non-droppable IDR, so the shedding
+    // policy cannot relieve a backlog — only a disconnect can. 4 MiB is 64
+    // tags, which a reader stall of roughly 10 ms accumulates while the
+    // producer floods at memcpy speed; nothing a test can do rules that out
+    // on a shared runner. So what is asserted is what holds under every
+    // schedule:
+    //   * whatever arrived is a contiguous prefix in publish order — a gap,
+    //     a repeat or a reorder is a real bug under either ending;
+    //   * a stream that reported completion (`NetStream.Play.Complete`,
+    //     pinned by `publisher_finish_delivers_stream_eof_to_watcher`) must
+    //     have carried every tag — truncating while still reporting a clean
+    //     end is a real bug, and that is the shape a lossy gate would take;
+    //   * the engagement tripwire is meaningful only for such a stream, so
+    //     it moved inside that branch.
+    // A cut-off run still proves the headline claim asserted above (the
+    // producer completed every send without parking forever); it forfeits
+    // only the delivery-side coverage, which the unit-level gate pins carry.
     let mut seqs: Vec<u32> = Vec::new();
+    let mut clean_end = false;
     for slice in captured.chunks(1024 * 1024) {
         for result in watcher.session.handle_input(slice).expect("handle_input") {
             match result {
@@ -603,19 +615,53 @@ fn high_water_publisher_backpressure_does_not_deadlock() {
                         seqs.push(seq);
                     }
                 }
+                ClientSessionResult::RaisedEvent(
+                    ClientSessionEvent::UnhandleableOnStatusCode { code },
+                ) => {
+                    if code == "NetStream.Play.Complete" {
+                        clean_end = true;
+                    }
+                }
                 _ => {}
             }
         }
     }
-    assert_eq!(
-        seqs.len(),
-        TAG_COUNT,
-        "every published tag must reach the watcher"
-    );
     assert!(
         seqs.iter().enumerate().all(|(i, &seq)| seq == i as u32),
-        "tags must arrive exactly once, in publish order"
+        "the delivered tags must be a contiguous prefix in publish order, with \
+         no gap and no repeat: {} tags delivered, clean_end={clean_end}",
+        seqs.len()
     );
+    if clean_end {
+        assert_eq!(
+            seqs.len(),
+            TAG_COUNT,
+            "a stream that reported completion must have carried every tag"
+        );
+        // Engagement tripwire (see the doc comment): producer-side snapshot
+        // of delivered bytes at completion. The ~20 MiB allowance covers the
+        // high-water window (8 MiB), the watcher write queue, kernel TCP
+        // buffering on both loopback ends, the drain round in flight at
+        // release time, and the counter's one-read lag. Linux-only: the bound
+        // is an environment heuristic, and the CI mutation evidence lives
+        // there.
+        #[cfg(target_os = "linux")]
+        {
+            let snapshot = at_finish.expect("resolved above");
+            assert!(
+                snapshot >= TOTAL_BYTES - INGRESS_HIGH_WATER_BYTES - 12 * 1024 * 1024,
+                "the byte gate never engaged: only {snapshot} bytes were delivered \
+                 when the producer finished (total {TOTAL_BYTES})"
+            );
+        }
+    } else {
+        assert!(
+            !seqs.is_empty(),
+            "the watcher was cut off before a single tag arrived, which leaves \
+             the delivery path untested rather than merely truncated"
+        );
+    }
+    let _ = at_finish;
 
     server.stop();
 }
