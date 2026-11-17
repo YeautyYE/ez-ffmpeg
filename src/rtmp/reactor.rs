@@ -4006,9 +4006,18 @@ mod tests {
 
     /// Shrink a socket's send/receive buffer so a modest enqueue reliably
     /// fills the kernel pipe and forces WouldBlock in tests.
+    ///
+    /// Do not shrink this further. 8 KiB is already far below every payload
+    /// these tests enqueue (64 KiB and 1 MiB), so WouldBlock is just as
+    /// certain as at a smaller size — but a 2 KiB window drives macOS into
+    /// repeated multi-second zero-window stalls mid-transfer (measured: one
+    /// ~5 s stall per run on an idle arm64 host, which left
+    /// `close_lingers_then_drains_an_undeliverable_tail` 5-10 s against its
+    /// 20 s drain watchdog and expired it outright on a loaded CI runner).
+    /// At 8 KiB the same drain finishes in under a millisecond.
     #[cfg(unix)]
     fn set_small_socket_buffer(fd: std::os::unix::io::RawFd, opt: libc::c_int) {
-        let size: libc::c_int = 2048;
+        let size: libc::c_int = 8192;
         // SAFETY: setsockopt on a valid fd with a valid SOL_SOCKET option and a
         // correctly-sized c_int value; return value is intentionally ignored
         // (best-effort tuning for the test).
