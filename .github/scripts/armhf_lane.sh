@@ -54,11 +54,24 @@ esac
 # rtmp_loopback proof at the end of this script needs; a minimal from-source
 # build has no H.264 encoder and would silently drop that coverage.
 #
+# Ask dpkg for paths because Debian uses a multiarch triplet include directory.
+# The compiler guard is the real check: an empty lookup must not silently pass
+# while the header remains reachable. Use __has_include, not #include, since
+# the header's <vulkan/vulkan.h> dependency is absent in this container.
+# Inverting the probe also fails the lane for a missing compiler or bad flags.
+#
 # Revert this once ffmpeg-sys-next makes the assertion pointer-width aware.
-vulkan_hwcontext=/usr/include/libavutil/hwcontext_vulkan.h
-if [ -f "$vulkan_hwcontext" ]; then
+while IFS= read -r vulkan_hwcontext; do
   mv "$vulkan_hwcontext" "$vulkan_hwcontext.disabled-for-32bit"
   echo "removed $vulkan_hwcontext (32-bit: ffmpeg-sys-next's Vulkan bindgen shim asserts a 64-bit struct size)"
+done < <(dpkg -L libavutil-dev | grep '/libavutil/hwcontext_vulkan\.h$' || true)
+
+# pkg-config output is intentionally unquoted to pass separate -I arguments.
+# shellcheck disable=SC2046
+if ! printf '#if __has_include(<libavutil/hwcontext_vulkan.h>)\n#error still reachable\n#endif\n' | \
+  cc $(pkg-config --cflags libavutil) -E -x c - >/dev/null; then
+  echo "libavutil/hwcontext_vulkan.h is still reachable (or the probe could not run); ffmpeg-sys-next would bind its 64-bit-only Vulkan shim and abort." >&2
+  exit 1
 fi
 
 # Trixie's packaged rustc is frozen at branch time; every other lane tracks
