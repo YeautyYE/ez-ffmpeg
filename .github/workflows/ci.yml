@@ -604,8 +604,9 @@ jobs:
             target: x86_64-pc-windows-msvc
             ffmpeg: "9.0"
             vcpkg_triplet: x64-windows
+            vcpkg_ffmpeg: "ffmpeg[network]"
             vcpkg_ref: 964e107c112ca636c0314740bfc0fbec25122b47
-            vcpkg_cache: 964e107c-ffmpeg-9.0.2-p7-v1
+            vcpkg_cache: 964e107c-ffmpeg-9.0.2-p7-network-v1
             build_features: async,opengl,wgpu,rtmp,flv,subtitle,cli,http-input
             test_features: async,rtmp,flv,subtitle,wgpu,cli,http-input
             default_ffmpeg_features: ""
@@ -616,6 +617,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             ffmpeg: "7.1"
             vcpkg_triplet: x64-windows
+            vcpkg_ffmpeg: "ffmpeg"
             vcpkg_ref: 6070d5cb2f818921c10ccdf6f35f3415a2503369
             vcpkg_cache: 6070d5cb-ffmpeg-7.1.2-p5-v1
             build_features: async,opengl,wgpu,rtmp,flv,subtitle,cli,http-input
@@ -628,8 +630,9 @@ jobs:
             target: aarch64-pc-windows-msvc
             ffmpeg: "9.0"
             vcpkg_triplet: arm64-windows
+            vcpkg_ffmpeg: "ffmpeg[network]"
             vcpkg_ref: 964e107c112ca636c0314740bfc0fbec25122b47
-            vcpkg_cache: 964e107c-ffmpeg-9.0.2-p7-v1
+            vcpkg_cache: 964e107c-ffmpeg-9.0.2-p7-network-v1
             build_features: async,opengl,wgpu,rtmp,flv,subtitle,cli,http-input
             test_features: async,rtmp,flv,subtitle,wgpu,cli,http-input
             default_ffmpeg_features: ""
@@ -640,6 +643,7 @@ jobs:
             target: aarch64-pc-windows-msvc
             ffmpeg: "7.1"
             vcpkg_triplet: arm64-windows
+            vcpkg_ffmpeg: "ffmpeg"
             vcpkg_ref: 6070d5cb2f818921c10ccdf6f35f3415a2503369
             vcpkg_cache: 6070d5cb-ffmpeg-7.1.2-p5-v1
             build_features: async,opengl,wgpu,rtmp,flv,subtitle,cli,http-input
@@ -746,6 +750,12 @@ jobs:
       - name: Install FFmpeg ${{ matrix.ffmpeg }} with vcpkg
         if: matrix.os == 'windows'
         shell: pwsh
+        # `vcpkg_ffmpeg` carries the port's feature selection. The pinned 9.0
+        # port configures `--disable-network` unless its `network` feature is
+        # requested, which drops every network protocol and leaves the library
+        # suite's tcp:// writer failing to open its output; the pinned 7.1 port
+        # builds them without being asked. The feature adds no other port: TLS
+        # comes from schannel, which is part of Windows.
         run: |
           git config --global --add safe.directory $env:VCPKG_ROOT
           if ($LASTEXITCODE -ne 0) { throw "git config exited with code $LASTEXITCODE" }
@@ -755,14 +765,28 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "git checkout exited with code $LASTEXITCODE" }
           & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
           if ($LASTEXITCODE -ne 0) { throw "bootstrap-vcpkg exited with code $LASTEXITCODE" }
-          & "$env:VCPKG_ROOT\vcpkg.exe" install "ffmpeg:${{ matrix.vcpkg_triplet }}" --clean-after-build
+          & "$env:VCPKG_ROOT\vcpkg.exe" install "${{ matrix.vcpkg_ffmpeg }}:${{ matrix.vcpkg_triplet }}" --clean-after-build
           if ($LASTEXITCODE -ne 0) { throw "vcpkg install exited with code $LASTEXITCODE" }
-          $ffmpeg = & "$env:VCPKG_ROOT\vcpkg.exe" list | Select-String "^ffmpeg:"
+          $installed = & "$env:VCPKG_ROOT\vcpkg.exe" list
           if ($LASTEXITCODE -ne 0) { throw "vcpkg list exited with code $LASTEXITCODE" }
+          $ffmpeg = $installed | Select-String "^ffmpeg:"
           if (-not $ffmpeg) { throw "The FFmpeg vcpkg package was not installed" }
           $expectedVersion = [regex]::Escape("${{ matrix.ffmpeg }}")
           if ("$ffmpeg" -notmatch "\s$expectedVersion\.") {
             throw "Expected FFmpeg ${{ matrix.ffmpeg }}.x, found: $ffmpeg"
+          }
+          # Every feature the spec asks for must have its own installed row.
+          # Without this, a port that quietly drops one stays undetected until
+          # a test fails deep inside FFmpeg, far from the cause.
+          if ("${{ matrix.vcpkg_ffmpeg }}" -match '^ffmpeg\[(.+)\]$') {
+            $features = $matches[1].Split(',')
+            $rows = @($installed | Where-Object { $_ -like 'ffmpeg*' })
+            foreach ($feature in $features) {
+              $pattern = "^ffmpeg\[" + [regex]::Escape($feature) + "\]:"
+              if (-not @($rows | Where-Object { $_ -match $pattern })) {
+                throw "FFmpeg was installed without the requested '$feature' feature; installed: $($rows -join ' | ')"
+              }
+            }
           }
           $ffmpeg
 
