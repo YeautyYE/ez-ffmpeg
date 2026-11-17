@@ -835,8 +835,9 @@ jobs:
       # command names an encoder this libx264-less link lacks; the
       # in-process gates accept EncoderUnavailable on that link), and on the
       # Homebrew 7.1 lane they run in full against the matching CLI. The
-      # emit-hardening tests type-check emitted programs with
-      # `rustc --emit=metadata`, needing no native linking.
+      # emit-hardening tests compare emitted source against pinned examples,
+      # needing no native linking; `cli-goldens` is what compiles those
+      # examples, on Linux x64 with FFmpeg 7.1.
       #
       # xnu regrows an unread TCP receive window past an explicitly pinned
       # SO_RCVBUF (observed on these runners: pinned to 16384 at accept,

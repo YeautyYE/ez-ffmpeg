@@ -13,6 +13,12 @@
 //! programs as ordinary example targets, for instance with
 //! `cargo build --features cli --examples`, so a payload that turns into
 //! live code fails the example build.
+//!
+//! This test itself only compares bytes; compiling the pins is a separate
+//! job (`cli-goldens` in CI, on one lane). That split is sound only while
+//! the emitted programs stay free of OS- or FFmpeg-version-conditional
+//! calls — if the emitter ever learns to generate those, the pins need to
+//! be compiled on more than one lane.
 
 #![cfg(feature = "cli")]
 
