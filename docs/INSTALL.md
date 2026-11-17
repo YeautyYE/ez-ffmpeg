@@ -82,10 +82,34 @@ a libavutil built **without** Vulkan — build FFmpeg from source with
 `--disable-vulkan`, or use a distribution package that does not enable it.
 Debian and Ubuntu do enable it, so their `libavutil-dev` triggers this.
 
+A cheaper third option, and the one this project's CI uses, is to hide the
+header so the `__has_include` gate skips the Vulkan block:
+
+```sh
+dpkg -L libavutil-dev | grep '/libavutil/hwcontext_vulkan\.h$' \
+    | while IFS= read -r h; do sudo mv "$h" "$h.disabled"; done
+```
+
+That omits the Vulkan hardware-context bindings from the generated Rust code.
+It does **not** disable Vulkan in the installed FFmpeg libraries and changes
+nothing else about them. Two details cost time if you try it:
+
+- On Debian the header sits under the multiarch include directory
+  (`/usr/include/arm-linux-gnueabihf/libavutil/`), not `/usr/include/libavutil/`,
+  so ask `dpkg` for the path instead of hardcoding one.
+- A probe written as `#include <libavutil/hwcontext_vulkan.h>` cannot confirm
+  the header is gone. That header pulls in `<vulkan/vulkan.h>`, which is absent
+  unless the Vulkan SDK is installed, so such a probe fails either way and
+  always looks like success. `__has_include` is what distinguishes the two.
+
 This affects 0.20 and later, which require `ffmpeg-sys-next` 9.x; 0.19.x is
 unaffected. It is an upstream defect, not a deliberate platform drop — 64-bit
 targets are unaffected, and CI covers 32-bit ARM against a Vulkan-less
-libavutil.
+libavutil. Tracked upstream as
+[rust-ffmpeg-sys#137](https://github.com/zmwangx/rust-ffmpeg-sys/issues/137),
+with a fix pending in
+[#143](https://github.com/zmwangx/rust-ffmpeg-sys/pull/143); once a release
+carries it, none of this is needed.
 
 ## Static linking on Windows
 

@@ -60,7 +60,8 @@ esac
 # the header's <vulkan/vulkan.h> dependency is absent in this container.
 # Inverting the probe also fails the lane for a missing compiler or bad flags.
 #
-# Revert this once ffmpeg-sys-next makes the assertion pointer-width aware.
+# Revert this once ffmpeg-sys-next makes the assertion pointer-width aware:
+# https://github.com/zmwangx/rust-ffmpeg-sys/pull/143 (reported as issue 137).
 while IFS= read -r vulkan_hwcontext; do
   mv "$vulkan_hwcontext" "$vulkan_hwcontext.disabled-for-32bit"
   echo "removed $vulkan_hwcontext (32-bit: ffmpeg-sys-next's Vulkan bindgen shim asserts a 64-bit struct size)"
