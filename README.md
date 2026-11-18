@@ -70,7 +70,7 @@ Static linking, building FFmpeg from source, and troubleshooting: see [docs/INST
 
 ```toml
 [dependencies]
-ez-ffmpeg = "0.19"
+ez-ffmpeg = "0.20"
 ```
 
 ### Basic Usage
