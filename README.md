@@ -32,9 +32,8 @@ The transcoding pipeline is ported from FFmpeg's own `fftools/ffmpeg` sources �
 - **Rust:** 1.88.0 or higher.
 - **FFmpeg:** 7.1 through 9.x (one build links exactly one major).
 
-These are the requirements of the **upcoming 0.20** release. The latest
-published release (0.19.x) still requires Rust 1.80 and links FFmpeg
-7.1–8.x; FFmpeg 9 support is not in any published version yet.
+These are the requirements as of 0.20. Earlier releases (0.19.x and below)
+require Rust 1.80 and link FFmpeg 7.1–8.x; they carry no FFmpeg 9 support.
 
 ## Quick Start
 

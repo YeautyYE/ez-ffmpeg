@@ -157,8 +157,7 @@ the copy ez-ffmpeg uses:
 
 ```toml
 [dependencies]
-# 0.20 is not published yet; until it is, point at a checkout of it.
-ez-ffmpeg = { path = "../ez-ffmpeg" }
+ez-ffmpeg = "0.20"
 # Keep the requirement compatible with the ffmpeg-next line ez-ffmpeg
 # resolves. Cargo rejects a graph needing two different ffmpeg-sys-next
 # packages: both declare `links = "ffmpeg"`, so they cannot coexist.
@@ -347,11 +346,11 @@ only matters if discovery reaches it — check your selected baseline and the
 installed package with `vcpkg list`, and remember it may differ from the
 version this project's CI uses.
 
-Two ways out: use ez-ffmpeg 0.20 once it is published (it links
-`ffmpeg-next` 9.x and supports FFmpeg 7.1 through 9.x), or keep ez-ffmpeg
-0.19.x and point it at an 8.1.x install. Note that 8.1.3 is one compatible
-8.x patch release — it is neither a minimum nor a statement that the 8.x
-series has ended; any 8.1.x works equally.
+Two ways out: use ez-ffmpeg 0.20 or later (it links `ffmpeg-next` 9.x and
+supports FFmpeg 7.1 through 9.x), or keep ez-ffmpeg 0.19.x and point it at an
+8.1.x install. Note that 8.1.3 is one compatible 8.x patch release — it is
+neither a minimum nor a statement that the 8.x series has ended; any 8.1.x
+works equally.
 (Reported in [#67](https://github.com/YeautyYE/ez-ffmpeg/issues/67).)
 
 </details>
