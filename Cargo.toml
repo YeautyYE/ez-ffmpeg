@@ -1,6 +1,6 @@
 [package]
 name = "ez-ffmpeg"
-version = "0.19.3"
+version = "0.20.0"
 edition = "2021"
 # 1.88 comes from ffmpeg-sys-next 9.x: it is `edition = "2024"` AND its build
 # script uses let-chains, which are stable only in 1.88. Edition 2024 alone
